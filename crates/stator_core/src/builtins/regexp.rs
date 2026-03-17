@@ -590,8 +590,13 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
             };
             idx_props.insert(i.to_string(), val);
         }
-        if !idx.groups.is_empty() {
+        // indices.groups — null-prototype object when named groups exist,
+        // undefined otherwise (per §22.2.7.8 step 26-28).
+        if m.named_groups.is_empty() {
+            idx_props.insert("groups".into(), JsValue::Undefined);
+        } else {
             let mut g = PropertyMap::new();
+            g.insert(INTERNAL_PROTO_PROPERTY_KEY.into(), JsValue::Null);
             for (k, (s, e)) in &idx.groups {
                 g.insert(
                     k.clone(),
@@ -606,6 +611,9 @@ fn match_to_js(m: &crate::objects::regexp::RegExpMatch) -> JsValue {
                 JsValue::PlainObject(Rc::new(RefCell::new(g))),
             );
         }
+        // Mark indices as array-like (spec: indices is an Array exotic).
+        idx_props.insert("length".into(), JsValue::Smi(idx.pairs.len() as i32));
+        idx_props.insert("__is_array__".into(), JsValue::Boolean(true));
         props.insert(
             "indices".into(),
             JsValue::PlainObject(Rc::new(RefCell::new(idx_props))),
@@ -1041,6 +1049,318 @@ mod tests {
                 let result = f(vec![JsValue::String("a".into())]).unwrap();
                 assert_eq!(get_bool(&result, "__is_array__"), Some(true));
                 assert_eq!(get_smi(&result, "length"), Some(1));
+            }
+        }
+    }
+
+    // ── groups is null-prototype object ──────────────────────────────────
+
+    #[test]
+    fn test_exec_groups_null_prototype() {
+        let re = regexp_construct(&[
+            JsValue::String(r"(?<a>\d+)".into()),
+            JsValue::String("".into()),
+        ])
+        .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let exec_fn = map.borrow().get("exec").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = exec_fn {
+                let result = f(vec![JsValue::String("42".into())]).unwrap();
+                if let JsValue::PlainObject(result_map) = &result {
+                    let groups = result_map.borrow().get("groups").cloned().unwrap();
+                    if let JsValue::PlainObject(g) = groups {
+                        // Null-prototype: __proto__ is Null
+                        assert_eq!(
+                            g.borrow().get(INTERNAL_PROTO_PROPERTY_KEY),
+                            Some(&JsValue::Null)
+                        );
+                    } else {
+                        panic!("groups should be PlainObject");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_exec_no_named_groups_returns_undefined() {
+        let re = regexp_construct(&[JsValue::String(r"\d+".into()), JsValue::String("".into())])
+            .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let exec_fn = map.borrow().get("exec").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = exec_fn {
+                let result = f(vec![JsValue::String("42".into())]).unwrap();
+                if let JsValue::PlainObject(result_map) = &result {
+                    let groups = result_map.borrow().get("groups").cloned().unwrap();
+                    assert_eq!(groups, JsValue::Undefined);
+                }
+            }
+        }
+    }
+
+    // ── /d flag indices integration tests ────────────────────────────────
+
+    #[test]
+    fn test_exec_indices_array_like() {
+        let re = regexp_construct(&[JsValue::String(r"\d+".into()), JsValue::String("d".into())])
+            .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let exec_fn = map.borrow().get("exec").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = exec_fn {
+                let result = f(vec![JsValue::String("abc 42".into())]).unwrap();
+                if let JsValue::PlainObject(result_map) = &result {
+                    let indices = result_map.borrow().get("indices").cloned().unwrap();
+                    // indices should be array-like
+                    assert_eq!(get_bool(&indices, "__is_array__"), Some(true));
+                    assert_eq!(get_smi(&indices, "length"), Some(1));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_exec_indices_with_named_groups_null_proto() {
+        let re = regexp_construct(&[
+            JsValue::String(r"(?<word>\w+)".into()),
+            JsValue::String("d".into()),
+        ])
+        .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let exec_fn = map.borrow().get("exec").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = exec_fn {
+                let result = f(vec![JsValue::String("hello".into())]).unwrap();
+                if let JsValue::PlainObject(result_map) = &result {
+                    let indices = result_map.borrow().get("indices").cloned().unwrap();
+                    if let JsValue::PlainObject(idx_map) = indices {
+                        let ig = idx_map.borrow().get("groups").cloned().unwrap();
+                        if let JsValue::PlainObject(g) = ig {
+                            assert_eq!(
+                                g.borrow().get(INTERNAL_PROTO_PROPERTY_KEY),
+                                Some(&JsValue::Null)
+                            );
+                            // "word" should be [0, 5]
+                            let word_idx = g.borrow().get("word").cloned().unwrap();
+                            if let JsValue::Array(arr) = word_idx {
+                                assert_eq!(arr.borrow()[0], JsValue::Smi(0));
+                                assert_eq!(arr.borrow()[1], JsValue::Smi(5));
+                            } else {
+                                panic!("word index should be array");
+                            }
+                        } else {
+                            panic!("indices.groups should be PlainObject");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_exec_indices_groups_undefined_without_named() {
+        let re = regexp_construct(&[
+            JsValue::String(r"(\d+)".into()),
+            JsValue::String("d".into()),
+        ])
+        .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let exec_fn = map.borrow().get("exec").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = exec_fn {
+                let result = f(vec![JsValue::String("42".into())]).unwrap();
+                if let JsValue::PlainObject(result_map) = &result {
+                    let indices = result_map.borrow().get("indices").cloned().unwrap();
+                    if let JsValue::PlainObject(idx_map) = indices {
+                        let groups = idx_map.borrow().get("groups").cloned().unwrap();
+                        assert_eq!(groups, JsValue::Undefined);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_exec_indices_capture_pairs() {
+        let re = regexp_construct(&[
+            JsValue::String(r"(\d+)-(\d+)".into()),
+            JsValue::String("d".into()),
+        ])
+        .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let exec_fn = map.borrow().get("exec").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = exec_fn {
+                let result = f(vec![JsValue::String("abc 12-34 end".into())]).unwrap();
+                if let JsValue::PlainObject(result_map) = &result {
+                    let indices = result_map.borrow().get("indices").cloned().unwrap();
+                    assert_eq!(get_smi(&indices, "length"), Some(3));
+                    // indices[0] = [4, 9] full match
+                    if let JsValue::PlainObject(idx) = &indices {
+                        let pair0 = idx.borrow().get("0").cloned().unwrap();
+                        if let JsValue::Array(arr) = pair0 {
+                            assert_eq!(arr.borrow()[0], JsValue::Smi(4));
+                            assert_eq!(arr.borrow()[1], JsValue::Smi(9));
+                        }
+                        // indices[1] = [4, 6]
+                        let pair1 = idx.borrow().get("1").cloned().unwrap();
+                        if let JsValue::Array(arr) = pair1 {
+                            assert_eq!(arr.borrow()[0], JsValue::Smi(4));
+                            assert_eq!(arr.borrow()[1], JsValue::Smi(6));
+                        }
+                        // indices[2] = [7, 9]
+                        let pair2 = idx.borrow().get("2").cloned().unwrap();
+                        if let JsValue::Array(arr) = pair2 {
+                            assert_eq!(arr.borrow()[0], JsValue::Smi(7));
+                            assert_eq!(arr.borrow()[1], JsValue::Smi(9));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── /v flag stub integration ─────────────────────────────────────────
+
+    #[test]
+    fn test_v_flag_construct() {
+        let re =
+            regexp_construct(&[JsValue::String("a".into()), JsValue::String("v".into())]).unwrap();
+        assert_eq!(get_str(&re, "flags").as_deref(), Some("v"));
+        assert_eq!(get_bool(&re, "unicodeSets"), Some(true));
+        assert_eq!(get_bool(&re, "unicode"), Some(false));
+    }
+
+    #[test]
+    fn test_v_flag_has_indices_combined() {
+        let re = regexp_construct(&[JsValue::String(r"\d+".into()), JsValue::String("dv".into())])
+            .unwrap();
+        assert_eq!(get_str(&re, "flags").as_deref(), Some("dv"));
+        assert_eq!(get_bool(&re, "hasIndices"), Some(true));
+        assert_eq!(get_bool(&re, "unicodeSets"), Some(true));
+    }
+
+    // ── flags ordering integration ───────────────────────────────────────
+
+    #[test]
+    fn test_flags_accessor_order() {
+        let re = regexp_construct(&[
+            JsValue::String("a".into()),
+            JsValue::String("ymisgd".into()),
+        ])
+        .unwrap();
+        assert_eq!(get_str(&re, "flags").as_deref(), Some("dgimsy"));
+    }
+
+    #[test]
+    fn test_flags_with_v_flag_order() {
+        let re = regexp_construct(&[JsValue::String("a".into()), JsValue::String("ygdv".into())])
+            .unwrap();
+        assert_eq!(get_str(&re, "flags").as_deref(), Some("dgvy"));
+    }
+
+    // ── exec no match returns null ───────────────────────────────────────
+
+    #[test]
+    fn test_exec_no_match_returns_null() {
+        let re =
+            regexp_construct(&[JsValue::String("xyz".into()), JsValue::String("".into())]).unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let exec_fn = map.borrow().get("exec").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = exec_fn {
+                let result = f(vec![JsValue::String("hello".into())]).unwrap();
+                assert_eq!(result, JsValue::Null);
+            }
+        }
+    }
+
+    // ── named backreference integration ──────────────────────────────────
+
+    #[test]
+    fn test_named_backreference_exec() {
+        let re = regexp_construct(&[
+            JsValue::String(r"(?<char>.)\k<char>".into()),
+            JsValue::String("".into()),
+        ])
+        .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let exec_fn = map.borrow().get("exec").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = exec_fn {
+                let result = f(vec![JsValue::String("aabbcc".into())]).unwrap();
+                assert_eq!(get_str(&result, "0").as_deref(), Some("aa"));
+                // groups.char = "a"
+                if let JsValue::PlainObject(result_map) = &result {
+                    let groups = result_map.borrow().get("groups").cloned().unwrap();
+                    if let JsValue::PlainObject(g) = groups {
+                        assert_eq!(g.borrow().get("char"), Some(&JsValue::String("a".into())));
+                    }
+                }
+            }
+        }
+    }
+
+    // ── replace with named groups integration ────────────────────────────
+
+    #[test]
+    fn test_replace_named_capture_integration() {
+        let re = regexp_construct(&[
+            JsValue::String(r"(?<y>\d{4})-(?<m>\d{2})-(?<d>\d{2})".into()),
+            JsValue::String("".into()),
+        ])
+        .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let replace_fn = map.borrow().get("__symbol_replace__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = replace_fn {
+                let result = f(vec![
+                    JsValue::String("2024-07-15".into()),
+                    JsValue::String("$<d>/$<m>/$<y>".into()),
+                ])
+                .unwrap();
+                assert_eq!(result, JsValue::String("15/07/2024".into()));
+            }
+        }
+    }
+
+    // ── legacy statics ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_legacy_statics_updated_after_exec() {
+        let re = regexp_construct(&[
+            JsValue::String(r"(\d+)-(\w+)".into()),
+            JsValue::String("".into()),
+        ])
+        .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let exec_fn = map.borrow().get("exec").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = exec_fn {
+                let _ = f(vec![JsValue::String("abc 42-foo end".into())]).unwrap();
+                assert_eq!(regexp_static_get("$1"), JsValue::String("42".into()));
+                assert_eq!(regexp_static_get("$2"), JsValue::String("foo".into()));
+                assert_eq!(
+                    regexp_static_get("lastMatch"),
+                    JsValue::String("42-foo".into())
+                );
+            }
+        }
+    }
+
+    // ── d flag with nonparticipating capture ──────────────────────────────
+
+    #[test]
+    fn test_exec_indices_nonparticipating() {
+        let re = regexp_construct(&[
+            JsValue::String(r"(x)?(\d+)".into()),
+            JsValue::String("d".into()),
+        ])
+        .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let exec_fn = map.borrow().get("exec").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = exec_fn {
+                let result = f(vec![JsValue::String("42".into())]).unwrap();
+                if let JsValue::PlainObject(result_map) = &result {
+                    let indices = result_map.borrow().get("indices").cloned().unwrap();
+                    if let JsValue::PlainObject(idx) = indices {
+                        // indices[1] should be undefined (group didn't participate)
+                        let pair1 = idx.borrow().get("1").cloned().unwrap();
+                        assert_eq!(pair1, JsValue::Undefined);
+                    }
+                }
             }
         }
     }

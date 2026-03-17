@@ -1231,4 +1231,301 @@ mod tests {
         assert!(re.test("42"));
         assert!(!re.test("abc"));
     }
+
+    // ── Named capture groups ─────────────────────────────────────────────
+
+    #[test]
+    fn test_named_capture_single_group() {
+        let re = JsRegExp::new(r"(?<word>\w+)", "").unwrap();
+        let m = re.exec("hello world").unwrap();
+        assert_eq!(m.matched, "hello");
+        assert_eq!(
+            m.named_groups.get("word").and_then(|v| v.as_deref()),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn test_named_capture_nonparticipating_group() {
+        let re = JsRegExp::new(r"(?<a>x)?(?<b>\d+)", "").unwrap();
+        let m = re.exec("42").unwrap();
+        assert_eq!(m.matched, "42");
+        assert_eq!(m.named_groups.get("a").and_then(|v| v.as_deref()), None);
+        assert_eq!(
+            m.named_groups.get("b").and_then(|v| v.as_deref()),
+            Some("42")
+        );
+        // The key "a" should still be present (with None value).
+        assert!(m.named_groups.contains_key("a"));
+    }
+
+    #[test]
+    fn test_named_capture_multiple_groups() {
+        let re = JsRegExp::new(r"(?<first>\w+)\s(?<last>\w+)", "").unwrap();
+        let m = re.exec("John Doe").unwrap();
+        assert_eq!(
+            m.named_groups.get("first").and_then(|v| v.as_deref()),
+            Some("John")
+        );
+        assert_eq!(
+            m.named_groups.get("last").and_then(|v| v.as_deref()),
+            Some("Doe")
+        );
+    }
+
+    #[test]
+    fn test_named_and_numbered_captures_coexist() {
+        let re = JsRegExp::new(r"(\d+)-(?<name>\w+)", "").unwrap();
+        let m = re.exec("42-foo").unwrap();
+        assert_eq!(m.captures[0], Some("42".to_string()));
+        assert_eq!(m.captures[1], Some("foo".to_string()));
+        assert_eq!(
+            m.named_groups.get("name").and_then(|v| v.as_deref()),
+            Some("foo")
+        );
+    }
+
+    // ── Named backreferences \k<name> ────────────────────────────────────
+
+    #[test]
+    fn test_named_backreference_basic() {
+        let re = JsRegExp::new(r"(?<tag>\w+)=\k<tag>", "").unwrap();
+        let m = re.exec("abc=abc").unwrap();
+        assert_eq!(m.matched, "abc=abc");
+    }
+
+    #[test]
+    fn test_named_backreference_no_match_when_different() {
+        let re = JsRegExp::new(r"(?<tag>\w+)=\k<tag>", "").unwrap();
+        assert!(re.exec("abc=def").is_none());
+    }
+
+    #[test]
+    fn test_named_backreference_with_flag_u() {
+        let re = JsRegExp::new(r"(?<char>.)\k<char>", "u").unwrap();
+        let m = re.exec("aabbcc").unwrap();
+        assert_eq!(m.matched, "aa");
+    }
+
+    #[test]
+    fn test_named_backreference_html_tag() {
+        let re = JsRegExp::new(r"<(?<tag>\w+)>.*?</\k<tag>>", "").unwrap();
+        let m = re.exec("<div>hello</div>").unwrap();
+        assert_eq!(m.matched, "<div>hello</div>");
+        assert!(re.exec("<div>hello</span>").is_none());
+    }
+
+    // ── String replace with named groups ─────────────────────────────────
+
+    #[test]
+    fn test_replace_named_capture_global() {
+        let re = JsRegExp::new(r"(?<d>\d+)", "gu").unwrap();
+        assert_eq!(re.symbol_replace("a1 b2 c3", "[$<d>]"), "a[1] b[2] c[3]");
+    }
+
+    #[test]
+    fn test_replace_named_capture_missing_name() {
+        let re = JsRegExp::new(r"(?<a>\d+)", "u").unwrap();
+        // $<b> doesn't match any group — should produce empty string
+        assert_eq!(re.symbol_replace("42", "$<b>"), "");
+    }
+
+    #[test]
+    fn test_replace_named_capture_nonparticipating() {
+        let re = JsRegExp::new(r"(?<a>x)?(?<b>\d+)", "").unwrap();
+        // Group "a" didn't participate — $<a> produces empty string
+        assert_eq!(re.symbol_replace("42", "$<a>-$<b>"), "-42");
+    }
+
+    #[test]
+    fn test_replace_named_capture_unclosed_angle() {
+        let re = JsRegExp::new(r"(?<a>\d+)", "").unwrap();
+        // $< without closing > — literal $
+        assert_eq!(re.symbol_replace("42", "$<a"), "$<a");
+    }
+
+    // ── /d flag (hasIndices) ─────────────────────────────────────────────
+
+    #[test]
+    fn test_has_indices_flag_parsed() {
+        let re = JsRegExp::new("a", "d").unwrap();
+        assert!(re.flags().contains(RegExpFlags::HAS_INDICES));
+    }
+
+    #[test]
+    fn test_has_indices_basic() {
+        let re = JsRegExp::new(r"\d+", "d").unwrap();
+        let m = re.exec("abc 42 end").unwrap();
+        let idx = m.indices.as_ref().unwrap();
+        assert_eq!(idx.pairs[0], Some((4, 6)));
+    }
+
+    #[test]
+    fn test_has_indices_capture_groups() {
+        let re = JsRegExp::new(r"(\d+)-(\d+)", "d").unwrap();
+        let m = re.exec("abc 12-34 end").unwrap();
+        let idx = m.indices.as_ref().unwrap();
+        assert_eq!(idx.pairs[0], Some((4, 9)));
+        assert_eq!(idx.pairs[1], Some((4, 6)));
+        assert_eq!(idx.pairs[2], Some((7, 9)));
+    }
+
+    #[test]
+    fn test_has_indices_nonparticipating_group() {
+        let re = JsRegExp::new(r"(x)?(\d+)", "d").unwrap();
+        let m = re.exec("42").unwrap();
+        let idx = m.indices.as_ref().unwrap();
+        assert_eq!(idx.pairs[0], Some((0, 2)));
+        assert_eq!(idx.pairs[1], None); // (x)? didn't participate
+        assert_eq!(idx.pairs[2], Some((0, 2)));
+    }
+
+    #[test]
+    fn test_has_indices_named_groups() {
+        let re = JsRegExp::new(r"(?<year>\d{4})-(?<month>\d{2})", "du").unwrap();
+        let m = re.exec("2024-07").unwrap();
+        let idx = m.indices.as_ref().unwrap();
+        assert_eq!(idx.groups.get("year"), Some(&(0, 4)));
+        assert_eq!(idx.groups.get("month"), Some(&(5, 7)));
+    }
+
+    #[test]
+    fn test_no_indices_without_d_flag() {
+        let re = JsRegExp::new(r"\d+", "").unwrap();
+        let m = re.exec("42").unwrap();
+        assert!(m.indices.is_none());
+    }
+
+    // ── /v flag stub ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_v_flag_parsed() {
+        let re = JsRegExp::new("a", "v").unwrap();
+        assert!(re.flags().contains(RegExpFlags::UNICODE_SETS));
+    }
+
+    #[test]
+    fn test_v_flag_in_flags_string() {
+        let re = JsRegExp::new("a", "v").unwrap();
+        assert_eq!(re.flags().to_flags_string(), "v");
+    }
+
+    #[test]
+    fn test_v_flag_enables_unicode_matching() {
+        // /v implies unicode mode — \p{L} should work
+        let re = JsRegExp::new(r"\p{L}+", "v").unwrap();
+        assert!(re.test("hello"));
+        assert!(!re.test("123"));
+    }
+
+    #[test]
+    fn test_v_and_u_cannot_combine() {
+        let err = RegExpFlags::parse("uv").unwrap_err();
+        assert!(matches!(err, StatorError::SyntaxError(_)));
+    }
+
+    #[test]
+    fn test_v_flag_in_to_string() {
+        let re = JsRegExp::new("abc", "gv").unwrap();
+        assert_eq!(re.to_string(), "/abc/gv");
+    }
+
+    // ── RegExp.prototype.flags ordering ──────────────────────────────────
+
+    #[test]
+    fn test_flags_canonical_order_all() {
+        let f = RegExpFlags::parse("ysmigd").unwrap();
+        assert_eq!(f.to_flags_string(), "dgimsy");
+    }
+
+    #[test]
+    fn test_flags_canonical_order_with_v() {
+        let f = RegExpFlags::parse("yvgd").unwrap();
+        assert_eq!(f.to_flags_string(), "dgvy");
+    }
+
+    #[test]
+    fn test_flags_empty() {
+        let f = RegExpFlags::parse("").unwrap();
+        assert_eq!(f.to_flags_string(), "");
+    }
+
+    // ── matchAll with named groups ───────────────────────────────────────
+
+    #[test]
+    fn test_match_all_named_groups() {
+        let re = JsRegExp::new(r"(?<num>\d+)", "g").unwrap();
+        let results = re.symbol_match_all("a1 b22 c333");
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results[0]
+                .named_groups
+                .get("num")
+                .and_then(|v| v.as_deref()),
+            Some("1")
+        );
+        assert_eq!(
+            results[2]
+                .named_groups
+                .get("num")
+                .and_then(|v| v.as_deref()),
+            Some("333")
+        );
+    }
+
+    #[test]
+    fn test_match_all_with_indices() {
+        let re = JsRegExp::new(r"\d+", "gd").unwrap();
+        let results = re.symbol_match_all("a1 b22");
+        assert_eq!(results.len(), 2);
+        let idx0 = results[0].indices.as_ref().unwrap();
+        assert_eq!(idx0.pairs[0], Some((1, 2)));
+        let idx1 = results[1].indices.as_ref().unwrap();
+        assert_eq!(idx1.pairs[0], Some((4, 6)));
+    }
+
+    // ── Edge cases ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_named_group_empty_match() {
+        let re = JsRegExp::new(r"(?<empty>)", "").unwrap();
+        let m = re.exec("abc").unwrap();
+        assert_eq!(
+            m.named_groups.get("empty").and_then(|v| v.as_deref()),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn test_exec_no_named_groups_empty_map() {
+        let re = JsRegExp::new(r"\d+", "").unwrap();
+        let m = re.exec("42").unwrap();
+        assert!(m.named_groups.is_empty());
+    }
+
+    #[test]
+    fn test_symbol_replace_dollar_n_and_named_combined() {
+        let re = JsRegExp::new(r"(\d+)-(?<w>\w+)", "").unwrap();
+        assert_eq!(re.symbol_replace("42-foo", "$1=$<w>"), "42=foo");
+    }
+
+    #[test]
+    fn test_source_text_empty_pattern() {
+        let re = JsRegExp::new("", "").unwrap();
+        assert_eq!(re.source_text(), "(?:)");
+    }
+
+    #[test]
+    fn test_source_text_escapes_slash() {
+        let re = JsRegExp::new("a/b", "").unwrap();
+        assert_eq!(re.source_text(), r"a\/b");
+    }
+
+    #[test]
+    fn test_global_empty_pattern_advances() {
+        let re = JsRegExp::new("", "g").unwrap();
+        let results = re.symbol_match_all("ab");
+        // Empty pattern matches at every position: "", "", ""
+        assert_eq!(results.len(), 3);
+    }
 }
