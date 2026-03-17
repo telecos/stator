@@ -1364,4 +1364,239 @@ mod tests {
             }
         }
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Integration tests — lookbehind, dotAll, Unicode property escapes,
+    //                      named backreferences, flag combinations
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── dotAll getter via wrap_regexp ─────────────────────────────────────
+
+    #[test]
+    fn test_dotall_getter_true() {
+        let re = regexp_construct(&[JsValue::String("a.b".into()), JsValue::String("s".into())])
+            .unwrap();
+        assert_eq!(get_bool(&re, "dotAll"), Some(true));
+    }
+
+    #[test]
+    fn test_dotall_getter_false() {
+        let re =
+            regexp_construct(&[JsValue::String("a.b".into()), JsValue::String("".into())]).unwrap();
+        assert_eq!(get_bool(&re, "dotAll"), Some(false));
+    }
+
+    // ── flags includes 's' when dotAll ───────────────────────────────────
+
+    #[test]
+    fn test_flags_includes_s_when_dotall() {
+        let re =
+            regexp_construct(&[JsValue::String("a".into()), JsValue::String("gs".into())]).unwrap();
+        let flags = get_str(&re, "flags").unwrap();
+        assert!(flags.contains('s'));
+        assert_eq!(flags, "gs");
+    }
+
+    // ── dotAll exec integration ──────────────────────────────────────────
+
+    #[test]
+    fn test_dotall_exec_matches_newline() {
+        let re = regexp_construct(&[JsValue::String("a.b".into()), JsValue::String("s".into())])
+            .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let test_fn = map.borrow().get("test").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = test_fn {
+                assert_eq!(
+                    f(vec![JsValue::String("a\nb".into())]).unwrap(),
+                    JsValue::Boolean(true)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_no_dotall_exec_rejects_newline() {
+        let re =
+            regexp_construct(&[JsValue::String("a.b".into()), JsValue::String("".into())]).unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let test_fn = map.borrow().get("test").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = test_fn {
+                assert_eq!(
+                    f(vec![JsValue::String("a\nb".into())]).unwrap(),
+                    JsValue::Boolean(false)
+                );
+            }
+        }
+    }
+
+    // ── Lookbehind via exec integration ──────────────────────────────────
+
+    #[test]
+    fn test_lookbehind_positive_exec() {
+        let re = regexp_construct(&[
+            JsValue::String(r"(?<=\$)\d+".into()),
+            JsValue::String("".into()),
+        ])
+        .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let exec_fn = map.borrow().get("exec").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = exec_fn {
+                let result = f(vec![JsValue::String("$100".into())]).unwrap();
+                assert_eq!(get_str(&result, "0").as_deref(), Some("100"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_lookbehind_negative_exec() {
+        let re = regexp_construct(&[
+            JsValue::String(r"(?<!\$)\d+".into()),
+            JsValue::String("".into()),
+        ])
+        .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let exec_fn = map.borrow().get("exec").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = exec_fn {
+                let result = f(vec![JsValue::String("42 items".into())]).unwrap();
+                assert_eq!(get_str(&result, "0").as_deref(), Some("42"));
+            }
+        }
+    }
+
+    // ── Unicode property escapes via integration ─────────────────────────
+
+    #[test]
+    fn test_unicode_property_letter_exec() {
+        let re = regexp_construct(&[
+            JsValue::String(r"\p{Letter}+".into()),
+            JsValue::String("u".into()),
+        ])
+        .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let exec_fn = map.borrow().get("exec").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = exec_fn {
+                let result = f(vec![JsValue::String("42 hello".into())]).unwrap();
+                assert_eq!(get_str(&result, "0").as_deref(), Some("hello"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_unicode_property_negated_exec() {
+        let re = regexp_construct(&[
+            JsValue::String(r"\P{Number}+".into()),
+            JsValue::String("u".into()),
+        ])
+        .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let exec_fn = map.borrow().get("exec").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = exec_fn {
+                let result = f(vec![JsValue::String("42abc99".into())]).unwrap();
+                assert_eq!(get_str(&result, "0").as_deref(), Some("abc"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_unicode_property_script_greek_exec() {
+        let re = regexp_construct(&[
+            JsValue::String(r"\p{Script=Greek}+".into()),
+            JsValue::String("u".into()),
+        ])
+        .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let test_fn = map.borrow().get("test").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = test_fn {
+                assert_eq!(
+                    f(vec![JsValue::String("αβγ".into())]).unwrap(),
+                    JsValue::Boolean(true)
+                );
+                assert_eq!(
+                    f(vec![JsValue::String("abc".into())]).unwrap(),
+                    JsValue::Boolean(false)
+                );
+            }
+        }
+    }
+
+    // ── Named backreference \k<name> integration ─────────────────────────
+
+    #[test]
+    fn test_named_backreference_exec_match() {
+        let re = regexp_construct(&[
+            JsValue::String(r"(?<w>\w+)=\k<w>".into()),
+            JsValue::String("".into()),
+        ])
+        .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let exec_fn = map.borrow().get("exec").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = exec_fn {
+                let result = f(vec![JsValue::String("abc=abc".into())]).unwrap();
+                assert_eq!(get_str(&result, "0").as_deref(), Some("abc=abc"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_named_backreference_exec_no_match() {
+        let re = regexp_construct(&[
+            JsValue::String(r"(?<w>\w+)=\k<w>".into()),
+            JsValue::String("".into()),
+        ])
+        .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let exec_fn = map.borrow().get("exec").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = exec_fn {
+                let result = f(vec![JsValue::String("abc=xyz".into())]).unwrap();
+                assert_eq!(result, JsValue::Null);
+            }
+        }
+    }
+
+    // ── Flag combinations integration ────────────────────────────────────
+
+    #[test]
+    fn test_flags_gimus_integration() {
+        let re = regexp_construct(&[JsValue::String(".".into()), JsValue::String("gimus".into())])
+            .unwrap();
+        assert_eq!(get_str(&re, "flags").as_deref(), Some("gimsu"));
+        assert_eq!(get_bool(&re, "global"), Some(true));
+        assert_eq!(get_bool(&re, "ignoreCase"), Some(true));
+        assert_eq!(get_bool(&re, "multiline"), Some(true));
+        assert_eq!(get_bool(&re, "dotAll"), Some(true));
+        assert_eq!(get_bool(&re, "unicode"), Some(true));
+    }
+
+    #[test]
+    fn test_flags_gimsuy_integration() {
+        let re = regexp_construct(&[
+            JsValue::String(".".into()),
+            JsValue::String("gimsuy".into()),
+        ])
+        .unwrap();
+        assert_eq!(get_str(&re, "flags").as_deref(), Some("gimsuy"));
+        assert_eq!(get_bool(&re, "sticky"), Some(true));
+    }
+
+    // ── Lookbehind with replace ──────────────────────────────────────────
+
+    #[test]
+    fn test_lookbehind_global_replace_integration() {
+        let re = regexp_construct(&[
+            JsValue::String(r"(?<=\$)\d+".into()),
+            JsValue::String("g".into()),
+        ])
+        .unwrap();
+        if let JsValue::PlainObject(map) = &re {
+            let replace_fn = map.borrow().get("__symbol_replace__").cloned().unwrap();
+            if let JsValue::NativeFunction(f) = replace_fn {
+                let result = f(vec![
+                    JsValue::String("$100 and $200".into()),
+                    JsValue::String("XXX".into()),
+                ])
+                .unwrap();
+                assert_eq!(result, JsValue::String("$XXX and $XXX".into()));
+            }
+        }
+    }
 }
