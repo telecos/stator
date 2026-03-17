@@ -21,6 +21,12 @@ use std::rc::Rc;
 use crate::error::{StatorError, StatorResult};
 use crate::objects::value::JsValue;
 
+/// Comparator function signature for `TypedArray.prototype.sort`.
+type SortCompareFn<'a> = Option<&'a dyn Fn(&JsValue, &JsValue) -> StatorResult<f64>>;
+
+/// Mapping function signature for `TypedArray.from(source, mapFn)`.
+type FromMapFn<'a> = Option<&'a dyn Fn(&JsValue, usize) -> StatorResult<JsValue>>;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TypedArrayKind
 // ─────────────────────────────────────────────────────────────────────────────
@@ -992,25 +998,114 @@ pub fn typed_array_set_from(
     Ok(())
 }
 
+/// `%TypedArray%.prototype.set(typedArray, offset?)` — TypedArray overload.
+///
+/// Copies all elements from `source` TypedArray into `ta` starting at `offset`.
+pub fn typed_array_set_from_typed_array(
+    ta: &JsTypedArray,
+    source: &JsTypedArray,
+    offset: usize,
+) -> StatorResult<()> {
+    let src_len = source.effective_length();
+    if offset + src_len > ta.effective_length() {
+        return Err(StatorError::RangeError("Source is too large".into()));
+    }
+    // Use fast byte-copy when source and target have the same kind and do not
+    // share the same buffer (or share but regions do not overlap).
+    let same_buffer = Rc::ptr_eq(&ta.buffer, &source.buffer);
+    if ta.kind == source.kind && !same_buffer {
+        let bpe = ta.kind.bytes_per_element();
+        let byte_count = src_len * bpe;
+        let src_buf = source.buffer.borrow();
+        let src_start = source.byte_offset;
+        let bytes = src_buf.data[src_start..src_start + byte_count].to_vec();
+        drop(src_buf);
+        let mut dst_buf = ta.buffer.borrow_mut();
+        let dst_start = ta.byte_offset + offset * bpe;
+        dst_buf.data[dst_start..dst_start + byte_count].copy_from_slice(&bytes);
+    } else {
+        // Slow path: read elements as JsValue, then write.
+        let elems: Vec<JsValue> = (0..src_len).map(|i| typed_array_get(source, i)).collect();
+        for (i, v) in elems.iter().enumerate() {
+            typed_array_set(ta, offset + i, v)?;
+        }
+    }
+    Ok(())
+}
+
 /// `%TypedArray%.prototype.sort(comparefn?)`.
 ///
-/// Sorts elements in-place using a default numeric sort (no custom comparator
-/// support in the pure-data API).
-pub fn typed_array_sort(ta: &JsTypedArray) {
+/// Sorts elements in-place.  When `compare` is `None` the default numeric
+/// comparison defined by the spec is used (ascending, with `NaN` sorted to
+/// the end and `-0` before `+0`).  When a comparator is provided its
+/// return value determines ordering.
+pub fn typed_array_sort(ta: &JsTypedArray, compare: SortCompareFn<'_>) -> StatorResult<()> {
     let len = ta.effective_length();
     if len < 2 {
-        return;
+        return Ok(());
     }
-    // Collect, sort, write back.
     let mut elems: Vec<JsValue> = (0..len).map(|i| typed_array_get(ta, i)).collect();
+
+    // We need to propagate errors from the comparator, so we use a
+    // Cell to capture the first error.
+    let mut err: Option<StatorError> = None;
     elems.sort_by(|a, b| {
-        let na = a.to_number().unwrap_or(f64::NAN);
-        let nb = b.to_number().unwrap_or(f64::NAN);
-        na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal)
+        if err.is_some() {
+            return std::cmp::Ordering::Equal;
+        }
+        match compare {
+            Some(cmp_fn) => match cmp_fn(a, b) {
+                Ok(v) => {
+                    if v < 0.0 {
+                        std::cmp::Ordering::Less
+                    } else if v > 0.0 {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                }
+                Err(e) => {
+                    err = Some(e);
+                    std::cmp::Ordering::Equal
+                }
+            },
+            None => {
+                let na = a.to_number().unwrap_or(f64::NAN);
+                let nb = b.to_number().unwrap_or(f64::NAN);
+                typed_array_default_compare(na, nb)
+            }
+        }
     });
-    for (i, v) in elems.iter().enumerate() {
-        let _ = typed_array_set(ta, i, v);
+    if let Some(e) = err {
+        return Err(e);
     }
+    for (i, v) in elems.iter().enumerate() {
+        typed_array_set(ta, i, v)?;
+    }
+    Ok(())
+}
+
+/// Default TypedArray sort comparison per ECMAScript §23.2.3.28.
+///
+/// * `NaN` sorts after all other values.
+/// * `-0` sorts before `+0`.
+fn typed_array_default_compare(x: f64, y: f64) -> std::cmp::Ordering {
+    if x.is_nan() && y.is_nan() {
+        return std::cmp::Ordering::Equal;
+    }
+    if x.is_nan() {
+        return std::cmp::Ordering::Greater;
+    }
+    if y.is_nan() {
+        return std::cmp::Ordering::Less;
+    }
+    if x == 0.0 && y == 0.0 {
+        // -0 < +0
+        let x_neg = x.is_sign_negative();
+        let y_neg = y.is_sign_negative();
+        return y_neg.cmp(&x_neg);
+    }
+    x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
 }
 
 /// `%TypedArray%.prototype.every(callbackfn)` — returns `true` if `pred`
@@ -1216,12 +1311,26 @@ pub fn typed_array_entries(ta: &JsTypedArray) -> Vec<JsValue> {
         .collect()
 }
 
-/// `TypedArray.from(source)`.
+/// `TypedArray.from(source, mapFn?)`.
+///
+/// Creates a new TypedArray from `source`, optionally applying `map_fn`
+/// to each element during construction.
 pub fn typed_array_static_from(
     kind: TypedArrayKind,
     source: &[JsValue],
+    map_fn: FromMapFn<'_>,
 ) -> StatorResult<JsTypedArray> {
-    typed_array_from_values(kind, source)
+    match map_fn {
+        None => typed_array_from_values(kind, source),
+        Some(f) => {
+            let mapped: Vec<JsValue> = source
+                .iter()
+                .enumerate()
+                .map(|(i, v)| f(v, i))
+                .collect::<StatorResult<Vec<_>>>()?;
+            typed_array_from_values(kind, &mapped)
+        }
+    }
 }
 
 /// `TypedArray.of(...items)`.
@@ -1507,7 +1616,7 @@ mod tests {
             &[JsValue::Smi(30), JsValue::Smi(10), JsValue::Smi(20)],
         )
         .unwrap();
-        typed_array_sort(&ta);
+        typed_array_sort(&ta, None).unwrap();
         assert_eq!(typed_array_get(&ta, 0), JsValue::Smi(10));
         assert_eq!(typed_array_get(&ta, 1), JsValue::Smi(20));
         assert_eq!(typed_array_get(&ta, 2), JsValue::Smi(30));
@@ -2012,6 +2121,7 @@ mod tests {
         let ta = typed_array_static_from(
             TypedArrayKind::Uint8,
             &[JsValue::Smi(10), JsValue::Smi(20), JsValue::Smi(30)],
+            None,
         )
         .unwrap();
         assert_eq!(typed_array_length(&ta), 3);
@@ -2056,7 +2166,7 @@ mod tests {
             ],
         )
         .unwrap();
-        typed_array_sort(&ta);
+        typed_array_sort(&ta, None).unwrap();
         assert_eq!(typed_array_get(&ta, 0), JsValue::HeapNumber(-1.0));
         assert_eq!(typed_array_get(&ta, 1), JsValue::HeapNumber(2.0));
         assert_eq!(typed_array_get(&ta, 2), JsValue::HeapNumber(3.0));
@@ -2180,5 +2290,364 @@ mod tests {
         } else {
             panic!("Expected HeapNumber for Uint32");
         }
+    }
+
+    // ── sort with custom comparator ─────────────────────────────────────
+
+    #[test]
+    fn test_typed_array_sort_with_comparator_descending() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[JsValue::Smi(10), JsValue::Smi(30), JsValue::Smi(20)],
+        )
+        .unwrap();
+        typed_array_sort(
+            &ta,
+            Some(&|a, b| {
+                let na = a.to_number()?;
+                let nb = b.to_number()?;
+                Ok(nb - na)
+            }),
+        )
+        .unwrap();
+        assert_eq!(typed_array_get(&ta, 0), JsValue::Smi(30));
+        assert_eq!(typed_array_get(&ta, 1), JsValue::Smi(20));
+        assert_eq!(typed_array_get(&ta, 2), JsValue::Smi(10));
+    }
+
+    #[test]
+    fn test_typed_array_sort_default_is_numeric_not_lexicographic() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[JsValue::Smi(100), JsValue::Smi(3), JsValue::Smi(20)],
+        )
+        .unwrap();
+        typed_array_sort(&ta, None).unwrap();
+        assert_eq!(typed_array_get(&ta, 0), JsValue::Smi(3));
+        assert_eq!(typed_array_get(&ta, 1), JsValue::Smi(20));
+        assert_eq!(typed_array_get(&ta, 2), JsValue::Smi(100));
+    }
+
+    #[test]
+    fn test_typed_array_sort_single_element() {
+        let ta = typed_array_from_values(TypedArrayKind::Int32, &[JsValue::Smi(42)]).unwrap();
+        typed_array_sort(&ta, None).unwrap();
+        assert_eq!(typed_array_get(&ta, 0), JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_typed_array_sort_empty() {
+        let ta = typed_array_new_from_length(TypedArrayKind::Int32, 0);
+        typed_array_sort(&ta, None).unwrap();
+        assert_eq!(typed_array_length(&ta), 0);
+    }
+
+    // ── from with mapFn ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_typed_array_static_from_with_map() {
+        let ta = typed_array_static_from(
+            TypedArrayKind::Int32,
+            &[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)],
+            Some(&|v, _| {
+                let n = v.to_number()? as i32;
+                Ok(JsValue::Smi(n * 10))
+            }),
+        )
+        .unwrap();
+        assert_eq!(typed_array_get(&ta, 0), JsValue::Smi(10));
+        assert_eq!(typed_array_get(&ta, 1), JsValue::Smi(20));
+        assert_eq!(typed_array_get(&ta, 2), JsValue::Smi(30));
+    }
+
+    #[test]
+    fn test_typed_array_static_from_with_map_receives_index() {
+        let ta = typed_array_static_from(
+            TypedArrayKind::Int32,
+            &[JsValue::Smi(0), JsValue::Smi(0), JsValue::Smi(0)],
+            Some(&|_, idx| Ok(JsValue::Smi(idx as i32))),
+        )
+        .unwrap();
+        assert_eq!(typed_array_get(&ta, 0), JsValue::Smi(0));
+        assert_eq!(typed_array_get(&ta, 1), JsValue::Smi(1));
+        assert_eq!(typed_array_get(&ta, 2), JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_typed_array_static_from_empty() {
+        let ta = typed_array_static_from(TypedArrayKind::Uint8, &[], None).unwrap();
+        assert_eq!(typed_array_length(&ta), 0);
+    }
+
+    // ── set_from_typed_array ────────────────────────────────────────────
+
+    #[test]
+    fn test_typed_array_set_from_typed_array_same_kind() {
+        let dst = typed_array_new_from_length(TypedArrayKind::Int32, 5);
+        let src =
+            typed_array_from_values(TypedArrayKind::Int32, &[JsValue::Smi(10), JsValue::Smi(20)])
+                .unwrap();
+        typed_array_set_from_typed_array(&dst, &src, 2).unwrap();
+        assert_eq!(typed_array_get(&dst, 2), JsValue::Smi(10));
+        assert_eq!(typed_array_get(&dst, 3), JsValue::Smi(20));
+    }
+
+    #[test]
+    fn test_typed_array_set_from_typed_array_different_kind() {
+        let dst = typed_array_new_from_length(TypedArrayKind::Float64, 3);
+        let src =
+            typed_array_from_values(TypedArrayKind::Int32, &[JsValue::Smi(5), JsValue::Smi(6)])
+                .unwrap();
+        typed_array_set_from_typed_array(&dst, &src, 1).unwrap();
+        assert_eq!(typed_array_get(&dst, 1), JsValue::HeapNumber(5.0));
+        assert_eq!(typed_array_get(&dst, 2), JsValue::HeapNumber(6.0));
+    }
+
+    #[test]
+    fn test_typed_array_set_from_typed_array_overflow_error() {
+        let dst = typed_array_new_from_length(TypedArrayKind::Int32, 2);
+        let src = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)],
+        )
+        .unwrap();
+        assert!(typed_array_set_from_typed_array(&dst, &src, 0).is_err());
+    }
+
+    // ── copyWithin negative ─────────────────────────────────────────────
+
+    #[test]
+    fn test_typed_array_copy_within_negative_target() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[
+                JsValue::Smi(1),
+                JsValue::Smi(2),
+                JsValue::Smi(3),
+                JsValue::Smi(4),
+                JsValue::Smi(5),
+            ],
+        )
+        .unwrap();
+        typed_array_copy_within(&ta, -2, 0, 2);
+        assert_eq!(typed_array_get(&ta, 3), JsValue::Smi(1));
+        assert_eq!(typed_array_get(&ta, 4), JsValue::Smi(2));
+    }
+
+    // ── fill negative end ───────────────────────────────────────────────
+
+    #[test]
+    fn test_typed_array_fill_negative_end() {
+        let ta = typed_array_new_from_length(TypedArrayKind::Uint8, 5);
+        typed_array_fill(&ta, &JsValue::Smi(3), 1, -1).unwrap();
+        assert_eq!(typed_array_get(&ta, 0), JsValue::Smi(0));
+        assert_eq!(typed_array_get(&ta, 1), JsValue::Smi(3));
+        assert_eq!(typed_array_get(&ta, 3), JsValue::Smi(3));
+        assert_eq!(typed_array_get(&ta, 4), JsValue::Smi(0));
+    }
+
+    // ── reduce/reduceRight edge cases ───────────────────────────────────
+
+    #[test]
+    fn test_typed_array_reduce_right_no_initial() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)],
+        )
+        .unwrap();
+        let sum = typed_array_reduce_right(
+            &ta,
+            |acc, v, _| {
+                let a = acc.to_number()?;
+                let b = v.to_number()?;
+                Ok(JsValue::Smi((a + b) as i32))
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(sum, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn test_typed_array_reduce_right_empty_no_initial_errors() {
+        let ta = typed_array_new_from_length(TypedArrayKind::Int32, 0);
+        let result = typed_array_reduce_right(&ta, |acc, _, _| Ok(acc.clone()), None);
+        assert!(result.is_err());
+    }
+
+    // ── find_last_index ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_typed_array_find_last_index_found() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(2)],
+        )
+        .unwrap();
+        let idx = typed_array_find_last_index(&ta, |v, _| Ok(v.to_number()? == 2.0)).unwrap();
+        assert_eq!(idx, 2);
+    }
+
+    #[test]
+    fn test_typed_array_find_last_index_not_found() {
+        let ta =
+            typed_array_from_values(TypedArrayKind::Int32, &[JsValue::Smi(1), JsValue::Smi(2)])
+                .unwrap();
+        let idx = typed_array_find_last_index(&ta, |v, _| Ok(v.to_number()? == 99.0)).unwrap();
+        assert_eq!(idx, -1);
+    }
+
+    // ── indexOf with negative from ──────────────────────────────────────
+
+    #[test]
+    fn test_typed_array_index_of_negative_beyond_start() {
+        let ta =
+            typed_array_from_values(TypedArrayKind::Int32, &[JsValue::Smi(10), JsValue::Smi(20)])
+                .unwrap();
+        assert_eq!(typed_array_index_of(&ta, &JsValue::Smi(10), -100), 0);
+    }
+
+    // ── lastIndexOf edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn test_typed_array_last_index_of_negative_from() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(1)],
+        )
+        .unwrap();
+        assert_eq!(typed_array_last_index_of(&ta, &JsValue::Smi(1), -2), 0);
+    }
+
+    // ── subarray auto_length ────────────────────────────────────────────
+
+    #[test]
+    fn test_typed_array_subarray_to_end() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Uint8,
+            &[
+                JsValue::Smi(1),
+                JsValue::Smi(2),
+                JsValue::Smi(3),
+                JsValue::Smi(4),
+            ],
+        )
+        .unwrap();
+        let sub = typed_array_subarray(&ta, 2, 4);
+        assert_eq!(typed_array_length(&sub), 2);
+        assert_eq!(typed_array_get(&sub, 0), JsValue::Smi(3));
+        assert_eq!(typed_array_get(&sub, 1), JsValue::Smi(4));
+    }
+
+    // ── slice empty result ──────────────────────────────────────────────
+
+    #[test]
+    fn test_typed_array_slice_empty_when_start_ge_end() {
+        let ta =
+            typed_array_from_values(TypedArrayKind::Int32, &[JsValue::Smi(1), JsValue::Smi(2)])
+                .unwrap();
+        let s = typed_array_slice(&ta, 2, 1).unwrap();
+        assert_eq!(typed_array_length(&s), 0);
+    }
+
+    // ── default compare NaN ordering ────────────────────────────────────
+
+    #[test]
+    fn test_typed_array_default_compare_nan_at_end() {
+        assert_eq!(
+            typed_array_default_compare(1.0, f64::NAN),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            typed_array_default_compare(f64::NAN, 1.0),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            typed_array_default_compare(f64::NAN, f64::NAN),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_typed_array_default_compare_negative_zero() {
+        assert_eq!(
+            typed_array_default_compare(-0.0_f64, 0.0_f64),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            typed_array_default_compare(0.0_f64, -0.0_f64),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    // ── map / filter return correct kind ────────────────────────────────
+
+    #[test]
+    fn test_typed_array_map_returns_same_kind() {
+        let ta =
+            typed_array_from_values(TypedArrayKind::Uint8, &[JsValue::Smi(1), JsValue::Smi(2)])
+                .unwrap();
+        let mapped = typed_array_map(&ta, |v, _| {
+            let n = v.to_number()? as i32;
+            Ok(JsValue::Smi(n + 1))
+        })
+        .unwrap();
+        assert_eq!(mapped.kind, TypedArrayKind::Uint8);
+        assert_eq!(typed_array_get(&mapped, 0), JsValue::Smi(2));
+        assert_eq!(typed_array_get(&mapped, 1), JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_typed_array_filter_returns_same_kind() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Float64,
+            &[
+                JsValue::HeapNumber(1.0),
+                JsValue::HeapNumber(2.0),
+                JsValue::HeapNumber(3.0),
+            ],
+        )
+        .unwrap();
+        let filtered = typed_array_filter(&ta, |v, _| Ok(v.to_number()? > 1.5)).unwrap();
+        assert_eq!(filtered.kind, TypedArrayKind::Float64);
+        assert_eq!(typed_array_length(&filtered), 2);
+    }
+
+    // ── for_each receives correct index ─────────────────────────────────
+
+    #[test]
+    fn test_typed_array_for_each_receives_index() {
+        let ta = typed_array_from_values(
+            TypedArrayKind::Int32,
+            &[JsValue::Smi(10), JsValue::Smi(20), JsValue::Smi(30)],
+        )
+        .unwrap();
+        let mut indices = Vec::new();
+        typed_array_for_each(&ta, |_, idx| {
+            indices.push(idx);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    // ── values / keys / entries ─────────────────────────────────────────
+
+    #[test]
+    fn test_typed_array_values_empty() {
+        let ta = typed_array_new_from_length(TypedArrayKind::Int32, 0);
+        assert!(typed_array_values(&ta).is_empty());
+    }
+
+    #[test]
+    fn test_typed_array_keys_empty() {
+        let ta = typed_array_new_from_length(TypedArrayKind::Int32, 0);
+        assert!(typed_array_keys(&ta).is_empty());
+    }
+
+    #[test]
+    fn test_typed_array_entries_empty() {
+        let ta = typed_array_new_from_length(TypedArrayKind::Int32, 0);
+        assert!(typed_array_entries(&ta).is_empty());
     }
 }

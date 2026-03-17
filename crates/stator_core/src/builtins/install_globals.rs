@@ -14159,7 +14159,7 @@ fn make_typed_array_instance(
             obj.insert(
                 "sort".into(),
                 native(move |_| {
-                    typed_array_sort(&inner.borrow());
+                    typed_array_sort(&inner.borrow(), None)?;
                     Ok(instance.clone())
                 }),
             );
@@ -36474,6 +36474,347 @@ mod tests {
     fn e2e_typed_array_sort_returns_receiver() {
         assert_eval_true(
             "var a = new Uint8Array([3,1,2]); a.sort() === a && a.join(',') === '1,2,3'",
+        );
+    }
+
+    // ── New TypedArray method e2e tests ──────────────────────────────────
+
+    #[test]
+    fn e2e_typed_array_sort_numeric_default() {
+        assert_eval_true(
+            "var a = new Int32Array([30, 10, 20]); a.sort(); a[0] === 10 && a[1] === 20 && a[2] === 30",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_sort_float64_negative() {
+        assert_eval_true(
+            "var a = new Float64Array([3.5, -1.5, 0, 2.5]); a.sort(); a[0] === -1.5 && a[1] === 0 && a[2] === 2.5 && a[3] === 3.5",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_fill_whole() {
+        assert_eval_true(
+            "var a = new Uint8Array(4); a.fill(7); a[0] === 7 && a[1] === 7 && a[2] === 7 && a[3] === 7",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_fill_negative_start() {
+        assert_eval_true(
+            "var a = new Uint8Array(4); a.fill(9, -2); a[0] === 0 && a[1] === 0 && a[2] === 9 && a[3] === 9",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_fill_with_range() {
+        assert_eval_true(
+            "var a = new Int32Array(5); a.fill(42, 1, 3); a[0] === 0 && a[1] === 42 && a[2] === 42 && a[3] === 0",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_copy_within_basic() {
+        assert_eval_true(
+            "var a = new Int32Array([1,2,3,4,5]); a.copyWithin(0, 3); a[0] === 4 && a[1] === 5 && a[2] === 3",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_copy_within_negative() {
+        assert_eval_true(
+            "var a = new Int32Array([1,2,3,4,5]); a.copyWithin(-2, 0, 2); a[3] === 1 && a[4] === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_subarray_basic() {
+        assert_eval_true(
+            "var a = new Int32Array([10,20,30]); var s = a.subarray(1, 3); s.length === 2 && s[0] === 20 && s[1] === 30",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_subarray_negative() {
+        assert_eval_true(
+            "var a = new Uint8Array([1,2,3,4]); var s = a.subarray(-2); s.length === 2 && s[0] === 3 && s[1] === 4",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_subarray_shared_buffer() {
+        assert_eval_true(
+            "var a = new Int32Array([1,2,3]); var s = a.subarray(1, 3); s[0] = 99; a[1] === 99",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_slice_copies() {
+        assert_eval_true(
+            "var a = new Int32Array([10,20,30]); var s = a.slice(1); s.length === 2 && s[0] === 20 && s[1] === 30",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_slice_negative() {
+        assert_eval_true(
+            "var a = new Int32Array([1,2,3,4]); var s = a.slice(-2); s.length === 2 && s[0] === 3 && s[1] === 4",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_slice_does_not_share() {
+        assert_eval_true(
+            "var a = new Int32Array([1,2,3]); var s = a.slice(0); s[0] = 99; a[0] === 1",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_find_returns_element() {
+        assert_eval_true("new Int32Array([1,2,3,4]).find(function(x) { return x > 2; }) === 3");
+    }
+
+    #[test]
+    fn e2e_typed_array_find_returns_undefined_if_not_found() {
+        assert_eval_true(
+            "new Int32Array([1,2,3]).find(function(x) { return x > 10; }) === undefined",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_find_index_returns_index() {
+        assert_eval_true(
+            "new Int32Array([10,20,30]).findIndex(function(x) { return x === 20; }) === 1",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_find_index_returns_neg_one() {
+        assert_eval_true(
+            "new Int32Array([1,2,3]).findIndex(function(x) { return x > 10; }) === -1",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_every_true() {
+        assert_eval_true(
+            "new Int32Array([2,4,6]).every(function(x) { return x % 2 === 0; }) === true",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_every_false() {
+        assert_eval_true(
+            "new Int32Array([2,3,4]).every(function(x) { return x % 2 === 0; }) === false",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_some_true() {
+        assert_eval_true(
+            "new Int32Array([1,3,4]).some(function(x) { return x % 2 === 0; }) === true",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_some_false() {
+        assert_eval_true(
+            "new Int32Array([1,3,5]).some(function(x) { return x % 2 === 0; }) === false",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_reduce_sum() {
+        assert_eval_true(
+            "new Int32Array([1,2,3]).reduce(function(a, b) { return a + b; }, 0) === 6",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_reduce_no_initial() {
+        assert_eval_true("new Int32Array([1,2,3]).reduce(function(a, b) { return a + b; }) === 6");
+    }
+
+    #[test]
+    fn e2e_typed_array_reduce_right_concat() {
+        assert_eval_true(
+            "new Uint8Array([1,2,3]).reduceRight(function(acc, v) { return acc * 10 + v; }, 0) === 321",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_map_double() {
+        assert_eval_true(
+            "var m = new Int32Array([1,2,3]).map(function(x) { return x * 2; }); m[0] === 2 && m[1] === 4 && m[2] === 6",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_map_preserves_kind() {
+        assert_eval_true(
+            "new Uint8Array([1,2,3]).map(function(x) { return x * 2; }).constructor === Uint8Array",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_filter_basic() {
+        assert_eval_true(
+            "var f = new Int32Array([1,2,3,4]).filter(function(x) { return x > 2; }); f.length === 2 && f[0] === 3 && f[1] === 4",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_filter_preserves_kind() {
+        assert_eval_true(
+            "new Uint8Array([1,2,3]).filter(function(x) { return x > 1; }).constructor === Uint8Array",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_for_each_side_effect() {
+        assert_eval_true(
+            "var sum = 0; new Int32Array([10,20,30]).forEach(function(x) { sum += x; }); sum === 60",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_index_of_found() {
+        assert_eval_true("new Int32Array([10,20,30]).indexOf(20) === 1");
+    }
+
+    #[test]
+    fn e2e_typed_array_index_of_not_found() {
+        assert_eval_true("new Int32Array([10,20,30]).indexOf(99) === -1");
+    }
+
+    #[test]
+    fn e2e_typed_array_index_of_from_index() {
+        assert_eval_true("new Int32Array([1,2,1,2]).indexOf(1, 1) === 2");
+    }
+
+    #[test]
+    fn e2e_typed_array_includes_found() {
+        assert_eval_true("new Int32Array([1,2,3]).includes(2) === true");
+    }
+
+    #[test]
+    fn e2e_typed_array_includes_not_found() {
+        assert_eval_true("new Int32Array([1,2,3]).includes(5) === false");
+    }
+
+    #[test]
+    fn e2e_typed_array_last_index_of_basic() {
+        assert_eval_true("new Int32Array([1,2,1,2]).lastIndexOf(1) === 2");
+    }
+
+    #[test]
+    fn e2e_typed_array_reverse_basic() {
+        assert_eval_true(
+            "var a = new Int32Array([1,2,3]); a.reverse(); a[0] === 3 && a[1] === 2 && a[2] === 1",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_reverse_returns_receiver() {
+        assert_eval_true("var a = new Int32Array([1,2,3]); a.reverse() === a");
+    }
+
+    #[test]
+    fn e2e_typed_array_set_array_offset() {
+        assert_eval_true(
+            "var a = new Int32Array(5); a.set([10, 20], 2); a[2] === 10 && a[3] === 20 && a[0] === 0",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_set_typed_array() {
+        assert_eval_true(
+            "var a = new Int32Array(4); var b = new Int32Array([7, 8]); a.set(b, 1); a[1] === 7 && a[2] === 8",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_at_positive() {
+        assert_eval_true("new Int32Array([10,20,30]).at(1) === 20");
+    }
+
+    #[test]
+    fn e2e_typed_array_at_negative() {
+        assert_eval_true("new Int32Array([10,20,30]).at(-1) === 30");
+    }
+
+    #[test]
+    fn e2e_typed_array_at_out_of_bounds() {
+        assert_eval_true("new Int32Array([10]).at(5) === undefined");
+    }
+
+    #[test]
+    fn e2e_typed_array_keys_iterator() {
+        assert_eval_true(
+            "var k = new Uint8Array([10,20,30]).keys(); var a = k.next(); a.value === 0 && !a.done",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_values_iterator() {
+        assert_eval_true(
+            "var v = new Uint8Array([10,20,30]).values(); var a = v.next(); a.value === 10 && !a.done",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_entries_iterator() {
+        assert_eval_true(
+            "var e = new Uint8Array([10,20]).entries(); var a = e.next(); a.value[0] === 0 && a.value[1] === 10",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_static_of_multiple() {
+        assert_eval_true(
+            "var a = Int32Array.of(1, 2, 3); a.length === 3 && a[0] === 1 && a[2] === 3",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_from_with_map_fn() {
+        assert_eval_true(
+            "var a = Uint8Array.from([1,2,3], function(x) { return x * 2; }); a[0] === 2 && a[1] === 4 && a[2] === 6",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_from_preserves_kind() {
+        assert_eval_true("Uint8Array.from([1,2,3]).constructor === Uint8Array");
+    }
+
+    #[test]
+    fn e2e_typed_array_join_default() {
+        assert_eval_true("new Uint8Array([1,2,3]).join() === '1,2,3'");
+    }
+
+    #[test]
+    fn e2e_typed_array_join_custom_sep() {
+        assert_eval_true("new Uint8Array([1,2,3]).join('-') === '1-2-3'");
+    }
+
+    #[test]
+    fn e2e_typed_array_bytes_per_element_property() {
+        assert_eval_true(
+            "Int32Array.BYTES_PER_ELEMENT === 4 && Uint8Array.BYTES_PER_ELEMENT === 1 && Float64Array.BYTES_PER_ELEMENT === 8",
+        );
+    }
+
+    #[test]
+    fn e2e_typed_array_copy_within_returns_receiver() {
+        assert_eval_true("var a = new Int32Array([1,2,3]); a.copyWithin(0, 1) === a");
+    }
+
+    #[test]
+    fn e2e_typed_array_fill_returns_receiver_check() {
+        assert_eval_true(
+            "var a = new Int32Array(3); var b = a.fill(5); b === a && a[0] === 5 && a[2] === 5",
         );
     }
 
