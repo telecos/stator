@@ -137,9 +137,9 @@ use crate::builtins::typed_array::{
 use crate::builtins::weak_ref::{weak_ref_deref, weak_ref_new, weak_ref_new_plain};
 use crate::error::{StatorError, StatorResult};
 use crate::interpreter::{
-    current_global_env, dispatch_call_value, dispatch_call_with_this, dispatch_get_property_value,
-    dispatch_set_property_value, function_display_name, function_length_value,
-    function_to_string_value, get_object_prototype, has_prototype_in_chain,
+    current_global_env, dispatch_call_value, dispatch_call_with_this, dispatch_construct_call,
+    dispatch_get_property_value, dispatch_set_property_value, function_display_name,
+    function_length_value, function_to_string_value, get_object_prototype, has_prototype_in_chain,
     ordinary_set_prototype_of, plain_object_has_own_property,
 };
 use crate::objects::js_object::JsObject;
@@ -12563,7 +12563,8 @@ fn make_reflect() -> JsValue {
                 {
                     map.borrow_mut().insert("__proto__".to_string(), ctor_proto);
                 }
-                let result = dispatch_call_with_this(&target, this_obj.clone(), arg_list)?;
+                let result =
+                    dispatch_construct_call(&target, this_obj.clone(), arg_list, new_target)?;
                 match result {
                     JsValue::PlainObject(_)
                     | JsValue::Array(_)

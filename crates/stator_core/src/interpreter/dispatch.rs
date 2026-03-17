@@ -1190,6 +1190,16 @@ fn handle_create_closure(
 
     // Non-arrow functions (flag == 0) get a .prototype property per ES §10.2.5.
     let is_arrow = matches!(instr.operands.get(2), Some(Operand::Flag(1)));
+    // Arrow functions lexically capture `new.target` from the enclosing scope
+    // (ES §15.3.4) so it survives even when the arrow is called later from a
+    // different context.
+    if is_arrow {
+        fn_props_set(
+            &func_rc,
+            ".new_target".to_string(),
+            ctx.frame.new_target.clone(),
+        );
+    }
     if !is_arrow {
         let func_val = JsValue::Function(Rc::clone(&func_rc));
         let mut proto = PropertyMap::new();
@@ -1260,7 +1270,7 @@ fn handle_call_any_receiver(
                     );
                     restore_closure_context(&mut callee_frame, &ba);
                     if ba.is_arrow() {
-                        callee_frame.new_target = ctx.frame.new_target.clone();
+                        callee_frame.new_target = fn_props_get(&ba, ".new_target");
                     }
                     populate_self_name(&mut callee_frame, &ba, &callee_val);
                     push_call_frame("<anonymous>")?;
@@ -1476,7 +1486,7 @@ fn handle_call_undefined_receiver0(
                     );
                     restore_closure_context(&mut callee_frame, &ba);
                     if ba.is_arrow() {
-                        callee_frame.new_target = ctx.frame.new_target.clone();
+                        callee_frame.new_target = fn_props_get(&ba, ".new_target");
                     }
                     populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                     push_call_frame("<anonymous>")?;
@@ -1580,7 +1590,7 @@ fn handle_call_undefined_receiver1(
                     );
                     restore_closure_context(&mut callee_frame, &ba);
                     if ba.is_arrow() {
-                        callee_frame.new_target = ctx.frame.new_target.clone();
+                        callee_frame.new_target = fn_props_get(&ba, ".new_target");
                     }
                     populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                     push_call_frame("<anonymous>")?;
@@ -1693,7 +1703,7 @@ fn handle_call_undefined_receiver2(
                     );
                     restore_closure_context(&mut callee_frame, &ba);
                     if ba.is_arrow() {
-                        callee_frame.new_target = ctx.frame.new_target.clone();
+                        callee_frame.new_target = fn_props_get(&ba, ".new_target");
                     }
                     populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                     push_call_frame("<anonymous>")?;
@@ -1791,7 +1801,7 @@ fn handle_call_property(
                 );
                 restore_closure_context(&mut callee_frame, &ba);
                 if ba.is_arrow() {
-                    callee_frame.new_target = ctx.frame.new_target.clone();
+                    callee_frame.new_target = fn_props_get(&ba, ".new_target");
                 }
                 populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                 // Arrow functions use lexical `this` — do NOT override.
@@ -8336,6 +8346,419 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    // ── new.target conformance ──────────────────────────────────────────────
+
+    /// 1. `new Foo()` sets `new.target` to `Foo`.
+    #[test]
+    fn e2e_new_target_in_constructor_is_ctor() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; function Foo() { nt = new.target; } new Foo(); nt === Foo",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 2. `Foo()` (normal call) → `new.target` is `undefined`.
+    #[test]
+    fn e2e_new_target_undefined_in_normal_call() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; function Foo() { nt = new.target; } Foo(); nt === undefined",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 3. `new.target` inside a class constructor is defined.
+    #[test]
+    fn e2e_new_target_defined_in_class_constructor() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; class A { constructor() { nt = new.target; } } new A(); nt !== undefined",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 4. `new.target` in a class constructor equals the class itself.
+    #[test]
+    fn e2e_new_target_is_class_in_class_constructor() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; class A { constructor() { nt = new.target; } } new A(); nt === A",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 5. Inheritance: `new.target` in parent constructor is the derived class.
+    #[test]
+    fn e2e_new_target_is_derived_in_parent_constructor() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; \
+             class A { constructor() { nt = new.target; } } \
+             class B extends A { constructor() { super(); } } \
+             new B(); nt === B",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 6. `new.target` preserved through multiple inheritance levels.
+    #[test]
+    fn e2e_new_target_three_level_inheritance() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; \
+             class A { constructor() { nt = new.target; } } \
+             class B extends A { constructor() { super(); } } \
+             class C extends B { constructor() { super(); } } \
+             new C(); nt === C",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 7. Arrow function inside constructor inherits `new.target`.
+    #[test]
+    fn e2e_new_target_in_arrow_inside_constructor() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; \
+             function Foo() { var f = () => new.target; nt = f(); } \
+             new Foo(); nt === Foo",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 8. Arrow inside normal call → `new.target` is `undefined`.
+    #[test]
+    fn e2e_new_target_arrow_in_normal_call_undefined() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; \
+             function Foo() { var f = () => new.target; nt = f(); } \
+             Foo(); nt === undefined",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 9. Nested arrow captures outer `new.target`.
+    #[test]
+    fn e2e_new_target_nested_arrow() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; \
+             function Foo() { var f = () => (() => new.target)(); nt = f(); } \
+             new Foo(); nt === Foo",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 10. Arrow stored and called later still sees captured `new.target`.
+    #[test]
+    fn e2e_new_target_arrow_stored_and_called_later() {
+        let r = crate::builtins::global::global_eval(
+            "var getter; \
+             function Foo() { getter = () => new.target; } \
+             new Foo(); \
+             getter() === Foo",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 11. Arrow inside class constructor captures `new.target` (class).
+    #[test]
+    fn e2e_new_target_arrow_inside_class_constructor() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; \
+             class A { constructor() { var f = () => new.target; nt = f(); } } \
+             new A(); nt === A",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 12. Arrow in derived constructor captures the derived `new.target`.
+    #[test]
+    fn e2e_new_target_arrow_in_derived_constructor() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; \
+             class A { constructor() {} } \
+             class B extends A { constructor() { super(); var f = () => new.target; nt = f(); } } \
+             new B(); nt === B",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 13. `new.target` outside any function is a SyntaxError.
+    #[test]
+    fn e2e_new_target_outside_function_syntax_error() {
+        let r = crate::builtins::global::global_eval("new.target");
+        assert!(
+            r.is_err(),
+            "new.target at top level should be a SyntaxError"
+        );
+    }
+
+    /// 14. `new.target` inside `eval()` at top level is a SyntaxError.
+    #[test]
+    fn e2e_new_target_in_eval_top_level_error() {
+        let r = crate::builtins::global::global_eval(
+            "try { eval('new.target'); false; } catch(e) { true }",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 15. `Reflect.construct(A, [])` → `new.target` is `A` inside `A`.
+    #[test]
+    fn e2e_reflect_construct_new_target_is_target() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; function A() { nt = new.target; } \
+             Reflect.construct(A, []); nt === A",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 16. `Reflect.construct(A, [], B)` → `new.target` is `B` inside `A`.
+    #[test]
+    fn e2e_reflect_construct_with_new_target() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; function A() { nt = new.target; } \
+             function B() {} \
+             Reflect.construct(A, [], B); nt === B",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 17. `Reflect.construct` sets prototype from `newTarget`.
+    #[test]
+    fn e2e_reflect_construct_prototype_from_new_target() {
+        let r = crate::builtins::global::global_eval(
+            "function A() {} \
+             function B() {} \
+             B.prototype.x = 42; \
+             var obj = Reflect.construct(A, [], B); \
+             obj.x === 42",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 18. `Reflect.construct` without third arg uses target as `newTarget`.
+    #[test]
+    fn e2e_reflect_construct_default_new_target() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; function A() { nt = new.target; } \
+             Reflect.construct(A, []); nt === A",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 19. `Reflect.construct` returns constructed object.
+    #[test]
+    fn e2e_reflect_construct_returns_object() {
+        let r = crate::builtins::global::global_eval(
+            "function A() { this.x = 1; } \
+             var o = Reflect.construct(A, []); o.x",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(1));
+    }
+
+    /// 20. `Reflect.construct` with non-constructor target throws TypeError.
+    #[test]
+    fn e2e_reflect_construct_non_constructor_throws() {
+        let r = crate::builtins::global::global_eval(
+            "try { Reflect.construct(123, []); false; } catch(e) { e instanceof TypeError }",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 21. `Reflect.construct` with non-constructor newTarget throws TypeError.
+    #[test]
+    fn e2e_reflect_construct_non_constructor_new_target_throws() {
+        let r = crate::builtins::global::global_eval(
+            "try { Reflect.construct(function(){}, [], 123); false; } \
+             catch(e) { e instanceof TypeError }",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 22. `new.target` is the actual constructor, not the base class, when
+    ///     using `new DerivedClass()`.
+    #[test]
+    fn e2e_new_target_base_vs_derived_identity() {
+        let r = crate::builtins::global::global_eval(
+            "var ntA, ntB; \
+             class A { constructor() { ntA = new.target; } } \
+             class B extends A { constructor() { super(); ntB = new.target; } } \
+             new B(); ntA === B && ntB === B",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 23. Direct `new A()` → `new.target` is `A`, not `B`.
+    #[test]
+    fn e2e_new_target_direct_base_new() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; \
+             class A { constructor() { nt = new.target; } } \
+             class B extends A { constructor() { super(); } } \
+             new A(); nt === A",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 24. `new.target` in a method is `undefined`.
+    #[test]
+    fn e2e_new_target_in_method_undefined() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; \
+             class A { m() { nt = new.target; } } \
+             new A().m(); nt === undefined",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 25. `new.target` is preserved across `super()` with arguments.
+    #[test]
+    fn e2e_new_target_preserved_super_with_args() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; \
+             class A { constructor(x) { nt = new.target; this.x = x; } } \
+             class B extends A { constructor() { super(42); } } \
+             var b = new B(); nt === B && b.x === 42",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 26. Function expression with `new.target`.
+    #[test]
+    fn e2e_new_target_function_expression() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; var F = function() { nt = new.target; }; new F(); nt === F",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 27. `new.target` after `toString` on constructor.
+    #[test]
+    fn e2e_new_target_typeof() {
+        let r = crate::builtins::global::global_eval(
+            "var t; function Foo() { t = typeof new.target; } new Foo(); t",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("function".into()));
+    }
+
+    /// 28. `new.target` typeof is `undefined` for normal call.
+    #[test]
+    fn e2e_new_target_typeof_normal_call() {
+        let r = crate::builtins::global::global_eval(
+            "var t; function Foo() { t = typeof new.target; } Foo(); t",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("undefined".into()));
+    }
+
+    /// 29. `new.target` in arrow inside method → `undefined`.
+    #[test]
+    fn e2e_new_target_arrow_in_method_undefined() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; \
+             class A { m() { var f = () => new.target; nt = f(); } } \
+             new A().m(); nt === undefined",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 30. Conditional based on `new.target` (abstract class pattern).
+    #[test]
+    fn e2e_new_target_abstract_class_pattern() {
+        let r = crate::builtins::global::global_eval(
+            "class Abstract { \
+                 constructor() { \
+                     if (new.target === Abstract) throw new TypeError('abstract'); \
+                 } \
+             } \
+             class Concrete extends Abstract { constructor() { super(); } } \
+             var ok = false; \
+             try { new Abstract(); } catch(e) { ok = e instanceof TypeError; } \
+             ok && (new Concrete() instanceof Concrete)",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 31. `Reflect.construct` with class constructors.
+    #[test]
+    fn e2e_reflect_construct_class_new_target() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; \
+             class A { constructor() { nt = new.target; } } \
+             class B {} \
+             Reflect.construct(A, [], B); nt === B",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 32. `new.target` in immediately-invoked constructor arrow.
+    #[test]
+    fn e2e_new_target_iife_arrow_in_constructor() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; \
+             function Foo() { nt = (() => new.target)(); } \
+             new Foo(); nt === Foo",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 33. `new.target` inside `try/catch` in a constructor.
+    #[test]
+    fn e2e_new_target_inside_try_catch() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; \
+             function Foo() { try { nt = new.target; } catch(e) {} } \
+             new Foo(); nt === Foo",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    /// 34. `Reflect.construct` passes arguments to target constructor.
+    #[test]
+    fn e2e_reflect_construct_passes_args() {
+        let r = crate::builtins::global::global_eval(
+            "function A(x, y) { this.sum = x + y; } \
+             var o = Reflect.construct(A, [3, 4]); o.sum",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Smi(7));
+    }
+
+    /// 35. `new.target` in function with default parameters.
+    #[test]
+    fn e2e_new_target_with_default_params() {
+        let r = crate::builtins::global::global_eval(
+            "var nt; function Foo(x = 1) { nt = new.target; } new Foo(); nt === Foo",
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
     }
 
     /// §7.3.21: `instanceof` with a non-callable RHS must throw TypeError.
