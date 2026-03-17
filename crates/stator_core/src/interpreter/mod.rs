@@ -681,6 +681,39 @@ pub(super) const TURBOFAN_OSR_LOOP_THRESHOLD: u32 = 10_000;
 /// Sentinel string used by `.return()` to force a return completion through the
 /// handler table so that `finally` blocks execute before the generator completes.
 pub(super) const GENERATOR_RETURN_SENTINEL: &str = "__stator_generator_return_completion__";
+const GENERATOR_RETURN_COMPLETION_MARKER_KEY: &str = "__stator_generator_return_completion__";
+const GENERATOR_RETURN_COMPLETION_VALUE_KEY: &str = "value";
+
+pub(crate) fn make_generator_return_completion(value: JsValue) -> JsValue {
+    let mut map = PropertyMap::new();
+    map.insert(
+        GENERATOR_RETURN_COMPLETION_MARKER_KEY.into(),
+        JsValue::Boolean(true),
+    );
+    map.insert(GENERATOR_RETURN_COMPLETION_VALUE_KEY.into(), value);
+    JsValue::PlainObject(Rc::new(RefCell::new(map)))
+}
+
+pub(crate) fn is_generator_return_completion(value: &JsValue) -> bool {
+    matches!(
+        value,
+        JsValue::PlainObject(map)
+            if map
+                .borrow()
+                .get(GENERATOR_RETURN_COMPLETION_MARKER_KEY)
+                .is_some_and(|flag| flag.to_boolean())
+    )
+}
+
+pub(crate) fn get_generator_return_completion_value(value: &JsValue) -> Option<JsValue> {
+    match value {
+        JsValue::PlainObject(map) if is_generator_return_completion(value) => map
+            .borrow()
+            .get(GENERATOR_RETURN_COMPLETION_VALUE_KEY)
+            .cloned(),
+        _ => None,
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Cross-frame exception propagation
@@ -1583,19 +1616,27 @@ impl Interpreter {
         state: &Rc<RefCell<GeneratorState>>,
         input: JsValue,
     ) -> StatorResult<GeneratorStep> {
-        // Short-circuit for exhausted generators.
-        if state.borrow().status == GeneratorStatus::Completed {
-            return Ok(GeneratorStep::Return(JsValue::Undefined));
-        }
-
-        let (bytecode_array, saved_registers, resume_pc) = {
+        let (status, resume_mode, bytecode_array, saved_registers, resume_pc) = {
             let gs = state.borrow();
             (
+                gs.status,
+                gs.resume_mode.clone(),
                 gs.bytecode_array.clone(),
                 gs.registers.clone(),
                 gs.resume_pc,
             )
         };
+        match status {
+            GeneratorStatus::Completed => {
+                return Ok(GeneratorStep::Return(JsValue::Undefined));
+            }
+            GeneratorStatus::Executing => {
+                return Err(StatorError::TypeError(
+                    "Generator is already running".into(),
+                ));
+            }
+            GeneratorStatus::SuspendedAtStart | GeneratorStatus::SuspendedAtYield => {}
+        }
 
         let param_count = bytecode_array.parameter_count() as usize;
         let frame_size = bytecode_array.frame_size() as usize;
@@ -1640,12 +1681,41 @@ impl Interpreter {
         // the body can reference the generator function by its own name.
         populate_self_name(&mut frame, &ba_ref, &JsValue::Generator(Rc::clone(state)));
 
+        if status == GeneratorStatus::SuspendedAtStart
+            && let GeneratorResumeMode::Throw(thrown) = resume_mode
+        {
+            state.borrow_mut().resume_mode = GeneratorResumeMode::Normal;
+            if let Some(handler_pc) = find_handler(0, frame.bytecode_array.handler_table()) {
+                frame.accumulator = thrown;
+                frame.pc = handler_pc;
+            } else {
+                state.borrow_mut().status = GeneratorStatus::Completed;
+                let msg = error_message_from_value(&thrown);
+                set_pending_exception(thrown);
+                return Err(StatorError::JsException(msg));
+            }
+        }
+
         state.borrow_mut().status = GeneratorStatus::Executing;
 
         push_call_frame("<generator>")?;
         let return_val = Interpreter::run(&mut frame);
         pop_call_frame();
-        let return_val = return_val?;
+        let return_val = match return_val {
+            Ok(value) => value,
+            Err(err) => {
+                if matches!(err, StatorError::JsException(_))
+                    && let Some(pending) = take_pending_exception()
+                {
+                    if let Some(value) = get_generator_return_completion_value(&pending) {
+                        state.borrow_mut().status = GeneratorStatus::Completed;
+                        return Ok(GeneratorStep::Return(value));
+                    }
+                    set_pending_exception(pending);
+                }
+                return Err(err);
+            }
+        };
 
         if let Some(yield_val) = frame.suspend_result {
             Ok(GeneratorStep::Yield(yield_val))
@@ -1765,17 +1835,13 @@ impl Interpreter {
                 match Self::run_generator_step(state, JsValue::Undefined) {
                     Ok(GeneratorStep::Yield(v)) => Ok(make_iterator_result(v, false)),
                     Ok(GeneratorStep::Return(v)) => Ok(make_iterator_result(v, true)),
-                    Err(StatorError::JsException(ref msg)) if msg == GENERATOR_RETURN_SENTINEL => {
-                        state.borrow_mut().status = GeneratorStatus::Completed;
-                        Ok(make_iterator_result(value, true))
-                    }
                     Err(e) => {
                         state.borrow_mut().status = GeneratorStatus::Completed;
                         Err(e)
                     }
                 }
             }
-            GeneratorStatus::Completed => Ok(make_iterator_result(value, true)),
+            GeneratorStatus::Completed => Ok(make_iterator_result(JsValue::Undefined, true)),
             GeneratorStatus::Executing => Err(StatorError::TypeError(
                 "Generator is already running".into(),
             )),
@@ -1810,14 +1876,17 @@ impl Interpreter {
                 }
             }
             GeneratorStatus::SuspendedAtStart => {
-                state.borrow_mut().status = GeneratorStatus::Completed;
-                let err_str = format!("{value:?}");
-                Err(StatorError::JsException(err_str))
+                state.borrow_mut().resume_mode = GeneratorResumeMode::Throw(value);
+                match Self::run_generator_step(state, JsValue::Undefined) {
+                    Ok(GeneratorStep::Yield(v)) => Ok(make_iterator_result(v, false)),
+                    Ok(GeneratorStep::Return(v)) => Ok(make_iterator_result(v, true)),
+                    Err(e) => {
+                        state.borrow_mut().status = GeneratorStatus::Completed;
+                        Err(e)
+                    }
+                }
             }
-            GeneratorStatus::Completed => {
-                let err_str = format!("{value:?}");
-                Err(StatorError::JsException(err_str))
-            }
+            GeneratorStatus::Completed => Ok(make_iterator_result(JsValue::Undefined, true)),
             GeneratorStatus::Executing => Err(StatorError::TypeError(
                 "Generator is already running".into(),
             )),

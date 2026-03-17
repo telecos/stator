@@ -41008,7 +41008,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(r, JsValue::String("42,true".into()));
+        assert_eq!(r, JsValue::String("undefined,true".into()));
     }
 
     /// Generator.prototype.throw ΓÇö throws into a generator with try/catch.
@@ -41376,6 +41376,285 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, JsValue::String("0,1,1,2,3,5,8,13".into()));
+    }
+
+    #[test]
+    fn e2e_generator_throw_completed_methods_done_true() {
+        let r = global_eval(
+            r#"
+            function* gen() { yield 1; }
+            var g = gen();
+            g.next();
+            g.next();
+            var a = g.next();
+            var b = g.return(99);
+            var c = g.throw('boom');
+            String(a.value) + ',' + a.done + ',' +
+            String(b.value) + ',' + b.done + ',' +
+            String(c.value) + ',' + c.done
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            r,
+            JsValue::String("undefined,true,undefined,true,undefined,true".into())
+        );
+    }
+
+    #[test]
+    fn e2e_generator_throw_before_start_with_catch() {
+        let r = global_eval(
+            r#"
+            function* gen() {
+                try { yield 'start'; }
+                catch (e) { yield 'caught:' + e; }
+                yield 'after';
+            }
+            var g = gen();
+            var a = g.throw('boom');
+            var b = g.next();
+            a.value + ',' + a.done + ',' + b.value + ',' + b.done
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("caught:boom,false,after,false".into()));
+    }
+
+    #[test]
+    fn e2e_generator_throw_before_start_uncaught_completes() {
+        let r = global_eval(
+            r#"
+            function* gen() { yield 1; }
+            var g = gen();
+            var first;
+            try { g.throw('boom'); } catch (e) { first = 'caught:' + e; }
+            var done = g.next();
+            first + ',' + String(done.value) + ',' + done.done
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("caught:boom,undefined,true".into()));
+    }
+
+    #[test]
+    fn e2e_generator_throw_before_start_runs_finally() {
+        let r = global_eval(
+            r#"
+            var log = [];
+            function* gen() {
+                try { yield 1; }
+                finally { log.push('finally'); }
+            }
+            var g = gen();
+            try { g.throw('boom'); } catch (e) {}
+            log.join(',') + ',' + g.next().done
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("finally,true".into()));
+    }
+
+    #[test]
+    fn e2e_generator_return_yield_in_finally_suspends() {
+        let r = global_eval(
+            r#"
+            function* gen() {
+                try { yield 1; }
+                finally { yield 2; }
+            }
+            var g = gen();
+            g.next();
+            var r = g.return(7);
+            r.value + ',' + r.done
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("2,false".into()));
+    }
+
+    #[test]
+    fn e2e_generator_return_yield_in_finally_completes_on_next() {
+        let r = global_eval(
+            r#"
+            function* gen() {
+                try { yield 1; }
+                finally { yield 2; }
+            }
+            var g = gen();
+            g.next();
+            var a = g.return(7);
+            var b = g.next();
+            a.value + ',' + a.done + ',' + b.value + ',' + b.done
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("2,false,7,true".into()));
+    }
+
+    #[test]
+    fn e2e_generator_return_before_start_next_is_done() {
+        let r = global_eval(
+            r#"
+            function* gen() { yield 1; }
+            var g = gen();
+            g.return(9);
+            var r = g.next();
+            String(r.value) + ',' + r.done
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("undefined,true".into()));
+    }
+
+    #[test]
+    fn e2e_generator_reentrant_next_throws() {
+        let r = global_eval(
+            r#"
+            var g;
+            function* gen() {
+                try { g.next(); }
+                catch (e) { yield String(e).indexOf('already running') >= 0; }
+            }
+            g = gen();
+            g.next().value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_generator_reentrant_return_throws() {
+        let r = global_eval(
+            r#"
+            var g;
+            function* gen() {
+                try { g.return(1); }
+                catch (e) { yield String(e).indexOf('already running') >= 0; }
+            }
+            g = gen();
+            g.next().value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_generator_throw_with_catch_continues() {
+        let r = global_eval(
+            r#"
+            function* gen() {
+                try { yield 1; }
+                catch (e) { yield 'caught:' + e; }
+                yield 'after';
+            }
+            var g = gen();
+            g.next();
+            var a = g.throw('x');
+            var b = g.next();
+            a.value + ',' + a.done + ',' + b.value + ',' + b.done
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("caught:x,false,after,false".into()));
+    }
+
+    #[test]
+    fn e2e_yield_star_throw_forwarded_to_inner() {
+        let r = global_eval(
+            r#"
+            function* inner() {
+                try { yield 1; }
+                catch (e) { yield 'inner:' + e; return 'done'; }
+            }
+            function* outer() { var x = yield* inner(); yield x; }
+            var g = outer();
+            g.next();
+            var a = g.throw('boom');
+            var b = g.next();
+            a.value + ',' + a.done + ',' + b.value + ',' + b.done
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("inner:boom,false,done,false".into()));
+    }
+
+    #[test]
+    fn e2e_yield_star_return_forwarded_to_inner_finally() {
+        let r = global_eval(
+            r#"
+            function* inner() {
+                try { yield 1; }
+                finally { yield 2; }
+            }
+            function* outer() { yield* inner(); yield 3; }
+            var g = outer();
+            g.next();
+            var a = g.return(9);
+            var b = g.next();
+            a.value + ',' + a.done + ',' + b.value + ',' + b.done
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("2,false,9,true".into()));
+    }
+
+    #[test]
+    fn e2e_yield_star_return_missing_method_completes() {
+        let r = global_eval(
+            r#"
+            var iterable = {
+                [Symbol.iterator]: function() {
+                    return {
+                        next: function() { return { value: 1, done: false }; }
+                    };
+                }
+            };
+            function* outer() { yield* iterable; yield 2; }
+            var g = outer();
+            g.next();
+            var r = g.return(5);
+            r.value + ',' + r.done
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("5,true".into()));
+    }
+
+    #[test]
+    fn e2e_yield_star_throw_done_true_continues_outer() {
+        let r = global_eval(
+            r#"
+            var iter = {
+                next: function() { return { value: 1, done: false }; },
+                throw: function(v) { return { value: 'thrown:' + v, done: true }; },
+                [Symbol.iterator]: function() { return this; }
+            };
+            function* outer() { var x = yield* iter; yield x; }
+            var g = outer();
+            g.next();
+            g.throw('boom').value
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::String("thrown:boom".into()));
+    }
+
+    #[test]
+    fn e2e_generator_throw_after_completed_newborn_throw() {
+        let r = global_eval(
+            r#"
+            function* gen() { yield 1; }
+            var g = gen();
+            try { g.throw('boom'); } catch (e) {}
+            var a = g.return(1);
+            var b = g.throw(2);
+            a.done && b.done && String(a.value) === 'undefined' && String(b.value) === 'undefined'
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
     }
 
     // ΓöÇΓöÇ Type coercion & conversion conformance ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ

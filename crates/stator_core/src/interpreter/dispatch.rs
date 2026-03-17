@@ -21,7 +21,8 @@ use super::{
     constant_pool_jump_delta, constant_to_value, decode_string_constant, dispatch_call_property,
     dispatch_call_value, dispatch_call_with_this, dispatch_setter, err_bad_operand,
     error_message_from_value, extract_context, find_handler, fn_props_get, fn_props_set,
-    has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
+    get_generator_return_completion_value, has_prototype_in_chain, is_js_receiver, js_add,
+    js_less_than, keyed_load, keyed_store, make_generator_return_completion,
     maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator,
     number_to_jsvalue, plain_object_to_array_items, populate_self_name, proto_lookup, resolve_jump,
     restore_closure_context, set_function_name_if_missing, set_pending_exception,
@@ -3675,13 +3676,13 @@ fn handle_resume_generator(
         let msg = error_message_from_value(&val);
         return Err(StatorError::JsException(msg));
     }
-    if return_val.is_some() {
+    if let Some(return_val) = return_val {
         // Force a "return" abrupt completion.  By throwing a sentinel
         // through the handler table, any enclosing `finally` block will
         // execute before the generator completes.
-        let sentinel = JsValue::String(super::GENERATOR_RETURN_SENTINEL.into());
-        ctx.frame.accumulator = sentinel.clone();
-        set_pending_exception(sentinel);
+        let completion = make_generator_return_completion(return_val);
+        ctx.frame.accumulator = completion.clone();
+        set_pending_exception(completion);
         return Err(StatorError::JsException(
             super::GENERATOR_RETURN_SENTINEL.into(),
         ));
@@ -5301,20 +5302,35 @@ fn handle_call_runtime(
         return Err(err_bad_operand("CallRuntime", 2));
     };
 
-    if runtime_id == crate::bytecode::bytecode_generator::RUNTIME_DYNAMIC_IMPORT {
-        use crate::builtins::promise::{MicrotaskQueue, promise_resolve};
+    let args = collect_args(ctx.frame, args_start_v, arg_count)?;
+    match runtime_id {
+        crate::bytecode::bytecode_generator::RUNTIME_DYNAMIC_IMPORT => {
+            use crate::builtins::promise::{MicrotaskQueue, promise_resolve};
 
-        let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-        let specifier = args.first().cloned().unwrap_or(JsValue::Undefined);
+            let specifier = args.first().cloned().unwrap_or(JsValue::Undefined);
 
-        let mut ns = PropertyMap::new();
-        ns.insert("default".into(), specifier);
-        let ns_val = JsValue::PlainObject(Rc::new(RefCell::new(ns)));
+            let mut ns = PropertyMap::new();
+            ns.insert("default".into(), specifier);
+            let ns_val = JsValue::PlainObject(Rc::new(RefCell::new(ns)));
 
-        let queue = MicrotaskQueue::new();
-        let p = promise_resolve(ns_val, &queue);
-        queue.drain();
-        ctx.frame.accumulator = JsValue::Promise(p);
+            let queue = MicrotaskQueue::new();
+            let p = promise_resolve(ns_val, &queue);
+            queue.drain();
+            ctx.frame.accumulator = JsValue::Promise(p);
+        }
+        crate::bytecode::bytecode_generator::RUNTIME_IS_GENERATOR_RETURN_COMPLETION => {
+            ctx.frame.accumulator = JsValue::Boolean(
+                args.first()
+                    .is_some_and(super::is_generator_return_completion),
+            );
+        }
+        crate::bytecode::bytecode_generator::RUNTIME_GET_GENERATOR_RETURN_COMPLETION_VALUE => {
+            ctx.frame.accumulator = args
+                .first()
+                .and_then(get_generator_return_completion_value)
+                .unwrap_or(JsValue::Undefined);
+        }
+        _ => {}
     }
     // Unrecognised runtime IDs are no-ops.
     Ok(DispatchAction::Continue)

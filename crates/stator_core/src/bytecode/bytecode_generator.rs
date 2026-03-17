@@ -53,6 +53,8 @@ use crate::parser::ast::{
 /// Used as the `RuntimeId` operand in `CallRuntime` so the interpreter can
 /// dispatch to the dynamic import handler.
 pub(crate) const RUNTIME_DYNAMIC_IMPORT: u32 = 1;
+pub(crate) const RUNTIME_IS_GENERATOR_RETURN_COMPLETION: u32 = 2;
+pub(crate) const RUNTIME_GET_GENERATOR_RETURN_COMPLETION_VALUE: u32 = 3;
 
 /// Convert a [`Register`] to an [`Operand::Register`].
 ///
@@ -5606,16 +5608,25 @@ impl FunctionCompiler {
             let result_reg = self.allocator.new_local();
             let method_reg = self.allocator.new_local();
             let value_reg = self.allocator.new_local();
+            let exception_reg = self.allocator.new_local();
+            let completion_value_reg = self.allocator.new_local();
 
             self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
             self.emit_star(sent_reg);
 
             let next_idx = self.add_string("next");
+            let return_idx = self.add_string("return");
+            let throw_idx = self.add_string("throw");
             let done_idx = self.add_string("done");
             let value_idx = self.add_string("value");
 
             let loop_lbl = self.new_label();
             let done_lbl = self.new_label();
+            let yield_resume_lbl = self.new_label();
+            let return_forward_lbl = self.new_label();
+            let missing_throw_lbl = self.new_label();
+            let rethrow_completion_lbl = self.new_label();
+            let after_resume_handler_lbl = self.new_label();
             let dummy = Operand::Register(0);
 
             self.bind_label(loop_lbl);
@@ -5666,6 +5677,7 @@ impl FunctionCompiler {
             self.emit_star(value_reg);
             self.emit_ldar(value_reg);
 
+            self.bind_label(yield_resume_lbl);
             let suspend_id = self.yield_suspend_id;
             self.yield_suspend_id += 1;
             self.emit(Instruction::new_unchecked(
@@ -5677,12 +5689,146 @@ impl FunctionCompiler {
                     Operand::Immediate(suspend_id as i32),
                 ],
             ));
+            let resume_try_start = self.instructions.len() as u32;
             self.emit(Instruction::new_unchecked(
                 Opcode::ResumeGenerator,
                 vec![dummy, dummy, Operand::RegisterCount(0)],
             ));
             self.emit_star(sent_reg);
+            let resume_try_end = self.instructions.len() as u32;
             self.emit_jump_loop_to(loop_lbl);
+            self.emit_jump(Opcode::Jump, after_resume_handler_lbl);
+
+            let resume_handler_start = self.instructions.len() as u32;
+            self.emit_star(exception_reg);
+            self.emit(Instruction::new_unchecked(
+                Opcode::CallRuntime,
+                vec![
+                    Operand::RuntimeId(RUNTIME_IS_GENERATOR_RETURN_COMPLETION),
+                    to_reg_op(exception_reg),
+                    Operand::RegisterCount(1),
+                ],
+            ));
+            self.emit_jump_if_true_to(return_forward_lbl);
+
+            let throw_load_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+            self.emit(Instruction::new_unchecked(
+                Opcode::LdaNamedProperty,
+                vec![
+                    to_reg_op(iter_reg),
+                    Operand::ConstantPoolIdx(throw_idx),
+                    throw_load_slot,
+                ],
+            ));
+            self.emit_jump(Opcode::JumpIfUndefinedOrNull, missing_throw_lbl);
+            self.emit_star(method_reg);
+
+            let throw_call_slot = self.alloc_slot(FeedbackSlotKind::Call);
+            self.emit(Instruction::new_unchecked(
+                Opcode::CallProperty1,
+                vec![
+                    to_reg_op(method_reg),
+                    to_reg_op(iter_reg),
+                    to_reg_op(exception_reg),
+                    throw_call_slot,
+                ],
+            ));
+            self.emit_star(result_reg);
+
+            let forwarded_done_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+            self.emit(Instruction::new_unchecked(
+                Opcode::LdaNamedProperty,
+                vec![
+                    to_reg_op(result_reg),
+                    Operand::ConstantPoolIdx(done_idx),
+                    forwarded_done_slot,
+                ],
+            ));
+            self.emit_jump_if_true_to(done_lbl);
+
+            let forwarded_value_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+            self.emit(Instruction::new_unchecked(
+                Opcode::LdaNamedProperty,
+                vec![
+                    to_reg_op(result_reg),
+                    Operand::ConstantPoolIdx(value_idx),
+                    forwarded_value_slot,
+                ],
+            ));
+            self.emit_jump(Opcode::Jump, yield_resume_lbl);
+
+            self.bind_label(return_forward_lbl);
+            self.emit(Instruction::new_unchecked(
+                Opcode::CallRuntime,
+                vec![
+                    Operand::RuntimeId(RUNTIME_GET_GENERATOR_RETURN_COMPLETION_VALUE),
+                    to_reg_op(exception_reg),
+                    Operand::RegisterCount(1),
+                ],
+            ));
+            self.emit_star(completion_value_reg);
+
+            let return_load_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+            self.emit(Instruction::new_unchecked(
+                Opcode::LdaNamedProperty,
+                vec![
+                    to_reg_op(iter_reg),
+                    Operand::ConstantPoolIdx(return_idx),
+                    return_load_slot,
+                ],
+            ));
+            self.emit_jump(Opcode::JumpIfUndefinedOrNull, rethrow_completion_lbl);
+            self.emit_star(method_reg);
+
+            let return_call_slot = self.alloc_slot(FeedbackSlotKind::Call);
+            self.emit(Instruction::new_unchecked(
+                Opcode::CallProperty1,
+                vec![
+                    to_reg_op(method_reg),
+                    to_reg_op(iter_reg),
+                    to_reg_op(completion_value_reg),
+                    return_call_slot,
+                ],
+            ));
+            self.emit_star(result_reg);
+
+            let return_done_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+            self.emit(Instruction::new_unchecked(
+                Opcode::LdaNamedProperty,
+                vec![
+                    to_reg_op(result_reg),
+                    Operand::ConstantPoolIdx(done_idx),
+                    return_done_slot,
+                ],
+            ));
+            self.emit_jump_if_true_to(rethrow_completion_lbl);
+
+            let return_value_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
+            self.emit(Instruction::new_unchecked(
+                Opcode::LdaNamedProperty,
+                vec![
+                    to_reg_op(result_reg),
+                    Operand::ConstantPoolIdx(value_idx),
+                    return_value_slot,
+                ],
+            ));
+            self.emit_jump(Opcode::Jump, yield_resume_lbl);
+
+            self.bind_label(missing_throw_lbl);
+            self.emit_ldar(exception_reg);
+            self.emit(Instruction::new_unchecked(Opcode::ReThrow, vec![]));
+
+            self.bind_label(rethrow_completion_lbl);
+            self.emit_ldar(exception_reg);
+            self.emit(Instruction::new_unchecked(Opcode::ReThrow, vec![]));
+
+            self.bind_label(after_resume_handler_lbl);
+            self.handler_table.push(HandlerTableEntry {
+                try_start: resume_try_start,
+                try_end: resume_try_end,
+                handler: resume_handler_start,
+                is_finally: false,
+            });
 
             self.bind_label(done_lbl);
             let final_value_slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
