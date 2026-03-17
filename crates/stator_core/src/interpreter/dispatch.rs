@@ -19,13 +19,13 @@ use super::{
     PropertyIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow, collect_args, concat_rc_strs,
     constant_pool_jump_delta, constant_to_value, decode_string_constant, dispatch_call_property,
     dispatch_call_value, dispatch_call_with_this, dispatch_setter, err_bad_operand,
-    error_message_from_value, extract_context, find_handler, fn_props_set, has_prototype_in_chain,
-    is_js_receiver, js_add, js_less_than, keyed_load, keyed_store, maybe_compile_baseline,
-    maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator, number_to_jsvalue,
-    plain_object_to_array_items, populate_self_name, proto_lookup, resolve_jump,
-    restore_closure_context, set_pending_exception, settle_async_iterator_result, strict_eq,
-    to_array_index, to_bigint, to_property_key, try_execute_best_jit, walk_context_chain,
-    wire_construct_prototype,
+    error_message_from_value, extract_context, find_handler, fn_props_get, fn_props_set,
+    has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
+    maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator,
+    number_to_jsvalue, plain_object_to_array_items, populate_self_name, proto_lookup, resolve_jump,
+    restore_closure_context, set_function_name_if_missing, set_pending_exception,
+    settle_async_iterator_result, strict_eq, to_array_index, to_bigint, to_property_key,
+    try_execute_best_jit, walk_context_chain, wire_construct_prototype,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
@@ -1353,6 +1353,7 @@ fn handle_tail_call(
                     let frame_size = new_ba.frame_size() as usize;
                     let total_regs = param_count + frame_size;
                     ctx.frame.bytecode_array = new_ba;
+                    ctx.frame.call_args = args.clone();
                     ctx.frame.registers.clear();
                     ctx.frame.registers.resize(total_regs, JsValue::Undefined);
                     for (i, arg) in args.into_iter().enumerate().take(param_count) {
@@ -2717,8 +2718,16 @@ fn handle_sta_global(
             "{name} is not defined"
         )));
     }
+    set_function_name_if_missing(&val, &name);
     env.insert(name, val);
     Ok(DispatchAction::Continue)
+}
+
+fn set_named_property_function_metadata(value: &JsValue, obj: &JsValue, name: &str) {
+    if let JsValue::Function(ba) = value {
+        fn_props_set(ba, ".home_object".to_string(), obj.clone());
+        set_function_name_if_missing(value, name);
+    }
 }
 
 fn handle_lda_named_property(
@@ -2942,6 +2951,7 @@ fn handle_sta_named_property(
                     return Ok(DispatchAction::Continue);
                 }
             }
+            set_function_name_if_missing(&val, &prop_name);
             map.borrow_mut().insert(prop_name.to_string(), val);
             // Populate shape store IC for future fast-path stores.
             if slot != u32::MAX {
@@ -2967,6 +2977,9 @@ fn handle_sta_named_property(
             });
         }
         JsValue::Function(ref ba) => {
+            if matches!(fn_props_get(ba, &prop_name), JsValue::Undefined) {
+                set_function_name_if_missing(&val, &prop_name);
+            }
             fn_props_set(ba, prop_name.to_string(), val);
         }
         JsValue::Array(ref arr) => {
@@ -3049,6 +3062,7 @@ fn handle_sta_keyed_property(
     // before falling through to keyed_store.
     if let JsValue::PlainObject(ref map) = obj {
         let key_str = to_property_key(&key)?;
+        set_function_name_if_missing(&val, &key_str);
         // Check for setter accessor first (__set_<key>__).
         let setter_key = format!("__set_{key_str}__");
         let getter_key = format!("__get_{key_str}__");
@@ -4381,9 +4395,7 @@ fn handle_define_named_own_property(
     let val = ctx.frame.accumulator.clone();
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     if let JsValue::PlainObject(ref map) = obj {
-        if let JsValue::Function(ba) = &val {
-            fn_props_set(ba, ".home_object".to_string(), obj.clone());
-        }
+        set_named_property_function_metadata(&val, &obj, &prop_name);
         map.borrow_mut().insert(prop_name, val);
     }
     // Accumulator stays unchanged.
@@ -4406,9 +4418,7 @@ fn handle_define_keyed_own_property(
     let val = ctx.frame.accumulator.clone();
     if let JsValue::PlainObject(ref map) = obj {
         let prop_name = to_property_key(&key)?;
-        if let JsValue::Function(ba) = &val {
-            fn_props_set(ba, ".home_object".to_string(), obj.clone());
-        }
+        set_named_property_function_metadata(&val, &obj, &prop_name);
         map.borrow_mut().insert(prop_name, val);
     }
     // Accumulator stays unchanged.
@@ -4431,9 +4441,7 @@ fn handle_define_keyed_own_property_in_literal(
     let val = ctx.frame.accumulator.clone();
     if let JsValue::PlainObject(ref map) = obj {
         let prop_name = to_property_key(&key)?;
-        if let JsValue::Function(ba) = &val {
-            fn_props_set(ba, ".home_object".to_string(), obj.clone());
-        }
+        set_named_property_function_metadata(&val, &obj, &prop_name);
         map.borrow_mut().insert(prop_name, val);
     }
     // Accumulator stays unchanged.
@@ -4942,8 +4950,8 @@ fn handle_create_rest_parameter(
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     let param_count = ctx.frame.bytecode_array.parameter_count() as usize;
-    let rest: Vec<JsValue> = if ctx.frame.registers.len() > param_count {
-        ctx.frame.registers[param_count..].to_vec()
+    let rest: Vec<JsValue> = if ctx.frame.call_args.len() > param_count {
+        ctx.frame.call_args[param_count..].to_vec()
     } else {
         vec![]
     };
@@ -4958,7 +4966,7 @@ fn handle_create_mapped_arguments(
     let param_count = ctx.frame.bytecode_array.parameter_count() as usize;
     let args: Vec<JsValue> = ctx
         .frame
-        .registers
+        .call_args
         .get(..param_count)
         .unwrap_or(&[])
         .to_vec();
@@ -4998,7 +5006,7 @@ fn handle_create_unmapped_arguments(
     let param_count = ctx.frame.bytecode_array.parameter_count() as usize;
     let args: Vec<JsValue> = ctx
         .frame
-        .registers
+        .call_args
         .get(..param_count)
         .unwrap_or(&[])
         .to_vec();

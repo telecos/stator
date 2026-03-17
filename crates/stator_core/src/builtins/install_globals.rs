@@ -47,8 +47,8 @@ use crate::builtins::finalization_registry::{
     finalization_registry_unregister_plain,
 };
 use crate::builtins::function::{
-    function_apply, function_bind, function_call, function_constructor, function_has_instance,
-    function_to_string,
+    function_apply, function_bound_name, function_call, function_constructor,
+    function_has_instance, function_length,
 };
 use crate::builtins::global::{
     GLOBAL_INFINITY, GLOBAL_NAN, global_decode_uri, global_decode_uri_component, global_encode_uri,
@@ -132,7 +132,8 @@ use crate::builtins::weak_ref::{weak_ref_deref, weak_ref_new, weak_ref_new_plain
 use crate::error::{StatorError, StatorResult};
 use crate::interpreter::{
     current_global_env, dispatch_call_value, dispatch_call_with_this, dispatch_get_property_value,
-    dispatch_set_property_value, get_object_prototype, has_prototype_in_chain,
+    dispatch_set_property_value, function_display_name, function_length_value,
+    function_to_string_value, get_object_prototype, has_prototype_in_chain,
 };
 use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
@@ -8666,6 +8667,24 @@ fn make_finalization_registry_builtin() -> JsValue {
 
 // ── Function constructor (ES2025 §20.2) ──────────────────────────────────────
 
+fn function_prototype_value() -> Option<JsValue> {
+    current_global_env().and_then(|globals| match globals.borrow().get("Function").cloned() {
+        Some(JsValue::PlainObject(map)) => map.borrow().get("prototype").cloned(),
+        _ => None,
+    })
+}
+
+fn create_bound_function_object(call_fn: JsValue, name: String, length: i32) -> JsValue {
+    let mut props = PropertyMap::new();
+    props.insert("__call__".to_string(), call_fn);
+    props.insert("name".to_string(), JsValue::String(name.into()));
+    props.insert("length".to_string(), JsValue::Smi(length));
+    if let Some(function_proto) = function_prototype_value() {
+        props.insert("__proto__".to_string(), function_proto);
+    }
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
 /// Build the `Function` constructor/namespace object.
 ///
 /// The returned `PlainObject` carries:
@@ -8758,20 +8777,25 @@ fn make_function() -> JsValue {
                 let func = args.first().cloned().unwrap_or(JsValue::Undefined);
                 let this_arg = args.get(1).cloned().unwrap_or(JsValue::Undefined);
                 let bound_args: Vec<JsValue> = args.get(2..).unwrap_or(&[]).to_vec();
-                let bound_count = bound_args.len() as i32;
-
-                // Compute the bound function's `.length` (ES §20.2.3.2 step 6).
-                let target_len = match &func {
-                    JsValue::Function(ba) => ba.parameter_count() as i32,
-                    _ => 0,
-                };
-                let result_len = std::cmp::max(0, target_len - bound_count);
+                let result_len =
+                    function_length(function_length_value(&func) as u32, bound_args.len() as u32)
+                        as i32;
+                let bound_name = function_bound_name(&function_display_name(&func));
 
                 match &func {
-                    JsValue::NativeFunction(f) => {
-                        let bound = function_bind(f, &this_arg, &bound_args);
-                        Ok(JsValue::NativeFunction(bound))
-                    }
+                    JsValue::NativeFunction(f) => Ok(create_bound_function_object(
+                        JsValue::NativeFunction(Rc::new({
+                            let f = Rc::clone(f);
+                            move |call_args: Vec<JsValue>| {
+                                let mut all_args = vec![this_arg.clone()];
+                                all_args.extend(bound_args.clone());
+                                all_args.extend(call_args);
+                                f(all_args)
+                            }
+                        })),
+                        bound_name,
+                        result_len,
+                    )),
                     JsValue::Function(_) | JsValue::PlainObject(_) => {
                         let call_fn =
                             JsValue::NativeFunction(Rc::new(move |call_args: Vec<JsValue>| {
@@ -8779,14 +8803,9 @@ fn make_function() -> JsValue {
                                 all_args.extend(call_args);
                                 dispatch_call_with_this(&func, this_arg.clone(), all_args)
                             }));
-                        let mut props = PropertyMap::new();
-                        props.insert("__call__".to_string(), call_fn);
-                        props.insert(
-                            "name".to_string(),
-                            JsValue::String("bound ".to_string().into()),
-                        );
-                        props.insert("length".to_string(), JsValue::Smi(result_len));
-                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(props))))
+                        Ok(create_bound_function_object(
+                            call_fn, bound_name, result_len,
+                        ))
                     }
                     _ => Err(StatorError::TypeError(
                         "Function.prototype.bind requires a callable".into(),
@@ -8799,8 +8818,8 @@ fn make_function() -> JsValue {
         proto.insert(
             "toString".into(),
             native(|args| {
-                let _func = args.first().cloned().unwrap_or(JsValue::Undefined);
-                Ok(JsValue::String(function_to_string("").into()))
+                let func = args.first().cloned().unwrap_or(JsValue::Undefined);
+                Ok(JsValue::String(function_to_string_value(&func).into()))
             }),
         );
 
@@ -14324,6 +14343,13 @@ mod tests {
 
     fn assert_eval_true(script: &str) {
         assert_eq!(global_eval(script).unwrap(), JsValue::Boolean(true));
+    }
+
+    fn assert_eval_type_error(script: &str) {
+        assert!(matches!(
+            global_eval(script),
+            Err(StatorError::TypeError(_))
+        ));
     }
 
     /// Verify that `install_globals` populates the expected keys.
@@ -21250,6 +21276,234 @@ mod tests {
             global_eval("function outer() { 'use strict'; return arguments['callee']; } outer()")
                 .unwrap_err();
         assert!(matches!(result, StatorError::TypeError(_)));
+    }
+
+    #[test]
+    fn e2e_function_bind_binds_this_value() {
+        assert_eval_true(
+            "function f(a) { return this.base + a; } var g = f.bind({ base: 40 }, 2); g() === 42",
+        );
+    }
+
+    #[test]
+    fn e2e_function_bind_supports_chained_partial_application() {
+        assert_eval_true(
+            "function sum(a, b, c) { return a + b + c; } sum.bind(null, 1).bind(null, 2)(3) === 6",
+        );
+    }
+
+    #[test]
+    fn e2e_function_bind_preserves_bound_name_for_anonymous_functions() {
+        assert_eval_true("(function() {}).bind(null).name === 'bound '");
+    }
+
+    #[test]
+    fn e2e_function_bind_reduces_length_to_zero() {
+        assert_eval_true("function add(a, b) {} add.bind(null, 1, 2, 3).length === 0");
+    }
+
+    #[test]
+    fn e2e_function_bind_to_string_uses_native_form() {
+        assert_eval_true(
+            "function named() {} named.bind(null).toString() === 'function bound named() { [native code] }'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_bind_inherits_function_prototype_methods() {
+        assert_eval_true(
+            "function add(a, b) { return a + b; } var bound = add.bind(null, 1); bound.call(null, 2) === 3",
+        );
+    }
+
+    #[test]
+    fn e2e_function_call_explicit_this_binding() {
+        assert_eval_true("function f(a) { return this.base + a; } f.call({ base: 5 }, 7) === 12");
+    }
+
+    #[test]
+    fn e2e_function_call_ignores_bound_this_when_recalled() {
+        assert_eval_true(
+            "function f() { return this.value; } var g = f.bind({ value: 1 }); g.call({ value: 2 }) === 1",
+        );
+    }
+
+    #[test]
+    fn e2e_function_apply_uses_array_like_objects() {
+        assert_eval_true(
+            "function join(a, b) { return a + ':' + b; } join.apply(null, { 0: 'x', 1: 'y', length: 2 }) === 'x:y'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_apply_fills_missing_array_like_entries_with_undefined() {
+        assert_eval_true(
+            "function f(a, b) { return a === 1 && b === undefined; } f.apply(null, { 0: 1, length: 2 })",
+        );
+    }
+
+    #[test]
+    fn e2e_function_apply_accepts_nullish_args_array() {
+        assert_eval_true(
+            "function f() { return arguments.length === 0; } f.apply(null, null) && f.apply(null, undefined)",
+        );
+    }
+
+    #[test]
+    fn e2e_function_apply_throws_for_non_object_args_array() {
+        assert_eval_type_error("(function() {}).apply(null, 1)");
+    }
+
+    #[test]
+    fn e2e_function_to_string_named_function_uses_name() {
+        assert_eval_true(
+            "function named() {} named.toString() === 'function named() { [native code] }'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_to_string_anonymous_function_uses_native_form() {
+        assert_eval_true("(function() {}).toString() === 'function () { [native code] }'");
+    }
+
+    #[test]
+    fn e2e_function_name_arrow_from_variable_declaration() {
+        assert_eval_true("let arrow = () => 1; arrow.name === 'arrow'");
+    }
+
+    #[test]
+    fn e2e_function_name_arrow_from_assignment() {
+        assert_eval_true("let arrow; arrow = () => 1; arrow.name === 'arrow'");
+    }
+
+    #[test]
+    fn e2e_function_name_anonymous_function_from_variable_declaration() {
+        assert_eval_true("let fnValue = function() {}; fnValue.name === 'fnValue'");
+    }
+
+    #[test]
+    fn e2e_function_name_object_property_value_function() {
+        assert_eval_true("({ answer: function() {} }).answer.name === 'answer'");
+    }
+
+    #[test]
+    fn e2e_function_name_object_property_value_arrow() {
+        assert_eval_true("({ answer: () => 1 }).answer.name === 'answer'");
+    }
+
+    #[test]
+    fn e2e_function_name_assignment_to_named_property() {
+        assert_eval_true("let obj = {}; obj.answer = function() {}; obj.answer.name === 'answer'");
+    }
+
+    #[test]
+    fn e2e_function_name_assignment_to_computed_property() {
+        assert_eval_true(
+            "let obj = {}; let key = 'answer'; obj[key] = () => 1; obj[key].name === 'answer'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_name_method_shorthand() {
+        assert_eval_true("({ answer() {} }).answer.name === 'answer'");
+    }
+
+    #[test]
+    fn e2e_function_name_getter_static() {
+        assert_eval_true(
+            "Object.getOwnPropertyDescriptor({ get value() { return 1; } }, 'value').get.name === 'get value'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_name_setter_static() {
+        assert_eval_true(
+            "Object.getOwnPropertyDescriptor({ set value(v) {} }, 'value').set.name === 'set value'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_name_getter_computed() {
+        assert_eval_true(
+            "let key = 'value'; Object.getOwnPropertyDescriptor({ get [key]() { return 1; } }, key).get.name === 'get value'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_name_setter_computed() {
+        assert_eval_true(
+            "let key = 'value'; Object.getOwnPropertyDescriptor({ set [key](v) {} }, key).set.name === 'set value'",
+        );
+    }
+
+    #[test]
+    fn e2e_function_length_counts_destructuring_parameter() {
+        assert_eval_true("function f({ a }, [b], c) {} f.length === 3");
+    }
+
+    #[test]
+    fn e2e_function_length_stops_before_destructuring_default() {
+        assert_eval_true("function f(a, { b } = {}, c) {} f.length === 1");
+    }
+
+    #[test]
+    fn e2e_arguments_length_and_index_access() {
+        assert_eval_true(
+            "function f(a) { return arguments.length === 3 && arguments[0] === 1 && arguments[2] === 3; } f(1, 2, 3)",
+        );
+    }
+
+    #[test]
+    fn e2e_arguments_rest_does_not_include_named_parameters() {
+        assert_eval_true(
+            "function f(a, ...rest) { return a === 1 && rest.length === 2 && rest[0] === 2 && rest[1] === 3; } f(1, 2, 3)",
+        );
+    }
+
+    #[test]
+    fn e2e_rest_parameters_collect_remaining_arguments() {
+        assert_eval_true(
+            "function f(...args) { return args.length === 3 && args[0] === 1 && args[2] === 3; } f(1, 2, 3)",
+        );
+    }
+
+    #[test]
+    fn e2e_rest_parameters_can_be_empty() {
+        assert_eval_true("function f(a, ...rest) { return rest.length === 0; } f(1)");
+    }
+
+    #[test]
+    fn e2e_default_parameters_apply_when_argument_is_undefined() {
+        assert_eval_true("function f(a = 1, b = 2) { return a + b; } f(undefined, 3) === 4");
+    }
+
+    #[test]
+    fn e2e_default_parameters_do_not_override_null() {
+        assert_eval_true("function f(a = 1) { return a; } f(null) === null");
+    }
+
+    #[test]
+    fn e2e_default_parameters_can_reference_earlier_parameters() {
+        assert_eval_true("function f(a, b = a + 1) { return b; } f(4) === 5");
+    }
+
+    #[test]
+    fn e2e_new_function_constructs_callable() {
+        assert_eval_true("new Function('a', 'b', 'return a + b')(20, 22) === 42");
+    }
+
+    #[test]
+    fn e2e_new_function_sets_name_and_length() {
+        assert_eval_true(
+            "var f = new Function('a', 'b', 'return a + b'); f.name === 'anonymous' && f.length === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_new_function_to_string_preserves_source() {
+        assert_eval_true(
+            "new Function('a', 'b', 'return a + b').toString() === 'function anonymous(a,b\\n) {\\nreturn a + b\\n}'",
+        );
     }
 
     // ── BigInt tests ────────────────────────────────────────────────────────

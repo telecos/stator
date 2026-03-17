@@ -1597,7 +1597,9 @@ impl FunctionCompiler {
                     // caller's global environment via StaGlobal so they
                     // survive after the eval frame completes.
                     if let Some(init) = &declarator.init {
-                        self.compile_expr(init)?;
+                        if !self.compile_named_callable_expr(init, &ident.name)? {
+                            self.compile_expr(init)?;
+                        }
                     } else {
                         self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
                     }
@@ -1610,7 +1612,9 @@ impl FunctionCompiler {
                     // the program would read from a stale register while
                     // the callback writes to global_env.
                     if let Some(init) = &declarator.init {
-                        self.compile_expr(init)?;
+                        if !self.compile_named_callable_expr(init, &ident.name)? {
+                            self.compile_expr(init)?;
+                        }
                     } else {
                         self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
                     }
@@ -1631,7 +1635,9 @@ impl FunctionCompiler {
                         self.define_function_scoped_local(&ident.name)
                     };
                     if let Some(init) = &declarator.init {
-                        self.compile_expr(init)?;
+                        if !self.compile_named_callable_expr(init, &ident.name)? {
+                            self.compile_expr(init)?;
+                        }
                         self.emit_star(reg);
                     }
                     // No init → the register already holds `undefined`
@@ -1649,7 +1655,9 @@ impl FunctionCompiler {
                         self.define_local(&ident.name)
                     };
                     if let Some(init) = &declarator.init {
-                        self.compile_expr(init)?;
+                        if !self.compile_named_callable_expr(init, &ident.name)? {
+                            self.compile_expr(init)?;
+                        }
                     } else {
                         self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
                     }
@@ -3566,7 +3574,20 @@ impl FunctionCompiler {
     fn compile_assign(&mut self, a: &crate::parser::ast::AssignExpr) -> StatorResult<()> {
         // For simple assignment, compile RHS and store.
         if a.op == AssignOp::Assign {
-            self.compile_expr(&a.right)?;
+            let inferred_name = match &a.left {
+                AssignTarget::Expr(expr) => match &**expr {
+                    Expr::Ident(id) => Some(id.name.as_str()),
+                    _ => None,
+                },
+                AssignTarget::Pat(_) => None,
+            };
+            if let Some(name) = inferred_name {
+                if !self.compile_named_callable_expr(&a.right, name)? {
+                    self.compile_expr(&a.right)?;
+                }
+            } else {
+                self.compile_expr(&a.right)?;
+            }
             self.compile_assign_target_store(&a.left)?;
             return Ok(());
         }
@@ -4762,6 +4783,58 @@ impl FunctionCompiler {
             vec![Operand::ConstantPoolIdx(pool_idx), slot, Operand::Flag(0)],
         ));
         Ok(())
+    }
+
+    fn compile_arrow_expr_named(&mut self, a: &ArrowExpr, name: &str) -> StatorResult<()> {
+        let body_block = match &a.body {
+            ArrowBody::Block(b) => b.clone(),
+            ArrowBody::Expr(expr) => {
+                use crate::parser::ast::{BlockStmt, ReturnStmt};
+                let loc = expr.loc();
+                BlockStmt {
+                    loc,
+                    body: vec![Stmt::Return(ReturnStmt {
+                        loc,
+                        argument: Some(expr.clone()),
+                    })],
+                }
+            }
+        };
+        let func_array = compile_function_inner(
+            &a.params,
+            &body_block,
+            false,
+            a.is_async,
+            a.is_strict,
+            true,
+            FunctionCompileOptions {
+                self_name: None,
+                private_names: self.private_names.clone(),
+            },
+        )?
+        .with_arrow_flag(true)
+        .with_function_name(name);
+        let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
+        let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
+        self.emit(Instruction::new_unchecked(
+            Opcode::CreateClosure,
+            vec![Operand::ConstantPoolIdx(pool_idx), slot, Operand::Flag(1)],
+        ));
+        Ok(())
+    }
+
+    fn compile_named_callable_expr(&mut self, expr: &Expr, name: &str) -> StatorResult<bool> {
+        match expr {
+            Expr::Fn(f) if f.id.is_none() => {
+                self.compile_fn_expr_named(f, name)?;
+                Ok(true)
+            }
+            Expr::Arrow(a) => {
+                self.compile_arrow_expr_named(a, name)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     /// Compile an arrow function expression.
@@ -6554,7 +6627,11 @@ fn compile_function_inner(
     if !is_arrow {
         // Create the `arguments` object and bind it as a local variable.
         compiler.emit(Instruction::new_unchecked(
-            Opcode::CreateMappedArguments,
+            if is_strict {
+                Opcode::CreateUnmappedArguments
+            } else {
+                Opcode::CreateMappedArguments
+            },
             vec![],
         ));
         let args_reg = compiler.define_local("arguments");
@@ -6595,7 +6672,12 @@ fn compile_function_inner(
             compiler.compile_stmt(stmt)?;
         }
     }
-    let mut ba = compiler.finalize()?;
+    let mut ba = compiler.finalize()?.with_function_length(
+        params
+            .iter()
+            .take_while(|param| param.default.is_none() && !matches!(param.pat, Pat::Rest(_)))
+            .count() as u32,
+    );
     if let Some(reg) = self_name_reg {
         ba = ba.with_self_name_register(reg.0);
     }
