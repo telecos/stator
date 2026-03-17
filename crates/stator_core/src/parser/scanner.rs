@@ -1890,18 +1890,10 @@ pub(crate) fn cook_template_raw(raw: &str) -> Option<String> {
                 }
             }
             Some('\u{2028}') | Some('\u{2029}') => {}
-            // Any other escape after `\` in a template is invalid per spec,
-            // but we treat it as an identity escape for non-tagged templates
-            // (the scanner would have already rejected truly invalid escapes
-            // in strict parsing mode).  For tagged templates the caller
-            // should check validity; we return the identity-escaped char.
-            Some(other) => {
-                // Legacy octal escapes (1-9) → invalid in templates.
-                if other.is_ascii_digit() {
-                    return None;
-                }
-                out.push(other);
-            }
+            // Any other escape after `\` in a template is invalid.  Tagged
+            // templates preserve the raw source text but receive `undefined`
+            // for the cooked segment, so we signal that with `None` here.
+            Some(_other) => return None,
         }
     }
     Some(out)
@@ -2703,6 +2695,8 @@ mod tests {
         assert_eq!(cook_template_raw(r"\xG"), None);
         // Incomplete unicode escape.
         assert_eq!(cook_template_raw(r"\u00G"), None);
+        // Unknown escapes are invalid in template literals.
+        assert_eq!(cook_template_raw(r"\unicode"), None);
     }
 
     #[test]

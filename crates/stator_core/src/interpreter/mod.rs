@@ -1261,9 +1261,6 @@ pub struct InterpreterFrame {
     /// Saved pending-exception message for `SetPendingMessage` (swap pattern
     /// used by `finally` blocks).
     pub pending_message: JsValue,
-    /// Cache of frozen template objects keyed by bytecode offset, used by
-    /// `GetTemplateObject`.
-    pub template_cache: HashMap<u32, JsValue>,
     /// The `new.target` value for this frame.  Set to the constructor function
     /// when invoked via `[[Construct]]`, or `undefined` for normal calls.
     pub new_target: JsValue,
@@ -1318,7 +1315,6 @@ impl InterpreterFrame {
             instructions_executed: 0,
             deadline: None,
             pending_message: JsValue::Undefined,
-            template_cache: HashMap::new(),
             new_target: JsValue::Undefined,
             mono_load_cache: HashMap::new(),
             poly_load_cache: HashMap::new(),
@@ -1628,7 +1624,6 @@ impl Interpreter {
             instructions_executed: 0,
             deadline: None,
             pending_message: JsValue::Undefined,
-            template_cache: std::collections::HashMap::new(),
             new_target: JsValue::Undefined,
             mono_load_cache: std::collections::HashMap::new(),
             poly_load_cache: std::collections::HashMap::new(),
@@ -12870,7 +12865,40 @@ mod tests {
         let mut frame = InterpreterFrame::new(ba, vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::String("tpl".to_string().into()));
-        assert_eq!(frame.template_cache.len(), 1);
+        assert_eq!(frame.bytecode_array.template_cache_len(), 1);
+    }
+
+    #[test]
+    fn test_get_template_object_cache_shared_across_frames() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::GetTemplateObject,
+                    vec![Operand::ConstantPoolIdx(0), Operand::FeedbackSlot(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::TemplateObject {
+                cooked: vec![Some("tpl".to_string())],
+                raw: vec!["tpl".to_string()],
+            }],
+            0,
+            0,
+        );
+        let mut frame1 = InterpreterFrame::new(ba.clone(), vec![]);
+        let result1 = Interpreter::run(&mut frame1).unwrap();
+        let mut frame2 = InterpreterFrame::new(ba, vec![]);
+        let result2 = Interpreter::run(&mut frame2).unwrap();
+
+        match (&result1, &result2) {
+            (JsValue::PlainObject(a), JsValue::PlainObject(b)) => {
+                assert!(
+                    Rc::ptr_eq(a, b),
+                    "template cache should reuse the same object across frames"
+                );
+            }
+            other => panic!("expected plain objects, got {other:?}"),
+        }
     }
 
     // ── SetPendingMessage ───────────────────────────────────────────────

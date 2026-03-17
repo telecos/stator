@@ -46832,8 +46832,193 @@ mod tests {
             "class C { \
                get x() { return 'instance'; } \
                static get x() { return 'static'; } \
-             } \
+              } \
              var c = new C(); c.x === 'instance' && C.x === 'static'",
         );
     }
+
+    fn assert_eval_syntax_error(script: &str) {
+        assert!(matches!(
+            global_eval(script),
+            Err(StatorError::SyntaxError(_))
+        ));
+    }
+
+    macro_rules! template_e2e_test {
+        ($name:ident, $script:expr) => {
+            #[test]
+            fn $name() {
+                assert_eval_true($script);
+            }
+        };
+    }
+
+    // ── Template literal edge cases ──────────────────────────────────────
+
+    template_e2e_test!(
+        e2e_template_nested_basic,
+        r#"`a ${`b ${1}`} d` === 'a b 1 d'"#
+    );
+    template_e2e_test!(
+        e2e_template_nested_deep,
+        r#"`start ${`mid ${`inner ${2}`}`} end` === 'start mid inner 2 end'"#
+    );
+    template_e2e_test!(
+        e2e_template_nested_empty_parts,
+        r#"`x ${`${1}${2}`}` === 'x 12'"#
+    );
+    template_e2e_test!(
+        e2e_template_nested_tag_result,
+        r#"
+        function tag(strings, value) { return strings[0] + value + strings[1]; }
+        `x ${tag`y ${1} z`} q` === 'x y 1 z q'
+        "#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_raw_newline_escape,
+        r#"function tag(strings) { return strings.raw[0] === '\\n'; } tag`\n`"#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_cooked_newline_escape,
+        r#"function tag(strings) { return strings[0] === "\n"; } tag`\n`"#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_raw_unicode_escape,
+        r#"function tag(strings) { return strings.raw[0] === '\\u0041' && strings[0] === 'A'; } tag`\u0041`"#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_raw_backtick_escape,
+        r#"function tag(strings) { return strings.raw[0] === '\\`' && strings[0] === '`'; } tag`\``"#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_raw_empty_segments_single_expr,
+        r#"function tag(strings) { return strings.raw.length === 2 && strings.raw[0] === '' && strings.raw[1] === ''; } tag`${1}`"#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_raw_empty_segments_double_expr,
+        r#"function tag(strings) { return strings.raw.length === 3 && strings.raw[0] === '' && strings.raw[1] === '' && strings.raw[2] === ''; } tag`${1}${2}`"#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_cache_same_site_across_calls,
+        r#"function tag(strings) { return strings; } function same() { return tag`x`; } same() === same()"#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_cache_same_site_with_method_tag,
+        r#"var obj = { tag: function(strings) { return strings; } }; function same() { return obj.tag`x`; } same() === same()"#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_cache_same_site_in_loop,
+        r#"function tag(strings) { return strings; } var first; var ok = true; for (var i = 0; i < 3; i++) { var current = tag`loop`; if (i === 0) { first = current; } else { ok = ok && current === first; } } ok"#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_cache_different_sites_not_equal,
+        r#"function tag(strings) { return strings; } var pair = [tag`a`, tag`b`]; pair[0] !== pair[1]"#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_cache_preserves_frozen_state,
+        r#"function tag(strings) { return Object.isFrozen(strings) && Object.isFrozen(strings.raw); } tag`freeze`"#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_invalid_escape_no_substitution,
+        r#"function tag(strings) { return strings[0] === undefined && strings.raw[0] === '\\unicode'; } tag`\unicode`"#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_invalid_escape_head,
+        r#"function tag(strings, value) { return strings[0] === undefined && strings[1] === '' && strings.raw[0] === '\\unicode' && value === 1; } tag`\unicode${1}`"#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_invalid_escape_middle,
+        r#"function tag(strings, a, b) { return strings[0] === '' && strings[1] === undefined && strings[2] === '' && strings.raw[1] === '\\unicode' && a === 1 && b === 2; } tag`${1}\unicode${2}`"#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_invalid_escape_tail,
+        r#"function tag(strings, value) { return strings[0] === '' && strings[1] === undefined && strings.raw[1] === '\\unicode' && value === 1; } tag`${1}\unicode`"#
+    );
+
+    #[test]
+    fn e2e_untagged_template_invalid_escape_is_syntax_error() {
+        assert_eval_syntax_error(r#"`\unicode`"#);
+    }
+
+    template_e2e_test!(
+        e2e_template_uses_to_string_before_value_of,
+        r#"var obj = { toString: function() { return 'ok'; }, valueOf: function() { return 'bad'; } }; `${obj}` === 'ok'"#
+    );
+    template_e2e_test!(
+        e2e_template_uses_string_hint_for_symbol_to_primitive,
+        r#"var hint = ''; var obj = {}; obj[Symbol.toPrimitive] = function(h) { hint = h; return 'ok'; }; `${obj}` === 'ok' && hint === 'string'"#
+    );
+    template_e2e_test!(
+        e2e_template_interpolates_number_wrapper_via_to_string,
+        r#"`value:${new Number(7)}` === 'value:7'"#
+    );
+    template_e2e_test!(
+        e2e_template_symbol_interpolation_throws_type_error,
+        r#"try { `${Symbol('x')}`; false; } catch (e) { e.name === 'TypeError'; }"#
+    );
+    template_e2e_test!(
+        e2e_template_array_interpolation_uses_string_result,
+        r#"`${[1, 2, 3]}` === '1,2,3'"#
+    );
+    template_e2e_test!(e2e_template_only_expression, r#"`${1}` === '1'"#);
+    template_e2e_test!(
+        e2e_template_two_adjacent_expressions,
+        r#"`${1}${2}` === '12'"#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_empty_parts_single_expression,
+        r#"function tag(strings) { return strings.length === 2 && strings[0] === '' && strings[1] === ''; } tag`${1}`"#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_empty_parts_adjacent_expressions,
+        r#"function tag(strings) { return strings.length === 3 && strings[0] === '' && strings[1] === '' && strings[2] === ''; } tag`${1}${2}`"#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_empty_parts_with_middle_text,
+        r#"function tag(strings) { return strings.raw[0] === '' && strings.raw[1] === 'x' && strings.raw[2] === ''; } tag`${1}x${2}`"#
+    );
+    template_e2e_test!(
+        e2e_template_multiline_literal,
+        "var s = `a\nb`; s === \"a\\nb\""
+    );
+    template_e2e_test!(
+        e2e_template_line_continuation,
+        "var s = `a\\\nb`; s === 'ab'"
+    );
+    template_e2e_test!(
+        e2e_template_nested_multiline,
+        "var s = `a ${`b\\\nc`} d`; s === 'a bc d'"
+    );
+    template_e2e_test!(
+        e2e_string_raw_as_tag_preserves_backslashes,
+        r#"String.raw`\\n` === "\\\\n""#
+    );
+    template_e2e_test!(
+        e2e_string_raw_as_tag_with_substitution,
+        r#"String.raw`a${1}\n` === "a1\\n""#
+    );
+    template_e2e_test!(
+        e2e_string_raw_as_tag_multiline,
+        "String.raw`a\nb` === \"a\\nb\""
+    );
+    template_e2e_test!(
+        e2e_string_raw_tagged_template_empty_segments,
+        r#"String.raw`${1}${2}` === "12""#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_raw_and_cooked_lengths_match,
+        r#"function tag(strings) { return strings.length === 3 && strings.raw.length === 3; } tag`a${1}b${2}c`"#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_raw_preserves_double_backslash,
+        r#"function tag(strings) { return strings.raw[0] === '\\\\' && strings[0] === '\\'; } tag`\\`"#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_nested_cache_identity,
+        r#"function tag(strings) { return strings; } function outer() { return tag`${tag`x` === tag`x`}`; } outer() === outer()"#
+    );
+    template_e2e_test!(
+        e2e_tagged_template_nested_invalid_escape_still_preserves_raw,
+        r#"function tag(strings) { return strings.raw[0] === '\\unicode' && strings[0] === undefined; } (function () { return tag`\unicode`; })()"#
+    );
 }
