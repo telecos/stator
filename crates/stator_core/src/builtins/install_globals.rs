@@ -159,14 +159,28 @@ fn native(f: impl Fn(Vec<JsValue>) -> StatorResult<JsValue> + 'static) -> JsValu
 /// Extract a stable identity key from a JsValue for use in weak collections.
 ///
 /// Returns `Some(usize)` for object-like values (`Object`, `PlainObject`,
-/// `Function`, `NativeFunction`) that have heap identity, or `None` for
-/// primitives which cannot be weak collection keys.
+/// `Function`, `NativeFunction`) that have heap identity, and for
+/// **non-registered** symbols (ES2023).  Registered symbols created via
+/// `Symbol.for()` are rejected (returns `None`) because they are shared
+/// across realms and thus violate weak-collection invariants.
+///
+/// Returns `None` for all other primitives.
 fn weak_collection_key(val: &JsValue) -> Option<usize> {
     match val {
         JsValue::Object(ptr) => Some(*ptr as usize),
         JsValue::PlainObject(rc) => Some(Rc::as_ptr(rc) as usize),
         JsValue::Function(rc) => Some(Rc::as_ptr(rc) as usize),
         JsValue::NativeFunction(rc) => Some(Rc::as_ptr(rc) as *const () as usize),
+        // ES2023: non-registered symbols are valid weak collection keys.
+        // Registered symbols (Symbol.for) are shared/immortal — reject them.
+        JsValue::Symbol(id) => {
+            if symbol_key_for(*id).is_some() {
+                None
+            } else {
+                // Tag with high bit to avoid collision with pointer addresses.
+                Some((*id as usize) | (1usize << 63))
+            }
+        }
         _ => None,
     }
 }
@@ -8438,7 +8452,7 @@ fn make_weak_map_builtin() -> JsValue {
 
     props.insert(
         "__call__".into(),
-        native(|_args| {
+        native(|args| {
             let inner: Rc<RefCell<HashMap<usize, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
             let obj_rc: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
             {
@@ -8576,6 +8590,25 @@ fn make_weak_map_builtin() -> JsValue {
                 );
                 obj.make_all_non_enumerable();
             }
+
+            // §24.3.1.1 step 5–8: populate from iterable argument
+            let iterable = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if !matches!(iterable, JsValue::Undefined | JsValue::Null) {
+                let (elements, _) = to_array_like_elements(&iterable);
+                for item in &elements {
+                    let (pair, _) = to_array_like_elements(item);
+                    let k = pair.first().cloned().unwrap_or(JsValue::Undefined);
+                    let v = pair.get(1).cloned().unwrap_or(JsValue::Undefined);
+                    if let Some(id) = weak_collection_key(&k) {
+                        inner.borrow_mut().insert(id, v);
+                    } else {
+                        return Err(StatorError::TypeError(
+                            "Invalid value used as weak map key".into(),
+                        ));
+                    }
+                }
+            }
+
             Ok(JsValue::PlainObject(obj_rc))
         }),
     );
@@ -8636,7 +8669,7 @@ fn make_weak_set_builtin() -> JsValue {
 
     props.insert(
         "__call__".into(),
-        native(|_args| {
+        native(|args| {
             let inner: Rc<RefCell<HashSet<usize>>> = Rc::new(RefCell::new(HashSet::new()));
             let obj_rc: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
             {
@@ -8660,7 +8693,7 @@ fn make_weak_set_builtin() -> JsValue {
                                 Ok(JsValue::PlainObject(Rc::clone(&self_ref)))
                             } else {
                                 Err(StatorError::TypeError(
-                                    "Invalid value used as weak set key".into(),
+                                    "Invalid value used in weak set".into(),
                                 ))
                             }
                         }),
@@ -8705,6 +8738,22 @@ fn make_weak_set_builtin() -> JsValue {
                 );
                 obj.make_all_non_enumerable();
             }
+
+            // §24.4.1.1 step 5–8: populate from iterable argument
+            let iterable = args.first().cloned().unwrap_or(JsValue::Undefined);
+            if !matches!(iterable, JsValue::Undefined | JsValue::Null) {
+                let (elements, _) = to_array_like_elements(&iterable);
+                for item in &elements {
+                    if let Some(key) = weak_collection_key(item) {
+                        inner.borrow_mut().insert(key);
+                    } else {
+                        return Err(StatorError::TypeError(
+                            "Invalid value used in weak set".into(),
+                        ));
+                    }
+                }
+            }
+
             Ok(JsValue::PlainObject(obj_rc))
         }),
     );
@@ -19995,6 +20044,642 @@ mod tests {
     #[test]
     fn e2e_weakset_no_size_property() {
         let r = global_eval("var ws = new WeakSet(); ws.size === undefined").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    // ── WeakMap conformance (constructor, key validation, Symbol keys) ────────
+
+    #[test]
+    fn e2e_weakmap_constructor_from_iterable() {
+        let r = global_eval(
+            r#"
+            var a = {};
+            var b = {};
+            var wm = new WeakMap([[a, 1], [b, 2]]);
+            wm.get(a) === 1 && wm.get(b) === 2
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_constructor_empty_array() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap([]);
+            typeof wm === "object"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_constructor_null_is_empty() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap(null);
+            typeof wm === "object"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_constructor_undefined_is_empty() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap(undefined);
+            typeof wm === "object"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_constructor_rejects_non_object_key_in_iterable() {
+        let r = global_eval(
+            r#"
+            var threw = false;
+            try { new WeakMap([[42, "val"]]); } catch(e) { threw = true; }
+            threw
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_set_rejects_string_key() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            var threw = false;
+            try { wm.set("hello", 1); } catch(e) { threw = true; }
+            threw
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_set_rejects_number_key() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            var threw = false;
+            try { wm.set(3.14, 1); } catch(e) { threw = true; }
+            threw
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_set_rejects_boolean_key() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            var threw = false;
+            try { wm.set(true, 1); } catch(e) { threw = true; }
+            threw
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_set_rejects_null_key() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            var threw = false;
+            try { wm.set(null, 1); } catch(e) { threw = true; }
+            threw
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_set_rejects_undefined_key() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            var threw = false;
+            try { wm.set(undefined, 1); } catch(e) { threw = true; }
+            threw
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_has_returns_false_for_non_object() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            wm.has(42) === false && wm.has("s") === false && wm.has(null) === false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_get_returns_undefined_for_non_object() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            wm.get(42) === undefined && wm.get("s") === undefined
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_delete_returns_false_for_non_object() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            wm.delete(42) === false && wm.delete("s") === false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_set_returns_weakmap() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            var key = {};
+            var ret = wm.set(key, 1);
+            ret === wm
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_overwrite_value() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            var key = {};
+            wm.set(key, 1);
+            wm.set(key, 2);
+            wm.get(key) === 2
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_function_key() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            var fn1 = function() {};
+            wm.set(fn1, "ok");
+            wm.get(fn1) === "ok"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_symbol_key_unregistered() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            var s = Symbol("myKey");
+            wm.set(s, "val");
+            wm.has(s) === true && wm.get(s) === "val"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_symbol_key_registered_rejected() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            var s = Symbol.for("shared");
+            var threw = false;
+            try { wm.set(s, 1); } catch(e) { threw = true; }
+            threw
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_symbol_key_delete() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            var s = Symbol("del");
+            wm.set(s, 99);
+            var a = wm.delete(s);
+            var b = wm.has(s);
+            a === true && b === false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_has_registered_symbol_returns_false() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            wm.has(Symbol.for("x")) === false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_prototype_constructor() {
+        let r = global_eval("WeakMap.prototype.constructor === WeakMap").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    // ── WeakSet conformance (constructor, value validation, Symbol values) ────
+
+    #[test]
+    fn e2e_weakset_constructor_from_iterable() {
+        let r = global_eval(
+            r#"
+            var a = {};
+            var b = {};
+            var ws = new WeakSet([a, b]);
+            ws.has(a) === true && ws.has(b) === true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_constructor_empty_array() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet([]);
+            typeof ws === "object"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_constructor_null_is_empty() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet(null);
+            typeof ws === "object"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_constructor_undefined_is_empty() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet(undefined);
+            typeof ws === "object"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_constructor_rejects_non_object_in_iterable() {
+        let r = global_eval(
+            r#"
+            var threw = false;
+            try { new WeakSet([42]); } catch(e) { threw = true; }
+            threw
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_add_rejects_string() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet();
+            var threw = false;
+            try { ws.add("hello"); } catch(e) { threw = true; }
+            threw
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_add_rejects_number() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet();
+            var threw = false;
+            try { ws.add(123); } catch(e) { threw = true; }
+            threw
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_add_rejects_boolean() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet();
+            var threw = false;
+            try { ws.add(false); } catch(e) { threw = true; }
+            threw
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_add_rejects_null() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet();
+            var threw = false;
+            try { ws.add(null); } catch(e) { threw = true; }
+            threw
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_add_rejects_undefined() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet();
+            var threw = false;
+            try { ws.add(undefined); } catch(e) { threw = true; }
+            threw
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_has_returns_false_for_non_object() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet();
+            ws.has(42) === false && ws.has("s") === false && ws.has(null) === false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_delete_returns_false_for_non_object() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet();
+            ws.delete(42) === false && ws.delete("s") === false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_add_returns_weakset() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet();
+            var obj = {};
+            var ret = ws.add(obj);
+            ret === ws
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_add_duplicate_is_noop() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet();
+            var obj = {};
+            ws.add(obj);
+            ws.add(obj);
+            ws.has(obj) === true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_function_value() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet();
+            var fn1 = function() {};
+            ws.add(fn1);
+            ws.has(fn1) === true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_symbol_unregistered() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet();
+            var s = Symbol("test");
+            ws.add(s);
+            ws.has(s) === true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_symbol_registered_rejected() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet();
+            var s = Symbol.for("shared");
+            var threw = false;
+            try { ws.add(s); } catch(e) { threw = true; }
+            threw
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_symbol_delete() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet();
+            var s = Symbol("del");
+            ws.add(s);
+            var a = ws.delete(s);
+            var b = ws.has(s);
+            a === true && b === false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_has_registered_symbol_returns_false() {
+        let r = global_eval(
+            r#"
+            var ws = new WeakSet();
+            ws.has(Symbol.for("x")) === false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_prototype_constructor() {
+        let r = global_eval("WeakSet.prototype.constructor === WeakSet").unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_multiple_symbol_keys() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            var s1 = Symbol("a");
+            var s2 = Symbol("b");
+            wm.set(s1, 10);
+            wm.set(s2, 20);
+            wm.get(s1) === 10 && wm.get(s2) === 20
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_constructor_with_symbol_iterable() {
+        let r = global_eval(
+            r#"
+            var s1 = Symbol("x");
+            var s2 = Symbol("y");
+            var ws = new WeakSet([s1, s2]);
+            ws.has(s1) && ws.has(s2)
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_constructor_with_symbol_key_iterable() {
+        let r = global_eval(
+            r#"
+            var s = Symbol("k");
+            var wm = new WeakMap([[s, "v"]]);
+            wm.get(s) === "v"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_constructor_rejects_registered_symbol_in_iterable() {
+        let r = global_eval(
+            r#"
+            var threw = false;
+            try { new WeakMap([[Symbol.for("bad"), 1]]); } catch(e) { threw = true; }
+            threw
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakset_constructor_rejects_registered_symbol_in_iterable() {
+        let r = global_eval(
+            r#"
+            var threw = false;
+            try { new WeakSet([Symbol.for("bad")]); } catch(e) { threw = true; }
+            threw
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_get_unregistered_symbol_returns_undefined() {
+        let r = global_eval(
+            r#"
+            var wm = new WeakMap();
+            wm.get(Symbol("nope")) === undefined
+            "#,
+        )
+        .unwrap();
+        assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_weakmap_constructor_later_pair_overwrites() {
+        let r = global_eval(
+            r#"
+            var key = {};
+            var wm = new WeakMap([[key, 1], [key, 2]]);
+            wm.get(key) === 2
+            "#,
+        )
+        .unwrap();
         assert_eq!(r, JsValue::Boolean(true));
     }
 
