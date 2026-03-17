@@ -852,7 +852,7 @@ mod tests {
         assert_eq!(number_to_fixed(3.14159, 2).unwrap(), "3.14");
         assert_eq!(number_to_fixed(1.0, 0).unwrap(), "1");
         assert_eq!(number_to_fixed(1.005, 2).unwrap(), "1.00");
-        assert_eq!(number_to_fixed(0.615, 2).unwrap(), "0.62");
+        assert_eq!(number_to_fixed(0.615, 2).unwrap(), "0.61");
     }
 
     #[test]

@@ -19874,6 +19874,401 @@ mod tests {
     }
 
     #[test]
+    fn e2e_number_to_fixed_rounds_binary_edge_down() {
+        assert_eval_true("(0.615).toFixed(2) === '0.61'");
+    }
+
+    #[test]
+    fn e2e_number_to_fixed_rounds_binary_edge_to_even_string_output() {
+        assert_eval_true("(1.005).toFixed(2) === '1.00'");
+    }
+
+    #[test]
+    fn e2e_number_to_fixed_rounds_half_up_for_exact_tenths() {
+        assert_eval_true("(2.35).toFixed(1) === '2.4'");
+    }
+
+    #[test]
+    fn e2e_number_to_fixed_zero_digits_rounds_half_up() {
+        assert_eval_true("(2.5).toFixed(0) === '3'");
+    }
+
+    #[test]
+    fn e2e_number_to_fixed_negative_half_rounds_away_from_zero() {
+        assert_eval_true("(-2.5).toFixed(0) === '-3'");
+    }
+
+    #[test]
+    fn e2e_number_to_fixed_preserves_large_number_format_cutoff() {
+        assert_eval_true("(1e21).toFixed(2) === '1e+21'");
+    }
+
+    #[test]
+    fn e2e_number_to_fixed_negative_zero_has_no_sign() {
+        assert_eval_true("(-0).toFixed(3) === '0.000'");
+    }
+
+    #[test]
+    fn e2e_number_to_fixed_nan_formats_as_nan() {
+        assert_eval_true("(NaN).toFixed(2) === 'NaN'");
+    }
+
+    #[test]
+    fn e2e_number_to_fixed_positive_infinity_formats_as_infinity() {
+        assert_eval_true("(Infinity).toFixed(2) === 'Infinity'");
+    }
+
+    #[test]
+    fn e2e_number_to_fixed_negative_infinity_formats_as_infinity() {
+        assert_eval_true("(-Infinity).toFixed(2) === '-Infinity'");
+    }
+
+    #[test]
+    fn e2e_number_to_precision_switches_to_exponential_below_negative_six() {
+        assert_eval_true("(1e-7).toPrecision(1) === '1e-7'");
+    }
+
+    #[test]
+    fn e2e_number_to_precision_stays_fixed_at_negative_six() {
+        assert_eval_true("(1e-6).toPrecision(1) === '0.000001'");
+    }
+
+    #[test]
+    fn e2e_number_to_precision_uses_exponential_at_precision_boundary() {
+        assert_eval_true("(100).toPrecision(1) === '1e+2'");
+    }
+
+    #[test]
+    fn e2e_number_to_precision_zero_pads_zero() {
+        assert_eval_true("(0).toPrecision(4) === '0.000'");
+    }
+
+    #[test]
+    fn e2e_number_to_precision_rounds_significant_digits() {
+        assert_eval_true("(12.5).toPrecision(2) === '13'");
+    }
+
+    #[test]
+    fn e2e_number_to_precision_formats_small_fraction() {
+        assert_eval_true("(0.000123).toPrecision(2) === '0.00012'");
+    }
+
+    #[test]
+    fn e2e_number_to_precision_preserves_sign() {
+        assert_eval_true("(-0.000123).toPrecision(2) === '-0.00012'");
+    }
+
+    #[test]
+    fn e2e_number_to_precision_without_argument_uses_default_string() {
+        assert_eval_true("(12.34).toPrecision() === '12.34'");
+    }
+
+    #[test]
+    fn e2e_number_to_precision_nan_formats_as_nan() {
+        assert_eval_true("(NaN).toPrecision(3) === 'NaN'");
+    }
+
+    #[test]
+    fn e2e_number_to_precision_positive_infinity_formats_as_infinity() {
+        assert_eval_true("(Infinity).toPrecision(3) === 'Infinity'");
+    }
+
+    #[test]
+    fn e2e_number_to_precision_negative_infinity_formats_as_infinity() {
+        assert_eval_true("(-Infinity).toPrecision(3) === '-Infinity'");
+    }
+
+    #[test]
+    fn e2e_number_to_exponential_rounds_fraction_digits() {
+        assert_eval_true("(1.25).toExponential(1) === '1.3e+0'");
+    }
+
+    #[test]
+    fn e2e_number_to_exponential_carries_into_exponent() {
+        assert_eval_true("(99.5).toExponential(1) === '1.0e+2'");
+    }
+
+    #[test]
+    fn e2e_number_to_exponential_formats_zero() {
+        assert_eval_true("(0).toExponential(2) === '0.00e+0'");
+    }
+
+    #[test]
+    fn e2e_number_to_exponential_formats_negative_zero_without_sign() {
+        assert_eval_true("(-0).toExponential(2) === '0.00e+0'");
+    }
+
+    #[test]
+    fn e2e_number_to_exponential_formats_small_numbers() {
+        assert_eval_true("(0.001).toExponential(2) === '1.00e-3'");
+    }
+
+    #[test]
+    fn e2e_number_to_exponential_without_argument_uses_minimal_digits() {
+        assert_eval_true("(123456).toExponential() === '1.23456e+5'");
+    }
+
+    #[test]
+    fn e2e_number_to_exponential_nan_formats_as_nan() {
+        assert_eval_true("(NaN).toExponential(2) === 'NaN'");
+    }
+
+    #[test]
+    fn e2e_number_to_exponential_positive_infinity_formats_as_infinity() {
+        assert_eval_true("(Infinity).toExponential(2) === 'Infinity'");
+    }
+
+    #[test]
+    fn e2e_number_to_exponential_negative_infinity_formats_as_infinity() {
+        assert_eval_true("(-Infinity).toExponential(2) === '-Infinity'");
+    }
+
+    #[test]
+    fn e2e_math_round_half_toward_positive_infinity() {
+        assert_eval_true("Math.round(0.5) === 1");
+    }
+
+    #[test]
+    fn e2e_math_round_negative_half_produces_negative_zero() {
+        assert_eval_true("Math.round(-0.5) === 0 && 1 / Math.round(-0.5) === -Infinity");
+    }
+
+    #[test]
+    fn e2e_math_round_negative_one_point_five_rounds_up_toward_positive_infinity() {
+        assert_eval_true("Math.round(-1.5) === -1");
+    }
+
+    #[test]
+    fn e2e_math_round_nan_propagates() {
+        assert_eval_true("Number.isNaN(Math.round(NaN))");
+    }
+
+    #[test]
+    fn e2e_math_round_positive_infinity_stays_infinite() {
+        assert_eval_true("Math.round(Infinity) === Infinity");
+    }
+
+    #[test]
+    fn e2e_math_round_negative_infinity_stays_infinite() {
+        assert_eval_true("Math.round(-Infinity) === -Infinity");
+    }
+
+    #[test]
+    fn e2e_math_trunc_positive_value() {
+        assert_eval_true("Math.trunc(13.9) === 13");
+    }
+
+    #[test]
+    fn e2e_math_trunc_negative_value() {
+        assert_eval_true("Math.trunc(-13.9) === -13");
+    }
+
+    #[test]
+    fn e2e_math_trunc_negative_fraction_produces_negative_zero() {
+        assert_eval_true("Math.trunc(-0.123) === 0 && 1 / Math.trunc(-0.123) === -Infinity");
+    }
+
+    #[test]
+    fn e2e_math_trunc_positive_infinity_stays_infinite() {
+        assert_eval_true("Math.trunc(Infinity) === Infinity");
+    }
+
+    #[test]
+    fn e2e_math_trunc_nan_propagates() {
+        assert_eval_true("Number.isNaN(Math.trunc(NaN))");
+    }
+
+    #[test]
+    fn e2e_math_sign_negative_zero_is_negative_zero() {
+        assert_eval_true("Math.sign(-0) === 0 && 1 / Math.sign(-0) === -Infinity");
+    }
+
+    #[test]
+    fn e2e_math_sign_positive_zero_is_positive_zero() {
+        assert_eval_true("Math.sign(0) === 0 && 1 / Math.sign(0) === Infinity");
+    }
+
+    #[test]
+    fn e2e_math_sign_negative_number_is_minus_one() {
+        assert_eval_true("Math.sign(-3) === -1");
+    }
+
+    #[test]
+    fn e2e_math_sign_positive_infinity_is_positive_one() {
+        assert_eval_true("Math.sign(Infinity) === 1");
+    }
+
+    #[test]
+    fn e2e_math_sign_nan_propagates() {
+        assert_eval_true("Number.isNaN(Math.sign(NaN))");
+    }
+
+    #[test]
+    fn e2e_math_cbrt_positive_cube() {
+        assert_eval_true("Math.cbrt(27) === 3");
+    }
+
+    #[test]
+    fn e2e_math_cbrt_negative_cube() {
+        assert_eval_true("Math.cbrt(-8) === -2");
+    }
+
+    #[test]
+    fn e2e_math_cbrt_negative_zero_is_negative_zero() {
+        assert_eval_true("Math.cbrt(-0) === 0 && 1 / Math.cbrt(-0) === -Infinity");
+    }
+
+    #[test]
+    fn e2e_math_cbrt_positive_infinity_stays_infinite() {
+        assert_eval_true("Math.cbrt(Infinity) === Infinity");
+    }
+
+    #[test]
+    fn e2e_math_cbrt_nan_propagates() {
+        assert_eval_true("Number.isNaN(Math.cbrt(NaN))");
+    }
+
+    #[test]
+    fn e2e_math_log2_power_of_two() {
+        assert_eval_true("Math.log2(8) === 3");
+    }
+
+    #[test]
+    fn e2e_math_log2_negative_zero_is_negative_infinity() {
+        assert_eval_true("Math.log2(-0) === -Infinity");
+    }
+
+    #[test]
+    fn e2e_math_log2_negative_input_is_nan() {
+        assert_eval_true("Number.isNaN(Math.log2(-1))");
+    }
+
+    #[test]
+    fn e2e_math_log2_positive_infinity_stays_infinite() {
+        assert_eval_true("Math.log2(Infinity) === Infinity");
+    }
+
+    #[test]
+    fn e2e_math_log10_power_of_ten() {
+        assert_eval_true("Math.log10(1000) === 3");
+    }
+
+    #[test]
+    fn e2e_math_log10_negative_zero_is_negative_infinity() {
+        assert_eval_true("Math.log10(-0) === -Infinity");
+    }
+
+    #[test]
+    fn e2e_math_log10_negative_input_is_nan() {
+        assert_eval_true("Number.isNaN(Math.log10(-1))");
+    }
+
+    #[test]
+    fn e2e_math_log10_positive_infinity_stays_infinite() {
+        assert_eval_true("Math.log10(Infinity) === Infinity");
+    }
+
+    #[test]
+    fn e2e_math_clz32_of_one_is_thirty_one() {
+        assert_eval_true("Math.clz32(1) === 31");
+    }
+
+    #[test]
+    fn e2e_math_clz32_of_zero_is_thirty_two() {
+        assert_eval_true("Math.clz32(0) === 32");
+    }
+
+    #[test]
+    fn e2e_math_clz32_of_negative_one_wraps_to_zero_leading_zeros() {
+        assert_eval_true("Math.clz32(-1) === 0");
+    }
+
+    #[test]
+    fn e2e_math_clz32_truncates_fractional_input() {
+        assert_eval_true("Math.clz32(1.5) === 31");
+    }
+
+    #[test]
+    fn e2e_math_fround_rounds_to_float32() {
+        assert_eval_true("Math.fround(1.337) === 1.3370000123977661");
+    }
+
+    #[test]
+    fn e2e_math_fround_overflow_becomes_infinity() {
+        assert_eval_true("Math.fround(1e40) === Infinity");
+    }
+
+    #[test]
+    fn e2e_math_fround_negative_zero_is_negative_zero() {
+        assert_eval_true("Math.fround(-0) === 0 && 1 / Math.fround(-0) === -Infinity");
+    }
+
+    #[test]
+    fn e2e_math_fround_nan_propagates() {
+        assert_eval_true("Number.isNaN(Math.fround(NaN))");
+    }
+
+    #[test]
+    fn e2e_math_imul_basic_product() {
+        assert_eval_true("Math.imul(3, 4) === 12");
+    }
+
+    #[test]
+    fn e2e_math_imul_wraps_like_i32() {
+        assert_eval_true("Math.imul(0xffffffff, 5) === -5");
+    }
+
+    #[test]
+    fn e2e_math_imul_nan_coerces_to_zero() {
+        assert_eval_true("Math.imul(NaN, 5) === 0");
+    }
+
+    #[test]
+    fn e2e_math_hypot_basic_triangle() {
+        assert_eval_true("Math.hypot(3, 4) === 5");
+    }
+
+    #[test]
+    fn e2e_math_hypot_empty_arguments_returns_zero() {
+        assert_eval_true("Math.hypot() === 0");
+    }
+
+    #[test]
+    fn e2e_math_hypot_infinity_wins_over_nan() {
+        assert_eval_true("Math.hypot(Infinity, NaN) === Infinity");
+    }
+
+    #[test]
+    fn e2e_math_hypot_nan_propagates_without_infinity() {
+        assert_eval_true("Number.isNaN(Math.hypot(NaN))");
+    }
+
+    #[test]
+    fn e2e_math_hypot_avoids_overflow_for_large_inputs() {
+        assert_eval_true("Math.hypot(1e308, 1e308) > 1e308 && Math.hypot(1e308, 1e308) < Infinity");
+    }
+
+    #[test]
+    fn e2e_math_hypot_avoids_underflow_for_tiny_inputs() {
+        assert_eval_true("Math.hypot(1e-300, 1e-300) > 0");
+    }
+
+    #[test]
+    fn e2e_number_epsilon_matches_spec_value() {
+        assert_eval_true("Number.EPSILON === 2.220446049250313e-16");
+    }
+
+    #[test]
+    fn e2e_number_max_safe_integer_matches_spec_value() {
+        assert_eval_true("Number.MAX_SAFE_INTEGER === 9007199254740991");
+    }
+
+    #[test]
+    fn e2e_number_min_safe_integer_matches_spec_value() {
+        assert_eval_true("Number.MIN_SAFE_INTEGER === -9007199254740991");
+    }
+
+    #[test]
     fn e2e_encode_uri_preserves_reserved_delimiters() {
         let result = global_eval("encodeURI('https://example.com/a b?x=1&y=2#hash')").unwrap();
         assert_eq!(
