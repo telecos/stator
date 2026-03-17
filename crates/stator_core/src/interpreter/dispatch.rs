@@ -1250,6 +1250,9 @@ fn handle_call_any_receiver(
                         Rc::clone(&ctx.frame.global_env),
                     );
                     restore_closure_context(&mut callee_frame, &ba);
+                    if ba.is_arrow() {
+                        callee_frame.new_target = ctx.frame.new_target.clone();
+                    }
                     populate_self_name(&mut callee_frame, &ba, &callee_val);
                     push_call_frame("<anonymous>")?;
                     let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
@@ -1432,6 +1435,9 @@ fn handle_call_undefined_receiver0(
                         Rc::clone(&ctx.frame.global_env),
                     );
                     restore_closure_context(&mut callee_frame, &ba);
+                    if ba.is_arrow() {
+                        callee_frame.new_target = ctx.frame.new_target.clone();
+                    }
                     populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                     push_call_frame("<anonymous>")?;
                     let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
@@ -1531,6 +1537,9 @@ fn handle_call_undefined_receiver1(
                         Rc::clone(&ctx.frame.global_env),
                     );
                     restore_closure_context(&mut callee_frame, &ba);
+                    if ba.is_arrow() {
+                        callee_frame.new_target = ctx.frame.new_target.clone();
+                    }
                     populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                     push_call_frame("<anonymous>")?;
                     let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
@@ -1639,6 +1648,9 @@ fn handle_call_undefined_receiver2(
                         Rc::clone(&ctx.frame.global_env),
                     );
                     restore_closure_context(&mut callee_frame, &ba);
+                    if ba.is_arrow() {
+                        callee_frame.new_target = ctx.frame.new_target.clone();
+                    }
                     populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                     push_call_frame("<anonymous>")?;
                     let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
@@ -1734,6 +1746,9 @@ fn handle_call_property(
                     Rc::clone(&ctx.frame.global_env),
                 );
                 restore_closure_context(&mut callee_frame, &ba);
+                if ba.is_arrow() {
+                    callee_frame.new_target = ctx.frame.new_target.clone();
+                }
                 populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                 // Arrow functions use lexical `this` — do NOT override.
                 if !ba.is_arrow() {
@@ -2084,6 +2099,7 @@ fn construct_class_from_plain_object(
     };
 
     // Helper closure: run the field initializer on the given `this` value.
+    let new_target = callee_frame.new_target.clone();
     let run_field_init = |env: &Rc<RefCell<std::collections::HashMap<String, JsValue>>>,
                           this: &JsValue|
      -> StatorResult<()> {
@@ -2096,6 +2112,11 @@ fn construct_class_from_plain_object(
                 Rc::clone(env),
             );
             restore_closure_context(&mut init_frame, &init_ba);
+            init_frame.new_target = new_target.clone();
+            init_frame
+                .global_env
+                .borrow_mut()
+                .insert("this".to_string(), this.clone());
             push_call_frame("<field_init>")?;
             let _ =
                 stacker::maybe_grow(64 * 1024, 1024 * 1024, || Interpreter::run(&mut init_frame));
@@ -6107,6 +6128,14 @@ fn handle_create_class(
     class_obj.borrow_mut().insert(
         "__call__".to_string(),
         JsValue::Function(Rc::clone(&ctor_ba_rc)),
+    );
+    let ctor_name = ctor_ba_rc.function_name().to_string();
+    class_obj
+        .borrow_mut()
+        .insert("name".to_string(), JsValue::String(ctor_name.into()));
+    class_obj.borrow_mut().insert(
+        "length".to_string(),
+        JsValue::Smi(ctor_ba_rc.function_length() as i32),
     );
     class_obj
         .borrow_mut()

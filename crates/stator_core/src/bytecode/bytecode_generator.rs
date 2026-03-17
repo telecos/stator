@@ -160,6 +160,18 @@ struct LocalBinding {
     needs_tdz_check: bool,
 }
 
+#[derive(Clone)]
+struct PrivateNameBinding {
+    storage_key: String,
+    brand_key: Option<String>,
+}
+
+#[derive(Default)]
+struct FunctionCompileOptions {
+    self_name: Option<String>,
+    private_names: HashMap<String, PrivateNameBinding>,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // FunctionCompiler
 // ─────────────────────────────────────────────────────────────────────────────
@@ -264,6 +276,11 @@ struct FunctionCompiler {
     optional_chain_null_label: Option<usize>,
     /// Nesting depth of active `with` statements.
     with_depth: usize,
+    /// Private names visible in the current class scope, keyed by source name
+    /// without the leading `#`.
+    private_names: HashMap<String, PrivateNameBinding>,
+    /// Monotonic counter used to mint unique private storage/brand names.
+    next_private_name_id: u32,
 }
 
 impl FunctionCompiler {
@@ -309,6 +326,8 @@ impl FunctionCompiler {
             finally_stack: Vec::new(),
             optional_chain_null_label: None,
             with_depth: 0,
+            private_names: HashMap::new(),
+            next_private_name_id: 0,
         };
         // Register simple ident params in the scope immediately; complex
         // patterns are handled by `emit_param_prologue`.
@@ -820,6 +839,60 @@ impl FunctionCompiler {
         let idx = self.constant_pool.len() as u32;
         self.constant_pool.push(entry);
         idx
+    }
+
+    fn resolve_private_binding(&self, name: &str) -> Option<&PrivateNameBinding> {
+        self.private_names.get(name)
+    }
+
+    fn resolve_private_storage_key(&self, name: &str) -> String {
+        self.resolve_private_binding(name)
+            .map(|binding| binding.storage_key.clone())
+            .unwrap_or_else(|| format!("#{name}"))
+    }
+
+    fn resolve_private_brand_key(&self, name: &str) -> String {
+        self.resolve_private_binding(name)
+            .and_then(|binding| binding.brand_key.clone())
+            .unwrap_or_else(|| self.resolve_private_storage_key(name))
+    }
+
+    fn build_class_private_names(
+        &mut self,
+        body: &crate::parser::ast::ClassBody,
+    ) -> HashMap<String, PrivateNameBinding> {
+        use crate::parser::ast::{ClassMember, PropKey};
+
+        let mut private_names = HashMap::new();
+        for member in &body.body {
+            let (name, is_static) = match member {
+                ClassMember::Method(method) => match &method.key {
+                    PropKey::Private(id) => (&id.name, method.is_static),
+                    _ => continue,
+                },
+                ClassMember::Property(prop) => match &prop.key {
+                    PropKey::Private(id) => (&id.name, prop.is_static),
+                    _ => continue,
+                },
+                ClassMember::StaticBlock(_) => continue,
+            };
+
+            private_names.entry(name.clone()).or_insert_with(|| {
+                let private_id = self.next_private_name_id;
+                self.next_private_name_id += 1;
+                let storage_key = format!(".private.{private_id}.{name}");
+                let brand_key = if is_static {
+                    None
+                } else {
+                    Some(format!(".private.brand.{private_id}.{name}"))
+                };
+                PrivateNameBinding {
+                    storage_key,
+                    brand_key,
+                }
+            });
+        }
+        private_names
     }
 
     // ── Finally inlining ────────────────────────────────────────────────────
@@ -1698,14 +1771,16 @@ impl FunctionCompiler {
     /// On return the accumulator holds the class constructor.
     fn compile_class(
         &mut self,
-        _id: Option<&crate::parser::ast::Ident>,
+        id: Option<&crate::parser::ast::Ident>,
         super_class: Option<&Expr>,
         body: &crate::parser::ast::ClassBody,
     ) -> StatorResult<()> {
         use crate::parser::ast::{ClassMember, MethodKind};
 
         let outer_strict = self.is_strict;
+        let outer_private_names = self.private_names.clone();
         self.is_strict = true;
+        self.private_names = self.build_class_private_names(body);
 
         // 1. Evaluate superclass (or load undefined) into a register.
         let super_reg = self.allocator.allocate_temporary();
@@ -1722,12 +1797,13 @@ impl FunctionCompiler {
             _ => None,
         });
         let ctor_array = if let Some(ctor) = ctor_method {
-            compile_function(
+            compile_function_with_private_names(
                 &ctor.value.params,
                 &ctor.value.body,
                 false,
                 false,
                 ctor.value.is_strict,
+                self.private_names.clone(),
             )?
         } else if super_class.is_some() {
             self.compile_default_derived_constructor(body.loc)?
@@ -1737,6 +1813,11 @@ impl FunctionCompiler {
                 body: vec![],
             };
             compile_function(&[], &empty_body, false, false, true)?
+        };
+        let ctor_array = if let Some(id) = id {
+            ctor_array.with_function_name(&id.name)
+        } else {
+            ctor_array
         };
         let ctor_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(ctor_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
@@ -1793,7 +1874,11 @@ impl FunctionCompiler {
                 _ => None,
             })
             .collect();
-        if !instance_fields.is_empty() {
+        let has_instance_private_names = self
+            .private_names
+            .values()
+            .any(|binding| binding.brand_key.is_some());
+        if !instance_fields.is_empty() || has_instance_private_names {
             self.compile_instance_field_initializer(class_reg, &instance_fields)?;
         }
 
@@ -1812,6 +1897,7 @@ impl FunctionCompiler {
             .map_err(|e| StatorError::Internal(e.to_string()))?;
 
         self.is_strict = outer_strict;
+        self.private_names = outer_private_names;
         Ok(())
     }
 
@@ -1876,7 +1962,7 @@ impl FunctionCompiler {
                     Some(n.raw.clone())
                 }
             }
-            PropKey::Private(id) => Some(format!("#{}", id.name)),
+            PropKey::Private(id) => Some(self.resolve_private_storage_key(&id.name)),
             PropKey::Computed(_) => None,
         };
 
@@ -2070,7 +2156,7 @@ impl FunctionCompiler {
                     .map_err(|e| StatorError::Internal(e.to_string()))?;
             }
             PropKey::Private(id) => {
-                let name_idx = self.add_string(&format!("#{}", id.name));
+                let name_idx = self.add_string(&self.resolve_private_storage_key(&id.name));
                 let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
                 self.emit(Instruction::new_unchecked(
                     Opcode::DefineNamedOwnProperty,
@@ -2095,7 +2181,14 @@ impl FunctionCompiler {
             loc: block.loc,
             body: block.body.clone(),
         };
-        let block_array = compile_function(&[], &body, false, false, true)?;
+        let block_array = compile_function_with_private_names(
+            &[],
+            &body,
+            false,
+            false,
+            true,
+            self.private_names.clone(),
+        )?;
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(block_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         self.emit(Instruction::new_unchecked(
@@ -2140,7 +2233,7 @@ impl FunctionCompiler {
             scopes: vec![{
                 let mut s = HashMap::new();
                 s.insert(
-                    ".this".to_owned(),
+                    "this".to_owned(),
                     LocalBinding {
                         reg: Register::parameter(0),
                         is_const: false,
@@ -2173,9 +2266,28 @@ impl FunctionCompiler {
             finally_stack: Vec::new(),
             optional_chain_null_label: None,
             with_depth: 0,
+            private_names: self.private_names.clone(),
+            next_private_name_id: 0,
         };
 
         let this_reg = Register::parameter(0);
+
+        let private_brand_keys: Vec<String> = ic
+            .private_names
+            .values()
+            .filter_map(|binding| binding.brand_key.clone())
+            .collect();
+        for brand_key in private_brand_keys {
+            let brand_idx = ic.add_string(&brand_key);
+            ic.emit(Instruction::new_unchecked(
+                Opcode::LdaConstant,
+                vec![Operand::ConstantPoolIdx(brand_idx)],
+            ));
+            ic.emit(Instruction::new_unchecked(
+                Opcode::DefinePrivateBrand,
+                vec![to_reg_op(this_reg)],
+            ));
+        }
 
         for field in fields {
             // Compile the field value (or undefined).
@@ -2253,7 +2365,7 @@ impl FunctionCompiler {
                         .map_err(|e| StatorError::Internal(e.to_string()))?;
                 }
                 PropKey::Private(id) => {
-                    let name_idx = ic.add_string(&format!("#{}", id.name));
+                    let name_idx = ic.add_string(&ic.resolve_private_storage_key(&id.name));
                     let slot = ic.alloc_slot(FeedbackSlotKind::StoreProperty);
                     ic.emit(Instruction::new_unchecked(
                         Opcode::DefineNamedOwnProperty,
@@ -2924,14 +3036,16 @@ impl FunctionCompiler {
                     Ok(())
                 }
                 Expr::This(_) => {
-                    // `this` is implicitly the receiver; load from a special slot.
-                    // We represent it as a named global lookup for now.
-                    let name_idx = self.add_string("this");
-                    let slot = self.alloc_slot(FeedbackSlotKind::LoadGlobal);
-                    self.emit(Instruction::new_unchecked(
-                        Opcode::LdaGlobal,
-                        vec![Operand::ConstantPoolIdx(name_idx), slot],
-                    ));
+                    if let Some(binding) = self.lookup_var("this") {
+                        self.emit_ldar(binding.reg);
+                    } else {
+                        let name_idx = self.add_string("this");
+                        let slot = self.alloc_slot(FeedbackSlotKind::LoadGlobal);
+                        self.emit(Instruction::new_unchecked(
+                            Opcode::LdaGlobal,
+                            vec![Operand::ConstantPoolIdx(name_idx), slot],
+                        ));
+                    }
                     Ok(())
                 }
 
@@ -3294,7 +3408,7 @@ impl FunctionCompiler {
             self.compile_expr(&b.right)?;
             let obj_reg = self.allocator.allocate_temporary();
             self.emit_star(obj_reg);
-            let name_idx = self.add_string(&format!("#{}", id.name));
+            let name_idx = self.add_string(&self.resolve_private_brand_key(&id.name));
             let brand_reg = self.allocator.allocate_temporary();
             self.emit(Instruction::new_unchecked(
                 Opcode::LdaConstant,
@@ -3613,7 +3727,7 @@ impl FunctionCompiler {
                 ));
             }
             crate::parser::ast::MemberProp::Private(id) => {
-                let name_idx = self.add_string(&format!("#{}", id.name));
+                let name_idx = self.add_string(&self.resolve_private_storage_key(&id.name));
                 let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
                 self.emit(Instruction::new_unchecked(
                     Opcode::LdaNamedProperty,
@@ -3661,7 +3775,7 @@ impl FunctionCompiler {
                 ));
             }
             crate::parser::ast::MemberProp::Private(id) => {
-                let name_idx = self.add_string(&format!("#{}", id.name));
+                let name_idx = self.add_string(&self.resolve_private_storage_key(&id.name));
                 let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
                 self.emit(Instruction::new_unchecked(
                     Opcode::LdaNamedPropertyFromSuper,
@@ -3754,7 +3868,7 @@ impl FunctionCompiler {
                 ));
             }
             crate::parser::ast::MemberProp::Private(id) => {
-                let name_idx = self.add_string(&format!("#{}", id.name));
+                let name_idx = self.add_string(&self.resolve_private_storage_key(&id.name));
                 let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
                 self.emit(Instruction::new_unchecked(
                     Opcode::LdaNamedProperty,
@@ -3895,7 +4009,7 @@ impl FunctionCompiler {
                     .map_err(|e| StatorError::Internal(e.to_string()))?;
             }
             crate::parser::ast::MemberProp::Private(id) => {
-                let name_idx = self.add_string(&format!("#{}", id.name));
+                let name_idx = self.add_string(&self.resolve_private_storage_key(&id.name));
                 let slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
                 // Reload value.
                 self.emit_ldar(val_reg);
@@ -4117,7 +4231,7 @@ impl FunctionCompiler {
                 ));
             }
             crate::parser::ast::MemberProp::Private(id) => {
-                let name_idx = self.add_string(&format!("#{}", id.name));
+                let name_idx = self.add_string(&self.resolve_private_storage_key(&id.name));
                 let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
                 self.emit(Instruction::new_unchecked(
                     Opcode::LdaNamedProperty,
@@ -4291,7 +4405,7 @@ impl FunctionCompiler {
                 ));
             }
             crate::parser::ast::MemberProp::Private(id) => {
-                let name_idx = self.add_string(&format!("#{}", id.name));
+                let name_idx = self.add_string(&self.resolve_private_storage_key(&id.name));
                 let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
                 self.emit(Instruction::new_unchecked(
                     Opcode::LdaNamedPropertyFromSuper,
@@ -4584,7 +4698,10 @@ impl FunctionCompiler {
             f.is_async,
             f.is_strict,
             false,
-            self_name,
+            FunctionCompileOptions {
+                self_name: self_name.map(str::to_owned),
+                private_names: self.private_names.clone(),
+            },
         )?;
         let func_array = if let Some(name) = self_name {
             func_array.with_function_name(name)
@@ -4613,7 +4730,10 @@ impl FunctionCompiler {
             f.is_async,
             f.is_strict,
             false,
-            self_name,
+            FunctionCompileOptions {
+                self_name: self_name.map(str::to_owned),
+                private_names: self.private_names.clone(),
+            },
         )?
         .with_function_name(name);
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
@@ -4650,7 +4770,10 @@ impl FunctionCompiler {
             a.is_async,
             a.is_strict,
             true,
-            None,
+            FunctionCompileOptions {
+                self_name: None,
+                private_names: self.private_names.clone(),
+            },
         )?
         .with_arrow_flag(true);
         let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
@@ -5179,7 +5302,7 @@ impl FunctionCompiler {
                 ));
             }
             crate::parser::ast::MemberProp::Private(id) => {
-                let name_idx = self.add_string(&format!("#{}", id.name));
+                let name_idx = self.add_string(&self.resolve_private_storage_key(&id.name));
                 let slot = self.alloc_slot(FeedbackSlotKind::LoadProperty);
                 self.emit(Instruction::new_unchecked(
                     Opcode::LdaNamedProperty,
@@ -6229,7 +6352,37 @@ fn compile_function(
     is_async: bool,
     is_strict: bool,
 ) -> StatorResult<BytecodeArray> {
-    compile_function_inner(params, body, is_generator, is_async, is_strict, false, None)
+    compile_function_inner(
+        params,
+        body,
+        is_generator,
+        is_async,
+        is_strict,
+        false,
+        FunctionCompileOptions::default(),
+    )
+}
+
+fn compile_function_with_private_names(
+    params: &[crate::parser::ast::Param],
+    body: &BlockStmt,
+    is_generator: bool,
+    is_async: bool,
+    is_strict: bool,
+    private_names: HashMap<String, PrivateNameBinding>,
+) -> StatorResult<BytecodeArray> {
+    compile_function_inner(
+        params,
+        body,
+        is_generator,
+        is_async,
+        is_strict,
+        false,
+        FunctionCompileOptions {
+            self_name: None,
+            private_names,
+        },
+    )
 }
 
 /// Core function compiler.  `is_arrow` controls whether an `arguments`
@@ -6243,12 +6396,17 @@ fn compile_function_inner(
     is_async: bool,
     is_strict: bool,
     is_arrow: bool,
-    self_name: Option<&str>,
+    options: FunctionCompileOptions,
 ) -> StatorResult<BytecodeArray> {
     let mut compiler = FunctionCompiler::new(params)?;
     compiler.is_generator = is_generator;
     compiler.is_async = is_async;
     compiler.is_strict = is_strict;
+    let FunctionCompileOptions {
+        self_name,
+        private_names,
+    } = options;
+    compiler.private_names = private_names;
 
     // Generator / async / async-generator prologue: jump to the saved resume
     // point on re-entry.  Async functions are desugared to generators internally,
@@ -6279,7 +6437,7 @@ fn compile_function_inner(
     // function body can reference the function by its own name (ES §15.2.4).
     // The register is initialised to `undefined` here; the interpreter
     // writes the actual function value at call time.
-    let self_name_reg = if let Some(name) = self_name {
+    let self_name_reg = if let Some(name) = self_name.as_deref() {
         let reg = compiler.define_local(name);
         compiler.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
         compiler.emit_star(reg);

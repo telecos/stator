@@ -34104,4 +34104,321 @@ mod tests {
         .unwrap();
         assert_eq!(result, JsValue::String("tdz".into()));
     }
+
+    // ── Class deep conformance ──────────────────────────────────────────────
+
+    #[test]
+    fn e2e_class_deep_expr_anonymous_constructs() {
+        let result = global_eval("new (class { value() { return 1; } })().value()").unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+    }
+
+    #[test]
+    fn e2e_class_deep_expr_named_name_property() {
+        let result = global_eval("var C = class Named {}; C.name").unwrap();
+        assert_eq!(result, JsValue::String("Named".into()));
+    }
+
+    #[test]
+    fn e2e_class_deep_decl_name_property() {
+        let result = global_eval("class Named {} Named.name").unwrap();
+        assert_eq!(result, JsValue::String("Named".into()));
+    }
+
+    #[test]
+    fn e2e_class_deep_ctor_length_property() {
+        let result = global_eval("class C { constructor(a, b) {} } C.length").unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn e2e_class_deep_computed_instance_method() {
+        let result = global_eval(
+            "var suffix = 'Value'; class C { ['get' + suffix]() { return 3; } } new C().getValue()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_class_deep_computed_instance_getter() {
+        let result =
+            global_eval("var key = 'value'; class C { get [key]() { return 4; } } new C().value")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(4));
+    }
+
+    #[test]
+    fn e2e_class_deep_computed_instance_setter() {
+        let result = global_eval(
+            "var key = 'value'; class C { set [key](v) { this._v = v; } get out() { return this._v; } } \
+             var c = new C(); c.value = 5; c.out",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(5));
+    }
+
+    #[test]
+    fn e2e_class_deep_computed_static_method() {
+        let result =
+            global_eval("var key = 'make'; class C { static [key]() { return 6; } } C.make()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn e2e_class_deep_computed_static_field() {
+        let result =
+            global_eval("var key = 'count'; class C { static [key] = 7; } C.count").unwrap();
+        assert_eq!(result, JsValue::Smi(7));
+    }
+
+    #[test]
+    fn e2e_class_deep_static_block_this_is_class() {
+        let result = global_eval("class C { static { this.answer = 8; } } C.answer").unwrap();
+        assert_eq!(result, JsValue::Smi(8));
+    }
+
+    #[test]
+    fn e2e_class_deep_static_block_sees_prior_static_field() {
+        let result =
+            global_eval("class C { static x = 9; static { this.y = this.x + 1; } } C.y").unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
+    #[test]
+    fn e2e_class_deep_static_block_updates_multiple_fields() {
+        let result =
+            global_eval("class C { static { this.a = 1; this.b = 2; } } C.a + C.b").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_class_deep_static_block_reads_private_static_field() {
+        let result =
+            global_eval("class C { static #x = 11; static { this.y = this.#x; } } C.y").unwrap();
+        assert_eq!(result, JsValue::Smi(11));
+    }
+
+    #[test]
+    fn e2e_class_deep_static_block_calls_private_static_method() {
+        let result = global_eval(
+            "class C { static #m() { return 12; } static { this.y = this.#m(); } } C.y",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(12));
+    }
+
+    #[test]
+    fn e2e_class_deep_field_this_reads_prior_field() {
+        let result = global_eval("class C { y = 13; x = this.y + 1; } new C().x").unwrap();
+        assert_eq!(result, JsValue::Smi(14));
+    }
+
+    #[test]
+    fn e2e_class_deep_field_computed_key_uses_this() {
+        let result =
+            global_eval("class C { key = 'z'; [this.key] = 15; } var c = new C(); c.z").unwrap();
+        assert_eq!(result, JsValue::Smi(15));
+    }
+
+    #[test]
+    fn e2e_class_deep_field_arrow_captures_this() {
+        let result =
+            global_eval("class C { x = 16; getX = () => this.x; } var c = new C(); c.getX()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(16));
+    }
+
+    #[test]
+    fn e2e_class_deep_field_direct_new_target() {
+        let result = global_eval("class C { x = new.target === C; } new C().x").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_class_deep_field_arrow_new_target() {
+        let result = global_eval("class C { x = (() => new.target === C)(); } new C().x").unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_class_deep_derived_field_runs_after_super() {
+        let result = global_eval(
+            "class Base { constructor() { this.base = 17; } } \
+             class Child extends Base { x = this.base + 1; } \
+             new Child().x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(18));
+    }
+
+    #[test]
+    fn e2e_class_deep_derived_field_new_target_preserved() {
+        let result = global_eval(
+            "class Base { constructor() { this.seen = new.target; } } \
+             class Child extends Base { x = this.seen === Child; } \
+             new Child().x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_class_deep_private_method_basic() {
+        let result = global_eval(
+            "class C { #m() { return 19; } call() { return this.#m(); } } new C().call()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(19));
+    }
+
+    #[test]
+    fn e2e_class_deep_private_method_accesses_private_field() {
+        let result = global_eval(
+            "class C { #x = 20; #m() { return this.#x; } call() { return this.#m(); } } new C().call()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(20));
+    }
+
+    #[test]
+    fn e2e_class_deep_private_method_arrow_receiver() {
+        let result = global_eval(
+            "class C { #m() { return 21; } call() { return (() => this.#m())(); } } new C().call()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(21));
+    }
+
+    #[test]
+    fn e2e_class_deep_private_method_names_are_isolated() {
+        let result = global_eval(
+            "class A { #m() { return 1; } call() { return this.#m(); } } \
+             class B { #m() { return 2; } call() { return this.#m(); } } \
+             new A().call() + new B().call()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_class_deep_private_method_in_operator_true_for_instance() {
+        let result = global_eval(
+            "class C { #m() {} has(obj) { return #m in obj; } } var c = new C(); c.has(c)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_class_deep_private_method_in_operator_false_for_other_object() {
+        let result =
+            global_eval("class C { #m() {} has(obj) { return #m in obj; } } new C().has({})")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(false));
+    }
+
+    #[test]
+    fn e2e_class_deep_private_static_method_basic() {
+        let result = global_eval(
+            "class C { static #m() { return 22; } static call() { return this.#m(); } } C.call()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(22));
+    }
+
+    #[test]
+    fn e2e_class_deep_private_static_field_basic() {
+        let result =
+            global_eval("class C { static #x = 23; static get() { return this.#x; } } C.get()")
+                .unwrap();
+        assert_eq!(result, JsValue::Smi(23));
+    }
+
+    #[test]
+    fn e2e_class_deep_private_static_names_are_isolated() {
+        let result = global_eval(
+            "class A { static #m() { return 1; } static call() { return this.#m(); } } \
+             class B { static #m() { return 2; } static call() { return this.#m(); } } \
+             A.call() + B.call()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn e2e_class_deep_new_target_in_base_constructor() {
+        let result =
+            global_eval("class C { constructor() { this.x = new.target === C; } } new C().x")
+                .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_class_deep_new_target_flows_through_super() {
+        let result = global_eval(
+            "class Base { constructor() { this.x = new.target === Child; } } \
+             class Child extends Base {} \
+             new Child().x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_class_deep_new_target_in_derived_constructor() {
+        let result = global_eval(
+            "class Base {} \
+             class Child extends Base { constructor() { super(); this.x = new.target === Child; } } \
+             new Child().x",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_class_deep_new_target_in_static_factory() {
+        let result = global_eval(
+            "class C { static make() { return new this().x; } x = new.target === C; } C.make()",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_class_deep_class_expression_outer_binding_is_constructor() {
+        let result =
+            global_eval("var C = class Named { value() { return 24; } }; new C().value()").unwrap();
+        assert_eq!(result, JsValue::Smi(24));
+    }
+
+    #[test]
+    fn e2e_class_deep_class_expression_name_not_visible_outside() {
+        let result = global_eval("var C = class Named {}; typeof Named").unwrap();
+        assert_eq!(result, JsValue::String("undefined".into()));
+    }
+
+    #[test]
+    fn e2e_class_deep_computed_field_from_outer_binding() {
+        let result =
+            global_eval("var key = 'answer'; class C { [key] = 25; } new C().answer").unwrap();
+        assert_eq!(result, JsValue::Smi(25));
+    }
+
+    #[test]
+    fn e2e_class_deep_computed_static_field_from_outer_binding() {
+        let result =
+            global_eval("var key = 'answer'; class C { static [key] = 26; } C.answer").unwrap();
+        assert_eq!(result, JsValue::Smi(26));
+    }
+
+    #[test]
+    fn e2e_class_deep_private_field_in_operator_after_init() {
+        let result = global_eval(
+            "class C { #x = 1; has(obj) { return #x in obj; } } var c = new C(); c.has(c)",
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
 }
