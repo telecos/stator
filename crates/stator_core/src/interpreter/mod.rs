@@ -2243,6 +2243,43 @@ fn build_template_object(cooked: &[Option<String>], raw: &[String]) -> JsValue {
 ///
 /// Plain strings (property names, identifier names) have no surrounding
 /// delimiters and are returned unchanged.
+fn flush_pending_string_surrogate(out: &mut String, pending_high_surrogate: &mut Option<u16>) {
+    if let Some(high) = pending_high_surrogate.take() {
+        out.push_str(&String::from_utf16_lossy(&[high]));
+    }
+}
+
+fn push_string_escape_code_unit(
+    out: &mut String,
+    pending_high_surrogate: &mut Option<u16>,
+    unit: u16,
+) {
+    match unit {
+        0xD800..=0xDBFF => {
+            flush_pending_string_surrogate(out, pending_high_surrogate);
+            *pending_high_surrogate = Some(unit);
+        }
+        0xDC00..=0xDFFF => {
+            if let Some(high) = pending_high_surrogate.take() {
+                out.push_str(&String::from_utf16_lossy(&[high, unit]));
+            } else {
+                out.push_str(&String::from_utf16_lossy(&[unit]));
+            }
+        }
+        _ => {
+            flush_pending_string_surrogate(out, pending_high_surrogate);
+            if let Some(ch) = char::from_u32(u32::from(unit)) {
+                out.push(ch);
+            }
+        }
+    }
+}
+
+fn push_string_escape_char(out: &mut String, pending_high_surrogate: &mut Option<u16>, ch: char) {
+    flush_pending_string_surrogate(out, pending_high_surrogate);
+    out.push(ch);
+}
+
 pub(super) fn decode_string_constant(raw: &str) -> String {
     let bytes = raw.as_bytes();
     if bytes.len() < 2 {
@@ -2256,21 +2293,28 @@ pub(super) fn decode_string_constant(raw: &str) -> String {
     };
     let mut out = String::with_capacity(inner.len());
     let mut chars = inner.chars().peekable();
+    let mut pending_high_surrogate = None;
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('r') => out.push('\r'),
-                Some('t') => out.push('\t'),
-                Some('b') => out.push('\u{0008}'),
-                Some('f') => out.push('\u{000C}'),
-                Some('v') => out.push('\u{000B}'),
-                Some('\\') => out.push('\\'),
-                Some('\'') => out.push('\''),
-                Some('"') => out.push('"'),
-                Some('`') => out.push('`'),
+                Some('n') => push_string_escape_char(&mut out, &mut pending_high_surrogate, '\n'),
+                Some('r') => push_string_escape_char(&mut out, &mut pending_high_surrogate, '\r'),
+                Some('t') => push_string_escape_char(&mut out, &mut pending_high_surrogate, '\t'),
+                Some('b') => {
+                    push_string_escape_char(&mut out, &mut pending_high_surrogate, '\u{0008}')
+                }
+                Some('f') => {
+                    push_string_escape_char(&mut out, &mut pending_high_surrogate, '\u{000C}')
+                }
+                Some('v') => {
+                    push_string_escape_char(&mut out, &mut pending_high_surrogate, '\u{000B}')
+                }
+                Some('\\') => push_string_escape_char(&mut out, &mut pending_high_surrogate, '\\'),
+                Some('\'') => push_string_escape_char(&mut out, &mut pending_high_surrogate, '\''),
+                Some('"') => push_string_escape_char(&mut out, &mut pending_high_surrogate, '"'),
+                Some('`') => push_string_escape_char(&mut out, &mut pending_high_surrogate, '`'),
                 Some('0') if !matches!(chars.peek(), Some('0'..='9')) => {
-                    out.push('\0');
+                    push_string_escape_char(&mut out, &mut pending_high_surrogate, '\0');
                 }
                 Some(d @ '0'..='7') => {
                     // Legacy octal escape — collect up to 3 octal digits.
@@ -2289,14 +2333,14 @@ pub(super) fn decode_string_constant(raw: &str) -> String {
                         }
                     }
                     if let Some(ch) = char::from_u32(val) {
-                        out.push(ch);
+                        push_string_escape_char(&mut out, &mut pending_high_surrogate, ch);
                     }
                 }
                 Some('x') => {
                     // \xHH — two hex digits
                     let h = take_hex_digits(&mut chars, 2);
                     if let Some(cp) = u32::from_str_radix(&h, 16).ok().and_then(char::from_u32) {
-                        out.push(cp);
+                        push_string_escape_char(&mut out, &mut pending_high_surrogate, cp);
                     }
                 }
                 Some('u') => {
@@ -2315,14 +2359,17 @@ pub(super) fn decode_string_constant(raw: &str) -> String {
                         if let Some(cp) =
                             u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
                         {
-                            out.push(cp);
+                            push_string_escape_char(&mut out, &mut pending_high_surrogate, cp);
                         }
                     } else {
                         // \uHHHH — exactly four hex digits
                         let h = take_hex_digits(&mut chars, 4);
-                        if let Some(cp) = u32::from_str_radix(&h, 16).ok().and_then(char::from_u32)
-                        {
-                            out.push(cp);
+                        if let Ok(unit) = u16::from_str_radix(&h, 16) {
+                            push_string_escape_code_unit(
+                                &mut out,
+                                &mut pending_high_surrogate,
+                                unit,
+                            );
                         }
                     }
                 }
@@ -2337,13 +2384,16 @@ pub(super) fn decode_string_constant(raw: &str) -> String {
                 }
                 Some('\u{2028}') | Some('\u{2029}') => {}
                 // Identity escape: any other character after `\` is itself.
-                Some(other) => out.push(other),
-                None => out.push('\\'),
+                Some(other) => {
+                    push_string_escape_char(&mut out, &mut pending_high_surrogate, other)
+                }
+                None => push_string_escape_char(&mut out, &mut pending_high_surrogate, '\\'),
             }
         } else {
-            out.push(c);
+            push_string_escape_char(&mut out, &mut pending_high_surrogate, c);
         }
     }
+    flush_pending_string_surrogate(&mut out, &mut pending_high_surrogate);
     out
 }
 
