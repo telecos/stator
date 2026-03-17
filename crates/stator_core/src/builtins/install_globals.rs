@@ -23585,6 +23585,37 @@ mod tests {
         assert_eq!(eval_module(script), JsValue::Boolean(true));
     }
 
+    fn drain_microtasks() {
+        use crate::builtins::promise::drain_active_microtask_queue;
+        let _ = drain_active_microtask_queue();
+    }
+
+    fn assert_eval_eq_after_microtasks(setup: &str, expr: &str, expected: JsValue) {
+        let _ = global_eval(setup).unwrap();
+        drain_microtasks();
+        assert_eq!(global_eval(expr).unwrap(), expected);
+    }
+
+    fn assert_eval_true_after_microtasks(setup: &str, expr: &str) {
+        assert_eval_eq_after_microtasks(setup, expr, JsValue::Boolean(true));
+    }
+
+    fn assert_microtask_transition(setup: &str, expr: &str, before: JsValue, after: JsValue) {
+        let _ = global_eval(setup).unwrap();
+        assert_eq!(global_eval(expr).unwrap(), before);
+        drain_microtasks();
+        assert_eq!(global_eval(expr).unwrap(), after);
+    }
+
+    macro_rules! promise_microtask_transition_test {
+        ($name:ident, $setup:expr, $expr:expr, $before:expr, $after:expr) => {
+            #[test]
+            fn $name() {
+                assert_microtask_transition($setup, $expr, $before, $after);
+            }
+        };
+    }
+
     fn assert_dynamic_import_syntax_error(script: &str) {
         assert!(
             matches!(global_eval(script), Err(StatorError::SyntaxError(_))),
@@ -25992,6 +26023,485 @@ mod tests {
         let result = global_eval("out").unwrap();
         assert_eq!(result, JsValue::String("cleanup failed".into()));
     }
+
+    // -- 91+. Promise microtask ordering and async edge cases
+
+    promise_microtask_transition_test!(
+        e2e_promise_microtask_order_same_promise_callbacks_async,
+        "var __promise_mt_order_1 = []; var __promise_mt_source_1 = Promise.resolve('value'); \
+         __promise_mt_source_1.then(function() { __promise_mt_order_1.push('first'); }); \
+         __promise_mt_source_1.then(function() { __promise_mt_order_1.push('second'); }); \
+         __promise_mt_source_1.then(function() { __promise_mt_order_1.push('third'); });",
+        "JSON.stringify(__promise_mt_order_1)",
+        JsValue::String("[]".into()),
+        JsValue::String(r#"["first","second","third"]"#.into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_microtask_order_multiple_resolved_promises_async,
+        "var __promise_mt_order_2 = []; \
+         Promise.resolve().then(function() { __promise_mt_order_2.push('a'); }); \
+         Promise.resolve().then(function() { __promise_mt_order_2.push('b'); }); \
+         Promise.resolve().then(function() { __promise_mt_order_2.push('c'); });",
+        "JSON.stringify(__promise_mt_order_2)",
+        JsValue::String("[]".into()),
+        JsValue::String(r#"["a","b","c"]"#.into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_microtask_order_nested_enqueues_fifo,
+        "var __promise_mt_order_3 = []; \
+         Promise.resolve().then(function() { \
+             __promise_mt_order_3.push('outer-1'); \
+             Promise.resolve().then(function() { __promise_mt_order_3.push('inner'); }); \
+         }); \
+         Promise.resolve().then(function() { __promise_mt_order_3.push('outer-2'); });",
+        "JSON.stringify(__promise_mt_order_3)",
+        JsValue::String("[]".into()),
+        JsValue::String(r#"["outer-1","outer-2","inner"]"#.into())
+    );
+
+    promise_microtask_transition_test!(
+        e2e_promise_chain_runs_handlers_in_order,
+        "var __promise_chain_order_1 = ''; \
+         Promise.resolve(1) \
+             .then(function(v) { return v + 1; }) \
+             .then(function(v) { return v + 1; }) \
+             .then(function(v) { __promise_chain_order_1 = '1,2,' + v; });",
+        "__promise_chain_order_1",
+        JsValue::String(String::new().into()),
+        JsValue::String("1,2,3".into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_chain_with_returned_promises_runs_in_order,
+        "var __promise_chain_order_2 = ''; \
+         Promise.resolve(1) \
+             .then(function(v) { return Promise.resolve(v + 1); }) \
+             .then(function(v) { return Promise.resolve(v * 2); }) \
+             .then(function(v) { __promise_chain_order_2 = '2,4,' + v; });",
+        "__promise_chain_order_2",
+        JsValue::String(String::new().into()),
+        JsValue::String("2,4,4".into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_chain_rejection_recovery_keeps_sequence,
+        "var __promise_chain_order_3 = ''; \
+         Promise.reject('boom') \
+             .then(function() { __promise_chain_order_3 = 'bad'; }) \
+             .catch(function() { __promise_chain_order_3 += 'catch'; return 'ok'; }) \
+             .then(function() { __promise_chain_order_3 += ',then'; });",
+        "__promise_chain_order_3",
+        JsValue::String(String::new().into()),
+        JsValue::String("catch,then".into())
+    );
+
+    promise_microtask_transition_test!(
+        e2e_promise_all_preserves_input_order_for_resolved_promises,
+        "var __promise_all_order_1 = ''; \
+         Promise.all([Promise.resolve('a'), Promise.resolve('b'), Promise.resolve('c')]) \
+             .then(function(values) { __promise_all_order_1 = values.join('|'); });",
+        "__promise_all_order_1",
+        JsValue::String(String::new().into()),
+        JsValue::String("a|b|c".into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_all_preserves_input_order_for_mixed_values,
+        "var __promise_all_order_2 = ''; \
+         Promise.all([1, Promise.resolve(2), 3]).then(function(values) { \
+             __promise_all_order_2 = values.join('|'); \
+         });",
+        "__promise_all_order_2",
+        JsValue::String(String::new().into()),
+        JsValue::String("1|2|3".into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_all_preserves_input_order_with_thenables,
+        "var __promise_all_order_3 = ''; \
+         Promise.all([{ then: function(resolve) { resolve('first'); } }, Promise.resolve('second')]) \
+             .then(function(values) { __promise_all_order_3 = values.join('|'); });",
+        "__promise_all_order_3",
+        JsValue::String(String::new().into()),
+        JsValue::String("first|second".into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_race_uses_first_input_when_all_are_already_resolved,
+        "var __promise_race_order_1 = ''; \
+         Promise.race([Promise.resolve('left'), Promise.resolve('right')]) \
+             .then(function(value) { __promise_race_order_1 = value; });",
+        "__promise_race_order_1",
+        JsValue::String(String::new().into()),
+        JsValue::String("left".into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_race_plain_value_before_later_promise_wins,
+        "var __promise_race_order_2 = 0; \
+         Promise.race([7, Promise.resolve(8)]).then(function(value) { __promise_race_order_2 = value; });",
+        "__promise_race_order_2",
+        JsValue::Smi(0),
+        JsValue::Smi(7)
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_any_uses_first_input_when_all_are_already_resolved,
+        "var __promise_any_order_1 = ''; \
+         Promise.any([Promise.resolve('first'), Promise.resolve('second')]) \
+             .then(function(value) { __promise_any_order_1 = value; });",
+        "__promise_any_order_1",
+        JsValue::String(String::new().into()),
+        JsValue::String("first".into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_any_plain_value_before_later_promise_wins,
+        "var __promise_any_order_2 = 0; \
+         Promise.any([11, Promise.resolve(12)]).then(function(value) { __promise_any_order_2 = value; });",
+        "__promise_any_order_2",
+        JsValue::Smi(0),
+        JsValue::Smi(11)
+    );
+
+    promise_microtask_transition_test!(
+        e2e_promise_resolve_thenable_calls_then_asynchronously,
+        "var __promise_thenable_async_1 = []; \
+         var __promise_thenable_value_1 = { \
+             then: function(resolve) { \
+                 __promise_thenable_async_1.push('then'); \
+                 resolve('done'); \
+             } \
+         }; \
+         __promise_thenable_async_1.push('sync'); \
+         Promise.resolve(__promise_thenable_value_1);",
+        "JSON.stringify(__promise_thenable_async_1)",
+        JsValue::String(r#"["sync"]"#.into()),
+        JsValue::String(r#"["sync","then"]"#.into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_resolve_thenable_settles_after_async_then_call,
+        "var __promise_thenable_async_2 = []; \
+         var __promise_thenable_value_2 = { \
+             then: function(resolve) { \
+                 __promise_thenable_async_2.push('then'); \
+                 resolve('value'); \
+             } \
+         }; \
+         Promise.resolve(__promise_thenable_value_2).then(function(value) { __promise_thenable_async_2.push(value); }); \
+         __promise_thenable_async_2.push('sync');",
+        "JSON.stringify(__promise_thenable_async_2)",
+        JsValue::String(r#"["sync"]"#.into()),
+        JsValue::String(r#"["sync","then","value"]"#.into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_resolve_nested_thenables_resolve_recursively,
+        "var __promise_thenable_async_3 = []; \
+         var __promise_thenable_inner_3 = { \
+             then: function(resolve) { \
+                 __promise_thenable_async_3.push('inner'); \
+                 resolve('done'); \
+             } \
+         }; \
+         var __promise_thenable_outer_3 = { \
+             then: function(resolve) { \
+                 __promise_thenable_async_3.push('outer'); \
+                 resolve(__promise_thenable_inner_3); \
+             } \
+         }; \
+         Promise.resolve(__promise_thenable_outer_3).then(function(value) { __promise_thenable_async_3.push(value); }); \
+         __promise_thenable_async_3.push('sync');",
+        "JSON.stringify(__promise_thenable_async_3)",
+        JsValue::String(r#"["sync"]"#.into()),
+        JsValue::String(r#"["sync","outer","inner","done"]"#.into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_resolve_thenable_rejection_happens_asynchronously,
+        "var __promise_thenable_async_4 = []; \
+         var __promise_thenable_value_4 = { \
+             then: function(resolve, reject) { \
+                 __promise_thenable_async_4.push('then'); \
+                 reject('boom'); \
+             } \
+         }; \
+         Promise.resolve(__promise_thenable_value_4).catch(function(reason) { \
+             __promise_thenable_async_4.push('reason:' + reason); \
+         }); \
+         __promise_thenable_async_4.push('sync');",
+        "JSON.stringify(__promise_thenable_async_4)",
+        JsValue::String(r#"["sync"]"#.into()),
+        JsValue::String(r#"["sync","then","reason:boom"]"#.into())
+    );
+
+    promise_microtask_transition_test!(
+        e2e_promise_constructor_executor_runs_synchronously,
+        "var __promise_executor_sync_1 = []; \
+         new Promise(function(resolve) { __promise_executor_sync_1.push('executor'); resolve(); }); \
+         __promise_executor_sync_1.push('after');",
+        "JSON.stringify(__promise_executor_sync_1)",
+        JsValue::String(r#"["executor","after"]"#.into()),
+        JsValue::String(r#"["executor","after"]"#.into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_constructor_executor_finishes_before_then_callback,
+        "var __promise_executor_sync_2 = []; \
+         new Promise(function(resolve) { __promise_executor_sync_2.push('executor'); resolve('ok'); }) \
+             .then(function(value) { __promise_executor_sync_2.push(value); }); \
+         __promise_executor_sync_2.push('after');",
+        "JSON.stringify(__promise_executor_sync_2)",
+        JsValue::String(r#"["executor","after"]"#.into()),
+        JsValue::String(r#"["executor","after","ok"]"#.into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_constructor_throw_rejects_after_executor_returns,
+        "var __promise_executor_sync_3 = []; \
+         new Promise(function(resolve, reject) { \
+             __promise_executor_sync_3.push('executor'); \
+             throw 'boom'; \
+         }).catch(function() { __promise_executor_sync_3.push('caught'); }); \
+         __promise_executor_sync_3.push('after');",
+        "JSON.stringify(__promise_executor_sync_3)",
+        JsValue::String(r#"["executor","after"]"#.into()),
+        JsValue::String(r#"["executor","after","caught"]"#.into())
+    );
+
+    promise_microtask_transition_test!(
+        e2e_promise_then_on_resolved_promise_runs_async,
+        "var __promise_resolved_async_1 = []; \
+         var __promise_resolved_value_1 = Promise.resolve('done'); \
+         __promise_resolved_value_1.then(function(value) { __promise_resolved_async_1.push(value); }); \
+         __promise_resolved_async_1.push('sync');",
+        "JSON.stringify(__promise_resolved_async_1)",
+        JsValue::String(r#"["sync"]"#.into()),
+        JsValue::String(r#"["sync","done"]"#.into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_catch_on_rejected_promise_runs_async,
+        "var __promise_resolved_async_2 = []; \
+         var __promise_resolved_value_2 = Promise.reject('boom'); \
+         __promise_resolved_value_2.catch(function(reason) { __promise_resolved_async_2.push(reason); }); \
+         __promise_resolved_async_2.push('sync');",
+        "JSON.stringify(__promise_resolved_async_2)",
+        JsValue::String(r#"["sync"]"#.into()),
+        JsValue::String(r#"["sync","boom"]"#.into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_finally_on_resolved_promise_runs_async,
+        "var __promise_resolved_async_3 = []; \
+         Promise.resolve('value').finally(function() { __promise_resolved_async_3.push('finally'); }); \
+         __promise_resolved_async_3.push('sync');",
+        "JSON.stringify(__promise_resolved_async_3)",
+        JsValue::String(r#"["sync"]"#.into()),
+        JsValue::String(r#"["sync","finally"]"#.into())
+    );
+
+    promise_microtask_transition_test!(
+        e2e_promise_multiple_then_handlers_keep_registration_order,
+        "var __promise_multi_then_1 = []; \
+         var __promise_multi_value_1 = Promise.resolve('value'); \
+         __promise_multi_value_1.then(function() { __promise_multi_then_1.push('first'); }); \
+         __promise_multi_value_1.then(function() { __promise_multi_then_1.push('second'); }); \
+         __promise_multi_value_1.then(function() { __promise_multi_then_1.push('third'); });",
+        "JSON.stringify(__promise_multi_then_1)",
+        JsValue::String("[]".into()),
+        JsValue::String(r#"["first","second","third"]"#.into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_multiple_catch_handlers_keep_registration_order,
+        "var __promise_multi_then_2 = []; \
+         var __promise_multi_value_2 = Promise.reject('boom'); \
+         __promise_multi_value_2.catch(function() { __promise_multi_then_2.push('first'); }); \
+         __promise_multi_value_2.catch(function() { __promise_multi_then_2.push('second'); }); \
+         __promise_multi_value_2.catch(function() { __promise_multi_then_2.push('third'); });",
+        "JSON.stringify(__promise_multi_then_2)",
+        JsValue::String("[]".into()),
+        JsValue::String(r#"["first","second","third"]"#.into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_multiple_then_handlers_can_observe_same_value_in_order,
+        "var __promise_multi_then_3 = []; \
+         var __promise_multi_value_3 = Promise.resolve(5); \
+         __promise_multi_value_3.then(function(value) { __promise_multi_then_3.push(String(value)); }); \
+         __promise_multi_value_3.then(function(value) { __promise_multi_then_3.push(String(value * 2)); });",
+        "JSON.stringify(__promise_multi_then_3)",
+        JsValue::String("[]".into()),
+        JsValue::String(r#"["5","10"]"#.into())
+    );
+
+    promise_microtask_transition_test!(
+        e2e_promise_nested_resolution_runs_inner_before_outer_then,
+        "var __promise_nested_1 = []; \
+         Promise.resolve('start') \
+             .then(function() { \
+                 return Promise.resolve().then(function() { __promise_nested_1.push('inner'); return 'value'; }); \
+             }) \
+             .then(function() { __promise_nested_1.push('outer'); }); \
+         __promise_nested_1.push('sync');",
+        "JSON.stringify(__promise_nested_1)",
+        JsValue::String(r#"["sync"]"#.into()),
+        JsValue::String(r#"["sync","inner","outer"]"#.into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_nested_thenable_resolution_runs_inner_before_outer_then,
+        "var __promise_nested_2 = []; \
+         Promise.resolve('start') \
+             .then(function() { \
+                 return { then: function(resolve) { __promise_nested_2.push('inner'); resolve('value'); } }; \
+             }) \
+             .then(function() { __promise_nested_2.push('outer'); }); \
+         __promise_nested_2.push('sync');",
+        "JSON.stringify(__promise_nested_2)",
+        JsValue::String(r#"["sync"]"#.into()),
+        JsValue::String(r#"["sync","inner","outer"]"#.into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_nested_promise_resolution_preserves_fifo_observation,
+        "var __promise_nested_3 = []; \
+         Promise.resolve() \
+             .then(function() { \
+                 __promise_nested_3.push('first'); \
+                 return Promise.resolve().then(function() { __promise_nested_3.push('second'); }); \
+             }) \
+             .then(function() { __promise_nested_3.push('third'); });",
+        "JSON.stringify(__promise_nested_3)",
+        JsValue::String("[]".into()),
+        JsValue::String(r#"["first","second","third"]"#.into())
+    );
+
+    promise_microtask_transition_test!(
+        e2e_promise_resolve_recursively_resolves_nested_thenables_to_value,
+        "var __promise_recursive_1 = 0; \
+         var __promise_recursive_inner_1 = { then: function(resolve) { resolve(99); } }; \
+         var __promise_recursive_outer_1 = { then: function(resolve) { resolve(__promise_recursive_inner_1); } }; \
+         Promise.resolve(__promise_recursive_outer_1).then(function(value) { __promise_recursive_1 = value; });",
+        "__promise_recursive_1",
+        JsValue::Smi(0),
+        JsValue::Smi(99)
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_resolve_recursively_propagates_nested_thenable_rejection,
+        "var __promise_recursive_2 = ''; \
+         var __promise_recursive_inner_2 = { then: function(resolve, reject) { reject('boom'); } }; \
+         var __promise_recursive_outer_2 = { then: function(resolve) { resolve(__promise_recursive_inner_2); } }; \
+         Promise.resolve(__promise_recursive_outer_2).catch(function(reason) { __promise_recursive_2 = reason; });",
+        "__promise_recursive_2",
+        JsValue::String(String::new().into()),
+        JsValue::String("boom".into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_resolve_recursively_observes_each_thenable_once_in_order,
+        "var __promise_recursive_3 = []; \
+         var __promise_recursive_inner_3 = { then: function(resolve) { __promise_recursive_3.push('inner'); resolve('done'); } }; \
+         var __promise_recursive_outer_3 = { then: function(resolve) { __promise_recursive_3.push('outer'); resolve(__promise_recursive_inner_3); } }; \
+         Promise.resolve(__promise_recursive_outer_3).then(function(value) { __promise_recursive_3.push(value); });",
+        "JSON.stringify(__promise_recursive_3)",
+        JsValue::String("[]".into()),
+        JsValue::String(r#"["outer","inner","done"]"#.into())
+    );
+
+    #[test]
+    fn e2e_promise_resolve_returns_same_promise_for_same_constructor() {
+        assert_eval_true_after_microtasks(
+            "var __promise_identity_1 = Promise.resolve(1); \
+             var __promise_identity_2 = Promise.resolve(__promise_identity_1);",
+            "__promise_identity_1 === __promise_identity_2",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_resolve_returns_same_subclass_promise_for_same_constructor() {
+        assert_eval_true_after_microtasks(
+            "class __PromiseIdentitySub extends Promise {} \
+             var __promise_identity_3 = __PromiseIdentitySub.resolve(1); \
+             var __promise_identity_4 = __PromiseIdentitySub.resolve(__promise_identity_3);",
+            "__promise_identity_3 === __promise_identity_4",
+        );
+    }
+
+    #[test]
+    fn e2e_promise_catch_matches_then_undefined_on_reject() {
+        assert_eval_true_after_microtasks(
+            "var __promise_catch_alias_1 = ''; \
+             var __promise_catch_alias_2 = ''; \
+             Promise.reject('boom').catch(function(reason) { __promise_catch_alias_1 = 'caught:' + reason; }); \
+             Promise.reject('boom').then(undefined, function(reason) { __promise_catch_alias_2 = 'caught:' + reason; });",
+            "__promise_catch_alias_1 === 'caught:boom' && __promise_catch_alias_2 === 'caught:boom'",
+        );
+    }
+
+    promise_microtask_transition_test!(
+        e2e_promise_catch_without_handler_matches_then_passthrough,
+        "var __promise_catch_alias_3 = ''; \
+         Promise.reject('x').catch(undefined).catch(function(reason) { __promise_catch_alias_3 = reason; });",
+        "__promise_catch_alias_3",
+        JsValue::String(String::new().into()),
+        JsValue::String("x".into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_catch_and_then_undefined_observe_same_registration_order,
+        "var __promise_catch_alias_4 = []; \
+         var __promise_catch_alias_4_source = Promise.reject('boom'); \
+         __promise_catch_alias_4_source.catch(function() { __promise_catch_alias_4.push('catch'); }); \
+         __promise_catch_alias_4_source.then(undefined, function() { __promise_catch_alias_4.push('then'); });",
+        "JSON.stringify(__promise_catch_alias_4)",
+        JsValue::String("[]".into()),
+        JsValue::String(r#"["catch","then"]"#.into())
+    );
+
+    promise_microtask_transition_test!(
+        e2e_promise_finally_runs_on_fulfill_and_preserves_value,
+        "var __promise_finally_1 = ''; \
+         Promise.resolve('value') \
+             .finally(function() { __promise_finally_1 += 'cleanup|'; }) \
+             .then(function(value) { __promise_finally_1 += value; });",
+        "__promise_finally_1",
+        JsValue::String(String::new().into()),
+        JsValue::String("cleanup|value".into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_finally_runs_on_reject_and_preserves_reason,
+        "var __promise_finally_2 = ''; \
+         Promise.reject('reason') \
+             .finally(function() { __promise_finally_2 += 'cleanup|'; }) \
+             .catch(function(reason) { __promise_finally_2 += reason; });",
+        "__promise_finally_2",
+        JsValue::String(String::new().into()),
+        JsValue::String("cleanup|reason".into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_finally_throw_overrides_fulfillment,
+        "var __promise_finally_3 = ''; \
+         Promise.resolve('value') \
+             .finally(function() { throw 'override'; }) \
+             .catch(function(reason) { __promise_finally_3 = reason; });",
+        "__promise_finally_3",
+        JsValue::String(String::new().into()),
+        JsValue::String("override".into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_finally_throw_overrides_rejection,
+        "var __promise_finally_4 = ''; \
+         Promise.reject('value') \
+             .finally(function() { throw 'override'; }) \
+             .catch(function(reason) { __promise_finally_4 = reason; });",
+        "__promise_finally_4",
+        JsValue::String(String::new().into()),
+        JsValue::String("override".into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_finally_returned_rejection_overrides_fulfillment,
+        "var __promise_finally_5 = ''; \
+         Promise.resolve('value') \
+             .finally(function() { return Promise.reject('cleanup-failed'); }) \
+             .catch(function(reason) { __promise_finally_5 = reason; });",
+        "__promise_finally_5",
+        JsValue::String(String::new().into()),
+        JsValue::String("cleanup-failed".into())
+    );
+    promise_microtask_transition_test!(
+        e2e_promise_finally_thenable_cleanup_preserves_original_value,
+        "var __promise_finally_6 = ''; \
+         Promise.resolve('value') \
+             .finally(function() { \
+                 return { then: function(resolve) { resolve('ignored'); } }; \
+             }) \
+             .then(function(value) { __promise_finally_6 = value; });",
+        "__promise_finally_6",
+        JsValue::String(String::new().into()),
+        JsValue::String("value".into())
+    );
 
     // ── eval: direct vs indirect (end-to-end) ───────────────────────────────
 
