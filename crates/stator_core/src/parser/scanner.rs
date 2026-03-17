@@ -287,6 +287,8 @@ pub enum TokenKind {
     SingleLineComment,
     /// Block comment `/* … */`.
     MultiLineComment,
+    /// Hashbang comment `#!…` at the very start of the source file.
+    HashbangComment,
 
     // ── End of file ───────────────────────────────────────────────────────
     /// End of input.
@@ -1080,7 +1082,7 @@ impl<'src> Scanner<'src> {
             let text = self.source[..self.pos].to_string();
             let end = self.current_pos();
             return Ok(Token {
-                kind: TokenKind::SingleLineComment,
+                kind: TokenKind::HashbangComment,
                 value: TokenValue::Str(text),
                 span: Span { start, end },
                 had_line_terminator_before: had_lt,
@@ -1951,7 +1953,9 @@ mod tests {
             .filter(|t| {
                 !matches!(
                     t.kind,
-                    TokenKind::SingleLineComment | TokenKind::MultiLineComment
+                    TokenKind::SingleLineComment
+                        | TokenKind::MultiLineComment
+                        | TokenKind::HashbangComment
                 )
             })
             .map(|t| t.kind)
@@ -2329,6 +2333,35 @@ mod tests {
     }
 
     // ── Comments ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_hashbang_comment_at_start() {
+        let toks = tokens("#!/usr/bin/env node\nfoo");
+        assert_eq!(toks[0].kind, TokenKind::HashbangComment);
+        assert_eq!(toks[0].value, TokenValue::Str("#!/usr/bin/env node".into()));
+        assert_eq!(toks[1].kind, TokenKind::Identifier);
+        assert!(toks[1].had_line_terminator_before);
+    }
+
+    #[test]
+    fn test_hashbang_only_file() {
+        let toks = tokens("#!/usr/bin/env node");
+        assert_eq!(toks[0].kind, TokenKind::HashbangComment);
+        assert_eq!(toks[1].kind, TokenKind::Eof);
+    }
+
+    #[test]
+    fn test_hashbang_filtered_by_kinds() {
+        let k = kinds("#!/usr/bin/env node\nvar x");
+        assert_eq!(k, vec![TokenKind::Var, TokenKind::Identifier]);
+    }
+
+    #[test]
+    fn test_hash_not_at_start_is_error() {
+        // `#!` not at byte 0 — should produce an error from the '#' handler.
+        let result = Scanner::tokenize_all(" #!");
+        assert!(result.is_err());
+    }
 
     #[test]
     fn test_single_line_comment() {
