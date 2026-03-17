@@ -22,10 +22,10 @@ use super::{
     error_message_from_value, extract_context, find_handler, fn_props_get, fn_props_set,
     has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
     maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator,
-    number_to_jsvalue, plain_object_to_array_items, populate_self_name, proto_lookup, resolve_jump,
-    restore_closure_context, set_function_name_if_missing, set_pending_exception,
-    settle_async_iterator_result, strict_eq, to_array_index, to_bigint, to_property_key,
-    try_execute_best_jit, walk_context_chain, wire_construct_prototype,
+    number_to_jsvalue, plain_object_to_array_items, populate_self_name, proto_lookup,
+    push_value_call_frame, resolve_jump, restore_closure_context, set_function_name_if_missing,
+    set_pending_exception, settle_async_iterator_result, strict_eq, to_array_index, to_bigint,
+    to_property_key, try_execute_best_jit, walk_context_chain, wire_construct_prototype,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
@@ -1261,7 +1261,7 @@ fn handle_call_any_receiver(
                         callee_frame.new_target = ctx.frame.new_target.clone();
                     }
                     populate_self_name(&mut callee_frame, &ba, &callee_val);
-                    push_call_frame("<anonymous>")?;
+                    push_value_call_frame(&JsValue::Function(Rc::clone(&ba)), "<anonymous>")?;
                     let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
                         Interpreter::run(&mut callee_frame)
                     });
@@ -1451,7 +1451,7 @@ fn handle_call_undefined_receiver0(
                         callee_frame.new_target = ctx.frame.new_target.clone();
                     }
                     populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
-                    push_call_frame("<anonymous>")?;
+                    push_value_call_frame(&JsValue::Function(Rc::clone(&ba)), "<anonymous>")?;
                     let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
                         Interpreter::run(&mut callee_frame)
                     });
@@ -1555,7 +1555,7 @@ fn handle_call_undefined_receiver1(
                         callee_frame.new_target = ctx.frame.new_target.clone();
                     }
                     populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
-                    push_call_frame("<anonymous>")?;
+                    push_value_call_frame(&JsValue::Function(Rc::clone(&ba)), "<anonymous>")?;
                     let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
                         Interpreter::run(&mut callee_frame)
                     });
@@ -1668,7 +1668,7 @@ fn handle_call_undefined_receiver2(
                         callee_frame.new_target = ctx.frame.new_target.clone();
                     }
                     populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
-                    push_call_frame("<anonymous>")?;
+                    push_value_call_frame(&JsValue::Function(Rc::clone(&ba)), "<anonymous>")?;
                     let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
                         Interpreter::run(&mut callee_frame)
                     });
@@ -1773,7 +1773,7 @@ fn handle_call_property(
                         .borrow_mut()
                         .insert("this".to_string(), this_val);
                 }
-                push_call_frame("<anonymous>")?;
+                push_value_call_frame(&JsValue::Function(Rc::clone(&ba)), "<anonymous>")?;
                 let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
                     Interpreter::run(&mut callee_frame)
                 });
@@ -1976,7 +1976,7 @@ fn handle_call_with_spread(
                 );
                 restore_closure_context(&mut callee_frame, &ba);
                 populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
-                push_call_frame("<anonymous>")?;
+                push_value_call_frame(&JsValue::Function(Rc::clone(&ba)), "<anonymous>")?;
                 let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
                     Interpreter::run(&mut callee_frame)
                 });
@@ -2058,7 +2058,7 @@ fn call_plain_object_function(
         InterpreterFrame::new_with_globals((**ba).clone(), args, Rc::clone(&ctx.frame.global_env));
     restore_closure_context(&mut callee_frame, ba);
     callee_frame.new_target = ctx.frame.new_target.clone();
-    push_call_frame("<anonymous>")?;
+    push_value_call_frame(&ctx.frame.new_target, "<anonymous>")?;
     let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
         Interpreter::run(&mut callee_frame)
     });
@@ -2145,7 +2145,7 @@ fn construct_class_from_plain_object(
                 .global_env
                 .borrow_mut()
                 .insert("this".to_string(), this.clone());
-            push_call_frame("<field_init>")?;
+            push_value_call_frame(&JsValue::Function(Rc::clone(&init_ba)), "<field_init>")?;
             let _ =
                 stacker::maybe_grow(64 * 1024, 1024 * 1024, || Interpreter::run(&mut init_frame));
             pop_call_frame();
@@ -2162,7 +2162,7 @@ fn construct_class_from_plain_object(
     }
 
     // 5. Run constructor body.
-    push_call_frame("<anonymous>")?;
+    push_value_call_frame(&JsValue::Function(Rc::clone(ba)), "<anonymous>")?;
     let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
         Interpreter::run(&mut callee_frame)
     });
@@ -2240,7 +2240,7 @@ fn handle_construct(
                 .global_env
                 .borrow_mut()
                 .insert("this".to_string(), this_val.clone());
-            push_call_frame("<anonymous>")?;
+            push_value_call_frame(&JsValue::Function(Rc::clone(&ba)), "<anonymous>")?;
             let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
                 Interpreter::run(&mut callee_frame)
             });
@@ -2341,7 +2341,7 @@ fn handle_construct_with_spread(
                 .global_env
                 .borrow_mut()
                 .insert("this".to_string(), this_val.clone());
-            push_call_frame("<anonymous>")?;
+            push_value_call_frame(&JsValue::Function(Rc::clone(&ba)), "<anonymous>")?;
             let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
                 Interpreter::run(&mut callee_frame)
             });
@@ -6132,7 +6132,7 @@ fn handle_call_direct_eval(
                     );
                     restore_closure_context(&mut callee_frame, &ba);
                     populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
-                    push_call_frame("<eval-fallback>")?;
+                    push_value_call_frame(&JsValue::Function(Rc::clone(&ba)), "<eval-fallback>")?;
                     let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
                         Interpreter::run(&mut callee_frame)
                     });

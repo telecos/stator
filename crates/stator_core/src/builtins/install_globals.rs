@@ -18,7 +18,7 @@
 //! ```
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -144,7 +144,6 @@ use crate::objects::js_object::JsObject;
 use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::PropertyMap;
 use crate::objects::value::{JsValue, NativeIterator, ToPrimitiveHint, number_to_string};
-use std::collections::HashSet;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -323,6 +322,83 @@ fn own_string_property_keys(map: &PropertyMap, enumerable_only: bool) -> Vec<Str
         .map(|(_, key)| key)
         .chain(string_keys)
         .collect()
+}
+
+fn error_own_data_property_attrs() -> PropertyAttributes {
+    PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE
+}
+
+fn synthetic_error_own_property_names(error: &JsError) -> Vec<String> {
+    let mut names = vec!["message".to_string(), "stack".to_string()];
+    if error.cause.is_some() {
+        names.push("cause".to_string());
+    }
+    if error.kind == ErrorKind::AggregateError {
+        names.push("errors".to_string());
+    }
+    names
+}
+
+fn error_own_string_property_names(error: &JsError) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
+
+    for name in synthetic_error_own_property_names(error) {
+        if !error.props.borrow().contains_key(&name) && seen.insert(name.clone()) {
+            names.push(name);
+        }
+    }
+
+    for name in own_string_property_keys(&error.props.borrow(), false) {
+        if seen.insert(name.clone()) {
+            names.push(name);
+        }
+    }
+
+    names
+}
+
+fn error_own_keys(error: &JsError) -> Vec<JsValue> {
+    let mut keys: Vec<JsValue> = error_own_string_property_names(error)
+        .into_iter()
+        .map(|name| JsValue::String(name.into()))
+        .collect();
+    keys.extend(
+        error
+            .props
+            .borrow()
+            .own_symbol_keys()
+            .into_iter()
+            .map(JsValue::Symbol),
+    );
+    keys
+}
+
+fn error_data_descriptor(
+    value: JsValue,
+    writable: bool,
+    enumerable: bool,
+    configurable: bool,
+) -> JsValue {
+    let mut desc = PropertyMap::new();
+    desc.insert("value".into(), value);
+    desc.insert("writable".into(), JsValue::Boolean(writable));
+    desc.insert("enumerable".into(), JsValue::Boolean(enumerable));
+    desc.insert("configurable".into(), JsValue::Boolean(configurable));
+    JsValue::PlainObject(Rc::new(RefCell::new(desc)))
+}
+
+fn synthetic_error_property_descriptor(error: &JsError, key: &str) -> Option<JsValue> {
+    let value = match key {
+        "message" => JsValue::String(error.message.clone().into()),
+        "stack" => JsValue::String(error.stack.clone().into()),
+        "cause" => error.cause.clone()?,
+        "errors" if error.kind == ErrorKind::AggregateError => {
+            JsValue::new_array(error.errors.clone())
+        }
+        _ => return None,
+    };
+    Some(error_data_descriptor(value, true, false, true))
 }
 
 fn enumerable_own_string_keys(value: &JsValue) -> Vec<String> {
@@ -1812,19 +1888,25 @@ fn initialize_error_plain_object(
         _ => kind.as_name(),
     };
     let mut borrow = target.borrow_mut();
-    borrow.insert(
+    borrow.insert_with_attrs(
         "message".into(),
         JsValue::String(message.to_string().into()),
+        error_own_data_property_attrs(),
     );
-    borrow.insert(
+    borrow.insert_with_attrs(
         "stack".into(),
         JsValue::String(crate::builtins::error::capture_stack_trace(stack_name, message).into()),
+        error_own_data_property_attrs(),
     );
     if let Some(cause) = cause {
-        borrow.insert("cause".into(), cause);
+        borrow.insert_with_attrs("cause".into(), cause, error_own_data_property_attrs());
     }
     if let Some(errors) = errors {
-        borrow.insert("errors".into(), JsValue::new_array(errors));
+        borrow.insert_with_attrs(
+            "errors".into(),
+            JsValue::new_array(errors),
+            error_own_data_property_attrs(),
+        );
     }
     drop(borrow);
     JsValue::PlainObject(Rc::clone(target))
@@ -1853,9 +1935,11 @@ fn make_error_constructor(kind: ErrorKind) -> JsValue {
         }
         let mut err = JsError::new(kind, message);
         if let Some(ref cause_val) = cause {
-            err.props
-                .borrow_mut()
-                .insert("cause".to_string(), cause_val.clone());
+            err.props.borrow_mut().insert_with_attrs(
+                "cause".to_string(),
+                cause_val.clone(),
+                error_own_data_property_attrs(),
+            );
         }
         err.cause = cause;
         Ok(JsValue::Error(Rc::new(err)))
@@ -1967,13 +2051,17 @@ fn make_aggregate_error_constructor(error_proto: &JsValue, error_ctor: &JsValue)
             ));
         }
         let mut err = JsError::new_aggregate(inner_errors, message);
-        err.props
-            .borrow_mut()
-            .insert("errors".to_string(), JsValue::new_array(err.errors.clone()));
+        err.props.borrow_mut().insert_with_attrs(
+            "errors".to_string(),
+            JsValue::new_array(err.errors.clone()),
+            error_own_data_property_attrs(),
+        );
         if let Some(ref cause_val) = cause {
-            err.props
-                .borrow_mut()
-                .insert("cause".to_string(), cause_val.clone());
+            err.props.borrow_mut().insert_with_attrs(
+                "cause".to_string(),
+                cause_val.clone(),
+                error_own_data_property_attrs(),
+            );
         }
         err.cause = cause;
         Ok(JsValue::Error(Rc::new(err)))
@@ -4749,12 +4837,7 @@ fn make_object() -> JsValue {
                     enumerable: bool,
                     configurable: bool,
                 ) -> JsValue {
-                    let mut desc = PropertyMap::new();
-                    desc.insert("value".into(), value);
-                    desc.insert("writable".into(), JsValue::Boolean(writable));
-                    desc.insert("enumerable".into(), JsValue::Boolean(enumerable));
-                    desc.insert("configurable".into(), JsValue::Boolean(configurable));
-                    JsValue::PlainObject(Rc::new(RefCell::new(desc)))
+                    error_data_descriptor(value, writable, enumerable, configurable)
                 }
 
                 match obj {
@@ -4844,6 +4927,21 @@ fn make_object() -> JsValue {
                             ))
                         } else if key == "name" {
                             Ok(data_desc(JsValue::String("".into()), false, false, true))
+                        } else {
+                            Ok(JsValue::Undefined)
+                        }
+                    }
+                    JsValue::Error(error) => {
+                        if let Some((value, attrs)) = error.props.borrow().get_with_attrs(&key) {
+                            Ok(data_desc(
+                                value.clone(),
+                                attrs.contains(PropertyAttributes::WRITABLE),
+                                attrs.contains(PropertyAttributes::ENUMERABLE),
+                                attrs.contains(PropertyAttributes::CONFIGURABLE),
+                            ))
+                        } else if let Some(desc) = synthetic_error_property_descriptor(error, &key)
+                        {
+                            Ok(desc)
                         } else {
                             Ok(JsValue::Undefined)
                         }
@@ -4966,6 +5064,12 @@ fn make_object() -> JsValue {
                             .collect();
                         Ok(JsValue::new_array(sorted))
                     }
+                    JsValue::Error(error) => Ok(JsValue::new_array(
+                        error_own_string_property_names(error)
+                            .into_iter()
+                            .map(|name| JsValue::String(name.into()))
+                            .collect(),
+                    )),
                     JsValue::Array(items) => {
                         let len = items.borrow().len();
                         let mut keys: Vec<JsValue> = (0..len)
@@ -5450,6 +5554,43 @@ fn make_object() -> JsValue {
                                 name.clone(),
                                 JsValue::PlainObject(Rc::new(RefCell::new(desc))),
                             );
+                        }
+                        Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
+                    }
+                    JsValue::Error(error) => {
+                        let mut result = PropertyMap::new();
+                        let prop_names = error_own_string_property_names(error);
+                        let props = error.props.borrow();
+                        for key in prop_names {
+                            let desc = if let Some((value, attrs)) = props.get_with_attrs(&key) {
+                                make_data_desc(
+                                    value.clone(),
+                                    attrs.contains(PropertyAttributes::WRITABLE),
+                                    attrs.contains(PropertyAttributes::ENUMERABLE),
+                                    attrs.contains(PropertyAttributes::CONFIGURABLE),
+                                )
+                            } else if let Some(desc) =
+                                synthetic_error_property_descriptor(error, &key)
+                            {
+                                desc
+                            } else {
+                                continue;
+                            };
+                            result.insert(key, desc);
+                        }
+                        for sym in props.own_symbol_keys() {
+                            let key = crate::builtins::symbol::symbol_to_property_key(sym);
+                            if let Some((value, attrs)) = props.get_with_attrs(&key) {
+                                result.insert(
+                                    key,
+                                    make_data_desc(
+                                        value.clone(),
+                                        attrs.contains(PropertyAttributes::WRITABLE),
+                                        attrs.contains(PropertyAttributes::ENUMERABLE),
+                                        attrs.contains(PropertyAttributes::CONFIGURABLE),
+                                    ),
+                                );
+                            }
                         }
                         Ok(JsValue::PlainObject(Rc::new(RefCell::new(result))))
                     }
@@ -12456,6 +12597,7 @@ fn make_reflect() -> JsValue {
                 }
                 let keys = match &target {
                     JsValue::PlainObject(map) => plain_own_keys(&map.borrow()),
+                    JsValue::Error(error) => error_own_keys(error),
                     JsValue::Array(items) => {
                         let mut keys: Vec<JsValue> = (0..items.borrow().len())
                             .map(|index| JsValue::String(index.to_string().into()))
@@ -43123,6 +43265,127 @@ mod tests {
     fn e2e_error_stack_trace_limit_type() {
         let result = global_eval("typeof Error.stackTraceLimit").unwrap();
         assert_eq!(result, JsValue::String("number".to_string()));
+    }
+
+    #[test]
+    fn e2e_error_stack_includes_function_names() {
+        let result = global_eval(
+            r#"
+            function outer() { return inner(); }
+            function inner() { return new Error("boom").stack; }
+            var stack = outer();
+            stack.indexOf("inner") !== -1 && stack.indexOf("outer") !== -1
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_type_error_stack_includes_constructor_name() {
+        let result =
+            global_eval(r#"new TypeError("boom").stack.indexOf("TypeError: boom") === 0"#).unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_error_message_descriptor_is_own_data_property() {
+        let result = global_eval(
+            r#"
+            var d = Object.getOwnPropertyDescriptor(new Error("boom"), "message");
+            d.value === "boom" && d.writable === true && d.enumerable === false && d.configurable === true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_error_cause_descriptor_is_own_data_property() {
+        let result = global_eval(
+            r#"
+            var d = Object.getOwnPropertyDescriptor(new Error("boom", { cause: 7 }), "cause");
+            d.value === 7 && d.writable === true && d.enumerable === false && d.configurable === true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_aggregate_error_errors_descriptor_is_own_data_property() {
+        let result = global_eval(
+            r#"
+            var err = new AggregateError([1, 2], "boom");
+            var d = Object.getOwnPropertyDescriptor(err, "errors");
+            Array.isArray(d.value) && d.value.length === 2 && d.enumerable === false && d.writable === true && d.configurable === true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_error_get_own_property_names_includes_message_and_stack() {
+        let result = global_eval(
+            r#"
+            var names = Object.getOwnPropertyNames(new Error("boom"));
+            names.indexOf("message") !== -1 && names.indexOf("stack") !== -1
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_error_get_own_property_names_includes_cause() {
+        let result = global_eval(
+            r#"
+            Object.getOwnPropertyNames(new Error("boom", { cause: 1 })).indexOf("cause") !== -1
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_reflect_own_keys_error_includes_message_stack_and_cause() {
+        let result = global_eval(
+            r#"
+            var keys = Reflect.ownKeys(new Error("boom", { cause: 1 }));
+            keys.indexOf("message") !== -1 && keys.indexOf("stack") !== -1 && keys.indexOf("cause") !== -1
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_reflect_own_keys_aggregate_error_includes_errors() {
+        let result = global_eval(
+            r#"
+            Reflect.ownKeys(new AggregateError([1], "boom")).indexOf("errors") !== -1
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_custom_error_subclass_message_remains_non_enumerable() {
+        let result = global_eval(
+            r#"
+            class MyError extends Error {
+                constructor(msg) {
+                    super(msg);
+                    this.name = "MyError";
+                }
+            }
+            Object.getOwnPropertyDescriptor(new MyError("boom"), "message").enumerable === false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Boolean(true));
     }
 
     // ── Number deep conformance e2e tests ───────────────────────────────

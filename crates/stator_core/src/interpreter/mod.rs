@@ -185,6 +185,7 @@ use crate::bytecode::bytecode_array::{MaglevJitCodeCache, TurbofanJitCodeCache};
 use crate::bytecode::bytecodes::decode_with_byte_offsets;
 use crate::error::{StatorError, StatorResult};
 use crate::inspector::debugger::Debugger;
+use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::PropertyMap;
 use crate::objects::string_intern::intern;
 use crate::objects::value::{JsContext, JsValue};
@@ -569,6 +570,15 @@ pub(crate) fn function_display_name(value: &JsValue) -> String {
             _ => String::new(),
         },
         _ => String::new(),
+    }
+}
+
+pub(crate) fn push_value_call_frame(value: &JsValue, fallback: &str) -> StatorResult<()> {
+    let name = function_display_name(value);
+    if name.is_empty() {
+        push_call_frame(fallback)
+    } else {
+        push_call_frame(name)
     }
 }
 
@@ -2518,7 +2528,7 @@ pub(super) fn dispatch_call(
                     );
                     restore_closure_context(&mut callee_frame, ba);
                     populate_self_name(&mut callee_frame, ba, &JsValue::Function(Rc::clone(ba)));
-                    push_call_frame("<anonymous>")?;
+                    push_value_call_frame(&JsValue::Function(Rc::clone(ba)), "<anonymous>")?;
                     let result = Interpreter::run(&mut callee_frame);
                     pop_call_frame();
                     frame.accumulator = result?;
@@ -2594,7 +2604,7 @@ pub(super) fn dispatch_call_property(
                             .borrow_mut()
                             .insert("this".to_string(), this_val);
                     }
-                    push_call_frame("<anonymous>")?;
+                    push_value_call_frame(&JsValue::Function(Rc::clone(ba)), "<anonymous>")?;
                     let result = Interpreter::run(&mut callee_frame);
                     pop_call_frame();
                     frame.accumulator = result?;
@@ -5837,7 +5847,7 @@ pub fn dispatch_call_value(callee: &JsValue, args: Vec<JsValue>) -> StatorResult
                 init_generator_state_prototype(&state, ba);
                 return Ok(JsValue::Generator(state));
             }
-            push_call_frame("<anonymous>")?;
+            push_value_call_frame(callee, "<anonymous>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
                 InterpreterFrame::new_with_globals((**ba).clone(), args, globals)
             } else {
@@ -5880,7 +5890,7 @@ pub fn dispatch_call_with_this(
                 init_generator_state_prototype(&state, ba);
                 return Ok(JsValue::Generator(state));
             }
-            push_call_frame("<anonymous>")?;
+            push_value_call_frame(callee, "<anonymous>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
                 InterpreterFrame::new_with_globals((**ba).clone(), args, globals)
             } else {
@@ -6160,7 +6170,16 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
         }
         JsValue::Error(e) => {
             let prop_name = to_property_key(key)?;
-            e.props.borrow_mut().insert(prop_name, value);
+            let mut props = e.props.borrow_mut();
+            if matches!(prop_name.as_str(), "message" | "stack" | "cause" | "errors") {
+                props.insert_with_attrs(
+                    prop_name,
+                    value,
+                    PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+                );
+            } else {
+                props.insert(prop_name, value);
+            }
         }
         _ => {}
     }
