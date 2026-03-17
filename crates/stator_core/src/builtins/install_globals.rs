@@ -497,7 +497,10 @@ fn array_like_length(val: &JsValue) -> StatorResult<usize> {
 /// Return whether an array-like value has an own indexed property at `index`.
 fn array_like_has_index(val: &JsValue, index: usize) -> bool {
     match val {
-        JsValue::Array(items) => index < items.borrow().len(),
+        JsValue::Array(items) => {
+            let borrow = items.borrow();
+            index < borrow.len() && !borrow[index].is_the_hole()
+        }
         JsValue::PlainObject(map) => map.borrow().contains_key(&index.to_string()),
         JsValue::Proxy(proxy) => proxy_has(&proxy.borrow(), &index.to_string()).unwrap_or(false),
         _ => false,
@@ -507,11 +510,10 @@ fn array_like_has_index(val: &JsValue, index: usize) -> bool {
 /// Read an indexed property from an array-like value.
 fn array_like_get_index(val: &JsValue, index: usize) -> JsValue {
     match val {
-        JsValue::Array(items) => items
-            .borrow()
-            .get(index)
-            .cloned()
-            .unwrap_or(JsValue::Undefined),
+        JsValue::Array(items) => match items.borrow().get(index).cloned() {
+            Some(value) if !value.is_the_hole() => value,
+            _ => JsValue::Undefined,
+        },
         JsValue::PlainObject(map) => map
             .borrow()
             .get(&index.to_string())
@@ -660,6 +662,26 @@ fn call_callback_with_this(
     args: Vec<JsValue>,
 ) -> StatorResult<JsValue> {
     dispatch_call_with_this(cb, this_arg, args)
+}
+
+fn flatten_array_like_into(
+    source: &JsValue,
+    depth: usize,
+    out: &mut Vec<JsValue>,
+) -> StatorResult<()> {
+    let len = array_like_length(source)?;
+    for index in 0..len {
+        if !array_like_has_index(source, index) {
+            continue;
+        }
+        let item = array_like_get_index(source, index);
+        if depth > 0 && is_js_array(&item) {
+            flatten_array_like_into(&item, depth - 1, out)?;
+        } else {
+            out.push(item);
+        }
+    }
+    Ok(())
 }
 
 /// ECMAScript §7.2.1 RequireObjectCoercible — throws TypeError for null/undefined.
@@ -6729,7 +6751,6 @@ fn make_array() -> JsValue {
             builtin_fn("flat", 0, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
-                let (elements, _) = to_array_like_elements(arr);
                 let depth_f = args
                     .get(1)
                     .unwrap_or(&JsValue::Smi(1))
@@ -6742,19 +6763,9 @@ fn make_array() -> JsValue {
                 } else {
                     depth_f as usize
                 };
-                fn flatten(items: &[JsValue], depth: usize) -> Vec<JsValue> {
-                    let mut result = Vec::new();
-                    for item in items {
-                        if depth > 0 && is_js_array(item) {
-                            let (inner, _) = to_array_like_elements(item);
-                            result.extend(flatten(&inner, depth - 1));
-                            continue;
-                        }
-                        result.push(item.clone());
-                    }
-                    result
-                }
-                Ok(JsValue::new_array(flatten(&elements, depth)))
+                let mut result = Vec::new();
+                flatten_array_like_into(arr, depth, &mut result)?;
+                Ok(JsValue::new_array(result))
             }),
         );
 
@@ -6789,8 +6800,7 @@ fn make_array() -> JsValue {
                         ],
                     )?;
                     if is_js_array(&mapped) {
-                        let (inner, _) = to_array_like_elements(&mapped);
-                        result.extend(inner);
+                        flatten_array_like_into(&mapped, 1, &mut result)?;
                     } else {
                         result.push(mapped);
                     }
@@ -7395,7 +7405,7 @@ fn make_array() -> JsValue {
             builtin_fn("toReversed", 0, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
-                let (mut elements, _) = to_array_like_elements(arr);
+                let (mut elements, _) = try_to_array_like_elements(arr)?;
                 elements.reverse();
                 Ok(JsValue::new_array(elements))
             }),
@@ -7407,8 +7417,16 @@ fn make_array() -> JsValue {
             builtin_fn("toSorted", 1, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
-                let (mut elements, _) = to_array_like_elements(arr);
+                let (mut elements, _) = try_to_array_like_elements(arr)?;
                 let cmp_fn = args.get(1).cloned();
+                if let Some(cb) = cmp_fn.as_ref()
+                    && !matches!(cb, JsValue::Undefined)
+                    && !is_callable(cb)
+                {
+                    return Err(StatorError::TypeError(
+                        "Array.prototype.toSorted compareFn must be callable".into(),
+                    ));
+                }
                 match &cmp_fn {
                     Some(cb) if !matches!(cb, JsValue::Undefined) => {
                         let mut sort_err: Option<StatorError> = None;
@@ -7453,7 +7471,7 @@ fn make_array() -> JsValue {
             builtin_fn("toSpliced", 2, |args| {
                 let arr = args.first().unwrap_or(&JsValue::Undefined);
                 require_object_coercible(arr)?;
-                let (elements, _) = to_array_like_elements(arr);
+                let (elements, _) = try_to_array_like_elements(arr)?;
                 let len = elements.len() as i64;
                 let start = args
                     .get(1)
@@ -44249,6 +44267,323 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn e2e_array_at_array_like_negative_index() {
+        assert_eval_true("Array.prototype.at.call({ 0: 'a', 1: 'b', length: 2 }, -1) === 'b'");
+    }
+
+    #[test]
+    fn e2e_array_at_string_index_truncates() {
+        assert_eval_true("[10, 20, 30].at('1.9') === 20");
+    }
+
+    #[test]
+    fn e2e_array_at_nan_defaults_to_zero() {
+        assert_eval_true("[10, 20, 30].at(NaN) === 10");
+    }
+
+    #[test]
+    fn e2e_array_at_infinity_returns_undefined() {
+        assert_eval_true("[10, 20, 30].at(Infinity) === undefined");
+    }
+
+    #[test]
+    fn e2e_array_at_array_like_missing_slot_returns_undefined() {
+        assert_eval_true("Array.prototype.at.call({ length: 1 }, 0) === undefined");
+    }
+
+    #[test]
+    fn e2e_array_find_last_visits_holes() {
+        assert_eval_true(
+            "var seen = []; [, 1].findLast(function(v, i) { seen.push(i + ':' + String(v)); return false; }); seen.join('|') === '1:1|0:undefined'",
+        );
+    }
+
+    #[test]
+    fn e2e_array_find_last_array_like_visits_missing_indices() {
+        assert_eval_true(
+            "var seen = []; Array.prototype.findLast.call({ 2: 3, length: 3 }, function(v, i) { seen.push(i + ':' + String(v)); return false; }); seen.join('|') === '2:3|1:undefined|0:undefined'",
+        );
+    }
+
+    #[test]
+    fn e2e_array_find_last_index_can_match_hole_as_undefined() {
+        assert_eval_true("[1, , 3].findLastIndex(function(v) { return v === undefined; }) === 1");
+    }
+
+    #[test]
+    fn e2e_array_find_last_index_reverse_searches() {
+        assert_eval_true("[1, 2, 3, 4].findLastIndex(function(v) { return v % 2 === 0; }) === 3");
+    }
+
+    #[test]
+    fn e2e_array_find_last_non_callable_throws() {
+        assert_eval_true(
+            "try { [1].findLast(null); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_array_find_last_index_non_callable_throws() {
+        assert_eval_true(
+            "try { [1].findLastIndex(null); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_array_to_reversed_materializes_holes_as_undefined() {
+        assert_eval_true(
+            "var r = [1, , 3].toReversed(); r.length === 3 && r[0] === 3 && r[1] === undefined && r[2] === 1 && Object.hasOwn(r, '1')",
+        );
+    }
+
+    #[test]
+    fn e2e_array_to_reversed_leaves_sparse_source_unchanged() {
+        assert_eval_true(
+            "var a = [1, , 3]; a.toReversed(); a.join(',') === '1,,3' && !Object.hasOwn(a, '1')",
+        );
+    }
+
+    #[test]
+    fn e2e_array_to_reversed_ignores_symbol_species() {
+        assert_eval_true(
+            "var hits = 0; var a = [1, 2, 3]; var ctor = {}; Object.defineProperty(ctor, Symbol.species, { get: function() { hits++; return function() { return ['bad']; }; } }); a.constructor = ctor; var r = a.toReversed(); hits === 0 && Array.isArray(r) && r.join(',') === '3,2,1'",
+        );
+    }
+
+    #[test]
+    fn e2e_array_to_reversed_propagates_length_errors() {
+        assert_eval_true(
+            "var p = new Proxy({ length: 1 }, { get: function(target, key) { if (key === 'length') throw new Error('boom'); return target[key]; } }); try { Array.prototype.toReversed.call(p); false; } catch (e) { e.message === 'boom'; }",
+        );
+    }
+
+    #[test]
+    fn e2e_array_to_sorted_default_is_lexicographic() {
+        assert_eval_true("[1, 10, 2].toSorted().join(',') === '1,10,2'");
+    }
+
+    #[test]
+    fn e2e_array_to_sorted_descending_compare_fn() {
+        assert_eval_true(
+            "[3, 1, 2].toSorted(function(a, b) { return b - a; }).join(',') === '3,2,1'",
+        );
+    }
+
+    #[test]
+    fn e2e_array_to_sorted_non_callable_comparefn_throws_even_for_singleton() {
+        assert_eval_true(
+            "try { [1].toSorted(null); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_array_to_sorted_undefined_comparefn_is_allowed() {
+        assert_eval_true("[1].toSorted(undefined)[0] === 1");
+    }
+
+    #[test]
+    fn e2e_array_to_sorted_ignores_symbol_species() {
+        assert_eval_true(
+            "var hits = 0; var a = [3, 1, 2]; var ctor = {}; Object.defineProperty(ctor, Symbol.species, { get: function() { hits++; return function() { return ['bad']; }; } }); a.constructor = ctor; var r = a.toSorted(); hits === 0 && Array.isArray(r) && r.join(',') === '1,2,3'",
+        );
+    }
+
+    #[test]
+    fn e2e_array_to_sorted_propagates_length_errors() {
+        assert_eval_true(
+            "var p = new Proxy({ 0: 2, 1: 1, length: 2 }, { get: function(target, key) { if (key === 'length') throw new Error('boom'); return target[key]; } }); try { Array.prototype.toSorted.call(p); false; } catch (e) { e.message === 'boom'; }",
+        );
+    }
+
+    #[test]
+    fn e2e_array_to_sorted_array_like_receiver() {
+        assert_eval_true(
+            "Array.prototype.toSorted.call({ 0: 'b', 1: 'a', length: 2 }).join(',') === 'a,b'",
+        );
+    }
+
+    #[test]
+    fn e2e_array_to_spliced_omitted_delete_count_removes_to_end() {
+        assert_eval_true("[1, 2, 3].toSpliced(1).join(',') === '1'");
+    }
+
+    #[test]
+    fn e2e_array_to_spliced_undefined_delete_count_is_zero() {
+        assert_eval_true("[1, 2, 3].toSpliced(1, undefined, 9).join(',') === '1,9,2,3'");
+    }
+
+    #[test]
+    fn e2e_array_to_spliced_negative_start_clamps_to_zero() {
+        assert_eval_true("[1, 2, 3].toSpliced(-99, 1, 8).join(',') === '8,2,3'");
+    }
+
+    #[test]
+    fn e2e_array_to_spliced_can_insert_at_end() {
+        assert_eval_true("[1, 2].toSpliced(2, 0, 3, 4).join(',') === '1,2,3,4'");
+    }
+
+    #[test]
+    fn e2e_array_to_spliced_ignores_symbol_species() {
+        assert_eval_true(
+            "var hits = 0; var a = [1, 2, 3]; var ctor = {}; Object.defineProperty(ctor, Symbol.species, { get: function() { hits++; return function() { return ['bad']; }; } }); a.constructor = ctor; var r = a.toSpliced(1, 1, 9); hits === 0 && Array.isArray(r) && r.join(',') === '1,9,3'",
+        );
+    }
+
+    #[test]
+    fn e2e_array_to_spliced_propagates_length_errors() {
+        assert_eval_true(
+            "var p = new Proxy({ 0: 1, length: 1 }, { get: function(target, key) { if (key === 'length') throw new Error('boom'); return target[key]; } }); try { Array.prototype.toSpliced.call(p, 0, 0, 9); false; } catch (e) { e.message === 'boom'; }",
+        );
+    }
+
+    #[test]
+    fn e2e_array_to_spliced_array_like_receiver() {
+        assert_eval_true(
+            "Array.prototype.toSpliced.call({ 0: 'a', 1: 'b', length: 2 }, 1, 0, 'x').join(',') === 'a,x,b'",
+        );
+    }
+
+    #[test]
+    fn e2e_array_with_replaces_without_mutating_source() {
+        assert_eval_true(
+            "var a = [1, 2, 3]; var b = a.with(1, 9); a.join(',') === '1,2,3' && b.join(',') === '1,9,3'",
+        );
+    }
+
+    #[test]
+    fn e2e_array_with_negative_index_replaces_from_end() {
+        assert_eval_true("[1, 2, 3].with(-1, 9).join(',') === '1,2,9'");
+    }
+
+    #[test]
+    fn e2e_array_with_string_index_truncates() {
+        assert_eval_true("[1, 2, 3].with('1.9', 9)[1] === 9");
+    }
+
+    #[test]
+    fn e2e_array_with_positive_out_of_bounds_throws() {
+        assert_eval_true(
+            "try { [1, 2].with(2, 0); false; } catch (e) { e instanceof RangeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_array_with_empty_array_throws() {
+        assert_eval_true("try { [].with(0, 1); false; } catch (e) { e instanceof RangeError; }");
+    }
+
+    #[test]
+    fn e2e_array_with_ignores_symbol_species() {
+        assert_eval_true(
+            "var hits = 0; var a = [1, 2, 3]; var ctor = {}; Object.defineProperty(ctor, Symbol.species, { get: function() { hits++; return function() { return ['bad']; }; } }); a.constructor = ctor; var r = a.with(1, 9); hits === 0 && Array.isArray(r) && r.join(',') === '1,9,3'",
+        );
+    }
+
+    #[test]
+    fn e2e_array_flat_skips_holes_in_source_and_nested_arrays() {
+        assert_eval_true(
+            "Array.prototype.flat.call({ 0: [1, , 2], 2: 3, length: 3 }).join(',') === '1,2,3'",
+        );
+    }
+
+    #[test]
+    fn e2e_array_flat_depth_two_flattens_two_levels() {
+        assert_eval_true("[1, [2, [3]]].flat(2).join(',') === '1,2,3'");
+    }
+
+    #[test]
+    fn e2e_array_flat_infinity_flattens_fully() {
+        assert_eval_true("[1, [2, [3, [4]]]].flat(Infinity).join(',') === '1,2,3,4'");
+    }
+
+    #[test]
+    fn e2e_array_flat_propagates_length_errors() {
+        assert_eval_true(
+            "var p = new Proxy({ length: 1 }, { get: function(target, key) { if (key === 'length') throw new Error('boom'); return target[key]; } }); try { Array.prototype.flat.call(p); false; } catch (e) { e.message === 'boom'; }",
+        );
+    }
+
+    #[test]
+    fn e2e_array_flatmap_skips_holes_in_source() {
+        assert_eval_true(
+            "var r = [, 1].flatMap(function(v) { return [v]; }); r.length === 1 && r[0] === 1",
+        );
+    }
+
+    #[test]
+    fn e2e_array_flatmap_skips_holes_in_returned_arrays() {
+        assert_eval_true(
+            "var r = [1].flatMap(function() { return [, 2]; }); r.length === 1 && r[0] === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_array_flatmap_array_like_receiver_skips_missing_slots() {
+        assert_eval_true(
+            "var r = Array.prototype.flatMap.call({ 1: 2, length: 2 }, function(v) { return [v]; }); r.length === 1 && r[0] === 2",
+        );
+    }
+
+    #[test]
+    fn e2e_array_flatmap_propagates_length_errors() {
+        assert_eval_true(
+            "var p = new Proxy({ length: 1 }, { get: function(target, key) { if (key === 'length') throw new Error('boom'); return target[key]; } }); try { Array.prototype.flatMap.call(p, function(v) { return [v]; }); false; } catch (e) { e.message === 'boom'; }",
+        );
+    }
+
+    #[test]
+    fn e2e_array_from_prefers_iterator_over_length() {
+        assert_eval_true(
+            "var obj = { 0: 'x', length: 1 }; obj[Symbol.iterator] = function() { var done = false; return { next: function() { if (done) return { done: true }; done = true; return { value: 'iter', done: false }; } }; }; Array.from(obj).join(',') === 'iter'",
+        );
+    }
+
+    #[test]
+    fn e2e_array_from_mapfn_visits_missing_array_like_indices_as_undefined() {
+        assert_eval_true(
+            "var seen = []; Array.from({ 1: 'x', length: 3 }, function(v, i) { seen.push(i + ':' + String(v)); return v; }); seen.join('|') === '0:undefined|1:x|2:undefined'",
+        );
+    }
+
+    #[test]
+    fn e2e_array_from_sparse_array_like_materializes_undefined_slots() {
+        assert_eval_true(
+            "var a = Array.from({ 1: 'x', length: 3 }); a.length === 3 && a[0] === undefined && a[1] === 'x' && a[2] === undefined && Object.hasOwn(a, '0') && Object.hasOwn(a, '2')",
+        );
+    }
+
+    #[test]
+    fn e2e_array_from_non_callable_mapfn_throws_even_for_empty_input() {
+        assert_eval_true(
+            "try { Array.from({ length: 0 }, null); false; } catch (e) { e instanceof TypeError; }",
+        );
+    }
+
+    #[test]
+    fn e2e_array_from_string_mapfn_with_this_arg() {
+        assert_eval_true(
+            "Array.from('ab', function(ch, i) { return this.prefix + ch + i; }, { prefix: '_' }).join('|') === '_a0|_b1'",
+        );
+    }
+
+    #[test]
+    fn e2e_array_from_set_preserves_iteration_order() {
+        assert_eval_true("Array.from(new Set([3, 1, 3])).join(',') === '3,1'");
+    }
+
+    #[test]
+    fn e2e_array_of_no_args_returns_empty_array() {
+        assert_eval_true("Array.of().length === 0");
+    }
+
+    #[test]
+    fn e2e_array_of_preserves_undefined_and_null() {
+        assert_eval_true(
+            "var a = Array.of(undefined, null, 'x'); a.length === 3 && a[0] === undefined && a[1] === null && a[2] === 'x'",
+        );
     }
 
     /// `Array.prototype.group` must not exist (removed Stage 3 TC39 proposal).
