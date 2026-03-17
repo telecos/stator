@@ -11089,6 +11089,23 @@ fn make_regexp() -> JsValue {
             props.insert(name.into(), JsValue::String(String::new().into()));
         }
 
+        // Annex B §B.2.4 — short alias getters: $_, $&, $+, $`, $'
+        for &(alias, canonical) in &[
+            ("$_", "input"),
+            ("$&", "lastMatch"),
+            ("$+", "lastParen"),
+            ("$`", "leftContext"),
+            ("$'", "rightContext"),
+        ] {
+            let getter_key = format!("__get_{alias}__");
+            let canon = canonical.to_string();
+            props.insert(
+                getter_key,
+                native(move |_args| Ok(regexp_static_get(&canon))),
+            );
+            props.insert(alias.into(), JsValue::String(String::new().into()));
+        }
+
         // §22.2.4.2 RegExp.escape(string)  — ES2025
         props.insert(
             "escape".into(),
@@ -11472,6 +11489,79 @@ fn make_regexp() -> JsValue {
                         return f(vec![input]);
                     }
                     Ok(JsValue::Undefined)
+                }),
+            );
+
+            // Annex B §B.2.5.1 RegExp.prototype.compile(pattern, flags)
+            //
+            // Deprecated legacy method that reinitialises a regexp in place.
+            // We create a fresh regexp from the new pattern/flags and then
+            // overwrite the properties on `this`.
+            proto.insert(
+                "compile".into(),
+                native(|args| {
+                    let this = args.first().unwrap_or(&JsValue::Undefined);
+                    let pattern_arg = args.get(1).unwrap_or(&JsValue::Undefined);
+                    let flags_arg = args.get(2).unwrap_or(&JsValue::Undefined);
+
+                    let pattern = match pattern_arg {
+                        JsValue::Undefined => String::new(),
+                        v => v.to_js_string()?,
+                    };
+                    let flags = match flags_arg {
+                        JsValue::Undefined => String::new(),
+                        v => v.to_js_string()?,
+                    };
+
+                    let new_re = regexp_construct(&[
+                        JsValue::String(pattern.into()),
+                        JsValue::String(flags.into()),
+                    ])?;
+
+                    if let (JsValue::PlainObject(target), JsValue::PlainObject(source)) =
+                        (this, &new_re)
+                    {
+                        let src = source.borrow();
+                        let mut tgt = target.borrow_mut();
+                        // Copy key properties from the freshly-created regexp.
+                        for key in &[
+                            "source",
+                            "flags",
+                            "global",
+                            "ignoreCase",
+                            "multiline",
+                            "dotAll",
+                            "unicode",
+                            "unicodeSets",
+                            "sticky",
+                            "hasIndices",
+                            "lastIndex",
+                            "test",
+                            "exec",
+                            "toString",
+                            "__symbol_match__",
+                            "__symbol_replace__",
+                            "__symbol_search__",
+                            "__symbol_split__",
+                            "__symbol_match_all__",
+                            "__get_source__",
+                            "__get_flags__",
+                            "__get_global__",
+                            "__get_ignoreCase__",
+                            "__get_multiline__",
+                            "__get_dotAll__",
+                            "__get_unicode__",
+                            "__get_unicodeSets__",
+                            "__get_sticky__",
+                            "__get_hasIndices__",
+                        ] {
+                            if let Some(val) = src.get(key) {
+                                tgt.insert(key.to_string(), val.clone());
+                            }
+                        }
+                    }
+
+                    Ok(this.clone())
                 }),
             );
 
