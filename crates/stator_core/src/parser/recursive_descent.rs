@@ -3939,9 +3939,8 @@ impl<'src> Parser<'src> {
                         },
                     }))
                 } else if self.peek_kind() == TokenKind::LeftParen {
-                    // `import(source)` or `import(source, options)`
+                    // `import(source)`
                     self.bump()?; // consume `(`
-                    // import() requires at least one argument.
                     if self.peek_kind() == TokenKind::RightParen {
                         return Err(Self::error_at(
                             import_tok.span,
@@ -3949,24 +3948,16 @@ impl<'src> Parser<'src> {
                         ));
                     }
                     let source = self.parse_assignment_expr()?;
-                    let options = if self.eat(TokenKind::Comma)? {
-                        // Allow trailing comma: `import(x,)`
-                        if self.peek_kind() == TokenKind::RightParen {
-                            None
-                        } else {
-                            let opts = self.parse_assignment_expr()?;
-                            // Consume optional trailing comma.
-                            self.eat(TokenKind::Comma)?;
-                            Some(Box::new(opts))
-                        }
-                    } else {
-                        None
-                    };
+                    if self.eat(TokenKind::Comma)? {
+                        return Err(Self::error_at(
+                            self.current_span(),
+                            "import() requires exactly one argument",
+                        ));
+                    }
                     let end = self.expect(TokenKind::RightParen)?;
                     Ok(Expr::Import(Box::new(ImportExpr {
                         loc: Self::merge_spans(import_tok.span, end.span),
                         source: Box::new(source),
-                        options,
                     })))
                 } else {
                     Err(Self::error_at(
@@ -7916,7 +7907,6 @@ mod tests {
             assert!(matches!(expr.as_ref(), Expr::Import(_)));
             if let Expr::Import(imp) = expr.as_ref() {
                 assert!(matches!(imp.source.as_ref(), Expr::Str(_)));
-                assert!(imp.options.is_none());
             }
         } else {
             panic!("expected expression statement with import()");
@@ -7924,12 +7914,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_dynamic_import_with_options() {
-        let prog = parse("import('./mod.json', { with: { type: 'json' } })").unwrap();
-        assert_eq!(prog.body.len(), 1);
+    fn test_parse_dynamic_import_template_literal_specifier() {
+        let prog = parse("import(`./module.js`)").unwrap();
         if let ProgramItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) = &prog.body[0] {
             if let Expr::Import(imp) = expr.as_ref() {
-                assert!(imp.options.is_some());
+                assert!(matches!(imp.source.as_ref(), Expr::Template(_)));
             } else {
                 panic!("expected import expression");
             }
@@ -7939,17 +7928,33 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_dynamic_import_trailing_comma() {
-        let prog = parse("import('./mod.js',)").unwrap();
-        if let ProgramItem::Stmt(Stmt::Expr(ExprStmt { expr, .. })) = &prog.body[0] {
-            if let Expr::Import(imp) = expr.as_ref() {
-                assert!(imp.options.is_none());
-            } else {
-                panic!("expected import expression");
-            }
-        } else {
-            panic!("expected expression statement");
-        }
+    fn test_parse_dynamic_import_requires_argument() {
+        let err = parse("import()").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("import() requires a specifier argument"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_dynamic_import_rejects_second_argument() {
+        let err = parse("import('./mod.json', { with: { type: 'json' } })").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("import() requires exactly one argument"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_dynamic_import_rejects_trailing_comma() {
+        let err = parse("import('./mod.js',)").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("import() requires exactly one argument"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]

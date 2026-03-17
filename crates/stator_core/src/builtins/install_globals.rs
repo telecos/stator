@@ -20249,6 +20249,283 @@ mod tests {
         result
     }
 
+    fn eval_module(src: &str) -> JsValue {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::rc::Rc;
+
+        use crate::builtins::promise::{PromiseState, drain_active_microtask_queue};
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::interpreter::{Interpreter, InterpreterFrame};
+        use crate::parser::{
+            ast::{ProgramItem, ReturnStmt, SourceType, Stmt},
+            parse,
+        };
+
+        let mut program = parse(src).unwrap();
+        if let Some(ProgramItem::Stmt(Stmt::Expr(expr_stmt))) = program.body.last_mut() {
+            let return_stmt = ReturnStmt {
+                loc: expr_stmt.loc,
+                argument: Some(expr_stmt.expr.clone()),
+            };
+            *program.body.last_mut().unwrap() = ProgramItem::Stmt(Stmt::Return(return_stmt));
+        }
+        program.source_type = SourceType::Module;
+        program.is_strict = true;
+
+        let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+        let mut globals = HashMap::new();
+        install_globals(&mut globals);
+        let mut frame =
+            InterpreterFrame::new_with_globals(bytecode, vec![], Rc::new(RefCell::new(globals)));
+        let result = Interpreter::run(&mut frame).unwrap();
+        drain_active_microtask_queue();
+        match result {
+            JsValue::Promise(promise) => match promise.state() {
+                PromiseState::Fulfilled(value) => value,
+                other => panic!("expected fulfilled module promise, got {other:?}"),
+            },
+            value => value,
+        }
+    }
+
+    fn assert_module_eval_true(script: &str) {
+        assert_eq!(eval_module(script), JsValue::Boolean(true));
+    }
+
+    fn assert_dynamic_import_syntax_error(script: &str) {
+        assert!(
+            matches!(global_eval(script), Err(StatorError::SyntaxError(_))),
+            "expected SyntaxError for {script:?}"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_import_returns_promise_script() {
+        assert_eval_true("typeof import('module') === 'object'");
+    }
+
+    #[test]
+    fn test_dynamic_import_returns_promise_template_literal_script() {
+        assert_eval_true("typeof import(`module`) === 'object'");
+    }
+
+    #[test]
+    fn test_dynamic_import_parses_in_const_initializer_script() {
+        assert_eval_true("const p = import('module'); typeof p === 'object'");
+    }
+
+    #[test]
+    fn test_dynamic_import_parses_in_let_initializer_script() {
+        assert_eval_true("let p = import('module'); typeof p === 'object'");
+    }
+
+    #[test]
+    fn test_dynamic_import_parses_in_var_initializer_script() {
+        assert_eval_true("var p = import('module'); typeof p === 'object'");
+    }
+
+    #[test]
+    fn test_dynamic_import_parses_in_array_literal_script() {
+        assert_eval_true("var values = [import('module')]; typeof values[0] === 'object'");
+    }
+
+    #[test]
+    fn test_dynamic_import_parses_in_object_literal_script() {
+        assert_eval_true(
+            "var holder = { promise: import('module') }; typeof holder.promise === 'object'",
+        );
+    }
+
+    #[test]
+    fn test_dynamic_import_parses_in_conditional_expression_script() {
+        assert_eval_true("var p = true ? import('module') : 0; typeof p === 'object'");
+    }
+
+    #[test]
+    fn test_dynamic_import_parses_in_sequence_expression_script() {
+        assert_eval_true("var p = (0, import('module')); typeof p === 'object'");
+    }
+
+    #[test]
+    fn test_dynamic_import_parses_in_return_position_script() {
+        assert_eval_true("function load() { return import('module'); } typeof load() === 'object'");
+    }
+
+    #[test]
+    fn test_dynamic_import_parses_in_arrow_body_script() {
+        assert_eval_true("var load = () => import('module'); typeof load() === 'object'");
+    }
+
+    #[test]
+    fn test_dynamic_import_parses_in_call_arguments_script() {
+        assert_eval_true(
+            "function id(value) { return value; } typeof id(import('module')) === 'object'",
+        );
+    }
+
+    #[test]
+    fn test_dynamic_import_parses_in_nested_expression_script() {
+        assert_eval_true("var p = ({ value: import('module') }).value; typeof p === 'object'");
+    }
+
+    #[test]
+    fn test_dynamic_import_then_resolves_default_specifier_script() {
+        let _ = eval_with_microtasks(
+            r#"
+            var out = '';
+            import('module').then(function(ns) { out = ns.default; });
+            "#,
+        );
+        assert_eq!(
+            global_eval("out").unwrap(),
+            JsValue::String("module".into())
+        );
+    }
+
+    #[test]
+    fn test_dynamic_import_then_resolves_template_literal_specifier_script() {
+        let _ = eval_with_microtasks(
+            r#"
+            var out = '';
+            import(`module`).then(function(ns) { out = ns.default; });
+            "#,
+        );
+        assert_eq!(
+            global_eval("out").unwrap(),
+            JsValue::String("module".into())
+        );
+    }
+
+    #[test]
+    fn test_dynamic_import_call_member_is_syntax_error_script() {
+        assert_dynamic_import_syntax_error("import.call('module')");
+    }
+
+    #[test]
+    fn test_dynamic_import_dot_member_is_syntax_error_script() {
+        assert_dynamic_import_syntax_error("import.foo");
+    }
+
+    #[test]
+    fn test_dynamic_import_requires_argument_script() {
+        assert_dynamic_import_syntax_error("import()");
+    }
+
+    #[test]
+    fn test_dynamic_import_rejects_second_argument_script() {
+        assert_dynamic_import_syntax_error("import('module', {})");
+    }
+
+    #[test]
+    fn test_dynamic_import_rejects_trailing_comma_script() {
+        assert_dynamic_import_syntax_error("import('module',)");
+    }
+
+    #[test]
+    fn test_import_meta_is_object_module() {
+        assert_module_eval_true("typeof import.meta === 'object' && import.meta !== null");
+    }
+
+    #[test]
+    fn test_import_meta_url_is_string_module() {
+        assert_module_eval_true("typeof import.meta.url === 'string'");
+    }
+
+    #[test]
+    fn test_import_meta_url_is_placeholder_module() {
+        assert_module_eval_true("import.meta.url === ''");
+    }
+
+    #[test]
+    fn test_import_meta_is_frozen_module() {
+        assert_module_eval_true("Object.isFrozen(import.meta)");
+    }
+
+    #[test]
+    fn test_import_meta_is_not_extensible_module() {
+        assert_module_eval_true("Object.isExtensible(import.meta) === false");
+    }
+
+    #[test]
+    fn test_import_meta_has_resolve_function_module() {
+        assert_module_eval_true("typeof import.meta.resolve === 'function'");
+    }
+
+    #[test]
+    fn test_import_meta_resolve_returns_argument_module() {
+        assert_module_eval_true("import.meta.resolve('module') === 'module'");
+    }
+
+    #[test]
+    fn test_import_meta_resolve_accepts_template_literal_module() {
+        assert_module_eval_true("import.meta.resolve(`module`) === 'module'");
+    }
+
+    #[test]
+    fn test_import_meta_resolve_works_when_extracted_module() {
+        assert_module_eval_true(
+            "var resolve = import.meta.resolve; resolve('module') === 'module'",
+        );
+    }
+
+    #[test]
+    fn test_import_meta_parses_in_array_literal_module() {
+        assert_module_eval_true("var meta = [import.meta][0]; typeof meta.url === 'string'");
+    }
+
+    #[test]
+    fn test_import_meta_parses_in_object_literal_module() {
+        assert_module_eval_true(
+            "var meta = { value: import.meta }.value; typeof meta.resolve === 'function'",
+        );
+    }
+
+    #[test]
+    fn test_import_meta_resolve_in_sequence_expression_module() {
+        assert_module_eval_true(
+            "var value = (0, import.meta.resolve('module')); value === 'module'",
+        );
+    }
+
+    #[test]
+    fn test_import_meta_url_works_in_concatenation_module() {
+        assert_module_eval_true("('prefix:' + import.meta.url) === 'prefix:'");
+    }
+
+    #[test]
+    fn test_import_meta_has_two_own_properties_module() {
+        assert_module_eval_true("Object.getOwnPropertyNames(import.meta).length === 2");
+    }
+
+    #[test]
+    fn test_import_meta_url_descriptor_is_non_writable_module() {
+        assert_module_eval_true(
+            "Object.getOwnPropertyDescriptor(import.meta, 'url').writable === false",
+        );
+    }
+
+    #[test]
+    fn test_import_meta_resolve_descriptor_is_non_writable_module() {
+        assert_module_eval_true(
+            "Object.getOwnPropertyDescriptor(import.meta, 'resolve').writable === false",
+        );
+    }
+
+    #[test]
+    fn test_import_meta_url_descriptor_is_non_configurable_module() {
+        assert_module_eval_true(
+            "Object.getOwnPropertyDescriptor(import.meta, 'url').configurable === false",
+        );
+    }
+
+    #[test]
+    fn test_import_meta_resolve_descriptor_is_non_configurable_module() {
+        assert_module_eval_true(
+            "Object.getOwnPropertyDescriptor(import.meta, 'resolve').configurable === false",
+        );
+    }
+
     // -- 1. Promise.resolve returns the same promise for Promise input
     #[test]
     fn e2e_promise_resolve_identity() {
