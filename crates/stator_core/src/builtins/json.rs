@@ -711,7 +711,14 @@ impl<'a> Parser<'a> {
             self.expect(':')?;
             self.skip_ws();
             let val = self.parse_value()?;
-            obj.borrow_mut().push((key, val));
+            // §25.5.1: duplicate keys — last value wins.
+            let mut entries = obj.borrow_mut();
+            if let Some(existing) = entries.iter_mut().find(|(k, _)| k == &key) {
+                existing.1 = val;
+            } else {
+                entries.push((key, val));
+            }
+            drop(entries);
             self.skip_ws();
             match self.peek() {
                 Some(',') => {
@@ -1834,7 +1841,6 @@ mod tests {
         let s = json_stringify_js_value(&obj, Some(&replacer), None)
             .unwrap()
             .unwrap();
-        // Only "a" and "c" should appear.
         assert!(s.contains("\"a\""), "should contain a: {s}");
         assert!(s.contains("\"c\""), "should contain c: {s}");
         assert!(!s.contains("\"b\""), "should not contain b: {s}");
