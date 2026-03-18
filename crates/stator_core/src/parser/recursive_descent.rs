@@ -410,7 +410,7 @@ impl<'src> Parser<'src> {
     // ── Statements ───────────────────────────────────────────────────────────
 
     fn parse_stmt(&mut self) -> StatorResult<Stmt> {
-        stacker::maybe_grow(32 * 1024, 512 * 1024, || {
+        stacker::maybe_grow(1024 * 1024, 8 * 1024 * 1024, || {
             self.enter()?;
             let result = self.parse_stmt_inner();
             self.leave();
@@ -2672,7 +2672,7 @@ impl<'src> Parser<'src> {
     /// Also handles arrow function expressions, which have assignment-level
     /// precedence: `x => x + 1`, `(x, y) => x + y`, `() => 42`.
     fn parse_assignment_expr(&mut self) -> StatorResult<Expr> {
-        stacker::maybe_grow(32 * 1024, 512 * 1024, || {
+        stacker::maybe_grow(1024 * 1024, 8 * 1024 * 1024, || {
             self.enter()?;
             let result = self.parse_assignment_expr_inner();
             self.leave();
@@ -4853,7 +4853,7 @@ impl<'src> Parser<'src> {
 pub fn parse(source: &str) -> StatorResult<Program> {
     // Parser recursion (expressions, nested functions, arrow bodies) can be
     // deep for generated / minified code.  Ensure stack headroom.
-    stacker::maybe_grow(256 * 1024, 4 * 1024 * 1024, || {
+    stacker::maybe_grow(1024 * 1024, 8 * 1024 * 1024, || {
         let mut parser = Parser::new(source)?;
         let program = parser.parse_program()?;
         Ok(program)
@@ -4881,7 +4881,7 @@ pub fn parse(source: &str) -> StatorResult<Program> {
 /// assert!(prog.is_strict);
 /// ```
 pub fn parse_module(source: &str) -> StatorResult<Program> {
-    stacker::maybe_grow(256 * 1024, 4 * 1024 * 1024, || {
+    stacker::maybe_grow(1024 * 1024, 8 * 1024 * 1024, || {
         let mut parser = Parser::new(source)?;
         parser.is_module = true;
         let program = parser.parse_program()?;
@@ -4910,7 +4910,7 @@ pub fn parse_module(source: &str) -> StatorResult<Program> {
 /// assert_eq!(prog.source_type, SourceType::Script);
 /// ```
 pub fn parse_script(source: &str) -> StatorResult<Program> {
-    stacker::maybe_grow(256 * 1024, 4 * 1024 * 1024, || {
+    stacker::maybe_grow(1024 * 1024, 8 * 1024 * 1024, || {
         let mut parser = Parser::new(source)?;
         let program = parser.parse_program()?;
         Ok(program)

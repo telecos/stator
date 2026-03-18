@@ -1505,10 +1505,10 @@ impl Interpreter {
             return Self::run_async_function(frame.bytecode_array.clone(), vec![]);
         }
         // Dynamically grow the native stack when headroom drops below 128 KiB.
-        // Each interpreter frame gets a 2 MiB heap-backed segment from stacker.
-        // Per-call recursion guards live in dispatch.rs (1 MiB each);
-        // this inner guard covers the run() frame itself.
-        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+        // Allocate a large (256 MiB) heap-backed segment on the first call
+        // so all nested interpreter frames stay on one big segment. The 8 MiB
+        // red zone guarantees this triggers even with default OS stacks.
+        stacker::maybe_grow(8 * 1024 * 1024, 256 * 1024 * 1024, || {
             // Outer loop: re-entered when a TailCall opcode rewrites the frame
             // with a new bytecode array (proper tail-call trampoline).
             'tail_call: loop {
@@ -1712,8 +1712,9 @@ impl Interpreter {
         state.borrow_mut().status = GeneratorStatus::Executing;
 
         push_call_frame("<generator>")?;
-        let return_val =
-            stacker::maybe_grow(128 * 1024, 1024 * 1024, || Interpreter::run(&mut frame));
+        let return_val = stacker::maybe_grow(1024 * 1024, 8 * 1024 * 1024, || {
+            Interpreter::run(&mut frame)
+        });
         pop_call_frame();
         let return_val = match return_val {
             Ok(value) => value,
@@ -2682,7 +2683,7 @@ pub(super) fn dispatch_call(
                     restore_closure_context(&mut callee_frame, ba);
                     populate_self_name(&mut callee_frame, ba, &JsValue::Function(Rc::clone(ba)));
                     push_call_frame("<anonymous>")?;
-                    let result = stacker::maybe_grow(128 * 1024, 1024 * 1024, || {
+                    let result = stacker::maybe_grow(1024 * 1024, 8 * 1024 * 1024, || {
                         Interpreter::run(&mut callee_frame)
                     });
                     pop_call_frame();
@@ -2760,7 +2761,7 @@ pub(super) fn dispatch_call_property(
                             .insert("this".to_string(), this_val);
                     }
                     push_call_frame("<anonymous>")?;
-                    let result = stacker::maybe_grow(128 * 1024, 1024 * 1024, || {
+                    let result = stacker::maybe_grow(1024 * 1024, 8 * 1024 * 1024, || {
                         Interpreter::run(&mut callee_frame)
                     });
                     pop_call_frame();
@@ -5926,8 +5927,9 @@ fn dispatch_getter(getter: &JsValue, this: &JsValue) -> StatorResult<JsValue> {
                 .global_env
                 .borrow_mut()
                 .insert("this".to_string(), this.clone());
-            let result =
-                stacker::maybe_grow(128 * 1024, 1024 * 1024, || Interpreter::run(&mut frame));
+            let result = stacker::maybe_grow(1024 * 1024, 8 * 1024 * 1024, || {
+                Interpreter::run(&mut frame)
+            });
             pop_call_frame();
             result
         }
@@ -5951,8 +5953,9 @@ pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) ->
                 .global_env
                 .borrow_mut()
                 .insert("this".to_string(), this.clone());
-            let result =
-                stacker::maybe_grow(128 * 1024, 1024 * 1024, || Interpreter::run(&mut frame));
+            let result = stacker::maybe_grow(1024 * 1024, 8 * 1024 * 1024, || {
+                Interpreter::run(&mut frame)
+            });
             pop_call_frame();
             result?;
             Ok(())
@@ -5991,8 +5994,9 @@ pub fn dispatch_call_value(callee: &JsValue, args: Vec<JsValue>) -> StatorResult
             };
             restore_closure_context(&mut frame, ba);
             populate_self_name(&mut frame, ba, &JsValue::Function(Rc::clone(ba)));
-            let result =
-                stacker::maybe_grow(128 * 1024, 1024 * 1024, || Interpreter::run(&mut frame));
+            let result = stacker::maybe_grow(1024 * 1024, 8 * 1024 * 1024, || {
+                Interpreter::run(&mut frame)
+            });
             pop_call_frame();
             result
         }
@@ -6057,8 +6061,9 @@ pub fn dispatch_call_with_this(
                     .borrow_mut()
                     .insert("this".to_string(), effective_this);
             }
-            let result =
-                stacker::maybe_grow(128 * 1024, 1024 * 1024, || Interpreter::run(&mut frame));
+            let result = stacker::maybe_grow(1024 * 1024, 8 * 1024 * 1024, || {
+                Interpreter::run(&mut frame)
+            });
             pop_call_frame();
             result
         }
@@ -6118,8 +6123,9 @@ pub fn dispatch_construct_call(
                 .global_env
                 .borrow_mut()
                 .insert("this".to_string(), this_val);
-            let result =
-                stacker::maybe_grow(128 * 1024, 1024 * 1024, || Interpreter::run(&mut frame));
+            let result = stacker::maybe_grow(1024 * 1024, 8 * 1024 * 1024, || {
+                Interpreter::run(&mut frame)
+            });
             pop_call_frame();
             result
         }
