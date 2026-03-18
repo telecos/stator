@@ -1717,21 +1717,259 @@ impl Interpreter {
                         }
                     }
 
-                    // ── Dispatch (computed-goto table) ─────────────────────────
-                    let handler = dispatch::DISPATCH_TABLE[instr.opcode as usize];
-                    let mut dctx = dispatch::DispatchContext {
-                        frame,
-                        instructions,
-                        byte_offsets,
-                        jump_targets,
-                        handler_table: handler_table.as_slice(),
-                    };
-                    match handler(&mut dctx, instr) {
-                        Ok(action) => match action {
-                            dispatch::DispatchAction::Continue => {}
-                            dispatch::DispatchAction::Return(v) => return Ok(v),
-                            dispatch::DispatchAction::TailCall => continue 'tail_call,
+                    // ── Dispatch (hot-path inline + table fallback) ───────────
+                    //
+                    // The 15 hottest opcodes are dispatched via a direct `match`
+                    // to eliminate the ~5-10 cycle indirect-call overhead of the
+                    // function-pointer dispatch table.  Rare opcodes fall back
+                    // to the table in `dispatch.rs`.
+                    use crate::bytecode::bytecodes::{Opcode, Operand};
+
+                    let dispatch_action: StatorResult<dispatch::DispatchAction> = match instr.opcode
+                    {
+                        // ── Load / Store ─────────────────────────
+                        Opcode::LdaSmi => match instr.operands[0] {
+                            Operand::Immediate(v) => {
+                                frame.accumulator = JsValue::Smi(v);
+                                Ok(dispatch::DispatchAction::Continue)
+                            }
+                            _ => Err(err_bad_operand("LdaSmi", 0)),
                         },
+                        Opcode::Star => match instr.operands[0] {
+                            Operand::Register(v) => {
+                                let val = frame.accumulator.cheap_clone();
+                                frame
+                                    .write_reg(v, val)
+                                    .map(|()| dispatch::DispatchAction::Continue)
+                            }
+                            _ => Err(err_bad_operand("Star", 0)),
+                        },
+                        Opcode::Ldar => match instr.operands[0] {
+                            Operand::Register(v) => match frame.read_reg(v) {
+                                Ok(val) => {
+                                    frame.accumulator = val.cheap_clone();
+                                    Ok(dispatch::DispatchAction::Continue)
+                                }
+                                Err(e) => Err(e),
+                            },
+                            _ => Err(err_bad_operand("Ldar", 0)),
+                        },
+
+                        // ── Arithmetic (SMI fast path, table fallback) ──
+                        Opcode::Add => {
+                            if let Operand::Register(v) = instr.operands[0]
+                                && let Ok(rhs) = frame.read_reg(v)
+                                && let (JsValue::Smi(a), JsValue::Smi(b)) =
+                                    (&frame.accumulator, rhs)
+                                && let Some(result) = a.checked_add(*b)
+                            {
+                                frame.accumulator = JsValue::Smi(result);
+                                Ok(dispatch::DispatchAction::Continue)
+                            } else {
+                                dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                )
+                            }
+                        }
+                        Opcode::Sub => {
+                            if let Operand::Register(v) = instr.operands[0]
+                                && let Ok(rhs) = frame.read_reg(v)
+                                && let (JsValue::Smi(a), JsValue::Smi(b)) =
+                                    (&frame.accumulator, rhs)
+                                && let Some(result) = a.checked_sub(*b)
+                            {
+                                frame.accumulator = JsValue::Smi(result);
+                                Ok(dispatch::DispatchAction::Continue)
+                            } else {
+                                dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                )
+                            }
+                        }
+                        Opcode::Mul => {
+                            if let Operand::Register(v) = instr.operands[0]
+                                && let Ok(rhs) = frame.read_reg(v)
+                                && let (JsValue::Smi(a), JsValue::Smi(b)) =
+                                    (&frame.accumulator, rhs)
+                                && let Some(result) = a.checked_mul(*b)
+                            {
+                                frame.accumulator = JsValue::Smi(result);
+                                Ok(dispatch::DispatchAction::Continue)
+                            } else {
+                                dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                )
+                            }
+                        }
+                        Opcode::AddSmi => {
+                            if let Operand::Immediate(imm) = instr.operands[0]
+                                && let JsValue::Smi(n) = frame.accumulator
+                                && let Some(result) = n.checked_add(imm)
+                            {
+                                frame.accumulator = JsValue::Smi(result);
+                                Ok(dispatch::DispatchAction::Continue)
+                            } else {
+                                dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                )
+                            }
+                        }
+
+                        // ── Return ───────────────────────────────
+                        Opcode::Return => {
+                            Ok(dispatch::DispatchAction::Return(frame.accumulator.clone()))
+                        }
+
+                        // ── Jumps ────────────────────────────────
+                        Opcode::Jump => match instr.operands[0] {
+                            Operand::JumpOffset(_) => {
+                                resolve_jump_inline(frame.pc, jump_targets, "Jump").map(|target| {
+                                    frame.pc = target;
+                                    dispatch::DispatchAction::Continue
+                                })
+                            }
+                            _ => Err(err_bad_operand("Jump", 0)),
+                        },
+                        Opcode::JumpIfTrue => match instr.operands[0] {
+                            Operand::JumpOffset(_) => {
+                                if matches!(frame.accumulator, JsValue::Boolean(true)) {
+                                    resolve_jump_inline(frame.pc, jump_targets, "JumpIfTrue").map(
+                                        |target| {
+                                            frame.pc = target;
+                                            dispatch::DispatchAction::Continue
+                                        },
+                                    )
+                                } else {
+                                    Ok(dispatch::DispatchAction::Continue)
+                                }
+                            }
+                            _ => Err(err_bad_operand("JumpIfTrue", 0)),
+                        },
+                        Opcode::JumpIfFalse => match instr.operands[0] {
+                            Operand::JumpOffset(_) => {
+                                if matches!(frame.accumulator, JsValue::Boolean(false)) {
+                                    resolve_jump_inline(frame.pc, jump_targets, "JumpIfFalse").map(
+                                        |target| {
+                                            frame.pc = target;
+                                            dispatch::DispatchAction::Continue
+                                        },
+                                    )
+                                } else {
+                                    Ok(dispatch::DispatchAction::Continue)
+                                }
+                            }
+                            _ => Err(err_bad_operand("JumpIfFalse", 0)),
+                        },
+                        Opcode::JumpLoop => match instr.operands[0] {
+                            Operand::JumpOffset(_) => {
+                                resolve_jump_inline(frame.pc, jump_targets, "JumpLoop").map(
+                                    |target| {
+                                        frame.pc = target;
+                                        frame.osr_loop_count =
+                                            frame.osr_loop_count.saturating_add(1);
+                                        if frame.osr_loop_count >= OSR_LOOP_THRESHOLD
+                                            && frame.bytecode_array.try_get_jit_code().is_none()
+                                        {
+                                            maybe_compile_baseline(&frame.bytecode_array);
+                                        }
+                                        if frame.osr_loop_count >= MAGLEV_OSR_LOOP_THRESHOLD {
+                                            maybe_compile_maglev(&frame.bytecode_array);
+                                        }
+                                        if frame.osr_loop_count >= TURBOFAN_OSR_LOOP_THRESHOLD {
+                                            maybe_compile_turbofan(&frame.bytecode_array);
+                                        }
+                                        dispatch::DispatchAction::Continue
+                                    },
+                                )
+                            }
+                            _ => Err(err_bad_operand("JumpLoop", 0)),
+                        },
+
+                        // ── Comparisons (SMI fast path, table fallback) ──
+                        Opcode::TestLessThan => {
+                            if let Operand::Register(v) = instr.operands[0]
+                                && let Ok(rhs) = frame.read_reg(v)
+                                && let (JsValue::Smi(a), JsValue::Smi(b)) =
+                                    (&frame.accumulator, rhs)
+                            {
+                                frame.accumulator = JsValue::Boolean(*a < *b);
+                                Ok(dispatch::DispatchAction::Continue)
+                            } else {
+                                dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                )
+                            }
+                        }
+                        Opcode::TestGreaterThan => {
+                            if let Operand::Register(v) = instr.operands[0]
+                                && let Ok(rhs) = frame.read_reg(v)
+                                && let (JsValue::Smi(a), JsValue::Smi(b)) =
+                                    (&frame.accumulator, rhs)
+                            {
+                                frame.accumulator = JsValue::Boolean(*a > *b);
+                                Ok(dispatch::DispatchAction::Continue)
+                            } else {
+                                dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                )
+                            }
+                        }
+                        Opcode::TestEqual => match instr.operands[0] {
+                            Operand::Register(v) => match frame.read_reg(v) {
+                                Ok(rhs) => {
+                                    let result = abstract_eq(&frame.accumulator, rhs);
+                                    frame.accumulator = JsValue::Boolean(result);
+                                    Ok(dispatch::DispatchAction::Continue)
+                                }
+                                Err(e) => Err(e),
+                            },
+                            _ => Err(err_bad_operand("TestEqual", 0)),
+                        },
+
+                        // ── All other opcodes: dispatch table ────
+                        _ => dispatch_via_table(
+                            frame,
+                            instructions,
+                            byte_offsets,
+                            jump_targets,
+                            handler_table.as_slice(),
+                            instr,
+                        ),
+                    };
+                    match dispatch_action {
+                        Ok(dispatch::DispatchAction::Continue) => {}
+                        Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                        Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
                         Err(e) => {
                             if let Some(resume_pc) =
                                 handle_dispatch_error(&e, frame, handler_table.as_slice())
@@ -2748,6 +2986,52 @@ fn instruction_limit_error() -> StatorError {
 /// handler covering the faulting instruction and, if found, store the
 /// error value in the frame accumulator and return the handler PC.
 ///
+/// Dispatch an opcode through the function-pointer dispatch table.
+///
+/// Used as the fallback path when the hot-path inline match does not
+/// handle an opcode (or when the SMI fast path does not apply).
+#[inline(always)]
+fn dispatch_via_table(
+    frame: &mut InterpreterFrame,
+    instructions: &[crate::bytecode::bytecodes::Instruction],
+    byte_offsets: &[usize],
+    jump_targets: &[Option<usize>],
+    handler_table: &[HandlerTableEntry],
+    instr: &crate::bytecode::bytecodes::Instruction,
+) -> StatorResult<dispatch::DispatchAction> {
+    let handler = dispatch::DISPATCH_TABLE[instr.opcode as usize];
+    let mut dctx = dispatch::DispatchContext {
+        frame,
+        instructions,
+        byte_offsets,
+        jump_targets,
+        handler_table,
+    };
+    handler(&mut dctx, instr)
+}
+
+/// Resolve the pre-computed jump target for the current instruction.
+///
+/// `frame_pc` must already be incremented past the jump instruction
+/// (the interpreter advances the PC before dispatching).
+#[inline(always)]
+fn resolve_jump_inline(
+    frame_pc: usize,
+    jump_targets: &[Option<usize>],
+    opcode_name: &str,
+) -> StatorResult<usize> {
+    let idx = frame_pc.checked_sub(1).ok_or_else(|| {
+        StatorError::Internal(format!(
+            "{opcode_name} executed before program counter advanced"
+        ))
+    })?;
+    jump_targets.get(idx).copied().flatten().ok_or_else(|| {
+        StatorError::Internal(format!(
+            "missing cached jump target for {opcode_name} at instruction {idx}"
+        ))
+    })
+}
+
 /// Returns `None` if no handler covers the instruction, meaning the
 /// error should propagate to the caller.
 #[cold]
