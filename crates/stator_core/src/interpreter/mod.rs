@@ -1423,9 +1423,47 @@ impl InterpreterFrame {
                 env.entry(k).or_insert(v);
             }
         }
-        let mut frame = Self::new(bytecode_array, args);
-        frame.global_env = global_env;
-        frame
+        // Build the frame directly with the shared global_env, avoiding the
+        // redundant install_globals call that `new()` would perform.
+        let param_count = bytecode_array.parameter_count() as usize;
+        let frame_size = bytecode_array.frame_size() as usize;
+        let total_regs = param_count + frame_size;
+        let mut registers = vec![JsValue::Undefined; total_regs];
+        for (i, arg) in args.iter().cloned().enumerate().take(param_count) {
+            registers[i] = arg;
+        }
+        Self {
+            bytecode_array,
+            registers,
+            call_args: args,
+            accumulator: JsValue::Undefined,
+            pc: 0,
+            context: None,
+            suspend_result: None,
+            generator_state: None,
+            global_env,
+            osr_loop_count: 0,
+            instruction_limit: 0,
+            instructions_executed: 0,
+            deadline: None,
+            pending_message: JsValue::Undefined,
+            new_target: JsValue::Undefined,
+            mono_load_cache: None,
+            poly_load_cache: None,
+            shape_load_ic: None,
+            shape_store_ic: None,
+            string_cache: None,
+            global_cache: [
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+            ],
+        }
     }
 
     /// Map an encoded register-operand value to a flat index into
