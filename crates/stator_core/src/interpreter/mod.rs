@@ -1633,6 +1633,25 @@ impl InterpreterFrame {
         Ok(&self.registers[idx])
     }
 
+    /// Read a validated register operand without bounds checks.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `reg` came from validated bytecode and maps to a
+    /// live register in this frame.
+    #[inline(always)]
+    unsafe fn read_reg_unchecked(&self, reg: u32) -> &JsValue {
+        let signed = reg as i32;
+        let idx = if signed >= 0 {
+            self.bytecode_array.parameter_count() as usize + signed as usize
+        } else {
+            (-(signed + 1)) as usize
+        };
+        debug_assert!(idx < self.registers.len());
+        // SAFETY: The caller guarantees `reg` maps to an in-bounds register.
+        unsafe { self.registers.get_unchecked(idx) }
+    }
+
     /// Return a reference to the accumulator value.
     #[inline(always)]
     pub fn accumulator_ref(&self) -> &JsValue {
@@ -1815,35 +1834,30 @@ impl Interpreter {
                         // and deadlines.  Uses bitwise AND instead of modulo for a
                         // zero-cost check on the fast path.
                         if frame.instructions_executed & 0x3FF == 0 {
-                            // ── CPU profiler checkpoint (periodic) ──────────────────
-                            crate::inspector::profiler::maybe_record_sample();
-
-                            // Refresh debugger flag from thread-local.
-                            debug_active = DEBUG_ATTACHED.with(Cell::get);
-
                             // Check per-frame instruction limit
                             if frame.instruction_limit > 0
                                 && frame.instructions_executed > frame.instruction_limit
                             {
                                 return Err(instruction_limit_error());
                             }
-                            // Check per-frame wall-clock deadline
-                            if let Some(dl) = frame.deadline
-                                && Instant::now() > dl
-                            {
-                                return Err(StatorError::RangeError(
-                                    "execution timeout exceeded".to_string(),
-                                ));
+
+                            // Check per-frame and thread-local wall-clock deadlines.
+                            let thread_deadline = EXECUTION_DEADLINE.with(|d| d.get());
+                            if frame.deadline.is_some() || thread_deadline.is_some() {
+                                let now = Instant::now();
+                                if frame.deadline.is_some_and(|dl| now > dl)
+                                    || thread_deadline.is_some_and(|dl| now > dl)
+                                {
+                                    return Err(execution_timeout_error());
+                                }
                             }
-                            // Check thread-local execution deadline (set by test
-                            // runner, inherited by child frames such as eval and
-                            // the Function constructor).
-                            if let Some(dl) = EXECUTION_DEADLINE.with(|d| d.get())
-                                && Instant::now() > dl
-                            {
-                                return Err(StatorError::RangeError(
-                                    "execution timeout exceeded".to_string(),
-                                ));
+
+                            if frame.instructions_executed & 0xFFF == 0 {
+                                // ── CPU profiler checkpoint (periodic) ──────────────
+                                crate::inspector::profiler::maybe_record_sample();
+
+                                // Refresh debugger flag from thread-local.
+                                debug_active = DEBUG_ATTACHED.with(Cell::get);
                             }
                         }
 
@@ -1862,7 +1876,7 @@ impl Interpreter {
                             Opcode::LdaSmi => match instr.operands[0] {
                                 Operand::Immediate(v) => {
                                     frame.accumulator = JsValue::Smi(v);
-                                    Ok(dispatch::DispatchAction::Continue)
+                                    continue;
                                 }
                                 _ => Err(err_bad_operand("LdaSmi", 0)),
                             },
@@ -1876,76 +1890,82 @@ impl Interpreter {
                                 _ => Err(err_bad_operand("Star", 0)),
                             },
                             Opcode::Ldar => match instr.operands[0] {
-                                Operand::Register(v) => match frame.read_reg(v) {
-                                    Ok(val) => {
-                                        frame.accumulator = val.cheap_clone();
-                                        Ok(dispatch::DispatchAction::Continue)
-                                    }
-                                    Err(e) => Err(e),
-                                },
+                                Operand::Register(v) => {
+                                    // SAFETY: The bytecode validator guarantees
+                                    // register operands are in bounds.
+                                    let val = unsafe { frame.read_reg_unchecked(v) };
+                                    frame.accumulator = val.cheap_clone();
+                                    continue;
+                                }
                                 _ => Err(err_bad_operand("Ldar", 0)),
                             },
 
                             // ── Arithmetic (SMI fast path, table fallback) ──
                             Opcode::Add => {
-                                if let Operand::Register(v) = instr.operands[0]
-                                    && let Ok(rhs) = frame.read_reg(v)
-                                    && let (JsValue::Smi(a), JsValue::Smi(b)) =
+                                if let Operand::Register(v) = instr.operands[0] {
+                                    // SAFETY: The bytecode validator guarantees
+                                    // register operands are in bounds.
+                                    let rhs = unsafe { frame.read_reg_unchecked(v) };
+                                    if let (JsValue::Smi(a), JsValue::Smi(b)) =
                                         (&frame.accumulator, rhs)
-                                    && let Some(result) = a.checked_add(*b)
-                                {
-                                    frame.accumulator = JsValue::Smi(result);
-                                    Ok(dispatch::DispatchAction::Continue)
-                                } else {
-                                    dispatch_via_table(
-                                        frame,
-                                        instructions,
-                                        byte_offsets,
-                                        jump_targets,
-                                        handler_table.as_slice(),
-                                        instr,
-                                    )
+                                        && let Some(result) = a.checked_add(*b)
+                                    {
+                                        frame.accumulator = JsValue::Smi(result);
+                                        continue;
+                                    }
                                 }
+                                dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                )
                             }
                             Opcode::Sub => {
-                                if let Operand::Register(v) = instr.operands[0]
-                                    && let Ok(rhs) = frame.read_reg(v)
-                                    && let (JsValue::Smi(a), JsValue::Smi(b)) =
+                                if let Operand::Register(v) = instr.operands[0] {
+                                    // SAFETY: The bytecode validator guarantees
+                                    // register operands are in bounds.
+                                    let rhs = unsafe { frame.read_reg_unchecked(v) };
+                                    if let (JsValue::Smi(a), JsValue::Smi(b)) =
                                         (&frame.accumulator, rhs)
-                                    && let Some(result) = a.checked_sub(*b)
-                                {
-                                    frame.accumulator = JsValue::Smi(result);
-                                    Ok(dispatch::DispatchAction::Continue)
-                                } else {
-                                    dispatch_via_table(
-                                        frame,
-                                        instructions,
-                                        byte_offsets,
-                                        jump_targets,
-                                        handler_table.as_slice(),
-                                        instr,
-                                    )
+                                        && let Some(result) = a.checked_sub(*b)
+                                    {
+                                        frame.accumulator = JsValue::Smi(result);
+                                        continue;
+                                    }
                                 }
+                                dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                )
                             }
                             Opcode::Mul => {
-                                if let Operand::Register(v) = instr.operands[0]
-                                    && let Ok(rhs) = frame.read_reg(v)
-                                    && let (JsValue::Smi(a), JsValue::Smi(b)) =
+                                if let Operand::Register(v) = instr.operands[0] {
+                                    // SAFETY: The bytecode validator guarantees
+                                    // register operands are in bounds.
+                                    let rhs = unsafe { frame.read_reg_unchecked(v) };
+                                    if let (JsValue::Smi(a), JsValue::Smi(b)) =
                                         (&frame.accumulator, rhs)
-                                    && let Some(result) = a.checked_mul(*b)
-                                {
-                                    frame.accumulator = JsValue::Smi(result);
-                                    Ok(dispatch::DispatchAction::Continue)
-                                } else {
-                                    dispatch_via_table(
-                                        frame,
-                                        instructions,
-                                        byte_offsets,
-                                        jump_targets,
-                                        handler_table.as_slice(),
-                                        instr,
-                                    )
+                                        && let Some(result) = a.checked_mul(*b)
+                                    {
+                                        frame.accumulator = JsValue::Smi(result);
+                                        continue;
+                                    }
                                 }
+                                dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                )
                             }
                             Opcode::AddSmi => {
                                 if let Operand::Immediate(imm) = instr.operands[0]
@@ -1953,17 +1973,16 @@ impl Interpreter {
                                     && let Some(result) = n.checked_add(imm)
                                 {
                                     frame.accumulator = JsValue::Smi(result);
-                                    Ok(dispatch::DispatchAction::Continue)
-                                } else {
-                                    dispatch_via_table(
-                                        frame,
-                                        instructions,
-                                        byte_offsets,
-                                        jump_targets,
-                                        handler_table.as_slice(),
-                                        instr,
-                                    )
+                                    continue;
                                 }
+                                dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                )
                             }
 
                             // ── Return ───────────────────────────────
@@ -1974,25 +1993,32 @@ impl Interpreter {
                             // ── Jumps ────────────────────────────────
                             Opcode::Jump => match instr.operands[0] {
                                 Operand::JumpOffset(_) => {
-                                    resolve_jump_inline(frame.pc, jump_targets, "Jump").map(
-                                        |target| {
+                                    match resolve_jump_inline(frame.pc, jump_targets, "Jump") {
+                                        Ok(target) => {
                                             frame.pc = target;
-                                            dispatch::DispatchAction::Continue
-                                        },
-                                    )
+                                            continue;
+                                        }
+                                        Err(e) => Err(e),
+                                    }
                                 }
                                 _ => Err(err_bad_operand("Jump", 0)),
                             },
                             Opcode::JumpIfTrue => match instr.operands[0] {
                                 Operand::JumpOffset(_) => {
                                     if matches!(frame.accumulator, JsValue::Boolean(true)) {
-                                        resolve_jump_inline(frame.pc, jump_targets, "JumpIfTrue")
-                                            .map(|target| {
+                                        match resolve_jump_inline(
+                                            frame.pc,
+                                            jump_targets,
+                                            "JumpIfTrue",
+                                        ) {
+                                            Ok(target) => {
                                                 frame.pc = target;
-                                                dispatch::DispatchAction::Continue
-                                            })
+                                                continue;
+                                            }
+                                            Err(e) => Err(e),
+                                        }
                                     } else {
-                                        Ok(dispatch::DispatchAction::Continue)
+                                        continue;
                                     }
                                 }
                                 _ => Err(err_bad_operand("JumpIfTrue", 0)),
@@ -2000,21 +2026,27 @@ impl Interpreter {
                             Opcode::JumpIfFalse => match instr.operands[0] {
                                 Operand::JumpOffset(_) => {
                                     if matches!(frame.accumulator, JsValue::Boolean(false)) {
-                                        resolve_jump_inline(frame.pc, jump_targets, "JumpIfFalse")
-                                            .map(|target| {
+                                        match resolve_jump_inline(
+                                            frame.pc,
+                                            jump_targets,
+                                            "JumpIfFalse",
+                                        ) {
+                                            Ok(target) => {
                                                 frame.pc = target;
-                                                dispatch::DispatchAction::Continue
-                                            })
+                                                continue;
+                                            }
+                                            Err(e) => Err(e),
+                                        }
                                     } else {
-                                        Ok(dispatch::DispatchAction::Continue)
+                                        continue;
                                     }
                                 }
                                 _ => Err(err_bad_operand("JumpIfFalse", 0)),
                             },
                             Opcode::JumpLoop => match instr.operands[0] {
                                 Operand::JumpOffset(_) => {
-                                    resolve_jump_inline(frame.pc, jump_targets, "JumpLoop").map(
-                                        |target| {
+                                    match resolve_jump_inline(frame.pc, jump_targets, "JumpLoop") {
+                                        Ok(target) => {
                                             frame.pc = target;
                                             frame.osr_loop_count =
                                                 frame.osr_loop_count.saturating_add(1);
@@ -2029,61 +2061,66 @@ impl Interpreter {
                                             if frame.osr_loop_count >= TURBOFAN_OSR_LOOP_THRESHOLD {
                                                 maybe_compile_turbofan(&frame.bytecode_array);
                                             }
-                                            dispatch::DispatchAction::Continue
-                                        },
-                                    )
+                                            continue;
+                                        }
+                                        Err(e) => Err(e),
+                                    }
                                 }
                                 _ => Err(err_bad_operand("JumpLoop", 0)),
                             },
 
                             // ── Comparisons (SMI fast path, table fallback) ──
                             Opcode::TestLessThan => {
-                                if let Operand::Register(v) = instr.operands[0]
-                                    && let Ok(rhs) = frame.read_reg(v)
-                                    && let (JsValue::Smi(a), JsValue::Smi(b)) =
+                                if let Operand::Register(v) = instr.operands[0] {
+                                    // SAFETY: The bytecode validator guarantees
+                                    // register operands are in bounds.
+                                    let rhs = unsafe { frame.read_reg_unchecked(v) };
+                                    if let (JsValue::Smi(a), JsValue::Smi(b)) =
                                         (&frame.accumulator, rhs)
-                                {
-                                    frame.accumulator = JsValue::Boolean(*a < *b);
-                                    Ok(dispatch::DispatchAction::Continue)
-                                } else {
-                                    dispatch_via_table(
-                                        frame,
-                                        instructions,
-                                        byte_offsets,
-                                        jump_targets,
-                                        handler_table.as_slice(),
-                                        instr,
-                                    )
+                                    {
+                                        frame.accumulator = JsValue::Boolean(*a < *b);
+                                        continue;
+                                    }
                                 }
+                                dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                )
                             }
                             Opcode::TestGreaterThan => {
-                                if let Operand::Register(v) = instr.operands[0]
-                                    && let Ok(rhs) = frame.read_reg(v)
-                                    && let (JsValue::Smi(a), JsValue::Smi(b)) =
+                                if let Operand::Register(v) = instr.operands[0] {
+                                    // SAFETY: The bytecode validator guarantees
+                                    // register operands are in bounds.
+                                    let rhs = unsafe { frame.read_reg_unchecked(v) };
+                                    if let (JsValue::Smi(a), JsValue::Smi(b)) =
                                         (&frame.accumulator, rhs)
-                                {
-                                    frame.accumulator = JsValue::Boolean(*a > *b);
-                                    Ok(dispatch::DispatchAction::Continue)
-                                } else {
-                                    dispatch_via_table(
-                                        frame,
-                                        instructions,
-                                        byte_offsets,
-                                        jump_targets,
-                                        handler_table.as_slice(),
-                                        instr,
-                                    )
+                                    {
+                                        frame.accumulator = JsValue::Boolean(*a > *b);
+                                        continue;
+                                    }
                                 }
+                                dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                )
                             }
                             Opcode::TestEqual => match instr.operands[0] {
-                                Operand::Register(v) => match frame.read_reg(v) {
-                                    Ok(rhs) => {
-                                        let result = abstract_eq(&frame.accumulator, rhs);
-                                        frame.accumulator = JsValue::Boolean(result);
-                                        Ok(dispatch::DispatchAction::Continue)
-                                    }
-                                    Err(e) => Err(e),
-                                },
+                                Operand::Register(v) => {
+                                    // SAFETY: The bytecode validator guarantees
+                                    // register operands are in bounds.
+                                    let rhs = unsafe { frame.read_reg_unchecked(v) };
+                                    let result = abstract_eq(&frame.accumulator, rhs);
+                                    frame.accumulator = JsValue::Boolean(result);
+                                    continue;
+                                }
                                 _ => Err(err_bad_operand("TestEqual", 0)),
                             },
 
@@ -3103,6 +3140,7 @@ pub(super) fn strict_eq(lhs: &JsValue, rhs: &JsValue) -> bool {
 
 /// Construct a diagnostic error for an unexpected operand kind.
 #[cold]
+#[inline(never)]
 pub(super) fn err_bad_operand(opcode_name: &'static str, operand_index: usize) -> StatorError {
     StatorError::Internal(format!(
         "{opcode_name}: unexpected operand kind at index {operand_index}"
@@ -3111,14 +3149,39 @@ pub(super) fn err_bad_operand(opcode_name: &'static str, operand_index: usize) -
 
 /// Error returned when the bytecode stream ends without a `Return`.
 #[cold]
+#[inline(never)]
 fn bytecode_end_error() -> StatorError {
     StatorError::Internal("bytecode ended without a Return instruction".into())
 }
 
 /// Error returned when the per-frame instruction limit is exceeded.
 #[cold]
+#[inline(never)]
 fn instruction_limit_error() -> StatorError {
     StatorError::Internal("instruction limit exceeded".into())
+}
+
+/// Error returned when execution exceeds a wall-clock deadline.
+#[cold]
+#[inline(never)]
+fn execution_timeout_error() -> StatorError {
+    StatorError::RangeError("execution timeout exceeded".to_string())
+}
+
+#[cold]
+#[inline(never)]
+fn jump_before_pc_advance_error(opcode_name: &'static str) -> StatorError {
+    StatorError::Internal(format!(
+        "{opcode_name} executed before program counter advanced"
+    ))
+}
+
+#[cold]
+#[inline(never)]
+fn missing_cached_jump_target_error(opcode_name: &'static str, idx: usize) -> StatorError {
+    StatorError::Internal(format!(
+        "missing cached jump target for {opcode_name} at instruction {idx}"
+    ))
 }
 
 /// Dispatch an opcode through the function-pointer dispatch table.
@@ -3153,18 +3216,16 @@ fn dispatch_via_table(
 fn resolve_jump_inline(
     frame_pc: usize,
     jump_targets: &[Option<usize>],
-    opcode_name: &str,
+    opcode_name: &'static str,
 ) -> StatorResult<usize> {
-    let idx = frame_pc.checked_sub(1).ok_or_else(|| {
-        StatorError::Internal(format!(
-            "{opcode_name} executed before program counter advanced"
-        ))
-    })?;
-    jump_targets.get(idx).copied().flatten().ok_or_else(|| {
-        StatorError::Internal(format!(
-            "missing cached jump target for {opcode_name} at instruction {idx}"
-        ))
-    })
+    let idx = frame_pc
+        .checked_sub(1)
+        .ok_or_else(|| jump_before_pc_advance_error(opcode_name))?;
+    jump_targets
+        .get(idx)
+        .copied()
+        .flatten()
+        .ok_or_else(|| missing_cached_jump_target_error(opcode_name, idx))
 }
 
 /// Handle a dispatch error on the cold path: look for a JS exception
