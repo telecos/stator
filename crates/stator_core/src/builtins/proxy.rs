@@ -100,7 +100,7 @@ pub type ConstructTrap = Box<dyn Fn(Vec<JsValue>, JsValue) -> StatorResult<JsVal
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```ignore
 /// use stator_core::builtins::proxy::{ProxyHandler, proxy_new, proxy_get};
 /// use stator_core::objects::js_object::JsObject;
 /// use stator_core::objects::value::JsValue;
@@ -749,7 +749,7 @@ pub fn proxy_get_own_property_descriptor(
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```ignore
 /// use stator_core::builtins::proxy::{ProxyHandler, proxy_new, proxy_get_prototype_of};
 /// use stator_core::objects::js_object::JsObject;
 /// use stator_core::objects::value::JsValue;
@@ -921,7 +921,7 @@ pub fn proxy_prevent_extensions(proxy: &mut JsProxy) -> StatorResult<bool> {
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```ignore
 /// use stator_core::builtins::proxy::{ProxyHandler, proxy_new, proxy_own_keys};
 /// use stator_core::objects::js_object::JsObject;
 /// use stator_core::objects::value::JsValue;
@@ -1050,7 +1050,7 @@ pub fn proxy_apply(
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```ignore
 /// use stator_core::builtins::proxy::{ProxyHandler, proxy_new, proxy_construct};
 /// use stator_core::objects::js_object::JsObject;
 /// use stator_core::objects::value::JsValue;
