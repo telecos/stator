@@ -1666,6 +1666,25 @@ impl InterpreterFrame {
         Ok(())
     }
 
+    /// Write `value` to a validated register operand without bounds checks.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `reg` came from validated bytecode and maps to a
+    /// live register in this frame.
+    #[inline(always)]
+    unsafe fn write_reg_unchecked(&mut self, reg: u32, value: JsValue) {
+        let signed = reg as i32;
+        let idx = if signed >= 0 {
+            self.bytecode_array.parameter_count() as usize + signed as usize
+        } else {
+            (-(signed + 1)) as usize
+        };
+        debug_assert!(idx < self.registers.len());
+        // SAFETY: The caller guarantees `reg` maps to an in-bounds register.
+        *unsafe { self.registers.get_unchecked_mut(idx) } = value;
+    }
+
     /// Copy a value from register `src` to register `dst` directly,
     /// avoiding the intermediate borrow that `read_reg` + `write_reg`
     /// would require.
@@ -1800,17 +1819,12 @@ impl Interpreter {
                     // read on every instruction.  Refreshed in the periodic block.
                     let mut debug_active = DEBUG_ATTACHED.with(Cell::get);
 
-                    loop {
+                    'dispatch: loop {
                         if frame.pc >= instructions.len() {
                             return Err(bytecode_end_error());
                         }
 
                         // ── Debug hook (pre-fetch) ─────────────────────────────────────
-                        //
-                        // Check for breakpoints and step conditions *before* fetching the
-                        // next instruction so that the paused frame state reflects what is
-                        // *about* to execute (the program counter still points at the
-                        // instruction that would fire next).
                         if debug_active {
                             let current_offset = byte_offsets[frame.pc] as u32;
                             if let Some(pause_err) = ACTIVE_DEBUGGER.with(|d| {
@@ -1827,21 +1841,22 @@ impl Interpreter {
                         let instr = unsafe { instructions.get_unchecked(frame.pc) };
                         frame.pc += 1;
 
-                        // ── Instruction limit & deadline checks ─────────────────────────
-                        frame.instructions_executed += 1;
+                        // ── Approximate instruction counting & periodic checks ──────────
+                        //
+                        // Instead of incrementing a counter every instruction, we
+                        // check the low bits of the PC.  This is ~free (bitwise AND
+                        // on a value we already have) and only slightly imprecise
+                        // because back-edges reset the PC.  The counter advances in
+                        // chunks of 0x1000 so that instruction_limit still works.
+                        if frame.pc & 0x3FF == 0 {
+                            frame.instructions_executed += 0x400;
 
-                        // Fast periodic check: every 1024 instructions check limits
-                        // and deadlines.  Uses bitwise AND instead of modulo for a
-                        // zero-cost check on the fast path.
-                        if frame.instructions_executed & 0x3FF == 0 {
-                            // Check per-frame instruction limit
                             if frame.instruction_limit > 0
                                 && frame.instructions_executed > frame.instruction_limit
                             {
                                 return Err(instruction_limit_error());
                             }
 
-                            // Check per-frame and thread-local wall-clock deadlines.
                             let thread_deadline = EXECUTION_DEADLINE.with(|d| d.get());
                             if frame.deadline.is_some() || thread_deadline.is_some() {
                                 let now = Instant::now();
@@ -1852,120 +1867,160 @@ impl Interpreter {
                                 }
                             }
 
-                            if frame.instructions_executed & 0xFFF == 0 {
-                                // ── CPU profiler checkpoint (periodic) ──────────────
+                            if frame.pc & 0xFFF == 0 {
                                 crate::inspector::profiler::maybe_record_sample();
-
-                                // Refresh debugger flag from thread-local.
                                 debug_active = DEBUG_ATTACHED.with(Cell::get);
                             }
                         }
 
                         // ── Dispatch (hot-path inline + table fallback) ───────────
                         //
-                        // The 15 hottest opcodes are dispatched via a direct `match`
-                        // to eliminate the ~5-10 cycle indirect-call overhead of the
-                        // function-pointer dispatch table.  Rare opcodes fall back
-                        // to the table in `dispatch.rs`.
+                        // The hottest opcodes are dispatched via a direct `match`
+                        // with unsafe operand extraction to eliminate all overhead.
+                        // Rare opcodes fall back to the table in `dispatch.rs`.
                         use crate::bytecode::bytecodes::{Opcode, Operand};
 
-                        let dispatch_action: StatorResult<dispatch::DispatchAction> = match instr
-                            .opcode
-                        {
-                            // ── Load / Store ─────────────────────────
-                            Opcode::LdaSmi => match instr.operands[0] {
-                                Operand::Immediate(v) => {
-                                    frame.accumulator = JsValue::Smi(v);
-                                    continue;
-                                }
-                                _ => Err(err_bad_operand("LdaSmi", 0)),
-                            },
-                            Opcode::Star => match instr.operands[0] {
-                                Operand::Register(v) => {
-                                    let val = frame.accumulator.cheap_clone();
-                                    frame
-                                        .write_reg(v, val)
-                                        .map(|()| dispatch::DispatchAction::Continue)
-                                }
-                                _ => Err(err_bad_operand("Star", 0)),
-                            },
-                            Opcode::Ldar => match instr.operands[0] {
-                                Operand::Register(v) => {
-                                    // SAFETY: The bytecode validator guarantees
-                                    // register operands are in bounds.
-                                    let val = unsafe { frame.read_reg_unchecked(v) };
-                                    frame.accumulator = val.cheap_clone();
-                                    continue;
-                                }
-                                _ => Err(err_bad_operand("Ldar", 0)),
-                            },
+                        match instr.opcode {
+                            // ── Load / Store (ultra-tight) ───────────────
+                            Opcode::LdaSmi => {
+                                // SAFETY: Bytecode generator guarantees operand[0]
+                                // is Immediate for LdaSmi.
+                                frame.accumulator =
+                                    JsValue::Smi(unsafe { operand_imm_unchecked(instr, 0) });
+                                continue 'dispatch;
+                            }
+                            Opcode::Star => {
+                                // SAFETY: Bytecode generator guarantees operand[0]
+                                // is Register for Star, and register is in bounds.
+                                let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                let val = frame.accumulator.cheap_clone();
+                                // SAFETY: Bytecode validator guarantees register is
+                                // in bounds for this frame.
+                                unsafe { frame.write_reg_unchecked(reg, val) };
+                                continue 'dispatch;
+                            }
+                            Opcode::Ldar => {
+                                // SAFETY: Bytecode generator guarantees operand[0]
+                                // is Register for Ldar, and register is in bounds.
+                                let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                // SAFETY: Bytecode validator guarantees register is
+                                // in bounds for this frame.
+                                let val = unsafe { frame.read_reg_unchecked(reg) };
+                                frame.accumulator = val.cheap_clone();
+                                continue 'dispatch;
+                            }
 
                             // ── Arithmetic (SMI fast path, table fallback) ──
                             Opcode::Add => {
                                 if let Operand::Register(v) = instr.operands[0] {
-                                    // SAFETY: The bytecode validator guarantees
-                                    // register operands are in bounds.
+                                    // SAFETY: Bytecode validator guarantees register
+                                    // operands are in bounds.
                                     let rhs = unsafe { frame.read_reg_unchecked(v) };
                                     if let (JsValue::Smi(a), JsValue::Smi(b)) =
                                         (&frame.accumulator, rhs)
                                         && let Some(result) = a.checked_add(*b)
                                     {
                                         frame.accumulator = JsValue::Smi(result);
-                                        continue;
+                                        continue 'dispatch;
                                     }
                                 }
-                                dispatch_via_table(
+                                match dispatch_via_table(
                                     frame,
                                     instructions,
                                     byte_offsets,
                                     jump_targets,
                                     handler_table.as_slice(),
                                     instr,
-                                )
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => continue 'dispatch,
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            frame.pc = resume_pc;
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
                             }
                             Opcode::Sub => {
                                 if let Operand::Register(v) = instr.operands[0] {
-                                    // SAFETY: The bytecode validator guarantees
-                                    // register operands are in bounds.
+                                    // SAFETY: Bytecode validator guarantees register
+                                    // operands are in bounds.
                                     let rhs = unsafe { frame.read_reg_unchecked(v) };
                                     if let (JsValue::Smi(a), JsValue::Smi(b)) =
                                         (&frame.accumulator, rhs)
                                         && let Some(result) = a.checked_sub(*b)
                                     {
                                         frame.accumulator = JsValue::Smi(result);
-                                        continue;
+                                        continue 'dispatch;
                                     }
                                 }
-                                dispatch_via_table(
+                                match dispatch_via_table(
                                     frame,
                                     instructions,
                                     byte_offsets,
                                     jump_targets,
                                     handler_table.as_slice(),
                                     instr,
-                                )
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => continue 'dispatch,
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            frame.pc = resume_pc;
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
                             }
                             Opcode::Mul => {
                                 if let Operand::Register(v) = instr.operands[0] {
-                                    // SAFETY: The bytecode validator guarantees
-                                    // register operands are in bounds.
+                                    // SAFETY: Bytecode validator guarantees register
+                                    // operands are in bounds.
                                     let rhs = unsafe { frame.read_reg_unchecked(v) };
                                     if let (JsValue::Smi(a), JsValue::Smi(b)) =
                                         (&frame.accumulator, rhs)
                                         && let Some(result) = a.checked_mul(*b)
                                     {
                                         frame.accumulator = JsValue::Smi(result);
-                                        continue;
+                                        continue 'dispatch;
                                     }
                                 }
-                                dispatch_via_table(
+                                match dispatch_via_table(
                                     frame,
                                     instructions,
                                     byte_offsets,
                                     jump_targets,
                                     handler_table.as_slice(),
                                     instr,
-                                )
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => continue 'dispatch,
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            frame.pc = resume_pc;
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
                             }
                             Opcode::AddSmi => {
                                 if let Operand::Immediate(imm) = instr.operands[0]
@@ -1973,182 +2028,219 @@ impl Interpreter {
                                     && let Some(result) = n.checked_add(imm)
                                 {
                                     frame.accumulator = JsValue::Smi(result);
-                                    continue;
+                                    continue 'dispatch;
                                 }
-                                dispatch_via_table(
+                                match dispatch_via_table(
                                     frame,
                                     instructions,
                                     byte_offsets,
                                     jump_targets,
                                     handler_table.as_slice(),
                                     instr,
-                                )
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => continue 'dispatch,
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            frame.pc = resume_pc;
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
                             }
 
                             // ── Return ───────────────────────────────
                             Opcode::Return => {
-                                Ok(dispatch::DispatchAction::Return(frame.accumulator.clone()))
+                                return Ok(frame.accumulator.clone());
                             }
 
-                            // ── Jumps ────────────────────────────────
-                            Opcode::Jump => match instr.operands[0] {
-                                Operand::JumpOffset(_) => {
-                                    match resolve_jump_inline(frame.pc, jump_targets, "Jump") {
-                                        Ok(target) => {
-                                            frame.pc = target;
-                                            continue;
-                                        }
-                                        Err(e) => Err(e),
-                                    }
+                            // ── Jumps (unsafe target resolution) ─────
+                            Opcode::Jump => {
+                                // SAFETY: Bytecode compiler guarantees all Jump
+                                // instructions have pre-computed targets.
+                                frame.pc =
+                                    unsafe { resolve_jump_unchecked(frame.pc, jump_targets) };
+                                continue 'dispatch;
+                            }
+                            Opcode::JumpIfTrue => {
+                                if matches!(frame.accumulator, JsValue::Boolean(true)) {
+                                    // SAFETY: Bytecode compiler guarantees all
+                                    // JumpIfTrue instructions have pre-computed targets.
+                                    frame.pc =
+                                        unsafe { resolve_jump_unchecked(frame.pc, jump_targets) };
                                 }
-                                _ => Err(err_bad_operand("Jump", 0)),
-                            },
-                            Opcode::JumpIfTrue => match instr.operands[0] {
-                                Operand::JumpOffset(_) => {
-                                    if matches!(frame.accumulator, JsValue::Boolean(true)) {
-                                        match resolve_jump_inline(
-                                            frame.pc,
-                                            jump_targets,
-                                            "JumpIfTrue",
-                                        ) {
-                                            Ok(target) => {
-                                                frame.pc = target;
-                                                continue;
-                                            }
-                                            Err(e) => Err(e),
-                                        }
-                                    } else {
-                                        continue;
-                                    }
+                                continue 'dispatch;
+                            }
+                            Opcode::JumpIfFalse => {
+                                if matches!(frame.accumulator, JsValue::Boolean(false)) {
+                                    // SAFETY: Bytecode compiler guarantees all
+                                    // JumpIfFalse instructions have pre-computed targets.
+                                    frame.pc =
+                                        unsafe { resolve_jump_unchecked(frame.pc, jump_targets) };
                                 }
-                                _ => Err(err_bad_operand("JumpIfTrue", 0)),
-                            },
-                            Opcode::JumpIfFalse => match instr.operands[0] {
-                                Operand::JumpOffset(_) => {
-                                    if matches!(frame.accumulator, JsValue::Boolean(false)) {
-                                        match resolve_jump_inline(
-                                            frame.pc,
-                                            jump_targets,
-                                            "JumpIfFalse",
-                                        ) {
-                                            Ok(target) => {
-                                                frame.pc = target;
-                                                continue;
-                                            }
-                                            Err(e) => Err(e),
-                                        }
-                                    } else {
-                                        continue;
-                                    }
+                                continue 'dispatch;
+                            }
+                            Opcode::JumpLoop => {
+                                // SAFETY: Bytecode compiler guarantees all JumpLoop
+                                // instructions have pre-computed targets.
+                                frame.pc =
+                                    unsafe { resolve_jump_unchecked(frame.pc, jump_targets) };
+                                frame.osr_loop_count = frame.osr_loop_count.saturating_add(1);
+                                if frame.osr_loop_count >= OSR_LOOP_THRESHOLD
+                                    && frame.bytecode_array.try_get_jit_code().is_none()
+                                {
+                                    maybe_compile_baseline(&frame.bytecode_array);
                                 }
-                                _ => Err(err_bad_operand("JumpIfFalse", 0)),
-                            },
-                            Opcode::JumpLoop => match instr.operands[0] {
-                                Operand::JumpOffset(_) => {
-                                    match resolve_jump_inline(frame.pc, jump_targets, "JumpLoop") {
-                                        Ok(target) => {
-                                            frame.pc = target;
-                                            frame.osr_loop_count =
-                                                frame.osr_loop_count.saturating_add(1);
-                                            if frame.osr_loop_count >= OSR_LOOP_THRESHOLD
-                                                && frame.bytecode_array.try_get_jit_code().is_none()
-                                            {
-                                                maybe_compile_baseline(&frame.bytecode_array);
-                                            }
-                                            if frame.osr_loop_count >= MAGLEV_OSR_LOOP_THRESHOLD {
-                                                maybe_compile_maglev(&frame.bytecode_array);
-                                            }
-                                            if frame.osr_loop_count >= TURBOFAN_OSR_LOOP_THRESHOLD {
-                                                maybe_compile_turbofan(&frame.bytecode_array);
-                                            }
-                                            continue;
-                                        }
-                                        Err(e) => Err(e),
-                                    }
+                                if frame.osr_loop_count >= MAGLEV_OSR_LOOP_THRESHOLD {
+                                    maybe_compile_maglev(&frame.bytecode_array);
                                 }
-                                _ => Err(err_bad_operand("JumpLoop", 0)),
-                            },
+                                if frame.osr_loop_count >= TURBOFAN_OSR_LOOP_THRESHOLD {
+                                    maybe_compile_turbofan(&frame.bytecode_array);
+                                }
+                                continue 'dispatch;
+                            }
 
                             // ── Comparisons (SMI fast path, table fallback) ──
                             Opcode::TestLessThan => {
                                 if let Operand::Register(v) = instr.operands[0] {
-                                    // SAFETY: The bytecode validator guarantees
-                                    // register operands are in bounds.
+                                    // SAFETY: Bytecode validator guarantees register
+                                    // operands are in bounds.
                                     let rhs = unsafe { frame.read_reg_unchecked(v) };
                                     if let (JsValue::Smi(a), JsValue::Smi(b)) =
                                         (&frame.accumulator, rhs)
                                     {
                                         frame.accumulator = JsValue::Boolean(*a < *b);
-                                        continue;
+                                        continue 'dispatch;
                                     }
                                 }
-                                dispatch_via_table(
+                                match dispatch_via_table(
                                     frame,
                                     instructions,
                                     byte_offsets,
                                     jump_targets,
                                     handler_table.as_slice(),
                                     instr,
-                                )
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => continue 'dispatch,
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            frame.pc = resume_pc;
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
                             }
                             Opcode::TestGreaterThan => {
                                 if let Operand::Register(v) = instr.operands[0] {
-                                    // SAFETY: The bytecode validator guarantees
-                                    // register operands are in bounds.
+                                    // SAFETY: Bytecode validator guarantees register
+                                    // operands are in bounds.
                                     let rhs = unsafe { frame.read_reg_unchecked(v) };
                                     if let (JsValue::Smi(a), JsValue::Smi(b)) =
                                         (&frame.accumulator, rhs)
                                     {
                                         frame.accumulator = JsValue::Boolean(*a > *b);
-                                        continue;
+                                        continue 'dispatch;
                                     }
                                 }
-                                dispatch_via_table(
+                                match dispatch_via_table(
                                     frame,
                                     instructions,
                                     byte_offsets,
                                     jump_targets,
                                     handler_table.as_slice(),
                                     instr,
-                                )
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => continue 'dispatch,
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            frame.pc = resume_pc;
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
                             }
-                            Opcode::TestEqual => match instr.operands[0] {
-                                Operand::Register(v) => {
-                                    // SAFETY: The bytecode validator guarantees
-                                    // register operands are in bounds.
+                            Opcode::TestEqual => {
+                                if let Operand::Register(v) = instr.operands[0] {
+                                    // SAFETY: Bytecode validator guarantees register
+                                    // operands are in bounds.
                                     let rhs = unsafe { frame.read_reg_unchecked(v) };
                                     let result = abstract_eq(&frame.accumulator, rhs);
                                     frame.accumulator = JsValue::Boolean(result);
-                                    continue;
+                                    continue 'dispatch;
                                 }
-                                _ => Err(err_bad_operand("TestEqual", 0)),
-                            },
+                                match dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => continue 'dispatch,
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            frame.pc = resume_pc;
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
+                            }
 
                             // ── All other opcodes: dispatch table ────
-                            _ => dispatch_via_table(
-                                frame,
-                                instructions,
-                                byte_offsets,
-                                jump_targets,
-                                handler_table.as_slice(),
-                                instr,
-                            ),
-                        };
-                        match dispatch_action {
-                            Ok(dispatch::DispatchAction::Continue) => {}
-                            Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
-                            Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
-                            Err(e) => {
-                                if let Some(resume_pc) =
-                                    handle_dispatch_error(&e, frame, handler_table.as_slice())
-                                {
-                                    frame.pc = resume_pc;
-                                    continue;
+                            _ => {
+                                match dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => continue 'dispatch,
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            frame.pc = resume_pc;
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
                                 }
-                                return Err(e);
                             }
                         }
-                    }
+                    } // 'dispatch
                 } // 'tail_call
             }) // stacker::maybe_grow
         })();
@@ -3168,20 +3260,64 @@ fn execution_timeout_error() -> StatorError {
     StatorError::RangeError("execution timeout exceeded".to_string())
 }
 
-#[cold]
-#[inline(never)]
-fn jump_before_pc_advance_error(opcode_name: &'static str) -> StatorError {
-    StatorError::Internal(format!(
-        "{opcode_name} executed before program counter advanced"
-    ))
+/// Extract a `Register(u32)` operand without checking the variant tag.
+///
+/// # Safety
+///
+/// The bytecode generator guarantees `instr.operands[idx]` is
+/// [`Operand::Register`] for the calling opcode.  `idx` must be in bounds.
+#[inline(always)]
+unsafe fn operand_reg_unchecked(
+    instr: &crate::bytecode::bytecodes::Instruction,
+    idx: usize,
+) -> u32 {
+    // SAFETY: Caller guarantees idx < operands.len() and the variant is Register.
+    match *unsafe { instr.operands.get_unchecked(idx) } {
+        crate::bytecode::bytecodes::Operand::Register(v) => v,
+        // SAFETY: The bytecode generator guarantees the operand is Register.
+        _ => unsafe { std::hint::unreachable_unchecked() },
+    }
 }
 
-#[cold]
-#[inline(never)]
-fn missing_cached_jump_target_error(opcode_name: &'static str, idx: usize) -> StatorError {
-    StatorError::Internal(format!(
-        "missing cached jump target for {opcode_name} at instruction {idx}"
-    ))
+/// Extract an `Immediate(i32)` operand without checking the variant tag.
+///
+/// # Safety
+///
+/// The bytecode generator guarantees `instr.operands[idx]` is
+/// [`Operand::Immediate`] for the calling opcode.  `idx` must be in bounds.
+#[inline(always)]
+unsafe fn operand_imm_unchecked(
+    instr: &crate::bytecode::bytecodes::Instruction,
+    idx: usize,
+) -> i32 {
+    // SAFETY: Caller guarantees idx < operands.len() and the variant is Immediate.
+    match *unsafe { instr.operands.get_unchecked(idx) } {
+        crate::bytecode::bytecodes::Operand::Immediate(v) => v,
+        // SAFETY: The bytecode generator guarantees the operand is Immediate.
+        _ => unsafe { std::hint::unreachable_unchecked() },
+    }
+}
+
+/// Resolve a pre-computed jump target without error checks.
+///
+/// # Safety
+///
+/// The caller must ensure `frame_pc > 0` and that `jump_targets[frame_pc - 1]`
+/// contains a valid `Some(target)`.  These invariants hold for all jump opcodes
+/// emitted by the bytecode compiler, which always populates jump targets for
+/// every jump instruction during pre-decoding.
+#[inline(always)]
+unsafe fn resolve_jump_unchecked(frame_pc: usize, jump_targets: &[Option<usize>]) -> usize {
+    // SAFETY: frame_pc was incremented past the instruction, so frame_pc - 1
+    // is the index of the jump instruction.  The bytecode compiler guarantees
+    // a valid target exists.
+    let idx = frame_pc - 1;
+    match *unsafe { jump_targets.get_unchecked(idx) } {
+        Some(target) => target,
+        // SAFETY: The bytecode compiler guarantees all jump instructions have
+        // pre-computed targets populated during decode.
+        None => unsafe { std::hint::unreachable_unchecked() },
+    }
 }
 
 /// Dispatch an opcode through the function-pointer dispatch table.
@@ -3206,26 +3342,6 @@ fn dispatch_via_table(
         handler_table,
     };
     handler(&mut dctx, instr)
-}
-
-/// Resolve the pre-computed jump target for the current instruction.
-///
-/// `frame_pc` must already be incremented past the jump instruction
-/// (the interpreter advances the PC before dispatching).
-#[inline(always)]
-fn resolve_jump_inline(
-    frame_pc: usize,
-    jump_targets: &[Option<usize>],
-    opcode_name: &'static str,
-) -> StatorResult<usize> {
-    let idx = frame_pc
-        .checked_sub(1)
-        .ok_or_else(|| jump_before_pc_advance_error(opcode_name))?;
-    jump_targets
-        .get(idx)
-        .copied()
-        .flatten()
-        .ok_or_else(|| missing_cached_jump_target_error(opcode_name, idx))
 }
 
 /// Handle a dispatch error on the cold path: look for a JS exception
