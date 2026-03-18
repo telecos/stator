@@ -81,6 +81,7 @@ pub(super) struct DispatchContext<'a> {
 const PRIVATE_STORAGE_PREFIX: &str = ".private.";
 const PRIVATE_BRAND_PREFIX: &str = ".private.brand.";
 const PRIVATE_KIND_PREFIX: &str = ".private.kind.";
+const POLYMORPHIC_LOAD_CACHE_CAP: usize = 8;
 
 fn is_private_storage_key(key: &str) -> bool {
     key.starts_with(PRIVATE_STORAGE_PREFIX)
@@ -3055,7 +3056,7 @@ fn handle_lda_named_property(
                 );
         }
     }
-    // Update polymorphic cache (up to 4 entries per slot).
+    // Update polymorphic cache (up to 8 entries per slot).
     if slot != u32::MAX {
         let obj_ptr = match &obj {
             JsValue::PlainObject(map) => Some(Rc::as_ptr(map) as usize),
@@ -3079,7 +3080,7 @@ fn handle_lda_named_property(
                     break;
                 }
             }
-            if !found && entries.len() < 4 {
+            if !found && entries.len() < POLYMORPHIC_LOAD_CACHE_CAP {
                 entries.push((ptr, result.clone()));
             }
         }
