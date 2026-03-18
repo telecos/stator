@@ -103,12 +103,14 @@ fn name_hash(s: &str) -> u64 {
 /// can still populate the cache.
 #[derive(Debug, Clone)]
 pub struct PropertyMap {
-    /// Property names in insertion order.
+    /// Property names in ECMAScript enumeration order.
     keys: Vec<String>,
     /// Property values, one per key.
     values: Vec<JsValue>,
     /// Property attributes, one per key.
     attrs: Vec<PropertyAttributes>,
+    /// Number of integer-indexed keys stored at the front of `keys`.
+    integer_key_count: usize,
     /// Name → slot-index mapping for O(1) lookup.
     index: HashMap<String, usize>,
     /// Inline cache: FNV-1a hashes of recently accessed property names.
@@ -131,6 +133,7 @@ impl PartialEq for PropertyMap {
         self.keys == other.keys
             && self.values == other.values
             && self.attrs == other.attrs
+            && self.integer_key_count == other.integer_key_count
             && self.index == other.index
             && self.extensible == other.extensible
     }
@@ -143,6 +146,7 @@ impl PropertyMap {
             keys: Vec::new(),
             values: Vec::new(),
             attrs: Vec::new(),
+            integer_key_count: 0,
             index: HashMap::new(),
             cache_hashes: Default::default(),
             cache_slots: Default::default(),
@@ -159,6 +163,7 @@ impl PropertyMap {
             keys: Vec::with_capacity(capacity),
             values: Vec::with_capacity(capacity),
             attrs: Vec::with_capacity(capacity),
+            integer_key_count: 0,
             index: HashMap::with_capacity(capacity),
             cache_hashes: Default::default(),
             cache_slots: Default::default(),
@@ -283,20 +288,11 @@ impl PropertyMap {
     /// keys in insertion order.
     fn spec_insert_pos(&self, key: &str) -> usize {
         if let Some(n) = parse_integer_index(key) {
-            // Integer index: find the correct sorted position among the
-            // existing integer-indexed keys that occupy the front of `keys`.
-            let mut pos = 0;
-            while pos < self.keys.len() {
-                if let Some(existing) = parse_integer_index(&self.keys[pos]) {
-                    if existing > n {
-                        return pos;
-                    }
-                    pos += 1;
-                } else {
-                    return pos;
-                }
-            }
-            pos
+            self.keys[..self.integer_key_count]
+                .binary_search_by(|existing| {
+                    parse_integer_index(existing).unwrap_or(u32::MAX).cmp(&n)
+                })
+                .unwrap_or_else(|pos| pos)
         } else if is_symbol_property_key(key) {
             // Symbol keys go at the very end, after all string keys.
             self.keys.len()
@@ -308,6 +304,20 @@ impl PropertyMap {
                 pos -= 1;
             }
             pos
+        }
+    }
+
+    /// Inserts a new property at `pos`, updating indices and integer-key
+    /// bookkeeping as needed.
+    fn insert_new(&mut self, key: String, value: JsValue, attrs: PropertyAttributes, pos: usize) {
+        let is_integer_key = parse_integer_index(&key).is_some();
+        self.index_shift_right(pos);
+        self.index.insert(key.clone(), pos);
+        self.keys.insert(pos, key);
+        self.values.insert(pos, value);
+        self.attrs.insert(pos, attrs);
+        if is_integer_key {
+            self.integer_key_count += 1;
         }
     }
 
@@ -375,11 +385,7 @@ impl PropertyMap {
                 DEFAULT_ATTRS
             };
             let pos = self.spec_insert_pos(&key);
-            self.index_shift_right(pos);
-            self.index.insert(key.clone(), pos);
-            self.keys.insert(pos, key);
-            self.values.insert(pos, value);
-            self.attrs.insert(pos, attrs);
+            self.insert_new(key, value, attrs, pos);
             self.bump_shape_id();
             if pos != self.keys.len() - 1 {
                 self.cache_invalidate();
@@ -395,11 +401,7 @@ impl PropertyMap {
             self.attrs[i] = BUILTIN_ATTRS;
         } else {
             let pos = self.spec_insert_pos(&key);
-            self.index_shift_right(pos);
-            self.index.insert(key.clone(), pos);
-            self.keys.insert(pos, key);
-            self.values.insert(pos, value);
-            self.attrs.insert(pos, BUILTIN_ATTRS);
+            self.insert_new(key, value, BUILTIN_ATTRS, pos);
             self.bump_shape_id();
             if pos != self.keys.len() - 1 {
                 self.cache_invalidate();
@@ -423,6 +425,9 @@ impl PropertyMap {
     /// enumeration order of the remaining properties is maintained.
     pub fn remove(&mut self, key: &str) -> Option<JsValue> {
         if let Some(i) = self.index.remove(key) {
+            if parse_integer_index(&self.keys[i]).is_some() {
+                self.integer_key_count -= 1;
+            }
             let val = self.values[i].clone();
             self.keys.remove(i);
             self.values.remove(i);
@@ -484,11 +489,7 @@ impl PropertyMap {
             self.attrs[i] = attrs;
         } else {
             let pos = self.spec_insert_pos(&key);
-            self.index_shift_right(pos);
-            self.index.insert(key.clone(), pos);
-            self.keys.insert(pos, key);
-            self.values.insert(pos, value);
-            self.attrs.insert(pos, attrs);
+            self.insert_new(key, value, attrs, pos);
             self.bump_shape_id();
             if pos != self.keys.len() - 1 {
                 self.cache_invalidate();
@@ -964,6 +965,19 @@ mod tests {
         pm.insert("20".to_string(), JsValue::Smi(20));
         let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
         assert_eq!(keys, vec!["1", "2", "10", "20"]);
+        assert_eq!(pm.integer_key_count, 4);
+    }
+
+    #[test]
+    fn test_string_and_symbol_inserts_do_not_change_integer_key_count() {
+        use crate::builtins::symbol::{symbol_create, symbol_to_property_key};
+
+        let mut pm = PropertyMap::new();
+        pm.insert("2".to_string(), JsValue::Smi(2));
+        pm.insert("name".to_string(), JsValue::Smi(1));
+        pm.insert(symbol_to_property_key(symbol_create(None)), JsValue::Smi(3));
+
+        assert_eq!(pm.integer_key_count, 1);
     }
 
     #[test]
@@ -1016,6 +1030,7 @@ mod tests {
         pm.remove("3");
         let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
         assert_eq!(keys, vec!["1", "x", "y"]);
+        assert_eq!(pm.integer_key_count, 1);
     }
 
     #[test]
