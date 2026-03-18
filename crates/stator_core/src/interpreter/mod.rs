@@ -1505,10 +1505,10 @@ impl Interpreter {
             return Self::run_async_function(frame.bytecode_array.clone(), vec![]);
         }
         // Dynamically grow the native stack when headroom drops below 128 KiB.
-        // Allocate a large (256 MiB) heap-backed segment on the first call
-        // so all nested interpreter frames stay on one big segment. The 8 MiB
-        // red zone guarantees this triggers even with default OS stacks.
-        stacker::maybe_grow(8 * 1024 * 1024, 256 * 1024 * 1024, || {
+        // Stack guard: allocate heap-backed segments when remaining stack is
+        // low.  With the CI's 64 MiB stack this is a no-op for normal tests;
+        // it only triggers if the stack is nearly exhausted.
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
             // Outer loop: re-entered when a TailCall opcode rewrites the frame
             // with a new bytecode array (proper tail-call trampoline).
             'tail_call: loop {

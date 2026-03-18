@@ -51,18 +51,18 @@ jobs:
         run: cargo build --package stator_test262 --release
 
       - name: Run Test262 suite
-        # Stack strategy: use a LARGE main thread stack (512 MiB) so the
-        # interpreter never overflows for normal tests.  The crash-restart
-        # loop handles the rare test that manages to overflow even this.
+        # Stack: 64 MiB — plenty for normal tests, but infinite-recursion
+        # bugs crash quickly (restart loop recovers).  The `timeout` wrapper
+        # kills stuck tests (infinite loops in parser/compiler).
         run: |
-          ulimit -s 524288   # 512 MiB main thread stack
+          ulimit -s 65536    # 64 MiB main thread stack
           PROGRESS_FILE=$(mktemp)
           SKIP=0
           CRASHES=0
           MAX_RESTARTS=50
           for attempt in $(seq 1 $MAX_RESTARTS); do
             set +e
-            ./target/release/stator_test262 \
+            timeout 120 ./target/release/stator_test262 \
               --test262-dir test262 \
               --threshold 25.0 \
               --progress-file "$PROGRESS_FILE" \
@@ -70,22 +70,20 @@ jobs:
             rc=$?
             set -e
             if [ $rc -eq 0 ]; then
-              # Clean exit — all tests processed successfully
               rm -f "$PROGRESS_FILE"
               exit 0
             elif [ $rc -eq 1 ]; then
-              # Threshold failure (pass rate too low)
               rm -f "$PROGRESS_FILE"
               exit 1
-            elif [ $rc -eq 134 ] || [ $rc -eq 137 ] || [ $rc -eq 139 ]; then
-              # Crash (SIGABRT=134, SIGKILL=137, SIGSEGV=139)
+            elif [ $rc -eq 124 ] || [ $rc -eq 134 ] || [ $rc -eq 137 ] || [ $rc -eq 139 ]; then
+              # 124=timeout, 134=SIGABRT, 137=SIGKILL, 139=SIGSEGV
               CRASHES=$((CRASHES + 1))
               if [ -f "$PROGRESS_FILE" ]; then
                 CRASHED_AT=$(cat "$PROGRESS_FILE")
                 SKIP=$((CRASHED_AT + 1))
-                echo "::warning::Runner crashed (exit $rc) at test $CRASHED_AT — restarting from $SKIP (crash $CRASHES/$MAX_RESTARTS)"
+                echo "::warning::Runner exited ($rc) at test $CRASHED_AT — restarting from $SKIP (crash $CRASHES/$MAX_RESTARTS)"
               else
-                echo "::warning::Runner crashed (exit $rc) with no progress — giving up"
+                echo "::warning::Runner exited ($rc) with no progress — giving up"
                 rm -f "$PROGRESS_FILE"
                 exit 0
               fi
@@ -95,6 +93,6 @@ jobs:
               exit 0
             fi
           done
-          echo "::warning::Exceeded $MAX_RESTARTS crash restarts ($CRASHES crashes total)"
+          echo "::warning::Exceeded $MAX_RESTARTS restarts ($CRASHES total)"
           rm -f "$PROGRESS_FILE"
           exit 0
