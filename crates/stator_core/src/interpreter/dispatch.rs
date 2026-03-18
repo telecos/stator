@@ -131,13 +131,15 @@ fn private_kind_marker(obj: &JsValue, storage_key: &str) -> Option<String> {
 
 fn invalidate_plain_object_caches(ctx: &mut DispatchContext, map: &Rc<RefCell<PropertyMap>>) {
     let map_ptr = Rc::as_ptr(map) as usize;
-    ctx.frame
-        .mono_load_cache
-        .retain(|_, (ptr, _)| *ptr != map_ptr);
-    ctx.frame.poly_load_cache.retain(|_, entries| {
-        entries.retain(|(ptr, _)| *ptr != map_ptr);
-        !entries.is_empty()
-    });
+    if let Some(cache) = &mut ctx.frame.mono_load_cache {
+        cache.retain(|_, (ptr, _)| *ptr != map_ptr);
+    }
+    if let Some(cache) = &mut ctx.frame.poly_load_cache {
+        cache.retain(|_, entries| {
+            entries.retain(|(ptr, _)| *ptr != map_ptr);
+            !entries.is_empty()
+        });
+    }
 }
 
 fn load_private_named_property(obj: &JsValue, storage_key: &str) -> StatorResult<JsValue> {
@@ -1580,11 +1582,21 @@ fn handle_tail_call(
                     }
                     restore_closure_context(ctx.frame, &ba);
                     populate_self_name(ctx.frame, &ba, &JsValue::Function(Rc::clone(&ba)));
-                    ctx.frame.string_cache.clear();
-                    ctx.frame.mono_load_cache.clear();
-                    ctx.frame.poly_load_cache.clear();
-                    ctx.frame.shape_load_ic.clear();
-                    ctx.frame.shape_store_ic.clear();
+                    if let Some(cache) = &mut ctx.frame.string_cache {
+                        cache.clear();
+                    }
+                    if let Some(cache) = &mut ctx.frame.mono_load_cache {
+                        cache.clear();
+                    }
+                    if let Some(cache) = &mut ctx.frame.poly_load_cache {
+                        cache.clear();
+                    }
+                    if let Some(cache) = &mut ctx.frame.shape_load_ic {
+                        cache.clear();
+                    }
+                    if let Some(cache) = &mut ctx.frame.shape_store_ic {
+                        cache.clear();
+                    }
                     return Ok(DispatchAction::TailCall);
                 }
             }
@@ -2980,7 +2992,11 @@ fn handle_lda_named_property(
     // ── Shape IC fast path: O(1) own-property access via cached offset ──
     if slot != u32::MAX
         && let JsValue::PlainObject(ref map) = obj
-        && let Some(ic) = ctx.frame.shape_load_ic.get(&slot)
+        && let Some(ic) = ctx
+            .frame
+            .shape_load_ic
+            .as_ref()
+            .and_then(|cache| cache.get(&slot))
     {
         let pm = map.borrow();
         if pm.shape_id() == ic.cached_shape
@@ -3001,7 +3017,11 @@ fn handle_lda_named_property(
             _ => None,
         };
         if let Some(ptr) = obj_ptr
-            && let Some(entries) = ctx.frame.poly_load_cache.get(&slot)
+            && let Some(entries) = ctx
+                .frame
+                .poly_load_cache
+                .as_ref()
+                .and_then(|cache| cache.get(&slot))
         {
             for &(cached_ptr, ref cached_val) in entries {
                 if cached_ptr == ptr {
@@ -3035,13 +3055,16 @@ fn handle_lda_named_property(
         if !pm.contains_key(&getter_key)
             && let Some(offset) = pm.offset_of(&prop_name)
         {
-            ctx.frame.shape_load_ic.insert(
-                slot,
-                PropertyIc {
-                    cached_shape: pm.shape_id(),
-                    cached_offset: offset,
-                },
-            );
+            ctx.frame
+                .shape_load_ic
+                .get_or_insert_with(std::collections::HashMap::new)
+                .insert(
+                    slot,
+                    PropertyIc {
+                        cached_shape: pm.shape_id(),
+                        cached_offset: offset,
+                    },
+                );
         }
     }
     // Update polymorphic cache (up to 4 entries per slot).
@@ -3053,7 +3076,12 @@ fn handle_lda_named_property(
             _ => None,
         };
         if let Some(ptr) = obj_ptr {
-            let entries = ctx.frame.poly_load_cache.entry(slot).or_default();
+            let entries = ctx
+                .frame
+                .poly_load_cache
+                .get_or_insert_with(std::collections::HashMap::new)
+                .entry(slot)
+                .or_default();
             // Check if we already have this pointer; update in place.
             let mut found = false;
             for entry in entries.iter_mut() {
@@ -3117,7 +3145,11 @@ fn handle_sta_named_property(
         JsValue::PlainObject(ref map) => {
             // ── Shape IC fast path for store: existing writable property ─
             if slot != u32::MAX
-                && let Some(ic) = ctx.frame.shape_store_ic.get(&slot)
+                && let Some(ic) = ctx
+                    .frame
+                    .shape_store_ic
+                    .as_ref()
+                    .and_then(|cache| cache.get(&slot))
             {
                 let pm = map.borrow();
                 if pm.shape_id() == ic.cached_shape {
@@ -3126,13 +3158,15 @@ fn handle_sta_named_property(
                         map.borrow_mut().set_by_offset(ic.cached_offset, val);
                         // Invalidate value-based caches for this object.
                         let map_ptr = Rc::as_ptr(map) as usize;
-                        ctx.frame
-                            .mono_load_cache
-                            .retain(|_, (ptr, _)| *ptr != map_ptr);
-                        ctx.frame.poly_load_cache.retain(|_, entries| {
-                            entries.retain(|(ptr, _)| *ptr != map_ptr);
-                            !entries.is_empty()
-                        });
+                        if let Some(cache) = &mut ctx.frame.mono_load_cache {
+                            cache.retain(|_, (ptr, _)| *ptr != map_ptr);
+                        }
+                        if let Some(cache) = &mut ctx.frame.poly_load_cache {
+                            cache.retain(|_, entries| {
+                                entries.retain(|(ptr, _)| *ptr != map_ptr);
+                                !entries.is_empty()
+                            });
+                        }
                         return Ok(DispatchAction::Continue);
                     }
                     // Non-writable: TypeError in strict mode, silently ignore in sloppy.
@@ -3217,24 +3251,29 @@ fn handle_sta_named_property(
             if slot != u32::MAX {
                 let pm = map.borrow();
                 if let Some(offset) = pm.offset_of(&prop_name) {
-                    ctx.frame.shape_store_ic.insert(
-                        slot,
-                        PropertyIc {
-                            cached_shape: pm.shape_id(),
-                            cached_offset: offset,
-                        },
-                    );
+                    ctx.frame
+                        .shape_store_ic
+                        .get_or_insert_with(std::collections::HashMap::new)
+                        .insert(
+                            slot,
+                            PropertyIc {
+                                cached_shape: pm.shape_id(),
+                                cached_offset: offset,
+                            },
+                        );
                 }
             }
             // Invalidate value-based caches for this object.
             let map_ptr = Rc::as_ptr(map) as usize;
-            ctx.frame
-                .mono_load_cache
-                .retain(|_, (ptr, _)| *ptr != map_ptr);
-            ctx.frame.poly_load_cache.retain(|_, entries| {
-                entries.retain(|(ptr, _)| *ptr != map_ptr);
-                !entries.is_empty()
-            });
+            if let Some(cache) = &mut ctx.frame.mono_load_cache {
+                cache.retain(|_, (ptr, _)| *ptr != map_ptr);
+            }
+            if let Some(cache) = &mut ctx.frame.poly_load_cache {
+                cache.retain(|_, entries| {
+                    entries.retain(|(ptr, _)| *ptr != map_ptr);
+                    !entries.is_empty()
+                });
+            }
         }
         JsValue::Function(ref ba) => {
             if matches!(fn_props_get(ba, &prop_name), JsValue::Undefined) {

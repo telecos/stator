@@ -1312,22 +1312,23 @@ pub struct InterpreterFrame {
     /// when invoked via `[[Construct]]`, or `undefined` for normal calls.
     pub new_target: JsValue,
     /// Monomorphic property-load cache: `slot → (map_ptr, cached_value)`.
-    /// When the same PropertyMap is seen again, the cached value is returned
-    /// without a full `proto_lookup` scan.
-    pub mono_load_cache: HashMap<u32, (usize, JsValue)>,
+    /// Lazily allocated on first write so leaf calls that never touch inline
+    /// caches pay no HashMap allocation cost.
+    pub mono_load_cache: Option<HashMap<u32, (usize, JsValue)>>,
     /// Polymorphic property-load cache: `slot → [(ptr, cached_value)]`.
     /// Holds up to 4 entries per feedback slot, supporting polymorphic sites.
-    pub poly_load_cache: HashMap<u32, Vec<(usize, JsValue)>>,
+    /// Lazily allocated on first write.
+    pub poly_load_cache: Option<HashMap<u32, Vec<(usize, JsValue)>>>,
     /// Shape-based inline cache for named property loads.
     /// Maps a feedback slot to a [`PropertyIc`] recording the last observed
     /// `(shape_id, offset)` pair so that a repeat access on the same shape
     /// can skip HashMap lookup entirely.
-    pub shape_load_ic: HashMap<u32, PropertyIc>,
+    pub shape_load_ic: Option<HashMap<u32, PropertyIc>>,
     /// Shape-based inline cache for named property stores.
-    pub shape_store_ic: HashMap<u32, PropertyIc>,
+    pub shape_store_ic: Option<HashMap<u32, PropertyIc>>,
     /// Pre-decoded string constants from the constant pool, keyed by index.
     /// Avoids repeated `String::clone()` from the constant pool.
-    pub string_cache: HashMap<u32, Rc<str>>,
+    pub string_cache: Option<HashMap<u32, Rc<str>>>,
 }
 
 impl InterpreterFrame {
@@ -1363,11 +1364,11 @@ impl InterpreterFrame {
             deadline: None,
             pending_message: JsValue::Undefined,
             new_target: JsValue::Undefined,
-            mono_load_cache: HashMap::new(),
-            poly_load_cache: HashMap::new(),
-            shape_load_ic: HashMap::new(),
-            shape_store_ic: HashMap::new(),
-            string_cache: HashMap::new(),
+            mono_load_cache: None,
+            poly_load_cache: None,
+            shape_load_ic: None,
+            shape_store_ic: None,
+            string_cache: None,
         }
     }
 
@@ -1460,7 +1461,7 @@ impl InterpreterFrame {
 
     /// Get a string constant from the constant pool, caching the result.
     pub fn get_string_constant(&mut self, idx: u32) -> StatorResult<Rc<str>> {
-        if let Some(cached) = self.string_cache.get(&idx) {
+        if let Some(cached) = self.string_cache.as_ref().and_then(|cache| cache.get(&idx)) {
             return Ok(Rc::clone(cached));
         }
         let s = match self.bytecode_array.get_constant(idx) {
@@ -1471,7 +1472,9 @@ impl InterpreterFrame {
                 ));
             }
         };
-        self.string_cache.insert(idx, Rc::clone(&s));
+        self.string_cache
+            .get_or_insert_with(HashMap::new)
+            .insert(idx, Rc::clone(&s));
         Ok(s)
     }
 }
@@ -1679,11 +1682,11 @@ impl Interpreter {
             deadline: None,
             pending_message: JsValue::Undefined,
             new_target: JsValue::Undefined,
-            mono_load_cache: std::collections::HashMap::new(),
-            poly_load_cache: std::collections::HashMap::new(),
-            shape_load_ic: std::collections::HashMap::new(),
-            shape_store_ic: std::collections::HashMap::new(),
-            string_cache: std::collections::HashMap::new(),
+            mono_load_cache: None,
+            poly_load_cache: None,
+            shape_load_ic: None,
+            shape_store_ic: None,
+            string_cache: None,
         };
         // Restore the captured closure context so generators can access outer
         // scope variables through the context chain.
