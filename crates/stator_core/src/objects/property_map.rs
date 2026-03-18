@@ -55,9 +55,9 @@ const BUILTIN_ATTRS: PropertyAttributes = PropertyAttributes::from_bits_truncate
 
 /// Maximum number of entries in the inline property-name cache.
 ///
-/// Four entries fit comfortably in a single cache line and cover the vast
-/// majority of tight property-access loops in typical JavaScript code.
-const INLINE_CACHE_CAP: usize = 4;
+/// Eight entries provide better coverage for moderately polymorphic property
+/// access patterns while keeping probes short and cache-friendly.
+const INLINE_CACHE_CAP: usize = 8;
 
 /// Returns `Some(n)` if `key` is a valid ECMAScript array index — a canonical
 /// decimal string representing an integer in `0 ..= 2^32 − 2`.
@@ -119,7 +119,7 @@ pub struct PropertyMap {
     cache_slots: [Cell<u32>; INLINE_CACHE_CAP],
     /// Number of valid entries in the inline cache (0..=INLINE_CACHE_CAP).
     cache_len: Cell<u8>,
-    /// Circular replacement cursor into the cache arrays.
+    /// Circular replacement cursor into the cache arrays once the cache is full.
     cache_cursor: Cell<u8>,
     /// Shape identifier — a monotonically-increasing stamp that changes on
     /// every structural mutation (property add/remove or attribute change).
@@ -187,6 +187,10 @@ impl PropertyMap {
                 // Verify against the canonical key to guard against hash
                 // collisions (extremely rare but must be handled).
                 if slot < self.keys.len() && self.keys[slot] == key {
+                    if i > 0 {
+                        self.cache_hashes[0].swap(&self.cache_hashes[i]);
+                        self.cache_slots[0].swap(&self.cache_slots[i]);
+                    }
                     return Some(slot);
                 }
             }
@@ -863,18 +867,37 @@ mod tests {
     #[test]
     fn test_cache_wraps_around() {
         let mut pm = PropertyMap::new();
-        for i in 0..6 {
+        for i in 0..(INLINE_CACHE_CAP as i32 + 2) {
             pm.insert(format!("k{i}"), JsValue::Smi(i));
         }
-        // Access 6 keys: first 4 fill the cache, next 2 replace via cursor.
-        for i in 0..6 {
+        // Access more keys than fit in the cache so insertion wraps via the cursor.
+        for i in 0..(INLINE_CACHE_CAP as i32 + 2) {
             assert_eq!(pm.get(&format!("k{i}")), Some(&JsValue::Smi(i)));
         }
         assert_eq!(pm.cache_len.get(), INLINE_CACHE_CAP as u8);
         // All lookups should still work (cache or HashMap fallback).
-        for i in 0..6 {
+        for i in 0..(INLINE_CACHE_CAP as i32 + 2) {
             assert_eq!(pm.get(&format!("k{i}")), Some(&JsValue::Smi(i)));
         }
+    }
+
+    #[test]
+    fn test_cache_hit_moves_entry_to_front() {
+        let mut pm = PropertyMap::new();
+        pm.insert("a".to_string(), JsValue::Smi(1));
+        pm.insert("b".to_string(), JsValue::Smi(2));
+
+        assert_eq!(pm.get("a"), Some(&JsValue::Smi(1)));
+        assert_eq!(pm.get("b"), Some(&JsValue::Smi(2)));
+
+        let hash_a = name_hash("a");
+        let hash_b = name_hash("b");
+        assert_eq!(pm.cache_hashes[0].get(), hash_a);
+        assert_eq!(pm.cache_hashes[1].get(), hash_b);
+
+        assert_eq!(pm.get("b"), Some(&JsValue::Smi(2)));
+        assert_eq!(pm.cache_hashes[0].get(), hash_b);
+        assert_eq!(pm.cache_hashes[1].get(), hash_a);
     }
 
     #[test]
