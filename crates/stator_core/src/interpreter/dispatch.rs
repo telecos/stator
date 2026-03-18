@@ -205,6 +205,7 @@ fn store_private_named_property(
                 let setter = proto_lookup(obj, &private_setter_key(storage_key));
                 if !matches!(setter, JsValue::Undefined) {
                     dispatch_setter(&setter, obj, value)?;
+                    ctx.frame.global_cache_invalidate();
                     return Ok(());
                 }
             }
@@ -237,6 +238,7 @@ fn store_private_named_property(
             let setter = map.borrow().get(&setter_key).cloned();
             if let Some(setter) = setter {
                 dispatch_setter(&setter, obj, value)?;
+                ctx.frame.global_cache_invalidate();
                 Ok(())
             } else {
                 Err(private_access_error("write to", storage_key))
@@ -1465,6 +1467,7 @@ fn handle_call_any_receiver(
                         Interpreter::run(&mut callee_frame)
                     });
                     pop_call_frame();
+                    ctx.frame.global_cache_invalidate();
                     ctx.frame.accumulator = result?;
                 }
             }
@@ -1472,6 +1475,7 @@ fn handle_call_any_receiver(
         JsValue::NativeFunction(f) => {
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
             ctx.frame.accumulator = f(args)?;
+            ctx.frame.global_cache_invalidate();
         }
         JsValue::PlainObject(ref map) => {
             let call_val = map.borrow().get("__call__").cloned();
@@ -1479,6 +1483,7 @@ fn handle_call_any_receiver(
                 Some(JsValue::NativeFunction(f)) => {
                     let args = collect_args(ctx.frame, args_start_v, arg_count)?;
                     ctx.frame.accumulator = f(args)?;
+                    ctx.frame.global_cache_invalidate();
                 }
                 Some(JsValue::Function(ba)) => {
                     let args = collect_args(ctx.frame, args_start_v, arg_count)?;
@@ -1610,11 +1615,13 @@ fn handle_tail_call(
         JsValue::NativeFunction(f) => {
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
             ctx.frame.accumulator = f(args)?;
+            ctx.frame.global_cache_invalidate();
         }
         JsValue::PlainObject(ref map) => {
             if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
                 ctx.frame.accumulator = f(args)?;
+                ctx.frame.global_cache_invalidate();
             } else {
                 return Err(StatorError::TypeError(
                     "TailCall: callee is not a function (got PlainObject)".to_string(),
@@ -1691,6 +1698,7 @@ fn handle_call_undefined_receiver0(
                         Interpreter::run(&mut callee_frame)
                     });
                     pop_call_frame();
+                    ctx.frame.global_cache_invalidate();
                     if !ba.is_arrow() && ba.is_strict() {
                         match saved_this {
                             Some(v) => {
@@ -1710,10 +1718,12 @@ fn handle_call_undefined_receiver0(
         }
         JsValue::NativeFunction(f) => {
             ctx.frame.accumulator = f(vec![])?;
+            ctx.frame.global_cache_invalidate();
         }
         JsValue::PlainObject(ref map) => {
             if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
                 ctx.frame.accumulator = f(vec![])?;
+                ctx.frame.global_cache_invalidate();
             } else {
                 return Err(StatorError::TypeError(
                     "CallUndefinedReceiver0: callee is not a function (got PlainObject)"
@@ -1795,6 +1805,7 @@ fn handle_call_undefined_receiver1(
                         Interpreter::run(&mut callee_frame)
                     });
                     pop_call_frame();
+                    ctx.frame.global_cache_invalidate();
                     if !ba.is_arrow() && ba.is_strict() {
                         match saved_this {
                             Some(v) => {
@@ -1815,11 +1826,13 @@ fn handle_call_undefined_receiver1(
         JsValue::NativeFunction(f) => {
             let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
             ctx.frame.accumulator = f(vec![arg1])?;
+            ctx.frame.global_cache_invalidate();
         }
         JsValue::PlainObject(ref map) => {
             if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
                 ctx.frame.accumulator = f(vec![arg1])?;
+                ctx.frame.global_cache_invalidate();
             } else {
                 return Err(StatorError::TypeError(
                     "CallUndefinedReceiver1: callee is not a function (got PlainObject)"
@@ -1908,6 +1921,7 @@ fn handle_call_undefined_receiver2(
                         Interpreter::run(&mut callee_frame)
                     });
                     pop_call_frame();
+                    ctx.frame.global_cache_invalidate();
                     if !ba.is_arrow() && ba.is_strict() {
                         match saved_this {
                             Some(v) => {
@@ -1929,12 +1943,14 @@ fn handle_call_undefined_receiver2(
             let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
             let arg2 = ctx.frame.read_reg(arg2_v)?.clone();
             ctx.frame.accumulator = f(vec![arg1, arg2])?;
+            ctx.frame.global_cache_invalidate();
         }
         JsValue::PlainObject(ref map) => {
             if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
                 let arg2 = ctx.frame.read_reg(arg2_v)?.clone();
                 ctx.frame.accumulator = f(vec![arg1, arg2])?;
+                ctx.frame.global_cache_invalidate();
             } else {
                 return Err(StatorError::TypeError(
                     "CallUndefinedReceiver2: callee is not a function (got PlainObject)"
@@ -2013,17 +2029,20 @@ fn handle_call_property(
                     Interpreter::run(&mut callee_frame)
                 });
                 pop_call_frame();
+                ctx.frame.global_cache_invalidate();
                 ctx.frame.accumulator = result?;
             }
         }
         JsValue::NativeFunction(f) => {
             ctx.frame.accumulator = f(args)?;
+            ctx.frame.global_cache_invalidate();
         }
         JsValue::PlainObject(ref map) => {
             let call_val = map.borrow().get("__call__").cloned();
             match call_val {
                 Some(JsValue::NativeFunction(f)) => {
                     ctx.frame.accumulator = f(args)?;
+                    ctx.frame.global_cache_invalidate();
                 }
                 Some(JsValue::Function(ba)) => {
                     call_plain_object_function(ctx, &ba, map, args)?;
@@ -2216,15 +2235,18 @@ fn handle_call_with_spread(
                     Interpreter::run(&mut callee_frame)
                 });
                 pop_call_frame();
+                ctx.frame.global_cache_invalidate();
                 ctx.frame.accumulator = result?;
             }
         }
         JsValue::NativeFunction(f) => {
             ctx.frame.accumulator = f(args)?;
+            ctx.frame.global_cache_invalidate();
         }
         JsValue::PlainObject(ref map) => {
             if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
                 ctx.frame.accumulator = f(args)?;
+                ctx.frame.global_cache_invalidate();
             } else {
                 return Err(StatorError::TypeError(
                     "CallWithSpread: callee is not a function (got PlainObject)".to_string(),
@@ -2298,6 +2320,7 @@ fn call_plain_object_function(
         Interpreter::run(&mut callee_frame)
     });
     pop_call_frame();
+    ctx.frame.global_cache_invalidate();
     ctx.frame.accumulator = result?;
     Ok(())
 }
@@ -2403,6 +2426,7 @@ fn construct_class_from_plain_object(
     //    calls super()) so that `this` is available.
     if !is_derived {
         run_field_init(&ctx.frame.global_env, &this_val)?;
+        ctx.frame.global_cache_invalidate();
     }
 
     // 5. Run constructor body.
@@ -2411,6 +2435,7 @@ fn construct_class_from_plain_object(
         Interpreter::run(&mut callee_frame)
     });
     pop_call_frame();
+    ctx.frame.global_cache_invalidate();
     let val = result?;
 
     // 6. For derived classes, run field initializer after the constructor.
@@ -2423,6 +2448,7 @@ fn construct_class_from_plain_object(
             .cloned()
             .unwrap_or(this_val.clone());
         run_field_init(&ctx.frame.global_env, &derived_this)?;
+        ctx.frame.global_cache_invalidate();
     }
 
     ctx.frame
@@ -2489,6 +2515,7 @@ fn handle_construct(
                 Interpreter::run(&mut callee_frame)
             });
             pop_call_frame();
+            ctx.frame.global_cache_invalidate();
             let val = result?;
             // If the constructor explicitly returns an object,
             // use it; otherwise return the `this` object.
@@ -2500,6 +2527,7 @@ fn handle_construct(
         JsValue::NativeFunction(f) => {
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
             let val = f(args)?;
+            ctx.frame.global_cache_invalidate();
             ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
         }
         JsValue::PlainObject(ref map) => {
@@ -2515,6 +2543,7 @@ fn handle_construct(
                 Some(JsValue::NativeFunction(f)) => {
                     let args = collect_args(ctx.frame, args_start_v, arg_count)?;
                     let val = f(args)?;
+                    ctx.frame.global_cache_invalidate();
                     ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
                 }
                 Some(JsValue::Function(ba)) => {
@@ -2590,6 +2619,7 @@ fn handle_construct_with_spread(
                 Interpreter::run(&mut callee_frame)
             });
             pop_call_frame();
+            ctx.frame.global_cache_invalidate();
             let val = result?;
             ctx.frame.accumulator = match val {
                 JsValue::PlainObject(_) | JsValue::Object(_) => val,
@@ -2598,6 +2628,7 @@ fn handle_construct_with_spread(
         }
         JsValue::NativeFunction(f) => {
             let val = f(args)?;
+            ctx.frame.global_cache_invalidate();
             ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
         }
         JsValue::PlainObject(ref map) => {
@@ -2610,6 +2641,7 @@ fn handle_construct_with_spread(
             match call_val {
                 Some(JsValue::NativeFunction(f)) => {
                     let val = f(args)?;
+                    ctx.frame.global_cache_invalidate();
                     ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
                 }
                 Some(JsValue::Function(ba)) => {
@@ -3214,6 +3246,7 @@ fn handle_sta_named_property(
             let setter = map.borrow().get(&setter_key).cloned();
             if let Some(setter_fn) = setter {
                 dispatch_setter(&setter_fn, &obj, val)?;
+                ctx.frame.global_cache_invalidate();
                 return Ok(DispatchAction::Continue);
             }
             // Getter-only accessor (own): no setter -> TypeError in strict,
@@ -3236,6 +3269,7 @@ fn handle_sta_named_property(
                             if let Some(s) = pb.get(&setter_key).cloned() {
                                 drop(pb);
                                 dispatch_setter(&s, &obj, val)?;
+                                ctx.frame.global_cache_invalidate();
                                 return Ok(DispatchAction::Continue);
                             }
                             if pb.contains_key(&getter_key) {
@@ -3398,6 +3432,7 @@ fn handle_sta_keyed_property(
         let setter = map.borrow().get(&setter_key).cloned();
         if let Some(setter_fn) = setter {
             dispatch_setter(&setter_fn, &obj, val)?;
+            ctx.frame.global_cache_invalidate();
             return Ok(DispatchAction::Continue);
         }
         // Getter-only accessor: no setter -> TypeError in strict, silent
@@ -3420,6 +3455,7 @@ fn handle_sta_keyed_property(
                         if let Some(s) = pb.get(&setter_key).cloned() {
                             drop(pb);
                             dispatch_setter(&s, &obj, val)?;
+                            ctx.frame.global_cache_invalidate();
                             return Ok(DispatchAction::Continue);
                         }
                         if pb.contains_key(&getter_key) {
@@ -4743,6 +4779,7 @@ fn handle_test_instance_of(
         match hi {
             JsValue::NativeFunction(f) => {
                 let result = f(vec![ctx.frame.accumulator.clone()])?;
+                ctx.frame.global_cache_invalidate();
                 ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
                 return Ok(DispatchAction::Continue);
             }
@@ -6322,6 +6359,7 @@ fn handle_construct_forward_all_args(
                 Interpreter::run(&mut callee_frame)
             });
             pop_call_frame();
+            ctx.frame.global_cache_invalidate();
             let val = result?;
             ctx.frame.accumulator = match val {
                 JsValue::PlainObject(_) | JsValue::Object(_) => val,
@@ -6330,6 +6368,7 @@ fn handle_construct_forward_all_args(
         }
         JsValue::NativeFunction(f) => {
             let val = f(args)?;
+            ctx.frame.global_cache_invalidate();
             ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
         }
         JsValue::PlainObject(ref map) => {
@@ -6342,6 +6381,7 @@ fn handle_construct_forward_all_args(
             match call_val {
                 Some(JsValue::NativeFunction(f)) => {
                     let val = f(args)?;
+                    ctx.frame.global_cache_invalidate();
                     ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
                 }
                 Some(JsValue::Function(ba)) => {
@@ -6510,15 +6550,18 @@ fn handle_call_direct_eval(
                         Interpreter::run(&mut callee_frame)
                     });
                     pop_call_frame();
+                    ctx.frame.global_cache_invalidate();
                     ctx.frame.accumulator = result?;
                 }
             }
             JsValue::NativeFunction(f) => {
                 ctx.frame.accumulator = f(args)?;
+                ctx.frame.global_cache_invalidate();
             }
             JsValue::PlainObject(ref map) => {
                 if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
                     ctx.frame.accumulator = f(args)?;
+                    ctx.frame.global_cache_invalidate();
                 } else {
                     return Err(StatorError::TypeError(
                         "CallDirectEval: callee is not a function (got PlainObject)".to_string(),

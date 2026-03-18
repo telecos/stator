@@ -38,7 +38,7 @@
 //! assert_eq!(decoded.len(), 2);
 //! ```
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -160,6 +160,13 @@ impl SourcePosition {
 /// to share the same cache without copying.
 type JitCodeCache = Rc<RefCell<Option<(Vec<u8>, usize)>>>;
 
+/// Shared decoded bytecode cache stored in a [`BytecodeArray`].
+///
+/// The cache is filled on first decode and then shared by all clones of the
+/// bytecode array so repeated function calls avoid re-decoding the same
+/// bytecode stream.
+type DecodedBytecodeCache = Rc<OnceCell<Rc<(Vec<Instruction>, Vec<usize>)>>>;
+
 /// Shared Maglev JIT code cache stored in a [`BytecodeArray`].
 ///
 /// Uses [`Arc`] + [`Mutex`] so that the Maglev background compilation thread
@@ -236,7 +243,9 @@ pub struct BytecodeArray {
     /// Compile-time description of all inline-cache feedback slots.
     feedback_metadata: FeedbackMetadata,
     /// Per-function exception handler table.
-    handler_table: Vec<HandlerTableEntry>,
+    handler_table: Rc<Vec<HandlerTableEntry>>,
+    /// Lazily-populated decoded instruction cache shared across clones.
+    cached_decode: DecodedBytecodeCache,
     /// Cached template objects keyed by bytecode offset.
     ///
     /// Tagged template sites must reuse the same frozen template object across
@@ -372,7 +381,8 @@ impl BytecodeArray {
             binding_registers: HashMap::new(),
             source_positions,
             feedback_metadata,
-            handler_table,
+            handler_table: Rc::new(handler_table),
+            cached_decode: Rc::new(OnceCell::new()),
             template_cache: Rc::new(RefCell::new(HashMap::new())),
             is_generator: false,
             is_async: false,
@@ -587,7 +597,12 @@ impl BytecodeArray {
     /// handler entry point.  Entries are ordered so that the innermost handler
     /// for any given instruction always appears before outer handlers.
     pub fn handler_table(&self) -> &[HandlerTableEntry] {
-        &self.handler_table
+        self.handler_table.as_slice()
+    }
+
+    /// Return a shared reference-counted handle to the exception handler table.
+    pub(crate) fn shared_handler_table(&self) -> Rc<Vec<HandlerTableEntry>> {
+        Rc::clone(&self.handler_table)
     }
 
     /// Decode the bytecode stream and return the list of [`Instruction`]s.
@@ -595,6 +610,31 @@ impl BytecodeArray {
     /// Returns an error if the byte stream is malformed.
     pub fn instructions(&self) -> StatorResult<Vec<Instruction>> {
         bytecodes::decode(&self.bytecodes)
+    }
+
+    fn ensure_decoded_instructions(&self) -> StatorResult<&Rc<(Vec<Instruction>, Vec<usize>)>> {
+        if self.cached_decode.get().is_none() {
+            let decoded = Rc::new(bytecodes::decode_with_byte_offsets(&self.bytecodes)?);
+            let _ = self.cached_decode.set(decoded);
+        }
+        Ok(self
+            .cached_decode
+            .get()
+            .expect("decoded bytecode cache must be initialized"))
+    }
+
+    /// Decode the bytecode stream once and return cached instructions plus
+    /// byte offsets on subsequent calls.
+    pub fn decoded_instructions(&mut self) -> StatorResult<(&[Instruction], &[usize])> {
+        let decoded = self.ensure_decoded_instructions()?;
+        Ok((decoded.0.as_slice(), decoded.1.as_slice()))
+    }
+
+    /// Return a shared handle to the cached decoded instruction stream.
+    pub(crate) fn shared_decoded_instructions(
+        &self,
+    ) -> StatorResult<Rc<(Vec<Instruction>, Vec<usize>)>> {
+        Ok(Rc::clone(self.ensure_decoded_instructions()?))
     }
 
     /// Look up a constant-pool entry by zero-based `index`.
@@ -870,5 +910,54 @@ mod tests {
             array.feedback_metadata().kind_of(1),
             Some(FeedbackSlotKind::LoadProperty)
         );
+    }
+
+    #[test]
+    fn test_decoded_instructions_are_cached() {
+        let mut array = make_simple_array();
+
+        // Decode fresh to compare against cached version.
+        let expected_offsets = bytecodes::decode_with_byte_offsets(array.bytecodes())
+            .expect("valid bytecode")
+            .1;
+
+        // First call populates the cache (uses &mut self).
+        {
+            let (instructions, offsets) = array.decoded_instructions().expect("valid bytecode");
+            assert_eq!(instructions.len(), 3);
+            assert_eq!(instructions[0].opcode, Opcode::LdaSmi);
+            assert_eq!(instructions[1].opcode, Opcode::Star);
+            assert_eq!(instructions[2].opcode, Opcode::Return);
+            assert_eq!(offsets, expected_offsets.as_slice());
+        }
+
+        // Second call returns the same cached Rc allocation.
+        let first = array
+            .shared_decoded_instructions()
+            .expect("cached bytecode");
+        let second = array
+            .shared_decoded_instructions()
+            .expect("cached bytecode 2");
+        assert!(std::ptr::eq(first.0.as_ptr(), second.0.as_ptr()));
+        assert!(std::ptr::eq(first.1.as_ptr(), second.1.as_ptr()));
+    }
+
+    #[test]
+    fn test_decoded_instructions_cache_is_shared_across_clones() {
+        let array = make_simple_array();
+        let clone = array.clone();
+        let decoded_orig = array.shared_decoded_instructions().expect("valid bytecode");
+        let decoded_clone = clone
+            .shared_decoded_instructions()
+            .expect("shared cached bytecode");
+
+        assert!(std::ptr::eq(
+            decoded_orig.0.as_ptr(),
+            decoded_clone.0.as_ptr()
+        ));
+        assert!(std::ptr::eq(
+            decoded_orig.1.as_ptr(),
+            decoded_clone.1.as_ptr()
+        ));
     }
 }

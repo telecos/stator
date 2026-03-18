@@ -186,7 +186,6 @@ use crate::bytecode::bytecode_array::{
 };
 #[cfg(all(target_arch = "x86_64", unix))]
 use crate::bytecode::bytecode_array::{MaglevJitCodeCache, TurbofanJitCodeCache};
-use crate::bytecode::bytecodes::decode_with_byte_offsets;
 use crate::error::{StatorError, StatorResult};
 use crate::inspector::debugger::Debugger;
 use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
@@ -1581,6 +1580,25 @@ impl InterpreterFrame {
     pub fn global_cache_put(&mut self, _name: &str, _value: JsValue) {
         // no-op while cache is disabled
     }
+
+    /// Invalidate the per-frame global variable cache.
+    ///
+    /// Must be called after any nested function call (Interpreter::run,
+    /// NativeFunction invocation, dispatch_setter, run_field_init, or
+    /// dispatch_getter) that could have mutated the shared global_env.
+    #[inline(always)]
+    pub fn global_cache_invalidate(&mut self) {
+        self.global_cache = [
+            (0, None, JsValue::Undefined),
+            (0, None, JsValue::Undefined),
+            (0, None, JsValue::Undefined),
+            (0, None, JsValue::Undefined),
+            (0, None, JsValue::Undefined),
+            (0, None, JsValue::Undefined),
+            (0, None, JsValue::Undefined),
+            (0, None, JsValue::Undefined),
+        ];
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1618,13 +1636,12 @@ impl Interpreter {
             // Outer loop: re-entered when a TailCall opcode rewrites the frame
             // with a new bytecode array (proper tail-call trampoline).
             'tail_call: loop {
-                // Pre-decode the bytecode once and capture byte offsets for jump resolution.
-                let (instructions, byte_offsets) =
-                    decode_with_byte_offsets(frame.bytecode_array.bytecodes())?;
-                // Clone the handler table once so the borrow on bytecode_array is released
-                // before we start mutating the frame.
-                let handler_table: Vec<HandlerTableEntry> =
-                    frame.bytecode_array.handler_table().to_vec();
+                // Pre-decode the bytecode once and capture byte offsets for jump
+                // resolution. The decoded instruction stream is cached on the
+                // bytecode array and shared across cloned frames.
+                let decoded = frame.bytecode_array.shared_decoded_instructions()?;
+                let (instructions, byte_offsets) = (&decoded.0[..], &decoded.1[..]);
+                let handler_table = frame.bytecode_array.shared_handler_table();
 
                 loop {
                     if frame.pc >= instructions.len() {
@@ -1692,9 +1709,9 @@ impl Interpreter {
                     let handler = dispatch::DISPATCH_TABLE[instr.opcode as usize];
                     let mut dctx = dispatch::DispatchContext {
                         frame,
-                        instructions: &instructions,
-                        byte_offsets: &byte_offsets,
-                        handler_table: &handler_table,
+                        instructions,
+                        byte_offsets,
+                        handler_table: handler_table.as_slice(),
                     };
                     match handler(&mut dctx, instr) {
                         Ok(action) => match action {
@@ -1704,7 +1721,7 @@ impl Interpreter {
                         },
                         Err(e) => {
                             if let Some(resume_pc) =
-                                handle_dispatch_error(&e, frame, &handler_table)
+                                handle_dispatch_error(&e, frame, handler_table.as_slice())
                             {
                                 frame.pc = resume_pc;
                                 continue;
