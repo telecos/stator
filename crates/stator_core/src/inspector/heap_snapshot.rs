@@ -79,7 +79,7 @@ pub struct AllocationRecord {
     /// Self-size of the allocation in bytes.
     pub size: usize,
     /// JavaScript call stack at the point of allocation (bottom-to-top).
-    pub stack: Vec<String>,
+    pub stack: Vec<&'static str>,
 }
 
 thread_local! {

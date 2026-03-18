@@ -66,7 +66,7 @@ thread_local! {
     /// Accumulated samples: each entry is `(timestamp_micros, call_stack)`.
     ///
     /// Written by [`maybe_record_sample`] and drained by [`CpuProfiler::stop`].
-    static SAMPLES: RefCell<Vec<(u64, Vec<String>)>> =
+    static SAMPLES: RefCell<Vec<(u64, Vec<&'static str>)>> =
         const { RefCell::new(Vec::new()) };
 
     /// Profiling-session start time in microseconds since the Unix epoch.
@@ -328,7 +328,8 @@ impl CpuProfiler {
 
         let end_time = now_micros();
         let start_time = SESSION_START_MICROS.with(|t| t.get());
-        let samples: Vec<(u64, Vec<String>)> = SAMPLES.with(|s| s.borrow_mut().drain(..).collect());
+        let samples: Vec<(u64, Vec<&'static str>)> =
+            SAMPLES.with(|s| s.borrow_mut().drain(..).collect());
 
         Some(build_profile_tree(&samples, start_time, end_time))
     }
@@ -351,7 +352,7 @@ impl Default for CpuProfiler {
 /// first, leaf frame last), matching the order maintained by
 /// `push_call_frame` / `pop_call_frame`.
 fn build_profile_tree(
-    samples: &[(u64, Vec<String>)],
+    samples: &[(u64, Vec<&'static str>)],
     start_time: u64,
     end_time: u64,
 ) -> CpuProfile {
@@ -465,7 +466,7 @@ mod tests {
 
     #[test]
     fn test_build_profile_tree_single_sample() {
-        let samples = vec![(1500u64, vec!["outer".to_string(), "inner".to_string()])];
+        let samples = vec![(1500u64, vec!["outer", "inner"])];
         let profile = build_profile_tree(&samples, 1000, 2000);
 
         // root → outer → inner
@@ -485,10 +486,7 @@ mod tests {
     #[test]
     fn test_build_profile_tree_merges_common_prefixes() {
         // Two samples that share the "outer" frame.
-        let samples = vec![
-            (1100u64, vec!["outer".to_string(), "a".to_string()]),
-            (1200u64, vec!["outer".to_string(), "b".to_string()]),
-        ];
+        let samples = vec![(1100u64, vec!["outer", "a"]), (1200u64, vec!["outer", "b"])];
         let profile = build_profile_tree(&samples, 1000, 2000);
 
         // root(1) → outer(2) → a(3)
@@ -506,9 +504,9 @@ mod tests {
     #[test]
     fn test_build_profile_tree_time_deltas() {
         let samples = vec![
-            (1100u64, vec!["f".to_string()]),
-            (1300u64, vec!["f".to_string()]),
-            (1700u64, vec!["f".to_string()]),
+            (1100u64, vec!["f"]),
+            (1300u64, vec!["f"]),
+            (1700u64, vec!["f"]),
         ];
         let profile = build_profile_tree(&samples, 1000, 2000);
 

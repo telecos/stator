@@ -68,7 +68,7 @@ thread_local! {
     /// function has no name).  The interpreter pushes a name before entering a
     /// nested call and pops it on return.  [`capture_stack_trace`] reads this
     /// list when a new error is created.
-    static CALL_STACK: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static CALL_STACK: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Maximum JavaScript call-stack depth.
@@ -96,7 +96,7 @@ pub const MAX_CALL_STACK_DEPTH: usize = 128;
 /// JavaScript `RangeError` instead of aborting on a native stack overflow.
 ///
 /// Call this immediately before entering a nested interpreter call.
-pub fn push_call_frame(name: impl Into<String>) -> StatorResult<()> {
+pub fn push_call_frame(name: &'static str) -> StatorResult<()> {
     CALL_STACK.with(|cs| {
         let mut stack = cs.borrow_mut();
         if stack.len() >= MAX_CALL_STACK_DEPTH {
@@ -104,7 +104,7 @@ pub fn push_call_frame(name: impl Into<String>) -> StatorResult<()> {
                 "Maximum call stack size exceeded".to_string(),
             ));
         }
-        stack.push(name.into());
+        stack.push(name);
         Ok(())
     })
 }
@@ -135,7 +135,7 @@ pub fn pop_call_frame() {
 /// caller is at index 0; the most-recently-entered frame is last.
 ///
 /// Used by the CPU profiler to record samples at safe points.
-pub fn capture_call_stack() -> Vec<String> {
+pub fn capture_call_stack() -> Vec<&'static str> {
     CALL_STACK.with(|cs| cs.borrow().clone())
 }
 

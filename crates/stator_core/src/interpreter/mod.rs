@@ -1338,6 +1338,10 @@ pub struct InterpreterFrame {
 }
 
 /// FNV-1a hash for short strings used by the global variable cache.
+///
+/// Currently unused while the global cache is disabled; retained for
+/// re-enabling with a generation counter.
+#[allow(dead_code)]
 #[inline(always)]
 fn fxhash(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1560,24 +1564,22 @@ impl InterpreterFrame {
     }
 
     /// Try to read a global from the per-frame direct-mapped cache.
+    ///
+    /// **Disabled**: the per-frame cache can go stale when nested calls
+    /// (setters, callbacks, Array.every, JSON.parse revivers, toPrimitive)
+    /// mutate the shared global_env via their own frame's StaGlobal.
+    /// Re-enable with a generation counter on global_env.
     #[inline(always)]
-    pub fn global_cache_get(&self, name: &str) -> Option<&JsValue> {
-        let hash = fxhash(name);
-        let idx = (hash as usize) & 7;
-        let (cached_hash, ref cached_name, ref cached_value) = self.global_cache[idx];
-        if cached_hash == hash && cached_name.as_ref().is_some_and(|n| &**n == name) {
-            Some(cached_value)
-        } else {
-            None
-        }
+    pub fn global_cache_get(&self, _name: &str) -> Option<&JsValue> {
+        None
     }
 
     /// Insert or update a global in the per-frame direct-mapped cache.
+    ///
+    /// **Disabled**: see global_cache_get.
     #[inline(always)]
-    pub fn global_cache_put(&mut self, name: &str, value: JsValue) {
-        let hash = fxhash(name);
-        let idx = (hash as usize) & 7;
-        self.global_cache[idx] = (hash, Some(Rc::from(name)), value);
+    pub fn global_cache_put(&mut self, _name: &str, _value: JsValue) {
+        // no-op while cache is disabled
     }
 }
 
@@ -1625,9 +1627,6 @@ impl Interpreter {
                     frame.bytecode_array.handler_table().to_vec();
 
                 loop {
-                    // ── CPU profiler checkpoint ────────────────────────────────────
-                    crate::inspector::profiler::maybe_record_sample();
-
                     if frame.pc >= instructions.len() {
                         return Err(bytecode_end_error());
                     }
@@ -1660,6 +1659,9 @@ impl Interpreter {
                     // and deadlines.  Uses bitwise AND instead of modulo for a
                     // zero-cost check on the fast path.
                     if frame.instructions_executed & 0x3FF == 0 {
+                        // ── CPU profiler checkpoint (periodic) ──────────────────
+                        crate::inspector::profiler::maybe_record_sample();
+
                         // Check per-frame instruction limit
                         if frame.instruction_limit > 0
                             && frame.instructions_executed > frame.instruction_limit
