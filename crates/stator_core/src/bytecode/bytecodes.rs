@@ -52,6 +52,8 @@
 //! assert_eq!(decoded, instructions);
 //! ```
 
+use arrayvec::ArrayVec;
+
 use crate::error::{StatorError, StatorResult};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -162,6 +164,11 @@ impl Operand {
 // Instruction
 // ─────────────────────────────────────────────────────────────────────────────
 
+const INLINE_OPERAND_CAPACITY: usize = 5;
+
+/// Inline operand storage for decoded instructions.
+pub type InstructionOperands = ArrayVec<Operand, INLINE_OPERAND_CAPACITY>;
+
 /// A fully decoded bytecode instruction: an [`Opcode`] paired with its
 /// [`Operand`] list.
 ///
@@ -172,15 +179,34 @@ pub struct Instruction {
     /// The operation to perform.
     pub opcode: Opcode,
     /// Operands in the order specified by [`Opcode::operand_types`].
-    pub operands: Vec<Operand>,
+    ///
+    /// All current opcodes fit entirely in this inline buffer, which avoids a
+    /// heap allocation for every decoded instruction.
+    pub operands: InstructionOperands,
 }
 
 impl Instruction {
+    fn collect_operands(
+        opcode: Opcode,
+        operands: impl IntoIterator<Item = Operand>,
+    ) -> StatorResult<InstructionOperands> {
+        let mut collected = InstructionOperands::new();
+        for operand in operands {
+            collected.try_push(operand).map_err(|_| {
+                StatorError::Internal(format!(
+                    "{opcode:?} exceeds inline operand capacity of {INLINE_OPERAND_CAPACITY}"
+                ))
+            })?;
+        }
+        Ok(collected)
+    }
+
     /// Construct an instruction, verifying that the operand count matches the
     /// opcode's declared operand list.
     ///
     /// Returns an error if the wrong number of operands is supplied.
-    pub fn new(opcode: Opcode, operands: Vec<Operand>) -> StatorResult<Self> {
+    pub fn new(opcode: Opcode, operands: impl IntoIterator<Item = Operand>) -> StatorResult<Self> {
+        let operands = Self::collect_operands(opcode, operands)?;
         let expected = opcode.operand_types().len();
         if operands.len() != expected {
             return Err(StatorError::Internal(format!(
@@ -195,7 +221,9 @@ impl Instruction {
     ///
     /// Prefer [`Instruction::new`] unless you are certain the operand count
     /// is correct (e.g. inside the decoder).
-    pub fn new_unchecked(opcode: Opcode, operands: Vec<Operand>) -> Self {
+    pub fn new_unchecked(opcode: Opcode, operands: impl IntoIterator<Item = Operand>) -> Self {
+        let operands = Self::collect_operands(opcode, operands)
+            .expect("opcode operand metadata must fit in inline storage");
         Self { opcode, operands }
     }
 }
@@ -1172,9 +1200,15 @@ pub fn decode_with_byte_offsets(bytes: &[u8]) -> StatorResult<(Vec<Instruction>,
         }
 
         let op_types = opcode.operand_types();
-        let mut operands = Vec::with_capacity(op_types.len());
+        let mut operands = InstructionOperands::new();
         for &op_type in op_types {
-            operands.push(read_operand(bytes, &mut pos, op_type, width)?);
+            operands
+                .try_push(read_operand(bytes, &mut pos, op_type, width)?)
+                .map_err(|_| {
+                    StatorError::Internal(format!(
+                        "{opcode:?} exceeds inline operand capacity of {INLINE_OPERAND_CAPACITY}"
+                    ))
+                })?;
         }
         byte_offsets.push(instr_start);
         instructions.push(Instruction::new_unchecked(opcode, operands));

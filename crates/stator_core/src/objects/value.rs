@@ -121,7 +121,7 @@ pub struct GeneratorState {
     pub prototype: Option<JsValue>,
     /// Saved register file at the point of suspension (empty before the
     /// first [`crate::bytecode::bytecodes::Opcode::SuspendGenerator`]).
-    pub registers: Vec<JsValue>,
+    pub registers: crate::interpreter::RegisterFile,
     /// Original call arguments for the activation.
     pub call_args: Vec<JsValue>,
     /// Global environment used to execute/resume the activation.
@@ -144,7 +144,7 @@ impl GeneratorState {
         Rc::new(RefCell::new(Self {
             bytecode_array,
             prototype: None,
-            registers: Vec::new(),
+            registers: crate::interpreter::RegisterFile::new(),
             call_args: Vec::new(),
             global_env: None,
             resume_pc: 0,
