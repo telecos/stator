@@ -485,33 +485,65 @@ impl JsValue {
     }
 
     /// Returns `true` if this value is a boolean.
-    #[inline]
+    #[inline(always)]
     pub fn is_boolean(&self) -> bool {
-        matches!(self, Self::Boolean(_))
+        std::mem::discriminant(self) == std::mem::discriminant(&Self::Boolean(false))
     }
 
     /// Returns `true` if this value is a small integer ([`Smi`][JsValue::Smi]).
-    #[inline]
+    #[inline(always)]
     pub fn is_smi(&self) -> bool {
-        matches!(self, Self::Smi(_))
+        std::mem::discriminant(self) == std::mem::discriminant(&Self::Smi(0))
+    }
+
+    /// Extract the Smi payload without re-checking the discriminant.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure [`Self::is_smi`] returns `true`.
+    #[inline(always)]
+    pub unsafe fn as_smi_unchecked(&self) -> i32 {
+        match self {
+            Self::Smi(value) => *value,
+            _ => {
+                // SAFETY: Caller guarantees this value is a Smi.
+                unsafe { std::hint::unreachable_unchecked() }
+            }
+        }
     }
 
     /// Returns `true` if this value is a heap number ([`HeapNumber`][JsValue::HeapNumber]).
-    #[inline]
+    #[inline(always)]
     pub fn is_heap_number(&self) -> bool {
-        matches!(self, Self::HeapNumber(_))
+        std::mem::discriminant(self) == std::mem::discriminant(&Self::HeapNumber(0.0))
+    }
+
+    /// Extract the heap-number payload without re-checking the discriminant.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure [`Self::is_heap_number`] returns `true`.
+    #[inline(always)]
+    pub unsafe fn as_heap_number_unchecked(&self) -> f64 {
+        match self {
+            Self::HeapNumber(value) => *value,
+            _ => {
+                // SAFETY: Caller guarantees this value is a HeapNumber.
+                unsafe { std::hint::unreachable_unchecked() }
+            }
+        }
     }
 
     /// Returns `true` if this value is any numeric type (`Smi` or `HeapNumber`).
-    #[inline]
+    #[inline(always)]
     pub fn is_number(&self) -> bool {
-        matches!(self, Self::Smi(_) | Self::HeapNumber(_))
+        self.is_smi() || self.is_heap_number()
     }
 
     /// Returns `true` if this value is a string.
-    #[inline]
+    #[inline(always)]
     pub fn is_string(&self) -> bool {
-        matches!(self, Self::String(_))
+        std::mem::discriminant(self) == std::mem::discriminant(&Self::String(Rc::from("")))
     }
 
     /// Returns `true` if this value is a symbol.
@@ -599,17 +631,112 @@ impl JsValue {
     /// back to the derived [`Clone`] implementation.
     #[inline(always)]
     pub fn cheap_clone(&self) -> Self {
+        if self.is_smi()
+            || self.is_boolean()
+            || self.is_heap_number()
+            || std::mem::discriminant(self) == std::mem::discriminant(&Self::Undefined)
+            || std::mem::discriminant(self) == std::mem::discriminant(&Self::Null)
+            || std::mem::discriminant(self) == std::mem::discriminant(&Self::TheHole)
+            || std::mem::discriminant(self) == std::mem::discriminant(&Self::Symbol(0))
+            || std::mem::discriminant(self)
+                == std::mem::discriminant(&Self::Object(std::ptr::null_mut()))
+            || std::mem::discriminant(self) == std::mem::discriminant(&Self::BigInt(0))
+        {
+            // SAFETY: The checked variants are stack-only scalars or raw pointers with
+            // no reference-counted ownership to update, so bitwise copy is valid.
+            unsafe { self.stack_clone() }
+        } else {
+            self.clone()
+        }
+    }
+
+    /// Clone a value that is known to be stack-only.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure the value contains no reference-counted or otherwise
+    /// ownership-tracked heap allocations.
+    #[inline(always)]
+    pub unsafe fn stack_clone(&self) -> Self {
+        // SAFETY: Caller guarantees this value is stack-only, so bitwise copy
+        // preserves correctness without reference-count updates.
+        unsafe { std::ptr::read(self) }
+    }
+
+    /// Extract the boolean payload without re-checking the discriminant.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure [`Self::is_boolean`] returns `true`.
+    #[inline(always)]
+    pub unsafe fn as_boolean_unchecked(&self) -> bool {
         match self {
-            Self::Undefined => Self::Undefined,
-            Self::Null => Self::Null,
-            Self::TheHole => Self::TheHole,
-            Self::Boolean(b) => Self::Boolean(*b),
-            Self::Smi(n) => Self::Smi(*n),
-            Self::HeapNumber(n) => Self::HeapNumber(*n),
-            Self::Symbol(s) => Self::Symbol(*s),
-            Self::Object(p) => Self::Object(*p),
-            Self::BigInt(n) => Self::BigInt(*n),
-            other => other.clone(),
+            Self::Boolean(value) => *value,
+            _ => {
+                // SAFETY: Caller guarantees this value is a Boolean.
+                unsafe { std::hint::unreachable_unchecked() }
+            }
+        }
+    }
+
+    /// Convert a numeric value to `f64` without re-checking the discriminant.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure [`Self::is_number`] returns `true`.
+    #[inline(always)]
+    pub unsafe fn to_f64_unchecked(&self) -> f64 {
+        if self.is_smi() {
+            // SAFETY: The `is_smi` check above guarantees the discriminant.
+            unsafe { self.as_smi_unchecked() as f64 }
+        } else if self.is_heap_number() {
+            // SAFETY: The `is_heap_number` check above guarantees the discriminant.
+            unsafe { self.as_heap_number_unchecked() }
+        } else {
+            // SAFETY: Caller guarantees this value is numeric.
+            unsafe { std::hint::unreachable_unchecked() }
+        }
+    }
+
+    /// Try to add two Smi values, returning `None` for non-Smis or overflow.
+    #[inline(always)]
+    pub fn try_add_smi(a: &Self, b: &Self) -> Option<Self> {
+        if a.is_smi() && b.is_smi() {
+            // SAFETY: Both operands were checked with `is_smi` above.
+            let lhs = unsafe { a.as_smi_unchecked() };
+            // SAFETY: Both operands were checked with `is_smi` above.
+            let rhs = unsafe { b.as_smi_unchecked() };
+            lhs.checked_add(rhs).map(Self::Smi)
+        } else {
+            None
+        }
+    }
+
+    /// Try to subtract two Smi values, returning `None` for non-Smis or overflow.
+    #[inline(always)]
+    pub fn try_sub_smi(a: &Self, b: &Self) -> Option<Self> {
+        if a.is_smi() && b.is_smi() {
+            // SAFETY: Both operands were checked with `is_smi` above.
+            let lhs = unsafe { a.as_smi_unchecked() };
+            // SAFETY: Both operands were checked with `is_smi` above.
+            let rhs = unsafe { b.as_smi_unchecked() };
+            lhs.checked_sub(rhs).map(Self::Smi)
+        } else {
+            None
+        }
+    }
+
+    /// Try to multiply two Smi values, returning `None` for non-Smis or overflow.
+    #[inline(always)]
+    pub fn try_mul_smi(a: &Self, b: &Self) -> Option<Self> {
+        if a.is_smi() && b.is_smi() {
+            // SAFETY: Both operands were checked with `is_smi` above.
+            let lhs = unsafe { a.as_smi_unchecked() };
+            // SAFETY: Both operands were checked with `is_smi` above.
+            let rhs = unsafe { b.as_smi_unchecked() };
+            lhs.checked_mul(rhs).map(Self::Smi)
+        } else {
+            None
         }
     }
 }
@@ -1782,6 +1909,126 @@ mod tests {
     fn test_is_string() {
         assert!(JsValue::String("hello".to_string().into()).is_string());
         assert!(!JsValue::Smi(0).is_string());
+    }
+
+    #[test]
+    fn test_as_boolean_unchecked() {
+        let value = JsValue::Boolean(true);
+        // SAFETY: `value` is explicitly constructed as a Boolean.
+        assert!(unsafe { value.as_boolean_unchecked() });
+
+        let value = JsValue::Boolean(false);
+        // SAFETY: `value` is explicitly constructed as a Boolean.
+        assert!(!unsafe { value.as_boolean_unchecked() });
+    }
+
+    #[test]
+    fn test_as_smi_unchecked() {
+        let value = JsValue::Smi(i32::MIN);
+        // SAFETY: `value` is explicitly constructed as a Smi.
+        assert_eq!(unsafe { value.as_smi_unchecked() }, i32::MIN);
+
+        let value = JsValue::Smi(i32::MAX);
+        // SAFETY: `value` is explicitly constructed as a Smi.
+        assert_eq!(unsafe { value.as_smi_unchecked() }, i32::MAX);
+    }
+
+    #[test]
+    fn test_as_heap_number_unchecked() {
+        let value = JsValue::HeapNumber(f64::NEG_INFINITY);
+        // SAFETY: `value` is explicitly constructed as a HeapNumber.
+        assert_eq!(
+            unsafe { value.as_heap_number_unchecked() },
+            f64::NEG_INFINITY
+        );
+
+        let value = JsValue::HeapNumber(f64::NAN);
+        // SAFETY: `value` is explicitly constructed as a HeapNumber.
+        assert!(unsafe { value.as_heap_number_unchecked() }.is_nan());
+    }
+
+    #[test]
+    fn test_to_f64_unchecked() {
+        let smi = JsValue::Smi(-123);
+        // SAFETY: `smi` is explicitly constructed as a numeric value.
+        assert_eq!(unsafe { smi.to_f64_unchecked() }, -123.0);
+
+        let heap_number = JsValue::HeapNumber(3.5);
+        // SAFETY: `heap_number` is explicitly constructed as a numeric value.
+        assert_eq!(unsafe { heap_number.to_f64_unchecked() }, 3.5);
+    }
+
+    #[test]
+    fn test_stack_clone_for_stack_only_values() {
+        let smi = JsValue::Smi(7);
+        // SAFETY: `smi` is stack-only with no reference-counted ownership.
+        assert_eq!(unsafe { smi.stack_clone() }, JsValue::Smi(7));
+
+        let boolean = JsValue::Boolean(true);
+        // SAFETY: `boolean` is stack-only with no reference-counted ownership.
+        assert_eq!(unsafe { boolean.stack_clone() }, JsValue::Boolean(true));
+
+        let symbol = JsValue::Symbol(99);
+        // SAFETY: `symbol` is stack-only with no reference-counted ownership.
+        assert_eq!(unsafe { symbol.stack_clone() }, JsValue::Symbol(99));
+    }
+
+    #[test]
+    fn test_cheap_clone_for_scalar_variants() {
+        assert_eq!(JsValue::Smi(5).cheap_clone(), JsValue::Smi(5));
+        assert_eq!(
+            JsValue::HeapNumber(2.5).cheap_clone(),
+            JsValue::HeapNumber(2.5)
+        );
+        assert_eq!(JsValue::Boolean(true).cheap_clone(), JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_try_add_smi() {
+        assert_eq!(
+            JsValue::try_add_smi(&JsValue::Smi(20), &JsValue::Smi(22)),
+            Some(JsValue::Smi(42))
+        );
+        assert_eq!(
+            JsValue::try_add_smi(&JsValue::Smi(i32::MAX), &JsValue::Smi(1)),
+            None
+        );
+        assert_eq!(
+            JsValue::try_add_smi(&JsValue::Smi(1), &JsValue::HeapNumber(2.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_try_sub_smi() {
+        assert_eq!(
+            JsValue::try_sub_smi(&JsValue::Smi(50), &JsValue::Smi(8)),
+            Some(JsValue::Smi(42))
+        );
+        assert_eq!(
+            JsValue::try_sub_smi(&JsValue::Smi(i32::MIN), &JsValue::Smi(1)),
+            None
+        );
+        assert_eq!(
+            JsValue::try_sub_smi(&JsValue::HeapNumber(5.0), &JsValue::Smi(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn test_try_mul_smi() {
+        assert_eq!(
+            JsValue::try_mul_smi(&JsValue::Smi(6), &JsValue::Smi(7)),
+            Some(JsValue::Smi(42))
+        );
+        assert_eq!(
+            JsValue::try_mul_smi(&JsValue::Smi(i32::MAX), &JsValue::Smi(2)),
+            None
+        );
+        assert_eq!(
+            JsValue::try_mul_smi(&JsValue::Smi(6), &JsValue::Boolean(true)),
+            None
+        );
     }
 
     #[test]

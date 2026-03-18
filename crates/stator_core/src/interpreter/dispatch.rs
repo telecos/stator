@@ -489,10 +489,8 @@ fn handle_add(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     };
     let rhs = ctx.frame.read_reg(v)?;
     // SMI fast path: both operands are Smi → direct i32 add.
-    if let (JsValue::Smi(a), JsValue::Smi(b)) = (&ctx.frame.accumulator, rhs)
-        && let Some(result) = a.checked_add(*b)
-    {
-        ctx.frame.accumulator = JsValue::Smi(result);
+    if let Some(result) = JsValue::try_add_smi(&ctx.frame.accumulator, rhs) {
+        ctx.frame.accumulator = result;
         return Ok(DispatchAction::Continue);
     }
     // Fast path: String + String – skip to_js_string conversion.
@@ -519,10 +517,8 @@ fn handle_sub(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     };
     let rhs = ctx.frame.read_reg(v)?;
     // SMI fast path: both operands are Smi → direct i32 subtract.
-    if let (JsValue::Smi(a), JsValue::Smi(b)) = (&ctx.frame.accumulator, rhs)
-        && let Some(result) = a.checked_sub(*b)
-    {
-        ctx.frame.accumulator = JsValue::Smi(result);
+    if let Some(result) = JsValue::try_sub_smi(&ctx.frame.accumulator, rhs) {
+        ctx.frame.accumulator = result;
         return Ok(DispatchAction::Continue);
     }
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
@@ -543,10 +539,8 @@ fn handle_mul(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     };
     let rhs = ctx.frame.read_reg(v)?;
     // SMI fast path: both operands are Smi → direct i32 multiply.
-    if let (JsValue::Smi(a), JsValue::Smi(b)) = (&ctx.frame.accumulator, rhs)
-        && let Some(result) = a.checked_mul(*b)
-    {
-        ctx.frame.accumulator = JsValue::Smi(result);
+    if let Some(result) = JsValue::try_mul_smi(&ctx.frame.accumulator, rhs) {
+        ctx.frame.accumulator = result;
         return Ok(DispatchAction::Continue);
     }
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
