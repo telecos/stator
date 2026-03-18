@@ -1242,7 +1242,7 @@ pub(super) fn try_execute_best_jit(
 
 /// A monomorphic inline-cache entry that maps a [`PropertyMap::shape_id`] to a
 /// direct slot offset, enabling O(1) property access when the shape is stable.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct PropertyIc {
     /// The [`PropertyMap::shape_id`] observed when the cache was populated.
     pub cached_shape: u64,
@@ -1321,12 +1321,13 @@ pub struct InterpreterFrame {
     /// Lazily allocated on first write.
     pub poly_load_cache: Option<HashMap<u32, Vec<(usize, JsValue)>>>,
     /// Shape-based inline cache for named property loads.
-    /// Maps a feedback slot to a [`PropertyIc`] recording the last observed
-    /// `(shape_id, offset)` pair so that a repeat access on the same shape
-    /// can skip HashMap lookup entirely.
-    pub shape_load_ic: Option<HashMap<u32, PropertyIc>>,
+    /// Direct-indexed by feedback slot for O(1) access.  Each entry records
+    /// the last observed `(shape_id, offset)` pair so that a repeat access
+    /// on the same shape can skip property-map lookup entirely.
+    pub shape_load_ic: Vec<Option<PropertyIc>>,
     /// Shape-based inline cache for named property stores.
-    pub shape_store_ic: Option<HashMap<u32, PropertyIc>>,
+    /// Direct-indexed by feedback slot, mirroring `shape_load_ic`.
+    pub shape_store_ic: Vec<Option<PropertyIc>>,
     /// Pre-decoded string constants from the constant pool, keyed by index.
     /// Avoids repeated `String::clone()` from the constant pool.
     pub string_cache: Option<HashMap<u32, Rc<str>>>,
@@ -1368,6 +1369,7 @@ impl InterpreterFrame {
         }
         let mut global_map = HashMap::new();
         crate::builtins::install_globals::install_globals(&mut global_map);
+        let ic_slots = bytecode_array.feedback_metadata().slot_count() as usize;
         Self {
             bytecode_array,
             registers,
@@ -1386,8 +1388,8 @@ impl InterpreterFrame {
             new_target: JsValue::Undefined,
             mono_load_cache: None,
             poly_load_cache: None,
-            shape_load_ic: None,
-            shape_store_ic: None,
+            shape_load_ic: vec![None; ic_slots],
+            shape_store_ic: vec![None; ic_slots],
             string_cache: None,
             global_cache: [
                 (0, None, JsValue::Undefined),
@@ -1435,6 +1437,7 @@ impl InterpreterFrame {
         for (i, arg) in args.iter().cloned().enumerate().take(param_count) {
             registers[i] = arg;
         }
+        let ic_slots = bytecode_array.feedback_metadata().slot_count() as usize;
         Self {
             bytecode_array,
             registers,
@@ -1453,8 +1456,8 @@ impl InterpreterFrame {
             new_target: JsValue::Undefined,
             mono_load_cache: None,
             poly_load_cache: None,
-            shape_load_ic: None,
-            shape_store_ic: None,
+            shape_load_ic: vec![None; ic_slots],
+            shape_store_ic: vec![None; ic_slots],
             string_cache: None,
             global_cache: [
                 (0, None, JsValue::Undefined),
@@ -1788,6 +1791,7 @@ impl Interpreter {
         let mut registers = saved_registers;
         registers.resize(total, JsValue::Undefined);
 
+        let ic_slots = bytecode_array.feedback_metadata().slot_count() as usize;
         let mut frame = InterpreterFrame {
             bytecode_array,
             registers,
@@ -1810,8 +1814,8 @@ impl Interpreter {
             new_target: JsValue::Undefined,
             mono_load_cache: None,
             poly_load_cache: None,
-            shape_load_ic: None,
-            shape_store_ic: None,
+            shape_load_ic: vec![None; ic_slots],
+            shape_store_ic: vec![None; ic_slots],
             string_cache: None,
             global_cache: [
                 (0, None, JsValue::Undefined),

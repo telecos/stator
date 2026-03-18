@@ -1567,12 +1567,8 @@ fn handle_tail_call(
                     if let Some(cache) = &mut ctx.frame.poly_load_cache {
                         cache.clear();
                     }
-                    if let Some(cache) = &mut ctx.frame.shape_load_ic {
-                        cache.clear();
-                    }
-                    if let Some(cache) = &mut ctx.frame.shape_store_ic {
-                        cache.clear();
-                    }
+                    ctx.frame.shape_load_ic.fill(None);
+                    ctx.frame.shape_store_ic.fill(None);
                     return Ok(DispatchAction::TailCall);
                 }
             }
@@ -3022,8 +3018,8 @@ fn handle_lda_named_property(
         && let Some(ic) = ctx
             .frame
             .shape_load_ic
-            .as_ref()
-            .and_then(|cache| cache.get(&slot))
+            .get(slot as usize)
+            .and_then(|opt| opt.as_ref())
     {
         let pm = map.borrow();
         if pm.shape_id() == ic.cached_shape
@@ -3081,17 +3077,12 @@ fn handle_lda_named_property(
         let getter_key = format!("__get_{prop_name}__");
         if !pm.contains_key(&getter_key)
             && let Some(offset) = pm.offset_of(&prop_name)
+            && let Some(entry) = ctx.frame.shape_load_ic.get_mut(slot as usize)
         {
-            ctx.frame
-                .shape_load_ic
-                .get_or_insert_with(std::collections::HashMap::new)
-                .insert(
-                    slot,
-                    PropertyIc {
-                        cached_shape: pm.shape_id(),
-                        cached_offset: offset,
-                    },
-                );
+            *entry = Some(PropertyIc {
+                cached_shape: pm.shape_id(),
+                cached_offset: offset,
+            });
         }
     }
     // Update polymorphic cache (up to 8 entries per slot).
@@ -3175,8 +3166,8 @@ fn handle_sta_named_property(
                 && let Some(ic) = ctx
                     .frame
                     .shape_store_ic
-                    .as_ref()
-                    .and_then(|cache| cache.get(&slot))
+                    .get(slot as usize)
+                    .and_then(|opt| opt.as_ref())
             {
                 let pm = map.borrow();
                 if pm.shape_id() == ic.cached_shape {
@@ -3279,17 +3270,13 @@ fn handle_sta_named_property(
             // Populate shape store IC for future fast-path stores.
             if slot != u32::MAX {
                 let pm = map.borrow();
-                if let Some(offset) = pm.offset_of(&prop_name) {
-                    ctx.frame
-                        .shape_store_ic
-                        .get_or_insert_with(std::collections::HashMap::new)
-                        .insert(
-                            slot,
-                            PropertyIc {
-                                cached_shape: pm.shape_id(),
-                                cached_offset: offset,
-                            },
-                        );
+                if let Some(offset) = pm.offset_of(&prop_name)
+                    && let Some(entry) = ctx.frame.shape_store_ic.get_mut(slot as usize)
+                {
+                    *entry = Some(PropertyIc {
+                        cached_shape: pm.shape_id(),
+                        cached_offset: offset,
+                    });
                 }
             }
             // Invalidate value-based caches for this object.
