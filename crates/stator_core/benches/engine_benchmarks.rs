@@ -711,7 +711,6 @@ criterion_group! {
         bench_property_access_1k,
         bench_object_creation_1k,
         bench_array_push_sum_1k,
-        bench_function_calls_1k,
         bench_closure_counter_1k,
         bench_prototype_chain_1k,
         bench_sieve_primes_1k,
