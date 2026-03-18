@@ -983,7 +983,8 @@ mod tests {
             assert_eq!(instructions[1].opcode, Opcode::Star);
             assert_eq!(instructions[2].opcode, Opcode::Return);
             assert_eq!(offsets, expected_offsets.as_slice());
-            assert!(jump_targets.is_empty());
+            // No jump instructions in simple bytecode, so all entries are None.
+            assert!(jump_targets.iter().all(|t| t.is_none()));
         }
 
         // Second call returns the same cached Rc allocation.
