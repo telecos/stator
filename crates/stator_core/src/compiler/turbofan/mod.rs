@@ -257,9 +257,7 @@ impl TurbofanCompiledCode {
         &self,
         bytecode_array: crate::bytecode::bytecode_array::BytecodeArray,
         feedback: &mut FeedbackVector,
-        global_env: std::rc::Rc<
-            std::cell::RefCell<std::collections::HashMap<String, crate::objects::value::JsValue>>,
-        >,
+        global_env: std::rc::Rc<std::cell::RefCell<crate::interpreter::GlobalEnv>>,
     ) -> StatorResult<crate::objects::value::JsValue> {
         let fn_ptr = self.module.get_finalized_function(self.func_id);
 

@@ -43,7 +43,6 @@
 //! ```
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::io;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::rc::Rc;
@@ -109,7 +108,7 @@ pub struct CdpEvent {
 /// globals environment used by `Runtime.evaluate`.
 pub struct CdpSession {
     ws: WebSocket<TcpStream>,
-    globals: Rc<RefCell<HashMap<String, JsValue>>>,
+    globals: Rc<RefCell<crate::interpreter::GlobalEnv>>,
     profiler: CpuProfiler,
     /// Whether the `Console` domain is currently enabled for this session.
     console_enabled: bool,
@@ -122,7 +121,7 @@ impl CdpSession {
     fn new(ws: WebSocket<TcpStream>) -> Self {
         Self {
             ws,
-            globals: Rc::new(RefCell::new(HashMap::new())),
+            globals: Rc::new(RefCell::new(crate::interpreter::GlobalEnv::new())),
             profiler: CpuProfiler::new(),
             console_enabled: false,
             next_breakpoint_id: 1,
@@ -341,6 +340,7 @@ impl CdpSession {
     fn runtime_get_properties(&self, _params: &Value) -> StatorResult<Value> {
         let globals = self.globals.borrow();
         let descriptors: Vec<Value> = globals
+            .vars
             .iter()
             .map(|(name, value)| {
                 json!({
@@ -449,7 +449,7 @@ impl CdpSession {
     // ── HeapProfiler.takeHeapSnapshot ────────────────────────────────────────
 
     fn heap_profiler_take_snapshot(&mut self) -> StatorResult<Value> {
-        let snapshot = HeapSnapshotBuilder::build(&self.globals.borrow());
+        let snapshot = HeapSnapshotBuilder::build(&self.globals.borrow().vars);
         let chunk = snapshot.to_json();
         // Emit the snapshot as an addHeapSnapshotChunk event.
         let event = json!({

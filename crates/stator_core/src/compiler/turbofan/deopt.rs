@@ -28,7 +28,6 @@
 //!
 //! ```
 //! use std::cell::RefCell;
-//! use std::collections::HashMap;
 //! use std::rc::Rc;
 //!
 //! use stator_core::bytecode::bytecode_array::BytecodeArray;
@@ -37,6 +36,7 @@
 //! use stator_core::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, ValueNode};
 //! use stator_core::compiler::turbofan::compile;
 //! use stator_core::compiler::turbofan::deopt::{TurbofanFrameState, deoptimize_turbofan};
+//! use stator_core::interpreter::GlobalEnv;
 //! use stator_core::objects::value::JsValue;
 //!
 //! // Build a trivial graph: return the Int32 constant 0.
@@ -72,14 +72,13 @@
 //! // SAFETY: compiled code is produced by cranelift-jit from a well-formed graph.
 //! let result = unsafe {
 //!     compiled
-//!         .execute_with_deopt(ba, &mut fv, Rc::new(RefCell::new(HashMap::new())))
+//!         .execute_with_deopt(ba, &mut fv, Rc::new(RefCell::new(GlobalEnv::new())))
 //! }
 //! .expect("interpreter fallback must succeed");
 //! assert_eq!(result, JsValue::Smi(0));
 //! ```
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::bytecode::bytecode_array::BytecodeArray;
@@ -88,6 +87,7 @@ use crate::compiler::baseline::compiler::jit_to_jsvalue;
 use crate::compiler::maglev::deopt::{DeoptInfo, DeoptReason, FrameState, deoptimize};
 use crate::compiler::turbofan::DeoptPoint;
 use crate::error::{StatorError, StatorResult};
+use crate::interpreter::GlobalEnv;
 use crate::objects::value::JsValue;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -219,7 +219,7 @@ pub fn deoptimize_turbofan(
     feedback: &mut FeedbackVector,
     deopt_points: &[DeoptPoint],
     frame: TurbofanFrameState,
-    global_env: Rc<RefCell<HashMap<String, JsValue>>>,
+    global_env: Rc<RefCell<GlobalEnv>>,
 ) -> StatorResult<JsValue> {
     // ── Step 1: find the matching deopt point ────────────────────────────────
     let point = deopt_points
@@ -292,7 +292,7 @@ pub fn deoptimize_with_entry(
     feedback: &mut FeedbackVector,
     entry: &DeoptEntry,
     raw_regs: &[i64],
-    global_env: Rc<RefCell<HashMap<String, JsValue>>>,
+    global_env: Rc<RefCell<GlobalEnv>>,
 ) -> StatorResult<JsValue> {
     let registers: Vec<JsValue> = entry
         .register_map
@@ -366,8 +366,8 @@ mod tests {
     use crate::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, ValueNode};
     use crate::compiler::turbofan::compile;
 
-    fn empty_globals() -> Rc<RefCell<HashMap<String, JsValue>>> {
-        Rc::new(RefCell::new(HashMap::new()))
+    fn empty_globals() -> Rc<RefCell<GlobalEnv>> {
+        Rc::new(RefCell::new(GlobalEnv::new()))
     }
 
     /// Build a trivial bytecode array: `LdaSmi(value)`, `Return`.

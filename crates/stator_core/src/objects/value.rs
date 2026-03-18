@@ -31,7 +31,6 @@
 //!   `Vec<JsValue>` and is surfaced as [`JsValue::Iterator`].
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::builtins::error::JsError;
@@ -126,7 +125,7 @@ pub struct GeneratorState {
     /// Original call arguments for the activation.
     pub call_args: Vec<JsValue>,
     /// Global environment used to execute/resume the activation.
-    pub global_env: Option<Rc<RefCell<HashMap<String, JsValue>>>>,
+    pub global_env: Option<Rc<RefCell<crate::interpreter::GlobalEnv>>>,
     /// Instruction index to resume from; `0` = start of function body.
     pub resume_pc: usize,
     /// Current lifecycle status.

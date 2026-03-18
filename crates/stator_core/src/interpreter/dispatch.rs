@@ -18,7 +18,7 @@ use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::PropertyMap;
 
 use super::{
-    ACTIVE_DEBUGGER, CallArgs, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD,
+    ACTIVE_DEBUGGER, CallArgs, GlobalEnv, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD,
     OSR_LOOP_THRESHOLD, PropertyIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow,
     collect_args, concat_rc_strs, constant_pool_jump_delta, constant_to_value,
     construct_builtin_result, decode_string_constant, dispatch_call_property, dispatch_call_value,
@@ -2508,9 +2508,7 @@ fn construct_class_from_plain_object(
 
     // Helper closure: run the field initializer on the given `this` value.
     let new_target = callee_frame.new_target.clone();
-    let run_field_init = |env: &Rc<RefCell<std::collections::HashMap<String, JsValue>>>,
-                          this: &JsValue|
-     -> StatorResult<()> {
+    let run_field_init = |env: &Rc<RefCell<GlobalEnv>>, this: &JsValue| -> StatorResult<()> {
         if let Some(JsValue::Function(init_ba)) =
             class_map.borrow().get(".class_field_initializer").cloned()
         {
@@ -6604,12 +6602,15 @@ fn handle_call_direct_eval(
         };
         let binding_registers = ctx.frame.bytecode_array.binding_registers().clone();
         let original_global_names: HashSet<String> =
-            ctx.frame.global_env.borrow().keys().cloned().collect();
-        let mut eval_bindings = ctx.frame.global_env.borrow().clone();
+            ctx.frame.global_env.borrow().vars.keys().cloned().collect();
+        let mut eval_bindings = ctx.frame.global_env.borrow().vars.clone();
         for (name, reg) in &binding_registers {
             eval_bindings.insert(name.clone(), ctx.frame.read_reg(*reg as u32)?.clone());
         }
-        let eval_env = Rc::new(RefCell::new(eval_bindings));
+        let eval_env = Rc::new(RefCell::new(GlobalEnv {
+            vars: eval_bindings,
+            generation: 0,
+        }));
         let (result, final_env, is_strict) =
             crate::builtins::global::global_eval_direct_with_scope_capture(
                 &source,
@@ -6624,7 +6625,7 @@ fn handle_call_direct_eval(
         }
         {
             let mut globals = ctx.frame.global_env.borrow_mut();
-            for (name, value) in final_bindings.iter() {
+            for (name, value) in final_bindings.vars.iter() {
                 if binding_registers.contains_key(name) {
                     continue;
                 }

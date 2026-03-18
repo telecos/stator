@@ -15,7 +15,6 @@
 //!
 //! ```
 //! use std::cell::RefCell;
-//! use std::collections::HashMap;
 //! use std::rc::Rc;
 //!
 //! use stator_core::bytecode::bytecode_array::BytecodeArray;
@@ -24,6 +23,7 @@
 //!     FeedbackMetadata, FeedbackSlotKind, FeedbackVector, InlineCacheState,
 //! };
 //! use stator_core::compiler::maglev::deopt::{DeoptInfo, DeoptReason, FrameState, deoptimize};
+//! use stator_core::interpreter::GlobalEnv;
 //! use stator_core::objects::value::JsValue;
 //!
 //! // Bytecode: LdaSmi 0, Return  (a trivial function that returns 0).
@@ -44,20 +44,19 @@
 //!     },
 //! };
 //!
-//! let result = deoptimize(ba, &mut fv, info, Rc::new(RefCell::new(HashMap::new())))
+//! let result = deoptimize(ba, &mut fv, info, Rc::new(RefCell::new(GlobalEnv::new())))
 //!     .expect("interpreter should succeed");
 //! assert_eq!(result, JsValue::Smi(0));
 //! ```
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::bytecode::bytecode_array::BytecodeArray;
 use crate::bytecode::bytecodes::decode_with_byte_offsets;
 use crate::bytecode::feedback::{FeedbackSlotKind, FeedbackVector, InlineCacheState};
 use crate::error::StatorResult;
-use crate::interpreter::{Interpreter, InterpreterFrame};
+use crate::interpreter::{GlobalEnv, Interpreter, InterpreterFrame};
 use crate::objects::value::JsValue;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -168,7 +167,7 @@ pub fn deoptimize(
     bytecode_array: BytecodeArray,
     feedback: &mut FeedbackVector,
     deopt_info: DeoptInfo,
-    global_env: Rc<RefCell<HashMap<String, JsValue>>>,
+    global_env: Rc<RefCell<GlobalEnv>>,
 ) -> StatorResult<JsValue> {
     // ── Step 1: update the feedback vector ──────────────────────────────────
     //
@@ -280,8 +279,8 @@ mod tests {
         BytecodeArray::new(bytes, vec![], 1, 2, vec![], feedback_meta, vec![])
     }
 
-    fn empty_globals() -> Rc<RefCell<HashMap<String, JsValue>>> {
-        Rc::new(RefCell::new(HashMap::new()))
+    fn empty_globals() -> Rc<RefCell<GlobalEnv>> {
+        Rc::new(RefCell::new(GlobalEnv::new()))
     }
 
     // ── Unit tests ────────────────────────────────────────────────────────────

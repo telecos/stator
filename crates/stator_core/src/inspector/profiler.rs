@@ -566,7 +566,7 @@ mod tests {
         let mut frame = InterpreterFrame::new_with_globals(
             bytecodes,
             vec![],
-            Rc::new(RefCell::new(std::collections::HashMap::new())),
+            Rc::new(RefCell::new(crate::interpreter::GlobalEnv::new())),
         );
         Interpreter::run(&mut frame).expect("run");
 
