@@ -1301,6 +1301,16 @@ fn main() {
 }
 
 fn main_inner() {
+    // Diagnostic: report stacker's view of remaining stack at startup.
+    match stacker::remaining_stack() {
+        Some(remaining) => eprintln!(
+            "stator_test262: remaining stack at startup: {} bytes ({:.1} MiB)",
+            remaining,
+            remaining as f64 / (1024.0 * 1024.0)
+        ),
+        None => eprintln!("stator_test262: remaining_stack() returned None (unknown platform)"),
+    }
+
     let cli = parse_args();
 
     let base_dir = match cli.test262_dir {

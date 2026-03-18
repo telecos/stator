@@ -59,7 +59,10 @@ jobs:
         # - Stack overflow from deep parser/interpreter recursion
         # Memory: 5 GB vmem cap prevents OOM-killing the runner.
         run: |
-          ulimit -v 5242880   # 5 GB virtual memory cap
+          echo "Default stack limit: $(ulimit -s) KB"
+          ulimit -s 524288   # 512 MB main thread stack
+          ulimit -v 5242880  # 5 GB virtual memory cap
+          echo "Active stack limit: $(ulimit -s) KB"
           set +e
           ./target/release/stator_test262 \
             --test262-dir test262 \
