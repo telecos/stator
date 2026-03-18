@@ -403,8 +403,7 @@ fn handle_add(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         ctx.frame.accumulator = concat_rc_strs(a, b);
         return Ok(DispatchAction::Continue);
     }
-    let rhs = rhs.cheap_clone();
-    ctx.frame.accumulator = js_add(&ctx.frame.accumulator, &rhs)?;
+    ctx.frame.accumulator = js_add(&ctx.frame.accumulator, rhs)?;
     Ok(DispatchAction::Continue)
 }
 
@@ -424,10 +423,9 @@ fn handle_sub(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         };
         return Ok(DispatchAction::Continue);
     }
-    let rhs = rhs.cheap_clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
-        let r = to_bigint(&rhs)?;
+        let r = to_bigint(rhs)?;
         ctx.frame.accumulator = JsValue::BigInt(l.wrapping_sub(r));
     } else {
         let lhs_n = ctx.frame.accumulator.to_number()?;
@@ -452,10 +450,9 @@ fn handle_mul(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         };
         return Ok(DispatchAction::Continue);
     }
-    let rhs = rhs.cheap_clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
-        let r = to_bigint(&rhs)?;
+        let r = to_bigint(rhs)?;
         ctx.frame.accumulator = JsValue::BigInt(l.wrapping_mul(r));
     } else {
         let lhs_n = ctx.frame.accumulator.to_number()?;
@@ -477,10 +474,9 @@ fn handle_div(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         ctx.frame.accumulator = number_to_jsvalue(a as f64 / *b as f64);
         return Ok(DispatchAction::Continue);
     }
-    let rhs = rhs.cheap_clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
-        let r = to_bigint(&rhs)?;
+        let r = to_bigint(rhs)?;
         if r == 0 {
             return Err(StatorError::RangeError("Division by zero".to_string()));
         }
@@ -505,10 +501,9 @@ fn handle_mod(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         ctx.frame.accumulator = number_to_jsvalue(a as f64 % *b as f64);
         return Ok(DispatchAction::Continue);
     }
-    let rhs = rhs.cheap_clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
-        let r = to_bigint(&rhs)?;
+        let r = to_bigint(rhs)?;
         if r == 0 {
             return Err(StatorError::RangeError("Division by zero".to_string()));
         }
@@ -533,10 +528,9 @@ fn handle_exp(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         ctx.frame.accumulator = number_to_jsvalue((a as f64).powf(*b as f64));
         return Ok(DispatchAction::Continue);
     }
-    let rhs = rhs.cheap_clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
-        let r = to_bigint(&rhs)?;
+        let r = to_bigint(rhs)?;
         if r < 0 {
             return Err(StatorError::RangeError(
                 "Exponent must be positive".to_string(),
@@ -566,10 +560,9 @@ fn handle_bitwise_or(
         ctx.frame.accumulator = JsValue::Smi(a | *b);
         return Ok(DispatchAction::Continue);
     }
-    let rhs = rhs.cheap_clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
-        let r = to_bigint(&rhs)?;
+        let r = to_bigint(rhs)?;
         ctx.frame.accumulator = JsValue::BigInt(l | r);
     } else {
         let lhs = ctx.frame.accumulator.to_int32()?;
@@ -594,10 +587,9 @@ fn handle_bitwise_xor(
         ctx.frame.accumulator = JsValue::Smi(a ^ *b);
         return Ok(DispatchAction::Continue);
     }
-    let rhs = rhs.cheap_clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
-        let r = to_bigint(&rhs)?;
+        let r = to_bigint(rhs)?;
         ctx.frame.accumulator = JsValue::BigInt(l ^ r);
     } else {
         let lhs = ctx.frame.accumulator.to_int32()?;
@@ -622,10 +614,9 @@ fn handle_bitwise_and(
         ctx.frame.accumulator = JsValue::Smi(a & *b);
         return Ok(DispatchAction::Continue);
     }
-    let rhs = rhs.cheap_clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
-        let r = to_bigint(&rhs)?;
+        let r = to_bigint(rhs)?;
         ctx.frame.accumulator = JsValue::BigInt(l & r);
     } else {
         let lhs = ctx.frame.accumulator.to_int32()?;
@@ -651,10 +642,9 @@ fn handle_shift_left(
         ctx.frame.accumulator = JsValue::Smi(a << shift);
         return Ok(DispatchAction::Continue);
     }
-    let rhs = rhs.cheap_clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
-        let r = to_bigint(&rhs)?;
+        let r = to_bigint(rhs)?;
         ctx.frame.accumulator = JsValue::BigInt(l.wrapping_shl(r as u32));
     } else {
         let lhs = ctx.frame.accumulator.to_int32()?;
@@ -680,10 +670,9 @@ fn handle_shift_right(
         ctx.frame.accumulator = JsValue::Smi(a >> shift);
         return Ok(DispatchAction::Continue);
     }
-    let rhs = rhs.cheap_clone();
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
-        let r = to_bigint(&rhs)?;
+        let r = to_bigint(rhs)?;
         ctx.frame.accumulator = JsValue::BigInt(l.wrapping_shr(r as u32));
     } else {
         let lhs = ctx.frame.accumulator.to_int32()?;
@@ -711,7 +700,6 @@ fn handle_shift_right_logical(
         ctx.frame.accumulator = number_to_jsvalue(result as f64);
         return Ok(DispatchAction::Continue);
     }
-    let rhs = rhs.cheap_clone();
     let lhs = ctx.frame.accumulator.to_int32()? as u32;
     let shift = rhs.to_uint32()? & 0x1f;
     let result = lhs >> shift;
@@ -961,8 +949,8 @@ fn handle_test_equal(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("TestEqual", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.cheap_clone();
-    let result = abstract_eq(&ctx.frame.accumulator, &rhs);
+    let rhs = ctx.frame.read_reg(v)?;
+    let result = abstract_eq(&ctx.frame.accumulator, rhs);
     ctx.frame.accumulator = JsValue::Boolean(result);
     Ok(DispatchAction::Continue)
 }
@@ -974,8 +962,8 @@ fn handle_test_not_equal(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("TestNotEqual", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.cheap_clone();
-    let result = !abstract_eq(&ctx.frame.accumulator, &rhs);
+    let rhs = ctx.frame.read_reg(v)?;
+    let result = !abstract_eq(&ctx.frame.accumulator, rhs);
     ctx.frame.accumulator = JsValue::Boolean(result);
     Ok(DispatchAction::Continue)
 }
@@ -995,8 +983,7 @@ fn handle_test_equal_strict(
         ctx.frame.accumulator = JsValue::Boolean(a == *b);
         return Ok(DispatchAction::Continue);
     }
-    let rhs = rhs.clone();
-    let result = strict_eq(&ctx.frame.accumulator, &rhs);
+    let result = strict_eq(&ctx.frame.accumulator, rhs);
     ctx.frame.accumulator = JsValue::Boolean(result);
     Ok(DispatchAction::Continue)
 }
@@ -1016,8 +1003,7 @@ fn handle_test_less_than(
         ctx.frame.accumulator = JsValue::Boolean(a < *b);
         return Ok(DispatchAction::Continue);
     }
-    let rhs = rhs.clone();
-    let result = js_less_than(&ctx.frame.accumulator, &rhs)?;
+    let result = js_less_than(&ctx.frame.accumulator, rhs)?;
     ctx.frame.accumulator = JsValue::Boolean(result);
     Ok(DispatchAction::Continue)
 }
@@ -1037,9 +1023,8 @@ fn handle_test_greater_than(
         ctx.frame.accumulator = JsValue::Boolean(a > *b);
         return Ok(DispatchAction::Continue);
     }
-    let rhs = rhs.clone();
     // §7.2.14: a > b ≡ IsLessThan(b, a, false) — evaluation order: right first
-    let result = JsValue::abstract_relational_comparison(&rhs, &ctx.frame.accumulator, false)?
+    let result = JsValue::abstract_relational_comparison(rhs, &ctx.frame.accumulator, false)?
         .unwrap_or(false);
     ctx.frame.accumulator = JsValue::Boolean(result);
     Ok(DispatchAction::Continue)
@@ -1060,10 +1045,9 @@ fn handle_test_less_than_or_equal(
         ctx.frame.accumulator = JsValue::Boolean(a <= *b);
         return Ok(DispatchAction::Continue);
     }
-    let rhs = rhs.clone();
     // §7.2.14: a <= b ≡ !(IsLessThan(b, a, false))
     // If result is undefined (NaN), return false (not !false=true).
-    let result = JsValue::abstract_relational_comparison(&rhs, &ctx.frame.accumulator, false)?
+    let result = JsValue::abstract_relational_comparison(rhs, &ctx.frame.accumulator, false)?
         .map(|r| !r)
         .unwrap_or(false);
     ctx.frame.accumulator = JsValue::Boolean(result);
@@ -1085,10 +1069,9 @@ fn handle_test_greater_than_or_equal(
         ctx.frame.accumulator = JsValue::Boolean(a >= *b);
         return Ok(DispatchAction::Continue);
     }
-    let rhs = rhs.clone();
     // §7.2.14: a >= b ≡ !(IsLessThan(a, b, true))
     // If result is undefined (NaN), return false (not !false=true).
-    let result = JsValue::abstract_relational_comparison(&ctx.frame.accumulator, &rhs, true)?
+    let result = JsValue::abstract_relational_comparison(&ctx.frame.accumulator, rhs, true)?
         .map(|r| !r)
         .unwrap_or(false);
     ctx.frame.accumulator = JsValue::Boolean(result);
@@ -5894,8 +5877,8 @@ fn handle_test_reference_equal(
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("TestReferenceEqual", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
-    let result = strict_eq(&ctx.frame.accumulator, &rhs);
+    let rhs = ctx.frame.read_reg(v)?;
+    let result = strict_eq(&ctx.frame.accumulator, rhs);
     ctx.frame.accumulator = JsValue::Boolean(result);
     Ok(DispatchAction::Continue)
 }

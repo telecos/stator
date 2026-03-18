@@ -1436,6 +1436,22 @@ impl InterpreterFrame {
         Ok(&self.registers[idx])
     }
 
+    /// Read a register value by reference, avoiding clone overhead.
+    ///
+    /// Use this in dispatch handlers that only need to inspect the value
+    /// (comparisons, type checks, arithmetic on Smi values).
+    #[inline(always)]
+    pub fn read_reg_ref(&self, reg: u32) -> StatorResult<&JsValue> {
+        let idx = self.reg_index(reg)?;
+        Ok(&self.registers[idx])
+    }
+
+    /// Return a reference to the accumulator value.
+    #[inline(always)]
+    pub fn accumulator_ref(&self) -> &JsValue {
+        &self.accumulator
+    }
+
     /// Write `value` to the register encoded by operand value `v`.
     #[inline(always)]
     fn write_reg(&mut self, v: u32, value: JsValue) -> StatorResult<()> {
