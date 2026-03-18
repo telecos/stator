@@ -865,10 +865,12 @@ fn execute_source(
     harness_prefix: &str,
     globals_map: HashMap<String, JsValue>,
 ) -> Result<JsValue, StatorError> {
-    // Each test execution gets a generous stack guarantee so that
-    // pathological inputs (deep regex, deep eval chains) cannot
-    // overflow the main thread stack across 53k+ tests.
-    stacker::maybe_grow(512 * 1024, 4 * 1024 * 1024, || {
+    // Each test runs on a dedicated 256 MiB heap-backed stacker segment.
+    // With the default 8 MiB main thread stack and an 8 MiB red_zone,
+    // stacker always allocates a fresh segment (remaining ≤ red_zone).
+    // This isolates each test's recursion depth from the main stack,
+    // preventing both cross-test stack accumulation and runner OOM.
+    stacker::maybe_grow(8 * 1024 * 1024, 256 * 1024 * 1024, || {
         execute_source_inner(source, harness_prefix, globals_map)
     })
 }
