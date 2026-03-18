@@ -2822,16 +2822,19 @@ pub(super) fn dispatch_call(
                         Interpreter::run(&mut callee_frame)
                     });
                     pop_call_frame();
+                    frame.global_cache_invalidate();
                     frame.accumulator = result?;
                 }
             }
         }
         JsValue::NativeFunction(f) => {
             frame.accumulator = f(args)?;
+            frame.global_cache_invalidate();
         }
         JsValue::PlainObject(map) => {
             if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
                 frame.accumulator = f(args)?;
+                frame.global_cache_invalidate();
             } else {
                 return Err(StatorError::TypeError(
                     "CallProperty: callee is not a function (got PlainObject)".to_string(),
@@ -2900,16 +2903,19 @@ pub(super) fn dispatch_call_property(
                         Interpreter::run(&mut callee_frame)
                     });
                     pop_call_frame();
+                    frame.global_cache_invalidate();
                     frame.accumulator = result?;
                 }
             }
         }
         JsValue::NativeFunction(f) => {
             frame.accumulator = f(args)?;
+            frame.global_cache_invalidate();
         }
         JsValue::PlainObject(map) => {
             if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
                 frame.accumulator = f(args)?;
+                frame.global_cache_invalidate();
             } else {
                 return Err(StatorError::TypeError(
                     "CallProperty: callee is not a function (got PlainObject)".to_string(),

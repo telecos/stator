@@ -696,6 +696,8 @@ mod tests {
 
     #[test]
     fn test_stack_trace_limit() {
+        // Clear any residual frames from other parallel tests.
+        clear_call_stack();
         let old_limit = get_stack_trace_limit();
         set_stack_trace_limit(2);
 

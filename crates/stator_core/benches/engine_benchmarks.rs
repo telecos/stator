@@ -536,12 +536,12 @@ fn bench_function_calls_1k(c: &mut Criterion) {
     let source = r#"
         function add(a, b) { return a + b; }
         var sum = 0;
-        for (var i = 0; i < 100; i++) {
+        for (var i = 0; i < 10; i++) {
             sum = add(sum, i);
         }
         sum;
     "#;
-    c.bench_function("function_calls_100", |b| {
+    c.bench_function("function_calls_10", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
         });
