@@ -63,8 +63,7 @@ jobs:
           set +e
           ./target/release/stator_test262 \
             --test262-dir test262 \
-            --threshold 25.0 \
-            --verbose
+            --threshold 25.0
           rc=$?
           if [ $rc -eq 134 ] || [ $rc -eq 137 ] || [ $rc -eq 139 ]; then
             echo "::warning::Test262 runner crashed (exit $rc) — stack overflow or OOM"
