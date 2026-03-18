@@ -382,14 +382,11 @@ fn handle_add(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         return Err(err_bad_operand("Add", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
-    // Fast path: Smi + Smi → Smi (no allocation, overflow → HeapNumber)
-    if let JsValue::Smi(a) = ctx.frame.accumulator
-        && let JsValue::Smi(b) = rhs
+    // SMI fast path: both operands are Smi → direct i32 add.
+    if let (JsValue::Smi(a), JsValue::Smi(b)) = (&ctx.frame.accumulator, rhs)
+        && let Some(result) = a.checked_add(*b)
     {
-        ctx.frame.accumulator = match a.checked_add(*b) {
-            Some(r) => JsValue::Smi(r),
-            None => JsValue::HeapNumber(a as f64 + *b as f64),
-        };
+        ctx.frame.accumulator = JsValue::Smi(result);
         return Ok(DispatchAction::Continue);
     }
     // Fast path: String + String – skip to_js_string conversion.
@@ -415,14 +412,11 @@ fn handle_sub(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         return Err(err_bad_operand("Sub", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
-    // Fast path: Smi - Smi → Smi
-    if let JsValue::Smi(a) = ctx.frame.accumulator
-        && let JsValue::Smi(b) = rhs
+    // SMI fast path: both operands are Smi → direct i32 subtract.
+    if let (JsValue::Smi(a), JsValue::Smi(b)) = (&ctx.frame.accumulator, rhs)
+        && let Some(result) = a.checked_sub(*b)
     {
-        ctx.frame.accumulator = match a.checked_sub(*b) {
-            Some(r) => JsValue::Smi(r),
-            None => JsValue::HeapNumber(a as f64 - *b as f64),
-        };
+        ctx.frame.accumulator = JsValue::Smi(result);
         return Ok(DispatchAction::Continue);
     }
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
@@ -442,14 +436,11 @@ fn handle_mul(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         return Err(err_bad_operand("Mul", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
-    // Fast path: Smi * Smi → Smi
-    if let JsValue::Smi(a) = ctx.frame.accumulator
-        && let JsValue::Smi(b) = rhs
+    // SMI fast path: both operands are Smi → direct i32 multiply.
+    if let (JsValue::Smi(a), JsValue::Smi(b)) = (&ctx.frame.accumulator, rhs)
+        && let Some(result) = a.checked_mul(*b)
     {
-        ctx.frame.accumulator = match a.checked_mul(*b) {
-            Some(r) => JsValue::Smi(r),
-            None => JsValue::HeapNumber(a as f64 * *b as f64),
-        };
+        ctx.frame.accumulator = JsValue::Smi(result);
         return Ok(DispatchAction::Continue);
     }
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
@@ -469,11 +460,12 @@ fn handle_div(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         return Err(err_bad_operand("Div", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
-    // Fast path: Smi / Smi → HeapNumber (JS division always yields float)
-    if let JsValue::Smi(a) = ctx.frame.accumulator
-        && let JsValue::Smi(b) = rhs
+    // SMI fast path: exact non-zero integer division stays in Smi.
+    if let (JsValue::Smi(a), JsValue::Smi(b)) = (&ctx.frame.accumulator, rhs)
+        && *b != 0
+        && *a % *b == 0
     {
-        ctx.frame.accumulator = number_to_jsvalue(a as f64 / *b as f64);
+        ctx.frame.accumulator = JsValue::Smi(*a / *b);
         return Ok(DispatchAction::Continue);
     }
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
@@ -714,12 +706,11 @@ fn handle_add_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
     let Operand::Immediate(imm) = instr.operands[0] else {
         return Err(err_bad_operand("AddSmi", 0));
     };
-    // Fast path: Smi + immediate
-    if let JsValue::Smi(n) = ctx.frame.accumulator {
-        ctx.frame.accumulator = match n.checked_add(imm) {
-            Some(r) => JsValue::Smi(r),
-            None => JsValue::HeapNumber(n as f64 + imm as f64),
-        };
+    // SMI fast path: accumulator + immediate Smi.
+    if let JsValue::Smi(n) = &ctx.frame.accumulator
+        && let Some(result) = n.checked_add(imm)
+    {
+        ctx.frame.accumulator = JsValue::Smi(result);
         return Ok(DispatchAction::Continue);
     }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
@@ -736,12 +727,11 @@ fn handle_sub_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
     let Operand::Immediate(imm) = instr.operands[0] else {
         return Err(err_bad_operand("SubSmi", 0));
     };
-    // Fast path: Smi - immediate
-    if let JsValue::Smi(n) = ctx.frame.accumulator {
-        ctx.frame.accumulator = match n.checked_sub(imm) {
-            Some(r) => JsValue::Smi(r),
-            None => JsValue::HeapNumber(n as f64 - imm as f64),
-        };
+    // SMI fast path: accumulator - immediate Smi.
+    if let JsValue::Smi(n) = &ctx.frame.accumulator
+        && let Some(result) = n.checked_sub(imm)
+    {
+        ctx.frame.accumulator = JsValue::Smi(result);
         return Ok(DispatchAction::Continue);
     }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
@@ -757,12 +747,11 @@ fn handle_mul_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
     let Operand::Immediate(imm) = instr.operands[0] else {
         return Err(err_bad_operand("MulSmi", 0));
     };
-    // Fast path: Smi * immediate
-    if let JsValue::Smi(n) = ctx.frame.accumulator {
-        ctx.frame.accumulator = match n.checked_mul(imm) {
-            Some(r) => JsValue::Smi(r),
-            None => JsValue::HeapNumber(n as f64 * imm as f64),
-        };
+    // SMI fast path: accumulator * immediate Smi.
+    if let JsValue::Smi(n) = &ctx.frame.accumulator
+        && let Some(result) = n.checked_mul(imm)
+    {
+        ctx.frame.accumulator = JsValue::Smi(result);
         return Ok(DispatchAction::Continue);
     }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
@@ -831,6 +820,10 @@ fn handle_bitwise_or_smi(
     let Operand::Immediate(imm) = instr.operands[0] else {
         return Err(err_bad_operand("BitwiseOrSmi", 0));
     };
+    if let JsValue::Smi(lhs) = &ctx.frame.accumulator {
+        ctx.frame.accumulator = JsValue::Smi(*lhs | imm);
+        return Ok(DispatchAction::Continue);
+    }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
         ctx.frame.accumulator = JsValue::BigInt(n | i128::from(imm));
     } else {
@@ -847,6 +840,10 @@ fn handle_bitwise_xor_smi(
     let Operand::Immediate(imm) = instr.operands[0] else {
         return Err(err_bad_operand("BitwiseXorSmi", 0));
     };
+    if let JsValue::Smi(lhs) = &ctx.frame.accumulator {
+        ctx.frame.accumulator = JsValue::Smi(*lhs ^ imm);
+        return Ok(DispatchAction::Continue);
+    }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
         ctx.frame.accumulator = JsValue::BigInt(n ^ i128::from(imm));
     } else {
@@ -863,6 +860,10 @@ fn handle_bitwise_and_smi(
     let Operand::Immediate(imm) = instr.operands[0] else {
         return Err(err_bad_operand("BitwiseAndSmi", 0));
     };
+    if let JsValue::Smi(lhs) = &ctx.frame.accumulator {
+        ctx.frame.accumulator = JsValue::Smi(*lhs & imm);
+        return Ok(DispatchAction::Continue);
+    }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
         ctx.frame.accumulator = JsValue::BigInt(n & i128::from(imm));
     } else {
@@ -879,6 +880,11 @@ fn handle_shift_left_smi(
     let Operand::Immediate(imm) = instr.operands[0] else {
         return Err(err_bad_operand("ShiftLeftSmi", 0));
     };
+    if let JsValue::Smi(lhs) = &ctx.frame.accumulator {
+        let shift = (imm as u32) & 0x1f;
+        ctx.frame.accumulator = JsValue::Smi(*lhs << shift);
+        return Ok(DispatchAction::Continue);
+    }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
         ctx.frame.accumulator = JsValue::BigInt(n.wrapping_shl(imm as u32));
     } else {
@@ -896,6 +902,11 @@ fn handle_shift_right_smi(
     let Operand::Immediate(imm) = instr.operands[0] else {
         return Err(err_bad_operand("ShiftRightSmi", 0));
     };
+    if let JsValue::Smi(lhs) = &ctx.frame.accumulator {
+        let shift = (imm as u32) & 0x1f;
+        ctx.frame.accumulator = JsValue::Smi(*lhs >> shift);
+        return Ok(DispatchAction::Continue);
+    }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
         ctx.frame.accumulator = JsValue::BigInt(n.wrapping_shr(imm as u32));
     } else {
@@ -913,6 +924,12 @@ fn handle_shift_right_logical_smi(
     let Operand::Immediate(imm) = instr.operands[0] else {
         return Err(err_bad_operand("ShiftRightLogicalSmi", 0));
     };
+    if let JsValue::Smi(lhs) = &ctx.frame.accumulator {
+        let shift = (imm as u32) & 0x1f;
+        let result = (*lhs as u32) >> shift;
+        ctx.frame.accumulator = number_to_jsvalue(result as f64);
+        return Ok(DispatchAction::Continue);
+    }
     let lhs = ctx.frame.accumulator.to_int32()? as u32;
     let shift = (imm as u32) & 0x1f;
     let result = lhs >> shift;
