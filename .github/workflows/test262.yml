@@ -51,17 +51,15 @@ jobs:
         run: cargo build --package stator_test262 --release
 
       - name: Run Test262 suite
-        # Stack strategy: set a SMALL main thread stack (4 MiB) so that
-        # stacker::maybe_grow(8 MiB red_zone, 256 MiB segment) always triggers.
-        # If the runner crashes (stack overflow, SIGSEGV), the restart loop
-        # skips the crashing test and continues from the next one.
+        # Stack strategy: use a LARGE main thread stack (512 MiB) so the
+        # interpreter never overflows for normal tests.  The crash-restart
+        # loop handles the rare test that manages to overflow even this.
         run: |
-          ulimit -s 4096     # 4 MB — forces stacker::maybe_grow to allocate heap segments
-          ulimit -v 5242880  # 5 GB virtual memory cap
+          ulimit -s 524288   # 512 MiB main thread stack
           PROGRESS_FILE=$(mktemp)
           SKIP=0
           CRASHES=0
-          MAX_RESTARTS=500
+          MAX_RESTARTS=50
           for attempt in $(seq 1 $MAX_RESTARTS); do
             set +e
             ./target/release/stator_test262 \
