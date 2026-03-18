@@ -59,3 +59,24 @@ jobs:
             );
           }
           NODE
+
+      - name: Display pre-compiled benchmark results
+        run: |
+          echo "=== Stator Pre-compiled Benchmarks (interpreter-only) ==="
+          echo "These benchmarks skip parsing and compilation to measure pure"
+          echo "interpreter speed — a fairer comparison against V8's JIT output."
+          echo
+          # Extract Criterion results for precompiled benchmarks
+          for bench in fib_40_iterative_precompiled arithmetic_loop_10k_precompiled \
+                       property_access_1k_precompiled object_creation_1k_precompiled \
+                       array_push_sum_1k_precompiled closure_counter_1k_precompiled \
+                       prototype_chain_1k_precompiled sieve_primes_1k_precompiled \
+                       deep_object_access_1k_precompiled; do
+            estimate_file="target/criterion/${bench}/new/estimates.json"
+            if [ -f "$estimate_file" ]; then
+              median_ns=$(python3 -c "import json; d=json.load(open('$estimate_file')); print(f\"{d['median']['point_estimate']/1000:.1f}\")")
+              printf "%-40s %12s µs (median)\n" "$bench" "$median_ns"
+            else
+              printf "%-40s %s\n" "$bench" "(no results found)"
+            fi
+          done
