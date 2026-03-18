@@ -1437,6 +1437,22 @@ impl InterpreterFrame {
         Ok(&self.registers[idx])
     }
 
+    /// Read a register value by reference, avoiding clone overhead.
+    ///
+    /// Use this in dispatch handlers that only need to inspect the value
+    /// (comparisons, type checks, arithmetic on Smi values).
+    #[inline(always)]
+    pub fn read_reg_ref(&self, reg: u32) -> StatorResult<&JsValue> {
+        let idx = self.reg_index(reg)?;
+        Ok(&self.registers[idx])
+    }
+
+    /// Return a reference to the accumulator value.
+    #[inline(always)]
+    pub fn accumulator_ref(&self) -> &JsValue {
+        &self.accumulator
+    }
+
     /// Write `value` to the register encoded by operand value `v`.
     #[inline(always)]
     fn write_reg(&mut self, v: u32, value: JsValue) -> StatorResult<()> {
@@ -1553,27 +1569,30 @@ impl Interpreter {
 
                     // ── Instruction limit & deadline checks ─────────────────────────
                     frame.instructions_executed += 1;
-                    if frame.instruction_limit > 0
-                        && frame.instructions_executed > frame.instruction_limit
-                    {
-                        return Err(instruction_limit_error());
-                    }
-                    // Every 100 000 instructions, check both the per-frame
-                    // deadline and the thread-local execution deadline.  The
-                    // thread-local deadline is set by the test runner and is
-                    // inherited by child frames (eval, Function constructor)
-                    // that would otherwise have no timeout.
-                    if frame.instructions_executed.is_multiple_of(100_000) {
-                        let now = Instant::now();
+
+                    // Fast periodic check: every 1024 instructions check limits
+                    // and deadlines.  Uses bitwise AND instead of modulo for a
+                    // zero-cost check on the fast path.
+                    if frame.instructions_executed & 0x3FF == 0 {
+                        // Check per-frame instruction limit
+                        if frame.instruction_limit > 0
+                            && frame.instructions_executed > frame.instruction_limit
+                        {
+                            return Err(instruction_limit_error());
+                        }
+                        // Check per-frame wall-clock deadline
                         if let Some(dl) = frame.deadline
-                            && now > dl
+                            && Instant::now() > dl
                         {
                             return Err(StatorError::RangeError(
                                 "execution timeout exceeded".to_string(),
                             ));
                         }
+                        // Check thread-local execution deadline (set by test
+                        // runner, inherited by child frames such as eval and
+                        // the Function constructor).
                         if let Some(dl) = EXECUTION_DEADLINE.with(|d| d.get())
-                            && now > dl
+                            && Instant::now() > dl
                         {
                             return Err(StatorError::RangeError(
                                 "execution timeout exceeded".to_string(),
