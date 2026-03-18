@@ -8,7 +8,7 @@
 #![allow(clippy::too_many_lines)]
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::builtins::string::{string_char_at, utf16_len};
@@ -73,8 +73,8 @@ pub(super) struct DispatchContext<'a> {
     pub instructions: &'a [Instruction],
     /// Byte-offset table parallel to `instructions`.
     pub byte_offsets: &'a [usize],
-    /// Pre-computed jump targets keyed by source instruction index.
-    pub jump_targets: &'a HashMap<usize, usize>,
+    /// Pre-computed jump targets indexed by source instruction index.
+    pub jump_targets: &'a [Option<usize>],
     /// Exception handler table for the current function.
     #[allow(dead_code)]
     pub handler_table: &'a [HandlerTableEntry],
@@ -93,8 +93,9 @@ fn resolve_cached_jump(ctx: &DispatchContext, opcode_name: &str) -> StatorResult
         ))
     })?;
     ctx.jump_targets
-        .get(&current_instr_index)
+        .get(current_instr_index)
         .copied()
+        .flatten()
         .ok_or_else(|| {
             StatorError::Internal(format!(
                 "missing cached jump target for {opcode_name} at instruction {current_instr_index}"

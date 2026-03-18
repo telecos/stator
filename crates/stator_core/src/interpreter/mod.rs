@@ -1641,7 +1641,7 @@ impl Interpreter {
                 // cached on the bytecode array and shared across cloned frames.
                 let decoded = frame.bytecode_array.shared_decoded_instructions()?;
                 let (instructions, byte_offsets, jump_targets) =
-                    (&decoded.0[..], &decoded.1[..], &decoded.2);
+                    (&decoded.0[..], &decoded.1[..], decoded.2.as_slice());
                 let handler_table = frame.bytecode_array.shared_handler_table();
 
                 loop {

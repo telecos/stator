@@ -165,9 +165,9 @@ type JitCodeCache = Rc<RefCell<Option<(Vec<u8>, usize)>>>;
 /// The cache is filled on first decode and then shared by all clones of the
 /// bytecode array so repeated function calls avoid re-decoding the same
 /// bytecode stream.
-pub(crate) type JumpTargetMap = HashMap<usize, usize>;
+pub(crate) type JumpTargetMap = Vec<Option<usize>>;
 type DecodedBytecode = (Vec<Instruction>, Vec<usize>, JumpTargetMap);
-type DecodedBytecodeRef<'a> = (&'a [Instruction], &'a [usize], &'a JumpTargetMap);
+type DecodedBytecodeRef<'a> = (&'a [Instruction], &'a [usize], &'a [Option<usize>]);
 type DecodedBytecodeCache = Rc<OnceCell<Rc<DecodedBytecode>>>;
 
 /// Shared Maglev JIT code cache stored in a [`BytecodeArray`].
@@ -619,7 +619,7 @@ impl BytecodeArray {
         if self.cached_decode.get().is_none() {
             let (instructions, byte_offsets) =
                 bytecodes::decode_with_byte_offsets(&self.bytecodes)?;
-            let mut jump_targets = HashMap::new();
+            let mut jump_targets = vec![None; instructions.len()];
             for (instruction_index, instruction) in instructions.iter().enumerate() {
                 for operand in &instruction.operands {
                     let Operand::JumpOffset(delta) = operand else {
@@ -639,7 +639,7 @@ impl BytecodeArray {
                                 "jump target byte offset {target_byte} is not at an instruction boundary"
                             ))
                         })?;
-                    jump_targets.insert(instruction_index, target_index);
+                    jump_targets[instruction_index] = Some(target_index);
                 }
             }
             let decoded = Rc::new((instructions, byte_offsets, jump_targets));
@@ -655,7 +655,11 @@ impl BytecodeArray {
     /// offsets, and pre-computed jump targets on subsequent calls.
     pub fn decoded_instructions(&mut self) -> StatorResult<DecodedBytecodeRef<'_>> {
         let decoded = self.ensure_decoded_instructions()?;
-        Ok((decoded.0.as_slice(), decoded.1.as_slice(), &decoded.2))
+        Ok((
+            decoded.0.as_slice(),
+            decoded.1.as_slice(),
+            decoded.2.as_slice(),
+        ))
     }
 
     /// Return a shared handle to the cached decoded instruction stream.
@@ -1022,6 +1026,6 @@ mod tests {
             array.decoded_instructions().expect("valid bytecode");
 
         assert_eq!(instructions[0].opcode, Opcode::Jump);
-        assert_eq!(jump_targets.get(&0), Some(&2));
+        assert_eq!(jump_targets[0], Some(2));
     }
 }
