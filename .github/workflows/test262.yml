@@ -51,11 +51,13 @@ jobs:
         run: cargo build --package stator_test262 --release
 
       - name: Run Test262 suite
-        # Stack: 64 MiB — plenty for normal tests, but infinite-recursion
-        # bugs crash quickly (restart loop recovers).  The `timeout` wrapper
-        # kills stuck tests (infinite loops in parser/compiler).
+        # Stack strategy: 4 MiB main stack forces stacker::maybe_grow to
+        # immediately allocate a 32 MiB heap segment (red_zone=8MiB > 4MiB).
+        # Stacker chains segments as needed for deep recursion.  Watchdog
+        # thread in the runner kills tests stuck >5s.  Crash-restart loop
+        # handles the rare infinite-recursion test.
         run: |
-          ulimit -s 65536    # 64 MiB main thread stack
+          ulimit -s 4096    # 4 MiB — forces stacker to allocate heap segments
           PROGRESS_FILE=$(mktemp)
           SKIP=0
           CRASHES=0

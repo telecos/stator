@@ -1488,7 +1488,7 @@ impl FunctionCompiler {
 
     /// Compile a single statement, emitting bytecode into `self.instructions`.
     fn compile_stmt(&mut self, stmt: &Stmt) -> StatorResult<()> {
-        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+        stacker::maybe_grow(512 * 1024, 4 * 1024 * 1024, || {
             // Record the source position of each non-empty statement so that the
             // debugger can map bytecode offsets back to line/column numbers.
             let loc = stmt.loc();
@@ -3218,7 +3218,7 @@ impl FunctionCompiler {
 
     /// Compile an expression, leaving the result in the accumulator.
     fn compile_expr(&mut self, expr: &Expr) -> StatorResult<()> {
-        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+        stacker::maybe_grow(512 * 1024, 4 * 1024 * 1024, || {
             // Only Call, Conditional, Logical, and Sequence expressions can
             // propagate tail position to sub-expressions.  All other expression
             // types clear the flag so that nested calls are not incorrectly
