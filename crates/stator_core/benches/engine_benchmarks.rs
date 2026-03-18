@@ -410,6 +410,225 @@ fn bench_js_closure_capture(c: &mut Criterion) {
 }
 
 // ===========================================================================
+// 5. V8 comparison benchmarks
+// ===========================================================================
+// These benchmarks mirror the JS snippets in benchmarks/v8_comparison/benchmarks.js
+// so that Stator's Criterion numbers can be compared to V8 (Node.js) results.
+
+fn bench_fib_30_recursive(c: &mut Criterion) {
+    let source = r#"
+        function fib(n) {
+            if (n < 2) return n;
+            return fib(n - 1) + fib(n - 2);
+        }
+        fib(30);
+    "#;
+    c.bench_function("fib_30_recursive", |b| {
+        b.iter(|| {
+            black_box(eval_js(black_box(source)).unwrap());
+        });
+    });
+}
+
+fn bench_fib_40_iterative(c: &mut Criterion) {
+    let source = r#"
+        var a = 0, b = 1;
+        for (var i = 0; i < 40; i++) {
+            var t = a + b;
+            a = b;
+            b = t;
+        }
+        b;
+    "#;
+    c.bench_function("fib_40_iterative", |b| {
+        b.iter(|| {
+            black_box(eval_js(black_box(source)).unwrap());
+        });
+    });
+}
+
+fn bench_arithmetic_loop_100k(c: &mut Criterion) {
+    let source = r#"
+        var n = 0;
+        for (var i = 0; i < 100000; i++) {
+            n = (n + i * 3 - 1) | 0;
+        }
+        n;
+    "#;
+    c.bench_function("arithmetic_loop_100k", |b| {
+        b.iter(|| {
+            black_box(eval_js(black_box(source)).unwrap());
+        });
+    });
+}
+
+fn bench_property_access_10k(c: &mut Criterion) {
+    let source = r#"
+        var obj = { a: 1, b: 2, c: 3, d: 4, e: 5 };
+        var sum = 0;
+        for (var i = 0; i < 10000; i++) {
+            sum = sum + obj.a + obj.b + obj.c + obj.d + obj.e;
+        }
+        sum;
+    "#;
+    c.bench_function("property_access_10k", |b| {
+        b.iter(|| {
+            black_box(eval_js(black_box(source)).unwrap());
+        });
+    });
+}
+
+fn bench_object_creation_10k(c: &mut Criterion) {
+    let source = r#"
+        var last;
+        for (var i = 0; i < 10000; i++) {
+            last = { x: i, y: i + 1, z: i * 2 };
+        }
+        last.x + last.y + last.z;
+    "#;
+    c.bench_function("object_creation_10k", |b| {
+        b.iter(|| {
+            black_box(eval_js(black_box(source)).unwrap());
+        });
+    });
+}
+
+fn bench_array_push_sum_10k(c: &mut Criterion) {
+    let source = r#"
+        var arr = [];
+        for (var i = 0; i < 10000; i++) {
+            arr.push(i);
+        }
+        var sum = 0;
+        for (var i = 0; i < arr.length; i++) {
+            sum = sum + arr[i];
+        }
+        sum;
+    "#;
+    c.bench_function("array_push_sum_10k", |b| {
+        b.iter(|| {
+            black_box(eval_js(black_box(source)).unwrap());
+        });
+    });
+}
+
+fn bench_string_concat_5k(c: &mut Criterion) {
+    let source = r#"
+        var s = "";
+        for (var i = 0; i < 5000; i++) {
+            s = s + "x";
+        }
+        s.length;
+    "#;
+    c.bench_function("string_concat_5k", |b| {
+        b.iter(|| {
+            black_box(eval_js(black_box(source)).unwrap());
+        });
+    });
+}
+
+fn bench_function_calls_10k(c: &mut Criterion) {
+    let source = r#"
+        function add(a, b) { return a + b; }
+        var sum = 0;
+        for (var i = 0; i < 10000; i++) {
+            sum = add(sum, i);
+        }
+        sum;
+    "#;
+    c.bench_function("function_calls_10k", |b| {
+        b.iter(|| {
+            black_box(eval_js(black_box(source)).unwrap());
+        });
+    });
+}
+
+fn bench_closure_counter_10k(c: &mut Criterion) {
+    let source = r#"
+        function make_counter() {
+            var count = 0;
+            return function() { count = count + 1; return count; };
+        }
+        var counter = make_counter();
+        var result = 0;
+        for (var i = 0; i < 10000; i++) {
+            result = counter();
+        }
+        result;
+    "#;
+    c.bench_function("closure_counter_10k", |b| {
+        b.iter(|| {
+            black_box(eval_js(black_box(source)).unwrap());
+        });
+    });
+}
+
+fn bench_prototype_chain_10k(c: &mut Criterion) {
+    let source = r#"
+        function Base() {}
+        Base.prototype.x = 42;
+        function Mid() {}
+        Mid.prototype = new Base();
+        function Leaf() {}
+        Leaf.prototype = new Mid();
+        var obj = new Leaf();
+        var sum = 0;
+        for (var i = 0; i < 10000; i++) {
+            sum = sum + obj.x;
+        }
+        sum;
+    "#;
+    c.bench_function("prototype_chain_10k", |b| {
+        b.iter(|| {
+            black_box(eval_js(black_box(source)).unwrap());
+        });
+    });
+}
+
+fn bench_sieve_primes_10k(c: &mut Criterion) {
+    let source = r#"
+        var n = 10000;
+        var sieve = [];
+        for (var i = 0; i <= n; i++) sieve[i] = true;
+        sieve[0] = false;
+        sieve[1] = false;
+        for (var i = 2; i * i <= n; i++) {
+            if (sieve[i]) {
+                for (var j = i * i; j <= n; j = j + i) {
+                    sieve[j] = false;
+                }
+            }
+        }
+        var count = 0;
+        for (var i = 0; i <= n; i++) {
+            if (sieve[i]) count = count + 1;
+        }
+        count;
+    "#;
+    c.bench_function("sieve_primes_10k", |b| {
+        b.iter(|| {
+            black_box(eval_js(black_box(source)).unwrap());
+        });
+    });
+}
+
+fn bench_deep_object_access_5k(c: &mut Criterion) {
+    let source = r#"
+        var root = { a: { b: { c: { d: { e: 99 } } } } };
+        var sum = 0;
+        for (var i = 0; i < 5000; i++) {
+            sum = sum + root.a.b.c.d.e;
+        }
+        sum;
+    "#;
+    c.bench_function("deep_object_access_5k", |b| {
+        b.iter(|| {
+            black_box(eval_js(black_box(source)).unwrap());
+        });
+    });
+}
+
+// ===========================================================================
 // Benchmark groups
 // ===========================================================================
 
@@ -460,9 +679,28 @@ criterion_group! {
         bench_js_closure_capture,
 }
 
+criterion_group! {
+    name = v8_comparison_benches;
+    config = ci_config();
+    targets =
+        bench_fib_30_recursive,
+        bench_fib_40_iterative,
+        bench_arithmetic_loop_100k,
+        bench_property_access_10k,
+        bench_object_creation_10k,
+        bench_array_push_sum_10k,
+        bench_string_concat_5k,
+        bench_function_calls_10k,
+        bench_closure_counter_10k,
+        bench_prototype_chain_10k,
+        bench_sieve_primes_10k,
+        bench_deep_object_access_5k,
+}
+
 criterion_main!(
     infra_benches,
     property_map_benches,
     jsvalue_benches,
-    js_benches
+    js_benches,
+    v8_comparison_benches
 );
