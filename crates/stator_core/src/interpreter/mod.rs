@@ -177,6 +177,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Instant;
 
+use smallvec::SmallVec;
+
 use crate::builtins::error::{pop_call_frame, push_call_frame};
 use crate::builtins::function::{function_bound_name, function_length, function_to_string};
 use crate::builtins::proxy::{proxy_apply, proxy_get_with_receiver, proxy_set_with_receiver};
@@ -234,6 +236,10 @@ thread_local! {
     /// pointer identity instead of full string equality.
     static STRING_TABLE: RefCell<crate::objects::js_string::StringTable> =
         RefCell::new(crate::objects::js_string::StringTable::new());
+
+    /// Thread-local pool of pre-allocated register vectors.
+    /// Avoids repeated heap allocation for interpreter frames.
+    static REGISTER_POOL: RefCell<Vec<Vec<JsValue>>> = const { RefCell::new(Vec::new()) };
 }
 
 thread_local! {
@@ -304,6 +310,7 @@ pub fn clear_interpreter_state() {
     STRING_TABLE.with(|table| {
         *table.borrow_mut() = crate::objects::js_string::StringTable::new();
     });
+    REGISTER_POOL.with(|pool| pool.borrow_mut().clear());
     CURRENT_GLOBALS.with(|g| *g.borrow_mut() = None);
 }
 
@@ -1250,6 +1257,46 @@ pub struct PropertyIc {
     pub cached_offset: usize,
 }
 
+/// Small inline-buffered argument storage for interpreter function calls.
+pub type CallArgs = SmallVec<[JsValue; 8]>;
+
+/// Acquire a register vector from the pool, or allocate a new one.
+fn acquire_registers(count: usize) -> Vec<JsValue> {
+    REGISTER_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if let Some(mut regs) = pool.pop() {
+            regs.clear();
+            regs.resize(count, JsValue::Undefined);
+            regs
+        } else {
+            vec![JsValue::Undefined; count]
+        }
+    })
+}
+
+/// Return a register vector to the pool for reuse.
+fn release_registers(mut regs: Vec<JsValue>) {
+    if regs.capacity() <= 256 {
+        regs.clear();
+        REGISTER_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < 32 {
+                pool.push(regs);
+            }
+        });
+    }
+}
+
+#[inline]
+fn make_string_cache(bytecode_array: &BytecodeArray) -> Option<HashMap<u32, Rc<str>>> {
+    let constant_pool_len = bytecode_array.constant_pool().len();
+    if !bytecode_array.constant_pool().is_empty() {
+        Some(HashMap::with_capacity(constant_pool_len.min(32)))
+    } else {
+        None
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // InterpreterFrame
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1271,7 +1318,7 @@ pub struct InterpreterFrame {
     pub registers: Vec<JsValue>,
     /// Full argument list supplied to the current call, including extras beyond
     /// the formal parameter count.
-    pub call_args: Vec<JsValue>,
+    pub call_args: CallArgs,
     /// The implicit accumulator register used by most instructions.
     pub accumulator: JsValue,
     /// Program counter: index of the *next* instruction to execute in the
@@ -1359,17 +1406,19 @@ impl InterpreterFrame {
     /// If `args` has fewer entries than the declared `parameter_count`, the
     /// remaining parameter registers are initialised to `undefined`.  Extra
     /// arguments beyond `parameter_count` are silently discarded.
-    pub fn new(bytecode_array: BytecodeArray, args: Vec<JsValue>) -> Self {
+    pub fn new(bytecode_array: BytecodeArray, args: impl IntoIterator<Item = JsValue>) -> Self {
+        let args: CallArgs = args.into_iter().collect();
         let param_count = bytecode_array.parameter_count() as usize;
         let frame_size = bytecode_array.frame_size() as usize;
         let total_regs = param_count + frame_size;
-        let mut registers = vec![JsValue::Undefined; total_regs];
+        let mut registers = acquire_registers(total_regs);
         for (i, arg) in args.iter().cloned().enumerate().take(param_count) {
             registers[i] = arg;
         }
         let mut global_map = HashMap::new();
         crate::builtins::install_globals::install_globals(&mut global_map);
         let ic_slots = bytecode_array.feedback_metadata().slot_count() as usize;
+        let string_cache = make_string_cache(&bytecode_array);
         Self {
             bytecode_array,
             registers,
@@ -1390,7 +1439,7 @@ impl InterpreterFrame {
             poly_load_cache: None,
             shape_load_ic: vec![None; ic_slots],
             shape_store_ic: vec![None; ic_slots],
-            string_cache: None,
+            string_cache,
             global_cache: [
                 (0, None, JsValue::Undefined),
                 (0, None, JsValue::Undefined),
@@ -1415,9 +1464,10 @@ impl InterpreterFrame {
     /// get a fully functional JavaScript environment.
     pub fn new_with_globals(
         bytecode_array: BytecodeArray,
-        args: Vec<JsValue>,
+        args: impl IntoIterator<Item = JsValue>,
         global_env: Rc<RefCell<HashMap<String, JsValue>>>,
     ) -> Self {
+        let args: CallArgs = args.into_iter().collect();
         // Ensure engine builtins are present.  The `eval` key is used as a
         // sentinel — if it exists the full set has already been installed.
         if !global_env.borrow().contains_key("eval") {
@@ -1433,11 +1483,12 @@ impl InterpreterFrame {
         let param_count = bytecode_array.parameter_count() as usize;
         let frame_size = bytecode_array.frame_size() as usize;
         let total_regs = param_count + frame_size;
-        let mut registers = vec![JsValue::Undefined; total_regs];
+        let mut registers = acquire_registers(total_regs);
         for (i, arg) in args.iter().cloned().enumerate().take(param_count) {
             registers[i] = arg;
         }
         let ic_slots = bytecode_array.feedback_metadata().slot_count() as usize;
+        let string_cache = make_string_cache(&bytecode_array);
         Self {
             bytecode_array,
             registers,
@@ -1458,7 +1509,7 @@ impl InterpreterFrame {
             poly_load_cache: None,
             shape_load_ic: vec![None; ic_slots],
             shape_store_ic: vec![None; ic_slots],
-            string_cache: None,
+            string_cache,
             global_cache: [
                 (0, None, JsValue::Undefined),
                 (0, None, JsValue::Undefined),
@@ -1625,126 +1676,130 @@ impl Interpreter {
     /// - an unimplemented opcode is encountered, or
     /// - a type error occurs during arithmetic.
     pub fn run(frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
-        // Publish the global environment for proto_lookup's constructor resolution.
-        CURRENT_GLOBALS.with(|g| {
-            *g.borrow_mut() = Some(Rc::clone(&frame.global_env));
-        });
-        if frame.bytecode_array.is_async() && frame.generator_state.is_none() {
-            return Self::run_async_function(frame.bytecode_array.clone(), vec![]);
-        }
-        // Dynamically grow the native stack when headroom drops below 128 KiB.
-        // Stack guard: allocate heap-backed segments when remaining stack is
-        // low.  With the CI's 64 MiB stack this is a no-op for normal tests.
-        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
-            // Outer loop: re-entered when a TailCall opcode rewrites the frame
-            // with a new bytecode array (proper tail-call trampoline).
-            'tail_call: loop {
-                // Pre-decode the bytecode once and capture byte offsets plus
-                // pre-computed jump targets. The decoded instruction stream is
-                // cached on the bytecode array and shared across cloned frames.
-                let decoded = frame.bytecode_array.shared_decoded_instructions()?;
-                let (instructions, byte_offsets, jump_targets) =
-                    (&decoded.0[..], &decoded.1[..], decoded.2.as_slice());
-                let handler_table = frame.bytecode_array.shared_handler_table();
+        let result = (|| {
+            // Publish the global environment for proto_lookup's constructor resolution.
+            CURRENT_GLOBALS.with(|g| {
+                *g.borrow_mut() = Some(Rc::clone(&frame.global_env));
+            });
+            if frame.bytecode_array.is_async() && frame.generator_state.is_none() {
+                return Self::run_async_function(frame.bytecode_array.clone(), CallArgs::new());
+            }
+            // Dynamically grow the native stack when headroom drops below 128 KiB.
+            // Stack guard: allocate heap-backed segments when remaining stack is
+            // low.  With the CI's 64 MiB stack this is a no-op for normal tests.
+            stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+                // Outer loop: re-entered when a TailCall opcode rewrites the frame
+                // with a new bytecode array (proper tail-call trampoline).
+                'tail_call: loop {
+                    // Pre-decode the bytecode once and capture byte offsets plus
+                    // pre-computed jump targets. The decoded instruction stream is
+                    // cached on the bytecode array and shared across cloned frames.
+                    let decoded = frame.bytecode_array.shared_decoded_instructions()?;
+                    let (instructions, byte_offsets, jump_targets) =
+                        (&decoded.0[..], &decoded.1[..], decoded.2.as_slice());
+                    let handler_table = frame.bytecode_array.shared_handler_table();
 
-                // Cache the debugger-attached flag so we avoid a thread-local
-                // read on every instruction.  Refreshed in the periodic block.
-                let mut debug_active = DEBUG_ATTACHED.with(Cell::get);
+                    // Cache the debugger-attached flag so we avoid a thread-local
+                    // read on every instruction.  Refreshed in the periodic block.
+                    let mut debug_active = DEBUG_ATTACHED.with(Cell::get);
 
-                loop {
-                    if frame.pc >= instructions.len() {
-                        return Err(bytecode_end_error());
-                    }
-
-                    // ── Debug hook (pre-fetch) ─────────────────────────────────────
-                    //
-                    // Check for breakpoints and step conditions *before* fetching the
-                    // next instruction so that the paused frame state reflects what is
-                    // *about* to execute (the program counter still points at the
-                    // instruction that would fire next).
-                    if debug_active {
-                        let current_offset = byte_offsets[frame.pc] as u32;
-                        if let Some(pause_err) = ACTIVE_DEBUGGER.with(|d| {
-                            let opt = d.borrow();
-                            opt.as_ref()
-                                .and_then(|rc| rc.borrow_mut().check_pause_at(current_offset))
-                        }) {
-                            return Err(pause_err);
+                    loop {
+                        if frame.pc >= instructions.len() {
+                            return Err(bytecode_end_error());
                         }
-                    }
 
-                    // ── Fetch ──────────────────────────────────────────────────────
-                    // SAFETY: The bounds check above guarantees frame.pc < instructions.len().
-                    let instr = unsafe { instructions.get_unchecked(frame.pc) };
-                    frame.pc += 1;
-
-                    // ── Instruction limit & deadline checks ─────────────────────────
-                    frame.instructions_executed += 1;
-
-                    // Fast periodic check: every 1024 instructions check limits
-                    // and deadlines.  Uses bitwise AND instead of modulo for a
-                    // zero-cost check on the fast path.
-                    if frame.instructions_executed & 0x3FF == 0 {
-                        // ── CPU profiler checkpoint (periodic) ──────────────────
-                        crate::inspector::profiler::maybe_record_sample();
-
-                        // Refresh debugger flag from thread-local.
-                        debug_active = DEBUG_ATTACHED.with(Cell::get);
-
-                        // Check per-frame instruction limit
-                        if frame.instruction_limit > 0
-                            && frame.instructions_executed > frame.instruction_limit
-                        {
-                            return Err(instruction_limit_error());
-                        }
-                        // Check per-frame wall-clock deadline
-                        if let Some(dl) = frame.deadline
-                            && Instant::now() > dl
-                        {
-                            return Err(StatorError::RangeError(
-                                "execution timeout exceeded".to_string(),
-                            ));
-                        }
-                        // Check thread-local execution deadline (set by test
-                        // runner, inherited by child frames such as eval and
-                        // the Function constructor).
-                        if let Some(dl) = EXECUTION_DEADLINE.with(|d| d.get())
-                            && Instant::now() > dl
-                        {
-                            return Err(StatorError::RangeError(
-                                "execution timeout exceeded".to_string(),
-                            ));
-                        }
-                    }
-
-                    // ── Dispatch (computed-goto table) ─────────────────────────
-                    let handler = dispatch::DISPATCH_TABLE[instr.opcode as usize];
-                    let mut dctx = dispatch::DispatchContext {
-                        frame,
-                        instructions,
-                        byte_offsets,
-                        jump_targets,
-                        handler_table: handler_table.as_slice(),
-                    };
-                    match handler(&mut dctx, instr) {
-                        Ok(action) => match action {
-                            dispatch::DispatchAction::Continue => {}
-                            dispatch::DispatchAction::Return(v) => return Ok(v),
-                            dispatch::DispatchAction::TailCall => continue 'tail_call,
-                        },
-                        Err(e) => {
-                            if let Some(resume_pc) =
-                                handle_dispatch_error(&e, frame, handler_table.as_slice())
-                            {
-                                frame.pc = resume_pc;
-                                continue;
+                        // ── Debug hook (pre-fetch) ─────────────────────────────────────
+                        //
+                        // Check for breakpoints and step conditions *before* fetching the
+                        // next instruction so that the paused frame state reflects what is
+                        // *about* to execute (the program counter still points at the
+                        // instruction that would fire next).
+                        if debug_active {
+                            let current_offset = byte_offsets[frame.pc] as u32;
+                            if let Some(pause_err) = ACTIVE_DEBUGGER.with(|d| {
+                                let opt = d.borrow();
+                                opt.as_ref()
+                                    .and_then(|rc| rc.borrow_mut().check_pause_at(current_offset))
+                            }) {
+                                return Err(pause_err);
                             }
-                            return Err(e);
+                        }
+
+                        // ── Fetch ──────────────────────────────────────────────────────
+                        // SAFETY: The bounds check above guarantees frame.pc < instructions.len().
+                        let instr = unsafe { instructions.get_unchecked(frame.pc) };
+                        frame.pc += 1;
+
+                        // ── Instruction limit & deadline checks ─────────────────────────
+                        frame.instructions_executed += 1;
+
+                        // Fast periodic check: every 1024 instructions check limits
+                        // and deadlines.  Uses bitwise AND instead of modulo for a
+                        // zero-cost check on the fast path.
+                        if frame.instructions_executed & 0x3FF == 0 {
+                            // ── CPU profiler checkpoint (periodic) ──────────────────
+                            crate::inspector::profiler::maybe_record_sample();
+
+                            // Refresh debugger flag from thread-local.
+                            debug_active = DEBUG_ATTACHED.with(Cell::get);
+
+                            // Check per-frame instruction limit
+                            if frame.instruction_limit > 0
+                                && frame.instructions_executed > frame.instruction_limit
+                            {
+                                return Err(instruction_limit_error());
+                            }
+                            // Check per-frame wall-clock deadline
+                            if let Some(dl) = frame.deadline
+                                && Instant::now() > dl
+                            {
+                                return Err(StatorError::RangeError(
+                                    "execution timeout exceeded".to_string(),
+                                ));
+                            }
+                            // Check thread-local execution deadline (set by test
+                            // runner, inherited by child frames such as eval and
+                            // the Function constructor).
+                            if let Some(dl) = EXECUTION_DEADLINE.with(|d| d.get())
+                                && Instant::now() > dl
+                            {
+                                return Err(StatorError::RangeError(
+                                    "execution timeout exceeded".to_string(),
+                                ));
+                            }
+                        }
+
+                        // ── Dispatch (computed-goto table) ─────────────────────────
+                        let handler = dispatch::DISPATCH_TABLE[instr.opcode as usize];
+                        let mut dctx = dispatch::DispatchContext {
+                            frame,
+                            instructions,
+                            byte_offsets,
+                            jump_targets,
+                            handler_table: handler_table.as_slice(),
+                        };
+                        match handler(&mut dctx, instr) {
+                            Ok(action) => match action {
+                                dispatch::DispatchAction::Continue => {}
+                                dispatch::DispatchAction::Return(v) => return Ok(v),
+                                dispatch::DispatchAction::TailCall => continue 'tail_call,
+                            },
+                            Err(e) => {
+                                if let Some(resume_pc) =
+                                    handle_dispatch_error(&e, frame, handler_table.as_slice())
+                                {
+                                    frame.pc = resume_pc;
+                                    continue;
+                                }
+                                return Err(e);
+                            }
                         }
                     }
-                }
-            } // 'tail_call
-        }) // stacker::maybe_grow
+                } // 'tail_call
+            }) // stacker::maybe_grow
+        })();
+        release_registers(std::mem::take(&mut frame.registers));
+        result
     }
 
     /// Execute one step of a generator function.
@@ -1800,10 +1855,11 @@ impl Interpreter {
         registers.resize(total, JsValue::Undefined);
 
         let ic_slots = bytecode_array.feedback_metadata().slot_count() as usize;
+        let string_cache = make_string_cache(&bytecode_array);
         let mut frame = InterpreterFrame {
             bytecode_array,
             registers,
-            call_args: Vec::new(),
+            call_args: CallArgs::new(),
             accumulator: input,
             pc: resume_pc,
             context: None,
@@ -1824,7 +1880,7 @@ impl Interpreter {
             poly_load_cache: None,
             shape_load_ic: vec![None; ic_slots],
             shape_store_ic: vec![None; ic_slots],
-            string_cache: None,
+            string_cache,
             global_cache: [
                 (0, None, JsValue::Undefined),
                 (0, None, JsValue::Undefined),
@@ -1900,7 +1956,7 @@ impl Interpreter {
     /// value, or already rejected if the async body threw.
     pub fn run_async_function(
         bytecode_array: BytecodeArray,
-        _args: Vec<JsValue>,
+        _args: impl IntoIterator<Item = JsValue>,
     ) -> StatorResult<JsValue> {
         use crate::builtins::promise::{MicrotaskQueue, promise_reject, promise_resolve};
 
@@ -2270,9 +2326,9 @@ pub(super) fn collect_args(
     frame: &InterpreterFrame,
     args_start_v: u32,
     count: u32,
-) -> StatorResult<Vec<JsValue>> {
+) -> StatorResult<CallArgs> {
     if count == 0 {
-        return Ok(vec![]);
+        return Ok(CallArgs::new());
     }
     let start_flat = frame.reg_index(args_start_v)?;
     let end_flat = start_flat + count as usize;
@@ -2283,7 +2339,10 @@ pub(super) fn collect_args(
             frame.registers.len()
         )));
     }
-    Ok(frame.registers[start_flat..end_flat].to_vec())
+    Ok(frame.registers[start_flat..end_flat]
+        .iter()
+        .cloned()
+        .collect())
 }
 
 /// Resolve a jump delta loaded from the constant pool to an instruction index.
@@ -2795,7 +2854,7 @@ pub(super) fn is_js_receiver(value: &JsValue) -> bool {
 pub(super) fn dispatch_call(
     frame: &mut InterpreterFrame,
     callee: &JsValue,
-    args: Vec<JsValue>,
+    args: CallArgs,
 ) -> StatorResult<()> {
     match callee {
         JsValue::Function(ba) => {
@@ -2842,12 +2901,12 @@ pub(super) fn dispatch_call(
             }
         }
         JsValue::NativeFunction(f) => {
-            frame.accumulator = f(args)?;
+            frame.accumulator = f(args.into_vec())?;
             frame.global_cache_invalidate();
         }
         JsValue::PlainObject(map) => {
             if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
-                frame.accumulator = f(args)?;
+                frame.accumulator = f(args.into_vec())?;
                 frame.global_cache_invalidate();
             } else {
                 return Err(StatorError::TypeError(
@@ -2871,7 +2930,7 @@ pub(super) fn dispatch_call_property(
     frame: &mut InterpreterFrame,
     callee: &JsValue,
     this_val: JsValue,
-    args: Vec<JsValue>,
+    args: CallArgs,
 ) -> StatorResult<()> {
     match callee {
         JsValue::Function(ba) => {
@@ -2923,12 +2982,12 @@ pub(super) fn dispatch_call_property(
             }
         }
         JsValue::NativeFunction(f) => {
-            frame.accumulator = f(args)?;
+            frame.accumulator = f(args.into_vec())?;
             frame.global_cache_invalidate();
         }
         JsValue::PlainObject(map) => {
             if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
-                frame.accumulator = f(args)?;
+                frame.accumulator = f(args.into_vec())?;
                 frame.global_cache_invalidate();
             } else {
                 return Err(StatorError::TypeError(
@@ -6129,7 +6188,11 @@ pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) ->
 /// - `JsValue::Function` (bytecode) — creates a new interpreter frame
 /// - `JsValue::NativeFunction` — calls the Rust closure directly
 /// - `JsValue::PlainObject` with `__call__` — delegates to the callable slot
-pub fn dispatch_call_value(callee: &JsValue, args: Vec<JsValue>) -> StatorResult<JsValue> {
+pub fn dispatch_call_value(
+    callee: &JsValue,
+    args: impl IntoIterator<Item = JsValue>,
+) -> StatorResult<JsValue> {
+    let args: CallArgs = args.into_iter().collect();
     match callee {
         JsValue::Function(ba) => {
             // Generator functions return a suspended generator object instead
@@ -6152,7 +6215,7 @@ pub fn dispatch_call_value(callee: &JsValue, args: Vec<JsValue>) -> StatorResult
             pop_call_frame();
             result
         }
-        JsValue::NativeFunction(f) => f(args),
+        JsValue::NativeFunction(f) => f(args.into_vec()),
         JsValue::PlainObject(map) => {
             let call_fn = map.borrow().get("__call__").cloned();
             if let Some(f) = call_fn {
@@ -6172,8 +6235,9 @@ pub fn dispatch_call_value(callee: &JsValue, args: Vec<JsValue>) -> StatorResult
 pub fn dispatch_call_with_this(
     callee: &JsValue,
     this_val: JsValue,
-    args: Vec<JsValue>,
+    args: impl IntoIterator<Item = JsValue>,
 ) -> StatorResult<JsValue> {
+    let args: CallArgs = args.into_iter().collect();
     match callee {
         JsValue::Function(ba) => {
             // Generator functions return a suspended generator object instead
@@ -6226,7 +6290,7 @@ pub fn dispatch_call_with_this(
                 })?;
             let old_this = globals.borrow().get("this").cloned();
             globals.borrow_mut().insert("this".to_string(), this_val);
-            let result = f(args);
+            let result = f(args.into_vec());
             match old_this {
                 Some(value) => {
                     globals.borrow_mut().insert("this".to_string(), value);
@@ -6245,7 +6309,7 @@ pub fn dispatch_call_with_this(
                 Err(StatorError::TypeError("object is not a function".into()))
             }
         }
-        JsValue::Proxy(proxy) => proxy_apply(&mut proxy.borrow_mut(), this_val, args),
+        JsValue::Proxy(proxy) => proxy_apply(&mut proxy.borrow_mut(), this_val, args.into_vec()),
         _ => Err(StatorError::TypeError("value is not a function".into())),
     }
 }
@@ -6256,9 +6320,10 @@ pub fn dispatch_call_with_this(
 pub fn dispatch_construct_call(
     callee: &JsValue,
     this_val: JsValue,
-    args: Vec<JsValue>,
+    args: impl IntoIterator<Item = JsValue>,
     new_target: JsValue,
 ) -> StatorResult<JsValue> {
+    let args: CallArgs = args.into_iter().collect();
     match callee {
         JsValue::Function(ba) => {
             push_call_frame("<anonymous>")?;
@@ -6281,7 +6346,7 @@ pub fn dispatch_construct_call(
         }
         JsValue::NativeFunction(f) => {
             let ctor_proto = proto_lookup(&new_target, "prototype");
-            construct_builtin_result(f(args)?, &ctor_proto)
+            construct_builtin_result(f(args.into_vec())?, &ctor_proto)
         }
         JsValue::PlainObject(map) => {
             let call_fn = map.borrow().get("__call__").cloned();

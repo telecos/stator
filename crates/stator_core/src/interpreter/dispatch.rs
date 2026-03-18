@@ -11,22 +11,25 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use smallvec::{SmallVec, smallvec};
+
 use crate::builtins::string::{string_char_at, utf16_len};
 use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::PropertyMap;
 
 use super::{
-    ACTIVE_DEBUGGER, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD, OSR_LOOP_THRESHOLD,
-    PropertyIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow, collect_args, concat_rc_strs,
-    constant_pool_jump_delta, constant_to_value, construct_builtin_result, decode_string_constant,
-    dispatch_call_property, dispatch_call_value, dispatch_call_with_this, dispatch_getter,
-    dispatch_setter, err_bad_operand, error_message_from_value, extract_context, find_handler,
-    fn_props_get, fn_props_set, has_prototype_in_chain, is_js_receiver, js_add, js_less_than,
-    keyed_load, keyed_store, maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan,
-    normalize_async_iterator, number_to_jsvalue, plain_object_to_array_items, populate_self_name,
-    proto_lookup, resolve_jump, restore_closure_context, set_function_name_if_missing,
-    set_pending_exception, settle_async_iterator_result, strict_eq, to_array_index, to_bigint,
-    to_property_key, try_execute_best_jit, walk_context_chain,
+    ACTIVE_DEBUGGER, CallArgs, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD,
+    OSR_LOOP_THRESHOLD, PropertyIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow,
+    collect_args, concat_rc_strs, constant_pool_jump_delta, constant_to_value,
+    construct_builtin_result, decode_string_constant, dispatch_call_property, dispatch_call_value,
+    dispatch_call_with_this, dispatch_getter, dispatch_setter, err_bad_operand,
+    error_message_from_value, extract_context, find_handler, fn_props_get, fn_props_set,
+    has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
+    maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator,
+    number_to_jsvalue, plain_object_to_array_items, populate_self_name, proto_lookup, resolve_jump,
+    restore_closure_context, set_function_name_if_missing, set_pending_exception,
+    settle_async_iterator_result, strict_eq, to_array_index, to_bigint, to_property_key,
+    try_execute_best_jit, walk_context_chain,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
@@ -1442,7 +1445,7 @@ fn handle_call_any_receiver(
         }
         JsValue::NativeFunction(f) => {
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-            ctx.frame.accumulator = f(args)?;
+            ctx.frame.accumulator = f(args.into_vec())?;
             ctx.frame.global_cache_invalidate();
         }
         JsValue::PlainObject(ref map) => {
@@ -1450,7 +1453,7 @@ fn handle_call_any_receiver(
             match call_val {
                 Some(JsValue::NativeFunction(f)) => {
                     let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                    ctx.frame.accumulator = f(args)?;
+                    ctx.frame.accumulator = f(args.into_vec())?;
                     ctx.frame.global_cache_invalidate();
                 }
                 Some(JsValue::Function(ba)) => {
@@ -1561,9 +1564,7 @@ fn handle_tail_call(
                     }
                     restore_closure_context(ctx.frame, &ba);
                     populate_self_name(ctx.frame, &ba, &JsValue::Function(Rc::clone(&ba)));
-                    if let Some(cache) = &mut ctx.frame.string_cache {
-                        cache.clear();
-                    }
+                    ctx.frame.string_cache = super::make_string_cache(&ctx.frame.bytecode_array);
                     if let Some(cache) = &mut ctx.frame.mono_load_cache {
                         cache.clear();
                     }
@@ -1578,13 +1579,13 @@ fn handle_tail_call(
         }
         JsValue::NativeFunction(f) => {
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-            ctx.frame.accumulator = f(args)?;
+            ctx.frame.accumulator = f(args.into_vec())?;
             ctx.frame.global_cache_invalidate();
         }
         JsValue::PlainObject(ref map) => {
             if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                ctx.frame.accumulator = f(args)?;
+                ctx.frame.accumulator = f(args.into_vec())?;
                 ctx.frame.global_cache_invalidate();
             } else {
                 return Err(StatorError::TypeError(
@@ -1618,7 +1619,7 @@ fn handle_call_undefined_receiver0(
             } else if ba.is_async() {
                 ctx.frame.accumulator = Interpreter::run_async_function((*ba).clone(), vec![])?;
             } else {
-                let args: Vec<JsValue> = vec![];
+                let args = CallArgs::new();
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
                     maybe_compile_baseline(&ba);
@@ -1950,7 +1951,7 @@ fn handle_call_property(
     let callee_flat = ctx.frame.reg_index(callee_v)?;
     let args = (0..arg_count as usize)
         .map(|i| ctx.frame.registers[callee_flat + 1 + i].clone())
-        .collect::<Vec<_>>();
+        .collect::<CallArgs>();
     match callee {
         JsValue::Function(ba) => {
             let this_val = ctx.frame.read_reg(recv_v)?.clone();
@@ -1998,14 +1999,14 @@ fn handle_call_property(
             }
         }
         JsValue::NativeFunction(f) => {
-            ctx.frame.accumulator = f(args)?;
+            ctx.frame.accumulator = f(args.into_vec())?;
             ctx.frame.global_cache_invalidate();
         }
         JsValue::PlainObject(ref map) => {
             let call_val = map.borrow().get("__call__").cloned();
             match call_val {
                 Some(JsValue::NativeFunction(f)) => {
-                    ctx.frame.accumulator = f(args)?;
+                    ctx.frame.accumulator = f(args.into_vec())?;
                     ctx.frame.global_cache_invalidate();
                 }
                 Some(JsValue::Function(ba)) => {
@@ -2036,10 +2037,10 @@ fn handle_call_property(
 /// into the flattened output, leaving non-array values untouched.
 ///
 /// Also handles iterables (String, Iterator, Generator) for robustness.
-fn expand_spread_args(raw_args: Vec<JsValue>) -> Vec<JsValue> {
-    let mut out = Vec::new();
-    for arg in &raw_args {
-        match arg {
+fn expand_spread_args(raw_args: impl IntoIterator<Item = JsValue>) -> CallArgs {
+    let mut out = SmallVec::new();
+    for arg in raw_args {
+        match &arg {
             JsValue::Array(items) => {
                 out.extend(items.borrow().iter().cloned());
             }
@@ -2068,7 +2069,9 @@ fn expand_spread_args(raw_args: Vec<JsValue>) -> Vec<JsValue> {
                     });
                     drop(map_ref);
                     if let Some(ref f) = iter_fn {
-                        if let Ok(iter_obj) = dispatch_call_with_this(f, arg.clone(), vec![]) {
+                        if let Ok(iter_obj) =
+                            dispatch_call_with_this(f, arg.clone(), CallArgs::new())
+                        {
                             match iter_obj {
                                 JsValue::Iterator(ni) => {
                                     while let Some(v) = ni.borrow_mut().next_item() {
@@ -2106,7 +2109,7 @@ fn expand_spread_args(raw_args: Vec<JsValue>) -> Vec<JsValue> {
                         }
                     } else if map.borrow().contains_key("next") {
                         // Raw iterator object (has "next" but no @@iterator).
-                        if let Ok(items) = collect_from_plain_object_iterator(arg, map) {
+                        if let Ok(items) = collect_from_plain_object_iterator(&arg, map) {
                             out.extend(items);
                         } else {
                             out.push(arg.clone());
@@ -2204,12 +2207,12 @@ fn handle_call_with_spread(
             }
         }
         JsValue::NativeFunction(f) => {
-            ctx.frame.accumulator = f(args)?;
+            ctx.frame.accumulator = f(args.into_vec())?;
             ctx.frame.global_cache_invalidate();
         }
         JsValue::PlainObject(ref map) => {
             if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
-                ctx.frame.accumulator = f(args)?;
+                ctx.frame.accumulator = f(args.into_vec())?;
                 ctx.frame.global_cache_invalidate();
             } else {
                 return Err(StatorError::TypeError(
@@ -2236,7 +2239,7 @@ fn call_plain_object_function(
     ctx: &mut DispatchContext,
     ba: &Rc<crate::bytecode::bytecode_array::BytecodeArray>,
     map: &Rc<RefCell<PropertyMap>>,
-    args: Vec<JsValue>,
+    args: CallArgs,
 ) -> StatorResult<()> {
     let is_class_constructor = matches!(
         map.borrow().get(".class_constructor"),
@@ -2306,7 +2309,7 @@ fn construct_class_from_plain_object(
     ba: &Rc<crate::bytecode::bytecode_array::BytecodeArray>,
     class_map: &Rc<RefCell<PropertyMap>>,
     ctor_proto: &JsValue,
-    args: Vec<JsValue>,
+    args: CallArgs,
 ) -> StatorResult<()> {
     // 1. Create `this`.
     let this_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
@@ -2490,7 +2493,7 @@ fn handle_construct(
         }
         JsValue::NativeFunction(f) => {
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-            let val = f(args)?;
+            let val = f(args.into_vec())?;
             ctx.frame.global_cache_invalidate();
             ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
         }
@@ -2506,7 +2509,7 @@ fn handle_construct(
             match call_val {
                 Some(JsValue::NativeFunction(f)) => {
                     let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                    let val = f(args)?;
+                    let val = f(args.into_vec())?;
                     ctx.frame.global_cache_invalidate();
                     ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
                 }
@@ -2525,7 +2528,7 @@ fn handle_construct(
         JsValue::Proxy(ref p) => {
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
             let ctor_val = ctx.frame.accumulator.clone();
-            let obj = proxy_construct(&mut p.borrow_mut(), args, ctor_val)?;
+            let obj = proxy_construct(&mut p.borrow_mut(), args.into_vec(), ctor_val)?;
             ctx.frame.accumulator = obj;
         }
         other => {
@@ -2591,7 +2594,7 @@ fn handle_construct_with_spread(
             };
         }
         JsValue::NativeFunction(f) => {
-            let val = f(args)?;
+            let val = f(args.into_vec())?;
             ctx.frame.global_cache_invalidate();
             ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
         }
@@ -2604,7 +2607,7 @@ fn handle_construct_with_spread(
             let call_val = map.borrow().get("__call__").cloned();
             match call_val {
                 Some(JsValue::NativeFunction(f)) => {
-                    let val = f(args)?;
+                    let val = f(args.into_vec())?;
                     ctx.frame.global_cache_invalidate();
                     ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
                 }
@@ -2620,7 +2623,7 @@ fn handle_construct_with_spread(
         }
         JsValue::Proxy(ref p) => {
             let ctor_val = ctx.frame.accumulator.clone();
-            let obj = proxy_construct(&mut p.borrow_mut(), args, ctor_val)?;
+            let obj = proxy_construct(&mut p.borrow_mut(), args.into_vec(), ctor_val)?;
             ctx.frame.accumulator = obj;
         }
         other => {
@@ -5412,7 +5415,7 @@ fn handle_call_property0(
     };
     let callee = ctx.frame.read_reg(callee_v)?.clone();
     let this_val = ctx.frame.read_reg(recv_v)?.clone();
-    dispatch_call_property(ctx.frame, &callee, this_val, vec![])?;
+    dispatch_call_property(ctx.frame, &callee, this_val, CallArgs::new())?;
     Ok(DispatchAction::Continue)
 }
 
@@ -5432,7 +5435,7 @@ fn handle_call_property1(
     let callee = ctx.frame.read_reg(callee_v)?.clone();
     let this_val = ctx.frame.read_reg(recv_v)?.clone();
     let arg0 = ctx.frame.read_reg(arg0_v)?.clone();
-    dispatch_call_property(ctx.frame, &callee, this_val, vec![arg0])?;
+    dispatch_call_property(ctx.frame, &callee, this_val, smallvec![arg0])?;
     Ok(DispatchAction::Continue)
 }
 
@@ -5456,7 +5459,7 @@ fn handle_call_property2(
     let this_val = ctx.frame.read_reg(recv_v)?.clone();
     let arg0 = ctx.frame.read_reg(arg0_v)?.clone();
     let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
-    dispatch_call_property(ctx.frame, &callee, this_val, vec![arg0, arg1])?;
+    dispatch_call_property(ctx.frame, &callee, this_val, smallvec![arg0, arg1])?;
     Ok(DispatchAction::Continue)
 }
 
@@ -6268,12 +6271,14 @@ fn handle_construct_forward_all_args(
     let ctor = ctx.frame.read_reg(ctor_v)?.clone();
     let ctor_proto = proto_lookup(&ctor, "prototype");
     let param_count = ctx.frame.bytecode_array.parameter_count() as usize;
-    let args: Vec<JsValue> = ctx
+    let args: CallArgs = ctx
         .frame
         .registers
         .get(..param_count)
         .unwrap_or(&[])
-        .to_vec();
+        .iter()
+        .cloned()
+        .collect();
     match ctor {
         JsValue::Function(ba) => {
             if ba.is_arrow() {
@@ -6312,7 +6317,7 @@ fn handle_construct_forward_all_args(
             };
         }
         JsValue::NativeFunction(f) => {
-            let val = f(args)?;
+            let val = f(args.into_vec())?;
             ctx.frame.global_cache_invalidate();
             ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
         }
@@ -6325,7 +6330,7 @@ fn handle_construct_forward_all_args(
             let call_val = map.borrow().get("__call__").cloned();
             match call_val {
                 Some(JsValue::NativeFunction(f)) => {
-                    let val = f(args)?;
+                    let val = f(args.into_vec())?;
                     ctx.frame.global_cache_invalidate();
                     ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
                 }
@@ -6500,12 +6505,12 @@ fn handle_call_direct_eval(
                 }
             }
             JsValue::NativeFunction(f) => {
-                ctx.frame.accumulator = f(args)?;
+                ctx.frame.accumulator = f(args.into_vec())?;
                 ctx.frame.global_cache_invalidate();
             }
             JsValue::PlainObject(ref map) => {
                 if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
-                    ctx.frame.accumulator = f(args)?;
+                    ctx.frame.accumulator = f(args.into_vec())?;
                     ctx.frame.global_cache_invalidate();
                 } else {
                     return Err(StatorError::TypeError(
