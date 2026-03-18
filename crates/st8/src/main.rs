@@ -20,9 +20,9 @@
 //!   newline, to standard output.
 //! - `console.log(...args)` — alias for `print`.
 
+use stator_core::interpreter::GlobalEnv;
 use stator_core::objects::property_map::PropertyMap;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::process;
 use std::rc::Rc;
 use std::thread;
@@ -199,7 +199,7 @@ fn main() {
 /// disconnects.
 fn run_with_inspector(
     bytecodes: stator_core::bytecode::bytecode_array::BytecodeArray,
-    globals: Rc<RefCell<HashMap<String, JsValue>>>,
+    globals: Rc<RefCell<GlobalEnv>>,
     _source: &str,
     source_name: &str,
     port: u16,
@@ -265,7 +265,7 @@ fn emit_startup_snapshot(path: &str) {
 
     let globals = build_globals();
     let map = globals.borrow();
-    let snap = serialize_globals(&map);
+    let snap = serialize_globals(&map.vars);
     if let Err(e) = snap.write_to_file(std::path::Path::new(path)) {
         eprintln!("st8: failed to write snapshot: {e}");
         process::exit(1);
@@ -273,14 +273,14 @@ fn emit_startup_snapshot(path: &str) {
     eprintln!(
         "st8: snapshot written to {path} ({} bytes, {} globals)",
         snap.len(),
-        map.len()
+        map.vars.len()
     );
 }
 
 /// Load globals from a pre-built snapshot for fast startup.
 ///
 /// Falls back to `build_globals()` if the snapshot is invalid.
-fn load_globals_from_snapshot(path: &str) -> Rc<RefCell<HashMap<String, JsValue>>> {
+fn load_globals_from_snapshot(path: &str) -> Rc<RefCell<GlobalEnv>> {
     use stator_core::snapshot::{StartupSnapshot, deserialize_globals};
 
     let snap = match StartupSnapshot::read_from_file(std::path::Path::new(path)) {
@@ -291,7 +291,10 @@ fn load_globals_from_snapshot(path: &str) -> Rc<RefCell<HashMap<String, JsValue>
         }
     };
     match deserialize_globals(snap.as_bytes()) {
-        Ok(map) => Rc::new(RefCell::new(map)),
+        Ok(map) => Rc::new(RefCell::new(GlobalEnv {
+            vars: map,
+            generation: 0,
+        })),
         Err(e) => {
             eprintln!("st8: invalid snapshot: {e} — falling back to bootstrap");
             build_globals()
@@ -304,8 +307,8 @@ fn load_globals_from_snapshot(path: &str) -> Rc<RefCell<HashMap<String, JsValue>
 /// Inserts `print`, `console.log`, and the `WebAssembly` namespace into a
 /// fresh globals map and returns it wrapped in an `Rc<RefCell<…>>` for use
 /// by the interpreter.
-fn build_globals() -> Rc<RefCell<HashMap<String, JsValue>>> {
-    let globals: Rc<RefCell<HashMap<String, JsValue>>> = Rc::new(RefCell::new(HashMap::new()));
+fn build_globals() -> Rc<RefCell<GlobalEnv>> {
+    let globals: Rc<RefCell<GlobalEnv>> = Rc::new(RefCell::new(GlobalEnv::new()));
 
     // print(...args) — ECMAScript-shell standard, mirrors d8's print()
     globals.borrow_mut().insert(

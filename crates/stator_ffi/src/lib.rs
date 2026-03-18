@@ -23,7 +23,7 @@ use stator_core::dom::{
     DomObjectWrap, DomWeakRef, IndexedPropertyHandlerConfig, NamedPropertyHandlerConfig,
 };
 use stator_core::gc::heap::Heap;
-use stator_core::interpreter::{Interpreter, InterpreterFrame};
+use stator_core::interpreter::{GlobalEnv, Interpreter, InterpreterFrame};
 use stator_core::objects::js_object::JsObject;
 use stator_core::objects::property_map::PropertyMap;
 use stator_core::objects::value::{JsValue, NativeFn};
@@ -370,7 +370,7 @@ pub struct StatorContext {
     /// Populated by [`stator_register_native_function`] and consumed by
     /// [`stator_script_run`].  The map owns [`JsValue`] values (including
     /// [`JsValue::NativeFunction`] and [`JsValue::PlainObject`] wrappers).
-    pub(crate) globals: Rc<RefCell<HashMap<String, JsValue>>>,
+    pub(crate) globals: Rc<RefCell<GlobalEnv>>,
 }
 
 // SAFETY: `StatorContext` only holds a pointer that is valid for the lifetime
@@ -400,7 +400,7 @@ pub unsafe extern "C" fn stator_context_new(isolate: *mut StatorIsolate) -> *mut
             inner: JsObject::new(),
             isolate,
         },
-        globals: Rc::new(RefCell::new(HashMap::new())),
+        globals: Rc::new(RefCell::new(GlobalEnv::new())),
     }));
     // SAFETY: caller guarantees `isolate` is valid; `ctx` was just created.
     unsafe { (*isolate).current_context = ctx };
@@ -2035,7 +2035,7 @@ pub unsafe extern "C" fn stator_script_run(
         // SAFETY: caller guarantees `ctx` is valid.
         Rc::clone(unsafe { &(*ctx).globals })
     } else {
-        Rc::new(RefCell::new(HashMap::new()))
+        Rc::new(RefCell::new(GlobalEnv::new()))
     };
 
     let mut frame = InterpreterFrame::new_with_globals(bytecodes, vec![], global_env);
@@ -2394,12 +2394,13 @@ pub unsafe extern "C" fn stator_register_native_function(
         let obj_name = &name_str[..dot];
         let method_name = &name_str[dot + 1..];
 
-        let mut env = globals.borrow_mut();
+        let env = globals.borrow_mut();
         // Insert the parent object if it doesn't exist yet.
-        let obj = env
-            .entry(obj_name.to_owned())
-            .or_insert_with(|| JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new()))))
-            .clone();
+        let obj = if let Some(existing) = env.get(obj_name) {
+            existing.clone()
+        } else {
+            JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())))
+        };
         drop(env); // release borrow before we potentially re-borrow
 
         if let JsValue::PlainObject(ref map) = obj {
@@ -2702,11 +2703,12 @@ pub unsafe extern "C" fn stator_context_global_set(
         let obj_name = &name_str[..dot];
         let method_name = &name_str[dot + 1..];
 
-        let mut env = globals.borrow_mut();
-        let obj = env
-            .entry(obj_name.to_owned())
-            .or_insert_with(|| JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new()))))
-            .clone();
+        let env = globals.borrow_mut();
+        let obj = if let Some(existing) = env.get(obj_name) {
+            existing.clone()
+        } else {
+            JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())))
+        };
         drop(env);
 
         if let JsValue::PlainObject(ref map) = obj {

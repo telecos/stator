@@ -30,7 +30,7 @@ use stator_core::builtins::promise::drain_active_microtask_queue;
 use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_core::error::StatorError;
 use stator_core::interpreter::{
-    Interpreter, InterpreterFrame, clear_interpreter_state, set_execution_deadline,
+    GlobalEnv, Interpreter, InterpreterFrame, clear_interpreter_state, set_execution_deadline,
 };
 use stator_core::objects::property_map::PropertyMap;
 use stator_core::objects::string_intern::clear_intern_pool;
@@ -891,7 +891,10 @@ fn execute_source_inner(
     // Wrap the caller-provided shallow clone in Rc<RefCell<…>> for the
     // interpreter.  The caller already cloned the template globals, so no
     // additional clone is needed here.
-    let globals = Rc::new(RefCell::new(globals_map));
+    let globals = Rc::new(RefCell::new(GlobalEnv {
+        vars: globals_map,
+        generation: 0,
+    }));
     // Keep a handle so we can break Rc cycles after the test finishes.
     let globals_cleanup = Rc::clone(&globals);
 
@@ -927,9 +930,9 @@ fn execute_source_inner(
 /// HashMap.  With shallow cloning, this is all that is needed — the
 /// template's own `Rc` references keep the builtins alive, and the
 /// test's `Rc` reference counts simply decrement back to their baseline.
-fn break_rc_cycles(globals: &Rc<RefCell<HashMap<String, JsValue>>>) {
+fn break_rc_cycles(globals: &Rc<RefCell<GlobalEnv>>) {
     if let Ok(mut g) = globals.try_borrow_mut() {
-        g.clear();
+        g.vars.clear();
     }
 }
 
