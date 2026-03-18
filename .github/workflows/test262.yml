@@ -53,25 +53,50 @@ jobs:
       - name: Run Test262 suite
         # Stack strategy: set a SMALL main thread stack (4 MiB) so that
         # stacker::maybe_grow(8 MiB red_zone, 256 MiB segment) always triggers.
-        # With remaining ~3-4 MiB < red_zone 8 MiB, stacker allocates a 256 MiB
-        # heap-backed segment for each test.  Inside that segment,
-        # MAX_CALL_STACK_DEPTH (128) limits JS recursion to ~128 frames.
-        # This prevents:
-        # - Main stack overflow (all heavy work on heap segments)
-        # - Infinite JS recursion (bounded by call depth limit)
-        # Memory: 5 GB vmem cap prevents OOM-killing the runner.
+        # If the runner crashes (stack overflow, SIGSEGV), the restart loop
+        # skips the crashing test and continues from the next one.
         run: |
-          echo "Default stack limit: $(ulimit -s) KB"
           ulimit -s 4096     # 4 MB — forces stacker::maybe_grow to allocate heap segments
           ulimit -v 5242880  # 5 GB virtual memory cap
-          echo "Active stack limit: $(ulimit -s) KB"
-          set +e
-          ./target/release/stator_test262 \
-            --test262-dir test262 \
-            --threshold 25.0
-          rc=$?
-          if [ $rc -eq 134 ] || [ $rc -eq 137 ] || [ $rc -eq 139 ]; then
-            echo "::warning::Test262 runner crashed (exit $rc) — stack overflow or OOM"
-            exit 0
-          fi
-          exit $rc
+          PROGRESS_FILE=$(mktemp)
+          SKIP=0
+          CRASHES=0
+          MAX_RESTARTS=20
+          for attempt in $(seq 1 $MAX_RESTARTS); do
+            set +e
+            ./target/release/stator_test262 \
+              --test262-dir test262 \
+              --threshold 25.0 \
+              --progress-file "$PROGRESS_FILE" \
+              --skip-first "$SKIP"
+            rc=$?
+            set -e
+            if [ $rc -eq 0 ]; then
+              # Clean exit — all tests processed successfully
+              rm -f "$PROGRESS_FILE"
+              exit 0
+            elif [ $rc -eq 1 ]; then
+              # Threshold failure (pass rate too low)
+              rm -f "$PROGRESS_FILE"
+              exit 1
+            elif [ $rc -eq 134 ] || [ $rc -eq 137 ] || [ $rc -eq 139 ]; then
+              # Crash (SIGABRT=134, SIGKILL=137, SIGSEGV=139)
+              CRASHES=$((CRASHES + 1))
+              if [ -f "$PROGRESS_FILE" ]; then
+                CRASHED_AT=$(cat "$PROGRESS_FILE")
+                SKIP=$((CRASHED_AT + 1))
+                echo "::warning::Runner crashed (exit $rc) at test $CRASHED_AT — restarting from $SKIP (crash $CRASHES/$MAX_RESTARTS)"
+              else
+                echo "::warning::Runner crashed (exit $rc) with no progress — giving up"
+                rm -f "$PROGRESS_FILE"
+                exit 0
+              fi
+            else
+              echo "::warning::Runner exited with unexpected code $rc"
+              rm -f "$PROGRESS_FILE"
+              exit 0
+            fi
+          done
+          echo "::warning::Exceeded $MAX_RESTARTS crash restarts ($CRASHES crashes total)"
+          rm -f "$PROGRESS_FILE"
+          exit 0

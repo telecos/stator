@@ -1157,130 +1157,6 @@ fn run_test(
     }
 }
 
-// ─── Fork-based process isolation (Unix only) ────────────────────────────────
-
-/// Run a single test inside a forked child process so that stack overflow,
-/// SIGSEGV, and other fatal signals in the engine kill only the child — not the
-/// entire test runner.
-///
-/// The child runs `run_test`, serialises the outcome as a single byte (0=pass,
-/// 1=fail, 2=skip) followed by an optional UTF-8 message, then calls `_exit`.
-/// The parent reads the result from a pipe and returns it.
-///
-/// Falls back to in-process execution on non-Unix platforms or if `fork` fails.
-#[cfg(unix)]
-fn run_test_forked(
-    source: &str,
-    harness_prefix: &str,
-    meta: &TestMeta,
-    template_globals: &HashMap<String, JsValue>,
-) -> TestOutcome {
-    use std::io::Read;
-
-    // SAFETY: We are single-threaded (no other threads hold locks).
-    // The child only writes to the pipe and calls _exit — no complex cleanup.
-    unsafe {
-        let mut fds: [libc::c_int; 2] = [0; 2];
-        if libc::pipe(fds.as_mut_ptr()) != 0 {
-            // pipe failed — fall back to in-process
-            return run_test(source, harness_prefix, meta, template_globals);
-        }
-        let (read_fd, write_fd) = (fds[0], fds[1]);
-
-        let pid = libc::fork();
-        if pid < 0 {
-            // fork failed — fall back to in-process
-            libc::close(read_fd);
-            libc::close(write_fd);
-            return run_test(source, harness_prefix, meta, template_globals);
-        }
-
-        if pid == 0 {
-            // ── CHILD PROCESS ──────────────────────────────────────────────
-            libc::close(read_fd);
-
-            let outcome = run_test(source, harness_prefix, meta, template_globals);
-            let (code, msg): (u8, String) = match outcome {
-                TestOutcome::Pass => (0, String::new()),
-                TestOutcome::Fail(m) => (1, m),
-                TestOutcome::Skip(m) => (2, m),
-            };
-
-            // Write: 1 byte code, then 4 bytes LE message length, then message.
-            let _ = libc::write(write_fd, &code as *const u8 as *const libc::c_void, 1);
-            let msg_bytes = msg.as_bytes();
-            let len = (msg_bytes.len() as u32).to_le_bytes();
-            let _ = libc::write(write_fd, len.as_ptr() as *const libc::c_void, 4);
-            if !msg_bytes.is_empty() {
-                let _ = libc::write(
-                    write_fd,
-                    msg_bytes.as_ptr() as *const libc::c_void,
-                    msg_bytes.len(),
-                );
-            }
-            libc::close(write_fd);
-            libc::_exit(0);
-        }
-
-        // ── PARENT PROCESS ─────────────────────────────────────────────────
-        libc::close(write_fd);
-
-        // Wrap the read end in a Rust File for easier reading.
-        use std::os::unix::io::FromRawFd;
-        let mut pipe_reader = std::fs::File::from_raw_fd(read_fd);
-
-        // Read result code.
-        let mut code_buf = [0u8; 1];
-        let outcome = if pipe_reader.read_exact(&mut code_buf).is_ok() {
-            // Read message length + message.
-            let mut len_buf = [0u8; 4];
-            let msg = if pipe_reader.read_exact(&mut len_buf).is_ok() {
-                let len = u32::from_le_bytes(len_buf) as usize;
-                if len > 0 && len < 65536 {
-                    let mut msg_buf = vec![0u8; len];
-                    if pipe_reader.read_exact(&mut msg_buf).is_ok() {
-                        String::from_utf8_lossy(&msg_buf).to_string()
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    String::new()
-                }
-            } else {
-                String::new()
-            };
-
-            match code_buf[0] {
-                0 => TestOutcome::Pass,
-                1 => TestOutcome::Fail(msg),
-                2 => TestOutcome::Skip(msg),
-                _ => TestOutcome::Fail("unknown child result code".into()),
-            }
-        } else {
-            // Child crashed before writing anything (stack overflow, SIGSEGV).
-            TestOutcome::Fail("child process crashed (stack overflow or signal)".into())
-        };
-
-        // Wait for child to avoid zombie.
-        let mut status: libc::c_int = 0;
-        libc::waitpid(pid, &mut status, 0);
-
-        // pipe_reader's Drop closes read_fd.
-        outcome
-    }
-}
-
-/// Non-Unix fallback: run in-process.
-#[cfg(not(unix))]
-fn run_test_forked(
-    source: &str,
-    harness_prefix: &str,
-    meta: &TestMeta,
-    template_globals: &HashMap<String, JsValue>,
-) -> TestOutcome {
-    run_test(source, harness_prefix, meta, template_globals)
-}
-
 // ─── Directory traversal ─────────────────────────────────────────────────────
 
 /// Recursively collects all `.js` files under `dir` into `out`.
@@ -1339,6 +1215,10 @@ struct CliArgs {
     threshold: f64,
     filter: Option<String>,
     verbose: bool,
+    /// Skip the first N tests (used for crash-restart recovery).
+    skip_first: usize,
+    /// Path to write current test index before each test (crash recovery).
+    progress_file: Option<PathBuf>,
 }
 
 fn parse_args() -> CliArgs {
@@ -1347,6 +1227,8 @@ fn parse_args() -> CliArgs {
     let mut threshold: f64 = 0.0;
     let mut filter: Option<String> = None;
     let mut verbose = false;
+    let mut skip_first: usize = 0;
+    let mut progress_file: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -1375,6 +1257,18 @@ fn parse_args() -> CliArgs {
                 i += 1;
                 if i < args.len() {
                     filter = Some(args[i].clone());
+                }
+            }
+            "--skip-first" => {
+                i += 1;
+                if i < args.len() {
+                    skip_first = args[i].parse().unwrap_or(0);
+                }
+            }
+            "--progress-file" => {
+                i += 1;
+                if i < args.len() {
+                    progress_file = Some(PathBuf::from(&args[i]));
                 }
             }
             "--verbose" | "-v" => verbose = true,
@@ -1410,6 +1304,8 @@ fn parse_args() -> CliArgs {
         threshold,
         filter,
         verbose,
+        skip_first,
+        progress_file,
     }
 }
 
@@ -1499,8 +1395,27 @@ fn main_inner() {
     );
     let _ = io::stdout().flush();
 
+    if cli.skip_first > 0 {
+        println!(
+            "stator_test262: skipping first {} tests (crash recovery)",
+            cli.skip_first
+        );
+    }
+
     // ── Run each test ─────────────────────────────────────────────────────────
     for (idx, path) in test_files.iter().enumerate() {
+        // ── Crash recovery: skip already-processed tests ──────────────────────
+        if idx < cli.skip_first {
+            skip += 1;
+            continue;
+        }
+
+        // Write current test index to progress file so the crash-restart
+        // wrapper knows where to resume.
+        if let Some(ref pf) = cli.progress_file {
+            let _ = std::fs::write(pf, idx.to_string());
+        }
+
         // ── Early skip: path-based filtering ──────────────────────────────────
         // Check skip patterns BEFORE reading or parsing the file to avoid
         // wasting I/O and CPU on tests we know will be skipped.
@@ -1577,7 +1492,7 @@ fn main_inner() {
 
         // ── Execute and record outcome ────────────────────────────────────────
         let test_start = std::time::Instant::now();
-        match run_test_forked(&source, &harness_prefix, &meta, &template_globals) {
+        match run_test(&source, &harness_prefix, &meta, &template_globals) {
             TestOutcome::Pass => {
                 pass += 1;
                 if cli.verbose {

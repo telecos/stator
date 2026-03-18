@@ -1760,7 +1760,6 @@ name = "stator_test262"
 version = "0.1.0"
 dependencies = [
  "env_logger",
- "libc",
  "log",
  "stacker",
  "stator_core",
