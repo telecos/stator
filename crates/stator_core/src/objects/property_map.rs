@@ -89,6 +89,27 @@ fn name_hash(s: &str) -> u64 {
     h
 }
 
+/// Deterministically hashes a property layout so structurally identical maps
+/// share the same layout identifier.
+#[inline]
+fn layout_hash(keys: &[String], attrs: &[PropertyAttributes]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for (key, attr) in keys.iter().zip(attrs.iter()) {
+        for b in key.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+        for b in attr.bits().to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h ^= keys.len() as u64;
+    h.wrapping_mul(0x0100_0000_01b3)
+}
+
 /// A map of named properties with ECMAScript attribute flags.
 ///
 /// Property values are stored in a flat `Vec` in ECMAScript enumeration
@@ -124,6 +145,9 @@ pub struct PropertyMap {
     /// Shape identifier — a monotonically-increasing stamp that changes on
     /// every structural mutation (property add/remove or attribute change).
     shape_id: u64,
+    /// Deterministic layout identifier shared by maps with the same property
+    /// names, insertion order, and attributes.
+    layout_id: u64,
     /// Whether new properties may be added to this object (§10.1 `[[Extensible]]`).
     pub extensible: bool,
 }
@@ -153,6 +177,7 @@ impl PropertyMap {
             cache_len: Cell::new(0),
             cache_cursor: Cell::new(0),
             shape_id: NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed),
+            layout_id: layout_hash(&[], &[]),
             extensible: true,
         }
     }
@@ -170,6 +195,7 @@ impl PropertyMap {
             cache_len: Cell::new(0),
             cache_cursor: Cell::new(0),
             shape_id: NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed),
+            layout_id: layout_hash(&[], &[]),
             extensible: true,
         }
     }
@@ -228,6 +254,7 @@ impl PropertyMap {
     #[inline]
     fn bump_shape_id(&mut self) {
         self.shape_id = NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed);
+        self.layout_id = layout_hash(&self.keys, &self.attrs);
     }
 
     // ── Shape / offset API ───────────────────────────────────────────────
@@ -239,6 +266,13 @@ impl PropertyMap {
     #[inline]
     pub fn shape_id(&self) -> u64 {
         self.shape_id
+    }
+
+    /// Returns the deterministic property-layout identifier shared by maps
+    /// with the same keys, key order, and attributes.
+    #[inline]
+    pub fn layout_id(&self) -> u64 {
+        self.layout_id
     }
 
     /// Returns the slot index (offset) for `key`, or `None` if absent.
@@ -259,6 +293,14 @@ impl PropertyMap {
     #[inline]
     pub fn get_by_offset(&self, offset: usize) -> Option<&JsValue> {
         self.values.get(offset)
+    }
+
+    /// Returns `true` when `offset` still names `key` in the current layout.
+    #[inline]
+    pub fn matches_key_at_offset(&self, offset: usize, key: &str) -> bool {
+        self.keys
+            .get(offset)
+            .is_some_and(|candidate| candidate == key)
     }
 
     /// Overwrites the value at a raw slot offset, returning `true` on
@@ -420,6 +462,9 @@ impl PropertyMap {
     pub fn make_all_non_enumerable(&mut self) {
         for attr in &mut self.attrs {
             attr.remove(PropertyAttributes::ENUMERABLE);
+        }
+        if !self.attrs.is_empty() {
+            self.bump_shape_id();
         }
     }
 
@@ -1138,6 +1183,36 @@ mod tests {
         let id1 = pm.shape_id();
         pm.set_writable("x", false);
         assert_ne!(pm.shape_id(), id1);
+    }
+
+    #[test]
+    fn test_layout_id_shared_for_identical_property_sequences() {
+        let mut first = PropertyMap::new();
+        first.insert("x".to_string(), JsValue::Smi(1));
+        first.insert("y".to_string(), JsValue::Smi(2));
+
+        let mut second = PropertyMap::new();
+        second.insert("x".to_string(), JsValue::Smi(10));
+        second.insert("y".to_string(), JsValue::Smi(20));
+
+        assert_eq!(first.layout_id(), second.layout_id());
+    }
+
+    #[test]
+    fn test_layout_id_changes_for_different_layouts() {
+        let mut attrs = PropertyMap::new();
+        attrs.insert("x".to_string(), JsValue::Smi(1));
+        attrs.set_writable("x", false);
+
+        let mut order = PropertyMap::new();
+        order.insert("y".to_string(), JsValue::Smi(1));
+        order.insert("x".to_string(), JsValue::Smi(2));
+
+        let mut baseline = PropertyMap::new();
+        baseline.insert("x".to_string(), JsValue::Smi(3));
+
+        assert_ne!(baseline.layout_id(), attrs.layout_id());
+        assert_ne!(baseline.layout_id(), order.layout_id());
     }
 
     #[test]

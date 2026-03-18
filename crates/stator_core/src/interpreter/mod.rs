@@ -1248,11 +1248,12 @@ pub(super) fn try_execute_best_jit(
 // PropertyIc – shape-based inline cache entry
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A monomorphic inline-cache entry that maps a [`PropertyMap::shape_id`] to a
-/// direct slot offset, enabling O(1) property access when the shape is stable.
+/// A monomorphic inline-cache entry that maps a shared property-layout id to a
+/// direct slot offset, enabling O(1) property access across objects that share
+/// the same layout.
 #[derive(Debug, Clone, Copy)]
 pub struct PropertyIc {
-    /// The [`PropertyMap::shape_id`] observed when the cache was populated.
+    /// The shared property-layout id observed when the cache was populated.
     pub cached_shape: u64,
     /// The Vec offset of the cached property inside the `PropertyMap`.
     pub cached_offset: usize,
@@ -1447,8 +1448,8 @@ pub struct InterpreterFrame {
     pub poly_load_cache: Option<HashMap<u32, Vec<(usize, JsValue)>>>,
     /// Shape-based inline cache for named property loads.
     /// Direct-indexed by feedback slot for O(1) access.  Each entry records
-    /// the last observed `(shape_id, offset)` pair so that a repeat access
-    /// on the same shape can skip property-map lookup entirely.
+    /// the last observed `(layout_id, offset)` pair so that a repeat access
+    /// on the same property layout can skip property-map lookup entirely.
     pub shape_load_ic: Vec<Option<PropertyIc>>,
     /// Shape-based inline cache for named property stores.
     /// Direct-indexed by feedback slot, mirroring `shape_load_ic`.
@@ -13705,6 +13706,75 @@ mod tests {
         let mut frame = InterpreterFrame::new(ba, vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(77));
+    }
+
+    #[test]
+    fn test_named_property_ic_reuses_shared_layout_across_objects() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(Opcode::CreateEmptyObjectLiteral, vec![]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(11)]),
+                Instruction::new_unchecked(
+                    Opcode::StaNamedProperty,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstantPoolIdx(0),
+                        Operand::FeedbackSlot(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::CreateEmptyObjectLiteral, vec![]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(22)]),
+                Instruction::new_unchecked(
+                    Opcode::StaNamedProperty,
+                    vec![
+                        Operand::Register(1),
+                        Operand::ConstantPoolIdx(0),
+                        Operand::FeedbackSlot(0),
+                    ],
+                ),
+                Instruction::new_unchecked(
+                    Opcode::LdaNamedProperty,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstantPoolIdx(0),
+                        Operand::FeedbackSlot(1),
+                    ],
+                ),
+                Instruction::new_unchecked(
+                    Opcode::LdaNamedProperty,
+                    vec![
+                        Operand::Register(1),
+                        Operand::ConstantPoolIdx(0),
+                        Operand::FeedbackSlot(1),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("x".to_string())],
+            2,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(22));
+
+        let ic = frame.shape_load_ic[1].expect("load IC should be populated");
+        let JsValue::PlainObject(map0) = &frame.registers[0] else {
+            panic!("r0 should hold the first object");
+        };
+        let JsValue::PlainObject(map1) = &frame.registers[1] else {
+            panic!("r1 should hold the second object");
+        };
+
+        let first = map0.borrow();
+        let second = map1.borrow();
+        assert_ne!(first.shape_id(), second.shape_id());
+        assert_eq!(first.layout_id(), second.layout_id());
+        assert_eq!(ic.cached_shape, first.layout_id());
+        assert_eq!(ic.cached_offset, first.offset_of("x").expect("x offset"));
+        assert_eq!(ic.cached_offset, second.offset_of("x").expect("x offset"));
     }
 
     // ── StaLookupSlot ───────────────────────────────────────────────────
