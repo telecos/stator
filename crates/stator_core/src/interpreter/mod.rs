@@ -665,26 +665,28 @@ pub(crate) fn set_function_name_if_missing(value: &JsValue, name: &str) {
 /// Number of loop back-edges taken before OSR baseline compilation is triggered.
 ///
 /// When a single interpreter loop accumulates this many `JumpLoop` iterations
-/// and the enclosing function has not yet been JIT-compiled, a baseline
-/// compilation is requested so the next *call* to that function executes
-/// via native code.
-pub(super) const OSR_LOOP_THRESHOLD: u32 = 1_000;
+/// (100 back-edges) and the enclosing function has not yet been JIT-compiled,
+/// a baseline compilation is requested so the next *call* to that function
+/// executes via native code.
+pub(super) const OSR_LOOP_THRESHOLD: u32 = 100;
 
 /// Number of loop back-edges taken before a Maglev background compilation is
 /// triggered via OSR.
 ///
 /// When a loop has already caused baseline JIT compilation and the back-edge
-/// count exceeds this threshold, a Maglev compilation is scheduled in a
-/// background thread so the next *call* can use the optimised tier.
-pub(super) const MAGLEV_OSR_LOOP_THRESHOLD: u32 = 5_000;
+/// count exceeds this threshold (500 back-edges), a Maglev compilation is
+/// scheduled in a background thread so the next *call* can use the optimised
+/// tier.
+pub(super) const MAGLEV_OSR_LOOP_THRESHOLD: u32 = 500;
 
 /// Number of loop back-edges taken before a Turbofan background compilation is
 /// triggered via OSR.
 ///
 /// When a loop has already caused Maglev JIT compilation and the back-edge
-/// count exceeds this threshold, a Turbofan compilation is scheduled in a
-/// background thread so the next *call* can use the fully-optimised tier.
-pub(super) const TURBOFAN_OSR_LOOP_THRESHOLD: u32 = 10_000;
+/// count exceeds this threshold (1 000 back-edges), a Turbofan compilation
+/// is scheduled in a background thread so the next *call* can use the
+/// fully-optimised tier.
+pub(super) const TURBOFAN_OSR_LOOP_THRESHOLD: u32 = 1_000;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Generator return completion sentinel
@@ -8809,7 +8811,7 @@ mod tests {
         let looper_ba = make_bytecode(patched_instrs, 2, 0); // frame_size=2, param_count=0
 
         // Run the loop function once; it iterates 2000 times which exceeds
-        // OSR_LOOP_THRESHOLD (1000), so a compilation should be triggered.
+        // OSR_LOOP_THRESHOLD (100), so a compilation should be triggered.
         let mut frame = InterpreterFrame::new(looper_ba.clone(), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
 
