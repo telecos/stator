@@ -27,3 +27,35 @@ jobs:
 
       - name: Run benchmarks
         run: cargo bench --package stator_core
+
+      - name: Run V8 (Node.js) comparison benchmarks
+        run: |
+          echo "=== V8 (Node.js) Reference Benchmarks ==="
+          output=$(node benchmarks/v8_comparison/benchmarks.js)
+          json_line=$(printf '%s\n' "$output" | grep '^V8_BENCHMARK_RESULTS_JSON=' || true)
+          if [ -z "$json_line" ]; then
+            printf '%s\n' "$output"
+            echo "Failed to capture V8 benchmark JSON output" >&2
+            exit 1
+          fi
+          printf '%s\n' "$output" | grep -v '^V8_BENCHMARK_RESULTS_JSON='
+          echo
+          echo "Captured JSON output:"
+          echo "$json_line"
+          echo
+          echo "=== Parsed V8 Comparison Table ==="
+          node - "$json_line" <<'NODE'
+          const line = process.argv[2];
+          const results = JSON.parse(line.replace(/^V8_BENCHMARK_RESULTS_JSON=/, ""));
+
+          console.log("Benchmark".padEnd(30) + "Median (us)".padStart(15) + "Mean (us)".padStart(15) + "Min (us)".padStart(15));
+          console.log("-".repeat(75));
+          for (const result of results) {
+            console.log(
+              result.name.padEnd(30) +
+              (result.median_ns / 1000).toFixed(1).padStart(15) +
+              (result.mean_ns / 1000).toFixed(1).padStart(15) +
+              (result.min_ns / 1000).toFixed(1).padStart(15)
+            );
+          }
+          NODE

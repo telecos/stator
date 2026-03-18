@@ -416,12 +416,10 @@ fn bench_js_closure_capture(c: &mut Criterion) {
 // These benchmarks mirror the JS snippets in benchmarks/v8_comparison/benchmarks.js
 // so that Stator's Criterion numbers can be compared to V8 (Node.js) results.
 
-// NOTE: fib_10_recursive, function_calls_1k, and closure_counter_1k are too
-// slow for CI (~300ms per function call in interpreter). They exist in the
-// Node.js comparison script (benchmarks/v8_comparison/benchmarks.js) for
-// manual comparison.
+// NOTE: fib_10_recursive is intentionally excluded from the Criterion group
+// because deep recursion can time out in CI. string_concat_5k remains
+// available for ad-hoc comparison runs.
 
-#[allow(dead_code)]
 fn bench_fib_10_recursive(c: &mut Criterion) {
     let source = r#"
         function fib(n) {
@@ -437,7 +435,6 @@ fn bench_fib_10_recursive(c: &mut Criterion) {
     });
 }
 
-#[allow(dead_code)]
 fn bench_fib_40_iterative(c: &mut Criterion) {
     let source = r#"
         var a = 0, b = 1;
@@ -455,7 +452,6 @@ fn bench_fib_40_iterative(c: &mut Criterion) {
     });
 }
 
-#[allow(dead_code)]
 fn bench_arithmetic_loop_10k(c: &mut Criterion) {
     let source = r#"
         var n = 0;
@@ -471,7 +467,6 @@ fn bench_arithmetic_loop_10k(c: &mut Criterion) {
     });
 }
 
-#[allow(dead_code)]
 fn bench_property_access_1k(c: &mut Criterion) {
     let source = r#"
         var obj = { a: 1, b: 2, c: 3, d: 4, e: 5 };
@@ -488,7 +483,6 @@ fn bench_property_access_1k(c: &mut Criterion) {
     });
 }
 
-#[allow(dead_code)]
 fn bench_object_creation_1k(c: &mut Criterion) {
     let source = r#"
         var last;
@@ -504,7 +498,6 @@ fn bench_object_creation_1k(c: &mut Criterion) {
     });
 }
 
-#[allow(dead_code)]
 fn bench_array_push_sum_1k(c: &mut Criterion) {
     let source = r#"
         var arr = [];
@@ -524,7 +517,6 @@ fn bench_array_push_sum_1k(c: &mut Criterion) {
     });
 }
 
-#[allow(dead_code)]
 fn bench_string_concat_5k(c: &mut Criterion) {
     let source = r#"
         var s = "";
@@ -540,7 +532,6 @@ fn bench_string_concat_5k(c: &mut Criterion) {
     });
 }
 
-#[allow(dead_code)]
 fn bench_function_calls_1k(c: &mut Criterion) {
     let source = r#"
         function add(a, b) { return a + b; }
@@ -557,7 +548,6 @@ fn bench_function_calls_1k(c: &mut Criterion) {
     });
 }
 
-#[allow(dead_code)]
 fn bench_closure_counter_1k(c: &mut Criterion) {
     let source = r#"
         function make_counter() {
@@ -578,7 +568,6 @@ fn bench_closure_counter_1k(c: &mut Criterion) {
     });
 }
 
-#[allow(dead_code)]
 fn bench_prototype_chain_1k(c: &mut Criterion) {
     let source = r#"
         function Base() {}
@@ -601,7 +590,6 @@ fn bench_prototype_chain_1k(c: &mut Criterion) {
     });
 }
 
-#[allow(dead_code)]
 fn bench_sieve_primes_1k(c: &mut Criterion) {
     let source = r#"
         var n = 1000;
@@ -629,7 +617,6 @@ fn bench_sieve_primes_1k(c: &mut Criterion) {
     });
 }
 
-#[allow(dead_code)]
 fn bench_deep_object_access_1k(c: &mut Criterion) {
     let source = r#"
         var root = { a: { b: { c: { d: { e: 99 } } } } };
@@ -696,15 +683,45 @@ criterion_group! {
         bench_js_closure_capture,
 }
 
-// V8 comparison benchmarks — only available via the standalone Node.js script
-// at benchmarks/v8_comparison/benchmarks.js. Stator's interpreter is too slow
-// for Criterion's CI budget on function-call-heavy and O(n²) string benchmarks.
-// The infrastructure and small-scale JS benchmarks above provide regression
-// tracking; the Node.js script provides cross-engine comparison.
+fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
+    let source = r#"
+        var n = 0;
+        for (var i = 0; i < 10000; i++) {
+            n = (n + i * 3 - 1) | 0;
+        }
+        n;
+    "#;
+    let program = recursive_descent::parse(source).unwrap();
+    let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    c.bench_function("arithmetic_loop_10k_precompiled", |b| {
+        b.iter(|| {
+            let mut frame = InterpreterFrame::new(bytecode.clone(), vec![]);
+            black_box(Interpreter::run(&mut frame).unwrap());
+        });
+    });
+}
+
+criterion_group! {
+    name = v8_comparison_benches;
+    config = ci_config();
+    targets =
+        bench_fib_40_iterative,
+        bench_arithmetic_loop_10k,
+        bench_js_arithmetic_precompiled,
+        bench_property_access_1k,
+        bench_object_creation_1k,
+        bench_array_push_sum_1k,
+        bench_function_calls_1k,
+        bench_closure_counter_1k,
+        bench_prototype_chain_1k,
+        bench_sieve_primes_1k,
+        bench_deep_object_access_1k,
+}
 
 criterion_main!(
     infra_benches,
     property_map_benches,
     jsvalue_benches,
-    js_benches
+    js_benches,
+    v8_comparison_benches
 );
