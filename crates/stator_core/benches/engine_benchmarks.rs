@@ -717,10 +717,209 @@ criterion_group! {
         bench_deep_object_access_1k,
 }
 
+// ===========================================================================
+// Pre-compiled V8 comparison benchmarks
+// ===========================================================================
+// These skip parse+compile and measure pure interpreter speed, giving a fairer
+// comparison against V8's JIT-compiled hot code.  JS sources match
+// benchmarks/v8_comparison/benchmarks.js exactly.
+
+fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
+    let source = r#"
+        var a = 0, b = 1;
+        for (var i = 0; i < 40; i++) {
+            var t = a + b;
+            a = b;
+            b = t;
+        }
+        b;
+    "#;
+    let program = recursive_descent::parse(source).unwrap();
+    let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    c.bench_function("fib_40_iterative_precompiled", |b| {
+        b.iter(|| {
+            let mut frame = InterpreterFrame::new(bytecode.clone(), vec![]);
+            black_box(Interpreter::run(black_box(&mut frame)).unwrap())
+        });
+    });
+}
+
+fn bench_property_access_1k_precompiled(c: &mut Criterion) {
+    let source = r#"
+        var obj = { a: 1, b: 2, c: 3, d: 4, e: 5 };
+        var sum = 0;
+        for (var i = 0; i < 1000; i++) {
+            sum = sum + obj.a + obj.b + obj.c + obj.d + obj.e;
+        }
+        sum;
+    "#;
+    let program = recursive_descent::parse(source).unwrap();
+    let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    c.bench_function("property_access_1k_precompiled", |b| {
+        b.iter(|| {
+            let mut frame = InterpreterFrame::new(bytecode.clone(), vec![]);
+            black_box(Interpreter::run(black_box(&mut frame)).unwrap())
+        });
+    });
+}
+
+fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
+    let source = r#"
+        var last;
+        for (var i = 0; i < 1000; i++) {
+            last = { x: i, y: i + 1, z: i * 2 };
+        }
+        last.x + last.y + last.z;
+    "#;
+    let program = recursive_descent::parse(source).unwrap();
+    let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    c.bench_function("object_creation_1k_precompiled", |b| {
+        b.iter(|| {
+            let mut frame = InterpreterFrame::new(bytecode.clone(), vec![]);
+            black_box(Interpreter::run(black_box(&mut frame)).unwrap())
+        });
+    });
+}
+
+fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
+    let source = r#"
+        var arr = [];
+        for (var i = 0; i < 1000; i++) {
+            arr.push(i);
+        }
+        var sum = 0;
+        for (var i = 0; i < arr.length; i++) {
+            sum = sum + arr[i];
+        }
+        sum;
+    "#;
+    let program = recursive_descent::parse(source).unwrap();
+    let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    c.bench_function("array_push_sum_1k_precompiled", |b| {
+        b.iter(|| {
+            let mut frame = InterpreterFrame::new(bytecode.clone(), vec![]);
+            black_box(Interpreter::run(black_box(&mut frame)).unwrap())
+        });
+    });
+}
+
+fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
+    let source = r#"
+        function make_counter() {
+            var count = 0;
+            return function() { count = count + 1; return count; };
+        }
+        var counter = make_counter();
+        var result = 0;
+        for (var i = 0; i < 1000; i++) {
+            result = counter();
+        }
+        result;
+    "#;
+    let program = recursive_descent::parse(source).unwrap();
+    let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    c.bench_function("closure_counter_1k_precompiled", |b| {
+        b.iter(|| {
+            let mut frame = InterpreterFrame::new(bytecode.clone(), vec![]);
+            black_box(Interpreter::run(black_box(&mut frame)).unwrap())
+        });
+    });
+}
+
+fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
+    let source = r#"
+        function Base() {}
+        Base.prototype.x = 42;
+        function Mid() {}
+        Mid.prototype = new Base();
+        function Leaf() {}
+        Leaf.prototype = new Mid();
+        var obj = new Leaf();
+        var sum = 0;
+        for (var i = 0; i < 1000; i++) {
+            sum = sum + obj.x;
+        }
+        sum;
+    "#;
+    let program = recursive_descent::parse(source).unwrap();
+    let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    c.bench_function("prototype_chain_1k_precompiled", |b| {
+        b.iter(|| {
+            let mut frame = InterpreterFrame::new(bytecode.clone(), vec![]);
+            black_box(Interpreter::run(black_box(&mut frame)).unwrap())
+        });
+    });
+}
+
+fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
+    let source = r#"
+        var n = 1000;
+        var sieve = [];
+        for (var i = 0; i <= n; i++) sieve[i] = true;
+        sieve[0] = false;
+        sieve[1] = false;
+        for (var i = 2; i * i <= n; i++) {
+            if (sieve[i]) {
+                for (var j = i * i; j <= n; j = j + i) {
+                    sieve[j] = false;
+                }
+            }
+        }
+        var count = 0;
+        for (var i = 0; i <= n; i++) {
+            if (sieve[i]) count = count + 1;
+        }
+        count;
+    "#;
+    let program = recursive_descent::parse(source).unwrap();
+    let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    c.bench_function("sieve_primes_1k_precompiled", |b| {
+        b.iter(|| {
+            let mut frame = InterpreterFrame::new(bytecode.clone(), vec![]);
+            black_box(Interpreter::run(black_box(&mut frame)).unwrap())
+        });
+    });
+}
+
+fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
+    let source = r#"
+        var root = { a: { b: { c: { d: { e: 99 } } } } };
+        var sum = 0;
+        for (var i = 0; i < 1000; i++) {
+            sum = sum + root.a.b.c.d.e;
+        }
+        sum;
+    "#;
+    let program = recursive_descent::parse(source).unwrap();
+    let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    c.bench_function("deep_object_access_1k_precompiled", |b| {
+        b.iter(|| {
+            let mut frame = InterpreterFrame::new(bytecode.clone(), vec![]);
+            black_box(Interpreter::run(black_box(&mut frame)).unwrap())
+        });
+    });
+}
+
+criterion_group! {
+    name = v8_precompiled_benches;
+    config = ci_config();
+    targets =
+        bench_fib_40_iterative_precompiled,
+        bench_js_arithmetic_precompiled,
+        bench_property_access_1k_precompiled,
+        bench_object_creation_1k_precompiled,
+        bench_array_push_sum_1k_precompiled,
+        bench_closure_counter_1k_precompiled,
+        bench_prototype_chain_1k_precompiled,
+        bench_sieve_primes_1k_precompiled,
+        bench_deep_object_access_1k_precompiled,
+}
+
 criterion_main!(
     infra_benches,
     property_map_benches,
     jsvalue_benches,
     js_benches,
-    v8_comparison_benches
+    v8_comparison_benches,
+    v8_precompiled_benches
 );
