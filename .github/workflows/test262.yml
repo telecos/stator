@@ -27,7 +27,7 @@ jobs:
   test262:
     name: Test262 conformance
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -81,7 +81,8 @@ jobs:
               # 124=timeout, 134=SIGABRT, 137=SIGKILL, 139=SIGSEGV
               CRASHES=$((CRASHES + 1))
               if [ -f "$PROGRESS_FILE" ]; then
-                CRASHED_AT=$(cat "$PROGRESS_FILE")
+                # Progress file format: INDEX PASS FAIL SKIP
+                CRASHED_AT=$(awk '{print $1}' "$PROGRESS_FILE")
                 SKIP=$((CRASHED_AT + 1))
                 echo "::warning::Runner exited ($rc) at test $CRASHED_AT — restarting from $SKIP (crash $CRASHES/$MAX_RESTARTS)"
               else

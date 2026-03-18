@@ -1380,6 +1380,22 @@ fn main_inner() {
     let mut pass: u64 = 0;
     let mut fail: u64 = 0;
     let mut skip: u64 = 0;
+
+    // ── Crash recovery: read accumulated results from progress file ───────
+    // The progress file format is: INDEX PASS FAIL SKIP
+    // This lets us accumulate results across crash-restart cycles.
+    if cli.skip_first > 0
+        && let Some(ref pf) = cli.progress_file
+        && let Ok(contents) = std::fs::read_to_string(pf)
+    {
+        let parts: Vec<&str> = contents.split_whitespace().collect();
+        if parts.len() >= 4 {
+            pass = parts[1].parse().unwrap_or(0);
+            fail = parts[2].parse().unwrap_or(0);
+            skip = parts[3].parse().unwrap_or(0);
+            println!("stator_test262: resuming with pass={pass} fail={fail} skip={skip}");
+        }
+    }
     let run_start = std::time::Instant::now();
 
     let mut harness = HarnessCache::new(harness_dir);
@@ -1431,14 +1447,24 @@ fn main_inner() {
     // ── Run each test ─────────────────────────────────────────────────────────
     // Jump directly to the first un-skipped test (O(1) restart).
     let start_idx = cli.skip_first.min(test_files.len());
-    skip += start_idx as u64;
+    // The crashed test itself counts as a fail (it never completed).
+    // Only bump fail if this is a restart (skip_first > 0) and we didn't
+    // already account for the crash in the progress counts.
+    if cli.skip_first > 0 && pass + fail + skip < cli.skip_first as u64 {
+        // Progress file didn't have counts — legacy format or missing.
+        // Count all skipped tests as skip.
+        skip = start_idx as u64;
+    } else if cli.skip_first > 0 {
+        // The crashed test counts as a fail.
+        fail += 1;
+    }
     for (offset, path) in test_files[start_idx..].iter().enumerate() {
         let idx = start_idx + offset;
 
-        // Write current test index to progress file so the crash-restart
-        // wrapper knows where to resume.
+        // Write current test index + accumulated results to progress file.
+        // Format: INDEX PASS FAIL SKIP
         if let Some(ref pf) = cli.progress_file {
-            let _ = std::fs::write(pf, idx.to_string());
+            let _ = std::fs::write(pf, format!("{idx} {pass} {fail} {skip}"));
         }
 
         // ── Early skip: path-based filtering ──────────────────────────────────
@@ -1460,9 +1486,9 @@ fn main_inner() {
             skip += 1;
             // Check the global timeout even on skipped tests so we don't
             // silently ignore it when a large block is skipped.
-            if run_start.elapsed().as_secs() > 18 * 60 {
+            if run_start.elapsed().as_secs() > 28 * 60 {
                 eprintln!(
-                    "Runner timeout after 18 min — stopping with {}/{total} tests processed  \
+                    "Runner timeout after 28 min — stopping with {}/{total} tests processed  \
                      (pass={pass} fail={fail} skip={skip})",
                     idx + 1
                 );
@@ -1560,9 +1586,9 @@ fn main_inner() {
 
         // Global runner timeout: stop processing after 18 minutes to leave
         // headroom for CI's 20-minute limit and ensure we print a summary.
-        if run_start.elapsed().as_secs() > 18 * 60 {
+        if run_start.elapsed().as_secs() > 28 * 60 {
             eprintln!(
-                "Runner timeout after 18 min — stopping with {}/{total} tests processed  \
+                "Runner timeout after 28 min — stopping with {}/{total} tests processed  \
                  (pass={pass} fail={fail} skip={skip})",
                 idx + 1
             );
