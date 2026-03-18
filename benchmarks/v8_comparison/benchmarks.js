@@ -29,12 +29,12 @@ function measure(name, fn, iterations) {
 const results = [];
 
 // ─── 1. Fibonacci (recursive) ────────────────────────────────────────────
-results.push(measure("fib_20_recursive", () => {
+results.push(measure("fib_10_recursive", () => {
   function fib(n) {
     if (n < 2) return n;
     return fib(n - 1) + fib(n - 2);
   }
-  return fib(20);
+  return fib(10);
 }, 200));
 
 // ─── 2. Fibonacci (iterative) ────────────────────────────────────────────

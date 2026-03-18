@@ -415,15 +415,15 @@ fn bench_js_closure_capture(c: &mut Criterion) {
 // These benchmarks mirror the JS snippets in benchmarks/v8_comparison/benchmarks.js
 // so that Stator's Criterion numbers can be compared to V8 (Node.js) results.
 
-fn bench_fib_20_recursive(c: &mut Criterion) {
+fn bench_fib_10_recursive(c: &mut Criterion) {
     let source = r#"
         function fib(n) {
             if (n < 2) return n;
             return fib(n - 1) + fib(n - 2);
         }
-        fib(20);
+        fib(10);
     "#;
-    c.bench_function("fib_20_recursive", |b| {
+    c.bench_function("fib_10_recursive", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
         });
@@ -683,7 +683,7 @@ criterion_group! {
     name = v8_comparison_benches;
     config = ci_config();
     targets =
-        bench_fib_20_recursive,
+        bench_fib_10_recursive,
         bench_fib_40_iterative,
         bench_arithmetic_loop_10k,
         bench_property_access_1k,
