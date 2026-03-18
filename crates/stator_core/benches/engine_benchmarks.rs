@@ -437,6 +437,7 @@ fn bench_fib_10_recursive(c: &mut Criterion) {
     });
 }
 
+#[allow(dead_code)]
 fn bench_fib_40_iterative(c: &mut Criterion) {
     let source = r#"
         var a = 0, b = 1;
@@ -454,6 +455,7 @@ fn bench_fib_40_iterative(c: &mut Criterion) {
     });
 }
 
+#[allow(dead_code)]
 fn bench_arithmetic_loop_10k(c: &mut Criterion) {
     let source = r#"
         var n = 0;
@@ -469,6 +471,7 @@ fn bench_arithmetic_loop_10k(c: &mut Criterion) {
     });
 }
 
+#[allow(dead_code)]
 fn bench_property_access_1k(c: &mut Criterion) {
     let source = r#"
         var obj = { a: 1, b: 2, c: 3, d: 4, e: 5 };
@@ -485,6 +488,7 @@ fn bench_property_access_1k(c: &mut Criterion) {
     });
 }
 
+#[allow(dead_code)]
 fn bench_object_creation_1k(c: &mut Criterion) {
     let source = r#"
         var last;
@@ -500,6 +504,7 @@ fn bench_object_creation_1k(c: &mut Criterion) {
     });
 }
 
+#[allow(dead_code)]
 fn bench_array_push_sum_1k(c: &mut Criterion) {
     let source = r#"
         var arr = [];
@@ -519,6 +524,7 @@ fn bench_array_push_sum_1k(c: &mut Criterion) {
     });
 }
 
+#[allow(dead_code)]
 fn bench_string_concat_5k(c: &mut Criterion) {
     let source = r#"
         var s = "";
@@ -572,6 +578,7 @@ fn bench_closure_counter_1k(c: &mut Criterion) {
     });
 }
 
+#[allow(dead_code)]
 fn bench_prototype_chain_1k(c: &mut Criterion) {
     let source = r#"
         function Base() {}
@@ -594,6 +601,7 @@ fn bench_prototype_chain_1k(c: &mut Criterion) {
     });
 }
 
+#[allow(dead_code)]
 fn bench_sieve_primes_1k(c: &mut Criterion) {
     let source = r#"
         var n = 1000;
@@ -621,6 +629,7 @@ fn bench_sieve_primes_1k(c: &mut Criterion) {
     });
 }
 
+#[allow(dead_code)]
 fn bench_deep_object_access_1k(c: &mut Criterion) {
     let source = r#"
         var root = { a: { b: { c: { d: { e: 99 } } } } };
@@ -687,29 +696,15 @@ criterion_group! {
         bench_js_closure_capture,
 }
 
-// V8 comparison benchmarks — only loop-based benchmarks that complete within
-// Criterion's time budget. Recursive/function-call-heavy benchmarks are too
-// slow for the interpreter (~300ms per function call) and are run via the
-// standalone Node.js script instead.
-criterion_group! {
-    name = v8_comparison_benches;
-    config = ci_config();
-    targets =
-        bench_fib_40_iterative,
-        bench_arithmetic_loop_10k,
-        bench_property_access_1k,
-        bench_object_creation_1k,
-        bench_array_push_sum_1k,
-        bench_string_concat_5k,
-        bench_prototype_chain_1k,
-        bench_sieve_primes_1k,
-        bench_deep_object_access_1k,
-}
+// V8 comparison benchmarks — only available via the standalone Node.js script
+// at benchmarks/v8_comparison/benchmarks.js. Stator's interpreter is too slow
+// for Criterion's CI budget on function-call-heavy and O(n²) string benchmarks.
+// The infrastructure and small-scale JS benchmarks above provide regression
+// tracking; the Node.js script provides cross-engine comparison.
 
 criterion_main!(
     infra_benches,
     property_map_benches,
     jsvalue_benches,
-    js_benches,
-    v8_comparison_benches
+    js_benches
 );
