@@ -3175,7 +3175,8 @@ fn handle_lda_named_property(
             .and_then(|opt| opt.as_ref())
     {
         let pm = map.borrow();
-        if pm.shape_id() == ic.cached_shape
+        if pm.layout_id() == ic.cached_shape
+            && pm.matches_key_at_offset(ic.cached_offset, prop_name.as_ref())
             && let Some(val) = pm.get_by_offset(ic.cached_offset)
         {
             let v = val.clone();
@@ -3233,7 +3234,7 @@ fn handle_lda_named_property(
             && let Some(entry) = ctx.frame.shape_load_ic.get_mut(slot as usize)
         {
             *entry = Some(PropertyIc {
-                cached_shape: pm.shape_id(),
+                cached_shape: pm.layout_id(),
                 cached_offset: offset,
             });
         }
@@ -3323,7 +3324,9 @@ fn handle_sta_named_property(
                     .and_then(|opt| opt.as_ref())
             {
                 let pm = map.borrow();
-                if pm.shape_id() == ic.cached_shape {
+                if pm.layout_id() == ic.cached_shape
+                    && pm.matches_key_at_offset(ic.cached_offset, prop_name.as_ref())
+                {
                     if pm.is_writable_by_offset(ic.cached_offset) {
                         drop(pm);
                         map.borrow_mut().set_by_offset(ic.cached_offset, val);
@@ -3427,7 +3430,7 @@ fn handle_sta_named_property(
                     && let Some(entry) = ctx.frame.shape_store_ic.get_mut(slot as usize)
                 {
                     *entry = Some(PropertyIc {
-                        cached_shape: pm.shape_id(),
+                        cached_shape: pm.layout_id(),
                         cached_offset: offset,
                     });
                 }
