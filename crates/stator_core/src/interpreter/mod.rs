@@ -1331,6 +1331,21 @@ pub struct InterpreterFrame {
     /// Pre-decoded string constants from the constant pool, keyed by index.
     /// Avoids repeated `String::clone()` from the constant pool.
     pub string_cache: Option<HashMap<u32, Rc<str>>>,
+    /// Cache of recently-accessed global variable values.
+    /// Avoids repeated `Rc→RefCell→HashMap` lookups for hot globals.
+    /// Format: `[(name_hash, name, value); 8]` — direct-mapped by hash.
+    pub global_cache: [(u64, Option<Rc<str>>, JsValue); 8],
+}
+
+/// FNV-1a hash for short strings used by the global variable cache.
+#[inline(always)]
+fn fxhash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
 }
 
 impl InterpreterFrame {
@@ -1371,6 +1386,16 @@ impl InterpreterFrame {
             shape_load_ic: None,
             shape_store_ic: None,
             string_cache: None,
+            global_cache: [
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+            ],
         }
     }
 
@@ -1494,6 +1519,27 @@ impl InterpreterFrame {
             .get_or_insert_with(HashMap::new)
             .insert(idx, Rc::clone(&s));
         Ok(s)
+    }
+
+    /// Try to read a global from the per-frame direct-mapped cache.
+    #[inline(always)]
+    pub fn global_cache_get(&self, name: &str) -> Option<&JsValue> {
+        let hash = fxhash(name);
+        let idx = (hash as usize) & 7;
+        let (cached_hash, ref cached_name, ref cached_value) = self.global_cache[idx];
+        if cached_hash == hash && cached_name.as_ref().is_some_and(|n| &**n == name) {
+            Some(cached_value)
+        } else {
+            None
+        }
+    }
+
+    /// Insert or update a global in the per-frame direct-mapped cache.
+    #[inline(always)]
+    pub fn global_cache_put(&mut self, name: &str, value: JsValue) {
+        let hash = fxhash(name);
+        let idx = (hash as usize) & 7;
+        self.global_cache[idx] = (hash, Some(Rc::from(name)), value);
     }
 }
 
@@ -1708,6 +1754,16 @@ impl Interpreter {
             shape_load_ic: None,
             shape_store_ic: None,
             string_cache: None,
+            global_cache: [
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+            ],
         };
         // Restore the captured closure context so generators can access outer
         // scope variables through the context chain.

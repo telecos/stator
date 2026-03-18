@@ -2901,13 +2901,26 @@ fn handle_lda_global(
         return Err(err_bad_operand("LdaGlobal", 0));
     };
     let name = ctx.frame.get_string_constant(name_idx)?;
-    ctx.frame.accumulator = ctx
+    // Fast path: check per-frame global cache.
+    if let Some(val) = ctx.frame.global_cache_get(name.as_ref()) {
+        ctx.frame.accumulator = val.clone();
+        if name.as_ref() == "this" && ctx.frame.accumulator == JsValue::TheHole {
+            return Err(StatorError::ReferenceError(
+                "Must call super constructor in derived class before accessing 'this'".into(),
+            ));
+        }
+        return Ok(DispatchAction::Continue);
+    }
+    // Slow path: HashMap lookup, then populate cache.
+    let val = ctx
         .frame
         .global_env
         .borrow()
         .get(name.as_ref())
         .cloned()
         .unwrap_or(JsValue::Undefined);
+    ctx.frame.global_cache_put(name.as_ref(), val.clone());
+    ctx.frame.accumulator = val;
     if name.as_ref() == "this" && ctx.frame.accumulator == JsValue::TheHole {
         return Err(StatorError::ReferenceError(
             "Must call super constructor in derived class before accessing 'this'".into(),
@@ -2929,13 +2942,21 @@ fn handle_lda_global_inside_typeof(
         return Err(err_bad_operand("LdaGlobalInsideTypeof", 0));
     };
     let name = ctx.frame.get_string_constant(name_idx)?;
-    ctx.frame.accumulator = ctx
+    // Fast path: check per-frame global cache.
+    if let Some(val) = ctx.frame.global_cache_get(name.as_ref()) {
+        ctx.frame.accumulator = val.clone();
+        return Ok(DispatchAction::Continue);
+    }
+    // Slow path: HashMap lookup, then populate cache.
+    let val = ctx
         .frame
         .global_env
         .borrow()
         .get(name.as_ref())
         .cloned()
         .unwrap_or(JsValue::Undefined);
+    ctx.frame.global_cache_put(name.as_ref(), val.clone());
+    ctx.frame.accumulator = val;
     Ok(DispatchAction::Continue)
 }
 
@@ -2963,7 +2984,10 @@ fn handle_sta_global(
         )));
     }
     set_function_name_if_missing(&val, &name);
-    env.insert(name, val);
+    env.insert(name.clone(), val.clone());
+    drop(env);
+    // Keep the global cache in sync with the HashMap.
+    ctx.frame.global_cache_put(&name, val);
     Ok(DispatchAction::Continue)
 }
 
@@ -5656,7 +5680,10 @@ fn handle_sta_lookup_slot(
             "{name} is not defined"
         )));
     }
-    env.insert(name, val);
+    env.insert(name.clone(), val.clone());
+    drop(env);
+    // Keep the global cache in sync with the HashMap.
+    ctx.frame.global_cache_put(&name, val);
     Ok(DispatchAction::Continue)
 }
 
@@ -5820,8 +5847,18 @@ fn handle_lda_lookup_global_slot(
             ));
         }
     };
-    ctx.frame.accumulator = match ctx.frame.global_env.borrow().get(&name) {
-        Some(v) => v.clone(),
+    // Fast path: check per-frame global cache.
+    if let Some(val) = ctx.frame.global_cache_get(&name) {
+        ctx.frame.accumulator = val.clone();
+        return Ok(DispatchAction::Continue);
+    }
+    // Slow path: HashMap lookup, then populate cache.
+    let lookup_result = ctx.frame.global_env.borrow().get(&name).cloned();
+    ctx.frame.accumulator = match lookup_result {
+        Some(v) => {
+            ctx.frame.global_cache_put(&name, v.clone());
+            v
+        }
         None => {
             return Err(StatorError::ReferenceError(format!(
                 "{name} is not defined"
@@ -5846,13 +5883,21 @@ fn handle_lda_lookup_global_slot_inside_typeof(
             ));
         }
     };
-    ctx.frame.accumulator = ctx
+    // Fast path: check per-frame global cache.
+    if let Some(val) = ctx.frame.global_cache_get(&name) {
+        ctx.frame.accumulator = val.clone();
+        return Ok(DispatchAction::Continue);
+    }
+    // Slow path: HashMap lookup, then populate cache.
+    let val = ctx
         .frame
         .global_env
         .borrow()
         .get(&name)
         .cloned()
         .unwrap_or(JsValue::Undefined);
+    ctx.frame.global_cache_put(&name, val.clone());
+    ctx.frame.accumulator = val;
     Ok(DispatchAction::Continue)
 }
 
