@@ -1636,11 +1636,12 @@ impl Interpreter {
             // Outer loop: re-entered when a TailCall opcode rewrites the frame
             // with a new bytecode array (proper tail-call trampoline).
             'tail_call: loop {
-                // Pre-decode the bytecode once and capture byte offsets for jump
-                // resolution. The decoded instruction stream is cached on the
-                // bytecode array and shared across cloned frames.
+                // Pre-decode the bytecode once and capture byte offsets plus
+                // pre-computed jump targets. The decoded instruction stream is
+                // cached on the bytecode array and shared across cloned frames.
                 let decoded = frame.bytecode_array.shared_decoded_instructions()?;
-                let (instructions, byte_offsets) = (&decoded.0[..], &decoded.1[..]);
+                let (instructions, byte_offsets, jump_targets) =
+                    (&decoded.0[..], &decoded.1[..], &decoded.2);
                 let handler_table = frame.bytecode_array.shared_handler_table();
 
                 loop {
@@ -1711,6 +1712,7 @@ impl Interpreter {
                         frame,
                         instructions,
                         byte_offsets,
+                        jump_targets,
                         handler_table: handler_table.as_slice(),
                     };
                     match handler(&mut dctx, instr) {
@@ -2272,7 +2274,7 @@ pub(super) fn collect_args(
     Ok(frame.registers[start_flat..end_flat].to_vec())
 }
 
-/// Resolve a [`Operand::JumpOffset`] delta to an instruction index.
+/// Resolve a jump delta loaded from the constant pool to an instruction index.
 ///
 /// `pc_after_jump` is the current program counter **after** incrementing past
 /// the jump instruction.  `byte_offsets[pc_after_jump]` is the byte offset

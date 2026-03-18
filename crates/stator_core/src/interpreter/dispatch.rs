@@ -8,7 +8,7 @@
 #![allow(clippy::too_many_lines)]
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::builtins::string::{string_char_at, utf16_len};
@@ -73,6 +73,8 @@ pub(super) struct DispatchContext<'a> {
     pub instructions: &'a [Instruction],
     /// Byte-offset table parallel to `instructions`.
     pub byte_offsets: &'a [usize],
+    /// Pre-computed jump targets keyed by source instruction index.
+    pub jump_targets: &'a HashMap<usize, usize>,
     /// Exception handler table for the current function.
     #[allow(dead_code)]
     pub handler_table: &'a [HandlerTableEntry],
@@ -82,6 +84,23 @@ const PRIVATE_STORAGE_PREFIX: &str = ".private.";
 const PRIVATE_BRAND_PREFIX: &str = ".private.brand.";
 const PRIVATE_KIND_PREFIX: &str = ".private.kind.";
 const POLYMORPHIC_LOAD_CACHE_CAP: usize = 8;
+
+#[inline]
+fn resolve_cached_jump(ctx: &DispatchContext, opcode_name: &str) -> StatorResult<usize> {
+    let current_instr_index = ctx.frame.pc.checked_sub(1).ok_or_else(|| {
+        StatorError::Internal(format!(
+            "{opcode_name} executed before program counter advanced"
+        ))
+    })?;
+    ctx.jump_targets
+        .get(&current_instr_index)
+        .copied()
+        .ok_or_else(|| {
+            StatorError::Internal(format!(
+                "missing cached jump target for {opcode_name} at instruction {current_instr_index}"
+            ))
+        })
+}
 
 fn is_private_storage_key(key: &str) -> bool {
     key.starts_with(PRIVATE_STORAGE_PREFIX)
@@ -1142,15 +1161,10 @@ fn handle_to_boolean_logical_not(
 
 #[inline]
 fn handle_jump(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = instr.operands[0] else {
         return Err(err_bad_operand("Jump", 0));
     };
-    ctx.frame.pc = resolve_jump(
-        ctx.frame.pc,
-        delta,
-        ctx.byte_offsets,
-        ctx.instructions.len(),
-    )?;
+    ctx.frame.pc = resolve_cached_jump(ctx, "Jump")?;
     Ok(DispatchAction::Continue)
 }
 
@@ -1158,15 +1172,10 @@ fn handle_jump_loop(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = instr.operands[0] else {
         return Err(err_bad_operand("JumpLoop", 0));
     };
-    ctx.frame.pc = resolve_jump(
-        ctx.frame.pc,
-        delta,
-        ctx.byte_offsets,
-        ctx.instructions.len(),
-    )?;
+    ctx.frame.pc = resolve_cached_jump(ctx, "JumpLoop")?;
     ctx.frame.osr_loop_count = ctx.frame.osr_loop_count.saturating_add(1);
     if ctx.frame.osr_loop_count >= OSR_LOOP_THRESHOLD
         && ctx.frame.bytecode_array.try_get_jit_code().is_none()
@@ -1187,16 +1196,11 @@ fn handle_jump_if_true(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = instr.operands[0] else {
         return Err(err_bad_operand("JumpIfTrue", 0));
     };
     if matches!(ctx.frame.accumulator, JsValue::Boolean(true)) {
-        ctx.frame.pc = resolve_jump(
-            ctx.frame.pc,
-            delta,
-            ctx.byte_offsets,
-            ctx.instructions.len(),
-        )?;
+        ctx.frame.pc = resolve_cached_jump(ctx, "JumpIfTrue")?;
     }
     Ok(DispatchAction::Continue)
 }
@@ -1206,16 +1210,11 @@ fn handle_jump_if_false(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = instr.operands[0] else {
         return Err(err_bad_operand("JumpIfFalse", 0));
     };
     if matches!(ctx.frame.accumulator, JsValue::Boolean(false)) {
-        ctx.frame.pc = resolve_jump(
-            ctx.frame.pc,
-            delta,
-            ctx.byte_offsets,
-            ctx.instructions.len(),
-        )?;
+        ctx.frame.pc = resolve_cached_jump(ctx, "JumpIfFalse")?;
     }
     Ok(DispatchAction::Continue)
 }
@@ -1225,16 +1224,11 @@ fn handle_jump_if_to_boolean_true(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = instr.operands[0] else {
         return Err(err_bad_operand("JumpIfToBooleanTrue", 0));
     };
     if ctx.frame.accumulator.to_boolean() {
-        ctx.frame.pc = resolve_jump(
-            ctx.frame.pc,
-            delta,
-            ctx.byte_offsets,
-            ctx.instructions.len(),
-        )?;
+        ctx.frame.pc = resolve_cached_jump(ctx, "JumpIfToBooleanTrue")?;
     }
     Ok(DispatchAction::Continue)
 }
@@ -1244,16 +1238,11 @@ fn handle_jump_if_to_boolean_false(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = instr.operands[0] else {
         return Err(err_bad_operand("JumpIfToBooleanFalse", 0));
     };
     if !ctx.frame.accumulator.to_boolean() {
-        ctx.frame.pc = resolve_jump(
-            ctx.frame.pc,
-            delta,
-            ctx.byte_offsets,
-            ctx.instructions.len(),
-        )?;
+        ctx.frame.pc = resolve_cached_jump(ctx, "JumpIfToBooleanFalse")?;
     }
     Ok(DispatchAction::Continue)
 }
@@ -1262,16 +1251,11 @@ fn handle_jump_if_null(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = instr.operands[0] else {
         return Err(err_bad_operand("JumpIfNull", 0));
     };
     if ctx.frame.accumulator.is_null() {
-        ctx.frame.pc = resolve_jump(
-            ctx.frame.pc,
-            delta,
-            ctx.byte_offsets,
-            ctx.instructions.len(),
-        )?;
+        ctx.frame.pc = resolve_cached_jump(ctx, "JumpIfNull")?;
     }
     Ok(DispatchAction::Continue)
 }
@@ -1280,16 +1264,11 @@ fn handle_jump_if_not_null(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = instr.operands[0] else {
         return Err(err_bad_operand("JumpIfNotNull", 0));
     };
     if !ctx.frame.accumulator.is_null() {
-        ctx.frame.pc = resolve_jump(
-            ctx.frame.pc,
-            delta,
-            ctx.byte_offsets,
-            ctx.instructions.len(),
-        )?;
+        ctx.frame.pc = resolve_cached_jump(ctx, "JumpIfNotNull")?;
     }
     Ok(DispatchAction::Continue)
 }
@@ -1298,16 +1277,11 @@ fn handle_jump_if_undefined(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = instr.operands[0] else {
         return Err(err_bad_operand("JumpIfUndefined", 0));
     };
     if ctx.frame.accumulator.is_undefined() {
-        ctx.frame.pc = resolve_jump(
-            ctx.frame.pc,
-            delta,
-            ctx.byte_offsets,
-            ctx.instructions.len(),
-        )?;
+        ctx.frame.pc = resolve_cached_jump(ctx, "JumpIfUndefined")?;
     }
     Ok(DispatchAction::Continue)
 }
@@ -1316,16 +1290,11 @@ fn handle_jump_if_not_undefined(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = instr.operands[0] else {
         return Err(err_bad_operand("JumpIfNotUndefined", 0));
     };
     if !ctx.frame.accumulator.is_undefined() {
-        ctx.frame.pc = resolve_jump(
-            ctx.frame.pc,
-            delta,
-            ctx.byte_offsets,
-            ctx.instructions.len(),
-        )?;
+        ctx.frame.pc = resolve_cached_jump(ctx, "JumpIfNotUndefined")?;
     }
     Ok(DispatchAction::Continue)
 }
@@ -1334,16 +1303,11 @@ fn handle_jump_if_undefined_or_null(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = instr.operands[0] else {
         return Err(err_bad_operand("JumpIfUndefinedOrNull", 0));
     };
     if ctx.frame.accumulator.is_nullish() {
-        ctx.frame.pc = resolve_jump(
-            ctx.frame.pc,
-            delta,
-            ctx.byte_offsets,
-            ctx.instructions.len(),
-        )?;
+        ctx.frame.pc = resolve_cached_jump(ctx, "JumpIfUndefinedOrNull")?;
     }
     Ok(DispatchAction::Continue)
 }
@@ -5172,7 +5136,7 @@ fn handle_jump_if_for_in_done(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = instr.operands[0] else {
         return Err(err_bad_operand("JumpIfForInDone", 0));
     };
     let Operand::Register(idx_v) = instr.operands[1] else {
@@ -5190,12 +5154,7 @@ fn handle_jump_if_for_in_done(
         _ => 0,
     };
     if idx >= len {
-        ctx.frame.pc = resolve_jump(
-            ctx.frame.pc,
-            delta,
-            ctx.byte_offsets,
-            ctx.instructions.len(),
-        )?;
+        ctx.frame.pc = resolve_cached_jump(ctx, "JumpIfForInDone")?;
     }
     Ok(DispatchAction::Continue)
 }
@@ -6040,16 +5999,11 @@ fn handle_jump_if_js_receiver(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = instr.operands[0] else {
         return Err(err_bad_operand("JumpIfJSReceiver", 0));
     };
     if is_js_receiver(&ctx.frame.accumulator) {
-        ctx.frame.pc = resolve_jump(
-            ctx.frame.pc,
-            delta,
-            ctx.byte_offsets,
-            ctx.instructions.len(),
-        )?;
+        ctx.frame.pc = resolve_cached_jump(ctx, "JumpIfJSReceiver")?;
     }
     Ok(DispatchAction::Continue)
 }

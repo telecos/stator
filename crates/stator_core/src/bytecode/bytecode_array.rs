@@ -44,10 +44,10 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::bytecode::bytecodes::{self, Instruction};
+use crate::bytecode::bytecodes::{self, Instruction, Operand};
 use crate::bytecode::feedback::FeedbackMetadata;
 use crate::compiler::turbofan::TurbofanCompiledCode;
-use crate::error::StatorResult;
+use crate::error::{StatorError, StatorResult};
 use crate::objects::value::JsContext;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -165,7 +165,10 @@ type JitCodeCache = Rc<RefCell<Option<(Vec<u8>, usize)>>>;
 /// The cache is filled on first decode and then shared by all clones of the
 /// bytecode array so repeated function calls avoid re-decoding the same
 /// bytecode stream.
-type DecodedBytecodeCache = Rc<OnceCell<Rc<(Vec<Instruction>, Vec<usize>)>>>;
+pub(crate) type JumpTargetMap = HashMap<usize, usize>;
+type DecodedBytecode = (Vec<Instruction>, Vec<usize>, JumpTargetMap);
+type DecodedBytecodeRef<'a> = (&'a [Instruction], &'a [usize], &'a JumpTargetMap);
+type DecodedBytecodeCache = Rc<OnceCell<Rc<DecodedBytecode>>>;
 
 /// Shared Maglev JIT code cache stored in a [`BytecodeArray`].
 ///
@@ -612,9 +615,34 @@ impl BytecodeArray {
         bytecodes::decode(&self.bytecodes)
     }
 
-    fn ensure_decoded_instructions(&self) -> StatorResult<&Rc<(Vec<Instruction>, Vec<usize>)>> {
+    fn ensure_decoded_instructions(&self) -> StatorResult<&Rc<DecodedBytecode>> {
         if self.cached_decode.get().is_none() {
-            let decoded = Rc::new(bytecodes::decode_with_byte_offsets(&self.bytecodes)?);
+            let (instructions, byte_offsets) =
+                bytecodes::decode_with_byte_offsets(&self.bytecodes)?;
+            let mut jump_targets = HashMap::new();
+            for (instruction_index, instruction) in instructions.iter().enumerate() {
+                for operand in &instruction.operands {
+                    let Operand::JumpOffset(delta) = operand else {
+                        continue;
+                    };
+                    let pc_after_jump = instruction_index + 1;
+                    let end_byte = *byte_offsets.get(pc_after_jump).ok_or_else(|| {
+                        StatorError::Internal(format!(
+                            "missing post-jump byte offset for instruction {instruction_index}"
+                        ))
+                    })?;
+                    let target_byte = (end_byte as i64 + i64::from(*delta)) as usize;
+                    let target_index = byte_offsets
+                        .binary_search(&target_byte)
+                        .map_err(|_| {
+                            StatorError::Internal(format!(
+                                "jump target byte offset {target_byte} is not at an instruction boundary"
+                            ))
+                        })?;
+                    jump_targets.insert(instruction_index, target_index);
+                }
+            }
+            let decoded = Rc::new((instructions, byte_offsets, jump_targets));
             let _ = self.cached_decode.set(decoded);
         }
         Ok(self
@@ -623,17 +651,15 @@ impl BytecodeArray {
             .expect("decoded bytecode cache must be initialized"))
     }
 
-    /// Decode the bytecode stream once and return cached instructions plus
-    /// byte offsets on subsequent calls.
-    pub fn decoded_instructions(&mut self) -> StatorResult<(&[Instruction], &[usize])> {
+    /// Decode the bytecode stream once and return cached instructions, byte
+    /// offsets, and pre-computed jump targets on subsequent calls.
+    pub fn decoded_instructions(&mut self) -> StatorResult<DecodedBytecodeRef<'_>> {
         let decoded = self.ensure_decoded_instructions()?;
-        Ok((decoded.0.as_slice(), decoded.1.as_slice()))
+        Ok((decoded.0.as_slice(), decoded.1.as_slice(), &decoded.2))
     }
 
     /// Return a shared handle to the cached decoded instruction stream.
-    pub(crate) fn shared_decoded_instructions(
-        &self,
-    ) -> StatorResult<Rc<(Vec<Instruction>, Vec<usize>)>> {
+    pub(crate) fn shared_decoded_instructions(&self) -> StatorResult<Rc<DecodedBytecode>> {
         Ok(Rc::clone(self.ensure_decoded_instructions()?))
     }
 
@@ -785,6 +811,29 @@ mod tests {
         )
     }
 
+    fn make_jump_array() -> BytecodeArray {
+        let instructions = vec![
+            Instruction::new_unchecked(Opcode::Jump, vec![Operand::JumpOffset(0)]),
+            Instruction::new_unchecked(Opcode::LdaZero, vec![]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let bytes = encode(&instructions);
+        let (_, offsets) = bytecodes::decode_with_byte_offsets(&bytes).expect("valid bytecode");
+        let target_byte = offsets[2];
+        let jump_end_byte = offsets[1];
+        let mut resolved = instructions;
+        resolved[0].operands[0] = Operand::JumpOffset(target_byte as i32 - jump_end_byte as i32);
+        BytecodeArray::new(
+            encode(&resolved),
+            vec![],
+            1,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        )
+    }
+
     #[test]
     fn test_create_bytecode_array() {
         let array = make_simple_array();
@@ -923,12 +972,14 @@ mod tests {
 
         // First call populates the cache (uses &mut self).
         {
-            let (instructions, offsets) = array.decoded_instructions().expect("valid bytecode");
+            let (instructions, offsets, jump_targets) =
+                array.decoded_instructions().expect("valid bytecode");
             assert_eq!(instructions.len(), 3);
             assert_eq!(instructions[0].opcode, Opcode::LdaSmi);
             assert_eq!(instructions[1].opcode, Opcode::Star);
             assert_eq!(instructions[2].opcode, Opcode::Return);
             assert_eq!(offsets, expected_offsets.as_slice());
+            assert!(jump_targets.is_empty());
         }
 
         // Second call returns the same cached Rc allocation.
@@ -940,6 +991,7 @@ mod tests {
             .expect("cached bytecode 2");
         assert!(std::ptr::eq(first.0.as_ptr(), second.0.as_ptr()));
         assert!(std::ptr::eq(first.1.as_ptr(), second.1.as_ptr()));
+        assert!(std::ptr::eq(&first.2, &second.2));
     }
 
     #[test]
@@ -959,5 +1011,17 @@ mod tests {
             decoded_orig.1.as_ptr(),
             decoded_clone.1.as_ptr()
         ));
+        assert!(std::ptr::eq(&decoded_orig.2, &decoded_clone.2));
+    }
+
+    #[test]
+    fn test_decoded_instructions_cache_includes_jump_targets() {
+        let mut array = make_jump_array();
+
+        let (instructions, _offsets, jump_targets) =
+            array.decoded_instructions().expect("valid bytecode");
+
+        assert_eq!(instructions[0].opcode, Opcode::Jump);
+        assert_eq!(jump_targets.get(&0), Some(&2));
     }
 }
