@@ -1448,6 +1448,13 @@ pub struct InterpreterFrame {
     /// Generation snapshot taken when the cache was last populated.
     /// Compared against `global_env.generation` to detect staleness.
     pub cache_generation: u64,
+    /// When true, the dispatch loop uses ultra-fast SMI-only paths.
+    /// Set when we detect a tight arithmetic loop with all-Smi values.
+    /// Cleared when any non-Smi value is encountered.
+    pub smi_mode: bool,
+    /// Tracks how many times each backward jump target has been taken
+    /// (for SMI mode detection).  Indexed by instruction PC, default 0.
+    loop_trip_counts: Vec<u16>,
 }
 
 /// FNV-1a hash for short strings used by the global variable cache.
@@ -1513,6 +1520,8 @@ impl InterpreterFrame {
                 (0, None, JsValue::Undefined),
             ],
             cache_generation: 0,
+            smi_mode: false,
+            loop_trip_counts: Vec::new(),
         }
     }
 
@@ -1584,6 +1593,8 @@ impl InterpreterFrame {
                 (0, None, JsValue::Undefined),
             ],
             cache_generation: 0,
+            smi_mode: false,
+            loop_trip_counts: Vec::new(),
         }
     }
 
@@ -1815,6 +1826,11 @@ impl Interpreter {
                         (&decoded.0[..], &decoded.1[..], decoded.2.as_slice());
                     let handler_table = frame.bytecode_array.shared_handler_table();
 
+                    // Ensure loop trip-count vector covers the instruction stream.
+                    if frame.loop_trip_counts.len() < instructions.len() {
+                        frame.loop_trip_counts.resize(instructions.len(), 0);
+                    }
+
                     // Cache the debugger-attached flag so we avoid a thread-local
                     // read on every instruction.  Refreshed in the periodic block.
                     let mut debug_active = DEBUG_ATTACHED.with(Cell::get);
@@ -1879,6 +1895,204 @@ impl Interpreter {
                         // with unsafe operand extraction to eliminate all overhead.
                         // Rare opcodes fall back to the table in `dispatch.rs`.
                         use crate::bytecode::bytecodes::{Opcode, Operand};
+
+                        // ── SMI-specialised fast dispatch ──────────────────────
+                        //
+                        // When `smi_mode` is active, the most common loop opcodes
+                        // are handled with zero pattern-matching on JsValue.  Any
+                        // opcode that cannot be served in SMI mode falls through
+                        // to the regular dispatch below after clearing the flag.
+                        if frame.smi_mode {
+                            match instr.opcode {
+                                Opcode::LdaSmi => {
+                                    // SAFETY: Bytecode generator guarantees operand[0]
+                                    // is Immediate for LdaSmi.
+                                    frame.accumulator =
+                                        JsValue::Smi(unsafe { operand_imm_unchecked(instr, 0) });
+                                    continue 'dispatch;
+                                }
+                                Opcode::Star => {
+                                    // SAFETY: Bytecode generator guarantees operand[0]
+                                    // is Register for Star, and register is in bounds.
+                                    let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                    let val = frame.accumulator.cheap_clone();
+                                    // SAFETY: Bytecode validator guarantees register is
+                                    // in bounds for this frame.
+                                    unsafe { frame.write_reg_unchecked(reg, val) };
+                                    continue 'dispatch;
+                                }
+                                Opcode::Ldar => {
+                                    // SAFETY: Bytecode generator guarantees operand[0]
+                                    // is Register for Ldar, and register is in bounds.
+                                    let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                    // SAFETY: Bytecode validator guarantees register is
+                                    // in bounds for this frame.
+                                    let val = unsafe { frame.read_reg_unchecked(reg) };
+                                    frame.accumulator = val.cheap_clone();
+                                    continue 'dispatch;
+                                }
+                                Opcode::Add | Opcode::AddSmi => {
+                                    let (a, b) = if instr.opcode == Opcode::Add {
+                                        let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                        // SAFETY: In SMI mode, accumulator and loop
+                                        // registers are guaranteed Smi.
+                                        let a = unsafe { frame.accumulator.as_smi_unchecked() };
+                                        let b = unsafe {
+                                            frame.read_reg_unchecked(reg).as_smi_unchecked()
+                                        };
+                                        (a, b)
+                                    } else {
+                                        // SAFETY: In SMI mode, accumulator is Smi.
+                                        // Bytecode generator guarantees operand[0] is
+                                        // Immediate for AddSmi.
+                                        let a = unsafe { frame.accumulator.as_smi_unchecked() };
+                                        let b = unsafe { operand_imm_unchecked(instr, 0) };
+                                        (a, b)
+                                    };
+                                    match a.checked_add(b) {
+                                        Some(result) => {
+                                            frame.accumulator = JsValue::Smi(result);
+                                        }
+                                        None => {
+                                            // Overflow — exit SMI mode.
+                                            frame.smi_mode = false;
+                                            frame.accumulator =
+                                                JsValue::HeapNumber((a as f64) + (b as f64));
+                                        }
+                                    }
+                                    continue 'dispatch;
+                                }
+                                Opcode::Sub | Opcode::SubSmi => {
+                                    let (a, b) = if instr.opcode == Opcode::Sub {
+                                        let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                        // SAFETY: In SMI mode, accumulator and loop
+                                        // registers are guaranteed Smi.
+                                        let a = unsafe { frame.accumulator.as_smi_unchecked() };
+                                        let b = unsafe {
+                                            frame.read_reg_unchecked(reg).as_smi_unchecked()
+                                        };
+                                        (a, b)
+                                    } else {
+                                        // SAFETY: In SMI mode, accumulator is Smi.
+                                        // Bytecode generator guarantees operand[0] is
+                                        // Immediate for SubSmi.
+                                        let a = unsafe { frame.accumulator.as_smi_unchecked() };
+                                        let b = unsafe { operand_imm_unchecked(instr, 0) };
+                                        (a, b)
+                                    };
+                                    match a.checked_sub(b) {
+                                        Some(result) => {
+                                            frame.accumulator = JsValue::Smi(result);
+                                        }
+                                        None => {
+                                            frame.smi_mode = false;
+                                            frame.accumulator =
+                                                JsValue::HeapNumber((a as f64) - (b as f64));
+                                        }
+                                    }
+                                    continue 'dispatch;
+                                }
+                                Opcode::Mul | Opcode::MulSmi => {
+                                    let (a, b) = if instr.opcode == Opcode::Mul {
+                                        let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                        // SAFETY: In SMI mode, accumulator and loop
+                                        // registers are guaranteed Smi.
+                                        let a = unsafe { frame.accumulator.as_smi_unchecked() };
+                                        let b = unsafe {
+                                            frame.read_reg_unchecked(reg).as_smi_unchecked()
+                                        };
+                                        (a, b)
+                                    } else {
+                                        // SAFETY: In SMI mode, accumulator is Smi.
+                                        // Bytecode generator guarantees operand[0] is
+                                        // Immediate for MulSmi.
+                                        let a = unsafe { frame.accumulator.as_smi_unchecked() };
+                                        let b = unsafe { operand_imm_unchecked(instr, 0) };
+                                        (a, b)
+                                    };
+                                    match a.checked_mul(b) {
+                                        Some(result) => {
+                                            frame.accumulator = JsValue::Smi(result);
+                                        }
+                                        None => {
+                                            frame.smi_mode = false;
+                                            frame.accumulator =
+                                                JsValue::HeapNumber((a as f64) * (b as f64));
+                                        }
+                                    }
+                                    continue 'dispatch;
+                                }
+                                Opcode::TestLessThan
+                                | Opcode::TestGreaterThan
+                                | Opcode::TestEqual
+                                | Opcode::TestLessThanOrEqual
+                                | Opcode::TestGreaterThanOrEqual => {
+                                    let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                    // SAFETY: In SMI mode, accumulator and loop
+                                    // registers are guaranteed Smi.
+                                    let a = unsafe { frame.accumulator.as_smi_unchecked() };
+                                    let b =
+                                        unsafe { frame.read_reg_unchecked(reg).as_smi_unchecked() };
+                                    let result = match instr.opcode {
+                                        Opcode::TestLessThan => a < b,
+                                        Opcode::TestGreaterThan => a > b,
+                                        Opcode::TestEqual => a == b,
+                                        Opcode::TestLessThanOrEqual => a <= b,
+                                        Opcode::TestGreaterThanOrEqual => a >= b,
+                                        // SAFETY: The outer match arm guarantees one of the five
+                                        // comparison opcodes.
+                                        _ => unsafe { std::hint::unreachable_unchecked() },
+                                    };
+                                    frame.accumulator = JsValue::Boolean(result);
+                                    continue 'dispatch;
+                                }
+                                Opcode::JumpIfTrue => {
+                                    if matches!(frame.accumulator, JsValue::Boolean(true)) {
+                                        // SAFETY: Bytecode compiler guarantees all
+                                        // JumpIfTrue instructions have pre-computed
+                                        // targets.
+                                        frame.pc = unsafe {
+                                            resolve_jump_unchecked(frame.pc, jump_targets)
+                                        };
+                                    }
+                                    continue 'dispatch;
+                                }
+                                Opcode::JumpIfFalse => {
+                                    if matches!(frame.accumulator, JsValue::Boolean(false)) {
+                                        // SAFETY: Bytecode compiler guarantees all
+                                        // JumpIfFalse instructions have pre-computed
+                                        // targets.
+                                        frame.pc = unsafe {
+                                            resolve_jump_unchecked(frame.pc, jump_targets)
+                                        };
+                                    }
+                                    continue 'dispatch;
+                                }
+                                Opcode::JumpLoop => {
+                                    // SAFETY: Bytecode compiler guarantees all JumpLoop
+                                    // instructions have pre-computed targets.
+                                    frame.pc =
+                                        unsafe { resolve_jump_unchecked(frame.pc, jump_targets) };
+                                    frame.osr_loop_count = frame.osr_loop_count.saturating_add(1);
+                                    continue 'dispatch;
+                                }
+                                Opcode::Jump => {
+                                    // SAFETY: Bytecode compiler guarantees all Jump
+                                    // instructions have pre-computed targets.
+                                    frame.pc =
+                                        unsafe { resolve_jump_unchecked(frame.pc, jump_targets) };
+                                    continue 'dispatch;
+                                }
+                                Opcode::Return => {
+                                    return Ok(frame.accumulator.clone());
+                                }
+                                _ => {
+                                    // Unsupported opcode — exit SMI mode and let the
+                                    // regular dispatch handle it.
+                                    frame.smi_mode = false;
+                                }
+                            }
+                        }
 
                         match instr.opcode {
                             // ── Load / Store (ultra-tight) ───────────────
@@ -2102,6 +2316,23 @@ impl Interpreter {
                                 }
                                 if frame.osr_loop_count >= TURBOFAN_OSR_LOOP_THRESHOLD {
                                     maybe_compile_turbofan(&frame.bytecode_array);
+                                }
+                                // SMI-mode detection: if the accumulator is still Smi
+                                // after several back-edge trips, enter SMI fast dispatch.
+                                if !frame.smi_mode
+                                    && let JsValue::Smi(_) = &frame.accumulator
+                                {
+                                    let target_pc = frame.pc;
+                                    if target_pc < frame.loop_trip_counts.len() {
+                                        // SAFETY: bounds check just above.
+                                        let count = unsafe {
+                                            frame.loop_trip_counts.get_unchecked_mut(target_pc)
+                                        };
+                                        *count = count.saturating_add(1);
+                                        if *count >= 4 {
+                                            frame.smi_mode = true;
+                                        }
+                                    }
                                 }
                                 continue 'dispatch;
                             }
@@ -2338,6 +2569,8 @@ impl Interpreter {
                 (0, None, JsValue::Undefined),
             ],
             cache_generation: 0,
+            smi_mode: false,
+            loop_trip_counts: Vec::new(),
         };
         // Restore the captured closure context so generators can access outer
         // scope variables through the context chain.
