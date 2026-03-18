@@ -143,7 +143,8 @@
 //!
 //! # Register layout
 //!
-//! The [`InterpreterFrame`] register file is a flat `Vec<JsValue>`:
+//! The [`InterpreterFrame`] register file is a flat inline-buffered register
+//! file:
 //!
 //! ```text
 //! [ param[0], param[1], …, local[0], local[1], … ]
@@ -237,9 +238,9 @@ thread_local! {
     static STRING_TABLE: RefCell<crate::objects::js_string::StringTable> =
         RefCell::new(crate::objects::js_string::StringTable::new());
 
-    /// Thread-local pool of pre-allocated register vectors.
-    /// Avoids repeated heap allocation for interpreter frames.
-    static REGISTER_POOL: RefCell<Vec<Vec<JsValue>>> = const { RefCell::new(Vec::new()) };
+    /// Thread-local pool of spilled register files.
+    /// Avoids repeated heap allocation for large interpreter frames.
+    static REGISTER_POOL: RefCell<Vec<RegisterFile>> = const { RefCell::new(Vec::new()) };
 }
 
 thread_local! {
@@ -1260,8 +1261,20 @@ pub struct PropertyIc {
 /// Small inline-buffered argument storage for interpreter function calls.
 pub type CallArgs = SmallVec<[JsValue; 8]>;
 
-/// Acquire a register vector from the pool, or allocate a new one.
-fn acquire_registers(count: usize) -> Vec<JsValue> {
+/// Register files with up to this many slots stay inline in the frame.
+pub const SMALL_REG_THRESHOLD: usize = 32;
+
+/// Inline-buffered register storage for interpreter frames.
+pub type RegisterFile = SmallVec<[JsValue; SMALL_REG_THRESHOLD]>;
+
+/// Acquire a register file from the pool, or allocate a new one.
+fn acquire_registers(count: usize) -> RegisterFile {
+    if count <= SMALL_REG_THRESHOLD {
+        let mut regs = RegisterFile::new();
+        regs.resize(count, JsValue::Undefined);
+        return regs;
+    }
+
     REGISTER_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
         if let Some(mut regs) = pool.pop() {
@@ -1269,14 +1282,16 @@ fn acquire_registers(count: usize) -> Vec<JsValue> {
             regs.resize(count, JsValue::Undefined);
             regs
         } else {
-            vec![JsValue::Undefined; count]
+            let mut regs = RegisterFile::with_capacity(count);
+            regs.resize(count, JsValue::Undefined);
+            regs
         }
     })
 }
 
-/// Return a register vector to the pool for reuse.
-fn release_registers(mut regs: Vec<JsValue>) {
-    if regs.capacity() <= 256 {
+/// Return a register file to the pool for reuse.
+fn release_registers(mut regs: RegisterFile) {
+    if regs.spilled() && regs.capacity() <= 256 {
         regs.clear();
         REGISTER_POOL.with(|pool| {
             let mut pool = pool.borrow_mut();
@@ -1378,7 +1393,7 @@ pub struct InterpreterFrame {
     /// Flat register file: `[params…, locals/temps…]`.
     ///
     /// Length = `bytecode_array.parameter_count() + bytecode_array.frame_size()`.
-    pub registers: Vec<JsValue>,
+    pub registers: RegisterFile,
     /// Full argument list supplied to the current call, including extras beyond
     /// the formal parameter count.
     pub call_args: CallArgs,
