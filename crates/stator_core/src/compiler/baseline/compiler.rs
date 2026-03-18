@@ -727,6 +727,42 @@ impl<'a> BaselineCompiler<'a> {
                 };
                 self.emit_load_reg(Reg64::R12, v);
             }
+            Opcode::LdarAddStar => {
+                let Operand::Register(src) = instr.operands[0] else {
+                    return Err(bad_operand("LdarAddStar", 0));
+                };
+                let Operand::Register(add_reg) = instr.operands[1] else {
+                    return Err(bad_operand("LdarAddStar", 1));
+                };
+                let Operand::Register(dst) = instr.operands[2] else {
+                    return Err(bad_operand("LdarAddStar", 2));
+                };
+                let Operand::FeedbackSlot(_slot) = instr.operands[3] else {
+                    return Err(bad_operand("LdarAddStar", 3));
+                };
+                self.emit_load_reg(Reg64::R12, src);
+                self.emit_load_reg(Reg64::R11, add_reg);
+                self.masm.add_rr(Reg64::R12, Reg64::R11);
+                self.emit_store_reg(dst, Reg64::R12);
+            }
+            Opcode::LdarSubStar => {
+                let Operand::Register(src) = instr.operands[0] else {
+                    return Err(bad_operand("LdarSubStar", 0));
+                };
+                let Operand::Register(sub_reg) = instr.operands[1] else {
+                    return Err(bad_operand("LdarSubStar", 1));
+                };
+                let Operand::Register(dst) = instr.operands[2] else {
+                    return Err(bad_operand("LdarSubStar", 2));
+                };
+                let Operand::FeedbackSlot(_slot) = instr.operands[3] else {
+                    return Err(bad_operand("LdarSubStar", 3));
+                };
+                self.emit_load_reg(Reg64::R12, src);
+                self.emit_load_reg(Reg64::R11, sub_reg);
+                self.masm.sub_rr(Reg64::R12, Reg64::R11);
+                self.emit_store_reg(dst, Reg64::R12);
+            }
             Opcode::Star => {
                 let Operand::Register(v) = instr.operands[0] else {
                     return Err(bad_operand("Star", 0));
@@ -778,6 +814,19 @@ impl<'a> BaselineCompiler<'a> {
                 };
                 self.masm.add_ri(Reg64::R12, imm);
             }
+            Opcode::AddSmiStar => {
+                let Operand::Immediate(imm) = instr.operands[0] else {
+                    return Err(bad_operand("AddSmiStar", 0));
+                };
+                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                    return Err(bad_operand("AddSmiStar", 1));
+                };
+                let Operand::Register(dst) = instr.operands[2] else {
+                    return Err(bad_operand("AddSmiStar", 2));
+                };
+                self.masm.add_ri(Reg64::R12, imm);
+                self.emit_store_reg(dst, Reg64::R12);
+            }
             Opcode::SubSmi => {
                 let Operand::Immediate(imm) = instr.operands[0] else {
                     return Err(bad_operand("SubSmi", 0));
@@ -801,6 +850,36 @@ impl<'a> BaselineCompiler<'a> {
                     return Err(bad_operand("TestLessThan", 0));
                 };
                 self.emit_compare_and_set(v, CondCode::Less);
+            }
+            Opcode::TestLessThanJump => {
+                let Operand::Register(v) = instr.operands[0] else {
+                    return Err(bad_operand("TestLessThanJump", 0));
+                };
+                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                    return Err(bad_operand("TestLessThanJump", 1));
+                };
+                let Operand::JumpOffset(delta) = instr.operands[2] else {
+                    return Err(bad_operand("TestLessThanJump", 2));
+                };
+                let Operand::Flag(is_true_flag) = instr.operands[3] else {
+                    return Err(bad_operand("TestLessThanJump", 3));
+                };
+                let target = Self::resolve_target(
+                    jump_target_byte(idx, delta, byte_offsets),
+                    byte_offsets,
+                    n,
+                )?;
+                self.emit_compare_and_set(v, CondCode::Less);
+                self.masm.mov_ri(
+                    Reg64::R11,
+                    if is_true_flag == 0 {
+                        JIT_FALSE
+                    } else {
+                        JIT_TRUE
+                    },
+                );
+                self.masm.cmp_rr(Reg64::R12, Reg64::R11);
+                self.emit_cond_jump(CondCode::Equal, target);
             }
             Opcode::TestGreaterThan => {
                 let Operand::Register(v) = instr.operands[0] else {
