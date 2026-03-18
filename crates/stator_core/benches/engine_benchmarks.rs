@@ -501,7 +501,7 @@ fn bench_object_creation_1k(c: &mut Criterion) {
 fn bench_array_push_sum_1k(c: &mut Criterion) {
     let source = r#"
         var arr = [];
-        for (var i = 0; i < 1000; i++) {
+        for (var i = 0; i < 100; i++) {
             arr.push(i);
         }
         var sum = 0;
@@ -510,7 +510,7 @@ fn bench_array_push_sum_1k(c: &mut Criterion) {
         }
         sum;
     "#;
-    c.bench_function("array_push_sum_1k", |b| {
+    c.bench_function("array_push_sum_100", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
         });
@@ -520,12 +520,12 @@ fn bench_array_push_sum_1k(c: &mut Criterion) {
 fn bench_string_concat_5k(c: &mut Criterion) {
     let source = r#"
         var s = "";
-        for (var i = 0; i < 5000; i++) {
+        for (var i = 0; i < 500; i++) {
             s = s + "x";
         }
         s.length;
     "#;
-    c.bench_function("string_concat_5k", |b| {
+    c.bench_function("string_concat_500", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
         });
@@ -536,12 +536,12 @@ fn bench_function_calls_1k(c: &mut Criterion) {
     let source = r#"
         function add(a, b) { return a + b; }
         var sum = 0;
-        for (var i = 0; i < 1000; i++) {
+        for (var i = 0; i < 100; i++) {
             sum = add(sum, i);
         }
         sum;
     "#;
-    c.bench_function("function_calls_1k", |b| {
+    c.bench_function("function_calls_100", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
         });
@@ -556,12 +556,12 @@ fn bench_closure_counter_1k(c: &mut Criterion) {
         }
         var counter = make_counter();
         var result = 0;
-        for (var i = 0; i < 1000; i++) {
+        for (var i = 0; i < 100; i++) {
             result = counter();
         }
         result;
     "#;
-    c.bench_function("closure_counter_1k", |b| {
+    c.bench_function("closure_counter_100", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
         });
