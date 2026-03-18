@@ -1429,12 +1429,11 @@ fn main_inner() {
     });
 
     // ── Run each test ─────────────────────────────────────────────────────────
-    for (idx, path) in test_files.iter().enumerate() {
-        // ── Crash recovery: skip already-processed tests ──────────────────────
-        if idx < cli.skip_first {
-            skip += 1;
-            continue;
-        }
+    // Jump directly to the first un-skipped test (O(1) restart).
+    let start_idx = cli.skip_first.min(test_files.len());
+    skip += start_idx as u64;
+    for (offset, path) in test_files[start_idx..].iter().enumerate() {
+        let idx = start_idx + offset;
 
         // Write current test index to progress file so the crash-restart
         // wrapper knows where to resume.
@@ -1571,7 +1570,7 @@ fn main_inner() {
         }
 
         // Periodic progress line (every 100 tests, unless verbose).
-        if !cli.verbose && (idx + 1) % 100 == 0 {
+        if !cli.verbose && (idx + 1).is_multiple_of(100) {
             let elapsed = run_start.elapsed();
             let rate = (idx + 1) as f64 / elapsed.as_secs_f64();
             println!(
