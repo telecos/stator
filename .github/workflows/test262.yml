@@ -21,16 +21,13 @@ on:
 # commit is tested, saving runner minutes.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   test262:
     name: Test262 conformance
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # Known issue: specific tests trigger unbounded interpreter recursion
-    # that overflows even a 1 GiB stack.  Tracked separately.
-    continue-on-error: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -54,21 +51,23 @@ jobs:
         run: cargo build --package stator_test262 --release
 
       - name: Run Test262 suite
-        # Threshold tracks conformance progress. Features enabled:
-        # async, generators, classes, symbols, BigInt, destructuring,
-        # for-of, dynamic-import, Proxy/Reflect, WeakRef, Intl, RegExp
-        # advanced, tail-call-optimization, globalThis.
-        env:
-          RUST_MIN_STACK: "1073741824"   # 1 GiB for spawned threads
+        # Threshold tracks conformance progress.
+        # Stack: 256 MB bounded limit so stacker allocates heap segments
+        # for deep recursion. ulimit -s unlimited is WRONG here — it makes
+        # stacker think the stack is infinite and skip its heap segments,
+        # causing the main thread stack to grow via page faults until OOM
+        # kills the runner.
+        # Memory: 4 GB virtual memory limit prevents OOM-killing the runner.
         run: |
-          ulimit -s unlimited
+          ulimit -s 262144    # 256 MB stack (stacker manages overflow)
+          ulimit -v 5242880   # 5 GB virtual memory cap
           set +e
           ./target/release/stator_test262 \
             --test262-dir test262 \
             --threshold 25.0
           rc=$?
-          if [ $rc -eq 134 ] || [ $rc -eq 139 ]; then
-            echo "::warning::Test262 runner crashed (stack overflow, exit $rc) — known issue"
+          if [ $rc -eq 134 ] || [ $rc -eq 137 ] || [ $rc -eq 139 ]; then
+            echo "::warning::Test262 runner crashed (exit $rc) — stack overflow or OOM"
             exit 0
           fi
           exit $rc

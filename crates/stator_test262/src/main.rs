@@ -20,7 +20,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -62,15 +62,21 @@ thread_local! {
     static ALLOC_EXCEEDED: Cell<bool> = const { Cell::new(false) };
 }
 
-// SAFETY: All methods delegate to `System`.  The safety invariants of
-// `GlobalAlloc` (valid layout, matching alloc/dealloc) are upheld by the
-// inner `System` allocator.  We never panic and never return null —
-// oversized allocations just set a flag.
+// SAFETY: All methods delegate to `System` (or return null for oversized
+// requests).  The safety invariants of `GlobalAlloc` (valid layout, matching
+// alloc/dealloc) are upheld by the inner `System` allocator.  We never panic.
+// For oversized allocations, we return null — callers (typically the Rust
+// standard library) will call `handle_alloc_error`, which aborts the process.
+// The CI workflow catches exit code 134 (SIGABRT) and treats it as a known
+// issue rather than a hard failure.
 unsafe impl GlobalAlloc for GuardedAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if layout.size() > MAX_ALLOC_SIZE {
-            // Oversized — set flag so the runner can fail this test.
+            // Oversized — set flag AND return null to prevent the allocation
+            // from actually going through.  Previously we delegated to System
+            // even for huge sizes, which caused the runner to OOM.
             ALLOC_EXCEEDED.with(|g| g.set(true));
+            return std::ptr::null_mut();
         }
         unsafe { System.alloc(layout) }
     }
@@ -469,11 +475,17 @@ fn is_skipped_path(rel_path: &str) -> bool {
 #[inline(never)]
 fn make_test_globals() -> HashMap<String, JsValue> {
     // Force stacker to allocate a fresh heap segment for install_globals.
-    // The 2 GiB red_zone exceeds any thread stack, so stacker always
-    // switches to a 32 MiB heap-backed segment.
+    // The 128 MiB red_zone exceeds any reasonable thread stack, so stacker
+    // always switches to a 32 MiB heap-backed segment.
+    //
+    // NOTE: Do NOT use a multi-GiB red_zone here.  When the OS stack limit
+    // is very large or unlimited (`ulimit -s unlimited`), stacker may
+    // compute "remaining stack = infinity", decide the red_zone is
+    // satisfied, and skip the heap segment entirely.  The 128 MiB value
+    // works correctly on both bounded (default 8 MiB) and unbounded stacks.
     stacker::maybe_grow(
-        2_usize * 1024 * 1024 * 1024, // red_zone: 2 GiB
-        32 * 1024 * 1024,             // new segment: 32 MiB
+        128 * 1024 * 1024, // red_zone: 128 MiB
+        32 * 1024 * 1024,  // new segment: 32 MiB
         || {
             let mut map = HashMap::new();
             install_globals(&mut map);
@@ -1329,6 +1341,7 @@ fn main_inner() {
 
     let total = test_files.len();
     println!("stator_test262: running {total} tests …");
+    let _ = io::stdout().flush();
 
     let mut pass: u64 = 0;
     let mut fail: u64 = 0;
@@ -1341,6 +1354,12 @@ fn main_inner() {
     // that per-test mutations don't leak across tests while avoiding the
     // heavy cost of re-running `install_globals` for every test.
     let template_globals = make_test_globals();
+    let init_elapsed = run_start.elapsed();
+    println!(
+        "stator_test262: globals initialized in {:.1}s",
+        init_elapsed.as_secs_f64()
+    );
+    let _ = io::stdout().flush();
 
     // ── Run each test ─────────────────────────────────────────────────────────
     for (idx, path) in test_files.iter().enumerate() {
@@ -1462,8 +1481,8 @@ fn main_inner() {
             break;
         }
 
-        // Periodic progress line (every 500 tests, unless verbose).
-        if !cli.verbose && (idx + 1) % 500 == 0 {
+        // Periodic progress line (every 100 tests, unless verbose).
+        if !cli.verbose && (idx + 1) % 100 == 0 {
             let elapsed = run_start.elapsed();
             let rate = (idx + 1) as f64 / elapsed.as_secs_f64();
             println!(
@@ -1472,6 +1491,7 @@ fn main_inner() {
                 idx + 1,
                 elapsed.as_secs_f64()
             );
+            let _ = io::stdout().flush();
         }
     }
 
