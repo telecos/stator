@@ -29,13 +29,13 @@ function measure(name, fn, iterations) {
 const results = [];
 
 // ─── 1. Fibonacci (recursive) ────────────────────────────────────────────
-results.push(measure("fib_30_recursive", () => {
+results.push(measure("fib_20_recursive", () => {
   function fib(n) {
     if (n < 2) return n;
     return fib(n - 1) + fib(n - 2);
   }
-  return fib(30);
-}, 50));
+  return fib(20);
+}, 200));
 
 // ─── 2. Fibonacci (iterative) ────────────────────────────────────────────
 results.push(measure("fib_40_iterative", () => {
@@ -49,37 +49,37 @@ results.push(measure("fib_40_iterative", () => {
 }, 200));
 
 // ─── 3. Arithmetic loop ─────────────────────────────────────────────────
-results.push(measure("arithmetic_loop_100k", () => {
+results.push(measure("arithmetic_loop_10k", () => {
   var n = 0;
-  for (var i = 0; i < 100000; i++) {
+  for (var i = 0; i < 10000; i++) {
     n = (n + i * 3 - 1) | 0;
   }
   return n;
-}, 100));
+}, 200));
 
 // ─── 4. Property access ─────────────────────────────────────────────────
-results.push(measure("property_access_10k", () => {
+results.push(measure("property_access_1k", () => {
   var obj = { a: 1, b: 2, c: 3, d: 4, e: 5 };
   var sum = 0;
-  for (var i = 0; i < 10000; i++) {
+  for (var i = 0; i < 1000; i++) {
     sum = sum + obj.a + obj.b + obj.c + obj.d + obj.e;
   }
   return sum;
-}, 100));
+}, 200));
 
 // ─── 5. Object creation ─────────────────────────────────────────────────
-results.push(measure("object_creation_10k", () => {
+results.push(measure("object_creation_1k", () => {
   var last;
-  for (var i = 0; i < 10000; i++) {
+  for (var i = 0; i < 1000; i++) {
     last = { x: i, y: i + 1, z: i * 2 };
   }
   return last.x + last.y + last.z;
-}, 50));
+}, 200));
 
 // ─── 6. Array push + sum ────────────────────────────────────────────────
-results.push(measure("array_push_sum_10k", () => {
+results.push(measure("array_push_sum_1k", () => {
   var arr = [];
-  for (var i = 0; i < 10000; i++) {
+  for (var i = 0; i < 1000; i++) {
     arr.push(i);
   }
   var sum = 0;
@@ -87,7 +87,7 @@ results.push(measure("array_push_sum_10k", () => {
     sum = sum + arr[i];
   }
   return sum;
-}, 50));
+}, 200));
 
 // ─── 7. String concatenation ────────────────────────────────────────────
 results.push(measure("string_concat_5k", () => {
@@ -99,31 +99,31 @@ results.push(measure("string_concat_5k", () => {
 }, 30));
 
 // ─── 8. Function calls (nested) ─────────────────────────────────────────
-results.push(measure("function_calls_10k", () => {
+results.push(measure("function_calls_1k", () => {
   function add(a, b) { return a + b; }
   var sum = 0;
-  for (var i = 0; i < 10000; i++) {
+  for (var i = 0; i < 1000; i++) {
     sum = add(sum, i);
   }
   return sum;
-}, 100));
+}, 200));
 
 // ─── 9. Closure capture ─────────────────────────────────────────────────
-results.push(measure("closure_counter_10k", () => {
+results.push(measure("closure_counter_1k", () => {
   function make_counter() {
     var count = 0;
     return function() { count = count + 1; return count; };
   }
   var counter = make_counter();
   var result = 0;
-  for (var i = 0; i < 10000; i++) {
+  for (var i = 0; i < 1000; i++) {
     result = counter();
   }
   return result;
-}, 100));
+}, 200));
 
 // ─── 10. Prototype chain lookup ──────────────────────────────────────────
-results.push(measure("prototype_chain_10k", () => {
+results.push(measure("prototype_chain_1k", () => {
   function Base() {}
   Base.prototype.x = 42;
   function Mid() {}
@@ -132,15 +132,15 @@ results.push(measure("prototype_chain_10k", () => {
   Leaf.prototype = new Mid();
   var obj = new Leaf();
   var sum = 0;
-  for (var i = 0; i < 10000; i++) {
+  for (var i = 0; i < 1000; i++) {
     sum = sum + obj.x;
   }
   return sum;
-}, 100));
+}, 200));
 
 // ─── 11. Sieve of Eratosthenes ──────────────────────────────────────────
-results.push(measure("sieve_primes_10k", () => {
-  var n = 10000;
+results.push(measure("sieve_primes_1k", () => {
+  var n = 1000;
   var sieve = [];
   for (var i = 0; i <= n; i++) sieve[i] = true;
   sieve[0] = false;
@@ -157,17 +157,17 @@ results.push(measure("sieve_primes_10k", () => {
     if (sieve[i]) count = count + 1;
   }
   return count;
-}, 50));
+}, 200));
 
 // ─── 12. JSON-like deep object access ────────────────────────────────────
-results.push(measure("deep_object_access_5k", () => {
+results.push(measure("deep_object_access_1k", () => {
   var root = { a: { b: { c: { d: { e: 99 } } } } };
   var sum = 0;
-  for (var i = 0; i < 5000; i++) {
+  for (var i = 0; i < 1000; i++) {
     sum = sum + root.a.b.c.d.e;
   }
   return sum;
-}, 100));
+}, 200));
 
 // ─── Output ──────────────────────────────────────────────────────────────
 console.log("V8_BENCHMARK_RESULTS_JSON=" + JSON.stringify(results));
