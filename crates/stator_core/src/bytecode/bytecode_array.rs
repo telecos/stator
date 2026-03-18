@@ -176,28 +176,28 @@ pub type TurbofanJitCodeCache = Arc<Mutex<Option<TurbofanCompiledCode>>>;
 
 /// Invocation-count threshold that triggers baseline JIT compilation.
 ///
-/// When a function's `invocation_count` reaches this value (10 calls) the
+/// When a function's `invocation_count` reaches this value (100 calls) the
 /// interpreter requests a baseline-compiled version; all subsequent calls
 /// that can be represented in the current JIT tier execute via native code.
-pub const TIERING_THRESHOLD: u32 = 10;
+pub const TIERING_THRESHOLD: u32 = 100;
 
 /// Invocation-count threshold that triggers Maglev JIT compilation.
 ///
-/// When a function's `invocation_count` reaches this value (100 calls) and
+/// When a function's `invocation_count` reaches this value (1 000 calls) and
 /// baseline JIT code is already present, the interpreter schedules a
 /// background Maglev compilation.  Once compilation finishes the cached
 /// Maglev code replaces the baseline tier for future calls.
-pub const MAGLEV_TIERING_THRESHOLD: u32 = 100;
+pub const MAGLEV_TIERING_THRESHOLD: u32 = 1_000;
 
 /// Invocation-count threshold that triggers Turbofan (Cranelift optimising)
 /// JIT compilation.
 ///
-/// When a function's `invocation_count` reaches this value (1 000 calls) a
+/// When a function's `invocation_count` reaches this value (10 000 calls) a
 /// background Turbofan compilation is scheduled.  Turbofan runs the full
 /// Maglev graph builder followed by Cranelift CLIF lowering and
 /// optimisation, producing code that is expected to reach within 90 % of
 /// peak throughput.
-pub const TURBOFAN_TIERING_THRESHOLD: u32 = 1_000;
+pub const TURBOFAN_TIERING_THRESHOLD: u32 = 10_000;
 
 /// An immutable, compact representation of the bytecode for a single
 /// JavaScript function.
