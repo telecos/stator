@@ -397,12 +397,12 @@ fn bench_js_closure_capture(c: &mut Criterion) {
         }
         var counter = make_counter();
         var result = 0;
-        for (var i = 0; i < 100; i++) {
+        for (var i = 0; i < 10; i++) {
             result = counter();
         }
         result;
     "#;
-    c.bench_function("js_closure_capture_100", |b| {
+    c.bench_function("js_closure_capture_10", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
         });
