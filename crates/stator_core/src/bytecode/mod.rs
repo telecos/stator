@@ -27,6 +27,8 @@ pub mod bytecode_generator;
 pub mod bytecodes;
 /// Feedback vectors and inline-cache state for adaptive optimisation.
 pub mod feedback;
+/// Peephole fusion pass for decoded bytecode streams.
+pub mod peephole;
 /// Virtual register type and register allocator for bytecode compilation.
 pub mod register;
 /// Source-position table: maps bytecode offsets to source locations for stack

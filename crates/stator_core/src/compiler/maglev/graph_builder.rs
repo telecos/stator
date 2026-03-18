@@ -448,6 +448,28 @@ impl<'a> GraphBuilder<'a> {
                 let id = self.env_get_register(reg)?;
                 self.env.set_accumulator(id);
             }
+            Opcode::LdarAddStar => {
+                let src = self.operand_register(instr, 0)?;
+                let add_reg = self.operand_register(instr, 1)?;
+                let dst = self.operand_register(instr, 2)?;
+                let slot = self.operand_feedback_slot(instr, 3)?;
+                let left = self.env_get_register(src)?;
+                let right = self.env_get_register(add_reg)?;
+                let id = self.emit_binary_op(left, right, slot, BinaryOpKind::Add)?;
+                self.env.set_accumulator(id);
+                self.env.set(dst, id);
+            }
+            Opcode::LdarSubStar => {
+                let src = self.operand_register(instr, 0)?;
+                let sub_reg = self.operand_register(instr, 1)?;
+                let dst = self.operand_register(instr, 2)?;
+                let slot = self.operand_feedback_slot(instr, 3)?;
+                let left = self.env_get_register(src)?;
+                let right = self.env_get_register(sub_reg)?;
+                let id = self.emit_binary_op(left, right, slot, BinaryOpKind::Sub)?;
+                self.env.set_accumulator(id);
+                self.env.set(dst, id);
+            }
             Opcode::Star => {
                 let reg = self.operand_register(instr, 0)?;
                 let id = self.env_get_accumulator()?;
@@ -571,6 +593,16 @@ impl<'a> GraphBuilder<'a> {
                 let right = self.emit(ValueNode::SmiConstant { value: imm })?;
                 let id = self.emit_binary_op(left, right, slot, BinaryOpKind::Add)?;
                 self.env.set_accumulator(id);
+            }
+            Opcode::AddSmiStar => {
+                let imm = self.operand_immediate(instr, 0)?;
+                let slot = self.operand_feedback_slot(instr, 1)?;
+                let dst = self.operand_register(instr, 2)?;
+                let left = self.env_get_accumulator()?;
+                let right = self.emit(ValueNode::SmiConstant { value: imm })?;
+                let id = self.emit_binary_op(left, right, slot, BinaryOpKind::Add)?;
+                self.env.set_accumulator(id);
+                self.env.set(dst, id);
             }
             Opcode::SubSmi => {
                 let imm = self.operand_immediate(instr, 0)?;
@@ -791,6 +823,28 @@ impl<'a> GraphBuilder<'a> {
                 let right = self.env_get_register(reg)?;
                 let id = self.emit_comparison(left, right, slot, CompareKind::LessThan)?;
                 self.env.set_accumulator(id);
+            }
+            Opcode::TestLessThanJump => {
+                let reg = self.operand_register(instr, 0)?;
+                let slot = self.operand_feedback_slot(instr, 1)?;
+                let is_true = self.operand_flag(instr, 3)? != 0;
+                let left = self.env_get_accumulator()?;
+                let right = self.env_get_register(reg)?;
+                let condition = self.emit_comparison(left, right, slot, CompareKind::LessThan)?;
+                self.env.set_accumulator(condition);
+                let target = self
+                    .resolve_jump_target(instr_idx, all_instructions)
+                    .unwrap_or(self.current_block + 1);
+                let fall = self
+                    .block_at
+                    .get(&(instr_idx + 1))
+                    .copied()
+                    .unwrap_or(self.current_block + 1);
+                self.set_control(ControlNode::Branch {
+                    condition,
+                    if_true: if is_true { target } else { fall },
+                    if_false: if is_true { fall } else { target },
+                });
             }
             Opcode::TestGreaterThan => {
                 let reg = self.operand_register(instr, 0)?;

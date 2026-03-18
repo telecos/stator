@@ -44,8 +44,11 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::bytecode::bytecodes::{self, Instruction, Operand};
 use crate::bytecode::feedback::FeedbackMetadata;
+use crate::bytecode::{
+    bytecodes::{self, Instruction, Operand},
+    peephole,
+};
 use crate::compiler::turbofan::TurbofanCompiledCode;
 use crate::error::{StatorError, StatorResult};
 use crate::objects::value::JsContext;
@@ -617,8 +620,9 @@ impl BytecodeArray {
 
     fn ensure_decoded_instructions(&self) -> StatorResult<&Rc<DecodedBytecode>> {
         if self.cached_decode.get().is_none() {
-            let (instructions, byte_offsets) =
+            let (mut instructions, mut byte_offsets) =
                 bytecodes::decode_with_byte_offsets(&self.bytecodes)?;
+            peephole::fuse_instructions(&mut instructions, &mut byte_offsets);
             let mut jump_targets = vec![None; instructions.len()];
             for (instruction_index, instruction) in instructions.iter().enumerate() {
                 for operand in &instruction.operands {
@@ -1028,5 +1032,56 @@ mod tests {
 
         assert_eq!(instructions[0].opcode, Opcode::Jump);
         assert_eq!(jump_targets[0], Some(2));
+    }
+
+    #[test]
+    fn test_decoded_instructions_apply_fusion_before_jump_resolution() {
+        let unresolved = vec![
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(
+                Opcode::Add,
+                vec![Operand::Register(1), Operand::FeedbackSlot(2)],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(2)]),
+            Instruction::new_unchecked(
+                Opcode::TestLessThan,
+                vec![Operand::Register(3), Operand::FeedbackSlot(4)],
+            ),
+            Instruction::new_unchecked(Opcode::JumpIfTrue, vec![Operand::JumpOffset(0)]),
+            Instruction::new_unchecked(Opcode::LdaZero, vec![]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let bytes = encode(&unresolved);
+        let (_, offsets) = bytecodes::decode_with_byte_offsets(&bytes).expect("valid bytecode");
+        let mut resolved = unresolved;
+        let target_byte = offsets[6];
+        let jump_end_byte = offsets[5];
+        resolved[4].operands[0] = Operand::JumpOffset(target_byte as i32 - jump_end_byte as i32);
+
+        let mut array = BytecodeArray::new(
+            encode(&resolved),
+            vec![],
+            4,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        );
+        let (instructions, _offsets, jump_targets) =
+            array.decoded_instructions().expect("valid bytecode");
+
+        assert_eq!(
+            instructions
+                .iter()
+                .map(|instr| instr.opcode)
+                .collect::<Vec<_>>(),
+            vec![
+                Opcode::LdarAddStar,
+                Opcode::TestLessThanJump,
+                Opcode::LdaZero,
+                Opcode::Return,
+            ]
+        );
+        assert_eq!(jump_targets[1], Some(3));
     }
 }

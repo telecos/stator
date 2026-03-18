@@ -699,10 +699,20 @@ pub enum Opcode {
     ExtraWide,
     /// Illegal / unreachable trap instruction.
     Illegal,
+    // ── Superinstructions ──────────────────────────────────────────────────
+    /// `Ldar(src); Add(add_reg, slot); Star(dst)`. `[src, add_reg, dst, slot]`
+    LdarAddStar,
+    /// `Ldar(src); Sub(sub_reg, slot); Star(dst)`. `[src, sub_reg, dst, slot]`
+    LdarSubStar,
+    /// `TestLessThan(reg, slot); JumpIf{True,False}(offset)`.
+    /// `[reg, slot, offset, is_true]`
+    TestLessThanJump,
+    /// `AddSmi(imm, slot); Star(dst)`. `[imm, slot, dst]`
+    AddSmiStar,
 }
 
-/// The maximum valid opcode byte (= `Opcode::Illegal as u8`).
-const MAX_OPCODE: u8 = Opcode::Illegal as u8;
+/// The maximum valid opcode byte.
+const MAX_OPCODE: u8 = Opcode::AddSmiStar as u8;
 
 impl Opcode {
     /// Convert a raw byte to an [`Opcode`], returning an error for
@@ -962,6 +972,12 @@ impl Opcode {
 
             // Prefixes / trap — no operands of their own
             Opcode::Wide | Opcode::ExtraWide | Opcode::Illegal => &[],
+
+            // Superinstructions
+            Opcode::LdarAddStar => &[Register, Register, Register, FeedbackSlot],
+            Opcode::LdarSubStar => &[Register, Register, Register, FeedbackSlot],
+            Opcode::TestLessThanJump => &[Register, FeedbackSlot, JumpOffset, Flag],
+            Opcode::AddSmiStar => &[Immediate, FeedbackSlot, Register],
         }
     }
 }
@@ -1428,6 +1444,47 @@ mod tests {
         round_trip(vec![
             Instruction::new_unchecked(Opcode::JumpIfTrue, vec![Operand::JumpOffset(4)]),
             Instruction::new_unchecked(Opcode::JumpIfFalse, vec![Operand::JumpOffset(-4)]),
+        ]);
+    }
+
+    #[test]
+    fn test_round_trip_superinstructions() {
+        round_trip(vec![
+            Instruction::new_unchecked(
+                Opcode::LdarAddStar,
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(2),
+                    Operand::Register(3),
+                    Operand::FeedbackSlot(4),
+                ],
+            ),
+            Instruction::new_unchecked(
+                Opcode::LdarSubStar,
+                vec![
+                    Operand::Register(5),
+                    Operand::Register(6),
+                    Operand::Register(7),
+                    Operand::FeedbackSlot(8),
+                ],
+            ),
+            Instruction::new_unchecked(
+                Opcode::TestLessThanJump,
+                vec![
+                    Operand::Register(9),
+                    Operand::FeedbackSlot(10),
+                    Operand::JumpOffset(-12),
+                    Operand::Flag(1),
+                ],
+            ),
+            Instruction::new_unchecked(
+                Opcode::AddSmiStar,
+                vec![
+                    Operand::Immediate(11),
+                    Operand::FeedbackSlot(12),
+                    Operand::Register(13),
+                ],
+            ),
         ]);
     }
 
