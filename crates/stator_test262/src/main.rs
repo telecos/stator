@@ -1441,20 +1441,27 @@ fn main_inner() {
 
         // ── Execute and record outcome ────────────────────────────────────────
         let test_start = std::time::Instant::now();
+        // Log the test path before execution so we can identify which test
+        // caused a crash (the last logged path is the culprit).
+        eprint!("[{}/{}] {} … ", idx + 1, total, rel_path);
+        let _ = io::stderr().flush();
         match run_test(&source, &harness_prefix, &meta, &template_globals) {
             TestOutcome::Pass => {
+                eprintln!("PASS");
                 pass += 1;
                 if cli.verbose {
                     println!("[PASS] {}", path.display());
                 }
             }
             TestOutcome::Fail(reason) => {
+                eprintln!("FAIL");
                 fail += 1;
                 if cli.verbose {
                     println!("[FAIL] {}: {reason}", path.display());
                 }
             }
             TestOutcome::Skip(reason) => {
+                eprintln!("SKIP");
                 skip += 1;
                 if cli.verbose {
                     println!("[SKIP] {}: {reason}", path.display());
