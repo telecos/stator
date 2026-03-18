@@ -51,16 +51,18 @@ jobs:
         run: cargo build --package stator_test262 --release
 
       - name: Run Test262 suite
-        # Stack strategy: keep the default 8 MB main thread stack.
-        # stacker::maybe_grow(8 MB red_zone, 256 MB segment) always triggers
-        # because remaining main stack (~8 MB) ≤ red_zone (8 MB), so every
-        # test runs on a dedicated 256 MB heap segment.  This prevents:
-        # - Unbounded main stack growth (the old ulimit -s unlimited OOM)
-        # - Stack overflow from deep parser/interpreter recursion
+        # Stack strategy: set a SMALL main thread stack (4 MiB) so that
+        # stacker::maybe_grow(8 MiB red_zone, 256 MiB segment) always triggers.
+        # With remaining ~3-4 MiB < red_zone 8 MiB, stacker allocates a 256 MiB
+        # heap-backed segment for each test.  Inside that segment,
+        # MAX_CALL_STACK_DEPTH (128) limits JS recursion to ~128 frames.
+        # This prevents:
+        # - Main stack overflow (all heavy work on heap segments)
+        # - Infinite JS recursion (bounded by call depth limit)
         # Memory: 5 GB vmem cap prevents OOM-killing the runner.
         run: |
           echo "Default stack limit: $(ulimit -s) KB"
-          ulimit -s 524288   # 512 MB main thread stack
+          ulimit -s 4096     # 4 MB — forces stacker::maybe_grow to allocate heap segments
           ulimit -v 5242880  # 5 GB virtual memory cap
           echo "Active stack limit: $(ulimit -s) KB"
           set +e
