@@ -1402,6 +1402,32 @@ fn main_inner() {
         );
     }
 
+    // ── Watchdog thread ───────────────────────────────────────────────────────
+    // A background thread monitors a shared deadline.  Before each test the
+    // main thread sets the deadline to NOW + 5 seconds.  If the test
+    // completes, the deadline is reset to u64::MAX.  If the test hangs
+    // (infinite loop in parser/compiler/interpreter), the watchdog fires
+    // and terminates the process — the outer crash-restart loop picks up
+    // from the next test.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WATCHDOG_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let deadline = WATCHDOG_DEADLINE.load(Ordering::Relaxed);
+            if deadline != u64::MAX {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                if now > deadline {
+                    eprintln!("WATCHDOG: test exceeded 5s deadline, aborting process");
+                    std::process::exit(134); // Match SIGABRT exit code
+                }
+            }
+        }
+    });
+
     // ── Run each test ─────────────────────────────────────────────────────────
     for (idx, path) in test_files.iter().enumerate() {
         // ── Crash recovery: skip already-processed tests ──────────────────────
@@ -1492,6 +1518,13 @@ fn main_inner() {
 
         // ── Execute and record outcome ────────────────────────────────────────
         let test_start = std::time::Instant::now();
+        // Arm the watchdog: 5 seconds from now.
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        WATCHDOG_DEADLINE.store(now_epoch + 5, Ordering::Relaxed);
+
         match run_test(&source, &harness_prefix, &meta, &template_globals) {
             TestOutcome::Pass => {
                 pass += 1;
@@ -1512,6 +1545,9 @@ fn main_inner() {
                 }
             }
         }
+        // Disarm the watchdog — test completed.
+        WATCHDOG_DEADLINE.store(u64::MAX, Ordering::Relaxed);
+
         let elapsed = test_start.elapsed();
         if elapsed.as_secs() >= 3 {
             eprintln!("[SLOW] {}: {:.1}s", path.display(), elapsed.as_secs_f64());
