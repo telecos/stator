@@ -14884,11 +14884,11 @@ fn make_typed_array_instance(
 #[inline(never)]
 fn make_shadow_realm() -> JsValue {
     use crate::bytecode::bytecode_generator::BytecodeGenerator;
-    use crate::interpreter::{Interpreter, InterpreterFrame};
+    use crate::interpreter::{GlobalEnv, Interpreter, InterpreterFrame};
     native(|_args| {
         // Create a fresh set of globals for this realm.
-        let mut realm_globals = HashMap::new();
-        install_globals(&mut realm_globals);
+        let mut realm_globals = GlobalEnv::new();
+        install_globals(&mut realm_globals.vars);
         let realm_globals = Rc::new(RefCell::new(realm_globals));
 
         let mut props = PropertyMap::new();
@@ -23801,10 +23801,10 @@ mod tests {
         program.is_strict = true;
 
         let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
-        let mut globals = HashMap::new();
-        install_globals(&mut globals);
+        let mut ge = crate::interpreter::GlobalEnv::new();
+        install_globals(&mut ge.vars);
         let mut frame =
-            InterpreterFrame::new_with_globals(bytecode, vec![], Rc::new(RefCell::new(globals)));
+            InterpreterFrame::new_with_globals(bytecode, vec![], Rc::new(RefCell::new(ge)));
         let result = Interpreter::run(&mut frame).unwrap();
         drain_active_microtask_queue();
         match result {

@@ -34,11 +34,11 @@
 //! * ECMAScript 2025 Language Specification §19.2 — *Function Properties of the Global Object*
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::builtins::number::{number_parse_float, number_parse_int};
 use crate::error::{StatorError, StatorResult};
+use crate::interpreter::GlobalEnv;
 use crate::objects::value::JsValue;
 
 // ── Constants (ECMAScript §19.1) ──────────────────────────────────────────────
@@ -362,11 +362,11 @@ pub enum EvalMode {
 
 struct EvalOutcome {
     result: JsValue,
-    global_env: Rc<RefCell<HashMap<String, JsValue>>>,
+    global_env: Rc<RefCell<GlobalEnv>>,
     is_strict: bool,
 }
 
-type DirectEvalCapture = (JsValue, Rc<RefCell<HashMap<String, JsValue>>>, bool);
+type DirectEvalCapture = (JsValue, Rc<RefCell<GlobalEnv>>, bool);
 
 /// ECMAScript §19.2.1 global `eval(x)`.
 ///
@@ -405,18 +405,18 @@ pub fn global_eval(source: &str) -> StatorResult<JsValue> {
 ///
 /// ```
 /// use std::cell::RefCell;
-/// use std::collections::HashMap;
 /// use std::rc::Rc;
 /// use stator_core::builtins::global::global_eval_direct;
+/// use stator_core::interpreter::GlobalEnv;
 /// use stator_core::objects::value::JsValue;
 ///
-/// let env = Rc::new(RefCell::new(HashMap::new()));
+/// let env = Rc::new(RefCell::new(GlobalEnv::new()));
 /// let result = global_eval_direct("1 + 2", Rc::clone(&env)).unwrap();
 /// assert_eq!(result, JsValue::Smi(3));
 /// ```
 pub fn global_eval_direct(
     source: &str,
-    caller_env: Rc<RefCell<HashMap<String, JsValue>>>,
+    caller_env: Rc<RefCell<GlobalEnv>>,
 ) -> StatorResult<JsValue> {
     global_eval_direct_with_scope(source, caller_env, None)
 }
@@ -446,12 +446,12 @@ pub fn global_eval_indirect(source: &str) -> StatorResult<JsValue> {
 ///
 /// ```
 /// use std::cell::RefCell;
-/// use std::collections::HashMap;
 /// use std::rc::Rc;
 /// use stator_core::builtins::global::global_eval_strict;
+/// use stator_core::interpreter::GlobalEnv;
 /// use stator_core::objects::value::JsValue;
 ///
-/// let env = Rc::new(RefCell::new(HashMap::new()));
+/// let env = Rc::new(RefCell::new(GlobalEnv::new()));
 /// let result = global_eval_strict("var x = 42; x", Rc::clone(&env)).unwrap();
 /// assert_eq!(result, JsValue::Smi(42));
 /// // x is NOT visible in the caller's environment.
@@ -459,7 +459,7 @@ pub fn global_eval_indirect(source: &str) -> StatorResult<JsValue> {
 /// ```
 pub fn global_eval_strict(
     source: &str,
-    caller_env: Rc<RefCell<HashMap<String, JsValue>>>,
+    caller_env: Rc<RefCell<GlobalEnv>>,
 ) -> StatorResult<JsValue> {
     use crate::bytecode::bytecode_generator::BytecodeGenerator;
     use crate::interpreter::{Interpreter, InterpreterFrame};
@@ -482,7 +482,7 @@ pub fn global_eval_strict(
 fn eval_core(
     source: &str,
     mode: EvalMode,
-    caller_env: Option<Rc<RefCell<HashMap<String, JsValue>>>>,
+    caller_env: Option<Rc<RefCell<GlobalEnv>>>,
     caller_context: Option<JsValue>,
 ) -> StatorResult<EvalOutcome> {
     use crate::bytecode::bytecode_generator::BytecodeGenerator;
@@ -531,7 +531,7 @@ fn eval_core(
 
 pub(crate) fn global_eval_direct_with_scope(
     source: &str,
-    caller_env: Rc<RefCell<HashMap<String, JsValue>>>,
+    caller_env: Rc<RefCell<GlobalEnv>>,
     caller_context: Option<JsValue>,
 ) -> StatorResult<JsValue> {
     Ok(global_eval_direct_with_scope_capture(source, caller_env, caller_context)?.0)
@@ -539,7 +539,7 @@ pub(crate) fn global_eval_direct_with_scope(
 
 pub(crate) fn global_eval_direct_with_scope_capture(
     source: &str,
-    caller_env: Rc<RefCell<HashMap<String, JsValue>>>,
+    caller_env: Rc<RefCell<GlobalEnv>>,
     caller_context: Option<JsValue>,
 ) -> StatorResult<DirectEvalCapture> {
     let outcome = eval_core(source, EvalMode::Direct, Some(caller_env), caller_context)?;
@@ -1038,8 +1038,9 @@ mod tests {
     fn test_eval_direct_shares_caller_env() {
         // Direct eval shares the caller's global_env: a `var` declaration
         // inside eval should be visible in the caller's environment.
-        let env = Rc::new(RefCell::new(HashMap::new()));
-        crate::builtins::install_globals::install_globals(&mut env.borrow_mut());
+        let mut ge = GlobalEnv::new();
+        crate::builtins::install_globals::install_globals(&mut ge.vars);
+        let env = Rc::new(RefCell::new(ge));
         let result = global_eval_direct("var x = 99; x", Rc::clone(&env)).unwrap();
         assert_eq!(result, JsValue::Smi(99));
         // `x` should now exist in the caller's environment.
@@ -1049,9 +1050,10 @@ mod tests {
     #[test]
     fn test_eval_direct_reads_caller_vars() {
         // Direct eval can read variables from the caller's environment.
-        let env = Rc::new(RefCell::new(HashMap::new()));
-        crate::builtins::install_globals::install_globals(&mut env.borrow_mut());
-        env.borrow_mut().insert("y".into(), JsValue::Smi(7));
+        let mut ge = GlobalEnv::new();
+        crate::builtins::install_globals::install_globals(&mut ge.vars);
+        ge.insert("y".into(), JsValue::Smi(7));
+        let env = Rc::new(RefCell::new(ge));
         let result = global_eval_direct("y + 3", Rc::clone(&env)).unwrap();
         assert_eq!(result, JsValue::Smi(10));
     }
@@ -1078,8 +1080,9 @@ mod tests {
     fn test_eval_strict_isolates_vars() {
         // Strict eval creates a child environment: `var` declarations inside
         // eval should NOT leak into the caller's scope.
-        let env = Rc::new(RefCell::new(HashMap::new()));
-        crate::builtins::install_globals::install_globals(&mut env.borrow_mut());
+        let mut ge = GlobalEnv::new();
+        crate::builtins::install_globals::install_globals(&mut ge.vars);
+        let env = Rc::new(RefCell::new(ge));
         let result = global_eval_strict("var secret = 100; secret", Rc::clone(&env)).unwrap();
         assert_eq!(result, JsValue::Smi(100));
         // `secret` must not exist in the caller's environment.

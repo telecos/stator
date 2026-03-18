@@ -261,7 +261,7 @@ thread_local! {
     /// resolve built-in constructor properties (e.g. `[].constructor === Array`)
     /// without threading the global env through every call site.
     #[allow(clippy::type_complexity)]
-    static CURRENT_GLOBALS: RefCell<Option<Rc<RefCell<HashMap<String, JsValue>>>>> =
+    static CURRENT_GLOBALS: RefCell<Option<Rc<RefCell<GlobalEnv>>>> =
         const { RefCell::new(None) };
 }
 
@@ -397,7 +397,7 @@ pub(super) fn init_generator_state_prototype(
 }
 
 /// Return the current thread's active global environment, if any.
-pub(crate) fn current_global_env() -> Option<Rc<RefCell<HashMap<String, JsValue>>>> {
+pub(crate) fn current_global_env() -> Option<Rc<RefCell<GlobalEnv>>> {
     CURRENT_GLOBALS.with(|g| g.borrow().clone())
 }
 
@@ -1298,6 +1298,69 @@ fn make_string_cache(bytecode_array: &BytecodeArray) -> Option<HashMap<u32, Rc<s
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GlobalEnv
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Global environment with a generation counter for cache invalidation.
+///
+/// Every mutation ([`insert`](Self::insert)/[`remove`](Self::remove)) bumps
+/// `generation`.  Frames compare their cached generation against the current
+/// one to detect staleness.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlobalEnv {
+    /// The variable bindings.
+    pub vars: HashMap<String, JsValue>,
+    /// Monotonically increasing counter bumped on every mutation.
+    pub generation: u64,
+}
+
+impl GlobalEnv {
+    /// Create an empty global environment.
+    pub fn new() -> Self {
+        Self {
+            vars: HashMap::new(),
+            generation: 0,
+        }
+    }
+
+    /// Insert a value, bumping the generation counter.
+    pub fn insert(&mut self, key: String, value: JsValue) {
+        self.vars.insert(key, value);
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Remove a key, bumping the generation counter.
+    pub fn remove(&mut self, key: &str) -> Option<JsValue> {
+        let removed = self.vars.remove(key);
+        if removed.is_some() {
+            self.generation = self.generation.wrapping_add(1);
+        }
+        removed
+    }
+
+    /// Get a reference to a value.
+    pub fn get(&self, key: &str) -> Option<&JsValue> {
+        self.vars.get(key)
+    }
+
+    /// Check if key exists.
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.vars.contains_key(key)
+    }
+
+    /// Get current generation.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl Default for GlobalEnv {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // InterpreterFrame
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1335,7 +1398,7 @@ pub struct InterpreterFrame {
     /// Shared global-variable environment.  The top-level script frame owns a
     /// fresh map; inner function frames inherit the same `Rc` so that globals
     /// written by a called function are visible back in the caller.
-    pub global_env: Rc<RefCell<HashMap<String, JsValue>>>,
+    pub global_env: Rc<RefCell<GlobalEnv>>,
     /// OSR (on-stack replacement) loop back-edge counter.
     ///
     /// Incremented by every `JumpLoop` instruction.  When this exceeds
@@ -1382,13 +1445,12 @@ pub struct InterpreterFrame {
     /// Avoids repeated `Rc→RefCell→HashMap` lookups for hot globals.
     /// Format: `[(name_hash, name, value); 8]` — direct-mapped by hash.
     pub global_cache: [(u64, Option<Rc<str>>, JsValue); 8],
+    /// Generation snapshot taken when the cache was last populated.
+    /// Compared against `global_env.generation` to detect staleness.
+    pub cache_generation: u64,
 }
 
 /// FNV-1a hash for short strings used by the global variable cache.
-///
-/// Currently unused while the global cache is disabled; retained for
-/// re-enabling with a generation counter.
-#[allow(dead_code)]
 #[inline(always)]
 fn fxhash(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1415,8 +1477,8 @@ impl InterpreterFrame {
         for (i, arg) in args.iter().cloned().enumerate().take(param_count) {
             registers[i] = arg;
         }
-        let mut global_map = HashMap::new();
-        crate::builtins::install_globals::install_globals(&mut global_map);
+        let mut global_env = GlobalEnv::new();
+        crate::builtins::install_globals::install_globals(&mut global_env.vars);
         let ic_slots = bytecode_array.feedback_metadata().slot_count() as usize;
         let string_cache = make_string_cache(&bytecode_array);
         Self {
@@ -1428,7 +1490,7 @@ impl InterpreterFrame {
             context: None,
             suspend_result: None,
             generator_state: None,
-            global_env: Rc::new(RefCell::new(global_map)),
+            global_env: Rc::new(RefCell::new(global_env)),
             osr_loop_count: 0,
             instruction_limit: 0,
             instructions_executed: 0,
@@ -1450,6 +1512,7 @@ impl InterpreterFrame {
                 (0, None, JsValue::Undefined),
                 (0, None, JsValue::Undefined),
             ],
+            cache_generation: 0,
         }
     }
 
@@ -1465,7 +1528,7 @@ impl InterpreterFrame {
     pub fn new_with_globals(
         bytecode_array: BytecodeArray,
         args: impl IntoIterator<Item = JsValue>,
-        global_env: Rc<RefCell<HashMap<String, JsValue>>>,
+        global_env: Rc<RefCell<GlobalEnv>>,
     ) -> Self {
         let args: CallArgs = args.into_iter().collect();
         // Ensure engine builtins are present.  The `eval` key is used as a
@@ -1475,7 +1538,7 @@ impl InterpreterFrame {
             crate::builtins::install_globals::install_globals(&mut defaults);
             let mut env = global_env.borrow_mut();
             for (k, v) in defaults {
-                env.entry(k).or_insert(v);
+                env.vars.entry(k).or_insert(v);
             }
         }
         // Build the frame directly with the shared global_env, avoiding the
@@ -1520,6 +1583,7 @@ impl InterpreterFrame {
                 (0, None, JsValue::Undefined),
                 (0, None, JsValue::Undefined),
             ],
+            cache_generation: 0,
         }
     }
 
@@ -1618,28 +1682,42 @@ impl InterpreterFrame {
 
     /// Try to read a global from the per-frame direct-mapped cache.
     ///
-    /// **Disabled**: the per-frame cache can go stale when nested calls
-    /// (setters, callbacks, Array.every, JSON.parse revivers, toPrimitive)
-    /// mutate the shared global_env via their own frame's StaGlobal.
-    /// Re-enable with a generation counter on global_env.
+    /// Returns `None` when the cache is stale (another frame mutated
+    /// `global_env` since the last put) or on a hash miss, forcing the
+    /// caller to take the slow HashMap path.
     #[inline(always)]
-    pub fn global_cache_get(&self, _name: &str) -> Option<&JsValue> {
-        None
+    pub fn global_cache_get(&self, name: &str) -> Option<&JsValue> {
+        // Check if cache is stale (another frame modified global_env).
+        let current_gen = self.global_env.borrow().generation();
+        if current_gen != self.cache_generation {
+            return None;
+        }
+        let h = fxhash(name);
+        let slot = (h as usize) & 7;
+        let (sh, ref sn, ref sv) = self.global_cache[slot];
+        if sh == h && sn.as_deref() == Some(name) {
+            Some(sv)
+        } else {
+            None
+        }
     }
 
     /// Insert or update a global in the per-frame direct-mapped cache.
     ///
-    /// **Disabled**: see global_cache_get.
+    /// Snapshots the current generation so subsequent gets can validate.
     #[inline(always)]
-    pub fn global_cache_put(&mut self, _name: &str, _value: JsValue) {
-        // no-op while cache is disabled
+    pub fn global_cache_put(&mut self, name: &str, value: JsValue) {
+        self.cache_generation = self.global_env.borrow().generation();
+        let h = fxhash(name);
+        let slot = (h as usize) & 7;
+        self.global_cache[slot] = (h, Some(Rc::from(name)), value);
     }
 
     /// Invalidate the per-frame global variable cache.
     ///
-    /// Must be called after any nested function call (Interpreter::run,
-    /// NativeFunction invocation, dispatch_setter, run_field_init, or
-    /// dispatch_getter) that could have mutated the shared global_env.
+    /// Kept for call-sites that explicitly need to clear the cache
+    /// (e.g. after a tail-call rewrite).  With the generation counter,
+    /// most invalidation is automatic.
     #[inline(always)]
     pub fn global_cache_invalidate(&mut self) {
         self.global_cache = [
@@ -2107,7 +2185,7 @@ impl Interpreter {
             global_env: CURRENT_GLOBALS.with(|g| {
                 g.borrow()
                     .clone()
-                    .unwrap_or_else(|| Rc::new(RefCell::new(std::collections::HashMap::new())))
+                    .unwrap_or_else(|| Rc::new(RefCell::new(GlobalEnv::new())))
             }),
             osr_loop_count: 0,
             instruction_limit: 0,
@@ -2130,6 +2208,7 @@ impl Interpreter {
                 (0, None, JsValue::Undefined),
                 (0, None, JsValue::Undefined),
             ],
+            cache_generation: 0,
         };
         // Restore the captured closure context so generators can access outer
         // scope variables through the context chain.
@@ -8527,7 +8606,7 @@ mod tests {
         let program = parse(src).unwrap();
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
         let mut frame = InterpreterFrame::new(ba, vec![]);
-        crate::builtins::install_globals::install_globals(&mut frame.global_env.borrow_mut());
+        crate::builtins::install_globals::install_globals(&mut frame.global_env.borrow_mut().vars);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::String("TypeError".to_string().into()));
     }
@@ -12580,7 +12659,7 @@ mod tests {
         let ba = make_bytecode_with_pool(instrs, pool, 3, 0);
         let mut frame = InterpreterFrame::new(ba, vec![]);
         // Re-install globals since make_bytecode_with_pool bypasses new()
-        crate::builtins::install_globals::install_globals(&mut frame.global_env.borrow_mut());
+        crate::builtins::install_globals::install_globals(&mut frame.global_env.borrow_mut().vars);
         Interpreter::run(&mut frame)
     }
 
@@ -12699,7 +12778,7 @@ mod tests {
         ];
         let ba = make_bytecode_with_pool(instrs, pool, 2, 0);
         let mut frame = InterpreterFrame::new(ba, vec![]);
-        crate::builtins::install_globals::install_globals(&mut frame.global_env.borrow_mut());
+        crate::builtins::install_globals::install_globals(&mut frame.global_env.borrow_mut().vars);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::String(String::new().into()));
     }
