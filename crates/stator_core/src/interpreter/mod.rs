@@ -1647,6 +1647,10 @@ impl Interpreter {
                     (&decoded.0[..], &decoded.1[..], decoded.2.as_slice());
                 let handler_table = frame.bytecode_array.shared_handler_table();
 
+                // Cache the debugger-attached flag so we avoid a thread-local
+                // read on every instruction.  Refreshed in the periodic block.
+                let mut debug_active = DEBUG_ATTACHED.with(Cell::get);
+
                 loop {
                     if frame.pc >= instructions.len() {
                         return Err(bytecode_end_error());
@@ -1658,7 +1662,7 @@ impl Interpreter {
                     // next instruction so that the paused frame state reflects what is
                     // *about* to execute (the program counter still points at the
                     // instruction that would fire next).
-                    if DEBUG_ATTACHED.with(Cell::get) {
+                    if debug_active {
                         let current_offset = byte_offsets[frame.pc] as u32;
                         if let Some(pause_err) = ACTIVE_DEBUGGER.with(|d| {
                             let opt = d.borrow();
@@ -1670,7 +1674,8 @@ impl Interpreter {
                     }
 
                     // ── Fetch ──────────────────────────────────────────────────────
-                    let instr = &instructions[frame.pc];
+                    // SAFETY: The bounds check above guarantees frame.pc < instructions.len().
+                    let instr = unsafe { instructions.get_unchecked(frame.pc) };
                     frame.pc += 1;
 
                     // ── Instruction limit & deadline checks ─────────────────────────
@@ -1682,6 +1687,9 @@ impl Interpreter {
                     if frame.instructions_executed & 0x3FF == 0 {
                         // ── CPU profiler checkpoint (periodic) ──────────────────
                         crate::inspector::profiler::maybe_record_sample();
+
+                        // Refresh debugger flag from thread-local.
+                        debug_active = DEBUG_ATTACHED.with(Cell::get);
 
                         // Check per-frame instruction limit
                         if frame.instruction_limit > 0

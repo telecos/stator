@@ -298,7 +298,7 @@ fn handle_lda_zero(
     Ok(DispatchAction::Continue)
 }
 
-#[inline]
+#[inline(always)]
 fn handle_lda_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
     let Operand::Immediate(v) = instr.operands[0] else {
         return Err(err_bad_operand("LdaSmi", 0));
@@ -368,7 +368,7 @@ fn handle_lda_constant(
     Ok(DispatchAction::Continue)
 }
 
-#[inline]
+#[inline(always)]
 fn handle_ldar(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Ldar", 0));
@@ -377,7 +377,7 @@ fn handle_ldar(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<D
     Ok(DispatchAction::Continue)
 }
 
-#[inline]
+#[inline(always)]
 fn handle_star(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Star", 0));
@@ -399,7 +399,7 @@ fn handle_mov(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     Ok(DispatchAction::Continue)
 }
 
-#[inline]
+#[inline(always)]
 fn handle_add(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Add", 0));
@@ -429,7 +429,7 @@ fn handle_add(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     Ok(DispatchAction::Continue)
 }
 
-#[inline]
+#[inline(always)]
 fn handle_sub(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Sub", 0));
@@ -984,6 +984,7 @@ fn handle_dec(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<D
     Ok(DispatchAction::Continue)
 }
 
+#[inline(always)]
 fn handle_test_equal(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -1031,6 +1032,7 @@ fn handle_test_equal_strict(
     Ok(DispatchAction::Continue)
 }
 
+#[inline(always)]
 fn handle_test_less_than(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -1052,6 +1054,7 @@ fn handle_test_less_than(
     Ok(DispatchAction::Continue)
 }
 
+#[inline(always)]
 fn handle_test_greater_than(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -1160,7 +1163,7 @@ fn handle_to_boolean_logical_not(
     Ok(DispatchAction::Continue)
 }
 
-#[inline]
+#[inline(always)]
 fn handle_jump(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
     let Operand::JumpOffset(_delta) = instr.operands[0] else {
         return Err(err_bad_operand("Jump", 0));
@@ -1192,7 +1195,7 @@ fn handle_jump_loop(
     Ok(DispatchAction::Continue)
 }
 
-#[inline]
+#[inline(always)]
 fn handle_jump_if_true(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -1206,7 +1209,7 @@ fn handle_jump_if_true(
     Ok(DispatchAction::Continue)
 }
 
-#[inline]
+#[inline(always)]
 fn handle_jump_if_false(
     ctx: &mut DispatchContext,
     instr: &Instruction,
