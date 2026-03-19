@@ -35,10 +35,12 @@ use crate::objects::value::JsValue;
 
 /// Internal storage key used for an object's prototype link.
 pub const INTERNAL_PROTO_PROPERTY_KEY: &str = "\0stator.internal.proto";
+const USER_VISIBLE_PROTO_PROPERTY_KEY: &str = "__proto__";
 
 /// Global monotonically-increasing counter used to assign unique shape
 /// identifiers to each [`PropertyMap`] structural configuration.
 static NEXT_SHAPE_ID: AtomicU64 = AtomicU64::new(1);
+static GLOBAL_PROTO_MUTATION_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Default attributes for properties created by ordinary JS assignment:
 /// writable, enumerable, and configurable.
@@ -230,6 +232,12 @@ pub struct PropertyMap {
     /// Deterministic layout identifier shared by maps with the same property
     /// names, insertion order, and attributes.
     layout_id: u64,
+    /// Cached prototype-chain generation for this map.
+    proto_generation: Cell<u32>,
+    /// Local mutation generation that contributes to `proto_generation`.
+    proto_epoch: Cell<u32>,
+    /// Global prototype-mutation epoch used to validate `proto_generation`.
+    proto_global_epoch: Cell<u64>,
     /// Whether new properties may be added to this object (§10.1 `[[Extensible]]`).
     pub extensible: bool,
     /// Whether this map contains any accessor properties (`__get_*__` or `__set_*__` keys).
@@ -274,6 +282,9 @@ impl PropertyMap {
             cache_cursor: Cell::new(0),
             shape_id: NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed),
             layout_id: layout_hash(&[], &[]),
+            proto_generation: Cell::new(0),
+            proto_epoch: Cell::new(0),
+            proto_global_epoch: Cell::new(0),
             extensible: true,
             has_accessors: false,
         }
@@ -341,6 +352,13 @@ impl PropertyMap {
         self.layout_id = layout_hash(&self.keys, &self.attrs);
     }
 
+    #[inline]
+    fn touch_proto_generation(&self) {
+        self.proto_epoch.set(self.proto_epoch.get().wrapping_add(1));
+        GLOBAL_PROTO_MUTATION_EPOCH.fetch_add(1, Ordering::Relaxed);
+        self.proto_global_epoch.set(u64::MAX);
+    }
+
     // ── Shape / offset API ───────────────────────────────────────────────
 
     /// Returns the current shape identifier.
@@ -357,6 +375,28 @@ impl PropertyMap {
     #[inline]
     pub fn layout_id(&self) -> u64 {
         self.layout_id
+    }
+
+    /// Returns the cached generation for this map's prototype chain.
+    #[inline]
+    pub fn proto_generation(&self) -> u32 {
+        let global_epoch = GLOBAL_PROTO_MUTATION_EPOCH.load(Ordering::Relaxed);
+        if self.proto_global_epoch.get() == global_epoch {
+            return self.proto_generation.get();
+        }
+
+        let inherited_generation = self
+            .get(INTERNAL_PROTO_PROPERTY_KEY)
+            .or_else(|| self.get(USER_VISIBLE_PROTO_PROPERTY_KEY))
+            .and_then(|value| match value {
+                JsValue::PlainObject(proto) => Some(proto.borrow().proto_generation()),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let generation = self.proto_epoch.get().wrapping_add(inherited_generation);
+        self.proto_generation.set(generation);
+        self.proto_global_epoch.set(global_epoch);
+        generation
     }
 
     /// Returns the slot index (offset) for `key`, or `None` if absent.
@@ -433,6 +473,7 @@ impl PropertyMap {
     pub fn set_by_offset(&mut self, offset: usize, value: JsValue) -> bool {
         if let Some(slot) = self.values.get_mut(offset) {
             *slot = value;
+            self.touch_proto_generation();
             true
         } else {
             false
@@ -536,6 +577,7 @@ impl PropertyMap {
     pub fn insert(&mut self, key: String, value: JsValue) {
         if let Some(i) = self.lookup_slot_cached(&key) {
             self.values[i] = value;
+            self.touch_proto_generation();
         } else {
             // Non-extensible objects reject new properties (except internal __dunder__ keys).
             if !self.extensible && !key.starts_with("__") {
@@ -553,6 +595,7 @@ impl PropertyMap {
             if pos != self.keys.len() - 1 {
                 self.cache_invalidate();
             }
+            self.touch_proto_generation();
         }
     }
 
@@ -562,6 +605,7 @@ impl PropertyMap {
         if let Some(i) = self.lookup_slot_cached(&key) {
             self.values[i] = value;
             self.attrs[i] = BUILTIN_ATTRS;
+            self.touch_proto_generation();
         } else {
             let pos = self.spec_insert_pos(&key);
             self.insert_new(key, value, BUILTIN_ATTRS, pos);
@@ -569,6 +613,7 @@ impl PropertyMap {
             if pos != self.keys.len() - 1 {
                 self.cache_invalidate();
             }
+            self.touch_proto_generation();
         }
     }
 
@@ -582,6 +627,7 @@ impl PropertyMap {
         }
         if !self.attrs.is_empty() {
             self.bump_shape_id();
+            self.touch_proto_generation();
         }
     }
 
@@ -612,6 +658,7 @@ impl PropertyMap {
             self.refresh_index_mode();
             self.bump_shape_id();
             self.cache_invalidate();
+            self.touch_proto_generation();
             Some(val)
         } else {
             None
@@ -654,6 +701,7 @@ impl PropertyMap {
         if let Some(i) = self.lookup_slot_cached(&key) {
             self.values[i] = value;
             self.attrs[i] = attrs;
+            self.touch_proto_generation();
         } else {
             let pos = self.spec_insert_pos(&key);
             self.insert_new(key, value, attrs, pos);
@@ -661,6 +709,7 @@ impl PropertyMap {
             if pos != self.keys.len() - 1 {
                 self.cache_invalidate();
             }
+            self.touch_proto_generation();
         }
     }
 
@@ -670,6 +719,7 @@ impl PropertyMap {
         if let Some(i) = self.lookup_slot_cached(key) {
             self.attrs[i] = attrs;
             self.bump_shape_id();
+            self.touch_proto_generation();
             true
         } else {
             false
@@ -711,6 +761,7 @@ impl PropertyMap {
                 self.attrs[i].remove(PropertyAttributes::WRITABLE);
             }
             self.bump_shape_id();
+            self.touch_proto_generation();
         }
     }
 
@@ -723,6 +774,7 @@ impl PropertyMap {
                 self.attrs[i].remove(PropertyAttributes::ENUMERABLE);
             }
             self.bump_shape_id();
+            self.touch_proto_generation();
         }
     }
 
@@ -735,6 +787,7 @@ impl PropertyMap {
                 self.attrs[i].remove(PropertyAttributes::CONFIGURABLE);
             }
             self.bump_shape_id();
+            self.touch_proto_generation();
         }
     }
 
@@ -788,6 +841,7 @@ impl PropertyMap {
         }
         self.extensible = false;
         self.bump_shape_id();
+        self.touch_proto_generation();
     }
 
     /// Returns `true` if the object is frozen: non-extensible with all
@@ -810,6 +864,7 @@ impl PropertyMap {
         }
         self.extensible = false;
         self.bump_shape_id();
+        self.touch_proto_generation();
     }
 
     /// Returns `true` if the object is sealed: non-extensible with all
@@ -844,6 +899,8 @@ impl Drop for PropertyMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[test]
     fn test_insert_get_default_attrs() {
@@ -1560,6 +1617,24 @@ mod tests {
         pm.make_all_non_enumerable();
         assert!(!pm.is_enumerable("a"));
         assert!(!pm.is_enumerable("b"));
+    }
+
+    #[test]
+    fn test_proto_generation_tracks_prototype_mutations() {
+        let proto = Rc::new(RefCell::new(PropertyMap::new()));
+        proto.borrow_mut().insert("x".to_string(), JsValue::Smi(1));
+
+        let child = Rc::new(RefCell::new(PropertyMap::new()));
+        child.borrow_mut().insert(
+            "__proto__".to_string(),
+            JsValue::PlainObject(Rc::clone(&proto)),
+        );
+
+        let before = child.borrow().proto_generation();
+        proto.borrow_mut().insert("x".to_string(), JsValue::Smi(2));
+        let after = child.borrow().proto_generation();
+
+        assert_ne!(after, before);
     }
 
     // ── set_writable / set_enumerable / set_configurable ─────────────────

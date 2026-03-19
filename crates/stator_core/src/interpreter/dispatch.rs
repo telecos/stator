@@ -15,18 +15,19 @@ use smallvec::{SmallVec, smallvec};
 
 use crate::builtins::string::{string_char_at, utf16_len};
 use crate::objects::map::PropertyAttributes;
-use crate::objects::property_map::PropertyMap;
+use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 
 use super::{
     ACTIVE_DEBUGGER, CallArgs, GlobalEnv, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD,
-    OSR_LOOP_THRESHOLD, PropertyIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow,
-    collect_args, concat_rc_strs, constant_pool_jump_delta, constant_to_value,
+    OSR_LOOP_THRESHOLD, PropertyIc, ProtoLoadIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq,
+    bigint_pow, collect_args, concat_rc_strs, constant_pool_jump_delta, constant_to_value,
     construct_builtin_result, decode_string_constant, dispatch_call_property, dispatch_call_value,
     dispatch_call_with_this, dispatch_getter, dispatch_setter, err_bad_operand,
     error_message_from_value, extract_context, find_handler, fn_props_get, fn_props_set,
     has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
     maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator,
-    number_to_jsvalue, plain_object_to_array_items, populate_self_name, proto_lookup, resolve_jump,
+    number_to_jsvalue, plain_object_has_own_property, plain_object_to_array_items,
+    populate_self_name, proto_lookup, proto_lookup_chain_depth, resolve_jump,
     restore_closure_context, set_function_name_if_missing, set_pending_exception,
     settle_async_iterator_result, strict_eq, to_array_index, to_bigint, to_property_key,
     try_execute_best_jit, try_fast_named_property_lookup, walk_context_chain,
@@ -1787,6 +1788,7 @@ fn handle_tail_call(
                     ctx.frame.mono_load_cache = None;
                     ctx.frame.poly_load_cache = None;
                     ctx.frame.shape_load_ic = None;
+                    ctx.frame.proto_load_ic = None;
                     ctx.frame.shape_store_ic = None;
                     return Ok(DispatchAction::TailCall);
                 }
@@ -3185,10 +3187,28 @@ fn handle_lda_named_property(
             return Ok(DispatchAction::Continue);
         }
     }
+    if slot != u32::MAX
+        && let JsValue::PlainObject(ref map) = obj
+        && let Some(ic) = ctx
+            .frame
+            .proto_load_ic
+            .as_ref()
+            .and_then(|cache| cache.get(&slot))
+    {
+        let pm = map.borrow();
+        if ic.receiver_shape == pm.layout_id()
+            && ic.proto_depth != 0
+            && ic.property_key.as_ref() == prop_name.as_ref()
+            && ic.proto_generation == pm.proto_generation()
+            && !plain_object_has_own_property(&pm, prop_name.as_ref())
+        {
+            ctx.frame.accumulator = ic.value.clone();
+            return Ok(DispatchAction::Continue);
+        }
+    }
     // Polymorphic cache: check if any cached entry matches by pointer identity.
     if slot != u32::MAX {
         let obj_ptr = match &obj {
-            JsValue::PlainObject(map) => Some(Rc::as_ptr(map) as usize),
             JsValue::Array(arr) => Some(Rc::as_ptr(arr) as usize),
             JsValue::Function(ba) => Some(Rc::as_ptr(ba) as usize),
             _ => None,
@@ -3219,8 +3239,26 @@ fn handle_lda_named_property(
             }
         )));
     }
-    let result = try_fast_named_property_lookup(&obj, &prop_name)
-        .unwrap_or_else(|| proto_lookup(&obj, &prop_name));
+    let mut inherited_proto_depth = None;
+    let result = if let Some(result) = try_fast_named_property_lookup(&obj, &prop_name) {
+        result
+    } else {
+        let result = proto_lookup(&obj, &prop_name);
+        if let JsValue::PlainObject(ref map) = obj
+            && !matches!(result, JsValue::Undefined)
+        {
+            let explicit_proto = {
+                let pm = map.borrow();
+                pm.get(INTERNAL_PROTO_PROPERTY_KEY)
+                    .or_else(|| pm.get("__proto__"))
+                    .cloned()
+            };
+            if let Some(proto) = explicit_proto {
+                inherited_proto_depth = proto_lookup_chain_depth(&proto, &prop_name);
+            }
+        }
+        result
+    };
     // ── Populate shape IC for own-property hits on PlainObject ───────────
     // Skip caching when the property has an accessor (__get_<key>__)
     // because the IC fast-path would return the placeholder data value
@@ -3240,11 +3278,24 @@ fn handle_lda_named_property(
                 },
             );
         }
+        if let Some(depth) = inherited_proto_depth {
+            ctx.frame.proto_load_ic_mut().insert(
+                slot,
+                ProtoLoadIc {
+                    receiver_shape: pm.layout_id(),
+                    proto_generation: pm.proto_generation(),
+                    proto_depth: depth,
+                    property_key: Rc::clone(&prop_name),
+                    value: result.clone(),
+                },
+            );
+        } else if let Some(cache) = &mut ctx.frame.proto_load_ic {
+            cache.remove(&slot);
+        }
     }
     // Update polymorphic cache (up to 8 entries per slot).
-    if slot != u32::MAX {
+    if slot != u32::MAX && inherited_proto_depth.is_none() {
         let obj_ptr = match &obj {
-            JsValue::PlainObject(map) => Some(Rc::as_ptr(map) as usize),
             JsValue::Array(arr) => Some(Rc::as_ptr(arr) as usize),
             JsValue::Function(ba) => Some(Rc::as_ptr(ba) as usize),
             _ => None,
