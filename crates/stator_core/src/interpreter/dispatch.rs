@@ -1782,15 +1782,11 @@ fn handle_tail_call(
                     }
                     restore_closure_context(ctx.frame, &ba);
                     populate_self_name(ctx.frame, &ba, &JsValue::Function(Rc::clone(&ba)));
-                    ctx.frame.string_cache = super::make_string_cache(&ctx.frame.bytecode_array);
-                    if let Some(cache) = &mut ctx.frame.mono_load_cache {
-                        cache.clear();
-                    }
-                    if let Some(cache) = &mut ctx.frame.poly_load_cache {
-                        cache.clear();
-                    }
-                    ctx.frame.shape_load_ic.fill(None);
-                    ctx.frame.shape_store_ic.fill(None);
+                    ctx.frame.string_cache = None;
+                    ctx.frame.mono_load_cache = None;
+                    ctx.frame.poly_load_cache = None;
+                    ctx.frame.shape_load_ic = None;
+                    ctx.frame.shape_store_ic = None;
                     return Ok(DispatchAction::TailCall);
                 }
             }
@@ -3240,8 +3236,8 @@ fn handle_lda_named_property(
         && let Some(ic) = ctx
             .frame
             .shape_load_ic
-            .get(slot as usize)
-            .and_then(|opt| opt.as_ref())
+            .as_ref()
+            .and_then(|cache| cache.get(&slot))
     {
         let pm = map.borrow();
         if pm.layout_id() == ic.cached_shape
@@ -3300,12 +3296,14 @@ fn handle_lda_named_property(
         let getter_key = format!("__get_{prop_name}__");
         if !pm.contains_key(&getter_key)
             && let Some(offset) = pm.offset_of(&prop_name)
-            && let Some(entry) = ctx.frame.shape_load_ic.get_mut(slot as usize)
         {
-            *entry = Some(PropertyIc {
-                cached_shape: pm.layout_id(),
-                cached_offset: offset,
-            });
+            ctx.frame.shape_load_ic_mut().insert(
+                slot,
+                PropertyIc {
+                    cached_shape: pm.layout_id(),
+                    cached_offset: offset,
+                },
+            );
         }
     }
     // Update polymorphic cache (up to 8 entries per slot).
@@ -3317,12 +3315,7 @@ fn handle_lda_named_property(
             _ => None,
         };
         if let Some(ptr) = obj_ptr {
-            let entries = ctx
-                .frame
-                .poly_load_cache
-                .get_or_insert_with(std::collections::HashMap::new)
-                .entry(slot)
-                .or_default();
+            let entries = ctx.frame.poly_load_cache_mut().entry(slot).or_default();
             // Check if we already have this pointer; update in place.
             let mut found = false;
             for entry in entries.iter_mut() {
@@ -3389,8 +3382,8 @@ fn handle_sta_named_property(
                 && let Some(ic) = ctx
                     .frame
                     .shape_store_ic
-                    .get(slot as usize)
-                    .and_then(|opt| opt.as_ref())
+                    .as_ref()
+                    .and_then(|cache| cache.get(&slot))
             {
                 let pm = map.borrow();
                 if pm.layout_id() == ic.cached_shape
@@ -3495,13 +3488,14 @@ fn handle_sta_named_property(
             // Populate shape store IC for future fast-path stores.
             if slot != u32::MAX {
                 let pm = map.borrow();
-                if let Some(offset) = pm.offset_of(&prop_name)
-                    && let Some(entry) = ctx.frame.shape_store_ic.get_mut(slot as usize)
-                {
-                    *entry = Some(PropertyIc {
-                        cached_shape: pm.layout_id(),
-                        cached_offset: offset,
-                    });
+                if let Some(offset) = pm.offset_of(&prop_name) {
+                    ctx.frame.shape_store_ic_mut().insert(
+                        slot,
+                        PropertyIc {
+                            cached_shape: pm.layout_id(),
+                            cached_offset: offset,
+                        },
+                    );
                 }
             }
             // Invalidate value-based caches for this object.

@@ -208,6 +208,10 @@ pub use crate::objects::value::{
 
 /// Property map for a single `Function` value in the side-table.
 type FnPropMap = Rc<RefCell<HashMap<String, JsValue>>>;
+type MonoLoadCache = HashMap<u32, (usize, JsValue)>;
+type PolyLoadCache = HashMap<u32, Vec<(usize, JsValue)>>;
+type ShapeIcCache = HashMap<u32, PropertyIc>;
+type StringCache = HashMap<u32, Rc<str>>;
 
 thread_local! {
     /// The currently-attached debugger for this thread, if any.
@@ -1304,16 +1308,6 @@ fn release_registers(mut regs: RegisterFile) {
     }
 }
 
-#[inline]
-fn make_string_cache(bytecode_array: &BytecodeArray) -> Option<HashMap<u32, Rc<str>>> {
-    let constant_pool_len = bytecode_array.constant_pool().len();
-    if !bytecode_array.constant_pool().is_empty() {
-        Some(HashMap::with_capacity(constant_pool_len.min(32)))
-    } else {
-        None
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // GlobalEnv
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1567,22 +1561,23 @@ pub struct InterpreterFrame {
     /// Monomorphic property-load cache: `slot → (map_ptr, cached_value)`.
     /// Lazily allocated on first write so leaf calls that never touch inline
     /// caches pay no HashMap allocation cost.
-    pub mono_load_cache: Option<HashMap<u32, (usize, JsValue)>>,
+    pub mono_load_cache: Option<Box<MonoLoadCache>>,
     /// Polymorphic property-load cache: `slot → [(ptr, cached_value)]`.
     /// Holds up to 4 entries per feedback slot, supporting polymorphic sites.
     /// Lazily allocated on first write.
-    pub poly_load_cache: Option<HashMap<u32, Vec<(usize, JsValue)>>>,
-    /// Shape-based inline cache for named property loads.
-    /// Direct-indexed by feedback slot for O(1) access.  Each entry records
-    /// the last observed `(layout_id, offset)` pair so that a repeat access
-    /// on the same property layout can skip property-map lookup entirely.
-    pub shape_load_ic: Vec<Option<PropertyIc>>,
+    pub poly_load_cache: Option<Box<PolyLoadCache>>,
+    /// Shape-based inline cache for named property loads keyed by feedback slot.
+    /// Each entry records the last observed `(layout_id, offset)` pair so that a
+    /// repeat access on the same property layout can skip property-map lookup
+    /// entirely. Lazily allocated on first write.
+    pub shape_load_ic: Option<Box<ShapeIcCache>>,
     /// Shape-based inline cache for named property stores.
-    /// Direct-indexed by feedback slot, mirroring `shape_load_ic`.
-    pub shape_store_ic: Vec<Option<PropertyIc>>,
+    /// Keyed by feedback slot, mirroring `shape_load_ic`. Lazily allocated on
+    /// first write.
+    pub shape_store_ic: Option<Box<ShapeIcCache>>,
     /// Pre-decoded string constants from the constant pool, keyed by index.
     /// Avoids repeated `String::clone()` from the constant pool.
-    pub string_cache: Option<HashMap<u32, Rc<str>>>,
+    pub string_cache: Option<Box<StringCache>>,
     /// Cache of recently-accessed global variable values.
     /// Avoids repeated `Rc→RefCell→HashMap` lookups for hot globals.
     /// Format: `[(name_hash, name, value); 8]` — direct-mapped by hash.
@@ -1640,8 +1635,6 @@ impl InterpreterFrame {
         }
         let mut global_env = GlobalEnv::new();
         crate::builtins::install_globals::install_globals(&mut global_env.vars);
-        let ic_slots = bytecode_array.feedback_metadata().slot_count() as usize;
-        let string_cache = make_string_cache(&bytecode_array);
         Self {
             bytecode_array,
             registers,
@@ -1660,9 +1653,9 @@ impl InterpreterFrame {
             new_target: JsValue::Undefined,
             mono_load_cache: None,
             poly_load_cache: None,
-            shape_load_ic: vec![None; ic_slots],
-            shape_store_ic: vec![None; ic_slots],
-            string_cache,
+            shape_load_ic: None,
+            shape_store_ic: None,
+            string_cache: None,
             global_cache: [
                 (0, None, JsValue::Undefined),
                 (0, None, JsValue::Undefined),
@@ -1716,8 +1709,6 @@ impl InterpreterFrame {
         for (i, arg) in args.iter().cloned().enumerate().take(param_count) {
             registers[i] = arg;
         }
-        let ic_slots = bytecode_array.feedback_metadata().slot_count() as usize;
-        let string_cache = make_string_cache(&bytecode_array);
         Self {
             bytecode_array,
             registers,
@@ -1736,9 +1727,9 @@ impl InterpreterFrame {
             new_target: JsValue::Undefined,
             mono_load_cache: None,
             poly_load_cache: None,
-            shape_load_ic: vec![None; ic_slots],
-            shape_store_ic: vec![None; ic_slots],
-            string_cache,
+            shape_load_ic: None,
+            shape_store_ic: None,
+            string_cache: None,
             global_cache: [
                 (0, None, JsValue::Undefined),
                 (0, None, JsValue::Undefined),
@@ -1888,6 +1879,45 @@ impl InterpreterFrame {
         Ok(())
     }
 
+    #[allow(dead_code)]
+    #[inline]
+    fn mono_load_cache_mut(&mut self) -> &mut MonoLoadCache {
+        self.mono_load_cache
+            .get_or_insert_with(|| Box::new(HashMap::new()))
+            .as_mut()
+    }
+
+    #[inline]
+    fn poly_load_cache_mut(&mut self) -> &mut PolyLoadCache {
+        self.poly_load_cache
+            .get_or_insert_with(|| Box::new(HashMap::new()))
+            .as_mut()
+    }
+
+    #[inline]
+    fn shape_load_ic_mut(&mut self) -> &mut ShapeIcCache {
+        let ic_slots = self.bytecode_array.feedback_metadata().slot_count() as usize;
+        self.shape_load_ic
+            .get_or_insert_with(|| Box::new(HashMap::with_capacity(ic_slots)))
+            .as_mut()
+    }
+
+    #[inline]
+    fn shape_store_ic_mut(&mut self) -> &mut ShapeIcCache {
+        let ic_slots = self.bytecode_array.feedback_metadata().slot_count() as usize;
+        self.shape_store_ic
+            .get_or_insert_with(|| Box::new(HashMap::with_capacity(ic_slots)))
+            .as_mut()
+    }
+
+    #[inline]
+    fn string_cache_mut(&mut self) -> &mut StringCache {
+        let constant_pool_len = self.bytecode_array.constant_pool().len();
+        self.string_cache
+            .get_or_insert_with(|| Box::new(HashMap::with_capacity(constant_pool_len.min(32))))
+            .as_mut()
+    }
+
     /// Get a string constant from the constant pool, caching the result.
     pub fn get_string_constant(&mut self, idx: u32) -> StatorResult<Rc<str>> {
         if let Some(cached) = self.string_cache.as_ref().and_then(|cache| cache.get(&idx)) {
@@ -1901,9 +1931,7 @@ impl InterpreterFrame {
                 ));
             }
         };
-        self.string_cache
-            .get_or_insert_with(HashMap::new)
-            .insert(idx, Rc::clone(&s));
+        self.string_cache_mut().insert(idx, Rc::clone(&s));
         Ok(s)
     }
 
@@ -3023,8 +3051,6 @@ impl Interpreter {
         let mut registers = saved_registers;
         registers.resize(total, JsValue::Undefined);
 
-        let ic_slots = bytecode_array.feedback_metadata().slot_count() as usize;
-        let string_cache = make_string_cache(&bytecode_array);
         let mut frame = InterpreterFrame {
             bytecode_array,
             registers,
@@ -3047,9 +3073,9 @@ impl Interpreter {
             new_target: JsValue::Undefined,
             mono_load_cache: None,
             poly_load_cache: None,
-            shape_load_ic: vec![None; ic_slots],
-            shape_store_ic: vec![None; ic_slots],
-            string_cache,
+            shape_load_ic: None,
+            shape_store_ic: None,
+            string_cache: None,
             global_cache: [
                 (0, None, JsValue::Undefined),
                 (0, None, JsValue::Undefined),
