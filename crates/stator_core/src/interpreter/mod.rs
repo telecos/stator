@@ -243,9 +243,9 @@ thread_local! {
     static STRING_TABLE: RefCell<crate::objects::js_string::StringTable> =
         RefCell::new(crate::objects::js_string::StringTable::new());
 
-    /// Thread-local pool of spilled register files.
+    /// Thread-local pool of spilled register file buffers.
     /// Avoids repeated heap allocation for large interpreter frames.
-    static REGISTER_POOL: RefCell<Vec<RegisterFile>> = const { RefCell::new(Vec::new()) };
+    static REGISTER_POOL: RefCell<Vec<Vec<JsValue>>> = const { RefCell::new(Vec::new()) };
 }
 
 thread_local! {
@@ -1284,25 +1284,25 @@ fn acquire_registers(count: usize) -> RegisterFile {
 
     REGISTER_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
-        if let Some(mut regs) = pool.pop() {
+        if let Some(pos) = pool.iter().position(|regs| regs.capacity() >= count) {
+            let mut regs = pool.swap_remove(pos);
             regs.clear();
             regs.resize(count, JsValue::Undefined);
-            regs
+            RegisterFile::from_vec(regs)
         } else {
-            let mut regs = RegisterFile::with_capacity(count);
-            regs.resize(count, JsValue::Undefined);
-            regs
+            RegisterFile::from_vec(vec![JsValue::Undefined; count])
         }
     })
 }
 
 /// Return a register file to the pool for reuse.
-fn release_registers(mut regs: RegisterFile) {
-    if regs.spilled() && regs.capacity() <= 256 {
+fn release_registers(regs: RegisterFile) {
+    if regs.spilled() {
+        let mut regs = regs.into_vec();
         regs.clear();
         REGISTER_POOL.with(|pool| {
             let mut pool = pool.borrow_mut();
-            if pool.len() < 32 {
+            if pool.len() < 16 {
                 pool.push(regs);
             }
         });
