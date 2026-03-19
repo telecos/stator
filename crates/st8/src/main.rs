@@ -173,7 +173,7 @@ fn main() {
         );
     } else if bytecodes.is_module() && bytecodes.is_async() {
         // Top-level await: run the module as an async function.
-        match Interpreter::run_async_function(bytecodes, vec![]) {
+        match Interpreter::run_async_function(Rc::new(bytecodes), vec![]) {
             Ok(_) => {}
             Err(e) => {
                 eprintln!("{e}");
@@ -181,7 +181,7 @@ fn main() {
             }
         }
     } else {
-        let mut frame = InterpreterFrame::new_with_globals(bytecodes, vec![], globals);
+        let mut frame = InterpreterFrame::new_with_globals(Rc::new(bytecodes), vec![], globals);
         if let Err(e) = Interpreter::run(&mut frame) {
             eprintln!("{e}");
             process::exit(1);
@@ -229,7 +229,7 @@ fn run_with_inspector(
     });
 
     // Execute the script on the main thread.
-    let mut frame = InterpreterFrame::new_with_globals(bytecodes, vec![], globals);
+    let mut frame = InterpreterFrame::new_with_globals(Rc::new(bytecodes), vec![], globals);
     if let Err(e) = Interpreter::run(&mut frame) {
         eprintln!("{e}");
         process::exit(1);

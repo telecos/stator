@@ -513,7 +513,7 @@ fn make_test_globals() -> HashMap<String, JsValue> {
                     };
                     let program = parser::parse(&code)?;
                     let bc = BytecodeGenerator::compile_program(&program)?;
-                    let mut frame = InterpreterFrame::new(bc, vec![]);
+                    let mut frame = InterpreterFrame::new(Rc::new(bc), vec![]);
                     Interpreter::run(&mut frame)
                 })),
             );
@@ -549,7 +549,7 @@ fn make_test_globals() -> HashMap<String, JsValue> {
                             };
                             let program = parser::parse(&code)?;
                             let bc = BytecodeGenerator::compile_program(&program)?;
-                            let mut frame = InterpreterFrame::new(bc, vec![]);
+                            let mut frame = InterpreterFrame::new(Rc::new(bc), vec![]);
                             // Populate the frame's global env with the realm's globals.
                             {
                                 let mut env = frame.global_env.borrow_mut();
@@ -735,7 +735,7 @@ fn make_test_globals() -> HashMap<String, JsValue> {
                     // Invoke the function and check if it throws.
                     let result = match &func {
                         JsValue::Function(ba) => {
-                            let mut frame = InterpreterFrame::new((**ba).clone(), vec![]);
+                            let mut frame = InterpreterFrame::new(Rc::clone(ba), vec![]);
                             Interpreter::run(&mut frame)
                         }
                         JsValue::NativeFunction(f) => f(vec![]),
@@ -903,7 +903,7 @@ fn execute_source_inner(
     let result = (|| -> Result<JsValue, StatorError> {
         let program = parser::parse(&combined)?;
         let bc = BytecodeGenerator::compile_program(&program)?;
-        let mut frame = InterpreterFrame::new_with_globals(bc, vec![], globals);
+        let mut frame = InterpreterFrame::new_with_globals(Rc::new(bc), vec![], globals);
         // Limit each test to 5 million instructions to prevent infinite
         // loops from hanging the runner.
         frame.instruction_limit = 5_000_000;

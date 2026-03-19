@@ -2038,7 +2038,7 @@ pub unsafe extern "C" fn stator_script_run(
         Rc::new(RefCell::new(GlobalEnv::new()))
     };
 
-    let mut frame = InterpreterFrame::new_with_globals(bytecodes, vec![], global_env);
+    let mut frame = InterpreterFrame::new_with_globals(Rc::new(bytecodes), vec![], global_env);
     match Interpreter::run(&mut frame) {
         Ok(val) => {
             // Wrap the result in a StatorValue.  Use the isolate from the
@@ -4044,7 +4044,8 @@ pub unsafe extern "C" fn stator_debug_session_create(
         Some(bc) => bc.clone(),
         None => return std::ptr::null_mut(),
     };
-    let frame = InterpreterFrame::new_with_globals(bytecodes, vec![], Rc::clone(&ctx_ref.globals));
+    let frame =
+        InterpreterFrame::new_with_globals(Rc::new(bytecodes), vec![], Rc::clone(&ctx_ref.globals));
     let dbg = Rc::new(RefCell::new(Debugger::new()));
     Box::into_raw(Box::new(StatorDebugSession {
         frame,
