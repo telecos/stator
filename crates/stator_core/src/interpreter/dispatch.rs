@@ -4473,7 +4473,8 @@ fn handle_create_empty_object_literal(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
+    ctx.frame.accumulator =
+        JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::with_capacity(4))));
     Ok(DispatchAction::Continue)
 }
 
@@ -4482,7 +4483,7 @@ fn handle_create_empty_array_literal(
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     // operands[0] is a FeedbackSlot, ignored at runtime.
-    let mut map = PropertyMap::new();
+    let mut map = PropertyMap::with_capacity(2);
     // Per ES spec, "length" is writable but not enumerable/configurable.
     map.insert_with_attrs(
         "length".to_string(),
@@ -4503,7 +4504,7 @@ fn handle_create_array_literal(
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     // operands: [ConstantPoolIdx, FeedbackSlot, Flag]
-    let mut map = PropertyMap::new();
+    let mut map = PropertyMap::with_capacity(2);
     map.insert_with_attrs(
         "length".to_string(),
         JsValue::Smi(0),
@@ -4663,7 +4664,7 @@ fn handle_create_array_from_iterable(
             return Err(StatorError::TypeError("object is not iterable".into()));
         }
     };
-    let mut map = PropertyMap::new();
+    let mut map = PropertyMap::with_capacity(items.len() + 2);
     for (i, v) in items.iter().enumerate() {
         map.insert(i.to_string(), v.clone());
     }
@@ -4683,10 +4684,15 @@ fn handle_create_array_from_iterable(
 
 fn handle_create_object_literal(
     ctx: &mut DispatchContext,
-    _instr: &Instruction,
+    instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     // operands: [ConstantPoolIdx, FeedbackSlot, Flag]
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
+    let capacity = match instr.operands.get(2) {
+        Some(Operand::Flag(count)) if *count > 0 => *count as usize,
+        _ => 4,
+    };
+    ctx.frame.accumulator =
+        JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::with_capacity(capacity))));
     Ok(DispatchAction::Continue)
 }
 
