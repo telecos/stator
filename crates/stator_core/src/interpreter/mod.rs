@@ -320,6 +320,7 @@ pub fn clear_interpreter_state() {
     });
     REGISTER_POOL.with(|pool| pool.borrow_mut().clear());
     CURRENT_GLOBALS.with(|g| *g.borrow_mut() = None);
+    crate::objects::property_map::clear_plain_object_pool();
 }
 
 /// Look up a built-in constructor by name from the current global environment.
@@ -8311,7 +8312,7 @@ pub(super) fn make_construct_this(ba: &Rc<BytecodeArray>, ctor_proto: &JsValue) 
             &bp.keys, &bp.attrs,
         )))
     } else {
-        Rc::new(RefCell::new(PropertyMap::new()))
+        crate::objects::property_map::acquire_plain_object(0)
     };
     if !matches!(ctor_proto, JsValue::Undefined) {
         this_obj

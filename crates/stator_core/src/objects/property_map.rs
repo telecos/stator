@@ -27,7 +27,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use smallvec::SmallVec;
 
 use crate::builtins::symbol::{is_symbol_property_key, property_key_to_symbol};
 use crate::objects::map::PropertyAttributes;
@@ -75,16 +78,41 @@ const PROPERTY_STORAGE_POOL_CAP: usize = 64;
 /// Avoid retaining very large backing allocations in the pool.
 const MAX_POOLED_PROPERTY_CAPACITY: usize = SMALL_PROPERTY_LINEAR_SCAN_CAP * 4;
 
+/// Maximum number of properties stored inline in a [`SmallVec`] without
+/// heap allocation.  Objects with 0–4 properties avoid any per-property
+/// heap work; objects that grow beyond this threshold spill to the heap
+/// automatically.
+const INLINE_PROP_CAP: usize = 4;
+
+/// Maximum number of reusable `Rc<RefCell<PropertyMap>>` wrappers per thread.
+const PLAIN_OBJECT_POOL_CAP: usize = 64;
+
+/// Inline-capable key storage (avoids heap allocation for ≤ 4 keys).
+type KeyVec = SmallVec<[String; INLINE_PROP_CAP]>;
+/// Inline-capable value storage (avoids heap allocation for ≤ 4 values).
+type ValueVec = SmallVec<[JsValue; INLINE_PROP_CAP]>;
+/// Inline-capable attribute storage (avoids heap allocation for ≤ 4 attrs).
+type AttrVec = SmallVec<[PropertyAttributes; INLINE_PROP_CAP]>;
+
 thread_local! {
     static PROPERTY_STORAGE_POOL: RefCell<Vec<PropertyStorageBuffers>> =
         RefCell::new(Vec::with_capacity(PROPERTY_STORAGE_POOL_CAP));
+
+    /// Pool of `Rc<RefCell<PropertyMap>>` wrappers for reuse.
+    ///
+    /// Avoids the heap allocation for the `RcBox<RefCell<PropertyMap>>`
+    /// on every object creation.  Pooled entries are reset via
+    /// [`PropertyMap::reset`] before being returned by
+    /// [`acquire_plain_object`].
+    static PLAIN_OBJECT_POOL: RefCell<Vec<Rc<RefCell<PropertyMap>>>> =
+        RefCell::new(Vec::with_capacity(PLAIN_OBJECT_POOL_CAP));
 }
 
 #[derive(Debug)]
 struct PropertyStorageBuffers {
-    keys: Vec<String>,
-    values: Vec<JsValue>,
-    attrs: Vec<PropertyAttributes>,
+    keys: KeyVec,
+    values: ValueVec,
+    attrs: AttrVec,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -95,6 +123,16 @@ enum PropertyIndex {
 }
 
 fn acquire_storage_buffers(capacity: usize) -> PropertyStorageBuffers {
+    // Inline-sized objects need no pooling — SmallVec keeps storage on the
+    // stack/struct.
+    if capacity <= INLINE_PROP_CAP {
+        return PropertyStorageBuffers {
+            keys: SmallVec::new(),
+            values: SmallVec::new(),
+            attrs: SmallVec::new(),
+        };
+    }
+
     PROPERTY_STORAGE_POOL
         .try_with(|pool| {
             let mut pool = pool.borrow_mut();
@@ -110,20 +148,25 @@ fn acquire_storage_buffers(capacity: usize) -> PropertyStorageBuffers {
                 buffers
             } else {
                 PropertyStorageBuffers {
-                    keys: Vec::with_capacity(capacity),
-                    values: Vec::with_capacity(capacity),
-                    attrs: Vec::with_capacity(capacity),
+                    keys: SmallVec::with_capacity(capacity),
+                    values: SmallVec::with_capacity(capacity),
+                    attrs: SmallVec::with_capacity(capacity),
                 }
             }
         })
         .unwrap_or_else(|_| PropertyStorageBuffers {
-            keys: Vec::with_capacity(capacity),
-            values: Vec::with_capacity(capacity),
-            attrs: Vec::with_capacity(capacity),
+            keys: SmallVec::with_capacity(capacity),
+            values: SmallVec::with_capacity(capacity),
+            attrs: SmallVec::with_capacity(capacity),
         })
 }
 
 fn release_storage_buffers(mut buffers: PropertyStorageBuffers) {
+    // Only pool heap-spilled buffers; inline SmallVecs are free to drop.
+    if !buffers.keys.spilled() {
+        return;
+    }
+
     if buffers.keys.capacity() > MAX_POOLED_PROPERTY_CAPACITY
         || buffers.values.capacity() > MAX_POOLED_PROPERTY_CAPACITY
         || buffers.attrs.capacity() > MAX_POOLED_PROPERTY_CAPACITY
@@ -210,11 +253,11 @@ fn layout_hash(keys: &[String], attrs: &[PropertyAttributes]) -> u64 {
 #[derive(Debug, Clone)]
 pub struct PropertyMap {
     /// Property names in ECMAScript enumeration order.
-    keys: Vec<String>,
+    keys: KeyVec,
     /// Property values, one per key.
-    values: Vec<JsValue>,
+    values: ValueVec,
     /// Property attributes, one per key.
-    attrs: Vec<PropertyAttributes>,
+    attrs: AttrVec,
     /// Number of integer-indexed keys stored at the front of `keys`.
     integer_key_count: usize,
     /// Name → slot-index mapping, kept inline for small objects and promoted
@@ -322,7 +365,7 @@ impl PropertyMap {
         debug_assert_eq!(keys.len(), attrs.len());
         let cap = keys.len();
         let mut buffers = acquire_storage_buffers(cap);
-        buffers.keys.extend_from_slice(keys);
+        buffers.keys.extend(keys.iter().cloned());
         buffers.values.resize(cap, JsValue::Undefined);
         buffers.attrs.extend_from_slice(attrs);
 
@@ -366,7 +409,7 @@ impl PropertyMap {
     pub fn boilerplate_snapshot(
         &self,
     ) -> (Vec<String>, Vec<crate::objects::map::PropertyAttributes>) {
-        (self.keys.clone(), self.attrs.clone())
+        (self.keys.to_vec(), self.attrs.to_vec())
     }
 
     /// Creates a structural clone of this property map for object-literal
@@ -381,7 +424,7 @@ impl PropertyMap {
     pub fn clone_template(&self) -> Self {
         let cap = self.keys.len();
         let mut buffers = acquire_storage_buffers(cap);
-        buffers.keys.extend_from_slice(&self.keys);
+        buffers.keys.extend(self.keys.iter().cloned());
         buffers.values.resize(cap, JsValue::Undefined);
         buffers.attrs.extend_from_slice(&self.attrs);
 
@@ -1033,6 +1076,48 @@ impl PropertyMap {
     }
 }
 
+impl PropertyMap {
+    /// Resets the property map to an empty state, reusing internal storage
+    /// buffers where possible.
+    ///
+    /// This is used by the [`PLAIN_OBJECT_POOL`] to recycle
+    /// `Rc<RefCell<PropertyMap>>` wrappers: the wrapper survives, and only
+    /// the map's contents are cleared and re-initialised.
+    pub fn reset(&mut self, capacity: usize) {
+        self.keys.clear();
+        self.values.clear();
+        self.attrs.clear();
+        self.integer_key_count = 0;
+        if capacity > SMALL_PROPERTY_LINEAR_SCAN_CAP {
+            match &mut self.index {
+                PropertyIndex::Map(map) => map.clear(),
+                _ => self.index = PropertyIndex::Map(HashMap::with_capacity(capacity)),
+            }
+        } else {
+            self.index = PropertyIndex::Inline;
+        }
+        self.cache_len.set(0);
+        self.cache_cursor.set(0);
+        self.shape_id = NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed);
+        self.layout_id = layout_hash(&[], &[]);
+        self.proto_generation.set(0);
+        self.proto_epoch.set(0);
+        self.proto_global_epoch.set(0);
+        self.extensible = true;
+        self.has_accessors = false;
+        self.template_next_slot = usize::MAX;
+        // Grow to requested capacity (only allocates for heap mode).
+        if capacity > INLINE_PROP_CAP {
+            self.keys
+                .reserve(capacity.saturating_sub(self.keys.capacity()));
+            self.values
+                .reserve(capacity.saturating_sub(self.values.capacity()));
+            self.attrs
+                .reserve(capacity.saturating_sub(self.attrs.capacity()));
+        }
+    }
+}
+
 impl Default for PropertyMap {
     fn default() -> Self {
         Self::new()
@@ -1048,6 +1133,52 @@ impl Drop for PropertyMap {
         };
         release_storage_buffers(buffers);
     }
+}
+
+// ── Rc<RefCell<PropertyMap>> pool ────────────────────────────────────────
+
+/// Acquires a fresh `Rc<RefCell<PropertyMap>>` from the thread-local pool,
+/// or allocates a new one if the pool is empty.
+///
+/// Pooled wrappers are reset via [`PropertyMap::reset`] so that the
+/// returned reference always contains an empty map with at least `capacity`
+/// property slots available.
+pub fn acquire_plain_object(capacity: usize) -> Rc<RefCell<PropertyMap>> {
+    PLAIN_OBJECT_POOL
+        .try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if let Some(rc) = pool.pop() {
+                rc.borrow_mut().reset(capacity);
+                rc
+            } else {
+                Rc::new(RefCell::new(PropertyMap::with_capacity(capacity)))
+            }
+        })
+        .unwrap_or_else(|_| Rc::new(RefCell::new(PropertyMap::with_capacity(capacity))))
+}
+
+/// Returns an `Rc<RefCell<PropertyMap>>` to the thread-local pool when it
+/// is the sole remaining owner (strong count == 1).
+///
+/// If other references still exist, the wrapper is silently dropped.
+pub fn release_plain_object(rc: Rc<RefCell<PropertyMap>>) {
+    if Rc::strong_count(&rc) != 1 {
+        return;
+    }
+    let _ = PLAIN_OBJECT_POOL.try_with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < PLAIN_OBJECT_POOL_CAP {
+            pool.push(rc);
+        }
+    });
+}
+
+/// Clears the thread-local `Rc<RefCell<PropertyMap>>` pool.
+///
+/// Called by [`crate::interpreter::clear_interpreter_state`] between test
+/// runs to avoid leaking cross-test state.
+pub fn clear_plain_object_pool() {
+    let _ = PLAIN_OBJECT_POOL.try_with(|pool| pool.borrow_mut().clear());
 }
 
 #[cfg(test)]

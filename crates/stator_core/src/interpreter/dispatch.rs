@@ -15,7 +15,9 @@ use smallvec::{SmallVec, smallvec};
 
 use crate::builtins::string::{string_char_at, utf16_len};
 use crate::objects::map::PropertyAttributes;
-use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
+use crate::objects::property_map::{
+    INTERNAL_PROTO_PROPERTY_KEY, PropertyMap, acquire_plain_object,
+};
 
 use super::{
     ACTIVE_DEBUGGER, CallArgs, GlobalEnv, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD,
@@ -2515,7 +2517,7 @@ fn construct_class_from_plain_object(
     args: CallArgs,
 ) -> StatorResult<()> {
     // 1. Create `this`.
-    let this_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
+    let this_obj: Rc<RefCell<PropertyMap>> = acquire_plain_object(0);
     if !matches!(ctor_proto, JsValue::Undefined) {
         this_obj
             .borrow_mut()
@@ -4800,8 +4802,7 @@ fn handle_create_empty_object_literal(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    ctx.frame.accumulator =
-        JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::with_capacity(4))));
+    ctx.frame.accumulator = JsValue::PlainObject(acquire_plain_object(4));
     Ok(DispatchAction::Continue)
 }
 
@@ -5010,8 +5011,7 @@ fn handle_create_object_literal(
             return Ok(DispatchAction::Continue);
         }
         // First execution: create normally and record as pending.
-        let map = PropertyMap::with_capacity(capacity);
-        let rc = Rc::new(RefCell::new(map));
+        let rc = acquire_plain_object(capacity);
         ctx.frame
             .bytecode_array
             .set_object_literal_pending(slot, Rc::clone(&rc));
@@ -5020,8 +5020,7 @@ fn handle_create_object_literal(
     }
 
     // No feedback slot — fall back to uncached creation.
-    ctx.frame.accumulator =
-        JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::with_capacity(capacity))));
+    ctx.frame.accumulator = JsValue::PlainObject(acquire_plain_object(capacity));
     Ok(DispatchAction::Continue)
 }
 
@@ -7029,7 +7028,7 @@ fn handle_create_class(
     //    bytecode in __call__ so it can be invoked via both `new` and
     //    direct calls.
     let ctor_ba_rc = Rc::clone(ctor_ba);
-    let class_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
+    let class_obj: Rc<RefCell<PropertyMap>> = acquire_plain_object(4);
     class_obj.borrow_mut().insert(
         "__call__".to_string(),
         JsValue::Function(Rc::clone(&ctor_ba_rc)),
@@ -7047,7 +7046,7 @@ fn handle_create_class(
         .insert(".class_constructor".to_string(), JsValue::Boolean(true));
 
     // 4. Create the prototype object.
-    let proto: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
+    let proto: Rc<RefCell<PropertyMap>> = acquire_plain_object(0);
 
     // 5. Wire `extends` — set up prototype chain.
     if !matches!(super_val, JsValue::Undefined | JsValue::Null) {
@@ -7604,7 +7603,7 @@ fn handle_get_module_namespace(
     let Operand::ConstantPoolIdx(_req_idx) = instr.operands[0] else {
         return Err(err_bad_operand("GetModuleNamespace", 0));
     };
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
+    ctx.frame.accumulator = JsValue::PlainObject(acquire_plain_object(0));
     Ok(DispatchAction::Continue)
 }
 
