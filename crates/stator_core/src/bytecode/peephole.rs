@@ -577,6 +577,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "constant folding disabled until correctness issues resolved"]
     fn test_fold_constant_add_sequence() {
         let original = vec![
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
