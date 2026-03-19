@@ -590,7 +590,7 @@ mod tests {
         profiler.start(10_000_000).expect("start"); // very long interval — we trigger manually
 
         // Simulate a call to "myFunction".
-        push_call_frame("myFunction");
+        let _ = push_call_frame("myFunction");
         // Force a sample immediately.
         SAMPLE_NEEDED.store(true, Ordering::Release);
         maybe_record_sample();
@@ -618,7 +618,7 @@ mod tests {
         let mut profiler = CpuProfiler::new();
         profiler.start(10_000_000).expect("start");
 
-        push_call_frame("greet");
+        let _ = push_call_frame("greet");
         SAMPLE_NEEDED.store(true, Ordering::Release);
         maybe_record_sample();
         pop_call_frame();

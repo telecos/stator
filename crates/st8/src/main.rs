@@ -355,6 +355,7 @@ mod tests {
     use stator_core::objects::value::JsValue;
     use stator_core::parser;
     use stator_core::parser::scanner::{Scanner, TokenKind};
+    use std::rc::Rc;
 
     /// Helper: parse, compile, and run `src` with the shell globals.
     fn run(src: &str) -> Result<JsValue, stator_core::error::StatorError> {
