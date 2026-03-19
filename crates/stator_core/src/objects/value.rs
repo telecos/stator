@@ -296,6 +296,11 @@ pub enum JsValue {
     /// layer enables in-place mutation required by `Array.prototype.push`,
     /// `splice`, `sort`, etc.
     Array(Rc<RefCell<Vec<JsValue>>>),
+    /// A mutable dense array optimized for small integer elements.
+    ///
+    /// Starts in compact `Vec<i32>` storage and promotes lazily to boxed
+    /// `JsValue` elements when holes or non-Smi values are written.
+    SmiArray(Rc<RefCell<SmiArrayStorage>>),
     /// A JavaScript generator object holding the suspended execution state of
     /// a generator function.
     ///
@@ -365,6 +370,219 @@ pub struct JsContext {
     pub parent: Option<Rc<RefCell<JsContext>>>,
 }
 
+/// Backing storage for [`JsValue::SmiArray`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum SmiArrayStorage {
+    /// Compact integer-only storage.
+    Smis(Vec<i32>),
+    /// Promoted storage used after writing holes or non-integer values.
+    Promoted(Vec<JsValue>),
+}
+
+impl SmiArrayStorage {
+    fn try_from_values(items: &[JsValue]) -> Option<Self> {
+        let mut smis = Vec::with_capacity(items.len());
+        for item in items {
+            if let JsValue::Smi(value) = item {
+                smis.push(*value);
+            } else {
+                return None;
+            }
+        }
+        Some(Self::Smis(smis))
+    }
+
+    fn from_values(items: Vec<JsValue>) -> Self {
+        Self::try_from_values(&items).unwrap_or(Self::Promoted(items))
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Smis(values) => values.len(),
+            Self::Promoted(values) => values.len(),
+        }
+    }
+
+    fn get_cloned(&self, idx: usize) -> Option<JsValue> {
+        match self {
+            Self::Smis(values) => values.get(idx).copied().map(JsValue::Smi),
+            Self::Promoted(values) => values.get(idx).cloned(),
+        }
+    }
+
+    fn clone_values(&self) -> Vec<JsValue> {
+        match self {
+            Self::Smis(values) => values.iter().copied().map(JsValue::Smi).collect(),
+            Self::Promoted(values) => values.clone(),
+        }
+    }
+
+    fn promote(&mut self) -> &mut Vec<JsValue> {
+        if let Self::Smis(values) = self {
+            let promoted = values.iter().copied().map(JsValue::Smi).collect();
+            *self = Self::Promoted(promoted);
+        }
+        match self {
+            Self::Promoted(values) => values,
+            Self::Smis(_) => unreachable!(),
+        }
+    }
+
+    fn replace_from_values(&mut self, values: Vec<JsValue>) {
+        *self = Self::from_values(values);
+    }
+
+    fn push_args(&mut self, args: &[JsValue]) -> usize {
+        match self {
+            Self::Smis(values) if args.iter().all(JsValue::is_smi) => {
+                values.extend(args.iter().map(|value| match value {
+                    JsValue::Smi(n) => *n,
+                    _ => unreachable!(),
+                }));
+                values.len()
+            }
+            Self::Smis(_) => {
+                let values = self.promote();
+                values.extend(args.iter().cloned());
+                values.len()
+            }
+            Self::Promoted(values) => {
+                values.extend(args.iter().cloned());
+                values.len()
+            }
+        }
+    }
+
+    fn pop_value(&mut self) -> JsValue {
+        match self {
+            Self::Smis(values) => values.pop().map(JsValue::Smi).unwrap_or(JsValue::Undefined),
+            Self::Promoted(values) => values.pop().unwrap_or(JsValue::Undefined),
+        }
+    }
+
+    fn shift_value(&mut self) -> JsValue {
+        match self {
+            Self::Smis(values) => {
+                if values.is_empty() {
+                    JsValue::Undefined
+                } else {
+                    JsValue::Smi(values.remove(0))
+                }
+            }
+            Self::Promoted(values) => {
+                if values.is_empty() {
+                    JsValue::Undefined
+                } else {
+                    values.remove(0)
+                }
+            }
+        }
+    }
+
+    fn unshift_args(&mut self, args: &[JsValue]) -> usize {
+        match self {
+            Self::Smis(values) if args.iter().all(JsValue::is_smi) => {
+                for (index, arg) in args.iter().enumerate() {
+                    let JsValue::Smi(value) = arg else {
+                        unreachable!();
+                    };
+                    values.insert(index, *value);
+                }
+                values.len()
+            }
+            Self::Smis(_) => {
+                let values = self.promote();
+                for (index, arg) in args.iter().enumerate() {
+                    values.insert(index, arg.clone());
+                }
+                values.len()
+            }
+            Self::Promoted(values) => {
+                for (index, arg) in args.iter().enumerate() {
+                    values.insert(index, arg.clone());
+                }
+                values.len()
+            }
+        }
+    }
+
+    fn index_of(&self, search: &JsValue, from: usize) -> i32 {
+        match self {
+            Self::Smis(values) => values[from..]
+                .iter()
+                .position(|value| JsValue::Smi(*value).is_strictly_equal(search))
+                .map_or(-1, |index| (from + index) as i32),
+            Self::Promoted(values) => values[from..]
+                .iter()
+                .position(|value| value.is_strictly_equal(search))
+                .map_or(-1, |index| (from + index) as i32),
+        }
+    }
+
+    fn includes(&self, search: &JsValue, from: usize) -> bool {
+        match self {
+            Self::Smis(values) => values[from..]
+                .iter()
+                .any(|value| JsValue::Smi(*value).same_value_zero(search)),
+            Self::Promoted(values) => values[from..]
+                .iter()
+                .any(|value| value.same_value_zero(search)),
+        }
+    }
+
+    fn set_index(&mut self, idx: usize, value: JsValue) {
+        match self {
+            Self::Smis(values) if idx < values.len() && value.is_smi() => {
+                if let JsValue::Smi(value) = value {
+                    values[idx] = value;
+                }
+            }
+            Self::Smis(values) if idx == values.len() && value.is_smi() => {
+                if let JsValue::Smi(value) = value {
+                    values.push(value);
+                }
+            }
+            Self::Smis(_) => {
+                let values = self.promote();
+                if idx >= values.len() {
+                    values.resize(idx + 1, JsValue::Undefined);
+                }
+                values[idx] = value;
+            }
+            Self::Promoted(values) => {
+                if idx >= values.len() {
+                    values.resize(idx + 1, JsValue::Undefined);
+                }
+                values[idx] = value;
+            }
+        }
+    }
+
+    fn set_length(&mut self, new_len: usize) {
+        match self {
+            Self::Smis(values) if new_len <= values.len() => values.truncate(new_len),
+            Self::Smis(_) => {
+                let values = self.promote();
+                values.resize(new_len, JsValue::Undefined);
+            }
+            Self::Promoted(values) => {
+                if new_len < values.len() {
+                    values.truncate(new_len);
+                } else {
+                    values.resize(new_len, JsValue::Undefined);
+                }
+            }
+        }
+    }
+
+    fn delete_index(&mut self, idx: usize) {
+        let values = self.promote();
+        if idx < values.len() {
+            values[idx] = JsValue::TheHole;
+        }
+    }
+}
+
 impl JsContext {
     /// Create a new context with `slot_count` slots initialised to `undefined`,
     /// chained to an optional parent context.
@@ -392,6 +610,7 @@ impl std::fmt::Debug for JsValue {
             Self::BigInt(n) => write!(f, "BigInt({n})"),
             Self::Function(ba) => write!(f, "Function({ba:?})"),
             Self::Array(arr) => write!(f, "Array({:?})", arr.borrow()),
+            Self::SmiArray(arr) => write!(f, "SmiArray({:?})", arr.borrow()),
             Self::Generator(g) => write!(f, "Generator({g:?})"),
             Self::Iterator(i) => write!(f, "Iterator({i:?})"),
             Self::Error(e) => write!(f, "Error({e:?})"),
@@ -430,6 +649,7 @@ impl PartialEq for JsValue {
             // Reference types: compare contents (matching the original derive behaviour).
             (Self::Function(a), Self::Function(b)) => a == b,
             (Self::Array(a), Self::Array(b)) => Rc::ptr_eq(a, b),
+            (Self::SmiArray(a), Self::SmiArray(b)) => Rc::ptr_eq(a, b),
             (Self::Generator(a), Self::Generator(b)) => Rc::ptr_eq(a, b),
             (Self::Iterator(a), Self::Iterator(b)) => Rc::ptr_eq(a, b),
             (Self::Error(a), Self::Error(b)) => Rc::ptr_eq(a, b),
@@ -458,7 +678,209 @@ impl JsValue {
     /// manually wrapping in `Rc<RefCell<…>>`.
     #[inline]
     pub fn new_array(items: Vec<JsValue>) -> Self {
-        Self::Array(Rc::new(RefCell::new(items)))
+        if let Some(storage) = SmiArrayStorage::try_from_values(&items) {
+            Self::SmiArray(Rc::new(RefCell::new(storage)))
+        } else {
+            Self::Array(Rc::new(RefCell::new(items)))
+        }
+    }
+
+    /// Create a new compact integer array.
+    #[inline]
+    pub fn new_smi_array(items: Vec<i32>) -> Self {
+        Self::SmiArray(Rc::new(RefCell::new(SmiArrayStorage::Smis(items))))
+    }
+
+    /// Returns the current length for dense array values.
+    #[inline]
+    pub fn dense_array_len(&self) -> Option<usize> {
+        match self {
+            Self::Array(items) => Some(items.borrow().len()),
+            Self::SmiArray(items) => Some(items.borrow().len()),
+            _ => None,
+        }
+    }
+
+    /// Clone the element at `idx` for dense array values.
+    #[inline]
+    pub fn dense_array_get(&self, idx: usize) -> Option<JsValue> {
+        match self {
+            Self::Array(items) => items.borrow().get(idx).cloned(),
+            Self::SmiArray(items) => items.borrow().get_cloned(idx),
+            _ => None,
+        }
+    }
+
+    /// Clone all elements for dense array values.
+    #[inline]
+    pub fn dense_array_clone(&self) -> Option<Vec<JsValue>> {
+        match self {
+            Self::Array(items) => Some(items.borrow().clone()),
+            Self::SmiArray(items) => Some(items.borrow().clone_values()),
+            _ => None,
+        }
+    }
+
+    /// Append `args` to a dense array value.
+    #[inline]
+    pub fn dense_array_push(&self, args: &[JsValue]) -> Option<usize> {
+        match self {
+            Self::Array(items) => {
+                let mut items = items.borrow_mut();
+                items.extend(args.iter().cloned());
+                Some(items.len())
+            }
+            Self::SmiArray(items) => Some(items.borrow_mut().push_args(args)),
+            _ => None,
+        }
+    }
+
+    /// Remove and return the last element from a dense array value.
+    #[inline]
+    pub fn dense_array_pop(&self) -> Option<JsValue> {
+        match self {
+            Self::Array(items) => Some(items.borrow_mut().pop().unwrap_or(JsValue::Undefined)),
+            Self::SmiArray(items) => Some(items.borrow_mut().pop_value()),
+            _ => None,
+        }
+    }
+
+    /// Remove and return the first element from a dense array value.
+    #[inline]
+    pub fn dense_array_shift(&self) -> Option<JsValue> {
+        match self {
+            Self::Array(items) => {
+                let mut items = items.borrow_mut();
+                Some(if items.is_empty() {
+                    JsValue::Undefined
+                } else {
+                    items.remove(0)
+                })
+            }
+            Self::SmiArray(items) => Some(items.borrow_mut().shift_value()),
+            _ => None,
+        }
+    }
+
+    /// Insert `args` at the front of a dense array value.
+    #[inline]
+    pub fn dense_array_unshift(&self, args: &[JsValue]) -> Option<usize> {
+        match self {
+            Self::Array(items) => {
+                let mut items = items.borrow_mut();
+                for (index, arg) in args.iter().enumerate() {
+                    items.insert(index, arg.clone());
+                }
+                Some(items.len())
+            }
+            Self::SmiArray(items) => Some(items.borrow_mut().unshift_args(args)),
+            _ => None,
+        }
+    }
+
+    /// Search a dense array value using `indexOf` semantics.
+    #[inline]
+    pub fn dense_array_index_of(&self, search: &JsValue, from: usize) -> Option<i32> {
+        match self {
+            Self::Array(items) => Some(
+                items.borrow()[from..]
+                    .iter()
+                    .position(|value| value.is_strictly_equal(search))
+                    .map_or(-1, |index| (from + index) as i32),
+            ),
+            Self::SmiArray(items) => Some(items.borrow().index_of(search, from)),
+            _ => None,
+        }
+    }
+
+    /// Search a dense array value using `includes` semantics.
+    #[inline]
+    pub fn dense_array_includes(&self, search: &JsValue, from: usize) -> Option<bool> {
+        match self {
+            Self::Array(items) => Some(
+                items.borrow()[from..]
+                    .iter()
+                    .any(|value| value.same_value_zero(search)),
+            ),
+            Self::SmiArray(items) => Some(items.borrow().includes(search, from)),
+            _ => None,
+        }
+    }
+
+    /// Store a dense array element.
+    #[inline]
+    pub fn dense_array_set_index(&self, idx: usize, value: JsValue) -> bool {
+        match self {
+            Self::Array(items) => {
+                let mut items = items.borrow_mut();
+                if idx >= items.len() {
+                    items.resize(idx + 1, JsValue::Undefined);
+                }
+                items[idx] = value;
+                true
+            }
+            Self::SmiArray(items) => {
+                items.borrow_mut().set_index(idx, value);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Update the `length` of a dense array value.
+    #[inline]
+    pub fn dense_array_set_length(&self, new_len: usize) -> bool {
+        match self {
+            Self::Array(items) => {
+                let mut items = items.borrow_mut();
+                if new_len < items.len() {
+                    items.truncate(new_len);
+                } else {
+                    items.resize(new_len, JsValue::Undefined);
+                }
+                true
+            }
+            Self::SmiArray(items) => {
+                items.borrow_mut().set_length(new_len);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Delete an indexed dense array element by turning it into a hole.
+    #[inline]
+    pub fn dense_array_delete_index(&self, idx: usize) -> bool {
+        match self {
+            Self::Array(items) => {
+                let mut items = items.borrow_mut();
+                if idx < items.len() {
+                    items[idx] = JsValue::TheHole;
+                }
+                true
+            }
+            Self::SmiArray(items) => {
+                items.borrow_mut().delete_index(idx);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Replace the contents of a dense array value from cloned elements.
+    #[inline]
+    pub fn dense_array_replace(&self, values: Vec<JsValue>) -> bool {
+        match self {
+            Self::Array(items) => {
+                *items.borrow_mut() = values;
+                true
+            }
+            Self::SmiArray(items) => {
+                items.borrow_mut().replace_from_values(values);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Returns `true` if this value is `undefined`.
@@ -598,7 +1020,7 @@ impl JsValue {
     /// Returns `true` if this value is a lightweight array ([`Array`][JsValue::Array]).
     #[inline]
     pub fn is_array(&self) -> bool {
-        matches!(self, Self::Array(_))
+        matches!(self, Self::Array(_) | Self::SmiArray(_))
     }
 
     /// Returns `true` if this value is a generator object ([`Generator`][JsValue::Generator]).
@@ -796,6 +1218,7 @@ impl JsValue {
             | Self::Object(_)
             | Self::Function(_)
             | Self::Array(_)
+            | Self::SmiArray(_)
             | Self::Error(_)
             | Self::Generator(_)
             | Self::Iterator(_)
@@ -924,6 +1347,17 @@ impl JsValue {
                 // Clone elements before iterating so the RefCell borrow is
                 // released before any recursive `to_js_string()` call.
                 let snapshot: Vec<JsValue> = items.borrow().clone();
+                let parts: Vec<String> = snapshot
+                    .iter()
+                    .map(|v| match v {
+                        Self::Null | Self::Undefined => String::new(),
+                        other => other.to_js_string().unwrap_or_default(),
+                    })
+                    .collect();
+                Ok(parts.join(","))
+            }
+            Self::SmiArray(items) => {
+                let snapshot = items.borrow().clone_values();
                 let parts: Vec<String> = snapshot
                     .iter()
                     .map(|v| match v {
@@ -1172,6 +1606,7 @@ impl JsValue {
             Self::Symbol(_) => "[object Symbol]".to_string(),
             Self::BigInt(_) => "[object BigInt]".to_string(),
             Self::Array(_) => "[object Array]".to_string(),
+            Self::SmiArray(_) => "[object Array]".to_string(),
             Self::Function(ba) => {
                 if ba.is_generator() {
                     "[object GeneratorFunction]".to_string()
@@ -1307,6 +1742,7 @@ impl JsValue {
             (Self::Object(a), Self::Object(b)) => std::ptr::eq(*a, *b),
             (Self::Function(a), Self::Function(b)) => Rc::ptr_eq(a, b),
             (Self::Array(a), Self::Array(b)) => Rc::ptr_eq(a, b),
+            (Self::SmiArray(a), Self::SmiArray(b)) => Rc::ptr_eq(a, b),
             (Self::Generator(a), Self::Generator(b)) => Rc::ptr_eq(a, b),
             (Self::Iterator(a), Self::Iterator(b)) => Rc::ptr_eq(a, b),
             (Self::Error(a), Self::Error(b)) => Rc::ptr_eq(a, b),
@@ -1458,6 +1894,11 @@ impl Trace for JsValue {
             }
             Self::Array(items) => {
                 for item in items.borrow().iter() {
+                    item.trace(tracer);
+                }
+            }
+            Self::SmiArray(items) => {
+                for item in items.borrow().clone_values() {
                     item.trace(tracer);
                 }
             }
@@ -2336,8 +2777,45 @@ mod tests {
 
     #[test]
     fn test_obj_to_string_tag_array() {
-        let arr = JsValue::Array(Rc::new(RefCell::new(vec![])));
+        let arr = JsValue::new_array(vec![]);
         assert_eq!(arr.obj_to_string_tag(), "[object Array]");
+    }
+
+    #[test]
+    fn test_new_array_uses_smi_array_for_small_integers() {
+        let arr = JsValue::new_array(vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)]);
+        assert!(matches!(arr, JsValue::SmiArray(_)));
+    }
+
+    #[test]
+    fn test_dense_array_push_promotes_smi_array_on_non_smi() {
+        let arr = JsValue::new_array(vec![JsValue::Smi(1), JsValue::Smi(2)]);
+        assert!(matches!(arr, JsValue::SmiArray(_)));
+
+        assert_eq!(
+            arr.dense_array_push(&[JsValue::String("x".into())]),
+            Some(3)
+        );
+        assert_eq!(
+            arr.dense_array_clone(),
+            Some(vec![
+                JsValue::Smi(1),
+                JsValue::Smi(2),
+                JsValue::String("x".into())
+            ])
+        );
+    }
+
+    #[test]
+    fn test_dense_array_set_index_promotes_smi_array_for_holes() {
+        let arr = JsValue::new_array(vec![JsValue::Smi(7)]);
+        assert!(matches!(arr, JsValue::SmiArray(_)));
+
+        assert!(arr.dense_array_set_index(2, JsValue::Smi(9)));
+        assert_eq!(
+            arr.dense_array_clone(),
+            Some(vec![JsValue::Smi(7), JsValue::Undefined, JsValue::Smi(9)])
+        );
     }
 
     #[test]
@@ -3653,7 +4131,7 @@ mod tests {
     #[test]
     fn test_to_primitive_array_number_hint() {
         let items = vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)];
-        let arr = JsValue::Array(Rc::new(RefCell::new(items)));
+        let arr = JsValue::new_array(items);
         let result = arr.to_primitive(ToPrimitiveHint::Number).unwrap();
         assert_eq!(result, JsValue::String("1,2,3".into()));
     }
@@ -3666,7 +4144,7 @@ mod tests {
             JsValue::Undefined,
             JsValue::Smi(4),
         ];
-        let arr = JsValue::Array(Rc::new(RefCell::new(items)));
+        let arr = JsValue::new_array(items);
         let result = arr.to_primitive(ToPrimitiveHint::Default).unwrap();
         assert_eq!(result, JsValue::String("1,,,4".into()));
     }
@@ -3674,7 +4152,7 @@ mod tests {
     #[test]
     fn test_to_primitive_empty_array() {
         let items: Vec<JsValue> = vec![];
-        let arr = JsValue::Array(Rc::new(RefCell::new(items)));
+        let arr = JsValue::new_array(items);
         let result = arr.to_primitive(ToPrimitiveHint::Number).unwrap();
         assert_eq!(result, JsValue::String("".into()));
     }
