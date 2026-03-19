@@ -19,19 +19,19 @@ use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 
 use super::{
     ACTIVE_DEBUGGER, CallArgs, GlobalEnv, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD,
-    MegamorphicIcEntry, MonomorphicNamedPropertyIcEntry, OSR_LOOP_THRESHOLD, ProtoLoadIc,
-    TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow, collect_args, concat_rc_strs,
-    constant_pool_jump_delta, constant_to_value, construct_builtin_result, decode_string_constant,
-    dispatch_call_property, dispatch_call_value, dispatch_call_with_this, dispatch_getter,
-    dispatch_setter, err_bad_operand, error_message_from_value, extract_context, find_handler,
-    fn_props_get, fn_props_set, has_prototype_in_chain, is_js_receiver, js_add, js_less_than,
-    keyed_load, keyed_store, make_construct_this, maybe_cache_construct_boilerplate,
-    maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator,
-    number_to_jsvalue, plain_object_has_own_property, plain_object_to_array_items,
-    populate_self_name, proto_lookup, proto_lookup_chain_depth, resolve_construct_proto,
-    resolve_jump, restore_closure_context, set_function_name_if_missing, set_pending_exception,
-    settle_async_iterator_result, strict_eq, to_array_index, to_bigint, to_property_key,
-    try_execute_best_jit, try_fast_named_property_lookup, walk_context_chain,
+    MegamorphicIcEntry, OSR_LOOP_THRESHOLD, ProtoLoadIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq,
+    bigint_pow, collect_args, concat_rc_strs, constant_pool_jump_delta, constant_to_value,
+    construct_builtin_result, decode_string_constant, dispatch_call_property, dispatch_call_value,
+    dispatch_call_with_this, dispatch_getter, dispatch_setter, err_bad_operand,
+    error_message_from_value, extract_context, find_handler, fn_props_get, fn_props_set,
+    has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
+    make_construct_this, maybe_cache_construct_boilerplate, maybe_compile_baseline,
+    maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator, number_to_jsvalue,
+    plain_object_has_own_property, plain_object_to_array_items, populate_self_name, proto_lookup,
+    proto_lookup_chain_depth, resolve_construct_proto, resolve_jump, restore_closure_context,
+    set_function_name_if_missing, set_pending_exception, settle_async_iterator_result, strict_eq,
+    to_array_index, to_bigint, to_property_key, try_execute_best_jit,
+    try_fast_named_property_lookup, walk_context_chain,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
@@ -207,42 +207,6 @@ fn invalidate_plain_object_caches(ctx: &mut DispatchContext, map: &Rc<RefCell<Pr
             entries.retain(|(ptr, _)| *ptr != map_ptr);
             !entries.is_empty()
         });
-    }
-}
-
-#[inline]
-fn update_mono_named_load_ic(
-    frame: &mut InterpreterFrame,
-    slot: u32,
-    receiver_shape: u64,
-    offset: usize,
-) {
-    if offset <= u16::MAX as usize {
-        frame.mono_named_load_ic_mut().insert(
-            slot,
-            MonomorphicNamedPropertyIcEntry {
-                receiver_shape,
-                cached_offset: offset as u16,
-            },
-        );
-    }
-}
-
-#[inline]
-fn update_mono_named_store_ic(
-    frame: &mut InterpreterFrame,
-    slot: u32,
-    receiver_shape: u64,
-    offset: usize,
-) {
-    if offset <= u16::MAX as usize {
-        frame.mono_named_store_ic_mut().insert(
-            slot,
-            MonomorphicNamedPropertyIcEntry {
-                receiver_shape,
-                cached_offset: offset as u16,
-            },
-        );
     }
 }
 
@@ -3319,70 +3283,43 @@ fn handle_lda_named_property(
         ctx.frame.accumulator = load_private_named_property(&obj, &prop_name)?;
         return Ok(DispatchAction::Continue);
     }
-    // ── Monomorphic IC fast path ────────────────────────────────────────
+    // ── Megamorphic IC fast path ────────────────────────────────────────
     if slot != u32::MAX
         && let JsValue::PlainObject(ref map) = obj
         && let Some(ic) = ctx
             .frame
-            .mono_named_load_ic
-            .as_ref()
-            .and_then(|cache| cache.get(&slot))
-    {
-        let pm = map.borrow();
-        if ic.receiver_shape == pm.shape_id()
-            && let Some(val) = pm.get_by_offset(ic.cached_offset as usize)
-        {
-            ctx.frame.accumulator = val.clone();
-            return Ok(DispatchAction::Continue);
-        }
-    }
-    // ── Megamorphic IC fast path ────────────────────────────────────────
-    if slot != u32::MAX
-        && let JsValue::PlainObject(ref map) = obj
-    {
-        let receiver_layout = map.borrow().layout_id();
-        if let Some(ic) = ctx
-            .frame
             .mega_load_ic
             .as_ref()
-            .and_then(|cache| cache.probe(slot, receiver_layout).copied())
-        {
-            if !ic.is_proto {
-                // Own-property hit: O(1) offset access on receiver.
-                let pm = map.borrow();
-                if pm.matches_key_at_offset(ic.cached_offset as usize, prop_name.as_ref())
-                    && let Some(val) = pm.get_by_offset(ic.cached_offset as usize)
+            .and_then(|cache| cache.probe(slot, map.borrow().layout_id()))
+    {
+        if !ic.is_proto {
+            // Own-property hit: O(1) offset access on receiver.
+            let pm = map.borrow();
+            if pm.matches_key_at_offset(ic.cached_offset as usize, prop_name.as_ref())
+                && let Some(val) = pm.get_by_offset(ic.cached_offset as usize)
+            {
+                let v = val.clone();
+                drop(pm);
+                ctx.frame.accumulator = v;
+                return Ok(DispatchAction::Continue);
+            }
+        } else {
+            // Proto-property hit: verify the immediate prototype's layout
+            // matches, then read by offset from the proto.
+            let proto_layout = ic.proto_layout;
+            let offset = ic.cached_offset;
+            let pm = map.borrow();
+            if let Some(JsValue::PlainObject(proto_map)) = pm.get(INTERNAL_PROTO_PROPERTY_KEY) {
+                let proto_pm = proto_map.borrow();
+                if proto_pm.layout_id() == proto_layout
+                    && proto_pm.matches_key_at_offset(offset as usize, prop_name.as_ref())
+                    && let Some(val) = proto_pm.get_by_offset(offset as usize)
                 {
-                    let receiver_shape = pm.shape_id();
                     let v = val.clone();
+                    drop(proto_pm);
                     drop(pm);
-                    update_mono_named_load_ic(
-                        ctx.frame,
-                        slot,
-                        receiver_shape,
-                        ic.cached_offset as usize,
-                    );
                     ctx.frame.accumulator = v;
                     return Ok(DispatchAction::Continue);
-                }
-            } else {
-                // Proto-property hit: verify the immediate prototype's layout
-                // matches, then read by offset from the proto.
-                let proto_layout = ic.proto_layout;
-                let offset = ic.cached_offset;
-                let pm = map.borrow();
-                if let Some(JsValue::PlainObject(proto_map)) = pm.get(INTERNAL_PROTO_PROPERTY_KEY) {
-                    let proto_pm = proto_map.borrow();
-                    if proto_pm.layout_id() == proto_layout
-                        && proto_pm.matches_key_at_offset(offset as usize, prop_name.as_ref())
-                        && let Some(val) = proto_pm.get_by_offset(offset as usize)
-                    {
-                        let v = val.clone();
-                        drop(proto_pm);
-                        drop(pm);
-                        ctx.frame.accumulator = v;
-                        return Ok(DispatchAction::Continue);
-                    }
                 }
             }
         }
@@ -3473,7 +3410,6 @@ fn handle_lda_named_property(
         if !has_accessor {
             match pm.offset_of(&prop_name) {
                 Some(offset) if offset <= u16::MAX as usize => {
-                    update_mono_named_load_ic(ctx.frame, slot, pm.shape_id(), offset);
                     // Own property — cache direct offset.
                     ctx.frame.mega_load_ic_mut().update(MegamorphicIcEntry {
                         slot,
@@ -3622,71 +3558,40 @@ fn handle_sta_named_property(
             }
         }
         JsValue::PlainObject(ref map) => {
-            // ── Monomorphic IC fast path for store: existing writable prop ──
+            // ── Megamorphic IC fast path for store: existing writable prop ──
             if slot != u32::MAX
                 && let Some(ic) = ctx
                     .frame
-                    .mono_named_store_ic
+                    .mega_store_ic
                     .as_ref()
-                    .and_then(|cache| cache.get(&slot))
+                    .and_then(|cache| cache.probe(slot, map.borrow().layout_id()))
             {
                 let offset = ic.cached_offset as usize;
                 let pm = map.borrow();
-                if ic.receiver_shape == pm.shape_id() && pm.is_writable_by_offset(offset) {
-                    drop(pm);
-                    map.borrow_mut().set_by_offset(offset, val);
-                    // Invalidate value-based caches for this object.
-                    let map_ptr = Rc::as_ptr(map) as usize;
-                    if let Some(cache) = &mut ctx.frame.mono_load_cache {
-                        cache.retain(|_, (ptr, _)| *ptr != map_ptr);
-                    }
-                    if let Some(cache) = &mut ctx.frame.poly_load_cache {
-                        cache.retain(|_, entries| {
-                            entries.retain(|(ptr, _)| *ptr != map_ptr);
-                            !entries.is_empty()
-                        });
-                    }
-                    return Ok(DispatchAction::Continue);
-                }
-            }
-            // ── Megamorphic IC fast path for store: existing writable prop ──
-            if slot != u32::MAX {
-                let receiver_layout = map.borrow().layout_id();
-                if let Some(ic) = ctx
-                    .frame
-                    .mega_store_ic
-                    .as_ref()
-                    .and_then(|cache| cache.probe(slot, receiver_layout).copied())
-                {
-                    let offset = ic.cached_offset as usize;
-                    let pm = map.borrow();
-                    if pm.matches_key_at_offset(offset, prop_name.as_ref()) {
-                        if pm.is_writable_by_offset(offset) {
-                            let receiver_shape = pm.shape_id();
-                            drop(pm);
-                            update_mono_named_store_ic(ctx.frame, slot, receiver_shape, offset);
-                            map.borrow_mut().set_by_offset(offset, val);
-                            // Invalidate value-based caches for this object.
-                            let map_ptr = Rc::as_ptr(map) as usize;
-                            if let Some(cache) = &mut ctx.frame.mono_load_cache {
-                                cache.retain(|_, (ptr, _)| *ptr != map_ptr);
-                            }
-                            if let Some(cache) = &mut ctx.frame.poly_load_cache {
-                                cache.retain(|_, entries| {
-                                    entries.retain(|(ptr, _)| *ptr != map_ptr);
-                                    !entries.is_empty()
-                                });
-                            }
-                            return Ok(DispatchAction::Continue);
+                if pm.matches_key_at_offset(offset, prop_name.as_ref()) {
+                    if pm.is_writable_by_offset(offset) {
+                        drop(pm);
+                        map.borrow_mut().set_by_offset(offset, val);
+                        // Invalidate value-based caches for this object.
+                        let map_ptr = Rc::as_ptr(map) as usize;
+                        if let Some(cache) = &mut ctx.frame.mono_load_cache {
+                            cache.retain(|_, (ptr, _)| *ptr != map_ptr);
                         }
-                        // Non-writable: TypeError in strict mode, silently ignore in sloppy.
-                        if ctx.frame.bytecode_array.is_strict() {
-                            return Err(StatorError::TypeError(format!(
-                                "Cannot assign to read only property '{prop_name}'"
-                            )));
+                        if let Some(cache) = &mut ctx.frame.poly_load_cache {
+                            cache.retain(|_, entries| {
+                                entries.retain(|(ptr, _)| *ptr != map_ptr);
+                                !entries.is_empty()
+                            });
                         }
                         return Ok(DispatchAction::Continue);
                     }
+                    // Non-writable: TypeError in strict mode, silently ignore in sloppy.
+                    if ctx.frame.bytecode_array.is_strict() {
+                        return Err(StatorError::TypeError(format!(
+                            "Cannot assign to read only property '{prop_name}'"
+                        )));
+                    }
+                    return Ok(DispatchAction::Continue);
                 }
             }
             // Check for setter accessor first (own object).
@@ -3777,7 +3682,6 @@ fn handle_sta_named_property(
                 if let Some(offset) = pm.offset_of(&prop_name)
                     && offset <= u16::MAX as usize
                 {
-                    update_mono_named_store_ic(ctx.frame, slot, pm.shape_id(), offset);
                     ctx.frame.mega_store_ic_mut().update(MegamorphicIcEntry {
                         slot,
                         receiver_layout: pm.layout_id(),
