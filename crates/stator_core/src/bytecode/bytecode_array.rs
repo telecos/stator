@@ -230,9 +230,14 @@ pub const TURBOFAN_TIERING_THRESHOLD: u32 = 10_000;
 #[derive(Debug, Clone)]
 pub struct BytecodeArray {
     /// The encoded bytecode stream.
-    bytecodes: Vec<u8>,
+    ///
+    /// Wrapped in [`Rc`] so that closure clones share the same allocation
+    /// instead of copying the entire byte buffer.
+    bytecodes: Rc<[u8]>,
     /// Literals referenced by [`bytecodes::Opcode::LdaConstant`].
-    constant_pool: Vec<ConstantPoolEntry>,
+    ///
+    /// Wrapped in [`Rc`] so that closure clones share the same pool.
+    constant_pool: Rc<[ConstantPoolEntry]>,
     /// Number of virtual registers (locals + temporaries) required.
     frame_size: u32,
     /// Number of formal parameters declared by the function.
@@ -240,15 +245,25 @@ pub struct BytecodeArray {
     /// `Function.prototype.length` metadata for this function.
     function_length: u32,
     /// Declared or inferred function name.
-    function_name: String,
+    ///
+    /// Wrapped in [`Rc`] so that closure clones share the same string.
+    function_name: Rc<str>,
     /// Optional source text used by `Function.prototype.toString()`.
-    source_text: Option<String>,
+    ///
+    /// Wrapped in [`Rc`] so that closure clones share the same source text.
+    source_text: Option<Rc<str>>,
     /// Visible binding-to-register mapping for direct `eval()`.
-    binding_registers: HashMap<String, i32>,
+    ///
+    /// Wrapped in [`Rc`] so that closure clones share the same map.
+    binding_registers: Rc<HashMap<String, i32>>,
     /// Sparse mapping from bytecode offsets to source locations.
-    source_positions: Vec<SourcePosition>,
+    ///
+    /// Wrapped in [`Rc`] so that closure clones share the same table.
+    source_positions: Rc<[SourcePosition]>,
     /// Compile-time description of all inline-cache feedback slots.
-    feedback_metadata: FeedbackMetadata,
+    ///
+    /// Wrapped in [`Rc`] so that closure clones share the same metadata.
+    feedback_metadata: Rc<FeedbackMetadata>,
     /// Per-function exception handler table.
     handler_table: Rc<Vec<HandlerTableEntry>>,
     /// Lazily-populated decoded instruction cache shared across clones.
@@ -317,6 +332,14 @@ pub struct BytecodeArray {
     /// reach captured variables.  `None` for top-level scripts and functions
     /// that do not close over any variables.
     closure_context: Option<Rc<RefCell<JsContext>>>,
+    /// `true` if this function's bytecode writes to any captured closure
+    /// variable (via `StaContextSlot` or `StaCurrentContextSlot`).
+    ///
+    /// When `false` the [`CreateClosure`](super::bytecodes::Opcode::CreateClosure)
+    /// handler can create a lightweight clone that shares all immutable
+    /// bytecode data with the template, because the closure only *reads*
+    /// from captured variables.
+    writes_closure_vars: bool,
     /// Register index for the named function expression self-reference.
     ///
     /// When a named function expression (`var f = function g() { … }`) is
@@ -410,6 +433,7 @@ impl PartialEq for BytecodeArray {
             && self.is_strict == other.is_strict
             && self.is_arrow == other.is_arrow
             && self.self_name_register == other.self_name_register
+            && self.writes_closure_vars == other.writes_closure_vars
     }
 }
 
@@ -437,16 +461,16 @@ impl BytecodeArray {
         handler_table: Vec<HandlerTableEntry>,
     ) -> Self {
         Self {
-            bytecodes,
-            constant_pool,
+            bytecodes: bytecodes.into(),
+            constant_pool: constant_pool.into(),
             frame_size,
             parameter_count,
             function_length: parameter_count,
-            function_name: String::new(),
+            function_name: Rc::from(""),
             source_text: None,
-            binding_registers: HashMap::new(),
-            source_positions,
-            feedback_metadata,
+            binding_registers: Rc::new(HashMap::new()),
+            source_positions: source_positions.into(),
+            feedback_metadata: Rc::new(feedback_metadata),
             handler_table: Rc::new(handler_table),
             cached_decode: Rc::new(OnceCell::new()),
             template_cache: Rc::new(RefCell::new(HashMap::new())),
@@ -462,6 +486,7 @@ impl BytecodeArray {
             turbofan_jit_code: Arc::new(Mutex::new(None)),
             turbofan_compile_started: Arc::new(AtomicBool::new(false)),
             closure_context: None,
+            writes_closure_vars: false,
             self_name_register: None,
             construct_proto_cache: Rc::new(RefCell::new(None)),
             construct_boilerplate: Rc::new(RefCell::new(None)),
@@ -573,6 +598,31 @@ impl BytecodeArray {
     /// Attach a captured closure context to this [`BytecodeArray`].
     pub fn set_closure_context(&mut self, ctx: Rc<RefCell<JsContext>>) {
         self.closure_context = Some(ctx);
+    }
+
+    /// Returns `true` if this function's bytecode writes to any captured
+    /// closure variable.
+    pub fn writes_closure_vars(&self) -> bool {
+        self.writes_closure_vars
+    }
+
+    /// Mark whether this function writes to captured closure variables.
+    pub fn with_writes_closure_vars(mut self, flag: bool) -> Self {
+        self.writes_closure_vars = flag;
+        self
+    }
+
+    /// Create a lightweight clone for use as a closure, attaching the given
+    /// closure context.
+    ///
+    /// All immutable bytecode data (bytecodes, constant pool, source
+    /// positions, etc.) is shared with the original via [`Rc`], making
+    /// this operation O(1) regardless of function size.
+    pub fn clone_for_closure(&self, ctx: Option<Rc<RefCell<JsContext>>>) -> Self {
+        Self {
+            closure_context: ctx,
+            ..self.clone()
+        }
     }
 
     /// Register index for a named function expression's self-reference.
@@ -699,7 +749,7 @@ impl BytecodeArray {
 
     /// Set the declared or inferred function name.
     pub fn with_function_name(mut self, name: impl Into<String>) -> Self {
-        self.function_name = name.into();
+        self.function_name = Rc::from(name.into());
         self
     }
 
@@ -710,7 +760,7 @@ impl BytecodeArray {
 
     /// Set the source text used by `Function.prototype.toString()`.
     pub fn with_source_text(mut self, source_text: impl Into<String>) -> Self {
-        self.source_text = Some(source_text.into());
+        self.source_text = Some(Rc::from(source_text.into()));
         self
     }
 
@@ -721,7 +771,7 @@ impl BytecodeArray {
 
     /// Set the binding-to-register mapping used by direct `eval()`.
     pub fn with_binding_registers(mut self, binding_registers: HashMap<String, i32>) -> Self {
-        self.binding_registers = binding_registers;
+        self.binding_registers = Rc::new(binding_registers);
         self
     }
 
