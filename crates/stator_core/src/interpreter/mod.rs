@@ -211,7 +211,6 @@ pub use crate::objects::value::{
 type FnPropMap = Rc<RefCell<HashMap<String, JsValue>>>;
 type MonoLoadCache = HashMap<u32, (usize, JsValue)>;
 type PolyLoadCache = HashMap<u32, Vec<(usize, JsValue)>>;
-type ShapeIcCache = HashMap<u32, PropertyIc>;
 type StringCache = HashMap<u32, Rc<str>>;
 
 thread_local! {
@@ -1252,18 +1251,90 @@ pub(super) fn try_execute_best_jit(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PropertyIc – shape-based inline cache entry
+// MegamorphicIc – shape-based inline cache with fixed-size direct-mapped table
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A monomorphic inline-cache entry that maps a shared property-layout id to a
-/// direct slot offset, enabling O(1) property access across objects that share
-/// the same layout.
+/// Number of entries in the megamorphic inline-cache table.
+///
+/// A power-of-two size allows cheap modular indexing via bitmask.  64 entries
+/// provide good coverage for megamorphic call-sites while staying within two
+/// cache lines per probe.
+const MEGAMORPHIC_IC_SIZE: usize = 64;
+
+/// A single inline-cache entry that maps a `(feedback_slot, layout_id)` pair
+/// to a direct slot offset inside a [`PropertyMap`], enabling O(1) property
+/// access across objects that share the same layout.
+///
+/// When `is_proto` is set, the property lives on the receiver's immediate
+/// prototype rather than on the receiver itself, and `proto_layout` records
+/// the prototype's layout so the hit can be validated in constant time.
 #[derive(Debug, Clone, Copy)]
-pub struct PropertyIc {
-    /// The shared property-layout id observed when the cache was populated.
-    pub cached_shape: u64,
-    /// The Vec offset of the cached property inside the `PropertyMap`.
-    pub cached_offset: usize,
+pub struct MegamorphicIcEntry {
+    /// Feedback slot this entry was populated from (tag for collision check).
+    pub slot: u32,
+    /// The `layout_id` of the receiver when the cache was populated.
+    pub receiver_layout: u64,
+    /// The `Vec` offset of the cached property inside the target
+    /// [`PropertyMap`].
+    pub cached_offset: u16,
+    /// `true` when the property was found on the receiver's direct `__proto__`
+    /// rather than on the receiver itself.
+    pub is_proto: bool,
+    /// When `is_proto`, the `layout_id` of the prototype that owns the
+    /// property.  Ignored when `is_proto` is `false`.
+    pub proto_layout: u64,
+}
+
+impl Default for MegamorphicIcEntry {
+    fn default() -> Self {
+        Self {
+            slot: u32::MAX,
+            receiver_layout: 0,
+            cached_offset: 0,
+            is_proto: false,
+            proto_layout: 0,
+        }
+    }
+}
+
+/// Fixed-size, direct-mapped megamorphic inline cache for named property
+/// access.
+///
+/// Entries are indexed by `feedback_slot & (MEGAMORPHIC_IC_SIZE - 1)`.
+/// Collisions are resolved by overwrite, providing natural LRU-ish eviction
+/// that works well for megamorphic sites where many different shapes compete
+/// for the same feedback slot.
+#[derive(Debug, Clone)]
+pub struct MegamorphicIc {
+    entries: Box<[MegamorphicIcEntry; MEGAMORPHIC_IC_SIZE]>,
+}
+
+impl MegamorphicIc {
+    /// Creates a new empty megamorphic IC table.
+    fn new() -> Self {
+        Self {
+            entries: Box::new([MegamorphicIcEntry::default(); MEGAMORPHIC_IC_SIZE]),
+        }
+    }
+
+    /// Probes the cache for a `(slot, receiver_layout)` pair.
+    #[inline]
+    pub fn probe(&self, slot: u32, receiver_layout: u64) -> Option<&MegamorphicIcEntry> {
+        let idx = (slot as usize) & (MEGAMORPHIC_IC_SIZE - 1);
+        let entry = &self.entries[idx];
+        if entry.slot == slot && entry.receiver_layout == receiver_layout {
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    /// Inserts or overwrites the entry for the given feedback slot.
+    #[inline]
+    pub fn update(&mut self, entry: MegamorphicIcEntry) {
+        let idx = (entry.slot as usize) & (MEGAMORPHIC_IC_SIZE - 1);
+        self.entries[idx] = entry;
+    }
 }
 
 /// Small inline-buffered argument storage for interpreter function calls.
@@ -1568,15 +1639,14 @@ pub struct InterpreterFrame {
     /// Holds up to 4 entries per feedback slot, supporting polymorphic sites.
     /// Lazily allocated on first write.
     pub poly_load_cache: Option<Box<PolyLoadCache>>,
-    /// Shape-based inline cache for named property loads keyed by feedback slot.
-    /// Each entry records the last observed `(layout_id, offset)` pair so that a
-    /// repeat access on the same property layout can skip property-map lookup
-    /// entirely. Lazily allocated on first write.
-    pub shape_load_ic: Option<Box<ShapeIcCache>>,
-    /// Shape-based inline cache for named property stores.
-    /// Keyed by feedback slot, mirroring `shape_load_ic`. Lazily allocated on
-    /// first write.
-    pub shape_store_ic: Option<Box<ShapeIcCache>>,
+    /// Shape-based megamorphic inline cache for named property loads.
+    /// Fixed-size direct-mapped table keyed by feedback slot, supporting O(1)
+    /// property access for both own and prototype-chain properties.  Lazily
+    /// allocated on first write.
+    pub mega_load_ic: Option<Box<MegamorphicIc>>,
+    /// Shape-based megamorphic inline cache for named property stores.
+    /// Mirrors `mega_load_ic`.  Lazily allocated on first write.
+    pub mega_store_ic: Option<Box<MegamorphicIc>>,
     /// Pre-decoded string constants from the constant pool, keyed by index.
     /// Avoids repeated `String::clone()` from the constant pool.
     pub string_cache: Option<Box<StringCache>>,
@@ -1655,8 +1725,8 @@ impl InterpreterFrame {
             new_target: JsValue::Undefined,
             mono_load_cache: None,
             poly_load_cache: None,
-            shape_load_ic: None,
-            shape_store_ic: None,
+            mega_load_ic: None,
+            mega_store_ic: None,
             string_cache: None,
             global_cache: [
                 (0, None, JsValue::Undefined),
@@ -1729,8 +1799,8 @@ impl InterpreterFrame {
             new_target: JsValue::Undefined,
             mono_load_cache: None,
             poly_load_cache: None,
-            shape_load_ic: None,
-            shape_store_ic: None,
+            mega_load_ic: None,
+            mega_store_ic: None,
             string_cache: None,
             global_cache: [
                 (0, None, JsValue::Undefined),
@@ -1897,18 +1967,16 @@ impl InterpreterFrame {
     }
 
     #[inline]
-    fn shape_load_ic_mut(&mut self) -> &mut ShapeIcCache {
-        let ic_slots = self.bytecode_array.feedback_metadata().slot_count() as usize;
-        self.shape_load_ic
-            .get_or_insert_with(|| Box::new(HashMap::with_capacity(ic_slots)))
+    fn mega_load_ic_mut(&mut self) -> &mut MegamorphicIc {
+        self.mega_load_ic
+            .get_or_insert_with(|| Box::new(MegamorphicIc::new()))
             .as_mut()
     }
 
     #[inline]
-    fn shape_store_ic_mut(&mut self) -> &mut ShapeIcCache {
-        let ic_slots = self.bytecode_array.feedback_metadata().slot_count() as usize;
-        self.shape_store_ic
-            .get_or_insert_with(|| Box::new(HashMap::with_capacity(ic_slots)))
+    fn mega_store_ic_mut(&mut self) -> &mut MegamorphicIc {
+        self.mega_store_ic
+            .get_or_insert_with(|| Box::new(MegamorphicIc::new()))
             .as_mut()
     }
 
@@ -3075,8 +3143,8 @@ impl Interpreter {
             new_target: JsValue::Undefined,
             mono_load_cache: None,
             poly_load_cache: None,
-            shape_load_ic: None,
-            shape_store_ic: None,
+            mega_load_ic: None,
+            mega_store_ic: None,
             string_cache: None,
             global_cache: [
                 (0, None, JsValue::Undefined),
