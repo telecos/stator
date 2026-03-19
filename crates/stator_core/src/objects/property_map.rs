@@ -284,6 +284,57 @@ impl PropertyMap {
         Self::from_buffers(capacity, acquire_storage_buffers(capacity))
     }
 
+    /// Creates a property map pre-populated with the given keys and
+    /// attributes, each slot initialised to [`JsValue::Undefined`].
+    ///
+    /// This is used by the constructor fast-path: when a constructor
+    /// consistently produces objects with the same set of properties, the
+    /// interpreter caches the key layout and uses this method on subsequent
+    /// `new` calls.  The constructor body then only needs to overwrite
+    /// existing slot values instead of performing full property insertions.
+    pub fn from_boilerplate(
+        keys: &[String],
+        attrs: &[crate::objects::map::PropertyAttributes],
+    ) -> Self {
+        debug_assert_eq!(keys.len(), attrs.len());
+        let cap = keys.len();
+        let mut buffers = acquire_storage_buffers(cap);
+        buffers.keys.extend_from_slice(keys);
+        buffers.values.resize(cap, JsValue::Undefined);
+        buffers.attrs.extend_from_slice(attrs);
+
+        let integer_key_count = keys
+            .iter()
+            .filter(|k| parse_integer_index(k).is_some())
+            .count();
+
+        let index = if cap > SMALL_PROPERTY_LINEAR_SCAN_CAP {
+            let mut map = HashMap::with_capacity(cap);
+            for (slot, key) in keys.iter().enumerate() {
+                map.insert(key.clone(), slot);
+            }
+            PropertyIndex::Map(map)
+        } else {
+            PropertyIndex::Inline
+        };
+
+        Self {
+            keys: buffers.keys,
+            values: buffers.values,
+            attrs: buffers.attrs,
+            integer_key_count,
+            index,
+            cache_hashes: Default::default(),
+            cache_slots: Default::default(),
+            cache_len: Cell::new(0),
+            cache_cursor: Cell::new(0),
+            shape_id: NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed),
+            layout_id: layout_hash(keys, attrs),
+            extensible: true,
+            has_accessors: false,
+        }
+    }
+
     // ── Inline cache helpers ──────────────────────────────────────────────
 
     /// Probes the inline cache for `key`, returning its slot index on hit.
@@ -636,6 +687,14 @@ impl PropertyMap {
     /// Returns `true` if the map contains no entries.
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
+    }
+
+    /// Returns cloned slices of the property keys and attributes, suitable
+    /// for capturing as a [`crate::bytecode::bytecode_array::ConstructBoilerplate`].
+    pub fn boilerplate_snapshot(
+        &self,
+    ) -> (Vec<String>, Vec<crate::objects::map::PropertyAttributes>) {
+        (self.keys.clone(), self.attrs.clone())
     }
 
     // ── Attribute-aware API ───────────────────────────────────────────────

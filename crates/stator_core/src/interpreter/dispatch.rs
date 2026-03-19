@@ -25,9 +25,10 @@ use super::{
     dispatch_call_with_this, dispatch_getter, dispatch_setter, err_bad_operand,
     error_message_from_value, extract_context, find_handler, fn_props_get, fn_props_set,
     has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
-    maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator,
-    number_to_jsvalue, plain_object_to_array_items, populate_self_name, proto_lookup, resolve_jump,
-    restore_closure_context, set_function_name_if_missing, set_pending_exception,
+    make_construct_this, maybe_cache_construct_boilerplate, maybe_compile_baseline,
+    maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator, number_to_jsvalue,
+    plain_object_to_array_items, populate_self_name, proto_lookup, resolve_construct_proto,
+    resolve_jump, restore_closure_context, set_function_name_if_missing, set_pending_exception,
     settle_async_iterator_result, strict_eq, to_array_index, to_bigint, to_property_key,
     try_execute_best_jit, try_fast_named_property_lookup, walk_context_chain,
 };
@@ -2593,8 +2594,6 @@ fn handle_construct(
         return Err(err_bad_operand("Construct", 2));
     };
     let ctor = ctx.frame.read_reg(ctor_v)?.clone();
-    // Resolve constructor's "prototype" for [[Prototype]] wiring.
-    let ctor_proto = proto_lookup(&ctor, "prototype");
     match ctor {
         JsValue::Function(ba) => {
             // Arrow functions are not constructable (ES §15.3.4).
@@ -2604,16 +2603,11 @@ fn handle_construct(
                 ));
             }
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-            // [[Construct]]: create a fresh object for `this`,
-            // wire its __proto__ to the constructor's prototype,
-            // then run the constructor body with `this` bound.
-            let this_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
-            if !matches!(ctor_proto, JsValue::Undefined) {
-                this_obj
-                    .borrow_mut()
-                    .insert("__proto__".to_string(), ctor_proto.clone());
-            }
-            let this_val = JsValue::PlainObject(this_obj);
+            // Fast path: resolve prototype from cache when available.
+            let ctor_proto = resolve_construct_proto(&JsValue::Function(Rc::clone(&ba)), &ba);
+            // [[Construct]]: create `this` using the boilerplate shape
+            // cache when available, then run the constructor body.
+            let this_val = make_construct_this(&ba, &ctor_proto);
             let mut callee_frame = InterpreterFrame::new_with_globals(
                 Rc::clone(&ba),
                 args,
@@ -2636,16 +2630,22 @@ fn handle_construct(
             // use it; otherwise return the `this` object.
             ctx.frame.accumulator = match val {
                 JsValue::PlainObject(_) | JsValue::Object(_) => val,
-                _ => this_val,
+                _ => {
+                    maybe_cache_construct_boilerplate(&ba, &this_val);
+                    this_val
+                }
             };
         }
         JsValue::NativeFunction(f) => {
+            // Resolve constructor's "prototype" for [[Prototype]] wiring.
+            let ctor_proto = proto_lookup(&JsValue::NativeFunction(Rc::clone(&f)), "prototype");
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
             let val = f(args.into_vec())?;
             ctx.frame.global_cache_invalidate();
             ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
         }
         JsValue::PlainObject(ref map) => {
+            let ctor_proto = proto_lookup(&ctor, "prototype");
             // Objects marked with `__no_construct__` (e.g. Symbol) are
             // callable but must not be used with `new`.
             if map.borrow().get("__no_construct__").is_some() {
@@ -2704,20 +2704,14 @@ fn handle_construct_with_spread(
         return Err(err_bad_operand("ConstructWithSpread", 2));
     };
     let ctor = ctx.frame.read_reg(ctor_v)?.clone();
-    let ctor_proto = proto_lookup(&ctor, "prototype");
     let raw_args = collect_args(ctx.frame, args_start_v, arg_count)?;
     // Expand any spread arrays (JsValue::Array or PlainObject with
     // __is_array__) into individual arguments.
     let args = expand_spread_args(raw_args);
     match ctor {
         JsValue::Function(ba) => {
-            let this_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
-            if !matches!(ctor_proto, JsValue::Undefined) {
-                this_obj
-                    .borrow_mut()
-                    .insert("__proto__".to_string(), ctor_proto.clone());
-            }
-            let this_val = JsValue::PlainObject(this_obj);
+            let ctor_proto = resolve_construct_proto(&JsValue::Function(Rc::clone(&ba)), &ba);
+            let this_val = make_construct_this(&ba, &ctor_proto);
             let mut callee_frame = InterpreterFrame::new_with_globals(
                 Rc::clone(&ba),
                 args,
@@ -2738,15 +2732,20 @@ fn handle_construct_with_spread(
             let val = result?;
             ctx.frame.accumulator = match val {
                 JsValue::PlainObject(_) | JsValue::Object(_) => val,
-                _ => this_val,
+                _ => {
+                    maybe_cache_construct_boilerplate(&ba, &this_val);
+                    this_val
+                }
             };
         }
         JsValue::NativeFunction(f) => {
+            let ctor_proto = proto_lookup(&JsValue::NativeFunction(Rc::clone(&f)), "prototype");
             let val = f(args.into_vec())?;
             ctx.frame.global_cache_invalidate();
             ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
         }
         JsValue::PlainObject(ref map) => {
+            let ctor_proto = proto_lookup(&ctor, "prototype");
             if map.borrow().get("__no_construct__").is_some() {
                 return Err(StatorError::TypeError(
                     "Symbol is not a constructor".to_string(),
@@ -6436,7 +6435,6 @@ fn handle_construct_forward_all_args(
     };
     // operands[1] is a FeedbackSlot, ignored at runtime.
     let ctor = ctx.frame.read_reg(ctor_v)?.clone();
-    let ctor_proto = proto_lookup(&ctor, "prototype");
     let param_count = ctx.frame.bytecode_array.parameter_count() as usize;
     let args: CallArgs = ctx
         .frame
@@ -6453,13 +6451,8 @@ fn handle_construct_forward_all_args(
                     "Function is not a constructor".to_string(),
                 ));
             }
-            let this_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
-            if !matches!(ctor_proto, JsValue::Undefined) {
-                this_obj
-                    .borrow_mut()
-                    .insert("__proto__".to_string(), ctor_proto.clone());
-            }
-            let this_val = JsValue::PlainObject(this_obj);
+            let ctor_proto = resolve_construct_proto(&JsValue::Function(Rc::clone(&ba)), &ba);
+            let this_val = make_construct_this(&ba, &ctor_proto);
             let mut callee_frame = InterpreterFrame::new_with_globals(
                 Rc::clone(&ba),
                 args,
@@ -6480,15 +6473,20 @@ fn handle_construct_forward_all_args(
             let val = result?;
             ctx.frame.accumulator = match val {
                 JsValue::PlainObject(_) | JsValue::Object(_) => val,
-                _ => this_val,
+                _ => {
+                    maybe_cache_construct_boilerplate(&ba, &this_val);
+                    this_val
+                }
             };
         }
         JsValue::NativeFunction(f) => {
+            let ctor_proto = proto_lookup(&JsValue::NativeFunction(Rc::clone(&f)), "prototype");
             let val = f(args.into_vec())?;
             ctx.frame.global_cache_invalidate();
             ctx.frame.accumulator = construct_builtin_result(val, &ctor_proto)?;
         }
         JsValue::PlainObject(ref map) => {
+            let ctor_proto = proto_lookup(&ctor, "prototype");
             if map.borrow().get("__no_construct__").is_some() {
                 return Err(StatorError::TypeError(
                     "Symbol is not a constructor".to_string(),
