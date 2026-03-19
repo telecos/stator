@@ -7136,6 +7136,57 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
 /// `Array.prototype` methods (push, map, filter, etc.) just work.
 fn array_literal_proto_lookup(obj: &JsValue, key: &str) -> JsValue {
     if let JsValue::PlainObject(map) = obj {
+        // ── Fast paths for common array methods ──────────────────────────
+        // Operate directly on the PlainObject HashMap to avoid the O(n)
+        // reconstruction + O(n) sync-back that would otherwise make
+        // repeated push/pop calls O(n²).
+
+        if key == "length" {
+            let borrow = map.borrow();
+            return borrow.get("length").cloned().unwrap_or(JsValue::Smi(0));
+        }
+
+        if key == "push" {
+            let map_rc = Rc::clone(map);
+            return JsValue::NativeFunction(Rc::new(move |args| {
+                let mut m = map_rc.borrow_mut();
+                let len = match m.get("length") {
+                    Some(JsValue::Smi(n)) => *n as usize,
+                    Some(JsValue::HeapNumber(n)) => *n as usize,
+                    _ => 0,
+                };
+                // args[0] = receiver (arr), args[1..] = values to push
+                let values = if args.len() > 1 { &args[1..] } else { &[] };
+                for (i, v) in values.iter().enumerate() {
+                    m.insert((len + i).to_string(), v.clone());
+                }
+                let new_len = len + values.len();
+                m.insert("length".into(), JsValue::Smi(new_len as i32));
+                Ok(JsValue::Smi(new_len as i32))
+            }));
+        }
+
+        if key == "pop" {
+            let map_rc = Rc::clone(map);
+            return JsValue::NativeFunction(Rc::new(move |_args| {
+                let mut m = map_rc.borrow_mut();
+                let len = match m.get("length") {
+                    Some(JsValue::Smi(n)) => *n as usize,
+                    Some(JsValue::HeapNumber(n)) => *n as usize,
+                    _ => return Ok(JsValue::Undefined),
+                };
+                if len == 0 {
+                    return Ok(JsValue::Undefined);
+                }
+                let last = m
+                    .remove(&(len - 1).to_string())
+                    .unwrap_or(JsValue::Undefined);
+                m.insert("length".into(), JsValue::Smi((len - 1) as i32));
+                Ok(last)
+            }));
+        }
+
+        // ── Slow path: reconstruct Array for other methods ───────────────
         let borrow = map.borrow();
         let len = match borrow.get("length") {
             Some(JsValue::Smi(n)) => *n as usize,
@@ -7155,15 +7206,7 @@ fn array_literal_proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         // PlainObject is updated from the Array.
         if matches!(
             key,
-            "push"
-                | "pop"
-                | "shift"
-                | "unshift"
-                | "splice"
-                | "reverse"
-                | "sort"
-                | "fill"
-                | "copyWithin"
+            "shift" | "unshift" | "splice" | "reverse" | "sort" | "fill" | "copyWithin"
         ) && let JsValue::NativeFunction(ref inner_fn) = result
         {
             let inner_fn = Rc::clone(inner_fn);
