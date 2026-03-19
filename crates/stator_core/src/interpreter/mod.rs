@@ -193,7 +193,9 @@ use crate::error::{StatorError, StatorResult};
 use crate::inspector::debugger::Debugger;
 use crate::objects::map::PropertyAttributes;
 use crate::objects::nanbox::NanBoxedValue;
-use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
+use crate::objects::property_map::{
+    INTERNAL_PROTO_PROPERTY_KEY, PropertyMap, acquire_plain_object,
+};
 use crate::objects::string_intern::intern;
 use crate::objects::value::{JsContext, JsValue};
 
@@ -8374,7 +8376,7 @@ pub(super) fn make_construct_this(ba: &Rc<BytecodeArray>, ctor_proto: &JsValue) 
             &bp.keys, &bp.attrs,
         )))
     } else {
-        Rc::new(RefCell::new(PropertyMap::new()))
+        acquire_plain_object()
     };
     if !matches!(ctor_proto, JsValue::Undefined) {
         this_obj

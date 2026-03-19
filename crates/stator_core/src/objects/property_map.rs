@@ -27,6 +27,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::builtins::symbol::{is_symbol_property_key, property_key_to_symbol};
@@ -139,6 +140,49 @@ fn release_storage_buffers(mut buffers: PropertyStorageBuffers) {
         let mut pool = pool.borrow_mut();
         if pool.len() < PROPERTY_STORAGE_POOL_CAP {
             pool.push(buffers);
+        }
+    });
+}
+
+// ── Rc<RefCell<PropertyMap>> wrapper pool ──────────────────────────────
+
+/// Number of reusable `Rc<RefCell<PropertyMap>>` wrappers kept per thread.
+const PLAIN_OBJECT_POOL_CAP: usize = 16;
+
+thread_local! {
+    static PLAIN_OBJECT_POOL: RefCell<Vec<Rc<RefCell<PropertyMap>>>> =
+        RefCell::new(Vec::with_capacity(PLAIN_OBJECT_POOL_CAP));
+}
+
+/// Acquires a ready-to-use `Rc<RefCell<PropertyMap>>` from the thread-local
+/// pool, or creates a fresh one when the pool is empty.  The returned map
+/// is always in a clean, empty state with preserved buffer capacity from
+/// its previous incarnation.
+pub fn acquire_plain_object() -> Rc<RefCell<PropertyMap>> {
+    PLAIN_OBJECT_POOL
+        .try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if let Some(rc) = pool.pop() {
+                rc.borrow_mut().reset();
+                rc
+            } else {
+                Rc::new(RefCell::new(PropertyMap::new()))
+            }
+        })
+        .unwrap_or_else(|_| Rc::new(RefCell::new(PropertyMap::new())))
+}
+
+/// Returns a sole-owner `Rc<RefCell<PropertyMap>>` to the thread-local pool
+/// for later reuse.  If the `Rc` has additional strong references or the
+/// pool is full, the wrapper is simply dropped normally.
+pub fn release_plain_object(rc: Rc<RefCell<PropertyMap>>) {
+    if Rc::strong_count(&rc) != 1 {
+        return;
+    }
+    let _ = PLAIN_OBJECT_POOL.try_with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < PLAIN_OBJECT_POOL_CAP {
+            pool.push(rc);
         }
     });
 }
@@ -309,6 +353,26 @@ impl PropertyMap {
     /// Creates a property map pre-allocated for `capacity` entries.
     pub fn with_capacity(capacity: usize) -> Self {
         Self::from_buffers(capacity, acquire_storage_buffers(capacity))
+    }
+
+    /// Resets this map to an empty state, preserving the allocated capacity
+    /// of the underlying storage buffers for reuse.  This avoids
+    /// deallocation and reallocation when recycling a `PropertyMap` from the
+    /// plain-object pool.
+    pub fn reset(&mut self) {
+        self.keys.clear();
+        self.values.clear();
+        self.attrs.clear();
+        self.integer_key_count = 0;
+        self.index = PropertyIndex::Inline;
+        self.shape_id = NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed);
+        self.layout_id = layout_hash(&[], &[]);
+        self.proto_generation.set(0);
+        self.proto_epoch.set(0);
+        self.proto_global_epoch.set(0);
+        self.extensible = true;
+        self.has_accessors = false;
+        self.template_next_slot = usize::MAX;
     }
 
     /// Creates a property map pre-populated with the given boilerplate
