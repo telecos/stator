@@ -7155,12 +7155,10 @@ fn array_literal_proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     Some(JsValue::HeapNumber(n)) => *n as usize,
                     _ => 0,
                 };
-                // args[0] = receiver (arr), args[1..] = values to push
-                let values = if args.len() > 1 { &args[1..] } else { &[] };
-                for (i, v) in values.iter().enumerate() {
+                for (i, v) in args.iter().enumerate() {
                     m.insert((len + i).to_string(), v.clone());
                 }
-                let new_len = len + values.len();
+                let new_len = len + args.len();
                 m.insert("length".into(), JsValue::Smi(new_len as i32));
                 Ok(JsValue::Smi(new_len as i32))
             }));
