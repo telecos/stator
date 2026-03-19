@@ -8,7 +8,7 @@
 #![allow(clippy::too_many_lines)]
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use smallvec::{SmallVec, smallvec};
@@ -3053,6 +3053,29 @@ fn handle_lda_global(
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
         return Err(err_bad_operand("LdaGlobal", 0));
     };
+    // Fastest path: global IC — indexed Vec access, no string needed.
+    if let Some(ic) = ctx.frame.global_ic.as_ref()
+        && let Some(&(slot_idx, cached_gen)) = ic.get(&name_idx)
+    {
+        let env = ctx.frame.global_env.borrow();
+        if cached_gen == env.generation()
+            && let Some(val) = env.get_by_index(slot_idx)
+        {
+            let val = val.clone();
+            drop(env);
+            if val == JsValue::TheHole {
+                let name = ctx.frame.get_string_constant(name_idx)?;
+                if name.as_ref() == "this" {
+                    return Err(StatorError::ReferenceError(
+                        "Must call super constructor in derived class before accessing 'this'"
+                            .into(),
+                    ));
+                }
+            }
+            ctx.frame.accumulator = val;
+            return Ok(DispatchAction::Continue);
+        }
+    }
     let name = ctx.frame.get_string_constant(name_idx)?;
     // Fast path: check per-frame global cache.
     if let Some(val) = ctx.frame.global_cache_get(name.as_ref()) {
@@ -3064,14 +3087,25 @@ fn handle_lda_global(
         }
         return Ok(DispatchAction::Continue);
     }
-    // Slow path: HashMap lookup, then populate cache.
-    let val = ctx
-        .frame
-        .global_env
-        .borrow()
-        .get(name.as_ref())
-        .cloned()
-        .unwrap_or(JsValue::Undefined);
+    // Slow path: HashMap lookup, then populate caches.
+    let (val, slot_info) = {
+        let env = ctx.frame.global_env.borrow();
+        let val = env
+            .get(name.as_ref())
+            .cloned()
+            .unwrap_or(JsValue::Undefined);
+        let slot_info = env
+            .slot_index(name.as_ref())
+            .map(|idx| (idx, env.generation()));
+        (val, slot_info)
+    };
+    if let Some((slot_idx, snap)) = slot_info {
+        let ic = ctx
+            .frame
+            .global_ic
+            .get_or_insert_with(|| Box::new(HashMap::new()));
+        ic.insert(name_idx, (slot_idx, snap));
+    }
     ctx.frame.global_cache_put(name.as_ref(), val.clone());
     ctx.frame.accumulator = val;
     if name.as_ref() == "this" && ctx.frame.accumulator == JsValue::TheHole {
@@ -3094,20 +3128,45 @@ fn handle_lda_global_inside_typeof(
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
         return Err(err_bad_operand("LdaGlobalInsideTypeof", 0));
     };
+    // Fastest path: global IC — indexed Vec access, no string needed.
+    if let Some(ic) = ctx.frame.global_ic.as_ref()
+        && let Some(&(slot_idx, cached_gen)) = ic.get(&name_idx)
+    {
+        let env = ctx.frame.global_env.borrow();
+        if cached_gen == env.generation()
+            && let Some(val) = env.get_by_index(slot_idx)
+        {
+            let val = val.clone();
+            drop(env);
+            ctx.frame.accumulator = val;
+            return Ok(DispatchAction::Continue);
+        }
+    }
     let name = ctx.frame.get_string_constant(name_idx)?;
     // Fast path: check per-frame global cache.
     if let Some(val) = ctx.frame.global_cache_get(name.as_ref()) {
         ctx.frame.accumulator = val.clone();
         return Ok(DispatchAction::Continue);
     }
-    // Slow path: HashMap lookup, then populate cache.
-    let val = ctx
-        .frame
-        .global_env
-        .borrow()
-        .get(name.as_ref())
-        .cloned()
-        .unwrap_or(JsValue::Undefined);
+    // Slow path: HashMap lookup, then populate caches.
+    let (val, slot_info) = {
+        let env = ctx.frame.global_env.borrow();
+        let val = env
+            .get(name.as_ref())
+            .cloned()
+            .unwrap_or(JsValue::Undefined);
+        let slot_info = env
+            .slot_index(name.as_ref())
+            .map(|idx| (idx, env.generation()));
+        (val, slot_info)
+    };
+    if let Some((slot_idx, snap)) = slot_info {
+        let ic = ctx
+            .frame
+            .global_ic
+            .get_or_insert_with(|| Box::new(HashMap::new()));
+        ic.insert(name_idx, (slot_idx, snap));
+    }
     ctx.frame.global_cache_put(name.as_ref(), val.clone());
     ctx.frame.accumulator = val;
     Ok(DispatchAction::Continue)
@@ -3131,7 +3190,15 @@ fn handle_sta_global(
     }
     set_function_name_if_missing(&val, &name);
     env.insert(name.to_string(), val.clone());
+    // Update the global IC with the (possibly new) slot index.
+    let slot_idx = env.slot_index(&name).unwrap();
+    let snap = env.generation();
     drop(env);
+    let ic = ctx
+        .frame
+        .global_ic
+        .get_or_insert_with(|| Box::new(HashMap::new()));
+    ic.insert(name_idx, (slot_idx, snap));
     // Keep the global cache in sync with the HashMap.
     ctx.frame.global_cache_put(&name, val);
     Ok(DispatchAction::Continue)
@@ -6625,6 +6692,8 @@ fn handle_call_direct_eval(
         let eval_env = Rc::new(RefCell::new(GlobalEnv {
             vars: eval_bindings,
             generation: 0,
+            slots: Vec::new(),
+            name_to_index: HashMap::new(),
         }));
         let (result, final_env, is_strict) =
             crate::builtins::global::global_eval_direct_with_scope_capture(
