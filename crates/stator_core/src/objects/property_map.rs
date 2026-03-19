@@ -382,6 +382,32 @@ impl PropertyMap {
         self.layout_id
     }
 
+    /// Clone this map as an object-literal template instance.
+    ///
+    /// The clone preserves the property-key layout and attribute flags but
+    /// assigns a fresh shape id, clears inline caches, resets prototype
+    /// generations, and fills every slot with `undefined`.
+    pub fn clone_template(&self) -> Self {
+        Self {
+            keys: self.keys.clone(),
+            values: vec![JsValue::Undefined; self.values.len()],
+            attrs: self.attrs.clone(),
+            integer_key_count: self.integer_key_count,
+            index: self.index.clone(),
+            cache_hashes: Default::default(),
+            cache_slots: Default::default(),
+            cache_len: Cell::new(0),
+            cache_cursor: Cell::new(0),
+            shape_id: NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed),
+            layout_id: self.layout_id,
+            proto_generation: Cell::new(0),
+            proto_epoch: Cell::new(0),
+            proto_global_epoch: Cell::new(0),
+            extensible: self.extensible,
+            has_accessors: self.has_accessors,
+        }
+    }
+
     /// Returns the cached generation for this map's prototype chain.
     ///
     /// The generation is a composite of the local mutation epoch and the
@@ -1446,6 +1472,33 @@ mod tests {
         let pm1 = PropertyMap::new();
         let pm2 = PropertyMap::new();
         assert_ne!(pm1.shape_id(), pm2.shape_id());
+    }
+
+    #[test]
+    fn test_clone_template_preserves_layout_but_refreshes_shape_id() {
+        let mut template = PropertyMap::new();
+        template.insert("a".to_string(), JsValue::Smi(1));
+        template.insert("b".to_string(), JsValue::Smi(2));
+
+        let cloned = template.clone_template();
+
+        assert_eq!(template.layout_id(), cloned.layout_id());
+        assert_ne!(template.shape_id(), cloned.shape_id());
+        assert_eq!(cloned.get("a"), Some(&JsValue::Undefined));
+        assert_eq!(cloned.get("b"), Some(&JsValue::Undefined));
+    }
+
+    #[test]
+    fn test_clone_template_preserves_accessor_flag() {
+        let mut template = PropertyMap::new();
+        template.insert_with_attrs(
+            "__get_value__".to_string(),
+            JsValue::Undefined,
+            PropertyAttributes::ENUMERABLE | PropertyAttributes::CONFIGURABLE,
+        );
+
+        let cloned = template.clone_template();
+        assert!(cloned.has_accessors);
     }
 
     // ── freeze / seal / is_frozen / is_sealed ────────────────────────────

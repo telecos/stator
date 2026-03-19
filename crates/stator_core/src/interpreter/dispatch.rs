@@ -4899,12 +4899,41 @@ fn handle_create_object_literal(
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     // operands: [ConstantPoolIdx, FeedbackSlot, Flag]
-    let capacity = match instr.operands.get(2) {
-        Some(Operand::Flag(count)) if *count > 0 => *count as usize,
-        _ => 4,
+    let Operand::ConstantPoolIdx(template_idx) = instr.operands[0] else {
+        return Err(err_bad_operand("CreateObjectLiteral", 0));
     };
-    ctx.frame.accumulator =
-        JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::with_capacity(capacity))));
+    let template = if let Some(cached) = ctx
+        .frame
+        .bytecode_array
+        .cached_object_template(template_idx)
+    {
+        cached
+    } else {
+        let ConstantPoolEntry::ObjectLiteralTemplate { keys } = ctx
+            .frame
+            .bytecode_array
+            .get_constant(template_idx)
+            .ok_or_else(|| {
+                StatorError::Internal(format!(
+                    "CreateObjectLiteral: constant pool index {template_idx} out of bounds"
+                ))
+            })?
+        else {
+            return Err(StatorError::Internal(
+                "CreateObjectLiteral: template descriptor is not an object literal template".into(),
+            ));
+        };
+        let mut built = PropertyMap::with_capacity(keys.len());
+        for key in keys {
+            built.insert(key.clone(), JsValue::Undefined);
+        }
+        let object = built.clone_template();
+        ctx.frame
+            .bytecode_array
+            .cache_object_template(template_idx, built);
+        object
+    };
+    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(template)));
     Ok(DispatchAction::Continue)
 }
 
@@ -5023,7 +5052,9 @@ fn handle_define_named_own_property(
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     if let JsValue::PlainObject(ref map) = obj {
         set_named_property_function_metadata(&val, &obj, &prop_name);
-        if let Some(attrs) = private_named_property_attrs(&prop_name) {
+        if let Some(offset) = map.borrow().offset_of(&prop_name) {
+            map.borrow_mut().set_by_offset(offset, val);
+        } else if let Some(attrs) = private_named_property_attrs(&prop_name) {
             map.borrow_mut().insert_with_attrs(prop_name, val, attrs);
         } else {
             map.borrow_mut().insert(prop_name, val);

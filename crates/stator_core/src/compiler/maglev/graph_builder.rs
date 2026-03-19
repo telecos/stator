@@ -1688,6 +1688,11 @@ impl<'a> GraphBuilder<'a> {
                 // emit an opaque constant-pool reference.
                 ValueNode::ConstantPoolEntry { index: idx }
             }
+            ConstantPoolEntry::ObjectLiteralTemplate { .. } => {
+                // Object-literal templates are handled by CreateObjectLiteral
+                // at runtime; emit an opaque constant-pool reference.
+                ValueNode::ConstantPoolEntry { index: idx }
+            }
         };
         self.emit(node)
     }

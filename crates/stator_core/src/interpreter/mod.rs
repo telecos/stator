@@ -3886,6 +3886,9 @@ pub(super) fn constant_to_value(entry: &ConstantPoolEntry) -> JsValue {
         ConstantPoolEntry::BigInt(n) => JsValue::BigInt(*n),
         ConstantPoolEntry::Function(ba) => JsValue::Function(Rc::clone(ba)),
         ConstantPoolEntry::TemplateObject { cooked, raw } => build_template_object(cooked, raw),
+        ConstantPoolEntry::ObjectLiteralTemplate { .. } => {
+            unreachable!("object literal templates are only consumed by CreateObjectLiteral")
+        }
     }
 }
 

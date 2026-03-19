@@ -162,6 +162,7 @@ const CPE_FUNCTION: u8 = 0x05;
 const CPE_TEMPLATE_OBJECT: u8 = 0x06;
 /// BigInt constant pool entry tag.
 const CPE_BIGINT: u8 = 0x07;
+const CPE_OBJECT_LITERAL_TEMPLATE: u8 = 0x08;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // StartupSnapshot
@@ -648,6 +649,13 @@ fn write_constant_pool_entry(buf: &mut Vec<u8>, entry: &ConstantPoolEntry) {
                 write_str32(buf, r);
             }
         }
+        ConstantPoolEntry::ObjectLiteralTemplate { keys } => {
+            write_u8(buf, CPE_OBJECT_LITERAL_TEMPLATE);
+            write_u32(buf, keys.len() as u32);
+            for key in keys {
+                write_str32(buf, key);
+            }
+        }
     }
 }
 
@@ -1054,6 +1062,14 @@ fn read_constant_pool_entry(bytes: &[u8], cursor: &mut usize) -> StatorResult<Co
                 raw.push(read_str32(bytes, cursor)?);
             }
             Ok(ConstantPoolEntry::TemplateObject { cooked, raw })
+        }
+        CPE_OBJECT_LITERAL_TEMPLATE => {
+            let len = read_u32(bytes, cursor)? as usize;
+            let mut keys = Vec::with_capacity(len);
+            for _ in 0..len {
+                keys.push(read_str32(bytes, cursor)?);
+            }
+            Ok(ConstantPoolEntry::ObjectLiteralTemplate { keys })
         }
         other => Err(StatorError::Internal(format!(
             "snapshot: unknown ConstantPoolEntry tag {other:#04x}"
