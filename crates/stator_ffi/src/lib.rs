@@ -2884,7 +2884,7 @@ fn jsvalue_to_stator_value_inner(v: &JsValue) -> StatorValueInner {
             }
         }
         JsValue::Function(_) | JsValue::NativeFunction(_) => StatorValueInner::Function,
-        JsValue::Array(_) => StatorValueInner::Array,
+        JsValue::Array(_) | JsValue::SmiArray(_) => StatorValueInner::Array,
         JsValue::Object(_)
         | JsValue::Generator(_)
         | JsValue::Iterator(_)
