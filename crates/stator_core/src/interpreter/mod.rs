@@ -191,6 +191,7 @@ use crate::bytecode::bytecode_array::{
 use crate::bytecode::bytecode_array::{MaglevJitCodeCache, TurbofanJitCodeCache};
 use crate::error::{StatorError, StatorResult};
 use crate::inspector::debugger::Debugger;
+use crate::objects::nanbox::NanBoxedValue;
 use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 use crate::objects::string_intern::intern;
 use crate::objects::value::{JsContext, JsValue};
@@ -1377,6 +1378,126 @@ impl Default for GlobalEnv {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// HotRegisters — NaN-boxed register cache
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Hot register cache using NaN-boxed values (8 bytes each vs 24 bytes for
+/// [`JsValue`]).
+///
+/// Only stores values that can be NaN-boxed (Smi, HeapNumber, Boolean,
+/// Undefined, Null).  When a register contains a heap object (String, Object,
+/// etc.), the corresponding hot register is marked invalid and the regular
+/// register file is used instead.
+///
+/// This gives us 3× better cache density for tight arithmetic loops where
+/// all values are Smi.
+pub struct HotRegisters {
+    /// NaN-boxed values, indexed the same as the flat register file.
+    values: Vec<NanBoxedValue>,
+    /// Bitset: entry `i` is `true` if `values[i]` mirrors `registers[i]`.
+    /// When `false`, the caller must fall back to the full [`JsValue`] register.
+    valid: Vec<bool>,
+}
+
+impl HotRegisters {
+    /// Create a new hot register cache of the given `size`.
+    ///
+    /// All slots start as valid `undefined` (which is NaN-boxable).
+    fn new(size: usize) -> Self {
+        Self {
+            values: vec![NanBoxedValue::undefined(); size],
+            valid: vec![true; size],
+        }
+    }
+
+    /// Try to read a register from the hot cache.
+    ///
+    /// Returns `Some(JsValue)` if the hot register is valid, `None` otherwise.
+    #[inline(always)]
+    fn try_read(&self, idx: usize) -> Option<JsValue> {
+        if idx < self.valid.len() {
+            // SAFETY: idx is bounds-checked above.
+            if unsafe { *self.valid.get_unchecked(idx) } {
+                let nb = unsafe { *self.values.get_unchecked(idx) };
+                Some(Self::decode(nb))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Write a value to the hot cache.  Returns `true` if the value was
+    /// NaN-boxable and was stored.
+    #[inline(always)]
+    fn try_write(&mut self, idx: usize, value: &JsValue) -> bool {
+        if idx >= self.values.len() {
+            return false;
+        }
+        if let Some(nb) = Self::try_encode(value) {
+            // SAFETY: idx < self.values.len() checked above.
+            unsafe {
+                *self.values.get_unchecked_mut(idx) = nb;
+                *self.valid.get_unchecked_mut(idx) = true;
+            }
+            true
+        } else {
+            // Not NaN-boxable (String, Object, Array, etc.)
+            unsafe {
+                *self.valid.get_unchecked_mut(idx) = false;
+            }
+            false
+        }
+    }
+
+    /// Invalidate a hot register (the regular register was written with a
+    /// value whose NaN-boxability is unknown).
+    #[inline(always)]
+    #[allow(dead_code)]
+    fn invalidate(&mut self, idx: usize) {
+        if idx < self.valid.len() {
+            // SAFETY: idx is bounds-checked above.
+            unsafe {
+                *self.valid.get_unchecked_mut(idx) = false;
+            }
+        }
+    }
+
+    /// Attempt to NaN-box a [`JsValue`].
+    #[inline(always)]
+    fn try_encode(value: &JsValue) -> Option<NanBoxedValue> {
+        match value {
+            JsValue::Smi(v) => Some(NanBoxedValue::from_smi(*v)),
+            JsValue::HeapNumber(v) => Some(NanBoxedValue::from_double(*v)),
+            JsValue::Boolean(v) => Some(NanBoxedValue::from_boolean(*v)),
+            JsValue::Undefined => Some(NanBoxedValue::undefined()),
+            JsValue::Null => Some(NanBoxedValue::null()),
+            _ => None,
+        }
+    }
+
+    /// Decode a [`NanBoxedValue`] back to a [`JsValue`].
+    #[inline(always)]
+    fn decode(nb: NanBoxedValue) -> JsValue {
+        if nb.is_double() {
+            JsValue::HeapNumber(nb.as_double())
+        } else if nb.is_smi() {
+            JsValue::Smi(nb.as_smi())
+        } else if nb.is_boolean() {
+            JsValue::Boolean(nb.as_boolean())
+        } else if nb.is_undefined() {
+            JsValue::Undefined
+        } else if nb.is_null() {
+            JsValue::Null
+        } else {
+            // Shouldn't happen for values we encoded, but be safe.
+            JsValue::Undefined
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // InterpreterFrame
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1468,6 +1589,13 @@ pub struct InterpreterFrame {
     /// Set when we detect a tight arithmetic loop with all-Smi values.
     /// Cleared when any non-Smi value is encountered.
     pub smi_mode: bool,
+    /// NaN-boxed hot register cache (8 bytes per slot vs 24 bytes for JsValue).
+    /// Mirrors the regular register file for values that can be NaN-boxed.
+    pub hot_registers: HotRegisters,
+    /// NaN-boxed accumulator for SMI mode.  Avoids constructing a full
+    /// `JsValue::Smi` on every arithmetic operation inside tight loops.
+    /// Only valid when `smi_mode` is true.
+    pub hot_accumulator: NanBoxedValue,
     /// Tracks how many times each backward jump target has been taken
     /// (for SMI mode detection).  Indexed by instruction PC, default 0.
     loop_trip_counts: Vec<u16>,
@@ -1537,6 +1665,8 @@ impl InterpreterFrame {
             ],
             cache_generation: 0,
             smi_mode: false,
+            hot_registers: HotRegisters::new(total_regs),
+            hot_accumulator: NanBoxedValue::undefined(),
             loop_trip_counts: Vec::new(),
         }
     }
@@ -1610,6 +1740,8 @@ impl InterpreterFrame {
             ],
             cache_generation: 0,
             smi_mode: false,
+            hot_registers: HotRegisters::new(total_regs),
+            hot_accumulator: NanBoxedValue::undefined(),
             loop_trip_counts: Vec::new(),
         }
     }
@@ -1679,6 +1811,21 @@ impl InterpreterFrame {
         unsafe { self.registers.get_unchecked(idx) }
     }
 
+    /// Compute the flat index for a register operand without bounds checks.
+    ///
+    /// This is the same index computation used by [`read_reg_unchecked`] and
+    /// [`write_reg_unchecked`], exposed so callers can index into parallel
+    /// data structures (e.g. [`HotRegisters`]).
+    #[inline(always)]
+    fn reg_flat_index_unchecked(&self, reg: u32) -> usize {
+        let signed = reg as i32;
+        if signed >= 0 {
+            self.bytecode_array.parameter_count() as usize + signed as usize
+        } else {
+            (-(signed + 1)) as usize
+        }
+    }
+
     /// Return a reference to the accumulator value.
     #[inline(always)]
     pub fn accumulator_ref(&self) -> &JsValue {
@@ -1689,6 +1836,7 @@ impl InterpreterFrame {
     #[inline(always)]
     fn write_reg(&mut self, v: u32, value: JsValue) -> StatorResult<()> {
         let idx = self.reg_index(v)?;
+        self.hot_registers.try_write(idx, &value);
         self.registers[idx] = value;
         Ok(())
     }
@@ -1708,6 +1856,7 @@ impl InterpreterFrame {
             (-(signed + 1)) as usize
         };
         debug_assert!(idx < self.registers.len());
+        self.hot_registers.try_write(idx, &value);
         // SAFETY: The caller guarantees `reg` maps to an in-bounds register.
         *unsafe { self.registers.get_unchecked_mut(idx) } = value;
     }
@@ -1721,6 +1870,7 @@ impl InterpreterFrame {
         let dst_idx = self.reg_index(dst)?;
         if src_idx != dst_idx {
             let val = self.registers[src_idx].cheap_clone();
+            self.hot_registers.try_write(dst_idx, &val);
             self.registers[dst_idx] = val;
         }
         Ok(())
@@ -1923,8 +2073,9 @@ impl Interpreter {
                                 Opcode::LdaSmi => {
                                     // SAFETY: Bytecode generator guarantees operand[0]
                                     // is Immediate for LdaSmi.
-                                    frame.accumulator =
-                                        JsValue::Smi(unsafe { operand_imm_unchecked(instr, 0) });
+                                    let val = unsafe { operand_imm_unchecked(instr, 0) };
+                                    frame.accumulator = JsValue::Smi(val);
+                                    frame.hot_accumulator = NanBoxedValue::from_smi(val);
                                     continue 'dispatch;
                                 }
                                 Opcode::Star => {
@@ -1934,6 +2085,7 @@ impl Interpreter {
                                     let val = frame.accumulator.cheap_clone();
                                     // SAFETY: Bytecode validator guarantees register is
                                     // in bounds for this frame.
+                                    // write_reg_unchecked also updates hot_registers.
                                     unsafe { frame.write_reg_unchecked(reg, val) };
                                     continue 'dispatch;
                                 }
@@ -1941,10 +2093,18 @@ impl Interpreter {
                                     // SAFETY: Bytecode generator guarantees operand[0]
                                     // is Register for Ldar, and register is in bounds.
                                     let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                    // SAFETY: Bytecode validator guarantees register is
-                                    // in bounds for this frame.
-                                    let val = unsafe { frame.read_reg_unchecked(reg) };
-                                    frame.accumulator = val.cheap_clone();
+                                    let flat = frame.reg_flat_index_unchecked(reg);
+                                    if let Some(val) = frame.hot_registers.try_read(flat) {
+                                        frame.accumulator = val;
+                                    } else {
+                                        // SAFETY: Bytecode validator guarantees register
+                                        // is in bounds for this frame.
+                                        let val = unsafe { frame.read_reg_unchecked(reg) };
+                                        frame.accumulator = val.cheap_clone();
+                                    }
+                                    frame.hot_accumulator =
+                                        HotRegisters::try_encode(&frame.accumulator)
+                                            .unwrap_or(NanBoxedValue::undefined());
                                     continue 'dispatch;
                                 }
                                 Opcode::Add | Opcode::AddSmi => {
@@ -1968,12 +2128,14 @@ impl Interpreter {
                                     match a.checked_add(b) {
                                         Some(result) => {
                                             frame.accumulator = JsValue::Smi(result);
+                                            frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                         }
                                         None => {
                                             // Overflow — exit SMI mode.
                                             frame.smi_mode = false;
-                                            frame.accumulator =
-                                                JsValue::HeapNumber((a as f64) + (b as f64));
+                                            let f = (a as f64) + (b as f64);
+                                            frame.accumulator = JsValue::HeapNumber(f);
+                                            frame.hot_accumulator = NanBoxedValue::from_double(f);
                                         }
                                     }
                                     continue 'dispatch;
@@ -1999,11 +2161,13 @@ impl Interpreter {
                                     match a.checked_sub(b) {
                                         Some(result) => {
                                             frame.accumulator = JsValue::Smi(result);
+                                            frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                         }
                                         None => {
                                             frame.smi_mode = false;
-                                            frame.accumulator =
-                                                JsValue::HeapNumber((a as f64) - (b as f64));
+                                            let f = (a as f64) - (b as f64);
+                                            frame.accumulator = JsValue::HeapNumber(f);
+                                            frame.hot_accumulator = NanBoxedValue::from_double(f);
                                         }
                                     }
                                     continue 'dispatch;
@@ -2029,11 +2193,13 @@ impl Interpreter {
                                     match a.checked_mul(b) {
                                         Some(result) => {
                                             frame.accumulator = JsValue::Smi(result);
+                                            frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                         }
                                         None => {
                                             frame.smi_mode = false;
-                                            frame.accumulator =
-                                                JsValue::HeapNumber((a as f64) * (b as f64));
+                                            let f = (a as f64) * (b as f64);
+                                            frame.accumulator = JsValue::HeapNumber(f);
+                                            frame.hot_accumulator = NanBoxedValue::from_double(f);
                                         }
                                     }
                                     continue 'dispatch;
@@ -2060,6 +2226,7 @@ impl Interpreter {
                                         _ => unsafe { std::hint::unreachable_unchecked() },
                                     };
                                     frame.accumulator = JsValue::Boolean(result);
+                                    frame.hot_accumulator = NanBoxedValue::from_boolean(result);
                                     continue 'dispatch;
                                 }
                                 Opcode::JumpIfTrue => {
@@ -2115,8 +2282,9 @@ impl Interpreter {
                             Opcode::LdaSmi => {
                                 // SAFETY: Bytecode generator guarantees operand[0]
                                 // is Immediate for LdaSmi.
-                                frame.accumulator =
-                                    JsValue::Smi(unsafe { operand_imm_unchecked(instr, 0) });
+                                let val = unsafe { operand_imm_unchecked(instr, 0) };
+                                frame.accumulator = JsValue::Smi(val);
+                                frame.hot_accumulator = NanBoxedValue::from_smi(val);
                                 continue 'dispatch;
                             }
                             Opcode::Star => {
@@ -2126,6 +2294,7 @@ impl Interpreter {
                                 let val = frame.accumulator.cheap_clone();
                                 // SAFETY: Bytecode validator guarantees register is
                                 // in bounds for this frame.
+                                // write_reg_unchecked also updates hot_registers.
                                 unsafe { frame.write_reg_unchecked(reg, val) };
                                 continue 'dispatch;
                             }
@@ -2133,14 +2302,20 @@ impl Interpreter {
                                 // SAFETY: Bytecode generator guarantees operand[0]
                                 // is Register for Ldar, and register is in bounds.
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                // SAFETY: Bytecode validator guarantees register is
-                                // in bounds for this frame.
-                                let val = unsafe { frame.read_reg_unchecked(reg) };
-                                frame.accumulator = val.cheap_clone();
+                                let flat = frame.reg_flat_index_unchecked(reg);
+                                if let Some(val) = frame.hot_registers.try_read(flat) {
+                                    frame.accumulator = val;
+                                } else {
+                                    // SAFETY: Bytecode validator guarantees register is
+                                    // in bounds for this frame.
+                                    let val = unsafe { frame.read_reg_unchecked(reg) };
+                                    frame.accumulator = val.cheap_clone();
+                                }
                                 continue 'dispatch;
                             }
                             Opcode::LdaUndefined => {
                                 frame.accumulator = JsValue::Undefined;
+                                frame.hot_accumulator = NanBoxedValue::undefined();
                                 continue 'dispatch;
                             }
                             Opcode::Mov => {
@@ -2149,6 +2324,7 @@ impl Interpreter {
                                 let src = unsafe { operand_reg_unchecked(instr, 0) };
                                 let dst = unsafe { operand_reg_unchecked(instr, 1) };
                                 let val = unsafe { frame.read_reg_unchecked(src) }.cheap_clone();
+                                // write_reg_unchecked also updates hot_registers.
                                 unsafe { frame.write_reg_unchecked(dst, val) };
                                 continue 'dispatch;
                             }
@@ -2164,6 +2340,7 @@ impl Interpreter {
                                         && let Some(result) = a.checked_add(*b)
                                     {
                                         frame.accumulator = JsValue::Smi(result);
+                                        frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                         continue 'dispatch;
                                     }
                                 }
@@ -2201,6 +2378,7 @@ impl Interpreter {
                                         && let Some(result) = a.checked_sub(*b)
                                     {
                                         frame.accumulator = JsValue::Smi(result);
+                                        frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                         continue 'dispatch;
                                     }
                                 }
@@ -2238,6 +2416,7 @@ impl Interpreter {
                                         && let Some(result) = a.checked_mul(*b)
                                     {
                                         frame.accumulator = JsValue::Smi(result);
+                                        frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                         continue 'dispatch;
                                     }
                                 }
@@ -2271,6 +2450,7 @@ impl Interpreter {
                                     && let Some(result) = n.checked_add(imm)
                                 {
                                     frame.accumulator = JsValue::Smi(result);
+                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                     continue 'dispatch;
                                 }
                                 match dispatch_via_table(
@@ -2303,6 +2483,7 @@ impl Interpreter {
                                     && let Some(result) = n.checked_sub(imm)
                                 {
                                     frame.accumulator = JsValue::Smi(result);
+                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                     continue 'dispatch;
                                 }
                                 match dispatch_via_table(
@@ -2392,6 +2573,11 @@ impl Interpreter {
                                         *count = count.saturating_add(1);
                                         if *count >= 4 {
                                             frame.smi_mode = true;
+                                            // Seed hot_accumulator for the first
+                                            // SMI-mode iteration.
+                                            if let JsValue::Smi(v) = &frame.accumulator {
+                                                frame.hot_accumulator = NanBoxedValue::from_smi(*v);
+                                            }
                                         }
                                     }
                                 }
@@ -2670,6 +2856,8 @@ impl Interpreter {
             ],
             cache_generation: 0,
             smi_mode: false,
+            hot_registers: HotRegisters::new(total),
+            hot_accumulator: NanBoxedValue::undefined(),
             loop_trip_counts: Vec::new(),
         };
         // Restore the captured closure context so generators can access outer
@@ -19044,5 +19232,152 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, JsValue::Smi(10 + 9 + 8));
+    }
+
+    // ── HotRegisters unit tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_hot_registers_smi_round_trip() {
+        let mut hr = HotRegisters::new(4);
+        let val = JsValue::Smi(42);
+        assert!(hr.try_write(0, &val));
+        let read = hr.try_read(0);
+        assert_eq!(read, Some(JsValue::Smi(42)));
+    }
+
+    #[test]
+    fn test_hot_registers_heap_number_round_trip() {
+        let mut hr = HotRegisters::new(4);
+        let val = JsValue::HeapNumber(3.14);
+        assert!(hr.try_write(1, &val));
+        let read = hr.try_read(1);
+        assert_eq!(read, Some(JsValue::HeapNumber(3.14)));
+    }
+
+    #[test]
+    fn test_hot_registers_boolean_round_trip() {
+        let mut hr = HotRegisters::new(4);
+        assert!(hr.try_write(0, &JsValue::Boolean(true)));
+        assert_eq!(hr.try_read(0), Some(JsValue::Boolean(true)));
+        assert!(hr.try_write(1, &JsValue::Boolean(false)));
+        assert_eq!(hr.try_read(1), Some(JsValue::Boolean(false)));
+    }
+
+    #[test]
+    fn test_hot_registers_undefined_null() {
+        let mut hr = HotRegisters::new(4);
+        assert!(hr.try_write(0, &JsValue::Undefined));
+        assert_eq!(hr.try_read(0), Some(JsValue::Undefined));
+        assert!(hr.try_write(1, &JsValue::Null));
+        assert_eq!(hr.try_read(1), Some(JsValue::Null));
+    }
+
+    #[test]
+    fn test_hot_registers_invalidates_for_string() {
+        let mut hr = HotRegisters::new(4);
+        // First write an Smi — should be valid.
+        assert!(hr.try_write(0, &JsValue::Smi(1)));
+        assert!(hr.try_read(0).is_some());
+        // Now write a String — not NaN-boxable, should invalidate.
+        let s: Rc<str> = "hello".into();
+        assert!(!hr.try_write(0, &JsValue::String(s)));
+        assert!(hr.try_read(0).is_none());
+    }
+
+    #[test]
+    fn test_hot_registers_invalidates_for_object() {
+        let mut hr = HotRegisters::new(4);
+        assert!(hr.try_write(0, &JsValue::Smi(99)));
+        assert!(hr.try_read(0).is_some());
+        // Object is not NaN-boxable.
+        assert!(!hr.try_write(0, &JsValue::Object(std::ptr::null_mut())));
+        assert!(hr.try_read(0).is_none());
+    }
+
+    #[test]
+    fn test_hot_registers_out_of_bounds_read() {
+        let hr = HotRegisters::new(2);
+        // Reading past the end returns None.
+        assert!(hr.try_read(5).is_none());
+    }
+
+    #[test]
+    fn test_hot_registers_out_of_bounds_write() {
+        let mut hr = HotRegisters::new(2);
+        // Writing past the end is a no-op (returns false).
+        assert!(!hr.try_write(5, &JsValue::Smi(1)));
+    }
+
+    #[test]
+    fn test_hot_registers_initial_state() {
+        let hr = HotRegisters::new(3);
+        // All registers start as valid undefined.
+        for i in 0..3 {
+            assert_eq!(hr.try_read(i), Some(JsValue::Undefined));
+        }
+    }
+
+    #[test]
+    fn test_hot_registers_invalidate() {
+        let mut hr = HotRegisters::new(4);
+        assert!(hr.try_write(0, &JsValue::Smi(10)));
+        assert!(hr.try_read(0).is_some());
+        hr.invalidate(0);
+        assert!(hr.try_read(0).is_none());
+    }
+
+    #[test]
+    fn test_hot_accumulator_smi_arithmetic() {
+        // Verify that NanBoxedValue round-trips correctly for Smi arithmetic.
+        let a = NanBoxedValue::from_smi(100);
+        let b = NanBoxedValue::from_smi(23);
+        let sum = a.as_smi() + b.as_smi();
+        let result = NanBoxedValue::from_smi(sum);
+        assert_eq!(result.as_smi(), 123);
+        // Decode back to JsValue.
+        let decoded = HotRegisters::decode(result);
+        assert_eq!(decoded, JsValue::Smi(123));
+    }
+
+    #[test]
+    fn test_hot_accumulator_overflow_to_f64() {
+        // When SMI overflows, the result is stored as f64 in hot_accumulator.
+        let a = i32::MAX;
+        let b = 1_i32;
+        let f = (a as f64) + (b as f64);
+        let nb = NanBoxedValue::from_double(f);
+        assert!(nb.is_double());
+        let decoded = HotRegisters::decode(nb);
+        assert_eq!(decoded, JsValue::HeapNumber(f));
+    }
+
+    #[test]
+    fn test_hot_registers_decode_all_types() {
+        // Smi
+        assert_eq!(
+            HotRegisters::decode(NanBoxedValue::from_smi(-42)),
+            JsValue::Smi(-42)
+        );
+        // HeapNumber
+        assert_eq!(
+            HotRegisters::decode(NanBoxedValue::from_double(2.718)),
+            JsValue::HeapNumber(2.718)
+        );
+        // Boolean
+        assert_eq!(
+            HotRegisters::decode(NanBoxedValue::from_boolean(true)),
+            JsValue::Boolean(true)
+        );
+        assert_eq!(
+            HotRegisters::decode(NanBoxedValue::from_boolean(false)),
+            JsValue::Boolean(false)
+        );
+        // Undefined
+        assert_eq!(
+            HotRegisters::decode(NanBoxedValue::undefined()),
+            JsValue::Undefined
+        );
+        // Null
+        assert_eq!(HotRegisters::decode(NanBoxedValue::null()), JsValue::Null);
     }
 }
