@@ -7172,6 +7172,24 @@ fn compile_function_inner(
     if let Some(source) = source_text {
         ba = ba.with_source_text(source);
     }
+
+    // Detect whether the function body writes to any captured closure
+    // variables.  Currently StaContextSlot / StaCurrentContextSlot are not
+    // emitted by the compiler, so all closures are read-only, but we scan
+    // defensively to future-proof against new emission paths.
+    let writes_closure = ba
+        .instructions()
+        .map(|instrs| {
+            instrs.iter().any(|i| {
+                matches!(
+                    i.opcode,
+                    Opcode::StaContextSlot | Opcode::StaCurrentContextSlot
+                )
+            })
+        })
+        .unwrap_or(false);
+    ba = ba.with_writes_closure_vars(writes_closure);
+
     Ok(ba)
 }
 

@@ -1648,12 +1648,14 @@ fn handle_create_closure(
             "CreateClosure: constant pool entry is not a Function".into(),
         ));
     };
-    let mut closure_ba = (**ba).clone();
-    // Capture the enclosing context so the closure can walk the scope chain.
-    if let Some(JsValue::Context(c)) = &ctx.frame.context {
-        closure_ba.set_closure_context(Rc::clone(c));
-    }
-    let func_rc = Rc::new(closure_ba);
+    // Create a lightweight closure clone.  All immutable bytecode data
+    // (bytecodes, constant pool, source positions, etc.) is shared via Rc,
+    // so this clone is O(1) regardless of function size.
+    let closure_ctx = match &ctx.frame.context {
+        Some(JsValue::Context(c)) => Some(Rc::clone(c)),
+        _ => None,
+    };
+    let func_rc = Rc::new(ba.clone_for_closure(closure_ctx));
 
     // Non-arrow functions (flag == 0) get a .prototype property per ES §10.2.5.
     let is_arrow = matches!(instr.operands.get(2), Some(Operand::Flag(1)));
