@@ -1473,6 +1473,7 @@ fn handle_return(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResul
     Ok(DispatchAction::Return(ctx.frame.accumulator.clone()))
 }
 
+#[cold]
 fn handle_create_closure(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -2910,6 +2911,7 @@ fn handle_sta_current_context_slot(
     Ok(DispatchAction::Continue)
 }
 
+#[cold]
 fn handle_create_function_context(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -2926,6 +2928,7 @@ fn handle_create_function_context(
     Ok(DispatchAction::Continue)
 }
 
+#[cold]
 fn handle_create_block_context(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -2939,6 +2942,7 @@ fn handle_create_block_context(
     Ok(DispatchAction::Continue)
 }
 
+#[cold]
 fn handle_create_eval_context(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -2955,6 +2959,7 @@ fn handle_create_eval_context(
     Ok(DispatchAction::Continue)
 }
 
+#[cold]
 fn handle_create_catch_context(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -2973,6 +2978,7 @@ fn handle_create_catch_context(
     Ok(DispatchAction::Continue)
 }
 
+#[cold]
 fn handle_create_with_context(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -2991,6 +2997,7 @@ fn handle_create_with_context(
     Ok(DispatchAction::Continue)
 }
 
+#[cold]
 fn handle_throw(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<DispatchAction> {
     let thrown = ctx.frame.accumulator.clone();
     let throw_idx = (ctx.frame.pc - 1) as u32;
@@ -4037,6 +4044,7 @@ fn handle_copy_data_properties(
     Ok(DispatchAction::Continue)
 }
 
+#[cold]
 fn handle_suspend_generator(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -4058,6 +4066,7 @@ fn handle_suspend_generator(
     Ok(DispatchAction::Return(yield_val))
 }
 
+#[cold]
 fn handle_resume_generator(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -4103,6 +4112,7 @@ fn handle_resume_generator(
     Ok(DispatchAction::Continue)
 }
 
+#[cold]
 fn handle_get_generator_state(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -4115,6 +4125,7 @@ fn handle_get_generator_state(
     Ok(DispatchAction::Continue)
 }
 
+#[cold]
 fn handle_set_generator_state(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -4127,6 +4138,7 @@ fn handle_set_generator_state(
     Ok(DispatchAction::Continue)
 }
 
+#[cold]
 fn handle_switch_on_generator_state(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -4140,6 +4152,7 @@ fn handle_switch_on_generator_state(
     Ok(DispatchAction::Continue)
 }
 
+#[cold]
 fn handle_debugger(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -5481,6 +5494,7 @@ fn handle_create_unmapped_arguments(
     Ok(DispatchAction::Continue)
 }
 
+#[cold]
 fn handle_throw_reference_error_if_hole(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -5500,6 +5514,7 @@ fn handle_throw_reference_error_if_hole(
     Ok(DispatchAction::Continue)
 }
 
+#[cold]
 fn handle_throw_super_not_called_if_hole(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -5515,6 +5530,7 @@ fn handle_throw_super_not_called_if_hole(
     Ok(DispatchAction::Continue)
 }
 
+#[cold]
 fn handle_throw_super_already_called_if_not_hole(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -5531,6 +5547,7 @@ fn handle_throw_super_already_called_if_not_hole(
 ///
 /// This is emitted at the start of destructuring patterns so that
 /// `const {a} = null` or `const [x] = undefined` produce a proper error.
+#[cold]
 fn handle_throw_if_null_or_undefined(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -6039,6 +6056,7 @@ fn handle_get_template_object(
     Ok(DispatchAction::Continue)
 }
 
+#[cold]
 fn handle_set_pending_message(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -6113,6 +6131,7 @@ fn handle_to_numeric(
     Ok(DispatchAction::Continue)
 }
 
+#[cold]
 fn handle_wide(_ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<DispatchAction> {
     Err(StatorError::Internal(
         "Wide/ExtraWide prefix should not appear as a decoded opcode".into(),
@@ -6434,6 +6453,7 @@ fn handle_construct_forward_all_args(
     Ok(DispatchAction::Continue)
 }
 
+#[cold]
 fn handle_collect_type_profile(
     _ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -6612,6 +6632,7 @@ fn handle_call_direct_eval(
 }
 
 /// Load `new.target` into the accumulator.
+#[cold]
 fn handle_lda_new_target(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -6627,6 +6648,7 @@ fn handle_lda_new_target(
 /// Creates a class constructor from the bytecode in constant pool entry
 /// `ctor_idx`, wires its prototype object, and (optionally) sets up the
 /// `extends` relationship with the superclass loaded from `super_reg`.
+#[cold]
 fn handle_create_class(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -7048,6 +7070,7 @@ fn handle_lda_enumerated_keyed_property(
 /// in `brand_reg`.  Sets the accumulator to `Boolean(true)` when the
 /// brand is found, `Boolean(false)` otherwise.  Throws `TypeError` when
 /// the target is not an object.
+#[cold]
 fn handle_test_private_brand(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -7088,6 +7111,7 @@ fn handle_test_private_brand(
 /// Brands the object in `obj_reg` with the brand identifier currently
 /// in the accumulator so that subsequent `TestPrivateBrand` calls on
 /// the same object will succeed for that brand.
+#[cold]
 fn handle_define_private_brand(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -7125,6 +7149,7 @@ fn handle_define_private_brand(
 /// Since full module linking is not yet wired up, module variables are
 /// backed by the shared global environment keyed as
 /// `__mod:{specifier}:{cell}`.
+#[cold]
 fn handle_lda_module_variable(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -7161,6 +7186,7 @@ fn handle_lda_module_variable(
 /// see updated values.
 ///
 /// Backed by the global environment (see [`handle_lda_module_variable`]).
+#[cold]
 fn handle_sta_module_variable(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -7193,6 +7219,7 @@ fn handle_sta_module_variable(
 ///
 /// Returns a frozen plain object with a placeholder `url` and a minimal
 /// `resolve(specifier)` stub.
+#[cold]
 fn handle_lda_import_meta(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
@@ -7224,6 +7251,7 @@ fn handle_lda_import_meta(
 ///
 /// Returns a fresh empty plain object (full namespace resolution depends
 /// on the module linker which is not yet wired up).
+#[cold]
 fn handle_get_module_namespace(
     ctx: &mut DispatchContext,
     instr: &Instruction,
