@@ -246,6 +246,18 @@ pub struct PropertyMap {
     /// Whether this map contains any accessor properties (`__get_*__` or `__set_*__` keys).
     /// Once set to `true` it is never cleared, so it is a conservative over-approximation.
     pub has_accessors: bool,
+    /// Offset of the next property expected to be filled when this map was
+    /// created via [`clone_template`](Self::clone_template).
+    ///
+    /// When a `PropertyMap` is created from a cached object-literal
+    /// template, all keys and attributes are pre-populated but values are
+    /// [`JsValue::Undefined`].  This counter tracks the sequential
+    /// fill position so that [`try_template_fill`](Self::try_template_fill)
+    /// can write values in O(1) without hash lookups.
+    ///
+    /// A value of `usize::MAX` means this map is **not** in template-fill
+    /// mode (the default for non-template-created maps).
+    template_next_slot: usize,
 }
 
 impl PartialEq for PropertyMap {
@@ -290,6 +302,7 @@ impl PropertyMap {
             proto_global_epoch: Cell::new(0),
             extensible: true,
             has_accessors: false,
+            template_next_slot: usize::MAX,
         }
     }
 
@@ -345,15 +358,89 @@ impl PropertyMap {
             proto_global_epoch: Cell::new(0),
             extensible: true,
             has_accessors: false,
+            template_next_slot: usize::MAX,
         }
     }
-
     /// Returns a snapshot of the property keys and their attribute flags,
     /// suitable for caching as a constructor boilerplate.
     pub fn boilerplate_snapshot(
         &self,
     ) -> (Vec<String>, Vec<crate::objects::map::PropertyAttributes>) {
         (self.keys.clone(), self.attrs.clone())
+    }
+
+    /// Creates a structural clone of this property map for object-literal
+    /// template caching.
+    ///
+    /// The returned map has the same key names, insertion order, and
+    /// attribute flags as `self`, but every value slot is reset to
+    /// [`JsValue::Undefined`] and a fresh shape identifier is assigned.
+    /// The map is placed in *template-fill mode* so that subsequent calls
+    /// to [`try_template_fill`](Self::try_template_fill) can populate
+    /// values in O(1) without hash lookups.
+    pub fn clone_template(&self) -> Self {
+        let cap = self.keys.len();
+        let mut buffers = acquire_storage_buffers(cap);
+        buffers.keys.extend_from_slice(&self.keys);
+        buffers.values.resize(cap, JsValue::Undefined);
+        buffers.attrs.extend_from_slice(&self.attrs);
+
+        let index = if cap > SMALL_PROPERTY_LINEAR_SCAN_CAP {
+            let mut map = HashMap::with_capacity(cap);
+            for (slot, key) in self.keys.iter().enumerate() {
+                map.insert(key.clone(), slot);
+            }
+            PropertyIndex::Map(map)
+        } else {
+            PropertyIndex::Inline
+        };
+
+        Self {
+            keys: buffers.keys,
+            values: buffers.values,
+            attrs: buffers.attrs,
+            integer_key_count: self.integer_key_count,
+            index,
+            cache_hashes: Default::default(),
+            cache_slots: Default::default(),
+            cache_len: Cell::new(0),
+            cache_cursor: Cell::new(0),
+            shape_id: NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed),
+            layout_id: self.layout_id,
+            proto_generation: Cell::new(0),
+            proto_epoch: Cell::new(0),
+            proto_global_epoch: Cell::new(0),
+            extensible: true,
+            has_accessors: false,
+            template_next_slot: 0,
+        }
+    }
+
+    /// Attempts to write `value` into the next expected template slot.
+    ///
+    /// When a `PropertyMap` is in template-fill mode (created via
+    /// [`clone_template`](Self::clone_template)), this method checks
+    /// whether `key` matches the property name at the next expected
+    /// sequential position.  If so, the value is written directly by
+    /// offset in O(1) — no hash lookup, no shape mutation, no prototype
+    /// generation bump.
+    ///
+    /// Returns `Ok(())` if the fast path succeeded and `value` was
+    /// consumed.  Returns `Err(value)` if the key did not match; the
+    /// unconsumed value is returned to the caller for fallback via
+    /// [`insert`](Self::insert).  On mismatch the template-fill mode is
+    /// permanently disabled for this map.
+    #[inline]
+    pub fn try_template_fill(&mut self, key: &str, value: JsValue) -> Result<(), JsValue> {
+        let slot = self.template_next_slot;
+        if slot < self.keys.len() && self.keys[slot] == key {
+            self.values[slot] = value;
+            self.template_next_slot = slot + 1;
+            Ok(())
+        } else {
+            self.template_next_slot = usize::MAX;
+            Err(value)
+        }
     }
 
     // ── Inline cache helpers ──────────────────────────────────────────────

@@ -296,7 +296,7 @@ fn load_globals_from_snapshot(path: &str) -> Rc<RefCell<GlobalEnv>> {
             ge.vars = map;
             ge.rebuild_slots();
             Rc::new(RefCell::new(ge))
-        },
+        }
         Err(e) => {
             eprintln!("st8: invalid snapshot: {e} — falling back to bootstrap");
             build_globals()

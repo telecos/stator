@@ -4985,10 +4985,41 @@ fn handle_create_object_literal(
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     // operands: [ConstantPoolIdx, FeedbackSlot, Flag]
+    let slot = match instr.operands.get(1) {
+        Some(Operand::FeedbackSlot(s)) => Some(*s),
+        _ => None,
+    };
     let capacity = match instr.operands.get(2) {
         Some(Operand::Flag(count)) if *count > 0 => *count as usize,
         _ => 4,
     };
+
+    if let Some(slot) = slot {
+        // Fast path: clone a previously cached template.
+        if let Some(map) = ctx.frame.bytecode_array.clone_object_literal_template(slot) {
+            ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+            return Ok(DispatchAction::Continue);
+        }
+        // Second execution: promote pending first-instance to cached template.
+        if let Some(map) = ctx
+            .frame
+            .bytecode_array
+            .promote_object_literal_template(slot)
+        {
+            ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+            return Ok(DispatchAction::Continue);
+        }
+        // First execution: create normally and record as pending.
+        let map = PropertyMap::with_capacity(capacity);
+        let rc = Rc::new(RefCell::new(map));
+        ctx.frame
+            .bytecode_array
+            .set_object_literal_pending(slot, Rc::clone(&rc));
+        ctx.frame.accumulator = JsValue::PlainObject(rc);
+        return Ok(DispatchAction::Continue);
+    }
+
+    // No feedback slot — fall back to uncached creation.
     ctx.frame.accumulator =
         JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::with_capacity(capacity))));
     Ok(DispatchAction::Continue)
@@ -5111,7 +5142,8 @@ fn handle_define_named_own_property(
         set_named_property_function_metadata(&val, &obj, &prop_name);
         if let Some(attrs) = private_named_property_attrs(&prop_name) {
             map.borrow_mut().insert_with_attrs(prop_name, val, attrs);
-        } else {
+        } else if let Err(val) = map.borrow_mut().try_template_fill(&prop_name, val) {
+            // Template fill missed — fall back to normal insert.
             map.borrow_mut().insert(prop_name, val);
         }
     }

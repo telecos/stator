@@ -51,6 +51,7 @@ use crate::bytecode::{
 };
 use crate::compiler::turbofan::TurbofanCompiledCode;
 use crate::error::{StatorError, StatorResult};
+use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsContext;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -335,6 +336,18 @@ pub struct BytecodeArray {
     /// Subsequent constructions clone this shape and fill in fresh values,
     /// avoiding per-property `insert` overhead.
     construct_boilerplate: Rc<RefCell<Option<ConstructBoilerplate>>>,
+    // ─── Object-literal template cache (shared across clones via Rc) ────
+    /// Cached object-literal property templates keyed by feedback-slot
+    /// index.
+    ///
+    /// On the first execution of a `CreateObjectLiteral` bytecode the
+    /// resulting [`PropertyMap`] is recorded as
+    /// [`ObjectLiteralCacheEntry::Pending`].  The second execution
+    /// promotes the entry to [`ObjectLiteralCacheEntry::Cached`] by
+    /// capturing the first object's finalised key layout.  Third and
+    /// subsequent executions clone the cached template via
+    /// [`PropertyMap::clone_template`] for O(1) object creation.
+    object_literal_templates: Rc<RefCell<HashMap<u32, ObjectLiteralCacheEntry>>>,
 }
 
 /// Cached property-key layout captured after the first successful
@@ -350,6 +363,28 @@ pub struct ConstructBoilerplate {
     pub keys: Vec<String>,
     /// Per-key attribute flags.
     pub attrs: Vec<crate::objects::map::PropertyAttributes>,
+}
+
+/// Cache entry for an object-literal template, keyed by feedback slot
+/// index inside a [`BytecodeArray`].
+///
+/// The cache transitions through two states:
+///
+/// 1. **[`Pending`](Self::Pending)** — recorded on the *first* execution
+///    of a `CreateObjectLiteral` bytecode.  Holds an `Rc` reference to
+///    the live [`PropertyMap`] being populated by subsequent
+///    `DefineNamedOwnProperty` instructions.
+/// 2. **[`Cached`](Self::Cached)** — promoted on the *second* execution.
+///    The first object's final key layout is captured as a template
+///    [`PropertyMap`] (values reset to `Undefined`).  All further
+///    executions clone this template via
+///    [`PropertyMap::clone_template`].
+#[derive(Debug)]
+pub enum ObjectLiteralCacheEntry {
+    /// First execution recorded; waiting for second to promote.
+    Pending(Rc<RefCell<PropertyMap>>),
+    /// Fully captured template ready for cloning.
+    Cached(Box<PropertyMap>),
 }
 
 impl PartialEq for BytecodeArray {
@@ -430,6 +465,7 @@ impl BytecodeArray {
             self_name_register: None,
             construct_proto_cache: Rc::new(RefCell::new(None)),
             construct_boilerplate: Rc::new(RefCell::new(None)),
+            object_literal_templates: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -572,6 +608,57 @@ impl BytecodeArray {
     /// `[[Construct]]` execution.
     pub fn set_construct_boilerplate(&self, bp: ConstructBoilerplate) {
         *self.construct_boilerplate.borrow_mut() = Some(bp);
+    }
+
+    // ─── Object-literal template cache API ───────────────────────────────
+
+    /// If a cached object-literal template exists for `slot`, returns a
+    /// fresh [`PropertyMap`] cloned from it via
+    /// [`PropertyMap::clone_template`].
+    pub fn clone_object_literal_template(&self, slot: u32) -> Option<PropertyMap> {
+        let borrow = self.object_literal_templates.borrow();
+        match borrow.get(&slot) {
+            Some(ObjectLiteralCacheEntry::Cached(template)) => Some(template.clone_template()),
+            _ => None,
+        }
+    }
+
+    /// If a [`Pending`](ObjectLiteralCacheEntry::Pending) first-instance
+    /// exists for `slot`, promotes it to
+    /// [`Cached`](ObjectLiteralCacheEntry::Cached) by capturing its
+    /// finalised key layout and returns a template clone.
+    ///
+    /// Returns `None` if no pending entry exists or the first instance has
+    /// no properties (nothing worth caching).
+    pub fn promote_object_literal_template(&self, slot: u32) -> Option<PropertyMap> {
+        let pending_rc = {
+            let borrow = self.object_literal_templates.borrow();
+            match borrow.get(&slot) {
+                Some(ObjectLiteralCacheEntry::Pending(rc)) => Some(Rc::clone(rc)),
+                _ => None,
+            }
+        };
+        let first_rc = pending_rc?;
+        let first_borrow = first_rc.borrow();
+        if first_borrow.is_empty() {
+            return None;
+        }
+        let (keys, attrs) = first_borrow.boilerplate_snapshot();
+        drop(first_borrow);
+        let template = PropertyMap::from_boilerplate(&keys, &attrs);
+        let cloned = template.clone_template();
+        self.object_literal_templates
+            .borrow_mut()
+            .insert(slot, ObjectLiteralCacheEntry::Cached(Box::new(template)));
+        Some(cloned)
+    }
+
+    /// Records a [`Pending`](ObjectLiteralCacheEntry::Pending)
+    /// first-instance for `slot`.
+    pub fn set_object_literal_pending(&self, slot: u32, map: Rc<RefCell<PropertyMap>>) {
+        self.object_literal_templates
+            .borrow_mut()
+            .insert(slot, ObjectLiteralCacheEntry::Pending(map));
     }
 
     /// The raw encoded bytecode bytes.
