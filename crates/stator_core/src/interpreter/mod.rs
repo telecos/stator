@@ -191,6 +191,7 @@ use crate::bytecode::bytecode_array::{
 use crate::bytecode::bytecode_array::{MaglevJitCodeCache, TurbofanJitCodeCache};
 use crate::error::{StatorError, StatorResult};
 use crate::inspector::debugger::Debugger;
+use crate::objects::map::PropertyAttributes;
 use crate::objects::nanbox::NanBoxedValue;
 use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 use crate::objects::string_intern::intern;
@@ -4230,6 +4231,12 @@ pub(super) fn dispatch_call_property(
     this_val: JsValue,
     args: CallArgs,
 ) -> StatorResult<()> {
+    if let Some(method_name) = fast_array_method_name(callee)
+        && let Some(result) = dispatch_fast_array_method(&this_val, method_name.as_ref(), &args)?
+    {
+        frame.accumulator = result;
+        return Ok(());
+    }
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
@@ -4300,6 +4307,209 @@ pub(super) fn dispatch_call_property(
         }
     }
     Ok(())
+}
+
+const FAST_ARRAY_METHOD_KEY: &str = "\0stator.fast_array_method";
+
+fn array_like_length_from_property_map(map: &PropertyMap) -> usize {
+    match map.get("length") {
+        Some(JsValue::Smi(n)) => (*n).max(0) as usize,
+        Some(JsValue::HeapNumber(n)) => crate::builtins::util::clamped_f64_to_usize(*n),
+        _ => 0,
+    }
+}
+
+fn is_array_like_plain_object(map: &PropertyMap) -> bool {
+    map.get("__is_array__")
+        .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
+}
+
+fn make_fast_array_method(target: &JsValue, name: &str, length: i32) -> JsValue {
+    let bound_target = target.clone();
+    let method_name: Rc<str> = name.into();
+    let mut props = PropertyMap::new();
+    let attrs = PropertyAttributes::CONFIGURABLE;
+    props.insert_with_attrs("name".into(), JsValue::String(name.into()), attrs);
+    props.insert_with_attrs("length".into(), JsValue::Smi(length), attrs);
+    props.insert_with_attrs(
+        FAST_ARRAY_METHOD_KEY.into(),
+        JsValue::String(name.into()),
+        PropertyAttributes::empty(),
+    );
+    props.insert_with_attrs(
+        "__call__".into(),
+        JsValue::NativeFunction(Rc::new(move |args| {
+            dispatch_fast_array_method(&bound_target, method_name.as_ref(), &args)?.ok_or_else(
+                || StatorError::TypeError(format!("{} is not a function", method_name.as_ref())),
+            )
+        })),
+        attrs,
+    );
+    props.make_all_non_enumerable();
+    JsValue::PlainObject(Rc::new(RefCell::new(props)))
+}
+
+fn fast_array_method_name(callee: &JsValue) -> Option<Rc<str>> {
+    let JsValue::PlainObject(map) = callee else {
+        return None;
+    };
+    match map.borrow().get(FAST_ARRAY_METHOD_KEY) {
+        Some(JsValue::String(name)) => Some(Rc::clone(name)),
+        _ => None,
+    }
+}
+
+fn normalize_from_index(len: usize, arg: Option<&JsValue>) -> usize {
+    let Some(value) = arg else {
+        return 0;
+    };
+    let from = value.to_number().unwrap_or(0.0) as i64;
+    if from < 0 {
+        (len as i64 + from).max(0) as usize
+    } else {
+        (from as usize).min(len)
+    }
+}
+
+fn dispatch_fast_array_method(
+    this_val: &JsValue,
+    method_name: &str,
+    args: &[JsValue],
+) -> StatorResult<Option<JsValue>> {
+    match this_val {
+        JsValue::Array(arr) => {
+            let result = match method_name {
+                "push" => {
+                    let mut items = arr.borrow_mut();
+                    items.extend(args.iter().cloned());
+                    JsValue::Smi(items.len() as i32)
+                }
+                "pop" => arr.borrow_mut().pop().unwrap_or(JsValue::Undefined),
+                "indexOf" => {
+                    let search = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    let items = arr.borrow();
+                    let from = normalize_from_index(items.len(), args.get(1));
+                    JsValue::Smi(
+                        items[from..]
+                            .iter()
+                            .position(|value| strict_eq(value, &search))
+                            .map_or(-1, |index| (from + index) as i32),
+                    )
+                }
+                "includes" => {
+                    let search = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    let items = arr.borrow();
+                    let from = normalize_from_index(items.len(), args.get(1));
+                    JsValue::Boolean(
+                        items[from..]
+                            .iter()
+                            .any(|value| value.same_value_zero(&search)),
+                    )
+                }
+                _ => return Ok(None),
+            };
+            Ok(Some(result))
+        }
+        JsValue::PlainObject(map) => {
+            let is_array = {
+                let borrow = map.borrow();
+                is_array_like_plain_object(&borrow)
+            };
+            if !is_array {
+                return Ok(None);
+            }
+            let result = match method_name {
+                "push" => {
+                    let mut array = map.borrow_mut();
+                    let len = array_like_length_from_property_map(&array);
+                    for (offset, value) in args.iter().enumerate() {
+                        array.insert((len + offset).to_string(), value.clone());
+                    }
+                    let new_len = len + args.len();
+                    array.insert("length".into(), JsValue::Smi(new_len as i32));
+                    JsValue::Smi(new_len as i32)
+                }
+                "pop" => {
+                    let mut array = map.borrow_mut();
+                    let len = array_like_length_from_property_map(&array);
+                    if len == 0 {
+                        JsValue::Undefined
+                    } else {
+                        let value = array
+                            .remove(&(len - 1).to_string())
+                            .unwrap_or(JsValue::Undefined);
+                        array.insert("length".into(), JsValue::Smi((len - 1) as i32));
+                        value
+                    }
+                }
+                "indexOf" => {
+                    let search = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    let array = map.borrow();
+                    let len = array_like_length_from_property_map(&array);
+                    let from = normalize_from_index(len, args.get(1));
+                    let mut found = -1;
+                    for index in from..len {
+                        let key = index.to_string();
+                        let value = array.get(&key).cloned().unwrap_or(JsValue::Undefined);
+                        if strict_eq(&value, &search) {
+                            found = index as i32;
+                            break;
+                        }
+                    }
+                    JsValue::Smi(found)
+                }
+                "includes" => {
+                    let search = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    let array = map.borrow();
+                    let len = array_like_length_from_property_map(&array);
+                    let from = normalize_from_index(len, args.get(1));
+                    let mut found = false;
+                    for index in from..len {
+                        let key = index.to_string();
+                        let value = array.get(&key).cloned().unwrap_or(JsValue::Undefined);
+                        if value.same_value_zero(&search) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    JsValue::Boolean(found)
+                }
+                _ => return Ok(None),
+            };
+            Ok(Some(result))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn try_fast_named_property_lookup(obj: &JsValue, key: &str) -> Option<JsValue> {
+    match obj {
+        JsValue::Array(arr) => match key {
+            "length" => Some(JsValue::Smi(arr.borrow().len() as i32)),
+            "push" => Some(make_fast_array_method(obj, "push", 1)),
+            "pop" => Some(make_fast_array_method(obj, "pop", 0)),
+            "indexOf" => Some(make_fast_array_method(obj, "indexOf", 1)),
+            "includes" => Some(make_fast_array_method(obj, "includes", 1)),
+            _ => None,
+        },
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            if !is_array_like_plain_object(&borrow) {
+                return None;
+            }
+            match key {
+                "length" => Some(JsValue::Smi(
+                    array_like_length_from_property_map(&borrow) as i32
+                )),
+                "push" => Some(make_fast_array_method(obj, "push", 1)),
+                "pop" => Some(make_fast_array_method(obj, "pop", 0)),
+                "indexOf" => Some(make_fast_array_method(obj, "indexOf", 1)),
+                "includes" => Some(make_fast_array_method(obj, "includes", 1)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Extract a `Rc<RefCell<JsContext>>` from a `JsValue::Context`.
@@ -5852,21 +6062,8 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             let arr_rc = Rc::clone(arr);
             match key {
                 "length" => return JsValue::Smi(arr.borrow().len() as i32),
-                "push" => {
-                    return JsValue::NativeFunction(Rc::new(move |args| {
-                        let mut v = arr_rc.borrow_mut();
-                        for arg in &args {
-                            v.push(arg.clone());
-                        }
-                        Ok(JsValue::Smi(v.len() as i32))
-                    }));
-                }
-                "pop" => {
-                    let a = Rc::clone(&arr_rc);
-                    return JsValue::NativeFunction(Rc::new(move |_args| {
-                        Ok(a.borrow_mut().pop().unwrap_or(JsValue::Undefined))
-                    }));
-                }
+                "push" => return make_fast_array_method(obj, "push", 1),
+                "pop" => return make_fast_array_method(obj, "pop", 0),
                 "shift" => {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |_args| {
@@ -5928,18 +6125,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         Ok(JsValue::String(parts.join(",").into()))
                     }));
                 }
-                "indexOf" => {
-                    let a = Rc::clone(&arr_rc);
-                    return JsValue::NativeFunction(Rc::new(move |args| {
-                        let search = args.first().cloned().unwrap_or(JsValue::Undefined);
-                        Ok(JsValue::Smi(
-                            a.borrow()
-                                .iter()
-                                .position(|v| strict_eq(v, &search))
-                                .map_or(-1, |i| i as i32),
-                        ))
-                    }));
-                }
+                "indexOf" => return make_fast_array_method(obj, "indexOf", 1),
                 "lastIndexOf" => {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
@@ -5966,27 +6152,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         ))
                     }));
                 }
-                "includes" => {
-                    let a = Rc::clone(&arr_rc);
-                    return JsValue::NativeFunction(Rc::new(move |args| {
-                        let search = args.first().cloned().unwrap_or(JsValue::Undefined);
-                        let items = a.borrow();
-                        let len = items.len() as i32;
-                        let from_raw = match args.get(1) {
-                            Some(v) => v.to_number().unwrap_or(0.0) as i64,
-                            None => 0,
-                        };
-                        let from = if from_raw < 0 {
-                            ((len as i64) + from_raw).max(0) as usize
-                        } else {
-                            (from_raw as usize).min(items.len())
-                        };
-                        // SameValueZero: NaN === NaN, unlike strict equality
-                        Ok(JsValue::Boolean(
-                            items[from..].iter().any(|v| v.same_value_zero(&search)),
-                        ))
-                    }));
-                }
+                "includes" => return make_fast_array_method(obj, "includes", 1),
                 "slice" => {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |args| {
@@ -7270,42 +7436,9 @@ fn array_literal_proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             return borrow.get("length").cloned().unwrap_or(JsValue::Smi(0));
         }
 
-        if key == "push" {
-            let map_rc = Rc::clone(map);
-            return JsValue::NativeFunction(Rc::new(move |args| {
-                let mut m = map_rc.borrow_mut();
-                let len = match m.get("length") {
-                    Some(JsValue::Smi(n)) => *n as usize,
-                    Some(JsValue::HeapNumber(n)) => *n as usize,
-                    _ => 0,
-                };
-                for (i, v) in args.iter().enumerate() {
-                    m.insert((len + i).to_string(), v.clone());
-                }
-                let new_len = len + args.len();
-                m.insert("length".into(), JsValue::Smi(new_len as i32));
-                Ok(JsValue::Smi(new_len as i32))
-            }));
-        }
-
-        if key == "pop" {
-            let map_rc = Rc::clone(map);
-            return JsValue::NativeFunction(Rc::new(move |_args| {
-                let mut m = map_rc.borrow_mut();
-                let len = match m.get("length") {
-                    Some(JsValue::Smi(n)) => *n as usize,
-                    Some(JsValue::HeapNumber(n)) => *n as usize,
-                    _ => return Ok(JsValue::Undefined),
-                };
-                if len == 0 {
-                    return Ok(JsValue::Undefined);
-                }
-                let last = m
-                    .remove(&(len - 1).to_string())
-                    .unwrap_or(JsValue::Undefined);
-                m.insert("length".into(), JsValue::Smi((len - 1) as i32));
-                Ok(last)
-            }));
+        if matches!(key, "push" | "pop" | "indexOf" | "includes") {
+            let length = if key == "pop" { 0 } else { 1 };
+            return make_fast_array_method(obj, key, length);
         }
 
         // ── Slow path: reconstruct Array for other methods ───────────────
@@ -18130,6 +18263,52 @@ mod tests {
         assert_eq!(result, JsValue::Smi(3));
     }
 
+    #[test]
+    fn test_array_push_sum_dense_literal() {
+        let result = crate::builtins::global::global_eval(
+            r#"
+            var arr = [];
+            for (var i = 0; i < 100; i++) {
+                arr.push(i);
+            }
+            var sum = 0;
+            for (var i = 0; i < arr.length; i++) {
+                sum = sum + arr[i];
+            }
+            sum;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(4950));
+    }
+
+    #[test]
+    fn test_array_sieve_dense_literal() {
+        let result = crate::builtins::global::global_eval(
+            r#"
+            var n = 30;
+            var sieve = [];
+            for (var i = 0; i <= n; i++) sieve[i] = true;
+            sieve[0] = false;
+            sieve[1] = false;
+            for (var i = 2; i * i <= n; i++) {
+                if (sieve[i]) {
+                    for (var j = i * i; j <= n; j = j + i) {
+                        sieve[j] = false;
+                    }
+                }
+            }
+            var count = 0;
+            for (var i = 0; i <= n; i++) {
+                if (sieve[i]) count = count + 1;
+            }
+            count;
+            "#,
+        )
+        .unwrap();
+        assert_eq!(result, JsValue::Smi(10));
+    }
+
     // ── proto_lookup: Object method fast-path tests ──────────────────────
 
     #[test]
@@ -18206,6 +18385,12 @@ mod tests {
         // Negative fromIndex counts from end
         let result = crate::builtins::global::global_eval("[1,2,3].includes(3, -1)").unwrap();
         assert_eq!(result, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn test_array_indexof_from_index() {
+        let result = crate::builtins::global::global_eval("[1,2,1,2].indexOf(2, 2)").unwrap();
+        assert_eq!(result, JsValue::Smi(3));
     }
 
     // ── Array.prototype.indexOf — strict equality (NaN !== NaN) ───────────────
