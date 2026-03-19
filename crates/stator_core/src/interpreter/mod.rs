@@ -1266,7 +1266,7 @@ pub struct PropertyIc {
 }
 
 /// Small inline-buffered argument storage for interpreter function calls.
-pub type CallArgs = SmallVec<[JsValue; 8]>;
+pub type CallArgs = SmallVec<[JsValue; 4]>;
 
 /// Register files with up to this many slots stay inline in the frame.
 pub const SMALL_REG_THRESHOLD: usize = 32;

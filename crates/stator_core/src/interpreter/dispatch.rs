@@ -1832,7 +1832,8 @@ fn handle_call_undefined_receiver0(
                 super::init_generator_state_prototype(&state, &ba);
                 ctx.frame.accumulator = JsValue::Generator(state);
             } else if ba.is_async() {
-                ctx.frame.accumulator = Interpreter::run_async_function(Rc::clone(&ba), vec![])?;
+                ctx.frame.accumulator =
+                    Interpreter::run_async_function(Rc::clone(&ba), CallArgs::new())?;
             } else {
                 let args = CallArgs::new();
                 let count = ba.increment_invocation_count();
@@ -1897,12 +1898,12 @@ fn handle_call_undefined_receiver0(
             }
         }
         JsValue::NativeFunction(f) => {
-            ctx.frame.accumulator = f(vec![])?;
+            ctx.frame.accumulator = f(CallArgs::new().into_vec())?;
             ctx.frame.global_cache_invalidate();
         }
         JsValue::PlainObject(ref map) => {
             if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
-                ctx.frame.accumulator = f(vec![])?;
+                ctx.frame.accumulator = f(CallArgs::new().into_vec())?;
                 ctx.frame.global_cache_invalidate();
             } else {
                 return Err(StatorError::TypeError(
@@ -1939,11 +1940,11 @@ fn handle_call_undefined_receiver1(
                 ctx.frame.accumulator = JsValue::Generator(state);
             } else if ba.is_async() {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
-                ctx.frame.accumulator =
-                    Interpreter::run_async_function(Rc::clone(&ba), vec![arg1])?;
+                let args: CallArgs = smallvec![arg1];
+                ctx.frame.accumulator = Interpreter::run_async_function(Rc::clone(&ba), args)?;
             } else {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
-                let args = vec![arg1];
+                let args: CallArgs = smallvec![arg1];
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
                     maybe_compile_baseline(&ba);
@@ -2006,13 +2007,15 @@ fn handle_call_undefined_receiver1(
         }
         JsValue::NativeFunction(f) => {
             let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
-            ctx.frame.accumulator = f(vec![arg1])?;
+            let args: CallArgs = smallvec![arg1];
+            ctx.frame.accumulator = f(args.into_vec())?;
             ctx.frame.global_cache_invalidate();
         }
         JsValue::PlainObject(ref map) => {
             if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
-                ctx.frame.accumulator = f(vec![arg1])?;
+                let args: CallArgs = smallvec![arg1];
+                ctx.frame.accumulator = f(args.into_vec())?;
                 ctx.frame.global_cache_invalidate();
             } else {
                 return Err(StatorError::TypeError(
@@ -2053,12 +2056,12 @@ fn handle_call_undefined_receiver2(
             } else if ba.is_async() {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
                 let arg2 = ctx.frame.read_reg(arg2_v)?.clone();
-                ctx.frame.accumulator =
-                    Interpreter::run_async_function(Rc::clone(&ba), vec![arg1, arg2])?;
+                let args: CallArgs = smallvec![arg1, arg2];
+                ctx.frame.accumulator = Interpreter::run_async_function(Rc::clone(&ba), args)?;
             } else {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
                 let arg2 = ctx.frame.read_reg(arg2_v)?.clone();
-                let args = vec![arg1, arg2];
+                let args: CallArgs = smallvec![arg1, arg2];
                 // ── Tiering ──────────────────────────────────
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
@@ -2123,14 +2126,16 @@ fn handle_call_undefined_receiver2(
         JsValue::NativeFunction(f) => {
             let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
             let arg2 = ctx.frame.read_reg(arg2_v)?.clone();
-            ctx.frame.accumulator = f(vec![arg1, arg2])?;
+            let args: CallArgs = smallvec![arg1, arg2];
+            ctx.frame.accumulator = f(args.into_vec())?;
             ctx.frame.global_cache_invalidate();
         }
         JsValue::PlainObject(ref map) => {
             if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
                 let arg2 = ctx.frame.read_reg(arg2_v)?.clone();
-                ctx.frame.accumulator = f(vec![arg1, arg2])?;
+                let args: CallArgs = smallvec![arg1, arg2];
+                ctx.frame.accumulator = f(args.into_vec())?;
                 ctx.frame.global_cache_invalidate();
             } else {
                 return Err(StatorError::TypeError(
