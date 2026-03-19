@@ -210,6 +210,7 @@ pub use crate::objects::value::{
 /// Property map for a single `Function` value in the side-table.
 type FnPropMap = Rc<RefCell<HashMap<String, JsValue>>>;
 type MonoLoadCache = HashMap<u32, (usize, JsValue)>;
+type MonoNamedPropertyIcCache = HashMap<u32, MonomorphicNamedPropertyIcEntry>;
 type PolyLoadCache = HashMap<u32, Vec<(usize, JsValue)>>;
 type ProtoLoadIcCache = HashMap<u32, ProtoLoadIc>;
 type StringCache = HashMap<u32, Rc<str>>;
@@ -1299,6 +1300,18 @@ impl Default for MegamorphicIcEntry {
     }
 }
 
+/// Monomorphic inline-cache entry for a named property access site.
+///
+/// Each feedback slot remembers the last receiver shape seen at that bytecode
+/// site along with the resolved own-property offset inside the receiver.
+#[derive(Debug, Clone, Copy)]
+pub struct MonomorphicNamedPropertyIcEntry {
+    /// Receiver `shape_id()` captured when the cache entry was populated.
+    pub receiver_shape: u64,
+    /// Cached own-property slot offset inside the receiver.
+    pub cached_offset: u16,
+}
+
 /// Fixed-size, direct-mapped megamorphic inline cache for named property
 /// access.
 ///
@@ -1721,6 +1734,10 @@ pub struct InterpreterFrame {
     /// Holds up to 4 entries per feedback slot, supporting polymorphic sites.
     /// Lazily allocated on first write.
     pub poly_load_cache: Option<Box<PolyLoadCache>>,
+    /// One-slot monomorphic inline cache for named property loads.
+    /// Remembers the last `(shape_id, offset)` pair seen at each feedback slot
+    /// and is probed before the megamorphic table.
+    pub mono_named_load_ic: Option<Box<MonoNamedPropertyIcCache>>,
     /// Shape-based megamorphic inline cache for named property loads.
     /// Fixed-size direct-mapped table keyed by feedback slot, supporting O(1)
     /// property access for both own and prototype-chain properties.  Lazily
@@ -1730,6 +1747,10 @@ pub struct InterpreterFrame {
     /// Stores inherited lookup results guarded by the receiver's shape and
     /// prototype-chain generation.
     pub proto_load_ic: Option<Box<ProtoLoadIcCache>>,
+    /// One-slot monomorphic inline cache for named property stores.
+    /// Mirrors `mono_named_load_ic` and caches the last own-property store
+    /// target seen at each feedback slot.
+    pub mono_named_store_ic: Option<Box<MonoNamedPropertyIcCache>>,
     /// Shape-based megamorphic inline cache for named property stores.
     /// Mirrors `mega_load_ic`.  Lazily allocated on first write.
     pub mega_store_ic: Option<Box<MegamorphicIc>>,
@@ -1816,8 +1837,10 @@ impl InterpreterFrame {
             new_target: JsValue::Undefined,
             mono_load_cache: None,
             poly_load_cache: None,
+            mono_named_load_ic: None,
             mega_load_ic: None,
             proto_load_ic: None,
+            mono_named_store_ic: None,
             mega_store_ic: None,
             string_cache: None,
             global_ic: None,
@@ -1893,8 +1916,10 @@ impl InterpreterFrame {
             new_target: JsValue::Undefined,
             mono_load_cache: None,
             poly_load_cache: None,
+            mono_named_load_ic: None,
             mega_load_ic: None,
             proto_load_ic: None,
+            mono_named_store_ic: None,
             mega_store_ic: None,
             string_cache: None,
             global_ic: None,
@@ -2063,6 +2088,13 @@ impl InterpreterFrame {
     }
 
     #[inline]
+    fn mono_named_load_ic_mut(&mut self) -> &mut MonoNamedPropertyIcCache {
+        self.mono_named_load_ic
+            .get_or_insert_with(|| Box::new(HashMap::new()))
+            .as_mut()
+    }
+
+    #[inline]
     fn mega_load_ic_mut(&mut self) -> &mut MegamorphicIc {
         self.mega_load_ic
             .get_or_insert_with(|| Box::new(MegamorphicIc::new()))
@@ -2072,6 +2104,13 @@ impl InterpreterFrame {
     #[inline]
     fn proto_load_ic_mut(&mut self) -> &mut ProtoLoadIcCache {
         self.proto_load_ic
+            .get_or_insert_with(|| Box::new(HashMap::new()))
+            .as_mut()
+    }
+
+    #[inline]
+    fn mono_named_store_ic_mut(&mut self) -> &mut MonoNamedPropertyIcCache {
+        self.mono_named_store_ic
             .get_or_insert_with(|| Box::new(HashMap::new()))
             .as_mut()
     }
@@ -3414,8 +3453,10 @@ impl Interpreter {
             new_target: JsValue::Undefined,
             mono_load_cache: None,
             poly_load_cache: None,
+            mono_named_load_ic: None,
             mega_load_ic: None,
             proto_load_ic: None,
+            mono_named_store_ic: None,
             mega_store_ic: None,
             string_cache: None,
             global_ic: None,
