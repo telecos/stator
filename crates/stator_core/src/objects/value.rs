@@ -535,6 +535,30 @@ impl JsValue {
         }
     }
 
+    /// If this value is a [`Smi`][JsValue::Smi], returns the inner `i32`.
+    ///
+    /// Uses a fast discriminant check — no full pattern match required.
+    #[inline(always)]
+    pub fn try_as_smi(&self) -> Option<i32> {
+        if let Self::Smi(n) = self {
+            Some(*n)
+        } else {
+            None
+        }
+    }
+
+    /// If this value is a [`HeapNumber`][JsValue::HeapNumber], returns the inner `f64`.
+    ///
+    /// Uses a fast discriminant check — no full pattern match required.
+    #[inline(always)]
+    pub fn try_as_heap_number(&self) -> Option<f64> {
+        if let Self::HeapNumber(n) = self {
+            Some(*n)
+        } else {
+            None
+        }
+    }
+
     /// Returns `true` if this value is any numeric type (`Smi` or `HeapNumber`).
     #[inline(always)]
     pub fn is_number(&self) -> bool {

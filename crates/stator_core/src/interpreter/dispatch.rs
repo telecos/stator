@@ -540,6 +540,14 @@ fn handle_add(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         ctx.frame.accumulator = result;
         return Ok(DispatchAction::Continue);
     }
+    // Speculative HeapNumber fast path: skip full JsValue match.
+    if let (Some(a), Some(b)) = (
+        ctx.frame.accumulator.try_as_heap_number(),
+        rhs.try_as_heap_number(),
+    ) {
+        ctx.frame.accumulator = number_to_jsvalue(a + b);
+        return Ok(DispatchAction::Continue);
+    }
     // Fast path: String + String – skip to_js_string conversion.
     if let JsValue::String(ref a) = ctx.frame.accumulator
         && let JsValue::String(b) = rhs
@@ -568,6 +576,14 @@ fn handle_sub(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         ctx.frame.accumulator = result;
         return Ok(DispatchAction::Continue);
     }
+    // Speculative HeapNumber fast path: skip full JsValue match.
+    if let (Some(a), Some(b)) = (
+        ctx.frame.accumulator.try_as_heap_number(),
+        rhs.try_as_heap_number(),
+    ) {
+        ctx.frame.accumulator = number_to_jsvalue(a - b);
+        return Ok(DispatchAction::Continue);
+    }
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(rhs)?;
@@ -591,6 +607,14 @@ fn handle_mul(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         ctx.frame.accumulator = result;
         return Ok(DispatchAction::Continue);
     }
+    // Speculative HeapNumber fast path: skip full JsValue match.
+    if let (Some(a), Some(b)) = (
+        ctx.frame.accumulator.try_as_heap_number(),
+        rhs.try_as_heap_number(),
+    ) {
+        ctx.frame.accumulator = number_to_jsvalue(a * b);
+        return Ok(DispatchAction::Continue);
+    }
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(rhs)?;
@@ -609,11 +633,21 @@ fn handle_div(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     };
     let rhs = ctx.frame.read_reg(v)?;
     // SMI fast path: exact non-zero integer division stays in Smi.
-    if let (JsValue::Smi(a), JsValue::Smi(b)) = (&ctx.frame.accumulator, rhs)
-        && *b != 0
-        && *a % *b == 0
-    {
-        ctx.frame.accumulator = JsValue::Smi(*a / *b);
+    if let (Some(a), Some(b)) = (ctx.frame.accumulator.try_as_smi(), rhs.try_as_smi()) {
+        if b != 0 && a % b == 0 {
+            ctx.frame.accumulator = JsValue::Smi(a / b);
+            return Ok(DispatchAction::Continue);
+        }
+        // Non-exact or zero divisor: promote to f64.
+        ctx.frame.accumulator = number_to_jsvalue(a as f64 / b as f64);
+        return Ok(DispatchAction::Continue);
+    }
+    // Speculative HeapNumber fast path: skip full JsValue match.
+    if let (Some(a), Some(b)) = (
+        ctx.frame.accumulator.try_as_heap_number(),
+        rhs.try_as_heap_number(),
+    ) {
+        ctx.frame.accumulator = number_to_jsvalue(a / b);
         return Ok(DispatchAction::Continue);
     }
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
@@ -636,11 +670,27 @@ fn handle_mod(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         return Err(err_bad_operand("Mod", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
-    // Fast path: Smi % Smi
-    if let JsValue::Smi(a) = ctx.frame.accumulator
-        && let JsValue::Smi(b) = rhs
-    {
-        ctx.frame.accumulator = number_to_jsvalue(a as f64 % *b as f64);
+    // Fast path: Smi % Smi — preserve negative zero.
+    if let (Some(a), Some(b)) = (ctx.frame.accumulator.try_as_smi(), rhs.try_as_smi()) {
+        if b != 0 {
+            let rem = a % b;
+            if rem == 0 && a < 0 {
+                // -x % y == 0 → negative zero per ECMAScript spec.
+                ctx.frame.accumulator = JsValue::HeapNumber(-0.0);
+            } else {
+                ctx.frame.accumulator = JsValue::Smi(rem);
+            }
+        } else {
+            ctx.frame.accumulator = JsValue::HeapNumber(f64::NAN);
+        }
+        return Ok(DispatchAction::Continue);
+    }
+    // Speculative HeapNumber fast path: skip full JsValue match.
+    if let (Some(a), Some(b)) = (
+        ctx.frame.accumulator.try_as_heap_number(),
+        rhs.try_as_heap_number(),
+    ) {
+        ctx.frame.accumulator = number_to_jsvalue(a % b);
         return Ok(DispatchAction::Continue);
     }
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
