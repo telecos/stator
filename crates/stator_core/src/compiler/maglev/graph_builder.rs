@@ -436,6 +436,7 @@ impl<'a> GraphBuilder<'a> {
                 let id = self.emit(ValueNode::FalseConstant)?;
                 self.env.set_accumulator(id);
             }
+            Opcode::Nop => {}
             Opcode::LdaConstant => {
                 let idx = self.operand_constant_pool_idx(instr, 0)?;
                 let id = self.emit_constant_pool_entry(idx)?;

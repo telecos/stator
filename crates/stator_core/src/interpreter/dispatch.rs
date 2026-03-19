@@ -290,7 +290,7 @@ pub(super) type OpcodeHandler =
     fn(&mut DispatchContext, &Instruction) -> StatorResult<DispatchAction>;
 
 /// Number of opcode variants.
-const OPCODE_COUNT: usize = Opcode::AddSmiStar as usize + 1;
+const OPCODE_COUNT: usize = Opcode::Nop as usize + 1;
 
 #[inline]
 fn handle_lda_zero(
@@ -298,6 +298,11 @@ fn handle_lda_zero(
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     ctx.frame.accumulator = JsValue::Smi(0);
+    Ok(DispatchAction::Continue)
+}
+
+#[inline]
+fn handle_nop(_ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<DispatchAction> {
     Ok(DispatchAction::Continue)
 }
 
@@ -7357,6 +7362,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::ShiftRightLogical as usize] = handle_shift_right_logical;
     table[Opcode::AddSmi as usize] = handle_add_smi;
     table[Opcode::AddSmiStar as usize] = handle_add_smi_star;
+    table[Opcode::Nop as usize] = handle_nop;
     table[Opcode::SubSmi as usize] = handle_sub_smi;
     table[Opcode::MulSmi as usize] = handle_mul_smi;
     table[Opcode::DivSmi as usize] = handle_div_smi;
