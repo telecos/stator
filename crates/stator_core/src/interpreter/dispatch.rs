@@ -3054,31 +3054,9 @@ fn handle_lda_global(
         return Err(err_bad_operand("LdaGlobal", 0));
     };
     let name = ctx.frame.get_string_constant(name_idx)?;
-    // Fast path: check per-frame global cache.
-    if let Some(val) = ctx.frame.global_cache_get(name.as_ref()) {
-        ctx.frame.accumulator = val.clone();
-        if name.as_ref() == "this" && ctx.frame.accumulator == JsValue::TheHole {
-            return Err(StatorError::ReferenceError(
-                "Must call super constructor in derived class before accessing 'this'".into(),
-            ));
-        }
-        return Ok(DispatchAction::Continue);
-    }
-    // Slow path: HashMap lookup, then populate cache.
-    let val = ctx
-        .frame
-        .global_env
-        .borrow()
-        .get(name.as_ref())
-        .cloned()
-        .unwrap_or(JsValue::Undefined);
-    ctx.frame.global_cache_put(name.as_ref(), val.clone());
-    ctx.frame.accumulator = val;
-    if name.as_ref() == "this" && ctx.frame.accumulator == JsValue::TheHole {
-        return Err(StatorError::ReferenceError(
-            "Must call super constructor in derived class before accessing 'this'".into(),
-        ));
-    }
+    let value = ctx.frame.load_global(name.as_ref())?;
+    ctx.frame.sync_hot_accumulator(&value);
+    ctx.frame.accumulator = value;
     Ok(DispatchAction::Continue)
 }
 
