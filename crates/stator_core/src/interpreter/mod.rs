@@ -212,6 +212,7 @@ type FnPropMap = Rc<RefCell<HashMap<String, JsValue>>>;
 type MonoLoadCache = HashMap<u32, (usize, JsValue)>;
 type PolyLoadCache = HashMap<u32, Vec<(usize, JsValue)>>;
 type StringCache = HashMap<u32, Rc<str>>;
+type GlobalIcCache = HashMap<u32, (usize, u64)>;
 
 thread_local! {
     /// The currently-attached debugger for this thread, if any.
@@ -1396,6 +1397,10 @@ pub struct GlobalEnv {
     pub vars: HashMap<String, JsValue>,
     /// Monotonically increasing counter bumped on every mutation.
     pub generation: u64,
+    /// Indexed storage mirroring `vars` for O(1) access by slot index.
+    slots: Vec<JsValue>,
+    /// Maps global names to their slot index in `slots`.
+    name_to_index: HashMap<String, usize>,
 }
 
 impl GlobalEnv {
@@ -1404,12 +1409,21 @@ impl GlobalEnv {
         Self {
             vars: HashMap::new(),
             generation: 0,
+            slots: Vec::new(),
+            name_to_index: HashMap::new(),
         }
     }
 
     /// Insert a value, bumping the generation counter.
     pub fn insert(&mut self, key: String, value: JsValue) {
-        self.vars.insert(key, value);
+        self.vars.insert(key.clone(), value.clone());
+        if let Some(&idx) = self.name_to_index.get(&key) {
+            self.slots[idx] = value;
+        } else {
+            let idx = self.slots.len();
+            self.name_to_index.insert(key, idx);
+            self.slots.push(value);
+        }
         self.generation = self.generation.wrapping_add(1);
     }
 
@@ -1417,6 +1431,9 @@ impl GlobalEnv {
     pub fn remove(&mut self, key: &str) -> Option<JsValue> {
         let removed = self.vars.remove(key);
         if removed.is_some() {
+            if let Some(idx) = self.name_to_index.remove(key) {
+                self.slots[idx] = JsValue::Undefined;
+            }
             self.generation = self.generation.wrapping_add(1);
         }
         removed
@@ -1435,6 +1452,36 @@ impl GlobalEnv {
     /// Get current generation.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Return the slot index for a given global name, if it exists.
+    #[inline(always)]
+    pub fn slot_index(&self, key: &str) -> Option<usize> {
+        self.name_to_index.get(key).copied()
+    }
+
+    /// O(1) indexed read from the slot vector.
+    #[inline(always)]
+    pub fn get_by_index(&self, idx: usize) -> Option<&JsValue> {
+        self.slots.get(idx)
+    }
+
+    /// Rebuild `slots` and `name_to_index` from the current `vars`.
+    pub fn rebuild_slots(&mut self) {
+        self.name_to_index.clear();
+        self.slots.clear();
+        self.slots.reserve(self.vars.len());
+        for (name, value) in &self.vars {
+            let idx = self.slots.len();
+            self.name_to_index.insert(name.clone(), idx);
+            self.slots.push(value.clone());
+        }
+    }
+
+    /// Returns `true` when the indexed slot storage has been populated.
+    #[inline(always)]
+    pub fn has_slots(&self) -> bool {
+        !self.slots.is_empty()
     }
 }
 
@@ -1647,6 +1694,9 @@ pub struct InterpreterFrame {
     /// Shape-based megamorphic inline cache for named property stores.
     /// Mirrors `mega_load_ic`.  Lazily allocated on first write.
     pub mega_store_ic: Option<Box<MegamorphicIc>>,
+    /// Global variable inline cache: `constant_pool_idx -> (slot_index, generation)`.
+    /// Lazily allocated on first write.
+    pub global_ic: Option<Box<GlobalIcCache>>,
     /// Pre-decoded string constants from the constant pool, keyed by index.
     /// Avoids repeated `String::clone()` from the constant pool.
     pub string_cache: Option<Box<StringCache>>,
@@ -1707,6 +1757,7 @@ impl InterpreterFrame {
         }
         let mut global_env = GlobalEnv::new();
         crate::builtins::install_globals::install_globals(&mut global_env.vars);
+        global_env.rebuild_slots();
         Self {
             bytecode_array,
             registers,
@@ -1727,6 +1778,7 @@ impl InterpreterFrame {
             poly_load_cache: None,
             mega_load_ic: None,
             mega_store_ic: None,
+            global_ic: None,
             string_cache: None,
             global_cache: [
                 (0, None, JsValue::Undefined),
@@ -1771,6 +1823,13 @@ impl InterpreterFrame {
             for (k, v) in defaults {
                 env.vars.entry(k).or_insert(v);
             }
+            env.rebuild_slots();
+        }
+        {
+            let mut env = global_env.borrow_mut();
+            if !env.has_slots() && !env.vars.is_empty() {
+                env.rebuild_slots();
+            }
         }
         // Build the frame directly with the shared global_env, avoiding the
         // redundant install_globals call that `new()` would perform.
@@ -1801,6 +1860,7 @@ impl InterpreterFrame {
             poly_load_cache: None,
             mega_load_ic: None,
             mega_store_ic: None,
+            global_ic: None,
             string_cache: None,
             global_cache: [
                 (0, None, JsValue::Undefined),
@@ -3145,6 +3205,7 @@ impl Interpreter {
             poly_load_cache: None,
             mega_load_ic: None,
             mega_store_ic: None,
+            global_ic: None,
             string_cache: None,
             global_cache: [
                 (0, None, JsValue::Undefined),
@@ -9792,7 +9853,11 @@ mod tests {
         let program = parse(src).unwrap();
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
         let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
-        crate::builtins::install_globals::install_globals(&mut frame.global_env.borrow_mut().vars);
+        {
+            let mut env = frame.global_env.borrow_mut();
+            crate::builtins::install_globals::install_globals(&mut env.vars);
+            env.rebuild_slots();
+        }
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::String("TypeError".to_string().into()));
     }
@@ -13843,7 +13908,11 @@ mod tests {
         let ba = make_bytecode_with_pool(instrs, pool, 3, 0);
         let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         // Re-install globals since make_bytecode_with_pool bypasses new()
-        crate::builtins::install_globals::install_globals(&mut frame.global_env.borrow_mut().vars);
+        {
+            let mut env = frame.global_env.borrow_mut();
+            crate::builtins::install_globals::install_globals(&mut env.vars);
+            env.rebuild_slots();
+        }
         Interpreter::run(&mut frame)
     }
 
@@ -13962,7 +14031,11 @@ mod tests {
         ];
         let ba = make_bytecode_with_pool(instrs, pool, 2, 0);
         let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
-        crate::builtins::install_globals::install_globals(&mut frame.global_env.borrow_mut().vars);
+        {
+            let mut env = frame.global_env.borrow_mut();
+            crate::builtins::install_globals::install_globals(&mut env.vars);
+            env.rebuild_slots();
+        }
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::String(String::new().into()));
     }

@@ -14889,6 +14889,7 @@ fn make_shadow_realm() -> JsValue {
         // Create a fresh set of globals for this realm.
         let mut realm_globals = GlobalEnv::new();
         install_globals(&mut realm_globals.vars);
+        realm_globals.rebuild_slots();
         let realm_globals = Rc::new(RefCell::new(realm_globals));
 
         let mut props = PropertyMap::new();

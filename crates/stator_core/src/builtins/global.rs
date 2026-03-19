@@ -1041,6 +1041,7 @@ mod tests {
         // inside eval should be visible in the caller's environment.
         let mut ge = GlobalEnv::new();
         crate::builtins::install_globals::install_globals(&mut ge.vars);
+        ge.rebuild_slots();
         let env = Rc::new(RefCell::new(ge));
         let result = global_eval_direct("var x = 99; x", Rc::clone(&env)).unwrap();
         assert_eq!(result, JsValue::Smi(99));
@@ -1053,6 +1054,7 @@ mod tests {
         // Direct eval can read variables from the caller's environment.
         let mut ge = GlobalEnv::new();
         crate::builtins::install_globals::install_globals(&mut ge.vars);
+        ge.rebuild_slots();
         ge.insert("y".into(), JsValue::Smi(7));
         let env = Rc::new(RefCell::new(ge));
         let result = global_eval_direct("y + 3", Rc::clone(&env)).unwrap();
@@ -1083,6 +1085,7 @@ mod tests {
         // eval should NOT leak into the caller's scope.
         let mut ge = GlobalEnv::new();
         crate::builtins::install_globals::install_globals(&mut ge.vars);
+        ge.rebuild_slots();
         let env = Rc::new(RefCell::new(ge));
         let result = global_eval_strict("var secret = 100; secret", Rc::clone(&env)).unwrap();
         assert_eq!(result, JsValue::Smi(100));
