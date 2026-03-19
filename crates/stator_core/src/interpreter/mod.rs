@@ -2139,6 +2139,19 @@ impl Interpreter {
                                 frame.accumulator = val.cheap_clone();
                                 continue 'dispatch;
                             }
+                            Opcode::LdaUndefined => {
+                                frame.accumulator = JsValue::Undefined;
+                                continue 'dispatch;
+                            }
+                            Opcode::Mov => {
+                                // SAFETY: Bytecode generator guarantees operand[0]
+                                // and operand[1] are Register, and both are in bounds.
+                                let src = unsafe { operand_reg_unchecked(instr, 0) };
+                                let dst = unsafe { operand_reg_unchecked(instr, 1) };
+                                let val = unsafe { frame.read_reg_unchecked(src) }.cheap_clone();
+                                unsafe { frame.write_reg_unchecked(dst, val) };
+                                continue 'dispatch;
+                            }
 
                             // ── Arithmetic (SMI fast path, table fallback) ──
                             Opcode::Add => {
@@ -2256,6 +2269,38 @@ impl Interpreter {
                                 if let Operand::Immediate(imm) = instr.operands[0]
                                     && let JsValue::Smi(n) = frame.accumulator
                                     && let Some(result) = n.checked_add(imm)
+                                {
+                                    frame.accumulator = JsValue::Smi(result);
+                                    continue 'dispatch;
+                                }
+                                match dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => continue 'dispatch,
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            frame.pc = resume_pc;
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                            Opcode::SubSmi => {
+                                if let Operand::Immediate(imm) = instr.operands[0]
+                                    && let JsValue::Smi(n) = frame.accumulator
+                                    && let Some(result) = n.checked_sub(imm)
                                 {
                                     frame.accumulator = JsValue::Smi(result);
                                     continue 'dispatch;
@@ -2432,6 +2477,45 @@ impl Interpreter {
                                     // operands are in bounds.
                                     let rhs = unsafe { frame.read_reg_unchecked(v) };
                                     let result = abstract_eq(&frame.accumulator, rhs);
+                                    frame.accumulator = JsValue::Boolean(result);
+                                    continue 'dispatch;
+                                }
+                                match dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => continue 'dispatch,
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            frame.pc = resume_pc;
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                            Opcode::TestEqualStrict => {
+                                if let Operand::Register(v) = instr.operands[0] {
+                                    // SAFETY: Bytecode validator guarantees register
+                                    // operands are in bounds.
+                                    let rhs = unsafe { frame.read_reg_unchecked(v) };
+                                    if let (JsValue::Smi(a), JsValue::Smi(b)) =
+                                        (&frame.accumulator, rhs)
+                                    {
+                                        frame.accumulator = JsValue::Boolean(*a == *b);
+                                        continue 'dispatch;
+                                    }
+                                    let result = strict_eq(&frame.accumulator, rhs);
                                     frame.accumulator = JsValue::Boolean(result);
                                     continue 'dispatch;
                                 }
@@ -3582,7 +3666,9 @@ fn dispatch_via_table(
     handler_table: &[HandlerTableEntry],
     instr: &crate::bytecode::bytecodes::Instruction,
 ) -> StatorResult<dispatch::DispatchAction> {
-    let handler = dispatch::DISPATCH_TABLE[instr.opcode as usize];
+    // SAFETY: The opcode discriminant is always < OPCODE_COUNT because
+    // the bytecodes enum is exhaustive and the table covers every variant.
+    let handler = unsafe { *dispatch::DISPATCH_TABLE.get_unchecked(instr.opcode as usize) };
     let mut dctx = dispatch::DispatchContext {
         frame,
         instructions,
