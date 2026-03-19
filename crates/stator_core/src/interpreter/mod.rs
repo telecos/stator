@@ -1468,6 +1468,11 @@ pub struct InterpreterFrame {
     /// Set when we detect a tight arithmetic loop with all-Smi values.
     /// Cleared when any non-Smi value is encountered.
     pub smi_mode: bool,
+    /// When non-zero, the dispatch loop is inside a validated loop body.
+    /// The value is the instruction index one past the `JumpLoop` — we
+    /// skip the bounds check for every PC strictly below this point
+    /// because the entire range was validated during bytecode decoding.
+    loop_end_pc: usize,
     /// Tracks how many times each backward jump target has been taken
     /// (for SMI mode detection).  Indexed by instruction PC, default 0.
     loop_trip_counts: Vec<u16>,
@@ -1537,6 +1542,7 @@ impl InterpreterFrame {
             ],
             cache_generation: 0,
             smi_mode: false,
+            loop_end_pc: 0,
             loop_trip_counts: Vec::new(),
         }
     }
@@ -1610,6 +1616,7 @@ impl InterpreterFrame {
             ],
             cache_generation: 0,
             smi_mode: false,
+            loop_end_pc: 0,
             loop_trip_counts: Vec::new(),
         }
     }
@@ -1851,41 +1858,59 @@ impl Interpreter {
                     // read on every instruction.  Refreshed in the periodic block.
                     let mut debug_active = DEBUG_ATTACHED.with(Cell::get);
 
+                    // Hoist the hottest frame fields into local variables so LLVM
+                    // can keep them in machine registers across the entire dispatch
+                    // loop.  Written back to `frame` before any cold-path call and
+                    // at every exit point.
+                    let mut pc = frame.pc;
+                    let mut acc = frame.accumulator.cheap_clone();
+
                     'dispatch: loop {
-                        if frame.pc >= instructions.len() {
-                            return Err(bytecode_end_error());
+                        // Inside a validated loop body we know every PC in
+                        // [jump_target, loop_end_pc) was decoded successfully, so
+                        // the bounds check is redundant.
+                        if pc >= frame.loop_end_pc {
+                            frame.loop_end_pc = 0;
+                            if pc >= instructions.len() {
+                                frame.pc = pc;
+                                frame.accumulator = acc;
+                                return Err(bytecode_end_error());
+                            }
                         }
 
                         // ── Debug hook (pre-fetch) ─────────────────────────────────────
                         if debug_active {
-                            let current_offset = byte_offsets[frame.pc] as u32;
+                            let current_offset = byte_offsets[pc] as u32;
                             if let Some(pause_err) = ACTIVE_DEBUGGER.with(|d| {
                                 let opt = d.borrow();
                                 opt.as_ref()
                                     .and_then(|rc| rc.borrow_mut().check_pause_at(current_offset))
                             }) {
+                                frame.pc = pc;
+                                frame.accumulator = acc;
                                 return Err(pause_err);
                             }
                         }
 
                         // ── Fetch ──────────────────────────────────────────────────────
-                        // SAFETY: The bounds check above guarantees frame.pc < instructions.len().
-                        let instr = unsafe { instructions.get_unchecked(frame.pc) };
-                        frame.pc += 1;
+                        // SAFETY: The bounds check (or loop_end_pc guard) guarantees
+                        // pc < instructions.len().
+                        let instr = unsafe { instructions.get_unchecked(pc) };
+                        pc += 1;
 
                         // ── Approximate instruction counting & periodic checks ──────────
                         //
-                        // Instead of incrementing a counter every instruction, we
-                        // check the low bits of the PC.  This is ~free (bitwise AND
-                        // on a value we already have) and only slightly imprecise
-                        // because back-edges reset the PC.  The counter advances in
-                        // chunks of 0x1000 so that instruction_limit still works.
-                        if frame.pc & 0x3FF == 0 {
+                        // Inside a validated loop body (loop_end_pc != 0) the
+                        // periodic check is deferred to the JumpLoop back-edge,
+                        // saving a branch per hot instruction.
+                        if frame.loop_end_pc == 0 && pc & 0x3FF == 0 {
                             frame.instructions_executed += 0x400;
 
                             if frame.instruction_limit > 0
                                 && frame.instructions_executed > frame.instruction_limit
                             {
+                                frame.pc = pc;
+                                frame.accumulator = acc;
                                 return Err(instruction_limit_error());
                             }
 
@@ -1895,11 +1920,13 @@ impl Interpreter {
                                 if frame.deadline.is_some_and(|dl| now > dl)
                                     || thread_deadline.is_some_and(|dl| now > dl)
                                 {
+                                    frame.pc = pc;
+                                    frame.accumulator = acc;
                                     return Err(execution_timeout_error());
                                 }
                             }
 
-                            if frame.pc & 0xFFF == 0 {
+                            if pc & 0xFFF == 0 {
                                 crate::inspector::profiler::maybe_record_sample();
                                 debug_active = DEBUG_ATTACHED.with(Cell::get);
                             }
@@ -1923,15 +1950,14 @@ impl Interpreter {
                                 Opcode::LdaSmi => {
                                     // SAFETY: Bytecode generator guarantees operand[0]
                                     // is Immediate for LdaSmi.
-                                    frame.accumulator =
-                                        JsValue::Smi(unsafe { operand_imm_unchecked(instr, 0) });
+                                    acc = JsValue::Smi(unsafe { operand_imm_unchecked(instr, 0) });
                                     continue 'dispatch;
                                 }
                                 Opcode::Star => {
                                     // SAFETY: Bytecode generator guarantees operand[0]
                                     // is Register for Star, and register is in bounds.
                                     let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                    let val = frame.accumulator.cheap_clone();
+                                    let val = acc.cheap_clone();
                                     // SAFETY: Bytecode validator guarantees register is
                                     // in bounds for this frame.
                                     unsafe { frame.write_reg_unchecked(reg, val) };
@@ -1944,7 +1970,7 @@ impl Interpreter {
                                     // SAFETY: Bytecode validator guarantees register is
                                     // in bounds for this frame.
                                     let val = unsafe { frame.read_reg_unchecked(reg) };
-                                    frame.accumulator = val.cheap_clone();
+                                    acc = val.cheap_clone();
                                     continue 'dispatch;
                                 }
                                 Opcode::Add | Opcode::AddSmi => {
@@ -1952,7 +1978,7 @@ impl Interpreter {
                                         let reg = unsafe { operand_reg_unchecked(instr, 0) };
                                         // SAFETY: In SMI mode, accumulator and loop
                                         // registers are guaranteed Smi.
-                                        let a = unsafe { frame.accumulator.as_smi_unchecked() };
+                                        let a = unsafe { acc.as_smi_unchecked() };
                                         let b = unsafe {
                                             frame.read_reg_unchecked(reg).as_smi_unchecked()
                                         };
@@ -1961,19 +1987,19 @@ impl Interpreter {
                                         // SAFETY: In SMI mode, accumulator is Smi.
                                         // Bytecode generator guarantees operand[0] is
                                         // Immediate for AddSmi.
-                                        let a = unsafe { frame.accumulator.as_smi_unchecked() };
+                                        let a = unsafe { acc.as_smi_unchecked() };
                                         let b = unsafe { operand_imm_unchecked(instr, 0) };
                                         (a, b)
                                     };
                                     match a.checked_add(b) {
                                         Some(result) => {
-                                            frame.accumulator = JsValue::Smi(result);
+                                            acc = JsValue::Smi(result);
                                         }
                                         None => {
                                             // Overflow — exit SMI mode.
                                             frame.smi_mode = false;
-                                            frame.accumulator =
-                                                JsValue::HeapNumber((a as f64) + (b as f64));
+                                            frame.loop_end_pc = 0;
+                                            acc = JsValue::HeapNumber((a as f64) + (b as f64));
                                         }
                                     }
                                     continue 'dispatch;
@@ -1983,7 +2009,7 @@ impl Interpreter {
                                         let reg = unsafe { operand_reg_unchecked(instr, 0) };
                                         // SAFETY: In SMI mode, accumulator and loop
                                         // registers are guaranteed Smi.
-                                        let a = unsafe { frame.accumulator.as_smi_unchecked() };
+                                        let a = unsafe { acc.as_smi_unchecked() };
                                         let b = unsafe {
                                             frame.read_reg_unchecked(reg).as_smi_unchecked()
                                         };
@@ -1992,18 +2018,18 @@ impl Interpreter {
                                         // SAFETY: In SMI mode, accumulator is Smi.
                                         // Bytecode generator guarantees operand[0] is
                                         // Immediate for SubSmi.
-                                        let a = unsafe { frame.accumulator.as_smi_unchecked() };
+                                        let a = unsafe { acc.as_smi_unchecked() };
                                         let b = unsafe { operand_imm_unchecked(instr, 0) };
                                         (a, b)
                                     };
                                     match a.checked_sub(b) {
                                         Some(result) => {
-                                            frame.accumulator = JsValue::Smi(result);
+                                            acc = JsValue::Smi(result);
                                         }
                                         None => {
                                             frame.smi_mode = false;
-                                            frame.accumulator =
-                                                JsValue::HeapNumber((a as f64) - (b as f64));
+                                            frame.loop_end_pc = 0;
+                                            acc = JsValue::HeapNumber((a as f64) - (b as f64));
                                         }
                                     }
                                     continue 'dispatch;
@@ -2013,7 +2039,7 @@ impl Interpreter {
                                         let reg = unsafe { operand_reg_unchecked(instr, 0) };
                                         // SAFETY: In SMI mode, accumulator and loop
                                         // registers are guaranteed Smi.
-                                        let a = unsafe { frame.accumulator.as_smi_unchecked() };
+                                        let a = unsafe { acc.as_smi_unchecked() };
                                         let b = unsafe {
                                             frame.read_reg_unchecked(reg).as_smi_unchecked()
                                         };
@@ -2022,18 +2048,18 @@ impl Interpreter {
                                         // SAFETY: In SMI mode, accumulator is Smi.
                                         // Bytecode generator guarantees operand[0] is
                                         // Immediate for MulSmi.
-                                        let a = unsafe { frame.accumulator.as_smi_unchecked() };
+                                        let a = unsafe { acc.as_smi_unchecked() };
                                         let b = unsafe { operand_imm_unchecked(instr, 0) };
                                         (a, b)
                                     };
                                     match a.checked_mul(b) {
                                         Some(result) => {
-                                            frame.accumulator = JsValue::Smi(result);
+                                            acc = JsValue::Smi(result);
                                         }
                                         None => {
                                             frame.smi_mode = false;
-                                            frame.accumulator =
-                                                JsValue::HeapNumber((a as f64) * (b as f64));
+                                            frame.loop_end_pc = 0;
+                                            acc = JsValue::HeapNumber((a as f64) * (b as f64));
                                         }
                                     }
                                     continue 'dispatch;
@@ -2046,7 +2072,7 @@ impl Interpreter {
                                     let reg = unsafe { operand_reg_unchecked(instr, 0) };
                                     // SAFETY: In SMI mode, accumulator and loop
                                     // registers are guaranteed Smi.
-                                    let a = unsafe { frame.accumulator.as_smi_unchecked() };
+                                    let a = unsafe { acc.as_smi_unchecked() };
                                     let b =
                                         unsafe { frame.read_reg_unchecked(reg).as_smi_unchecked() };
                                     let result = match instr.opcode {
@@ -2059,53 +2085,80 @@ impl Interpreter {
                                         // comparison opcodes.
                                         _ => unsafe { std::hint::unreachable_unchecked() },
                                     };
-                                    frame.accumulator = JsValue::Boolean(result);
+                                    acc = JsValue::Boolean(result);
                                     continue 'dispatch;
                                 }
                                 Opcode::JumpIfTrue => {
-                                    if matches!(frame.accumulator, JsValue::Boolean(true)) {
+                                    if matches!(acc, JsValue::Boolean(true)) {
                                         // SAFETY: Bytecode compiler guarantees all
                                         // JumpIfTrue instructions have pre-computed
                                         // targets.
-                                        frame.pc = unsafe {
-                                            resolve_jump_unchecked(frame.pc, jump_targets)
-                                        };
+                                        pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
                                     }
                                     continue 'dispatch;
                                 }
                                 Opcode::JumpIfFalse => {
-                                    if matches!(frame.accumulator, JsValue::Boolean(false)) {
+                                    if matches!(acc, JsValue::Boolean(false)) {
                                         // SAFETY: Bytecode compiler guarantees all
                                         // JumpIfFalse instructions have pre-computed
                                         // targets.
-                                        frame.pc = unsafe {
-                                            resolve_jump_unchecked(frame.pc, jump_targets)
-                                        };
+                                        pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
                                     }
                                     continue 'dispatch;
                                 }
                                 Opcode::JumpLoop => {
+                                    // Record the end of the loop body for bounds-check
+                                    // elimination on the next iteration.
+                                    let loop_end = pc;
                                     // SAFETY: Bytecode compiler guarantees all JumpLoop
                                     // instructions have pre-computed targets.
-                                    frame.pc =
-                                        unsafe { resolve_jump_unchecked(frame.pc, jump_targets) };
+                                    pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
                                     frame.osr_loop_count = frame.osr_loop_count.saturating_add(1);
+                                    frame.loop_end_pc = loop_end;
+
+                                    // Batch the periodic check at the back-edge instead
+                                    // of checking on every instruction.
+                                    frame.instructions_executed += (loop_end - pc) as u64;
+                                    if frame.instruction_limit > 0
+                                        && frame.instructions_executed > frame.instruction_limit
+                                    {
+                                        frame.pc = pc;
+                                        frame.accumulator = acc;
+                                        return Err(instruction_limit_error());
+                                    }
+                                    if frame.instructions_executed & 0xFFFF == 0 {
+                                        let thread_deadline = EXECUTION_DEADLINE.with(|d| d.get());
+                                        if frame.deadline.is_some() || thread_deadline.is_some() {
+                                            let now = Instant::now();
+                                            if frame.deadline.is_some_and(|dl| now > dl)
+                                                || thread_deadline.is_some_and(|dl| now > dl)
+                                            {
+                                                frame.pc = pc;
+                                                frame.accumulator = acc;
+                                                return Err(execution_timeout_error());
+                                            }
+                                        }
+                                        crate::inspector::profiler::maybe_record_sample();
+                                        debug_active = DEBUG_ATTACHED.with(Cell::get);
+                                    }
                                     continue 'dispatch;
                                 }
                                 Opcode::Jump => {
                                     // SAFETY: Bytecode compiler guarantees all Jump
                                     // instructions have pre-computed targets.
-                                    frame.pc =
-                                        unsafe { resolve_jump_unchecked(frame.pc, jump_targets) };
+                                    pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
                                     continue 'dispatch;
                                 }
                                 Opcode::Return => {
+                                    frame.pc = pc;
+                                    frame.accumulator = acc.clone();
                                     return Ok(frame.accumulator.clone());
                                 }
                                 _ => {
                                     // Unsupported opcode — exit SMI mode and let the
                                     // regular dispatch handle it.
                                     frame.smi_mode = false;
+                                    frame.loop_end_pc = 0;
                                 }
                             }
                         }
@@ -2115,15 +2168,14 @@ impl Interpreter {
                             Opcode::LdaSmi => {
                                 // SAFETY: Bytecode generator guarantees operand[0]
                                 // is Immediate for LdaSmi.
-                                frame.accumulator =
-                                    JsValue::Smi(unsafe { operand_imm_unchecked(instr, 0) });
+                                acc = JsValue::Smi(unsafe { operand_imm_unchecked(instr, 0) });
                                 continue 'dispatch;
                             }
                             Opcode::Star => {
                                 // SAFETY: Bytecode generator guarantees operand[0]
                                 // is Register for Star, and register is in bounds.
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let val = frame.accumulator.cheap_clone();
+                                let val = acc.cheap_clone();
                                 // SAFETY: Bytecode validator guarantees register is
                                 // in bounds for this frame.
                                 unsafe { frame.write_reg_unchecked(reg, val) };
@@ -2136,11 +2188,11 @@ impl Interpreter {
                                 // SAFETY: Bytecode validator guarantees register is
                                 // in bounds for this frame.
                                 let val = unsafe { frame.read_reg_unchecked(reg) };
-                                frame.accumulator = val.cheap_clone();
+                                acc = val.cheap_clone();
                                 continue 'dispatch;
                             }
                             Opcode::LdaUndefined => {
-                                frame.accumulator = JsValue::Undefined;
+                                acc = JsValue::Undefined;
                                 continue 'dispatch;
                             }
                             Opcode::Mov => {
@@ -2159,14 +2211,16 @@ impl Interpreter {
                                     // SAFETY: Bytecode validator guarantees register
                                     // operands are in bounds.
                                     let rhs = unsafe { frame.read_reg_unchecked(v) };
-                                    if let (JsValue::Smi(a), JsValue::Smi(b)) =
-                                        (&frame.accumulator, rhs)
+                                    if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs)
                                         && let Some(result) = a.checked_add(*b)
                                     {
-                                        frame.accumulator = JsValue::Smi(result);
+                                        acc = JsValue::Smi(result);
                                         continue 'dispatch;
                                     }
                                 }
+                                // Write back locals before cold-path dispatch.
+                                frame.pc = pc;
+                                frame.accumulator = acc;
                                 match dispatch_via_table(
                                     frame,
                                     instructions,
@@ -2175,7 +2229,11 @@ impl Interpreter {
                                     handler_table.as_slice(),
                                     instr,
                                 ) {
-                                    Ok(dispatch::DispatchAction::Continue) => continue 'dispatch,
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
                                     Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
                                     Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
                                     Err(e) => {
@@ -2184,7 +2242,8 @@ impl Interpreter {
                                             frame,
                                             handler_table.as_slice(),
                                         ) {
-                                            frame.pc = resume_pc;
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
                                             continue 'dispatch;
                                         }
                                         return Err(e);
@@ -2196,14 +2255,15 @@ impl Interpreter {
                                     // SAFETY: Bytecode validator guarantees register
                                     // operands are in bounds.
                                     let rhs = unsafe { frame.read_reg_unchecked(v) };
-                                    if let (JsValue::Smi(a), JsValue::Smi(b)) =
-                                        (&frame.accumulator, rhs)
+                                    if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs)
                                         && let Some(result) = a.checked_sub(*b)
                                     {
-                                        frame.accumulator = JsValue::Smi(result);
+                                        acc = JsValue::Smi(result);
                                         continue 'dispatch;
                                     }
                                 }
+                                frame.pc = pc;
+                                frame.accumulator = acc;
                                 match dispatch_via_table(
                                     frame,
                                     instructions,
@@ -2212,7 +2272,11 @@ impl Interpreter {
                                     handler_table.as_slice(),
                                     instr,
                                 ) {
-                                    Ok(dispatch::DispatchAction::Continue) => continue 'dispatch,
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
                                     Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
                                     Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
                                     Err(e) => {
@@ -2221,7 +2285,8 @@ impl Interpreter {
                                             frame,
                                             handler_table.as_slice(),
                                         ) {
-                                            frame.pc = resume_pc;
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
                                             continue 'dispatch;
                                         }
                                         return Err(e);
@@ -2233,14 +2298,15 @@ impl Interpreter {
                                     // SAFETY: Bytecode validator guarantees register
                                     // operands are in bounds.
                                     let rhs = unsafe { frame.read_reg_unchecked(v) };
-                                    if let (JsValue::Smi(a), JsValue::Smi(b)) =
-                                        (&frame.accumulator, rhs)
+                                    if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs)
                                         && let Some(result) = a.checked_mul(*b)
                                     {
-                                        frame.accumulator = JsValue::Smi(result);
+                                        acc = JsValue::Smi(result);
                                         continue 'dispatch;
                                     }
                                 }
+                                frame.pc = pc;
+                                frame.accumulator = acc;
                                 match dispatch_via_table(
                                     frame,
                                     instructions,
@@ -2249,7 +2315,11 @@ impl Interpreter {
                                     handler_table.as_slice(),
                                     instr,
                                 ) {
-                                    Ok(dispatch::DispatchAction::Continue) => continue 'dispatch,
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
                                     Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
                                     Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
                                     Err(e) => {
@@ -2258,7 +2328,8 @@ impl Interpreter {
                                             frame,
                                             handler_table.as_slice(),
                                         ) {
-                                            frame.pc = resume_pc;
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
                                             continue 'dispatch;
                                         }
                                         return Err(e);
@@ -2267,12 +2338,14 @@ impl Interpreter {
                             }
                             Opcode::AddSmi => {
                                 if let Operand::Immediate(imm) = instr.operands[0]
-                                    && let JsValue::Smi(n) = frame.accumulator
+                                    && let JsValue::Smi(n) = acc
                                     && let Some(result) = n.checked_add(imm)
                                 {
-                                    frame.accumulator = JsValue::Smi(result);
+                                    acc = JsValue::Smi(result);
                                     continue 'dispatch;
                                 }
+                                frame.pc = pc;
+                                frame.accumulator = acc;
                                 match dispatch_via_table(
                                     frame,
                                     instructions,
@@ -2281,7 +2354,11 @@ impl Interpreter {
                                     handler_table.as_slice(),
                                     instr,
                                 ) {
-                                    Ok(dispatch::DispatchAction::Continue) => continue 'dispatch,
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
                                     Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
                                     Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
                                     Err(e) => {
@@ -2290,7 +2367,8 @@ impl Interpreter {
                                             frame,
                                             handler_table.as_slice(),
                                         ) {
-                                            frame.pc = resume_pc;
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
                                             continue 'dispatch;
                                         }
                                         return Err(e);
@@ -2299,12 +2377,14 @@ impl Interpreter {
                             }
                             Opcode::SubSmi => {
                                 if let Operand::Immediate(imm) = instr.operands[0]
-                                    && let JsValue::Smi(n) = frame.accumulator
+                                    && let JsValue::Smi(n) = acc
                                     && let Some(result) = n.checked_sub(imm)
                                 {
-                                    frame.accumulator = JsValue::Smi(result);
+                                    acc = JsValue::Smi(result);
                                     continue 'dispatch;
                                 }
+                                frame.pc = pc;
+                                frame.accumulator = acc;
                                 match dispatch_via_table(
                                     frame,
                                     instructions,
@@ -2313,7 +2393,11 @@ impl Interpreter {
                                     handler_table.as_slice(),
                                     instr,
                                 ) {
-                                    Ok(dispatch::DispatchAction::Continue) => continue 'dispatch,
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
                                     Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
                                     Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
                                     Err(e) => {
@@ -2322,7 +2406,8 @@ impl Interpreter {
                                             frame,
                                             handler_table.as_slice(),
                                         ) {
-                                            frame.pc = resume_pc;
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
                                             continue 'dispatch;
                                         }
                                         return Err(e);
@@ -2332,6 +2417,8 @@ impl Interpreter {
 
                             // ── Return ───────────────────────────────
                             Opcode::Return => {
+                                frame.pc = pc;
+                                frame.accumulator = acc;
                                 return Ok(frame.accumulator.clone());
                             }
 
@@ -2339,33 +2426,29 @@ impl Interpreter {
                             Opcode::Jump => {
                                 // SAFETY: Bytecode compiler guarantees all Jump
                                 // instructions have pre-computed targets.
-                                frame.pc =
-                                    unsafe { resolve_jump_unchecked(frame.pc, jump_targets) };
+                                pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
                                 continue 'dispatch;
                             }
                             Opcode::JumpIfTrue => {
-                                if matches!(frame.accumulator, JsValue::Boolean(true)) {
+                                if matches!(acc, JsValue::Boolean(true)) {
                                     // SAFETY: Bytecode compiler guarantees all
                                     // JumpIfTrue instructions have pre-computed targets.
-                                    frame.pc =
-                                        unsafe { resolve_jump_unchecked(frame.pc, jump_targets) };
+                                    pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
                                 }
                                 continue 'dispatch;
                             }
                             Opcode::JumpIfFalse => {
-                                if matches!(frame.accumulator, JsValue::Boolean(false)) {
+                                if matches!(acc, JsValue::Boolean(false)) {
                                     // SAFETY: Bytecode compiler guarantees all
                                     // JumpIfFalse instructions have pre-computed targets.
-                                    frame.pc =
-                                        unsafe { resolve_jump_unchecked(frame.pc, jump_targets) };
+                                    pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
                                 }
                                 continue 'dispatch;
                             }
                             Opcode::JumpLoop => {
                                 // SAFETY: Bytecode compiler guarantees all JumpLoop
                                 // instructions have pre-computed targets.
-                                frame.pc =
-                                    unsafe { resolve_jump_unchecked(frame.pc, jump_targets) };
+                                pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
                                 frame.osr_loop_count = frame.osr_loop_count.saturating_add(1);
                                 if frame.osr_loop_count >= OSR_LOOP_THRESHOLD
                                     && frame.bytecode_array.try_get_jit_code().is_none()
@@ -2381,9 +2464,9 @@ impl Interpreter {
                                 // SMI-mode detection: if the accumulator is still Smi
                                 // after several back-edge trips, enter SMI fast dispatch.
                                 if !frame.smi_mode
-                                    && let JsValue::Smi(_) = &frame.accumulator
+                                    && let JsValue::Smi(_) = &acc
                                 {
-                                    let target_pc = frame.pc;
+                                    let target_pc = pc;
                                     if target_pc < frame.loop_trip_counts.len() {
                                         // SAFETY: bounds check just above.
                                         let count = unsafe {
@@ -2404,13 +2487,13 @@ impl Interpreter {
                                     // SAFETY: Bytecode validator guarantees register
                                     // operands are in bounds.
                                     let rhs = unsafe { frame.read_reg_unchecked(v) };
-                                    if let (JsValue::Smi(a), JsValue::Smi(b)) =
-                                        (&frame.accumulator, rhs)
-                                    {
-                                        frame.accumulator = JsValue::Boolean(*a < *b);
+                                    if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
+                                        acc = JsValue::Boolean(*a < *b);
                                         continue 'dispatch;
                                     }
                                 }
+                                frame.pc = pc;
+                                frame.accumulator = acc;
                                 match dispatch_via_table(
                                     frame,
                                     instructions,
@@ -2419,7 +2502,11 @@ impl Interpreter {
                                     handler_table.as_slice(),
                                     instr,
                                 ) {
-                                    Ok(dispatch::DispatchAction::Continue) => continue 'dispatch,
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
                                     Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
                                     Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
                                     Err(e) => {
@@ -2428,7 +2515,8 @@ impl Interpreter {
                                             frame,
                                             handler_table.as_slice(),
                                         ) {
-                                            frame.pc = resume_pc;
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
                                             continue 'dispatch;
                                         }
                                         return Err(e);
@@ -2440,13 +2528,13 @@ impl Interpreter {
                                     // SAFETY: Bytecode validator guarantees register
                                     // operands are in bounds.
                                     let rhs = unsafe { frame.read_reg_unchecked(v) };
-                                    if let (JsValue::Smi(a), JsValue::Smi(b)) =
-                                        (&frame.accumulator, rhs)
-                                    {
-                                        frame.accumulator = JsValue::Boolean(*a > *b);
+                                    if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
+                                        acc = JsValue::Boolean(*a > *b);
                                         continue 'dispatch;
                                     }
                                 }
+                                frame.pc = pc;
+                                frame.accumulator = acc;
                                 match dispatch_via_table(
                                     frame,
                                     instructions,
@@ -2455,7 +2543,11 @@ impl Interpreter {
                                     handler_table.as_slice(),
                                     instr,
                                 ) {
-                                    Ok(dispatch::DispatchAction::Continue) => continue 'dispatch,
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
                                     Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
                                     Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
                                     Err(e) => {
@@ -2464,7 +2556,8 @@ impl Interpreter {
                                             frame,
                                             handler_table.as_slice(),
                                         ) {
-                                            frame.pc = resume_pc;
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
                                             continue 'dispatch;
                                         }
                                         return Err(e);
@@ -2476,10 +2569,12 @@ impl Interpreter {
                                     // SAFETY: Bytecode validator guarantees register
                                     // operands are in bounds.
                                     let rhs = unsafe { frame.read_reg_unchecked(v) };
-                                    let result = abstract_eq(&frame.accumulator, rhs);
-                                    frame.accumulator = JsValue::Boolean(result);
+                                    let result = abstract_eq(&acc, rhs);
+                                    acc = JsValue::Boolean(result);
                                     continue 'dispatch;
                                 }
+                                frame.pc = pc;
+                                frame.accumulator = acc;
                                 match dispatch_via_table(
                                     frame,
                                     instructions,
@@ -2488,7 +2583,11 @@ impl Interpreter {
                                     handler_table.as_slice(),
                                     instr,
                                 ) {
-                                    Ok(dispatch::DispatchAction::Continue) => continue 'dispatch,
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
                                     Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
                                     Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
                                     Err(e) => {
@@ -2497,7 +2596,8 @@ impl Interpreter {
                                             frame,
                                             handler_table.as_slice(),
                                         ) {
-                                            frame.pc = resume_pc;
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
                                             continue 'dispatch;
                                         }
                                         return Err(e);
@@ -2509,16 +2609,16 @@ impl Interpreter {
                                     // SAFETY: Bytecode validator guarantees register
                                     // operands are in bounds.
                                     let rhs = unsafe { frame.read_reg_unchecked(v) };
-                                    if let (JsValue::Smi(a), JsValue::Smi(b)) =
-                                        (&frame.accumulator, rhs)
-                                    {
-                                        frame.accumulator = JsValue::Boolean(*a == *b);
+                                    if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
+                                        acc = JsValue::Boolean(*a == *b);
                                         continue 'dispatch;
                                     }
-                                    let result = strict_eq(&frame.accumulator, rhs);
-                                    frame.accumulator = JsValue::Boolean(result);
+                                    let result = strict_eq(&acc, rhs);
+                                    acc = JsValue::Boolean(result);
                                     continue 'dispatch;
                                 }
+                                frame.pc = pc;
+                                frame.accumulator = acc;
                                 match dispatch_via_table(
                                     frame,
                                     instructions,
@@ -2527,7 +2627,11 @@ impl Interpreter {
                                     handler_table.as_slice(),
                                     instr,
                                 ) {
-                                    Ok(dispatch::DispatchAction::Continue) => continue 'dispatch,
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
                                     Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
                                     Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
                                     Err(e) => {
@@ -2536,7 +2640,8 @@ impl Interpreter {
                                             frame,
                                             handler_table.as_slice(),
                                         ) {
-                                            frame.pc = resume_pc;
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
                                             continue 'dispatch;
                                         }
                                         return Err(e);
@@ -2546,6 +2651,9 @@ impl Interpreter {
 
                             // ── All other opcodes: dispatch table ────
                             _ => {
+                                // Write back locals before cold-path dispatch.
+                                frame.pc = pc;
+                                frame.accumulator = acc;
                                 match dispatch_via_table(
                                     frame,
                                     instructions,
@@ -2554,7 +2662,11 @@ impl Interpreter {
                                     handler_table.as_slice(),
                                     instr,
                                 ) {
-                                    Ok(dispatch::DispatchAction::Continue) => continue 'dispatch,
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
                                     Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
                                     Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
                                     Err(e) => {
@@ -2563,7 +2675,8 @@ impl Interpreter {
                                             frame,
                                             handler_table.as_slice(),
                                         ) {
-                                            frame.pc = resume_pc;
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
                                             continue 'dispatch;
                                         }
                                         return Err(e);
@@ -2670,6 +2783,7 @@ impl Interpreter {
             ],
             cache_generation: 0,
             smi_mode: false,
+            loop_end_pc: 0,
             loop_trip_counts: Vec::new(),
         };
         // Restore the captured closure context so generators can access outer
