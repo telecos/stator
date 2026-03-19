@@ -251,6 +251,7 @@ pub enum ToPrimitiveHint {
 /// the engine heap.  It is the caller's responsibility to ensure the object
 /// outlives the `JsValue` that wraps it and that no GC compaction has
 /// invalidated the pointer.
+#[repr(u8)]
 #[derive(Clone)]
 pub enum JsValue {
     /// The ECMAScript `undefined` primitive.
@@ -353,6 +354,24 @@ pub enum JsValue {
     DataView(Rc<RefCell<crate::builtins::typed_array::JsDataView>>),
 }
 
+const JSVALUE_BOOLEAN_TAG: u8 = 3;
+const JSVALUE_SMI_TAG: u8 = 4;
+const JSVALUE_HEAP_NUMBER_TAG: u8 = 5;
+
+#[repr(C)]
+struct TaggedI32Layout {
+    tag: u8,
+    _padding: [u8; 3],
+    value: i32,
+}
+
+#[repr(C)]
+struct TaggedF64Layout {
+    tag: u8,
+    _padding: [u8; 7],
+    value: f64,
+}
+
 /// A scope context representing the environment for captured variables.
 ///
 /// Each context contains a vector of numbered slots and an optional parent
@@ -452,6 +471,13 @@ impl PartialEq for JsValue {
 // ──────────────────────────────────────────────────────────────────────────────
 
 impl JsValue {
+    #[inline(always)]
+    fn tag(&self) -> u8 {
+        // SAFETY: `JsValue` uses `#[repr(u8)]`, so the discriminant is stored
+        // in the first byte.
+        unsafe { std::ptr::addr_of!(*self).cast::<u8>().read() }
+    }
+
     /// Create a new mutable `Array` value from a `Vec<JsValue>`.
     ///
     /// This is the preferred constructor—callers should use this instead of
@@ -488,13 +514,24 @@ impl JsValue {
     /// Returns `true` if this value is a boolean.
     #[inline(always)]
     pub fn is_boolean(&self) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(&Self::Boolean(false))
+        self.tag() == JSVALUE_BOOLEAN_TAG
     }
 
     /// Returns `true` if this value is a small integer ([`Smi`][JsValue::Smi]).
     #[inline(always)]
     pub fn is_smi(&self) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(&Self::Smi(0))
+        self.tag() == JSVALUE_SMI_TAG
+    }
+
+    /// Try to extract a Smi payload using a tag-byte check.
+    #[inline(always)]
+    pub fn try_as_smi(&self) -> Option<i32> {
+        if self.is_smi() {
+            // SAFETY: The tag-byte check above guarantees this value is a Smi.
+            Some(unsafe { self.as_smi_unchecked() })
+        } else {
+            None
+        }
     }
 
     /// Extract the Smi payload without re-checking the discriminant.
@@ -504,19 +541,32 @@ impl JsValue {
     /// Caller must ensure [`Self::is_smi`] returns `true`.
     #[inline(always)]
     pub unsafe fn as_smi_unchecked(&self) -> i32 {
-        match self {
-            Self::Smi(value) => *value,
-            _ => {
-                // SAFETY: Caller guarantees this value is a Smi.
-                unsafe { std::hint::unreachable_unchecked() }
-            }
+        debug_assert!(self.is_smi());
+        let ptr = std::ptr::from_ref(self).cast::<u8>();
+        // SAFETY: Caller guarantees this value is a Smi. With `#[repr(u8)]`,
+        // the `Smi(i32)` payload uses the same offset as `TaggedI32Layout`.
+        unsafe {
+            ptr.add(std::mem::offset_of!(TaggedI32Layout, value))
+                .cast::<i32>()
+                .read()
         }
     }
 
     /// Returns `true` if this value is a heap number ([`HeapNumber`][JsValue::HeapNumber]).
     #[inline(always)]
     pub fn is_heap_number(&self) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(&Self::HeapNumber(0.0))
+        self.tag() == JSVALUE_HEAP_NUMBER_TAG
+    }
+
+    /// Try to extract a heap-number payload using a tag-byte check.
+    #[inline(always)]
+    pub fn try_as_number(&self) -> Option<f64> {
+        if self.is_heap_number() {
+            // SAFETY: The tag-byte check above guarantees this value is a HeapNumber.
+            Some(unsafe { self.as_heap_number_unchecked() })
+        } else {
+            None
+        }
     }
 
     /// Extract the heap-number payload without re-checking the discriminant.
@@ -526,12 +576,14 @@ impl JsValue {
     /// Caller must ensure [`Self::is_heap_number`] returns `true`.
     #[inline(always)]
     pub unsafe fn as_heap_number_unchecked(&self) -> f64 {
-        match self {
-            Self::HeapNumber(value) => *value,
-            _ => {
-                // SAFETY: Caller guarantees this value is a HeapNumber.
-                unsafe { std::hint::unreachable_unchecked() }
-            }
+        debug_assert!(self.is_heap_number());
+        let ptr = std::ptr::from_ref(self).cast::<u8>();
+        // SAFETY: Caller guarantees this value is a HeapNumber. With `#[repr(u8)]`,
+        // the `HeapNumber(f64)` payload uses the same offset as `TaggedF64Layout`.
+        unsafe {
+            ptr.add(std::mem::offset_of!(TaggedF64Layout, value))
+                .cast::<f64>()
+                .read()
         }
     }
 
@@ -702,43 +754,25 @@ impl JsValue {
     /// Try to add two Smi values, returning `None` for non-Smis or overflow.
     #[inline(always)]
     pub fn try_add_smi(a: &Self, b: &Self) -> Option<Self> {
-        if a.is_smi() && b.is_smi() {
-            // SAFETY: Both operands were checked with `is_smi` above.
-            let lhs = unsafe { a.as_smi_unchecked() };
-            // SAFETY: Both operands were checked with `is_smi` above.
-            let rhs = unsafe { b.as_smi_unchecked() };
-            lhs.checked_add(rhs).map(Self::Smi)
-        } else {
-            None
-        }
+        let lhs = a.try_as_smi()?;
+        let rhs = b.try_as_smi()?;
+        lhs.checked_add(rhs).map(Self::Smi)
     }
 
     /// Try to subtract two Smi values, returning `None` for non-Smis or overflow.
     #[inline(always)]
     pub fn try_sub_smi(a: &Self, b: &Self) -> Option<Self> {
-        if a.is_smi() && b.is_smi() {
-            // SAFETY: Both operands were checked with `is_smi` above.
-            let lhs = unsafe { a.as_smi_unchecked() };
-            // SAFETY: Both operands were checked with `is_smi` above.
-            let rhs = unsafe { b.as_smi_unchecked() };
-            lhs.checked_sub(rhs).map(Self::Smi)
-        } else {
-            None
-        }
+        let lhs = a.try_as_smi()?;
+        let rhs = b.try_as_smi()?;
+        lhs.checked_sub(rhs).map(Self::Smi)
     }
 
     /// Try to multiply two Smi values, returning `None` for non-Smis or overflow.
     #[inline(always)]
     pub fn try_mul_smi(a: &Self, b: &Self) -> Option<Self> {
-        if a.is_smi() && b.is_smi() {
-            // SAFETY: Both operands were checked with `is_smi` above.
-            let lhs = unsafe { a.as_smi_unchecked() };
-            // SAFETY: Both operands were checked with `is_smi` above.
-            let rhs = unsafe { b.as_smi_unchecked() };
-            lhs.checked_mul(rhs).map(Self::Smi)
-        } else {
-            None
-        }
+        let lhs = a.try_as_smi()?;
+        let rhs = b.try_as_smi()?;
+        lhs.checked_mul(rhs).map(Self::Smi)
     }
 }
 
@@ -1936,6 +1970,12 @@ mod tests {
     }
 
     #[test]
+    fn test_try_as_smi() {
+        assert_eq!(JsValue::Smi(-42).try_as_smi(), Some(-42));
+        assert_eq!(JsValue::HeapNumber(-42.0).try_as_smi(), None);
+    }
+
+    #[test]
     fn test_as_heap_number_unchecked() {
         let value = JsValue::HeapNumber(f64::NEG_INFINITY);
         // SAFETY: `value` is explicitly constructed as a HeapNumber.
@@ -1947,6 +1987,12 @@ mod tests {
         let value = JsValue::HeapNumber(f64::NAN);
         // SAFETY: `value` is explicitly constructed as a HeapNumber.
         assert!(unsafe { value.as_heap_number_unchecked() }.is_nan());
+    }
+
+    #[test]
+    fn test_try_as_number() {
+        assert_eq!(JsValue::HeapNumber(3.5).try_as_number(), Some(3.5));
+        assert_eq!(JsValue::Smi(3).try_as_number(), None);
     }
 
     #[test]

@@ -535,9 +535,19 @@ fn handle_add(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         return Err(err_bad_operand("Add", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
-    // SMI fast path: both operands are Smi → direct i32 add.
-    if let Some(result) = JsValue::try_add_smi(&ctx.frame.accumulator, rhs) {
-        ctx.frame.accumulator = result;
+    if let Some(lhs_smi) = ctx.frame.accumulator.try_as_smi()
+        && let Some(rhs_smi) = rhs.try_as_smi()
+    {
+        ctx.frame.accumulator = match lhs_smi.checked_add(rhs_smi) {
+            Some(result) => JsValue::Smi(result),
+            None => JsValue::HeapNumber(lhs_smi as f64 + rhs_smi as f64),
+        };
+        return Ok(DispatchAction::Continue);
+    }
+    if let Some(lhs_n) = ctx.frame.accumulator.try_as_number()
+        && let Some(rhs_n) = rhs.try_as_number()
+    {
+        ctx.frame.accumulator = number_to_jsvalue(lhs_n + rhs_n);
         return Ok(DispatchAction::Continue);
     }
     // Fast path: String + String – skip to_js_string conversion.
@@ -563,9 +573,19 @@ fn handle_sub(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         return Err(err_bad_operand("Sub", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
-    // SMI fast path: both operands are Smi → direct i32 subtract.
-    if let Some(result) = JsValue::try_sub_smi(&ctx.frame.accumulator, rhs) {
-        ctx.frame.accumulator = result;
+    if let Some(lhs_smi) = ctx.frame.accumulator.try_as_smi()
+        && let Some(rhs_smi) = rhs.try_as_smi()
+    {
+        ctx.frame.accumulator = match lhs_smi.checked_sub(rhs_smi) {
+            Some(result) => JsValue::Smi(result),
+            None => JsValue::HeapNumber(lhs_smi as f64 - rhs_smi as f64),
+        };
+        return Ok(DispatchAction::Continue);
+    }
+    if let Some(lhs_n) = ctx.frame.accumulator.try_as_number()
+        && let Some(rhs_n) = rhs.try_as_number()
+    {
+        ctx.frame.accumulator = number_to_jsvalue(lhs_n - rhs_n);
         return Ok(DispatchAction::Continue);
     }
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
@@ -586,9 +606,19 @@ fn handle_mul(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         return Err(err_bad_operand("Mul", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
-    // SMI fast path: both operands are Smi → direct i32 multiply.
-    if let Some(result) = JsValue::try_mul_smi(&ctx.frame.accumulator, rhs) {
-        ctx.frame.accumulator = result;
+    if let Some(lhs_smi) = ctx.frame.accumulator.try_as_smi()
+        && let Some(rhs_smi) = rhs.try_as_smi()
+    {
+        ctx.frame.accumulator = match lhs_smi.checked_mul(rhs_smi) {
+            Some(result) => JsValue::Smi(result),
+            None => JsValue::HeapNumber(lhs_smi as f64 * rhs_smi as f64),
+        };
+        return Ok(DispatchAction::Continue);
+    }
+    if let Some(lhs_n) = ctx.frame.accumulator.try_as_number()
+        && let Some(rhs_n) = rhs.try_as_number()
+    {
+        ctx.frame.accumulator = number_to_jsvalue(lhs_n * rhs_n);
         return Ok(DispatchAction::Continue);
     }
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
@@ -603,17 +633,29 @@ fn handle_mul(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     Ok(DispatchAction::Continue)
 }
 
+#[inline(always)]
 fn handle_div(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Div", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
-    // SMI fast path: exact non-zero integer division stays in Smi.
-    if let (JsValue::Smi(a), JsValue::Smi(b)) = (&ctx.frame.accumulator, rhs)
-        && *b != 0
-        && *a % *b == 0
+    if let Some(lhs_smi) = ctx.frame.accumulator.try_as_smi()
+        && let Some(rhs_smi) = rhs.try_as_smi()
     {
-        ctx.frame.accumulator = JsValue::Smi(*a / *b);
+        if rhs_smi != 0
+            && lhs_smi % rhs_smi == 0
+            && let Some(result) = lhs_smi.checked_div(rhs_smi)
+        {
+            ctx.frame.accumulator = JsValue::Smi(result);
+        } else {
+            ctx.frame.accumulator = JsValue::HeapNumber(lhs_smi as f64 / rhs_smi as f64);
+        }
+        return Ok(DispatchAction::Continue);
+    }
+    if let Some(lhs_n) = ctx.frame.accumulator.try_as_number()
+        && let Some(rhs_n) = rhs.try_as_number()
+    {
+        ctx.frame.accumulator = number_to_jsvalue(lhs_n / rhs_n);
         return Ok(DispatchAction::Continue);
     }
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
@@ -631,16 +673,26 @@ fn handle_div(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     Ok(DispatchAction::Continue)
 }
 
+#[inline(always)]
 fn handle_mod(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Mod", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
-    // Fast path: Smi % Smi
-    if let JsValue::Smi(a) = ctx.frame.accumulator
-        && let JsValue::Smi(b) = rhs
+    if let Some(lhs_smi) = ctx.frame.accumulator.try_as_smi()
+        && let Some(rhs_smi) = rhs.try_as_smi()
     {
-        ctx.frame.accumulator = number_to_jsvalue(a as f64 % *b as f64);
+        ctx.frame.accumulator = match lhs_smi.checked_rem(rhs_smi) {
+            Some(0) if lhs_smi < 0 => number_to_jsvalue(-0.0),
+            Some(result) => JsValue::Smi(result),
+            None => JsValue::HeapNumber(lhs_smi as f64 % rhs_smi as f64),
+        };
+        return Ok(DispatchAction::Continue);
+    }
+    if let Some(lhs_n) = ctx.frame.accumulator.try_as_number()
+        && let Some(rhs_n) = rhs.try_as_number()
+    {
+        ctx.frame.accumulator = number_to_jsvalue(lhs_n % rhs_n);
         return Ok(DispatchAction::Continue);
     }
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
@@ -8856,6 +8908,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, JsValue::Smi(6));
+    }
+
+    #[test]
+    fn e2e_add_smi_overflow_promotes_to_heap_number() {
+        let result = crate::builtins::global::global_eval("2147483647 + 1").unwrap();
+        assert_eq!(result, JsValue::HeapNumber(2147483648.0));
+    }
+
+    #[test]
+    fn e2e_div_smi_non_exact_promotes_to_heap_number() {
+        let result = crate::builtins::global::global_eval("7 / 2").unwrap();
+        assert_eq!(result, JsValue::HeapNumber(3.5));
     }
 
     // ── Class features ──────────────────────────────────────────────
