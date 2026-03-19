@@ -1940,23 +1940,16 @@ impl InterpreterFrame {
         self.global_cache[slot] = (h, Some(Rc::from(name)), value);
     }
 
-    /// Invalidate the per-frame global variable cache.
+    /// Mark the per-frame global variable cache as potentially stale.
     ///
-    /// Kept for call-sites that explicitly need to clear the cache
-    /// (e.g. after a tail-call rewrite).  With the generation counter,
-    /// most invalidation is automatic.
+    /// With the generation-counter check in [`global_cache_get`], callers
+    /// no longer need to rebuild 8 cache entries after every function call.
+    /// Setting `cache_generation` to `u64::MAX` guarantees a mismatch on
+    /// the next get, which will re-read from the HashMap and re-snapshot
+    /// the real generation.
     #[inline(always)]
     pub fn global_cache_invalidate(&mut self) {
-        self.global_cache = [
-            (0, None, JsValue::Undefined),
-            (0, None, JsValue::Undefined),
-            (0, None, JsValue::Undefined),
-            (0, None, JsValue::Undefined),
-            (0, None, JsValue::Undefined),
-            (0, None, JsValue::Undefined),
-            (0, None, JsValue::Undefined),
-            (0, None, JsValue::Undefined),
-        ];
+        self.cache_generation = u64::MAX;
     }
 }
 
