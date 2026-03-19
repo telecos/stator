@@ -15,11 +15,11 @@ use smallvec::{SmallVec, smallvec};
 
 use crate::builtins::string::{string_char_at, utf16_len};
 use crate::objects::map::PropertyAttributes;
-use crate::objects::property_map::PropertyMap;
+use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 
 use super::{
     ACTIVE_DEBUGGER, CallArgs, GlobalEnv, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD,
-    OSR_LOOP_THRESHOLD, PropertyIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow,
+    MegamorphicIcEntry, OSR_LOOP_THRESHOLD, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow,
     collect_args, concat_rc_strs, constant_pool_jump_delta, constant_to_value,
     construct_builtin_result, decode_string_constant, dispatch_call_property, dispatch_call_value,
     dispatch_call_with_this, dispatch_getter, dispatch_setter, err_bad_operand,
@@ -1786,8 +1786,8 @@ fn handle_tail_call(
                     ctx.frame.string_cache = None;
                     ctx.frame.mono_load_cache = None;
                     ctx.frame.poly_load_cache = None;
-                    ctx.frame.shape_load_ic = None;
-                    ctx.frame.shape_store_ic = None;
+                    ctx.frame.mega_load_ic = None;
+                    ctx.frame.mega_store_ic = None;
                     return Ok(DispatchAction::TailCall);
                 }
             }
@@ -3165,24 +3165,45 @@ fn handle_lda_named_property(
         ctx.frame.accumulator = load_private_named_property(&obj, &prop_name)?;
         return Ok(DispatchAction::Continue);
     }
-    // ── Shape IC fast path: O(1) own-property access via cached offset ──
+    // ── Megamorphic IC fast path ────────────────────────────────────────
     if slot != u32::MAX
         && let JsValue::PlainObject(ref map) = obj
         && let Some(ic) = ctx
             .frame
-            .shape_load_ic
+            .mega_load_ic
             .as_ref()
-            .and_then(|cache| cache.get(&slot))
+            .and_then(|cache| cache.probe(slot, map.borrow().layout_id()))
     {
-        let pm = map.borrow();
-        if pm.layout_id() == ic.cached_shape
-            && pm.matches_key_at_offset(ic.cached_offset, prop_name.as_ref())
-            && let Some(val) = pm.get_by_offset(ic.cached_offset)
-        {
-            let v = val.clone();
-            drop(pm);
-            ctx.frame.accumulator = v;
-            return Ok(DispatchAction::Continue);
+        if !ic.is_proto {
+            // Own-property hit: O(1) offset access on receiver.
+            let pm = map.borrow();
+            if pm.matches_key_at_offset(ic.cached_offset as usize, prop_name.as_ref())
+                && let Some(val) = pm.get_by_offset(ic.cached_offset as usize)
+            {
+                let v = val.clone();
+                drop(pm);
+                ctx.frame.accumulator = v;
+                return Ok(DispatchAction::Continue);
+            }
+        } else {
+            // Proto-property hit: verify the immediate prototype's layout
+            // matches, then read by offset from the proto.
+            let proto_layout = ic.proto_layout;
+            let offset = ic.cached_offset;
+            let pm = map.borrow();
+            if let Some(JsValue::PlainObject(proto_map)) = pm.get(INTERNAL_PROTO_PROPERTY_KEY) {
+                let proto_pm = proto_map.borrow();
+                if proto_pm.layout_id() == proto_layout
+                    && proto_pm.matches_key_at_offset(offset as usize, prop_name.as_ref())
+                    && let Some(val) = proto_pm.get_by_offset(offset as usize)
+                {
+                    let v = val.clone();
+                    drop(proto_pm);
+                    drop(pm);
+                    ctx.frame.accumulator = v;
+                    return Ok(DispatchAction::Continue);
+                }
+            }
         }
     }
     // Polymorphic cache: check if any cached entry matches by pointer identity.
@@ -3221,7 +3242,7 @@ fn handle_lda_named_property(
     }
     let result = try_fast_named_property_lookup(&obj, &prop_name)
         .unwrap_or_else(|| proto_lookup(&obj, &prop_name));
-    // ── Populate shape IC for own-property hits on PlainObject ───────────
+    // ── Populate megamorphic IC for PlainObject property hits ────────────
     // Skip caching when the property has an accessor (__get_<key>__)
     // because the IC fast-path would return the placeholder data value
     // instead of invoking the getter.
@@ -3229,16 +3250,72 @@ fn handle_lda_named_property(
         && let JsValue::PlainObject(ref map) = obj
     {
         let pm = map.borrow();
-        if !(pm.has_accessors && pm.contains_key(&format!("__get_{prop_name}__")))
-            && let Some(offset) = pm.offset_of(&prop_name)
-        {
-            ctx.frame.shape_load_ic_mut().insert(
-                slot,
-                PropertyIc {
-                    cached_shape: pm.layout_id(),
-                    cached_offset: offset,
-                },
-            );
+        let has_accessor = pm.has_accessors && pm.contains_key(&format!("__get_{prop_name}__"));
+        if !has_accessor {
+            match pm.offset_of(&prop_name) {
+                Some(offset) if offset <= u16::MAX as usize => {
+                    // Own property — cache direct offset.
+                    ctx.frame.mega_load_ic_mut().update(MegamorphicIcEntry {
+                        slot,
+                        receiver_layout: pm.layout_id(),
+                        cached_offset: offset as u16,
+                        is_proto: false,
+                        proto_layout: 0,
+                    });
+                }
+                None => {
+                    // Not an own property — check the immediate prototype
+                    // for a cacheable data-property hit.
+                    if let Some(JsValue::PlainObject(proto_map)) =
+                        pm.get(INTERNAL_PROTO_PROPERTY_KEY)
+                    {
+                        let proto_pm = proto_map.borrow();
+                        let proto_has_accessor = proto_pm.has_accessors
+                            && proto_pm.contains_key(&format!("__get_{prop_name}__"));
+                        if !proto_has_accessor
+                            && let Some(proto_offset) = proto_pm.offset_of(&prop_name)
+                            && proto_offset <= u16::MAX as usize
+                        {
+                            let receiver_layout = pm.layout_id();
+                            let proto_layout = proto_pm.layout_id();
+                            drop(proto_pm);
+                            drop(pm);
+                            ctx.frame.mega_load_ic_mut().update(MegamorphicIcEntry {
+                                slot,
+                                receiver_layout,
+                                cached_offset: proto_offset as u16,
+                                is_proto: true,
+                                proto_layout,
+                            });
+                            // Update polymorphic cache (borrows already dropped).
+                            let obj_ptr = match &obj {
+                                JsValue::PlainObject(map) => Some(Rc::as_ptr(map) as usize),
+                                JsValue::Array(arr) => Some(Rc::as_ptr(arr) as usize),
+                                JsValue::Function(ba) => Some(Rc::as_ptr(ba) as usize),
+                                _ => None,
+                            };
+                            if let Some(ptr) = obj_ptr {
+                                let entries =
+                                    ctx.frame.poly_load_cache_mut().entry(slot).or_default();
+                                let mut found = false;
+                                for entry in entries.iter_mut() {
+                                    if entry.0 == ptr {
+                                        entry.1 = result.clone();
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                                if !found && entries.len() < POLYMORPHIC_LOAD_CACHE_CAP {
+                                    entries.push((ptr, result.clone()));
+                                }
+                            }
+                            ctx.frame.accumulator = result;
+                            return Ok(DispatchAction::Continue);
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
     // Update polymorphic cache (up to 8 entries per slot).
@@ -3312,21 +3389,20 @@ fn handle_sta_named_property(
             }
         }
         JsValue::PlainObject(ref map) => {
-            // ── Shape IC fast path for store: existing writable property ─
+            // ── Megamorphic IC fast path for store: existing writable prop ──
             if slot != u32::MAX
                 && let Some(ic) = ctx
                     .frame
-                    .shape_store_ic
+                    .mega_store_ic
                     .as_ref()
-                    .and_then(|cache| cache.get(&slot))
+                    .and_then(|cache| cache.probe(slot, map.borrow().layout_id()))
             {
+                let offset = ic.cached_offset as usize;
                 let pm = map.borrow();
-                if pm.layout_id() == ic.cached_shape
-                    && pm.matches_key_at_offset(ic.cached_offset, prop_name.as_ref())
-                {
-                    if pm.is_writable_by_offset(ic.cached_offset) {
+                if pm.matches_key_at_offset(offset, prop_name.as_ref()) {
+                    if pm.is_writable_by_offset(offset) {
                         drop(pm);
-                        map.borrow_mut().set_by_offset(ic.cached_offset, val);
+                        map.borrow_mut().set_by_offset(offset, val);
                         // Invalidate value-based caches for this object.
                         let map_ptr = Rc::as_ptr(map) as usize;
                         if let Some(cache) = &mut ctx.frame.mono_load_cache {
@@ -3431,17 +3507,19 @@ fn handle_sta_named_property(
             }
             set_function_name_if_missing(&val, &prop_name);
             map.borrow_mut().insert(prop_name.to_string(), val);
-            // Populate shape store IC for future fast-path stores.
+            // Populate megamorphic store IC for future fast-path stores.
             if slot != u32::MAX {
                 let pm = map.borrow();
-                if let Some(offset) = pm.offset_of(&prop_name) {
-                    ctx.frame.shape_store_ic_mut().insert(
+                if let Some(offset) = pm.offset_of(&prop_name)
+                    && offset <= u16::MAX as usize
+                {
+                    ctx.frame.mega_store_ic_mut().update(MegamorphicIcEntry {
                         slot,
-                        PropertyIc {
-                            cached_shape: pm.layout_id(),
-                            cached_offset: offset,
-                        },
-                    );
+                        receiver_layout: pm.layout_id(),
+                        cached_offset: offset as u16,
+                        is_proto: false,
+                        proto_layout: 0,
+                    });
                 }
             }
             // Invalidate value-based caches for this object.
