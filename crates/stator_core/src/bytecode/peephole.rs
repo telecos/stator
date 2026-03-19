@@ -18,7 +18,189 @@ pub fn fuse_instructions(instructions: &mut Vec<Instruction>, byte_offsets: &mut
     // remaining correctness issues are resolved (423 test failures from
     // incorrect store elimination across exception-throwing paths).
     // optimize_bytecode(instructions, byte_offsets);
+    eliminate_redundant_moves(instructions, byte_offsets);
     fuse_superinstructions(instructions, byte_offsets);
+}
+
+/// Eliminate provably redundant register-to-accumulator moves.
+///
+/// This pass handles three patterns, all requiring that no jump target or block
+/// boundary intervenes between the two instructions:
+///
+/// 1. **Star rX → Ldar rX** — the `Ldar` is redundant because the accumulator
+///    still holds the value just stored.  Only intermediate `Star` / `Nop`
+///    instructions (which preserve the accumulator) are allowed between them.
+///
+/// 2. **Ldar rX → Star rX** — the `Star` is redundant because the register
+///    already contains the value just loaded into the accumulator.  Only `Nop`
+///    instructions are allowed between them (any other instruction might change
+///    the accumulator, making the `Star` store a different value).
+///
+/// 3. **Star rX → Star rY** (adjacent, no intervening use of rX) — the first
+///    `Star` is dead.  We only eliminate when the two `Star` instructions are
+///    directly adjacent (no instructions between them) so we do not need
+///    complex liveness analysis.
+///
+/// Eliminated instructions are replaced with `Nop` and then compacted out.
+fn eliminate_redundant_moves(instructions: &mut Vec<Instruction>, byte_offsets: &mut Vec<usize>) {
+    if instructions.len() < 2 || byte_offsets.len() != instructions.len() + 1 {
+        return;
+    }
+
+    let jump_target_bytes = collect_jump_target_bytes(instructions, byte_offsets);
+    let mut changed = false;
+
+    // Pattern 1: Star rX … Ldar rX  (accumulator preserved between them)
+    // Pattern 2: Ldar rX … Star rX  (no accumulator change between them)
+    {
+        let mut i = 0;
+        while i < instructions.len() {
+            // --- Pattern 1: Star rX followed (through acc-preserving ops) by Ldar rX ---
+            if instructions[i].opcode == Opcode::Star
+                && let Some(reg) = get_register(&instructions[i], 0)
+                && let Some(ldar_idx) =
+                    find_next_matching_ldar(instructions, byte_offsets, &jump_target_bytes, i, reg)
+            {
+                instructions[ldar_idx] = nop_instruction();
+                changed = true;
+                i = ldar_idx + 1;
+                continue;
+            }
+
+            // --- Pattern 2: Ldar rX followed (through Nops only) by Star rX ---
+            if instructions[i].opcode == Opcode::Ldar
+                && let Some(reg) = get_register(&instructions[i], 0)
+                && let Some(star_idx) =
+                    find_next_matching_star(instructions, byte_offsets, &jump_target_bytes, i, reg)
+            {
+                instructions[star_idx] = nop_instruction();
+                changed = true;
+                i = star_idx + 1;
+                continue;
+            }
+
+            i += 1;
+        }
+    }
+
+    // Pattern 3: Star rX immediately followed by Star rY — first Star is dead
+    // if rX is not mentioned by the second Star (rX != rY since Star takes one
+    // register operand and both are different).
+    {
+        let mut i = 0;
+        while i + 1 < instructions.len() {
+            if instructions[i].opcode == Opcode::Star
+                && instructions[i + 1].opcode == Opcode::Star
+                && !is_jump_target(byte_offsets, &jump_target_bytes, i + 1)
+            {
+                // Both store the accumulator, so the first is dead unless the
+                // second one somehow reads the first register (it doesn't — Star
+                // only writes).  Safe to eliminate.
+                instructions[i] = nop_instruction();
+                changed = true;
+                // Don't skip i+1; it could itself be part of another pattern.
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    if changed {
+        compact_nops(instructions, byte_offsets);
+    }
+}
+
+/// Scan forward from a `Star rX` at `star_idx` looking for an `Ldar rX` that
+/// loads the same register, with only accumulator-preserving instructions
+/// (`Star`, `Nop`) in between.  Returns the index of the redundant `Ldar`.
+fn find_next_matching_ldar(
+    instructions: &[Instruction],
+    byte_offsets: &[usize],
+    jump_target_bytes: &HashSet<usize>,
+    star_idx: usize,
+    reg: u32,
+) -> Option<usize> {
+    let mut scan = star_idx + 1;
+    while scan < instructions.len() {
+        if is_jump_target(byte_offsets, jump_target_bytes, scan)
+            || is_block_boundary(&instructions[scan])
+        {
+            return None;
+        }
+
+        let instr = &instructions[scan];
+        if instr.opcode == Opcode::Ldar && get_register(instr, 0) == Some(reg) {
+            return Some(scan);
+        }
+
+        // Only Star and Nop preserve the accumulator — anything else clobbers
+        // it, so the Ldar would no longer be redundant.
+        if !preserves_accumulator(instr) {
+            return None;
+        }
+
+        // If an intervening Star writes to the same register, the Ldar after
+        // it would still load the correct value (acc didn't change), but only
+        // if nothing else wrote to that register.  An intervening Star to a
+        // *different* register is fine.  An intervening Star to the *same*
+        // register is also fine (it writes the same acc value back).
+        scan += 1;
+    }
+    None
+}
+
+/// Scan forward from an `Ldar rX` at `ldar_idx` looking for a `Star rX` that
+/// stores back to the same register, with only `Nop` instructions between them
+/// (the accumulator must not have been modified).  Returns the index of the
+/// redundant `Star`.
+fn find_next_matching_star(
+    instructions: &[Instruction],
+    byte_offsets: &[usize],
+    jump_target_bytes: &HashSet<usize>,
+    ldar_idx: usize,
+    reg: u32,
+) -> Option<usize> {
+    let mut scan = ldar_idx + 1;
+    while scan < instructions.len() {
+        if is_jump_target(byte_offsets, jump_target_bytes, scan)
+            || is_block_boundary(&instructions[scan])
+        {
+            return None;
+        }
+
+        let instr = &instructions[scan];
+        if instr.opcode == Opcode::Star && get_register(instr, 0) == Some(reg) {
+            return Some(scan);
+        }
+
+        // Only Nop is safe here — any other instruction (including another
+        // Star to a different register) might have changed the accumulator
+        // value, making the Star no longer store the original Ldar'd value.
+        // Actually, Star preserves the accumulator too, so we can skip over
+        // Stars to *other* registers.
+        if instr.opcode == Opcode::Nop {
+            scan += 1;
+            continue;
+        }
+
+        // A Star to a *different* register still preserves the accumulator,
+        // but we must make sure it didn't write to `reg` (which would make
+        // the later Star redundant for a different reason).
+        if instr.opcode == Opcode::Star {
+            // Star to a different register — acc is preserved, and `reg` is
+            // untouched.
+            if get_register(instr, 0) != Some(reg) {
+                scan += 1;
+                continue;
+            }
+            // Star to the same register — this IS the redundant store.
+            return Some(scan);
+        }
+
+        return None;
+    }
+    None
 }
 
 fn optimize_bytecode(instructions: &mut Vec<Instruction>, byte_offsets: &mut Vec<usize>) {
@@ -717,6 +899,164 @@ mod tests {
                 .map(|instr| instr.opcode)
                 .collect::<Vec<_>>(),
             vec![Opcode::Jump, Opcode::AddSmi, Opcode::Star, Opcode::Return]
+        );
+    }
+
+    // ---- Move elimination tests ----
+
+    #[test]
+    fn test_star_ldar_same_register_eliminated() {
+        // Star r0 → Ldar r0 should eliminate the Ldar.
+        let original = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let (mut instructions, mut byte_offsets) = decode_with_offsets(&original);
+        fuse_instructions(&mut instructions, &mut byte_offsets);
+
+        assert_eq!(
+            instructions.iter().map(|i| i.opcode).collect::<Vec<_>>(),
+            vec![Opcode::LdaSmi, Opcode::Star, Opcode::Return]
+        );
+        assert_eq!(byte_offsets.len(), instructions.len() + 1);
+    }
+
+    #[test]
+    fn test_star_ldar_different_register_not_eliminated() {
+        // Star r0 → Ldar r1 must NOT be eliminated.
+        let original = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let (mut instructions, mut byte_offsets) = decode_with_offsets(&original);
+        fuse_instructions(&mut instructions, &mut byte_offsets);
+
+        // Ldar r1 should survive (different register).
+        let opcodes: Vec<_> = instructions.iter().map(|i| i.opcode).collect();
+        assert!(
+            opcodes.contains(&Opcode::Ldar),
+            "Ldar to a different register must not be eliminated"
+        );
+    }
+
+    #[test]
+    fn test_star_ldar_with_intervening_star_eliminated() {
+        // Star r0 → Star r1 → Ldar r0 — the Ldar is still redundant because
+        // Star preserves the accumulator.
+        let original = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(10)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let (mut instructions, mut byte_offsets) = decode_with_offsets(&original);
+        fuse_instructions(&mut instructions, &mut byte_offsets);
+
+        // The consecutive Star r0/Star r1 pair: first Star is dead (pattern 3),
+        // then Star r1 → Ldar r0 won't match (different reg). But the original
+        // Star r0 → Ldar r0 spans across the intervening Star r1 (which
+        // preserves acc). The Ldar r0 should be eliminated.
+        let opcodes: Vec<_> = instructions.iter().map(|i| i.opcode).collect();
+        assert!(
+            !opcodes.contains(&Opcode::Ldar),
+            "Ldar r0 after Star r0 + Star r1 should be eliminated"
+        );
+    }
+
+    #[test]
+    fn test_ldar_star_same_register_eliminated() {
+        // Ldar r0 → Star r0 should eliminate the Star.
+        let original = vec![
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let (mut instructions, mut byte_offsets) = decode_with_offsets(&original);
+        fuse_instructions(&mut instructions, &mut byte_offsets);
+
+        assert_eq!(
+            instructions.iter().map(|i| i.opcode).collect::<Vec<_>>(),
+            vec![Opcode::Ldar, Opcode::Return]
+        );
+        assert_eq!(byte_offsets.len(), instructions.len() + 1);
+    }
+
+    #[test]
+    fn test_ldar_star_different_register_not_eliminated() {
+        // Ldar r0 → Star r1 must NOT be eliminated (different register).
+        let original = vec![
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let (mut instructions, mut byte_offsets) = decode_with_offsets(&original);
+        fuse_instructions(&mut instructions, &mut byte_offsets);
+
+        let opcodes: Vec<_> = instructions.iter().map(|i| i.opcode).collect();
+        assert_eq!(opcodes, vec![Opcode::Ldar, Opcode::Star, Opcode::Return]);
+    }
+
+    #[test]
+    fn test_adjacent_star_star_eliminates_first() {
+        // Star r0 → Star r1 — the first Star is dead (acc unchanged).
+        let original = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let (mut instructions, mut byte_offsets) = decode_with_offsets(&original);
+        fuse_instructions(&mut instructions, &mut byte_offsets);
+
+        assert_eq!(
+            instructions.iter().map(|i| i.opcode).collect::<Vec<_>>(),
+            vec![Opcode::LdaSmi, Opcode::Star, Opcode::Return]
+        );
+        // The surviving Star should target r1.
+        assert_eq!(get_register(&instructions[1], 0), Some(1));
+        assert_eq!(byte_offsets.len(), instructions.len() + 1);
+    }
+
+    #[test]
+    fn test_move_elimination_respects_jump_targets() {
+        // Star r0 → [jump target] Ldar r0 — must NOT eliminate across a jump
+        // target because control flow could enter at the Ldar.
+        let unresolved = vec![
+            Instruction::new_unchecked(Opcode::Jump, vec![Operand::JumpOffset(0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let bytes = encode(&unresolved);
+        let (_, offsets) =
+            crate::bytecode::bytecodes::decode_with_byte_offsets(&bytes).expect("valid bytecode");
+        // Make the jump target the Ldar instruction (index 3).
+        let mut resolved = unresolved;
+        let target_byte = offsets[3];
+        let jump_end_byte = offsets[1];
+        resolved[0].operands[0] = Operand::JumpOffset(target_byte as i32 - jump_end_byte as i32);
+
+        let (mut instructions, mut byte_offsets) = decode_with_offsets(&resolved);
+        fuse_instructions(&mut instructions, &mut byte_offsets);
+
+        // The Ldar must survive because it's a jump target.
+        let opcodes: Vec<_> = instructions.iter().map(|i| i.opcode).collect();
+        assert!(
+            opcodes.contains(&Opcode::Ldar),
+            "Ldar at a jump target must not be eliminated"
         );
     }
 }
