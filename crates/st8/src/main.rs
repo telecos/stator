@@ -291,10 +291,12 @@ fn load_globals_from_snapshot(path: &str) -> Rc<RefCell<GlobalEnv>> {
         }
     };
     match deserialize_globals(snap.as_bytes()) {
-        Ok(map) => Rc::new(RefCell::new(GlobalEnv {
-            vars: map,
-            generation: 0,
-        })),
+        Ok(map) => {
+            let mut ge = GlobalEnv::default();
+            ge.vars = map;
+            ge.rebuild_slots();
+            Rc::new(RefCell::new(ge))
+        },
         Err(e) => {
             eprintln!("st8: invalid snapshot: {e} — falling back to bootstrap");
             build_globals()

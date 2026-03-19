@@ -891,10 +891,11 @@ fn execute_source_inner(
     // Wrap the caller-provided shallow clone in Rc<RefCell<…>> for the
     // interpreter.  The caller already cloned the template globals, so no
     // additional clone is needed here.
-    let globals = Rc::new(RefCell::new(GlobalEnv {
-        vars: globals_map,
-        generation: 0,
-    }));
+    let mut ge = GlobalEnv::default();
+    ge.vars = globals_map;
+    ge.generation = 0;
+    ge.rebuild_slots();
+    let globals = Rc::new(RefCell::new(ge));
     // Keep a handle so we can break Rc cycles after the test finishes.
     let globals_cleanup = Rc::clone(&globals);
 

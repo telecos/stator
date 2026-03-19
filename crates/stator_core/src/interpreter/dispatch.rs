@@ -3109,8 +3109,47 @@ fn handle_lda_global(
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
         return Err(err_bad_operand("LdaGlobal", 0));
     };
+
+    // Fast path: global variable IC — O(1) Vec index.
+    let ic_hit = ctx
+        .frame
+        .global_ic
+        .as_ref()
+        .and_then(|ic| ic.get(&name_idx).copied());
+    if let Some((slot_idx, cached_gen)) = ic_hit {
+        let env = ctx.frame.global_env.borrow();
+        if env.generation() == cached_gen {
+            let value = env.get_by_index(slot_idx).clone();
+            drop(env);
+            // TheHole means uninitialized `this` — fall through to slow path
+            // which produces the proper ReferenceError.
+            if value != JsValue::TheHole {
+                ctx.frame.sync_hot_accumulator(&value);
+                ctx.frame.accumulator = value;
+                return Ok(DispatchAction::Continue);
+            }
+        }
+    }
+
+    // Slow path: resolve name and use load_global (hash cache + HashMap).
     let name = ctx.frame.get_string_constant(name_idx)?;
     let value = ctx.frame.load_global(name.as_ref())?;
+
+    // Populate IC on miss.
+    {
+        let env = ctx.frame.global_env.borrow();
+        let slot_gen = env
+            .slot_index_for(name.as_ref())
+            .map(|idx| (idx, env.generation()));
+        drop(env);
+        if let Some((slot_idx, cached_gen)) = slot_gen {
+            ctx.frame
+                .global_ic
+                .get_or_insert_with(Box::default)
+                .insert(name_idx, (slot_idx, cached_gen));
+        }
+    }
+
     ctx.frame.sync_hot_accumulator(&value);
     ctx.frame.accumulator = value;
     Ok(DispatchAction::Continue)
@@ -3128,6 +3167,23 @@ fn handle_lda_global_inside_typeof(
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
         return Err(err_bad_operand("LdaGlobalInsideTypeof", 0));
     };
+
+    // Fast path: global variable IC — O(1) Vec index.
+    let ic_hit = ctx
+        .frame
+        .global_ic
+        .as_ref()
+        .and_then(|ic| ic.get(&name_idx).copied());
+    if let Some((slot_idx, cached_gen)) = ic_hit {
+        let env = ctx.frame.global_env.borrow();
+        if env.generation() == cached_gen {
+            let value = env.get_by_index(slot_idx).clone();
+            drop(env);
+            ctx.frame.accumulator = value;
+            return Ok(DispatchAction::Continue);
+        }
+    }
+
     let name = ctx.frame.get_string_constant(name_idx)?;
     // Fast path: check per-frame global cache.
     if let Some(val) = ctx.frame.global_cache_get(name.as_ref()) {
@@ -3143,6 +3199,22 @@ fn handle_lda_global_inside_typeof(
         .cloned()
         .unwrap_or(JsValue::Undefined);
     ctx.frame.global_cache_put(name.as_ref(), val.clone());
+
+    // Populate IC on miss.
+    {
+        let env = ctx.frame.global_env.borrow();
+        let slot_gen = env
+            .slot_index_for(name.as_ref())
+            .map(|idx| (idx, env.generation()));
+        drop(env);
+        if let Some((slot_idx, cached_gen)) = slot_gen {
+            ctx.frame
+                .global_ic
+                .get_or_insert_with(Box::default)
+                .insert(name_idx, (slot_idx, cached_gen));
+        }
+    }
+
     ctx.frame.accumulator = val;
     Ok(DispatchAction::Continue)
 }
@@ -3165,7 +3237,17 @@ fn handle_sta_global(
     }
     set_function_name_if_missing(&val, &name);
     env.insert(name.to_string(), val.clone());
+    let slot_gen = env.slot_index_for(&name).map(|idx| (idx, env.generation()));
     drop(env);
+
+    // Populate/update IC so subsequent loads hit the fast path.
+    if let Some((slot_idx, cached_gen)) = slot_gen {
+        ctx.frame
+            .global_ic
+            .get_or_insert_with(Box::default)
+            .insert(name_idx, (slot_idx, cached_gen));
+    }
+
     // Keep the global cache in sync with the HashMap.
     ctx.frame.global_cache_put(&name, val);
     Ok(DispatchAction::Continue)
@@ -6788,10 +6870,7 @@ fn handle_call_direct_eval(
         for (name, reg) in &binding_registers {
             eval_bindings.insert(name.clone(), ctx.frame.read_reg(*reg as u32)?.clone());
         }
-        let eval_env = Rc::new(RefCell::new(GlobalEnv {
-            vars: eval_bindings,
-            generation: 0,
-        }));
+        let eval_env = Rc::new(RefCell::new(GlobalEnv::with_vars(eval_bindings)));
         let (result, final_env, is_strict) =
             crate::builtins::global::global_eval_direct_with_scope_capture(
                 &source,
