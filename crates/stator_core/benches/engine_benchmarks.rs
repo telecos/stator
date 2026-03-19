@@ -34,11 +34,23 @@ use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_core::error::StatorResult;
 use stator_core::gc::handle::HandleScope;
 use stator_core::gc::heap::{Heap, HeapObject};
-use stator_core::interpreter::{Interpreter, InterpreterFrame};
+use stator_core::interpreter::{GlobalEnv, Interpreter, InterpreterFrame};
 use stator_core::objects::property_map::PropertyMap;
 use stator_core::objects::tagged::TaggedValue;
 use stator_core::objects::value::JsValue;
 use stator_core::parser::recursive_descent;
+
+/// Create a shared [`GlobalEnv`] with builtins pre-installed.
+///
+/// Benchmarks should call this **once** before the timing loop and pass
+/// the returned `Rc<RefCell<GlobalEnv>>` to
+/// [`InterpreterFrame::new_with_globals`] in each iteration.  This avoids
+/// the ~3 ms cost of `install_globals()` on every iteration.
+fn make_global_env() -> Rc<RefCell<GlobalEnv>> {
+    let mut env = GlobalEnv::new();
+    stator_core::builtins::install_globals::install_globals(&mut env.vars);
+    Rc::new(RefCell::new(env))
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -693,9 +705,11 @@ fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
     "#;
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    let env = make_global_env();
     c.bench_function("arithmetic_loop_10k_precompiled", |b| {
         b.iter(|| {
-            let mut frame = InterpreterFrame::new(bytecode.clone(), vec![]);
+            let mut frame =
+                InterpreterFrame::new_with_globals(bytecode.clone(), vec![], Rc::clone(&env));
             black_box(Interpreter::run(&mut frame).unwrap());
         });
     });
@@ -736,9 +750,11 @@ fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
     "#;
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    let env = make_global_env();
     c.bench_function("fib_40_iterative_precompiled", |b| {
         b.iter(|| {
-            let mut frame = InterpreterFrame::new(bytecode.clone(), vec![]);
+            let mut frame =
+                InterpreterFrame::new_with_globals(bytecode.clone(), vec![], Rc::clone(&env));
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
@@ -755,9 +771,11 @@ fn bench_property_access_1k_precompiled(c: &mut Criterion) {
     "#;
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    let env = make_global_env();
     c.bench_function("property_access_1k_precompiled", |b| {
         b.iter(|| {
-            let mut frame = InterpreterFrame::new(bytecode.clone(), vec![]);
+            let mut frame =
+                InterpreterFrame::new_with_globals(bytecode.clone(), vec![], Rc::clone(&env));
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
@@ -773,9 +791,11 @@ fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
     "#;
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    let env = make_global_env();
     c.bench_function("object_creation_1k_precompiled", |b| {
         b.iter(|| {
-            let mut frame = InterpreterFrame::new(bytecode.clone(), vec![]);
+            let mut frame =
+                InterpreterFrame::new_with_globals(bytecode.clone(), vec![], Rc::clone(&env));
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
@@ -795,9 +815,11 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
     "#;
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    let env = make_global_env();
     c.bench_function("array_push_sum_1k_precompiled", |b| {
         b.iter(|| {
-            let mut frame = InterpreterFrame::new(bytecode.clone(), vec![]);
+            let mut frame =
+                InterpreterFrame::new_with_globals(bytecode.clone(), vec![], Rc::clone(&env));
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
@@ -818,9 +840,11 @@ fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
     "#;
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    let env = make_global_env();
     c.bench_function("closure_counter_1k_precompiled", |b| {
         b.iter(|| {
-            let mut frame = InterpreterFrame::new(bytecode.clone(), vec![]);
+            let mut frame =
+                InterpreterFrame::new_with_globals(bytecode.clone(), vec![], Rc::clone(&env));
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
@@ -843,9 +867,11 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
     "#;
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    let env = make_global_env();
     c.bench_function("prototype_chain_1k_precompiled", |b| {
         b.iter(|| {
-            let mut frame = InterpreterFrame::new(bytecode.clone(), vec![]);
+            let mut frame =
+                InterpreterFrame::new_with_globals(bytecode.clone(), vec![], Rc::clone(&env));
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
@@ -873,9 +899,11 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
     "#;
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    let env = make_global_env();
     c.bench_function("sieve_primes_1k_precompiled", |b| {
         b.iter(|| {
-            let mut frame = InterpreterFrame::new(bytecode.clone(), vec![]);
+            let mut frame =
+                InterpreterFrame::new_with_globals(bytecode.clone(), vec![], Rc::clone(&env));
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
@@ -892,9 +920,11 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
     "#;
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    let env = make_global_env();
     c.bench_function("deep_object_access_1k_precompiled", |b| {
         b.iter(|| {
-            let mut frame = InterpreterFrame::new(bytecode.clone(), vec![]);
+            let mut frame =
+                InterpreterFrame::new_with_globals(bytecode.clone(), vec![], Rc::clone(&env));
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
