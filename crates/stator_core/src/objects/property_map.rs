@@ -232,6 +232,9 @@ pub struct PropertyMap {
     layout_id: u64,
     /// Whether new properties may be added to this object (§10.1 `[[Extensible]]`).
     pub extensible: bool,
+    /// Whether this map contains any accessor properties (`__get_*__` or `__set_*__` keys).
+    /// Once set to `true` it is never cleared, so it is a conservative over-approximation.
+    pub has_accessors: bool,
 }
 
 impl PartialEq for PropertyMap {
@@ -242,6 +245,7 @@ impl PartialEq for PropertyMap {
             && self.integer_key_count == other.integer_key_count
             && self.index == other.index
             && self.extensible == other.extensible
+            && self.has_accessors == other.has_accessors
     }
 }
 
@@ -271,6 +275,7 @@ impl PropertyMap {
             shape_id: NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed),
             layout_id: layout_hash(&[], &[]),
             extensible: true,
+            has_accessors: false,
         }
     }
 
@@ -472,6 +477,9 @@ impl PropertyMap {
     /// Inserts a new property at `pos`, updating indices and integer-key
     /// bookkeeping as needed.
     fn insert_new(&mut self, key: String, value: JsValue, attrs: PropertyAttributes, pos: usize) {
+        if key.starts_with("__get_") || key.starts_with("__set_") {
+            self.has_accessors = true;
+        }
         let is_integer_key = parse_integer_index(&key).is_some();
         self.index_shift_right(pos);
         if let PropertyIndex::Map(index) = &mut self.index {
