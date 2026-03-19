@@ -505,6 +505,23 @@ fn write_jsvalue(buf: &mut Vec<u8>, value: &JsValue, ctx: &mut SerContext) {
                 }
             }
         }
+        JsValue::SmiArray(rc) => {
+            let addr = Rc::as_ptr(rc) as *const () as usize;
+            if let Some(id) = ctx.track_ptr(addr) {
+                write_u8(buf, TAG_BACK_REF);
+                write_u32(buf, id);
+            } else {
+                let id = ctx.next_id - 1;
+                write_u8(buf, TAG_DEFINE_REF);
+                write_u32(buf, id);
+                write_u8(buf, TAG_ARRAY);
+                let items = value.dense_array_clone().unwrap_or_default();
+                write_u32(buf, items.len() as u32);
+                for item in &items {
+                    write_jsvalue(buf, item, ctx);
+                }
+            }
+        }
         JsValue::PlainObject(rc) => {
             let addr = Rc::as_ptr(rc) as *const () as usize;
             if let Some(id) = ctx.track_ptr(addr) {

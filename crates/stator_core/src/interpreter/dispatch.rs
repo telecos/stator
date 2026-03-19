@@ -2247,6 +2247,9 @@ fn expand_spread_args(raw_args: impl IntoIterator<Item = JsValue>) -> CallArgs {
             JsValue::Array(items) => {
                 out.extend(items.borrow().iter().cloned());
             }
+            JsValue::SmiArray(_) => {
+                out.extend(arg.dense_array_clone().unwrap_or_default());
+            }
             JsValue::PlainObject(map) => {
                 let map_ref = map.borrow();
                 if map_ref.get("__is_array__").is_some() {
@@ -3347,6 +3350,7 @@ fn handle_lda_named_property(
     if slot != u32::MAX {
         let obj_ptr = match &obj {
             JsValue::Array(arr) => Some(Rc::as_ptr(arr) as usize),
+            JsValue::SmiArray(arr) => Some(Rc::as_ptr(arr) as usize),
             JsValue::Function(ba) => Some(Rc::as_ptr(ba) as usize),
             _ => None,
         };
@@ -3444,6 +3448,7 @@ fn handle_lda_named_property(
                             // Update polymorphic cache (borrows already dropped).
                             let obj_ptr = match &obj {
                                 JsValue::Array(arr) => Some(Rc::as_ptr(arr) as usize),
+                                JsValue::SmiArray(arr) => Some(Rc::as_ptr(arr) as usize),
                                 JsValue::Function(ba) => Some(Rc::as_ptr(ba) as usize),
                                 _ => None,
                             };
@@ -3490,6 +3495,7 @@ fn handle_lda_named_property(
     if slot != u32::MAX && inherited_proto_depth.is_none() {
         let obj_ptr = match &obj {
             JsValue::Array(arr) => Some(Rc::as_ptr(arr) as usize),
+            JsValue::SmiArray(arr) => Some(Rc::as_ptr(arr) as usize),
             JsValue::Function(ba) => Some(Rc::as_ptr(ba) as usize),
             _ => None,
         };
@@ -3707,20 +3713,24 @@ fn handle_sta_named_property(
             }
             fn_props_set(ba, prop_name.to_string(), val);
         }
-        JsValue::Array(ref arr) => {
+        JsValue::Array(_) => {
             if prop_name.as_ref() == "length" {
                 let new_len = val.to_number()?;
                 let new_len_u32 = new_len as u32;
                 if (new_len_u32 as f64) != new_len || new_len < 0.0 || !new_len.is_finite() {
                     return Err(StatorError::RangeError("Invalid array length".to_string()));
                 }
-                let mut v = arr.borrow_mut();
-                let current_len = v.len();
-                if (new_len_u32 as usize) < current_len {
-                    v.truncate(new_len_u32 as usize);
-                } else {
-                    v.resize(new_len_u32 as usize, JsValue::TheHole);
+                obj.dense_array_set_length(new_len_u32 as usize);
+            }
+        }
+        JsValue::SmiArray(_) => {
+            if prop_name.as_ref() == "length" {
+                let new_len = val.to_number()?;
+                let new_len_u32 = new_len as u32;
+                if (new_len_u32 as f64) != new_len || new_len < 0.0 || !new_len.is_finite() {
+                    return Err(StatorError::RangeError("Invalid array length".to_string()));
                 }
+                obj.dense_array_set_length(new_len_u32 as usize);
             }
         }
         JsValue::Error(ref e) => {
@@ -3758,11 +3768,10 @@ fn handle_lda_keyed_property(
                 return Ok(DispatchAction::Continue);
             }
             // Fall through for missing elements (prototype chain)
-        } else if let JsValue::Array(items) = obj {
-            let borrow = items.borrow();
-            let i = idx_val as usize;
-            let result = borrow.get(i).cloned().unwrap_or(JsValue::Undefined);
-            drop(borrow);
+        } else if matches!(obj, JsValue::Array(_) | JsValue::SmiArray(_)) {
+            let result = obj
+                .dense_array_get(idx_val as usize)
+                .unwrap_or(JsValue::Undefined);
             ctx.frame.accumulator = result;
             return Ok(DispatchAction::Continue);
         }
@@ -3820,15 +3829,8 @@ fn handle_sta_keyed_property(
                 m.insert("length".to_owned(), JsValue::Smi((i + 1) as i32));
             }
             return Ok(DispatchAction::Continue);
-        } else if let JsValue::Array(items) = obj_ref {
-            let items_rc = Rc::clone(items);
-            let val = ctx.frame.accumulator.clone();
-            let i = idx_val as usize;
-            let mut v = items_rc.borrow_mut();
-            if i >= v.len() {
-                v.resize(i + 1, JsValue::Undefined);
-            }
-            v[i] = val;
+        } else if matches!(obj_ref, JsValue::Array(_) | JsValue::SmiArray(_)) {
+            obj_ref.dense_array_set_index(idx_val as usize, ctx.frame.accumulator.clone());
             return Ok(DispatchAction::Continue);
         }
     }
@@ -3957,6 +3959,21 @@ fn handle_get_iterator(
                 .collect();
             JsValue::Iterator(NativeIterator::from_items(items_vec))
         }
+        JsValue::SmiArray(_) => {
+            let items_vec = iterable
+                .dense_array_clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|value| {
+                    if value.is_the_hole() {
+                        JsValue::Undefined
+                    } else {
+                        value
+                    }
+                })
+                .collect();
+            JsValue::Iterator(NativeIterator::from_items(items_vec))
+        }
         JsValue::String(ref s) => JsValue::Iterator(NativeIterator::from_string(s)),
         // Generators and existing iterators pass through unchanged.
         JsValue::Generator(_) | JsValue::Iterator(_) => iterable,
@@ -4049,6 +4066,10 @@ fn handle_get_async_iterator(
     ctx.frame.accumulator = match iterable {
         JsValue::Array(items) => {
             let items_vec: Vec<JsValue> = items.borrow().clone();
+            normalize_async_iterator(JsValue::Iterator(NativeIterator::from_items(items_vec)))
+        }
+        JsValue::SmiArray(_) => {
+            let items_vec = iterable.dense_array_clone().unwrap_or_default();
             normalize_async_iterator(JsValue::Iterator(NativeIterator::from_items(items_vec)))
         }
         JsValue::String(ref s) => {
@@ -4357,6 +4378,16 @@ fn handle_copy_data_properties(
                     t.borrow_mut().insert(i.to_string(), v.clone());
                 }
             }
+            JsValue::SmiArray(_) => {
+                for (i, v) in source
+                    .dense_array_clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .enumerate()
+                {
+                    t.borrow_mut().insert(i.to_string(), v);
+                }
+            }
             JsValue::String(s) => {
                 for i in 0..utf16_len(s) {
                     t.borrow_mut().insert(
@@ -4506,7 +4537,9 @@ fn handle_type_of(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResu
         JsValue::Symbol(_) => "symbol",
         JsValue::BigInt(_) => "bigint",
         JsValue::Function(_) | JsValue::NativeFunction(_) => "function",
-        JsValue::Object(_) | JsValue::Array(_) | JsValue::Error(_) => "object",
+        JsValue::Object(_) | JsValue::Array(_) | JsValue::SmiArray(_) | JsValue::Error(_) => {
+            "object"
+        }
         JsValue::PlainObject(map) => {
             if map.borrow().get("__call__").is_some() {
                 "function"
@@ -4559,6 +4592,7 @@ fn handle_test_type_of(
             JsValue::Null
             | JsValue::Object(_)
             | JsValue::Array(_)
+            | JsValue::SmiArray(_)
             | JsValue::Error(_)
             | JsValue::Generator(_)
             | JsValue::Iterator(_)
@@ -4623,6 +4657,7 @@ fn handle_to_object(
         // Objects, arrays, and other reference types stay as-is.
         JsValue::PlainObject(_)
         | JsValue::Array(_)
+        | JsValue::SmiArray(_)
         | JsValue::Function(_)
         | JsValue::NativeFunction(_)
         | JsValue::Promise(_)
@@ -4815,7 +4850,7 @@ fn handle_create_empty_array_literal(
     // O(1) JsValue::Array fast-paths in handle_lda_keyed_property,
     // handle_sta_keyed_property, and proto_lookup instead of going through
     // PropertyMap with string-keyed indices.
-    ctx.frame.accumulator = JsValue::Array(Rc::new(RefCell::new(Vec::new())));
+    ctx.frame.accumulator = JsValue::new_array(Vec::new());
     Ok(DispatchAction::Continue)
 }
 
@@ -4826,7 +4861,7 @@ fn handle_create_array_literal(
     // operands: [ConstantPoolIdx, FeedbackSlot, Flag]
     //
     // Dense Vec storage — see handle_create_empty_array_literal for rationale.
-    ctx.frame.accumulator = JsValue::Array(Rc::new(RefCell::new(Vec::new())));
+    ctx.frame.accumulator = JsValue::new_array(Vec::new());
     Ok(DispatchAction::Continue)
 }
 
@@ -4885,6 +4920,7 @@ fn handle_create_array_from_iterable(
     let iterable = ctx.frame.accumulator.clone();
     let items: Vec<JsValue> = match &iterable {
         JsValue::Array(arr) => arr.borrow().clone(),
+        JsValue::SmiArray(_) => iterable.dense_array_clone().unwrap_or_default(),
         JsValue::Iterator(iter) => {
             let mut out = Vec::new();
             loop {
@@ -4976,7 +5012,7 @@ fn handle_create_array_from_iterable(
         }
     };
     // Dense Vec storage — avoids PropertyMap string-keyed overhead.
-    ctx.frame.accumulator = JsValue::Array(Rc::new(RefCell::new(items)));
+    ctx.frame.accumulator = JsValue::new_array(items);
     Ok(DispatchAction::Continue)
 }
 
@@ -5085,14 +5121,10 @@ fn handle_sta_in_array_literal(
     let arr = ctx.frame.read_reg(arr_v)?.clone();
     let key = ctx.frame.read_reg(idx_v)?.clone();
     let val = ctx.frame.accumulator.clone();
-    if let JsValue::Array(ref items) = arr {
+    if matches!(arr, JsValue::Array(_) | JsValue::SmiArray(_)) {
         // Dense path: direct Vec index set, no string conversion.
         if let Some(idx) = to_array_index(&key) {
-            let mut v = items.borrow_mut();
-            if idx >= v.len() {
-                v.resize(idx + 1, JsValue::Undefined);
-            }
-            v[idx] = val;
+            arr.dense_array_set_index(idx, val);
         }
     } else if let JsValue::PlainObject(ref map) = arr {
         let idx_str = to_property_key(&key)?;
@@ -5262,7 +5294,7 @@ fn handle_test_instance_of(
         type BuiltinCheck = (&'static str, fn(&JsValue) -> bool);
         let builtin_checks: &[BuiltinCheck] = &[
             ("Array", |v| {
-                matches!(v, JsValue::Array(_))
+                matches!(v, JsValue::Array(_) | JsValue::SmiArray(_))
                     || matches!(v, JsValue::PlainObject(m) if m.borrow().get("__is_array__").is_some())
             }),
             ("Function", |v| {
@@ -5392,6 +5424,20 @@ fn handle_test_in(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
                 !matches!(proto_lookup(&object, &prop), JsValue::Undefined)
             }
         }
+        JsValue::SmiArray(_) => {
+            if let JsValue::String(s) = key
+                && &**s == "length"
+            {
+                true
+            } else if let Some(idx) = to_array_index(key) {
+                object
+                    .dense_array_get(idx)
+                    .is_some_and(|value| !value.is_the_hole())
+            } else {
+                let prop = to_property_key(key)?;
+                !matches!(proto_lookup(&object, &prop), JsValue::Undefined)
+            }
+        }
         JsValue::TypedArray(ta) => {
             // TypedArray: numeric indices check bounds, "length" is always present.
             if let JsValue::String(s) = key
@@ -5503,6 +5549,9 @@ fn handle_for_in_enumerate(
         JsValue::Array(items) => (0..items.borrow().len())
             .map(|i| JsValue::String(i.to_string().into()))
             .collect(),
+        JsValue::SmiArray(_) => (0..obj.dense_array_len().unwrap_or(0))
+            .map(|i| JsValue::String(i.to_string().into()))
+            .collect(),
         // for...in on a string enumerates character indices ("0", "1", …).
         JsValue::String(s) => (0..utf16_len(s))
             .map(|i| JsValue::String(i.to_string().into()))
@@ -5568,6 +5617,7 @@ fn handle_for_in_prepare(
     let keys = ctx.frame.read_reg(keys_v)?.clone();
     let len = match &keys {
         JsValue::Array(items) => items.borrow().len() as i32,
+        JsValue::SmiArray(_) => keys.dense_array_len().unwrap_or(0) as i32,
         _ => 0,
     };
     ctx.frame.accumulator = JsValue::Smi(len);
@@ -5600,6 +5650,7 @@ fn handle_for_in_next(
             .get(idx)
             .cloned()
             .unwrap_or(JsValue::Undefined),
+        JsValue::SmiArray(_) => keys.dense_array_get(idx).unwrap_or(JsValue::Undefined),
         _ => JsValue::Undefined,
     };
     ctx.frame.accumulator = match key {
@@ -5680,15 +5731,12 @@ fn handle_delete_property_sloppy(
             // Non-existent property: return true per spec.
             true
         }
-    } else if let JsValue::Array(ref items) = obj {
+    } else if matches!(obj, JsValue::Array(_) | JsValue::SmiArray(_)) {
         if key == "length" {
             // "length" is non-configurable on arrays.
             false
         } else if let Ok(idx) = key.parse::<usize>() {
-            let mut arr = items.borrow_mut();
-            if idx < arr.len() {
-                arr[idx] = JsValue::TheHole;
-            }
+            obj.dense_array_delete_index(idx);
             true
         } else {
             true
@@ -5726,17 +5774,14 @@ fn handle_delete_property_strict(
         }
         drop(pm);
         map.borrow_mut().remove(&key);
-    } else if let JsValue::Array(ref items) = obj {
+    } else if matches!(obj, JsValue::Array(_) | JsValue::SmiArray(_)) {
         if key == "length" {
             return Err(StatorError::TypeError(
                 "Cannot delete property 'length' of array".to_string(),
             ));
         }
         if let Ok(idx) = key.parse::<usize>() {
-            let mut arr = items.borrow_mut();
-            if idx < arr.len() {
-                arr[idx] = JsValue::TheHole;
-            }
+            obj.dense_array_delete_index(idx);
         }
     }
     ctx.frame.accumulator = JsValue::Boolean(true);
@@ -6825,6 +6870,22 @@ fn handle_create_object_from_iterable(
             m.insert(
                 "length".to_string(),
                 JsValue::Smi(arr.borrow().len() as i32),
+            );
+            m
+        }
+        JsValue::SmiArray(_) => {
+            let mut m = PropertyMap::new();
+            for (i, v) in iterable
+                .dense_array_clone()
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+            {
+                m.insert(i.to_string(), v);
+            }
+            m.insert(
+                "length".to_string(),
+                JsValue::Smi(iterable.dense_array_len().unwrap_or(0) as i32),
             );
             m
         }

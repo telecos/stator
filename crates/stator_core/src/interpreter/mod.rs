@@ -4770,6 +4770,30 @@ fn dispatch_fast_array_method(
             };
             Ok(Some(result))
         }
+        JsValue::SmiArray(_) => {
+            let result = match method_name {
+                "push" => JsValue::Smi(this_val.dense_array_push(args).unwrap_or(0) as i32),
+                "pop" => this_val.dense_array_pop().unwrap_or(JsValue::Undefined),
+                "indexOf" => {
+                    let search = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    let from =
+                        normalize_from_index(this_val.dense_array_len().unwrap_or(0), args.get(1));
+                    JsValue::Smi(this_val.dense_array_index_of(&search, from).unwrap_or(-1))
+                }
+                "includes" => {
+                    let search = args.first().cloned().unwrap_or(JsValue::Undefined);
+                    let from =
+                        normalize_from_index(this_val.dense_array_len().unwrap_or(0), args.get(1));
+                    JsValue::Boolean(
+                        this_val
+                            .dense_array_includes(&search, from)
+                            .unwrap_or(false),
+                    )
+                }
+                _ => return Ok(None),
+            };
+            Ok(Some(result))
+        }
         JsValue::PlainObject(map) => {
             let is_array = {
                 let borrow = map.borrow();
@@ -4846,6 +4870,14 @@ fn try_fast_named_property_lookup(obj: &JsValue, key: &str) -> Option<JsValue> {
     match obj {
         JsValue::Array(arr) => match key {
             "length" => Some(JsValue::Smi(arr.borrow().len() as i32)),
+            "push" => Some(make_fast_array_method(obj, "push", 1)),
+            "pop" => Some(make_fast_array_method(obj, "pop", 0)),
+            "indexOf" => Some(make_fast_array_method(obj, "indexOf", 1)),
+            "includes" => Some(make_fast_array_method(obj, "includes", 1)),
+            _ => None,
+        },
+        JsValue::SmiArray(_) => match key {
+            "length" => Some(JsValue::Smi(obj.dense_array_len().unwrap_or(0) as i32)),
             "push" => Some(make_fast_array_method(obj, "push", 1)),
             "pop" => Some(make_fast_array_method(obj, "pop", 0)),
             "indexOf" => Some(make_fast_array_method(obj, "indexOf", 1)),
@@ -7790,6 +7822,37 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             _ => {}
         }
     }
+    if let JsValue::SmiArray(_) = obj {
+        if key == "length" {
+            return JsValue::Smi(obj.dense_array_len().unwrap_or(0) as i32);
+        }
+        if matches!(key, "push" | "pop" | "indexOf" | "includes") {
+            let length = if key == "pop" { 0 } else { 1 };
+            return make_fast_array_method(obj, key, length);
+        }
+
+        let arr = JsValue::Array(Rc::new(RefCell::new(
+            obj.dense_array_clone().unwrap_or_default(),
+        )));
+        let result = proto_lookup(&arr, key);
+        if matches!(
+            key,
+            "shift" | "unshift" | "splice" | "reverse" | "sort" | "fill" | "copyWithin"
+        ) && let JsValue::NativeFunction(ref inner_fn) = result
+            && let JsValue::Array(ref arr_ref) = arr
+        {
+            let inner_fn = Rc::clone(inner_fn);
+            let arr_ref = Rc::clone(arr_ref);
+            let original = obj.clone();
+            return JsValue::NativeFunction(Rc::new(move |args| {
+                let ret = inner_fn(args)?;
+                let elems = arr_ref.borrow().clone();
+                original.dense_array_replace(elems);
+                Ok(ret)
+            }));
+        }
+        return result;
+    }
     let mut current = obj.clone();
     for _ in 0..256 {
         if let JsValue::PlainObject(ref map) = current {
@@ -8381,6 +8444,18 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
             let prop_name = to_property_key(key)?;
             Ok(proto_lookup(obj, &prop_name))
         }
+        JsValue::SmiArray(_) => {
+            if let JsValue::String(s) = key
+                && &**s == "length"
+            {
+                return Ok(JsValue::Smi(obj.dense_array_len().unwrap_or(0) as i32));
+            }
+            if let Some(idx) = to_array_index(key) {
+                return Ok(obj.dense_array_get(idx).unwrap_or(JsValue::Undefined));
+            }
+            let prop_name = to_property_key(key)?;
+            Ok(proto_lookup(obj, &prop_name))
+        }
         JsValue::String(_) => {
             // "length" property
             if let JsValue::String(k) = key
@@ -8524,7 +8599,7 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
             let prop_name = to_property_key(key)?;
             fn_props_set(ba, prop_name, value);
         }
-        JsValue::Array(arr) => {
+        JsValue::Array(_) => {
             if let JsValue::String(s) = key
                 && &**s == "length"
             {
@@ -8533,20 +8608,23 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
                 if (new_len_u32 as f64) != new_len || new_len < 0.0 || !new_len.is_finite() {
                     return Err(StatorError::RangeError("Invalid array length".to_string()));
                 }
-                let mut v = arr.borrow_mut();
-                let current_len = v.len();
-                if (new_len_u32 as usize) < current_len {
-                    v.truncate(new_len_u32 as usize);
-                } else {
-                    v.resize(new_len_u32 as usize, JsValue::Undefined);
-                }
+                obj.dense_array_set_length(new_len_u32 as usize);
             } else if let Some(idx) = to_array_index(key) {
-                let mut v = arr.borrow_mut();
-                // Extend the array if needed
-                if idx >= v.len() {
-                    v.resize(idx + 1, JsValue::Undefined);
+                obj.dense_array_set_index(idx, value);
+            }
+        }
+        JsValue::SmiArray(_) => {
+            if let JsValue::String(s) = key
+                && &**s == "length"
+            {
+                let new_len = value.to_number()?;
+                let new_len_u32 = new_len as u32;
+                if (new_len_u32 as f64) != new_len || new_len < 0.0 || !new_len.is_finite() {
+                    return Err(StatorError::RangeError("Invalid array length".to_string()));
                 }
-                v[idx] = value;
+                obj.dense_array_set_length(new_len_u32 as usize);
+            } else if let Some(idx) = to_array_index(key) {
+                obj.dense_array_set_index(idx, value);
             }
         }
         JsValue::Error(e) => {
