@@ -420,7 +420,8 @@ impl PartialEq for JsValue {
             (Self::Boolean(a), Self::Boolean(b)) => a == b,
             (Self::Smi(a), Self::Smi(b)) => a == b,
             (Self::HeapNumber(a), Self::HeapNumber(b)) => a == b,
-            (Self::String(a), Self::String(b)) => a == b,
+            // Fast path: pointer equality for interned Rc<str> is O(1).
+            (Self::String(a), Self::String(b)) => Rc::ptr_eq(a, b) || **a == **b,
             (Self::Symbol(a), Self::Symbol(b)) => a == b,
             // Object identity — `JsValue::Object` holds a raw `*mut HeapObject`
             // pointer; equality is pointer equality (same allocation).
@@ -1269,7 +1270,8 @@ impl JsValue {
         match (self, other) {
             (Self::Undefined, Self::Undefined) | (Self::Null, Self::Null) => true,
             (Self::Boolean(a), Self::Boolean(b)) => a == b,
-            (Self::String(a), Self::String(b)) => a == b,
+            // Fast path: pointer equality for interned Rc<str> is O(1).
+            (Self::String(a), Self::String(b)) => Rc::ptr_eq(a, b) || **a == **b,
             (Self::Symbol(a), Self::Symbol(b)) => a == b,
             (Self::BigInt(a), Self::BigInt(b)) => a == b,
             // Numeric — IEEE 754: NaN !== NaN handled by f64 PartialEq.

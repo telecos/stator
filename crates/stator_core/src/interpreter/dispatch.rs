@@ -3113,14 +3113,7 @@ fn handle_sta_global(
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
         return Err(err_bad_operand("StaGlobal", 0));
     };
-    let name = match ctx.frame.bytecode_array.get_constant(name_idx) {
-        Some(ConstantPoolEntry::String(s)) => s.clone(),
-        _ => {
-            return Err(StatorError::Internal(
-                "StaGlobal: constant is not a string".into(),
-            ));
-        }
-    };
+    let name = ctx.frame.get_string_constant(name_idx)?;
     let val = ctx.frame.accumulator.clone();
     let mut env = ctx.frame.global_env.borrow_mut();
     // Strict mode: assigning to an undeclared variable is a ReferenceError.
@@ -3130,7 +3123,7 @@ fn handle_sta_global(
         )));
     }
     set_function_name_if_missing(&val, &name);
-    env.insert(name.clone(), val.clone());
+    env.insert(name.to_string(), val.clone());
     drop(env);
     // Keep the global cache in sync with the HashMap.
     ctx.frame.global_cache_put(&name, val);
@@ -5775,14 +5768,7 @@ fn handle_delete_lookup_slot(
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
         return Err(err_bad_operand("DeleteLookupSlot", 0));
     };
-    let name = match ctx.frame.bytecode_array.get_constant(name_idx) {
-        Some(ConstantPoolEntry::String(s)) => s.clone(),
-        _ => {
-            return Err(StatorError::Internal(
-                "DeleteLookupSlot: slot name is not a string".into(),
-            ));
-        }
-    };
+    let name = ctx.frame.get_string_constant(name_idx)?;
     ctx.frame.accumulator = if let Some(deleted) = delete_with_binding(&ctx.frame.context, &name) {
         JsValue::Boolean(deleted)
     } else {
@@ -5798,14 +5784,7 @@ fn handle_sta_lookup_slot(
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
         return Err(err_bad_operand("StaLookupSlot", 0));
     };
-    let name = match ctx.frame.bytecode_array.get_constant(name_idx) {
-        Some(ConstantPoolEntry::String(s)) => s.clone(),
-        _ => {
-            return Err(StatorError::Internal(
-                "StaLookupSlot: slot name is not a string".into(),
-            ));
-        }
-    };
+    let name = ctx.frame.get_string_constant(name_idx)?;
     let val = ctx.frame.accumulator.clone();
     if store_with_binding(&ctx.frame.context, &name, &val) {
         return Ok(DispatchAction::Continue);
@@ -5817,7 +5796,7 @@ fn handle_sta_lookup_slot(
             "{name} is not defined"
         )));
     }
-    env.insert(name.clone(), val.clone());
+    env.insert(name.to_string(), val.clone());
     drop(env);
     // Keep the global cache in sync with the HashMap.
     ctx.frame.global_cache_put(&name, val);
@@ -5831,14 +5810,7 @@ fn handle_lda_lookup_slot(
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
         return Err(err_bad_operand("LdaLookupSlot", 0));
     };
-    let name = match ctx.frame.bytecode_array.get_constant(name_idx) {
-        Some(ConstantPoolEntry::String(s)) => s.clone(),
-        _ => {
-            return Err(StatorError::Internal(
-                "LdaLookupSlot: slot name is not a string".into(),
-            ));
-        }
-    };
+    let name = ctx.frame.get_string_constant(name_idx)?;
     ctx.frame.accumulator = if let Some(value) = lookup_with_binding(&ctx.frame.context, &name) {
         value
     } else {
@@ -5861,14 +5833,7 @@ fn handle_lda_lookup_slot_inside_typeof(
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
         return Err(err_bad_operand("LdaLookupSlotInsideTypeof", 0));
     };
-    let name = match ctx.frame.bytecode_array.get_constant(name_idx) {
-        Some(ConstantPoolEntry::String(s)) => s.clone(),
-        _ => {
-            return Err(StatorError::Internal(
-                "LdaLookupSlotInsideTypeof: slot name is not a string".into(),
-            ));
-        }
-    };
+    let name = ctx.frame.get_string_constant(name_idx)?;
     ctx.frame.accumulator = lookup_with_binding(&ctx.frame.context, &name)
         .or_else(|| ctx.frame.global_env.borrow().get(&name).cloned())
         .unwrap_or(JsValue::Undefined);
@@ -5903,14 +5868,7 @@ fn handle_lda_lookup_context_slot(
     }
 
     // Slow path: fall back to global name-based lookup.
-    let name = match ctx.frame.bytecode_array.get_constant(name_idx) {
-        Some(ConstantPoolEntry::String(s)) => s.clone(),
-        _ => {
-            return Err(StatorError::Internal(
-                "LdaLookupContextSlot: slot name is not a string".into(),
-            ));
-        }
-    };
+    let name = ctx.frame.get_string_constant(name_idx)?;
     ctx.frame.accumulator = match ctx.frame.global_env.borrow().get(&name) {
         Some(v) => v.clone(),
         None => {
@@ -5951,14 +5909,7 @@ fn handle_lda_lookup_context_slot_inside_typeof(
     }
 
     // Slow path: fall back to global name-based lookup (undefined if missing).
-    let name = match ctx.frame.bytecode_array.get_constant(name_idx) {
-        Some(ConstantPoolEntry::String(s)) => s.clone(),
-        _ => {
-            return Err(StatorError::Internal(
-                "LdaLookupContextSlotInsideTypeof: slot name is not a string".into(),
-            ));
-        }
-    };
+    let name = ctx.frame.get_string_constant(name_idx)?;
     ctx.frame.accumulator = ctx
         .frame
         .global_env
@@ -5976,14 +5927,7 @@ fn handle_lda_lookup_global_slot(
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
         return Err(err_bad_operand("LdaLookupGlobalSlot", 0));
     };
-    let name = match ctx.frame.bytecode_array.get_constant(name_idx) {
-        Some(ConstantPoolEntry::String(s)) => s.clone(),
-        _ => {
-            return Err(StatorError::Internal(
-                "LdaLookupGlobalSlot: slot name is not a string".into(),
-            ));
-        }
-    };
+    let name = ctx.frame.get_string_constant(name_idx)?;
     // Fast path: check per-frame global cache.
     if let Some(val) = ctx.frame.global_cache_get(&name) {
         ctx.frame.accumulator = val.clone();
@@ -6012,14 +5956,7 @@ fn handle_lda_lookup_global_slot_inside_typeof(
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
         return Err(err_bad_operand("LdaLookupGlobalSlotInsideTypeof", 0));
     };
-    let name = match ctx.frame.bytecode_array.get_constant(name_idx) {
-        Some(ConstantPoolEntry::String(s)) => s.clone(),
-        _ => {
-            return Err(StatorError::Internal(
-                "LdaLookupGlobalSlotInsideTypeof: slot name is not a string".into(),
-            ));
-        }
-    };
+    let name = ctx.frame.get_string_constant(name_idx)?;
     // Fast path: check per-frame global cache.
     if let Some(val) = ctx.frame.global_cache_get(&name) {
         ctx.frame.accumulator = val.clone();
@@ -6048,14 +5985,7 @@ fn handle_lda_named_property_from_super(
     let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
         return Err(err_bad_operand("LdaNamedPropertyFromSuper", 1));
     };
-    let prop_name = match ctx.frame.bytecode_array.get_constant(name_idx) {
-        Some(ConstantPoolEntry::String(s)) => s.clone(),
-        _ => {
-            return Err(StatorError::Internal(
-                "LdaNamedPropertyFromSuper: property name is not a string".into(),
-            ));
-        }
-    };
+    let prop_name = ctx.frame.get_string_constant(name_idx)?;
     // The accumulator holds the lookup-start object for super property
     // access (HomeObject.[[Prototype]]).  The lookup must begin there,
     // NOT on `this` (the receiver), so that overridden methods on the
