@@ -211,6 +211,7 @@ pub use crate::objects::value::{
 type FnPropMap = Rc<RefCell<HashMap<String, JsValue>>>;
 type MonoLoadCache = HashMap<u32, (usize, JsValue)>;
 type PolyLoadCache = HashMap<u32, Vec<(usize, JsValue)>>;
+type ProtoLoadIcCache = HashMap<u32, ProtoLoadIc>;
 type StringCache = HashMap<u32, Rc<str>>;
 
 thread_local! {
@@ -1337,6 +1338,25 @@ impl MegamorphicIc {
     }
 }
 
+/// Cached result for a prototype-chain property load.
+///
+/// Stores the value found by walking the prototype chain, guarded by the
+/// receiver's layout and the prototype-chain generation counter.  When both
+/// match, the cached value can be returned without re-walking the chain.
+#[derive(Debug, Clone)]
+pub struct ProtoLoadIc {
+    /// Receiver layout observed when the cache entry was populated.
+    pub receiver_shape: u64,
+    /// Prototype-chain generation snapshot for the receiver.
+    pub proto_generation: u32,
+    /// Cached distance from receiver to the prototype that supplied the value.
+    pub proto_depth: u8,
+    /// Property key associated with the cached lookup.
+    pub property_key: Rc<str>,
+    /// Value returned by the inherited property lookup.
+    pub value: JsValue,
+}
+
 /// Small inline-buffered argument storage for interpreter function calls.
 pub type CallArgs = SmallVec<[JsValue; 4]>;
 
@@ -1644,6 +1664,10 @@ pub struct InterpreterFrame {
     /// property access for both own and prototype-chain properties.  Lazily
     /// allocated on first write.
     pub mega_load_ic: Option<Box<MegamorphicIc>>,
+    /// Prototype-chain inline cache for named property loads keyed by feedback slot.
+    /// Stores inherited lookup results guarded by the receiver's shape and
+    /// prototype-chain generation.
+    pub proto_load_ic: Option<Box<ProtoLoadIcCache>>,
     /// Shape-based megamorphic inline cache for named property stores.
     /// Mirrors `mega_load_ic`.  Lazily allocated on first write.
     pub mega_store_ic: Option<Box<MegamorphicIc>>,
@@ -1726,6 +1750,7 @@ impl InterpreterFrame {
             mono_load_cache: None,
             poly_load_cache: None,
             mega_load_ic: None,
+            proto_load_ic: None,
             mega_store_ic: None,
             string_cache: None,
             global_cache: [
@@ -1800,6 +1825,7 @@ impl InterpreterFrame {
             mono_load_cache: None,
             poly_load_cache: None,
             mega_load_ic: None,
+            proto_load_ic: None,
             mega_store_ic: None,
             string_cache: None,
             global_cache: [
@@ -1970,6 +1996,13 @@ impl InterpreterFrame {
     fn mega_load_ic_mut(&mut self) -> &mut MegamorphicIc {
         self.mega_load_ic
             .get_or_insert_with(|| Box::new(MegamorphicIc::new()))
+            .as_mut()
+    }
+
+    #[inline]
+    fn proto_load_ic_mut(&mut self) -> &mut ProtoLoadIcCache {
+        self.proto_load_ic
+            .get_or_insert_with(|| Box::new(HashMap::new()))
             .as_mut()
     }
 
@@ -3312,6 +3345,7 @@ impl Interpreter {
             mono_load_cache: None,
             poly_load_cache: None,
             mega_load_ic: None,
+            proto_load_ic: None,
             mega_store_ic: None,
             string_cache: None,
             global_cache: [
@@ -4951,6 +4985,48 @@ pub(super) fn to_property_key(key: &JsValue) -> StatorResult<String> {
     }
 }
 
+/// Extracts the prototype value from a [`PropertyMap`], checking both the
+/// internal prototype key and the user-visible `__proto__` key.
+#[inline]
+fn plain_object_proto_value(map: &PropertyMap) -> Option<JsValue> {
+    map.get(INTERNAL_PROTO_PROPERTY_KEY)
+        .or_else(|| map.get("__proto__"))
+        .cloned()
+}
+
+/// Walks the prototype chain starting from `current` and returns the depth
+/// (number of hops from the starting object) at which `key` is found.
+///
+/// Returns `None` if the key is not found before the chain ends or exceeds
+/// the maximum depth of 255.
+fn proto_lookup_chain_depth(current: &JsValue, key: &str) -> Option<u8> {
+    let mut current = current.clone();
+    for depth in 1..=u8::MAX {
+        if matches!(current, JsValue::Null | JsValue::Undefined) {
+            return None;
+        }
+        if let JsValue::PlainObject(ref map) = current {
+            let borrow = map.borrow();
+            if borrow.has_accessors {
+                let getter_key = format!("__get_{key}__");
+                if borrow.get(&getter_key).is_some() {
+                    return Some(depth);
+                }
+            }
+            if borrow.get(key).is_some() {
+                return Some(depth);
+            }
+            if let Some(proto) = plain_object_proto_value(&borrow) {
+                drop(borrow);
+                current = proto;
+                continue;
+            }
+        }
+        break;
+    }
+    None
+}
+
 /// Perform a keyed property load: `obj[key]`.
 ///
 /// Handles `PlainObject` (string keys), `Array` (integer keys + `"length"`),
@@ -4988,7 +5064,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             drop(borrow);
             return array_literal_proto_lookup(obj, key);
         }
-        let explicit_proto = borrow.get(INTERNAL_PROTO_PROPERTY_KEY).cloned();
+        let explicit_proto = plain_object_proto_value(&borrow);
         if key == "__proto__" {
             if let Some(proto) = explicit_proto.clone() {
                 return proto;
@@ -5050,7 +5126,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }
                 "constructor" => {
                     // Walk __proto__ chain to find constructor (set by finalize_ctor).
-                    if let Some(proto) = borrow.get(INTERNAL_PROTO_PROPERTY_KEY).cloned() {
+                    if let Some(proto) = plain_object_proto_value(&borrow) {
                         drop(borrow);
                         return proto_lookup(&proto, "constructor");
                     }
@@ -5102,9 +5178,8 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 {
                                     return Ok(g.clone());
                                 }
-                                match b.get(INTERNAL_PROTO_PROPERTY_KEY) {
+                                match plain_object_proto_value(&b) {
                                     Some(next) => {
-                                        let next = next.clone();
                                         drop(b);
                                         cur = next;
                                         continue;
@@ -5136,9 +5211,8 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 {
                                     return Ok(s.clone());
                                 }
-                                match b.get(INTERNAL_PROTO_PROPERTY_KEY) {
+                                match plain_object_proto_value(&b) {
                                     Some(next) => {
-                                        let next = next.clone();
                                         drop(b);
                                         cur = next;
                                         continue;
@@ -7662,8 +7736,7 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     };
                 }
             }
-            if let Some(proto) = borrow.get(INTERNAL_PROTO_PROPERTY_KEY) {
-                let next = proto.clone();
+            if let Some(next) = plain_object_proto_value(&borrow) {
                 drop(borrow);
                 current = next;
                 continue;
@@ -7776,8 +7849,7 @@ fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsVal
             if let Some(val) = borrow.get(key) {
                 return val.clone();
             }
-            if let Some(proto) = borrow.get(INTERNAL_PROTO_PROPERTY_KEY) {
-                let next = proto.clone();
+            if let Some(next) = plain_object_proto_value(&borrow) {
                 drop(borrow);
                 current = next;
                 continue;
@@ -12077,6 +12149,22 @@ mod tests {
     fn test_proto_lookup_non_object_returns_undefined() {
         assert_eq!(proto_lookup(&JsValue::Smi(42), "x"), JsValue::Undefined);
         assert_eq!(proto_lookup(&JsValue::Null, "x"), JsValue::Undefined);
+    }
+
+    #[test]
+    fn test_proto_lookup_chain_depth_counts_inherited_hops() {
+        let grandparent = make_plain_object(vec![("deep", JsValue::Smi(7))]);
+        let parent = make_plain_object(vec![("__proto__", grandparent)]);
+        let child = make_plain_object(vec![("__proto__", parent)]);
+        let JsValue::PlainObject(map) = child else {
+            panic!("expected plain object");
+        };
+        let proto = map
+            .borrow()
+            .get("__proto__")
+            .cloned()
+            .unwrap_or(JsValue::Null);
+        assert_eq!(proto_lookup_chain_depth(&proto, "deep"), Some(2));
     }
 
     #[test]
