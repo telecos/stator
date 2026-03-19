@@ -2329,6 +2329,102 @@ impl Interpreter {
                                     frame.accumulator = acc.clone();
                                     return Ok(frame.accumulator.clone());
                                 }
+                                Opcode::BitwiseOr | Opcode::BitwiseOrSmi => {
+                                    let (a, b) = if instr.opcode == Opcode::BitwiseOr {
+                                        let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                        let a = unsafe { acc.as_smi_unchecked() };
+                                        let b = unsafe {
+                                            frame.read_reg_unchecked(reg).as_smi_unchecked()
+                                        };
+                                        (a, b)
+                                    } else {
+                                        let a = unsafe { acc.as_smi_unchecked() };
+                                        let b = unsafe { operand_imm_unchecked(instr, 0) };
+                                        (a, b)
+                                    };
+                                    let result = a | b;
+                                    acc = JsValue::Smi(result);
+                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
+                                    continue 'dispatch;
+                                }
+                                Opcode::BitwiseAnd | Opcode::BitwiseAndSmi => {
+                                    let (a, b) = if instr.opcode == Opcode::BitwiseAnd {
+                                        let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                        let a = unsafe { acc.as_smi_unchecked() };
+                                        let b = unsafe {
+                                            frame.read_reg_unchecked(reg).as_smi_unchecked()
+                                        };
+                                        (a, b)
+                                    } else {
+                                        let a = unsafe { acc.as_smi_unchecked() };
+                                        let b = unsafe { operand_imm_unchecked(instr, 0) };
+                                        (a, b)
+                                    };
+                                    let result = a & b;
+                                    acc = JsValue::Smi(result);
+                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
+                                    continue 'dispatch;
+                                }
+                                Opcode::Inc => {
+                                    // SAFETY: In SMI mode, accumulator is Smi.
+                                    let val = unsafe { acc.as_smi_unchecked() };
+                                    match val.checked_add(1) {
+                                        Some(result) => {
+                                            acc = JsValue::Smi(result);
+                                            frame.hot_accumulator = NanBoxedValue::from_smi(result);
+                                        }
+                                        None => {
+                                            frame.smi_mode = false;
+                                            frame.loop_end_pc = 0;
+                                            let f = (val as f64) + 1.0;
+                                            acc = JsValue::HeapNumber(f);
+                                            frame.hot_accumulator = NanBoxedValue::from_double(f);
+                                        }
+                                    }
+                                    continue 'dispatch;
+                                }
+                                Opcode::Dec => {
+                                    // SAFETY: In SMI mode, accumulator is Smi.
+                                    let val = unsafe { acc.as_smi_unchecked() };
+                                    match val.checked_sub(1) {
+                                        Some(result) => {
+                                            acc = JsValue::Smi(result);
+                                            frame.hot_accumulator = NanBoxedValue::from_smi(result);
+                                        }
+                                        None => {
+                                            frame.smi_mode = false;
+                                            frame.loop_end_pc = 0;
+                                            let f = (val as f64) - 1.0;
+                                            acc = JsValue::HeapNumber(f);
+                                            frame.hot_accumulator = NanBoxedValue::from_double(f);
+                                        }
+                                    }
+                                    continue 'dispatch;
+                                }
+                                Opcode::Mod | Opcode::ModSmi => {
+                                    let (a, b) = if instr.opcode == Opcode::Mod {
+                                        let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                        let a = unsafe { acc.as_smi_unchecked() };
+                                        let b = unsafe {
+                                            frame.read_reg_unchecked(reg).as_smi_unchecked()
+                                        };
+                                        (a, b)
+                                    } else {
+                                        let a = unsafe { acc.as_smi_unchecked() };
+                                        let b = unsafe { operand_imm_unchecked(instr, 0) };
+                                        (a, b)
+                                    };
+                                    if b != 0 {
+                                        let result = a % b;
+                                        acc = JsValue::Smi(result);
+                                        frame.hot_accumulator = NanBoxedValue::from_smi(result);
+                                    } else {
+                                        acc = JsValue::HeapNumber(f64::NAN);
+                                        frame.smi_mode = false;
+                                        frame.loop_end_pc = 0;
+                                    }
+                                    continue 'dispatch;
+                                }
                                 _ => {
                                     // Unsupported opcode — exit SMI mode and let the
                                     // regular dispatch handle it.

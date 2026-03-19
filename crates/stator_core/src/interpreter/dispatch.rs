@@ -538,6 +538,7 @@ fn handle_sub(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     Ok(DispatchAction::Continue)
 }
 
+#[inline(always)]
 fn handle_mul(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
     let Operand::Register(v) = instr.operands[0] else {
         return Err(err_bad_operand("Mul", 0));
@@ -644,6 +645,7 @@ fn handle_exp(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     Ok(DispatchAction::Continue)
 }
 
+#[inline(always)]
 fn handle_bitwise_or(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -698,6 +700,7 @@ fn handle_bitwise_xor(
     Ok(DispatchAction::Continue)
 }
 
+#[inline(always)]
 fn handle_bitwise_and(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -1077,9 +1080,19 @@ fn handle_shift_right_logical_smi(
     Ok(DispatchAction::Continue)
 }
 
-#[inline]
+#[inline(always)]
 fn handle_inc(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<DispatchAction> {
     // operands[0] is a FeedbackSlot, ignored at runtime.
+    // Fast path: Smi increment without to_number() overhead.
+    if let JsValue::Smi(n) = ctx.frame.accumulator {
+        if let Some(result) = n.checked_add(1) {
+            ctx.frame.accumulator = JsValue::Smi(result);
+            return Ok(DispatchAction::Continue);
+        }
+        // Overflow: promote to HeapNumber.
+        ctx.frame.accumulator = JsValue::HeapNumber((n as f64) + 1.0);
+        return Ok(DispatchAction::Continue);
+    }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
         ctx.frame.accumulator = JsValue::BigInt(n.wrapping_add(1));
     } else {
@@ -1089,9 +1102,18 @@ fn handle_inc(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<D
     Ok(DispatchAction::Continue)
 }
 
-#[inline]
+#[inline(always)]
 fn handle_dec(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<DispatchAction> {
     // operands[0] is a FeedbackSlot, ignored at runtime.
+    // Fast path: Smi decrement without to_number() overhead.
+    if let JsValue::Smi(n) = ctx.frame.accumulator {
+        if let Some(result) = n.checked_sub(1) {
+            ctx.frame.accumulator = JsValue::Smi(result);
+            return Ok(DispatchAction::Continue);
+        }
+        ctx.frame.accumulator = JsValue::HeapNumber((n as f64) - 1.0);
+        return Ok(DispatchAction::Continue);
+    }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
         ctx.frame.accumulator = JsValue::BigInt(n.wrapping_sub(1));
     } else {
