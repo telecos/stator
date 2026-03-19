@@ -455,8 +455,9 @@ pub(crate) fn get_object_prototype(obj: &JsValue) -> Option<JsValue> {
 pub(crate) fn plain_object_has_own_property(map: &PropertyMap, key: &str) -> bool {
     key != INTERNAL_PROTO_PROPERTY_KEY
         && (map.contains_key(key)
-            || map.contains_key(&format!("__get_{key}__"))
-            || map.contains_key(&format!("__set_{key}__")))
+            || (map.has_accessors
+                && (map.contains_key(&format!("__get_{key}__"))
+                    || map.contains_key(&format!("__set_{key}__")))))
 }
 
 /// Returns `true` if `key` exists anywhere on `obj`'s prototype chain.
@@ -4474,13 +4475,15 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         // Check for getter accessor (__get_<key>__) BEFORE the data key so
         // that accessor properties defined via Object.defineProperty are
         // dispatched correctly even when a placeholder data key exists.
-        let getter_key = format!("__get_{key}__");
-        if let Some(getter) = borrow.get(&getter_key).cloned() {
-            drop(borrow);
-            return match dispatch_getter(&getter, obj) {
-                Ok(v) => v,
-                Err(_) => JsValue::Undefined,
-            };
+        if borrow.has_accessors {
+            let getter_key = format!("__get_{key}__");
+            if let Some(getter) = borrow.get(&getter_key).cloned() {
+                drop(borrow);
+                return match dispatch_getter(&getter, obj) {
+                    Ok(v) => v,
+                    Err(_) => JsValue::Undefined,
+                };
+            }
         }
         if let Some(val) = borrow.get(key) {
             return val.clone();
@@ -4597,14 +4600,18 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             Some(v) => js_to_string(v),
                             None => return Ok(JsValue::Undefined),
                         };
-                        let getter_key = format!("__get_{prop}__");
                         // Walk the prototype chain looking for the getter.
                         let mut cur = JsValue::PlainObject(Rc::clone(&map));
+                        let mut getter_key: Option<String> = None;
                         for _ in 0..256 {
                             if let JsValue::PlainObject(ref m) = cur {
                                 let b = m.borrow();
-                                if let Some(g) = b.get(&getter_key) {
-                                    return Ok(g.clone());
+                                if b.has_accessors {
+                                    let gk =
+                                        getter_key.get_or_insert_with(|| format!("__get_{prop}__"));
+                                    if let Some(g) = b.get(gk.as_str()) {
+                                        return Ok(g.clone());
+                                    }
                                 }
                                 match b.get(INTERNAL_PROTO_PROPERTY_KEY) {
                                     Some(next) => {
@@ -4630,13 +4637,17 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                             Some(v) => js_to_string(v),
                             None => return Ok(JsValue::Undefined),
                         };
-                        let setter_key = format!("__set_{prop}__");
                         let mut cur = JsValue::PlainObject(Rc::clone(&map));
+                        let mut setter_key: Option<String> = None;
                         for _ in 0..256 {
                             if let JsValue::PlainObject(ref m) = cur {
                                 let b = m.borrow();
-                                if let Some(s) = b.get(&setter_key) {
-                                    return Ok(s.clone());
+                                if b.has_accessors {
+                                    let sk =
+                                        setter_key.get_or_insert_with(|| format!("__set_{prop}__"));
+                                    if let Some(s) = b.get(sk.as_str()) {
+                                        return Ok(s.clone());
+                                    }
                                 }
                                 match b.get(INTERNAL_PROTO_PROPERTY_KEY) {
                                     Some(next) => {
@@ -7198,13 +7209,15 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             if let Some(val) = borrow.get(key) {
                 return val.clone();
             }
-            let getter_key = format!("__get_{key}__");
-            if let Some(getter) = borrow.get(&getter_key).cloned() {
-                drop(borrow);
-                return match dispatch_getter(&getter, obj) {
-                    Ok(v) => v,
-                    Err(_) => JsValue::Undefined,
-                };
+            if borrow.has_accessors {
+                let getter_key = format!("__get_{key}__");
+                if let Some(getter) = borrow.get(&getter_key).cloned() {
+                    drop(borrow);
+                    return match dispatch_getter(&getter, obj) {
+                        Ok(v) => v,
+                        Err(_) => JsValue::Undefined,
+                    };
+                }
             }
             if let Some(proto) = borrow.get(INTERNAL_PROTO_PROPERTY_KEY) {
                 let next = proto.clone();
@@ -7340,13 +7353,15 @@ fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsVal
             // Check for getter accessor BEFORE data key (same rationale
             // as proto_lookup: accessor properties may have a placeholder
             // data key that should not shadow the getter).
-            let getter_key = format!("__get_{key}__");
-            if let Some(getter) = borrow.get(&getter_key).cloned() {
-                drop(borrow);
-                return match dispatch_getter(&getter, this_obj) {
-                    Ok(v) => v,
-                    Err(_) => JsValue::Undefined,
-                };
+            if borrow.has_accessors {
+                let getter_key = format!("__get_{key}__");
+                if let Some(getter) = borrow.get(&getter_key).cloned() {
+                    drop(borrow);
+                    return match dispatch_getter(&getter, this_obj) {
+                        Ok(v) => v,
+                        Err(_) => JsValue::Undefined,
+                    };
+                }
             }
             if let Some(val) = borrow.get(key) {
                 return val.clone();
@@ -7824,23 +7839,25 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
             }
             // Check for setter accessor (__set_<key>__) first — accessor
             // properties take precedence over data properties.
-            let setter_key = format!("__set_{prop_name}__");
-            let getter_key = format!("__get_{prop_name}__");
-            {
-                let pm = map.borrow();
-                let has_setter = pm.contains_key(&setter_key);
-                let has_getter = pm.contains_key(&getter_key);
-                if has_setter {
-                    let setter_fn = pm.get(&setter_key).cloned();
-                    drop(pm);
-                    if let Some(setter) = setter_fn {
-                        dispatch_setter(&setter, obj, value)?;
+            if map.borrow().has_accessors {
+                let setter_key = format!("__set_{prop_name}__");
+                let getter_key = format!("__get_{prop_name}__");
+                {
+                    let pm = map.borrow();
+                    let has_setter = pm.contains_key(&setter_key);
+                    let has_getter = pm.contains_key(&getter_key);
+                    if has_setter {
+                        let setter_fn = pm.get(&setter_key).cloned();
+                        drop(pm);
+                        if let Some(setter) = setter_fn {
+                            dispatch_setter(&setter, obj, value)?;
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
-                }
-                if has_getter {
-                    // Getter-only accessor: silently ignore store (sloppy).
-                    return Ok(());
+                    if has_getter {
+                        // Getter-only accessor: silently ignore store (sloppy).
+                        return Ok(());
+                    }
                 }
             }
             // Existing non-writable property: silently ignore (sloppy mode).
