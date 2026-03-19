@@ -10181,7 +10181,7 @@ mod tests {
             // Rc tiering state, so the invocation counter and JIT cache are
             // visible through any clone.
             let inner_ba: &BytecodeArray = match outer_ba.constant_pool().first().unwrap() {
-                ConstantPoolEntry::Function(Rc::new(ba)) => ba,
+                ConstantPoolEntry::Function(rc_ba) => rc_ba.as_ref(),
                 _ => panic!("expected Function in constant pool"),
             };
             assert!(
@@ -10506,7 +10506,7 @@ mod tests {
         #[cfg(all(target_arch = "x86_64", unix))]
         {
             let inner_ba: &BytecodeArray = match outer_ba.constant_pool().first().unwrap() {
-                ConstantPoolEntry::Function(Rc::new(ba)) => ba,
+                ConstantPoolEntry::Function(rc_ba) => rc_ba.as_ref(),
                 _ => panic!("expected Function in constant pool"),
             };
 
@@ -10648,7 +10648,7 @@ mod tests {
         #[cfg(all(target_arch = "x86_64", unix))]
         {
             let inner_ba: &BytecodeArray = match outer_ba.constant_pool().first().unwrap() {
-                ConstantPoolEntry::Function(Rc::new(ba)) => ba,
+                ConstantPoolEntry::Function(rc_ba) => rc_ba.as_ref(),
                 _ => panic!("expected Function in constant pool"),
             };
 

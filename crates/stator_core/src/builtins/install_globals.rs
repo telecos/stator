@@ -23781,7 +23781,6 @@ mod tests {
 
     fn eval_module(src: &str) -> JsValue {
         use std::cell::RefCell;
-        use std::collections::HashMap;
         use std::rc::Rc;
 
         use crate::builtins::promise::{PromiseState, drain_active_microtask_queue};

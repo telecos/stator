@@ -360,7 +360,7 @@ mod tests {
     fn run(src: &str) -> Result<JsValue, stator_core::error::StatorError> {
         let bytecodes = parser::parse(src).and_then(|p| BytecodeGenerator::compile_program(&p))?;
         let globals = build_globals();
-        let mut frame = InterpreterFrame::new_with_globals(bytecodes, vec![], globals);
+        let mut frame = InterpreterFrame::new_with_globals(Rc::new(bytecodes), vec![], globals);
         Interpreter::run(&mut frame)
     }
 
