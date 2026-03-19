@@ -213,6 +213,7 @@ type MonoLoadCache = HashMap<u32, (usize, JsValue)>;
 type PolyLoadCache = HashMap<u32, Vec<(usize, JsValue)>>;
 type ProtoLoadIcCache = HashMap<u32, ProtoLoadIc>;
 type StringCache = HashMap<u32, Rc<str>>;
+type GlobalIcCache = HashMap<u32, (usize, u64)>;
 
 thread_local! {
     /// The currently-attached debugger for this thread, if any.
@@ -1416,6 +1417,10 @@ pub struct GlobalEnv {
     pub vars: HashMap<String, JsValue>,
     /// Monotonically increasing counter bumped on every mutation.
     pub generation: u64,
+    /// Indexed storage for O(1) access by slot index.
+    slots: Vec<JsValue>,
+    /// Maps global variable name to its slot index in `slots`.
+    name_to_index: HashMap<String, usize>,
 }
 
 impl GlobalEnv {
@@ -1424,12 +1429,33 @@ impl GlobalEnv {
         Self {
             vars: HashMap::new(),
             generation: 0,
+            slots: Vec::new(),
+            name_to_index: HashMap::new(),
         }
+    }
+
+    /// Create a `GlobalEnv` pre-populated with the given bindings.
+    pub fn with_vars(vars: HashMap<String, JsValue>) -> Self {
+        let mut env = Self {
+            vars,
+            generation: 0,
+            slots: Vec::new(),
+            name_to_index: HashMap::new(),
+        };
+        env.rebuild_slots();
+        env
     }
 
     /// Insert a value, bumping the generation counter.
     pub fn insert(&mut self, key: String, value: JsValue) {
-        self.vars.insert(key, value);
+        self.vars.insert(key.clone(), value.clone());
+        if let Some(&idx) = self.name_to_index.get(&key) {
+            self.slots[idx] = value;
+        } else {
+            let idx = self.slots.len();
+            self.slots.push(value);
+            self.name_to_index.insert(key, idx);
+        }
         self.generation = self.generation.wrapping_add(1);
     }
 
@@ -1437,6 +1463,9 @@ impl GlobalEnv {
     pub fn remove(&mut self, key: &str) -> Option<JsValue> {
         let removed = self.vars.remove(key);
         if removed.is_some() {
+            if let Some(idx) = self.name_to_index.remove(key) {
+                self.slots[idx] = JsValue::Undefined;
+            }
             self.generation = self.generation.wrapping_add(1);
         }
         removed
@@ -1455,6 +1484,39 @@ impl GlobalEnv {
     /// Get current generation.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Rebuild the indexed `slots` and `name_to_index` from `vars`.
+    ///
+    /// Call after bulk-inserting into `vars` directly (e.g. via
+    /// [`install_globals`](crate::builtins::install_globals::install_globals)).
+    pub fn rebuild_slots(&mut self) {
+        self.slots.clear();
+        self.name_to_index.clear();
+        self.slots.reserve(self.vars.len());
+        for (name, value) in &self.vars {
+            let idx = self.slots.len();
+            self.slots.push(value.clone());
+            self.name_to_index.insert(name.clone(), idx);
+        }
+    }
+
+    /// Get a value by slot index (O(1) Vec access).
+    #[inline(always)]
+    pub fn get_by_index(&self, idx: usize) -> &JsValue {
+        &self.slots[idx]
+    }
+
+    /// Set a value by slot index (O(1) Vec access).
+    #[inline(always)]
+    pub fn set_by_index(&mut self, idx: usize, value: JsValue) {
+        self.slots[idx] = value;
+    }
+
+    /// Look up the slot index for a global variable name.
+    #[inline(always)]
+    pub fn slot_index_for(&self, key: &str) -> Option<usize> {
+        self.name_to_index.get(key).copied()
     }
 }
 
@@ -1674,6 +1736,10 @@ pub struct InterpreterFrame {
     /// Pre-decoded string constants from the constant pool, keyed by index.
     /// Avoids repeated `String::clone()` from the constant pool.
     pub string_cache: Option<Box<StringCache>>,
+    /// Global variable inline cache: `constant_pool_idx → (slot_index, generation)`.
+    /// Maps bytecode constant-pool indices to indexed `GlobalEnv` slots for
+    /// O(1) global variable access.  Lazily allocated on first IC miss.
+    pub global_ic: Option<Box<GlobalIcCache>>,
     /// Cache of recently-accessed global variable values.
     /// Avoids repeated `Rc→RefCell→HashMap` lookups for hot globals.
     /// Format: `[(name_hash, name, value); 8]` — direct-mapped by hash.
@@ -1731,6 +1797,7 @@ impl InterpreterFrame {
         }
         let mut global_env = GlobalEnv::new();
         crate::builtins::install_globals::install_globals(&mut global_env.vars);
+        global_env.rebuild_slots();
         Self {
             bytecode_array,
             registers,
@@ -1753,6 +1820,7 @@ impl InterpreterFrame {
             proto_load_ic: None,
             mega_store_ic: None,
             string_cache: None,
+            global_ic: None,
             global_cache: [
                 (0, None, JsValue::Undefined),
                 (0, None, JsValue::Undefined),
@@ -1796,6 +1864,7 @@ impl InterpreterFrame {
             for (k, v) in defaults {
                 env.vars.entry(k).or_insert(v);
             }
+            env.rebuild_slots();
         }
         // Build the frame directly with the shared global_env, avoiding the
         // redundant install_globals call that `new()` would perform.
@@ -1828,6 +1897,7 @@ impl InterpreterFrame {
             proto_load_ic: None,
             mega_store_ic: None,
             string_cache: None,
+            global_ic: None,
             global_cache: [
                 (0, None, JsValue::Undefined),
                 (0, None, JsValue::Undefined),
@@ -3348,6 +3418,7 @@ impl Interpreter {
             proto_load_ic: None,
             mega_store_ic: None,
             string_cache: None,
+            global_ic: None,
             global_cache: [
                 (0, None, JsValue::Undefined),
                 (0, None, JsValue::Undefined),
