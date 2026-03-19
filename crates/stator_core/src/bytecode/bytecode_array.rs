@@ -51,6 +51,7 @@ use crate::bytecode::{
 };
 use crate::compiler::turbofan::TurbofanCompiledCode;
 use crate::error::{StatorError, StatorResult};
+use crate::objects::property_map::PropertyMap;
 use crate::objects::value::JsContext;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -119,6 +120,14 @@ pub enum ConstantPoolEntry {
         /// Raw template strings.
         raw: Vec<String>,
     },
+    /// A shape descriptor for [`Opcode::CreateObjectLiteral`](super::bytecodes::Opcode::CreateObjectLiteral).
+    ///
+    /// The runtime turns the keys into a cached [`PropertyMap`] template on
+    /// first execution and clones that template for subsequent allocations.
+    ObjectLiteralTemplate {
+        /// Property keys emitted for this literal site.
+        keys: Vec<String>,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -172,6 +181,7 @@ pub(crate) type JumpTargetMap = Vec<Option<usize>>;
 type DecodedBytecode = (Vec<Instruction>, Vec<usize>, JumpTargetMap);
 type DecodedBytecodeRef<'a> = (&'a [Instruction], &'a [usize], &'a [Option<usize>]);
 type DecodedBytecodeCache = Rc<OnceCell<Rc<DecodedBytecode>>>;
+type ObjectTemplateCache = Rc<RefCell<Vec<Option<PropertyMap>>>>;
 
 /// Shared Maglev JIT code cache stored in a [`BytecodeArray`].
 ///
@@ -258,6 +268,12 @@ pub struct BytecodeArray {
     /// executions of the same compiled function. Clones of this bytecode array
     /// share the cache so repeated calls observe the same identity.
     template_cache: Rc<RefCell<HashMap<u32, crate::objects::value::JsValue>>>,
+    /// Cached object-literal templates keyed by constant-pool index.
+    ///
+    /// Each cached entry stores a fully constructed [`PropertyMap`] with the
+    /// literal's keys already inserted. Executions clone the cached template
+    /// and only overwrite the slot values.
+    object_templates: ObjectTemplateCache,
     /// `true` if this bytecode belongs to a generator function (`function*`).
     ///
     /// When a generator function is *called*, the interpreter creates a fresh
@@ -331,7 +347,8 @@ impl PartialEq for BytecodeArray {
     /// Two [`BytecodeArray`]s are equal when their static bytecode and metadata
     /// are identical.  The tiering state (`invocation_count`, `jit_code`,
     /// `maglev_jit_code`, `turbofan_jit_code`) and runtime caches
-    /// (`template_cache`) are intentionally excluded from the comparison.
+    /// (`template_cache`, `object_templates`) are intentionally excluded from
+    /// the comparison.
     fn eq(&self, other: &Self) -> bool {
         self.bytecodes == other.bytecodes
             && self.constant_pool == other.constant_pool
@@ -376,6 +393,7 @@ impl BytecodeArray {
         feedback_metadata: FeedbackMetadata,
         handler_table: Vec<HandlerTableEntry>,
     ) -> Self {
+        let object_templates = vec![None; constant_pool.len()];
         Self {
             bytecodes,
             constant_pool,
@@ -390,6 +408,7 @@ impl BytecodeArray {
             handler_table: Rc::new(handler_table),
             cached_decode: Rc::new(OnceCell::new()),
             template_cache: Rc::new(RefCell::new(HashMap::new())),
+            object_templates: Rc::new(RefCell::new(object_templates)),
             is_generator: false,
             is_async: false,
             is_module: false,
@@ -429,6 +448,35 @@ impl BytecodeArray {
     #[cfg(test)]
     pub(crate) fn template_cache_len(&self) -> usize {
         self.template_cache.borrow().len()
+    }
+
+    /// Return a cloned cached object-literal template for `template_id`.
+    pub fn cached_object_template(&self, template_id: u32) -> Option<PropertyMap> {
+        self.object_templates
+            .borrow()
+            .get(template_id as usize)
+            .and_then(|entry| entry.as_ref().map(PropertyMap::clone_template))
+    }
+
+    /// Cache an object-literal template for `template_id`.
+    pub fn cache_object_template(&self, template_id: u32, template: PropertyMap) {
+        if let Some(slot) = self
+            .object_templates
+            .borrow_mut()
+            .get_mut(template_id as usize)
+        {
+            *slot = Some(template);
+        }
+    }
+
+    /// Return the number of cached object-literal templates.
+    #[cfg(test)]
+    pub(crate) fn object_template_cache_len(&self) -> usize {
+        self.object_templates
+            .borrow()
+            .iter()
+            .filter(|entry| entry.is_some())
+            .count()
     }
 
     /// Mark this [`BytecodeArray`] as belonging to a generator function.

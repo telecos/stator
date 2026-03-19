@@ -5340,10 +5340,28 @@ impl FunctionCompiler {
 
     /// Compile an object literal.
     fn compile_object(&mut self, o: &crate::parser::ast::ObjectExpr) -> StatorResult<()> {
-        self.emit(Instruction::new_unchecked(
-            Opcode::CreateEmptyObjectLiteral,
-            vec![],
-        ));
+        if let Some(keys) = Self::object_literal_template_keys(o) {
+            let key_count = u8::try_from(keys.len()).map_err(|_| {
+                StatorError::Internal(
+                    "object literal template exceeds Flag operand capacity".into(),
+                )
+            })?;
+            let template_idx = self.add_object_literal_template(keys);
+            let slot = self.alloc_slot(FeedbackSlotKind::Literal);
+            self.emit(Instruction::new_unchecked(
+                Opcode::CreateObjectLiteral,
+                vec![
+                    Operand::ConstantPoolIdx(template_idx),
+                    slot,
+                    Operand::Flag(key_count),
+                ],
+            ));
+        } else {
+            self.emit(Instruction::new_unchecked(
+                Opcode::CreateEmptyObjectLiteral,
+                vec![],
+            ));
+        }
         let obj_reg = self.allocator.allocate_temporary();
         self.emit_star(obj_reg);
 
@@ -5782,6 +5800,61 @@ impl FunctionCompiler {
         let cooked: Vec<Option<String>> = t.quasis.iter().map(|q| q.cooked.clone()).collect();
         let raw: Vec<String> = t.quasis.iter().map(|q| q.raw.clone()).collect();
         self.add_constant_raw(ConstantPoolEntry::TemplateObject { cooked, raw })
+    }
+
+    /// Add a [`ConstantPoolEntry::ObjectLiteralTemplate`] and return its index.
+    fn add_object_literal_template(&mut self, keys: Vec<String>) -> u32 {
+        self.add_constant_raw(ConstantPoolEntry::ObjectLiteralTemplate { keys })
+    }
+
+    fn object_literal_template_key(prop: &crate::parser::ast::Prop) -> Option<String> {
+        use crate::parser::ast::{PropKey, PropValue};
+
+        let key_name = match &prop.key {
+            PropKey::Ident(id) => Some(id.name.clone()),
+            PropKey::Str(s) => Some(s.value.clone()),
+            PropKey::Num(n) => {
+                let v = n.value;
+                if v.fract() == 0.0 && v.is_finite() && v >= 0.0 {
+                    Some(format!("{}", v as u64))
+                } else {
+                    Some(n.raw.clone())
+                }
+            }
+            PropKey::Private(id) => Some(format!("#{}", id.name)),
+            PropKey::Computed(_) => None,
+        }?;
+
+        let is_proto_literal_value = matches!(&prop.value, PropValue::Value(_))
+            && !prop.is_computed
+            && match &prop.key {
+                PropKey::Ident(id) => id.name == "__proto__",
+                PropKey::Str(s) => {
+                    s.value == "\"__proto__\"" || s.value == "'__proto__'" || s.value == "__proto__"
+                }
+                _ => false,
+            };
+        if is_proto_literal_value {
+            return None;
+        }
+
+        match &prop.value {
+            PropValue::Value(_) | PropValue::Shorthand | PropValue::Method(_) => Some(key_name),
+            PropValue::Get(_) | PropValue::Set(_) => None,
+        }
+    }
+
+    fn object_literal_template_keys(o: &crate::parser::ast::ObjectExpr) -> Option<Vec<String>> {
+        let mut keys = Vec::with_capacity(o.properties.len());
+        for prop in &o.properties {
+            match prop {
+                crate::parser::ast::ObjectProp::Prop(prop) => {
+                    keys.push(Self::object_literal_template_key(prop)?);
+                }
+                crate::parser::ast::ObjectProp::Spread(_) => return None,
+            }
+        }
+        Some(keys)
     }
 
     // ── Generator / yield ────────────────────────────────────────────────────
@@ -8923,6 +8996,74 @@ mod tests {
                 .iter()
                 .any(|i| i.opcode == Opcode::DefineGetterProperty),
             "expected DefineGetterProperty opcode, got {instrs:?}"
+        );
+    }
+
+    #[test]
+    fn test_plain_object_literal_emits_create_object_literal_template() {
+        let prog = make_program(vec![var_decl_stmt(
+            VarKind::Var,
+            "o",
+            Some(object_expr(vec![
+                ObjectProp::Prop(Box::new(Prop {
+                    loc: span(),
+                    key: PropKey::Ident(ident("a")),
+                    is_computed: false,
+                    value: PropValue::Value(Box::new(num_expr(1.0))),
+                })),
+                ObjectProp::Prop(Box::new(Prop {
+                    loc: span(),
+                    key: PropKey::Ident(ident("b")),
+                    is_computed: false,
+                    value: PropValue::Value(Box::new(num_expr(2.0))),
+                })),
+            ])),
+        )]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        let create = instrs
+            .iter()
+            .find(|instr| instr.opcode == Opcode::CreateObjectLiteral)
+            .expect("expected CreateObjectLiteral");
+        let Operand::ConstantPoolIdx(template_idx) = create.operands[0] else {
+            panic!("CreateObjectLiteral must carry a constant-pool template");
+        };
+        assert_eq!(
+            arr.get_constant(template_idx),
+            Some(&ConstantPoolEntry::ObjectLiteralTemplate {
+                keys: vec!["a".to_string(), "b".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn test_object_literal_with_computed_key_uses_empty_object_literal() {
+        let prog = make_program(vec![
+            var_decl_stmt(VarKind::Let, "k", Some(str_expr("a"))),
+            var_decl_stmt(
+                VarKind::Var,
+                "o",
+                Some(object_expr(vec![ObjectProp::Prop(Box::new(Prop {
+                    loc: span(),
+                    key: PropKey::Computed(Box::new(ident_expr("k"))),
+                    is_computed: true,
+                    value: PropValue::Value(Box::new(num_expr(1.0))),
+                }))])),
+            ),
+        ]);
+        let arr = BytecodeGenerator::compile_program(&prog).unwrap();
+        let instrs = arr.instructions().unwrap();
+        assert!(
+            instrs
+                .iter()
+                .any(|instr| instr.opcode == Opcode::CreateEmptyObjectLiteral),
+            "computed-key literal must fall back to CreateEmptyObjectLiteral, got {instrs:?}"
+        );
+        assert!(
+            !arr.constant_pool()
+                .iter()
+                .any(|entry| matches!(entry, ConstantPoolEntry::ObjectLiteralTemplate { .. })),
+            "computed-key literal must not allocate an object template"
         );
     }
 

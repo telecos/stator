@@ -3616,6 +3616,9 @@ pub(super) fn constant_to_value(entry: &ConstantPoolEntry) -> JsValue {
         ConstantPoolEntry::BigInt(n) => JsValue::BigInt(*n),
         ConstantPoolEntry::Function(ba) => JsValue::Function(Rc::clone(ba)),
         ConstantPoolEntry::TemplateObject { cooked, raw } => build_template_object(cooked, raw),
+        ConstantPoolEntry::ObjectLiteralTemplate { .. } => {
+            unreachable!("object literal templates are only consumed by CreateObjectLiteral")
+        }
     }
 }
 
@@ -12725,7 +12728,7 @@ mod tests {
                 ),
                 Instruction::new_unchecked(Opcode::Return, vec![]),
             ],
-            vec![ConstantPoolEntry::Undefined],
+            vec![ConstantPoolEntry::ObjectLiteralTemplate { keys: vec![] }],
             0,
             0,
         );
@@ -12735,6 +12738,73 @@ mod tests {
             assert!(map.borrow().is_empty());
         } else {
             panic!("expected PlainObject, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_create_object_literal_template_cache_clones_shape() {
+        let bytecode = Rc::new(make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::CreateObjectLiteral,
+                    vec![
+                        Operand::ConstantPoolIdx(0),
+                        Operand::FeedbackSlot(0),
+                        Operand::Flag(2),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(10)]),
+                Instruction::new_unchecked(
+                    Opcode::DefineNamedOwnProperty,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstantPoolIdx(1),
+                        Operand::FeedbackSlot(1),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(20)]),
+                Instruction::new_unchecked(
+                    Opcode::DefineNamedOwnProperty,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstantPoolIdx(2),
+                        Operand::FeedbackSlot(2),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![
+                ConstantPoolEntry::ObjectLiteralTemplate {
+                    keys: vec!["a".to_string(), "b".to_string()],
+                },
+                ConstantPoolEntry::String("a".to_string()),
+                ConstantPoolEntry::String("b".to_string()),
+            ],
+            1,
+            0,
+        ));
+
+        let mut frame1 = InterpreterFrame::new(Rc::clone(&bytecode), vec![]);
+        let result1 = Interpreter::run(&mut frame1).unwrap();
+        let mut frame2 = InterpreterFrame::new(Rc::clone(&bytecode), vec![]);
+        let result2 = Interpreter::run(&mut frame2).unwrap();
+
+        assert_eq!(bytecode.object_template_cache_len(), 1);
+        match (&result1, &result2) {
+            (JsValue::PlainObject(first), JsValue::PlainObject(second)) => {
+                assert!(!Rc::ptr_eq(first, second));
+                let first = first.borrow();
+                let second = second.borrow();
+                assert_eq!(first.get("a"), Some(&JsValue::Smi(10)));
+                assert_eq!(first.get("b"), Some(&JsValue::Smi(20)));
+                assert_eq!(second.get("a"), Some(&JsValue::Smi(10)));
+                assert_eq!(second.get("b"), Some(&JsValue::Smi(20)));
+                assert_eq!(first.layout_id(), second.layout_id());
+                assert_ne!(first.shape_id(), second.shape_id());
+            }
+            _ => panic!("expected PlainObject results, got {result1:?} and {result2:?}"),
         }
     }
 
