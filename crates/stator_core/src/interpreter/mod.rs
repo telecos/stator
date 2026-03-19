@@ -12123,13 +12123,11 @@ mod tests {
         );
         let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
-        // Should be a PlainObject with length=0
-        if let JsValue::PlainObject(map) = &result {
-            let borrow = map.borrow();
-            assert_eq!(borrow.get("length"), Some(&JsValue::Smi(0)));
-            assert_eq!(borrow.len(), 2); // "length" + "__is_array__"
+        // Should be a dense Array with no elements.
+        if let JsValue::Array(items) = &result {
+            assert_eq!(items.borrow().len(), 0);
         } else {
-            panic!("expected PlainObject, got {result:?}");
+            panic!("expected Array, got {result:?}");
         }
     }
 
@@ -12206,14 +12204,14 @@ mod tests {
         );
         let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
-        if let JsValue::PlainObject(map) = &result {
-            let borrow = map.borrow();
-            assert_eq!(borrow.get("length"), Some(&JsValue::Smi(3)));
-            assert_eq!(borrow.get("0"), Some(&JsValue::Smi(10)));
-            assert_eq!(borrow.get("1"), Some(&JsValue::Smi(20)));
-            assert_eq!(borrow.get("2"), Some(&JsValue::Smi(30)));
+        if let JsValue::Array(items) = &result {
+            let borrow = items.borrow();
+            assert_eq!(borrow.len(), 3);
+            assert_eq!(borrow[0], JsValue::Smi(10));
+            assert_eq!(borrow[1], JsValue::Smi(20));
+            assert_eq!(borrow[2], JsValue::Smi(30));
         } else {
-            panic!("expected PlainObject, got {result:?}");
+            panic!("expected Array, got {result:?}");
         }
     }
 
@@ -12572,10 +12570,10 @@ mod tests {
         );
         let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
-        if let JsValue::PlainObject(map) = &result {
-            assert_eq!(map.borrow().get("length"), Some(&JsValue::Smi(0)));
+        if let JsValue::Array(items) = &result {
+            assert_eq!(items.borrow().len(), 0);
         } else {
-            panic!("expected PlainObject, got {result:?}");
+            panic!("expected Array, got {result:?}");
         }
     }
 

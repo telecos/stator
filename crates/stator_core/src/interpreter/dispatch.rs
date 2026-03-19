@@ -4635,19 +4635,12 @@ fn handle_create_empty_array_literal(
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     // operands[0] is a FeedbackSlot, ignored at runtime.
-    let mut map = PropertyMap::with_capacity(2);
-    // Per ES spec, "length" is writable but not enumerable/configurable.
-    map.insert_with_attrs(
-        "length".to_string(),
-        JsValue::Smi(0),
-        PropertyAttributes::WRITABLE,
-    );
-    map.insert_with_attrs(
-        "__is_array__".to_string(),
-        JsValue::Boolean(true),
-        PropertyAttributes::empty(),
-    );
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+    //
+    // Use dense Vec storage so that push / index-read / index-write hit the
+    // O(1) JsValue::Array fast-paths in handle_lda_keyed_property,
+    // handle_sta_keyed_property, and proto_lookup instead of going through
+    // PropertyMap with string-keyed indices.
+    ctx.frame.accumulator = JsValue::Array(Rc::new(RefCell::new(Vec::new())));
     Ok(DispatchAction::Continue)
 }
 
@@ -4656,18 +4649,9 @@ fn handle_create_array_literal(
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     // operands: [ConstantPoolIdx, FeedbackSlot, Flag]
-    let mut map = PropertyMap::with_capacity(2);
-    map.insert_with_attrs(
-        "length".to_string(),
-        JsValue::Smi(0),
-        PropertyAttributes::WRITABLE,
-    );
-    map.insert_with_attrs(
-        "__is_array__".to_string(),
-        JsValue::Boolean(true),
-        PropertyAttributes::empty(),
-    );
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+    //
+    // Dense Vec storage — see handle_create_empty_array_literal for rationale.
+    ctx.frame.accumulator = JsValue::Array(Rc::new(RefCell::new(Vec::new())));
     Ok(DispatchAction::Continue)
 }
 
@@ -4816,21 +4800,8 @@ fn handle_create_array_from_iterable(
             return Err(StatorError::TypeError("object is not iterable".into()));
         }
     };
-    let mut map = PropertyMap::with_capacity(items.len() + 2);
-    for (i, v) in items.iter().enumerate() {
-        map.insert(i.to_string(), v.clone());
-    }
-    map.insert_with_attrs(
-        "length".to_string(),
-        JsValue::Smi(items.len() as i32),
-        PropertyAttributes::WRITABLE,
-    );
-    map.insert_with_attrs(
-        "__is_array__".to_string(),
-        JsValue::Boolean(true),
-        PropertyAttributes::empty(),
-    );
-    ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+    // Dense Vec storage — avoids PropertyMap string-keyed overhead.
+    ctx.frame.accumulator = JsValue::Array(Rc::new(RefCell::new(items)));
     Ok(DispatchAction::Continue)
 }
 
@@ -4908,7 +4879,16 @@ fn handle_sta_in_array_literal(
     let arr = ctx.frame.read_reg(arr_v)?.clone();
     let key = ctx.frame.read_reg(idx_v)?.clone();
     let val = ctx.frame.accumulator.clone();
-    if let JsValue::PlainObject(ref map) = arr {
+    if let JsValue::Array(ref items) = arr {
+        // Dense path: direct Vec index set, no string conversion.
+        if let Some(idx) = to_array_index(&key) {
+            let mut v = items.borrow_mut();
+            if idx >= v.len() {
+                v.resize(idx + 1, JsValue::Undefined);
+            }
+            v[idx] = val;
+        }
+    } else if let JsValue::PlainObject(ref map) = arr {
         let idx_str = to_property_key(&key)?;
         map.borrow_mut().insert(idx_str, val);
         // Update length: max(current_length, index + 1).
