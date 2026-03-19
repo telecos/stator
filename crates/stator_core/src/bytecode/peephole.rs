@@ -1,5 +1,9 @@
 //! Peephole fusion over decoded bytecode instructions.
 
+// Dead-store elimination and constant folding are currently disabled (see
+// `fuse_instructions`).  Allow the helper functions to remain for future use.
+#![allow(dead_code)]
+
 use std::collections::HashSet;
 
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
@@ -10,7 +14,10 @@ pub fn fuse_instructions(instructions: &mut Vec<Instruction>, byte_offsets: &mut
         return;
     }
 
-    optimize_bytecode(instructions, byte_offsets);
+    // Dead-store elimination and constant folding are disabled until the
+    // remaining correctness issues are resolved (423 test failures from
+    // incorrect store elimination across exception-throwing paths).
+    // optimize_bytecode(instructions, byte_offsets);
     fuse_superinstructions(instructions, byte_offsets);
 }
 
