@@ -684,7 +684,6 @@ impl<'a> BaselineCompiler<'a> {
             Opcode::LdaFalse => {
                 self.masm.mov_ri(Reg64::R12, JIT_FALSE);
             }
-            Opcode::Nop => {}
             Opcode::LdaConstant => {
                 let Operand::ConstantPoolIdx(idx_cp) = instr.operands[0] else {
                     return Err(bad_operand("LdaConstant", 0));

@@ -737,12 +737,10 @@ pub enum Opcode {
     TestLessThanJump,
     /// `AddSmi(imm, slot); Star(dst)`. `[imm, slot, dst]`
     AddSmiStar,
-    /// No-op placeholder used by bytecode optimization before final compaction.
-    Nop,
 }
 
 /// The maximum valid opcode byte.
-const MAX_OPCODE: u8 = Opcode::Nop as u8;
+const MAX_OPCODE: u8 = Opcode::AddSmiStar as u8;
 
 impl Opcode {
     /// Convert a raw byte to an [`Opcode`], returning an error for
@@ -1008,7 +1006,6 @@ impl Opcode {
             Opcode::LdarSubStar => &[Register, Register, Register, FeedbackSlot],
             Opcode::TestLessThanJump => &[Register, FeedbackSlot, JumpOffset, Flag],
             Opcode::AddSmiStar => &[Immediate, FeedbackSlot, Register],
-            Opcode::Nop => &[],
         }
     }
 }
@@ -1535,11 +1532,6 @@ mod tests {
                 ],
             ),
         ]);
-    }
-
-    #[test]
-    fn test_round_trip_nop() {
-        round_trip(vec![Instruction::new_unchecked(Opcode::Nop, vec![])]);
     }
 
     // ── context / lookup ──────────────────────────────────────────────────
