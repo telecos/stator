@@ -13710,51 +13710,59 @@ mod tests {
 
     #[test]
     fn test_named_property_ic_reuses_shared_layout_across_objects() {
-        let ba = make_bytecode_with_pool(
-            vec![
-                Instruction::new_unchecked(Opcode::CreateEmptyObjectLiteral, vec![]),
-                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
-                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(11)]),
-                Instruction::new_unchecked(
-                    Opcode::StaNamedProperty,
-                    vec![
-                        Operand::Register(0),
-                        Operand::ConstantPoolIdx(0),
-                        Operand::FeedbackSlot(0),
-                    ],
-                ),
-                Instruction::new_unchecked(Opcode::CreateEmptyObjectLiteral, vec![]),
-                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
-                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(22)]),
-                Instruction::new_unchecked(
-                    Opcode::StaNamedProperty,
-                    vec![
-                        Operand::Register(1),
-                        Operand::ConstantPoolIdx(0),
-                        Operand::FeedbackSlot(0),
-                    ],
-                ),
-                Instruction::new_unchecked(
-                    Opcode::LdaNamedProperty,
-                    vec![
-                        Operand::Register(0),
-                        Operand::ConstantPoolIdx(0),
-                        Operand::FeedbackSlot(1),
-                    ],
-                ),
-                Instruction::new_unchecked(
-                    Opcode::LdaNamedProperty,
-                    vec![
-                        Operand::Register(1),
-                        Operand::ConstantPoolIdx(0),
-                        Operand::FeedbackSlot(1),
-                    ],
-                ),
-                Instruction::new_unchecked(Opcode::Return, vec![]),
-            ],
+        use crate::bytecode::feedback::{FeedbackMetadata, FeedbackSlotKind};
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::CreateEmptyObjectLiteral, vec![]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(11)]),
+            Instruction::new_unchecked(
+                Opcode::StaNamedProperty,
+                vec![
+                    Operand::Register(0),
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::CreateEmptyObjectLiteral, vec![]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(22)]),
+            Instruction::new_unchecked(
+                Opcode::StaNamedProperty,
+                vec![
+                    Operand::Register(1),
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(0),
+                ],
+            ),
+            Instruction::new_unchecked(
+                Opcode::LdaNamedProperty,
+                vec![
+                    Operand::Register(0),
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(1),
+                ],
+            ),
+            Instruction::new_unchecked(
+                Opcode::LdaNamedProperty,
+                vec![
+                    Operand::Register(1),
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(1),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = BytecodeArray::new(
+            encode(&instrs),
             vec![ConstantPoolEntry::String("x".to_string())],
             2,
             0,
+            vec![],
+            FeedbackMetadata::new(vec![
+                FeedbackSlotKind::StoreProperty,
+                FeedbackSlotKind::LoadProperty,
+            ]),
+            vec![],
         );
         let mut frame = InterpreterFrame::new(ba, vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
