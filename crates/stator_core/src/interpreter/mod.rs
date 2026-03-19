@@ -207,7 +207,7 @@ pub use crate::objects::value::{
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Property map for a single `Function` value in the side-table.
-type FnPropMap = Rc<RefCell<HashMap<String, JsValue>>>;
+type FnPropMap = Rc<RefCell<HashMap<Rc<str>, JsValue>>>;
 type MonoLoadCache = HashMap<u32, (usize, JsValue)>;
 type PolyLoadCache = HashMap<u32, Vec<(usize, JsValue)>>;
 type ShapeIcCache = HashMap<u32, PropertyIc>;
@@ -595,13 +595,16 @@ fn fn_props_key(ba: &Rc<BytecodeArray>) -> usize {
 }
 
 /// Store a named property on a `Function` value's side-table entry.
+///
+/// The key is interned for deduplication.
 pub(crate) fn fn_props_set(ba: &Rc<BytecodeArray>, name: String, val: JsValue) {
+    let interned = crate::objects::string_intern::intern(&name);
     FUNCTION_PROPS.with(|fp| {
         let mut table = fp.borrow_mut();
         let map = table
             .entry(fn_props_key(ba))
             .or_insert_with(|| Rc::new(RefCell::new(HashMap::new())));
-        map.borrow_mut().insert(name, val);
+        map.borrow_mut().insert(interned, val);
     });
 }
 

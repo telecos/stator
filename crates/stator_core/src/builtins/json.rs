@@ -1103,7 +1103,7 @@ fn js_value_to_json_inner(
             // §25.5.2 step 6: only enumerable own properties are serialised.
             for (k, v) in map.borrow().enumerable_iter() {
                 if let Some(jv) = js_value_to_json_inner(v, seen)? {
-                    entries.push((k.clone(), jv));
+                    entries.push((k.to_string(), jv));
                 }
             }
             seen.remove(&ptr);

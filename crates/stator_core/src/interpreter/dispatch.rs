@@ -4166,7 +4166,7 @@ fn handle_copy_data_properties(
                             || k.starts_with("Symbol(")
                             || k.starts_with('.'))
                     })
-                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .map(|(k, v)| (k.to_string(), v.clone()))
                     .collect();
                 for (k, v) in entries {
                     t.borrow_mut().insert(k, v);
@@ -5265,7 +5265,7 @@ fn handle_for_in_enumerate(
                     // to the actual property name X.
                     if let Some(prop) = k.strip_prefix("__get_").and_then(|s| s.strip_suffix("__"))
                     {
-                        seen.insert(k.clone());
+                        seen.insert(k.to_string());
                         if seen.insert(prop.to_string()) && is_enumerable {
                             all_keys.push(JsValue::String(prop.to_string().into()));
                         }
@@ -5273,7 +5273,7 @@ fn handle_for_in_enumerate(
                     }
                     if let Some(prop) = k.strip_prefix("__set_").and_then(|s| s.strip_suffix("__"))
                     {
-                        seen.insert(k.clone());
+                        seen.insert(k.to_string());
                         if seen.insert(prop.to_string()) && is_enumerable {
                             all_keys.push(JsValue::String(prop.to_string().into()));
                         }
@@ -5289,13 +5289,13 @@ fn handle_for_in_enumerate(
                         || k.starts_with('.')
                         || k.starts_with('#')
                     {
-                        seen.insert(k.clone());
+                        seen.insert(k.to_string());
                         continue;
                     }
                     // Regular property: add to seen for shadowing, push if
                     // enumerable and not already seen at a higher level.
-                    if seen.insert(k.clone()) && is_enumerable {
-                        all_keys.push(JsValue::String(k.clone().into()));
+                    if seen.insert(k.to_string()) && is_enumerable {
+                        all_keys.push(JsValue::String(k.clone()));
                     }
                 }
                 current_map = borrow.get("__proto__").and_then(|v| {

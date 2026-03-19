@@ -1296,7 +1296,7 @@ fn plain_own_keys(map: &PropertyMap) -> Vec<JsValue> {
     let mut symbols: Vec<JsValue> = Vec::new();
     let mut seen = HashSet::new();
     for key in map.keys() {
-        if key == "__proto__" {
+        if &**key == "__proto__" {
             continue;
         }
         if let Some(symbol) = property_key_to_symbol(key) {
@@ -1312,7 +1312,7 @@ fn plain_own_keys(map: &PropertyMap) -> Vec<JsValue> {
         if is_internal_accessor_key(key) {
             continue;
         }
-        string_parts.push(JsValue::String(key.clone().into()));
+        string_parts.push(JsValue::String(key.clone()));
     }
     // ES spec ordering: integer indices ascending, then string keys in
     // insertion order, then symbols in insertion order.
@@ -2872,7 +2872,7 @@ fn structured_clone(val: &JsValue) -> StatorResult<JsValue> {
         JsValue::PlainObject(map) => {
             let mut cloned = PropertyMap::new();
             for (k, v) in map.borrow().iter() {
-                cloned.insert(k.clone(), structured_clone(v)?);
+                cloned.insert(k.to_string(), structured_clone(v)?);
             }
             Ok(JsValue::PlainObject(Rc::new(RefCell::new(cloned))))
         }
@@ -3586,7 +3586,10 @@ fn json_serialize_value(
                 let keys: Vec<String> = if let Some(property_list) = property_list {
                     property_list.to_vec()
                 } else {
-                    map.borrow().enumerable_keys().cloned().collect()
+                    map.borrow()
+                        .enumerable_keys()
+                        .map(|k| k.to_string())
+                        .collect()
                 };
 
                 let mut parts = Vec::new();
@@ -3743,7 +3746,7 @@ fn apply_js_reviver(holder: &JsValue, key: &str, reviver: &JsValue) -> StatorRes
     let value = json_get_property(holder, key)?;
     let value = match value {
         JsValue::PlainObject(map) => {
-            let keys: Vec<String> = map.borrow().keys().cloned().collect();
+            let keys: Vec<String> = map.borrow().keys().map(|k| k.to_string()).collect();
             let object = JsValue::PlainObject(Rc::clone(&map));
             for property in keys {
                 let revived = apply_js_reviver(&object, &property, reviver)?;
@@ -5537,7 +5540,7 @@ fn make_object() -> JsValue {
                             .borrow()
                             .iter()
                             .filter(|(k, _)| !k.starts_with("__"))
-                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .map(|(k, v)| (k.to_string(), v.clone()))
                             .collect();
                         for (key, desc_val) in &entries {
                             if let JsValue::PlainObject(single_desc) = desc_val {
@@ -5591,8 +5594,8 @@ fn make_object() -> JsValue {
                             if k.starts_with("__") || k.starts_with('#') {
                                 continue;
                             }
-                            if seen.insert(k.clone()) {
-                                names.push(k.clone());
+                            if seen.insert(k.to_string()) {
+                                names.push(k.to_string());
                             }
                         }
                         // ES spec ordering: integer indices ascending, then
@@ -5772,7 +5775,7 @@ fn make_object() -> JsValue {
                         .borrow()
                         .iter()
                         .filter(|(k, _)| !k.starts_with("__"))
-                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .map(|(k, v)| (k.to_string(), v.clone()))
                         .collect();
                     for (key, desc_val) in &entries {
                         if let JsValue::PlainObject(desc) = desc_val {
@@ -6024,7 +6027,7 @@ fn make_object() -> JsValue {
                         let visible_keys: Vec<String> = borrow
                             .keys()
                             .filter(|k| !k.starts_with("__"))
-                            .cloned()
+                            .map(|k| k.to_string())
                             .collect();
                         let mut accessor_names: Vec<String> = Vec::new();
                         for k in borrow.keys() {
@@ -12613,7 +12616,7 @@ fn plain_object_to_js_object(map: &Rc<RefCell<PropertyMap>>) -> JsObject {
     let mut obj = JsObject::new();
     let borrow = map.borrow();
     for (k, v) in borrow.iter() {
-        if k == "__proto__" || is_internal_accessor_key(k) {
+        if &**k == "__proto__" || is_internal_accessor_key(k) {
             continue;
         }
         let mut attrs = PropertyAttributes::empty();

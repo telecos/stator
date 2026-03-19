@@ -386,7 +386,7 @@ fn plain_visible_own_property_keys(map: &PropertyMap) -> Vec<String> {
     let mut seen = HashSet::new();
 
     for raw_key in map.keys() {
-        if raw_key == "__proto__" {
+        if &**raw_key == "__proto__" {
             continue;
         }
         if let Some(name) = accessor_property_name(raw_key) {
@@ -395,8 +395,8 @@ fn plain_visible_own_property_keys(map: &PropertyMap) -> Vec<String> {
             }
             continue;
         }
-        if seen.insert(raw_key.clone()) {
-            keys.push(raw_key.clone());
+        if seen.insert(raw_key.to_string()) {
+            keys.push(raw_key.to_string());
         }
     }
 

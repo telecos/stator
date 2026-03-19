@@ -27,10 +27,12 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::builtins::symbol::{is_symbol_property_key, property_key_to_symbol};
 use crate::objects::map::PropertyAttributes;
+use crate::objects::string_intern::intern;
 use crate::objects::value::JsValue;
 
 /// Internal storage key used for an object's prototype link.
@@ -77,7 +79,7 @@ thread_local! {
 
 #[derive(Debug)]
 struct PropertyStorageBuffers {
-    keys: Vec<String>,
+    keys: Vec<Rc<str>>,
     values: Vec<JsValue>,
     attrs: Vec<PropertyAttributes>,
 }
@@ -86,7 +88,7 @@ struct PropertyStorageBuffers {
 enum PropertyIndex {
     #[default]
     Inline,
-    Map(HashMap<String, usize>),
+    Map(HashMap<Rc<str>, usize>),
 }
 
 fn acquire_storage_buffers(capacity: usize) -> PropertyStorageBuffers {
@@ -171,7 +173,7 @@ fn name_hash(s: &str) -> u64 {
 /// Deterministically hashes a property layout so structurally identical maps
 /// share the same layout identifier.
 #[inline]
-fn layout_hash(keys: &[String], attrs: &[PropertyAttributes]) -> u64 {
+fn layout_hash(keys: &[Rc<str>], attrs: &[PropertyAttributes]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for (key, attr) in keys.iter().zip(attrs.iter()) {
         for b in key.bytes() {
@@ -205,7 +207,7 @@ fn layout_hash(keys: &[String], attrs: &[PropertyAttributes]) -> u64 {
 #[derive(Debug, Clone)]
 pub struct PropertyMap {
     /// Property names in ECMAScript enumeration order.
-    keys: Vec<String>,
+    keys: Vec<Rc<str>>,
     /// Property values, one per key.
     values: Vec<JsValue>,
     /// Property attributes, one per key.
@@ -296,7 +298,7 @@ impl PropertyMap {
                 let slot = self.cache_slots[i].get() as usize;
                 // Verify against the canonical key to guard against hash
                 // collisions (extremely rare but must be handled).
-                if slot < self.keys.len() && self.keys[slot] == key {
+                if slot < self.keys.len() && *self.keys[slot] == *key {
                     if i > 0 {
                         self.cache_hashes[0].swap(&self.cache_hashes[i]);
                         self.cache_slots[0].swap(&self.cache_slots[i]);
@@ -370,7 +372,7 @@ impl PropertyMap {
     #[inline]
     fn lookup_slot(&self, key: &str) -> Option<usize> {
         match &self.index {
-            PropertyIndex::Inline => self.keys.iter().position(|candidate| candidate == key),
+            PropertyIndex::Inline => self.keys.iter().position(|candidate| &**candidate == key),
             PropertyIndex::Map(index) => index.get(key).copied(),
         }
     }
@@ -421,7 +423,7 @@ impl PropertyMap {
     pub fn matches_key_at_offset(&self, offset: usize, key: &str) -> bool {
         self.keys
             .get(offset)
-            .is_some_and(|candidate| candidate == key)
+            .is_some_and(|candidate| &**candidate == key)
     }
 
     /// Overwrites the value at a raw slot offset, returning `true` on
@@ -476,7 +478,7 @@ impl PropertyMap {
 
     /// Inserts a new property at `pos`, updating indices and integer-key
     /// bookkeeping as needed.
-    fn insert_new(&mut self, key: String, value: JsValue, attrs: PropertyAttributes, pos: usize) {
+    fn insert_new(&mut self, key: Rc<str>, value: JsValue, attrs: PropertyAttributes, pos: usize) {
         if key.starts_with("__get_") || key.starts_with("__set_") {
             self.has_accessors = true;
         }
@@ -533,16 +535,23 @@ impl PropertyMap {
     /// New properties are placed according to ECMAScript enumeration order:
     /// integer-indexed keys occupy the front of the storage (sorted
     /// numerically), followed by string keys in insertion order.
+    ///
+    /// The key is interned internally for deduplication.  Callers that
+    /// already hold an `Rc<str>` can use [`insert_rc`](Self::insert_rc) to
+    /// skip the extra `String` allocation.
     pub fn insert(&mut self, key: String, value: JsValue) {
+        self.insert_rc(intern(&key), value);
+    }
+
+    /// Like [`insert`](Self::insert) but takes a pre-interned key directly.
+    pub fn insert_rc(&mut self, key: Rc<str>, value: JsValue) {
         if let Some(i) = self.lookup_slot_cached(&key) {
             self.values[i] = value;
         } else {
-            // Non-extensible objects reject new properties (except internal __dunder__ keys).
             if !self.extensible && !key.starts_with("__") {
                 return;
             }
-            // The internal prototype link must never be enumerable.
-            let attrs = if key == INTERNAL_PROTO_PROPERTY_KEY {
+            let attrs = if *key == *INTERNAL_PROTO_PROPERTY_KEY {
                 BUILTIN_ATTRS
             } else {
                 DEFAULT_ATTRS
@@ -558,7 +567,15 @@ impl PropertyMap {
 
     /// Insert a built-in method or constructor property (writable,
     /// non-enumerable, configurable — per ES spec).
+    ///
+    /// The key is interned; use [`insert_builtin_rc`](Self::insert_builtin_rc)
+    /// when you already have an `Rc<str>`.
     pub fn insert_builtin(&mut self, key: String, value: JsValue) {
+        self.insert_builtin_rc(intern(&key), value);
+    }
+
+    /// Like [`insert_builtin`](Self::insert_builtin) but takes a pre-interned key.
+    pub fn insert_builtin_rc(&mut self, key: Rc<str>, value: JsValue) {
         if let Some(i) = self.lookup_slot_cached(&key) {
             self.values[i] = value;
             self.attrs[i] = BUILTIN_ATTRS;
@@ -619,12 +636,12 @@ impl PropertyMap {
     }
 
     /// Returns an iterator over the property keys.
-    pub fn keys(&self) -> impl Iterator<Item = &String> {
+    pub fn keys(&self) -> impl Iterator<Item = &Rc<str>> {
         self.keys.iter()
     }
 
     /// Returns an iterator over `(key, value)` pairs, ignoring attributes.
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &JsValue)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&Rc<str>, &JsValue)> {
         self.keys.iter().zip(self.values.iter())
     }
 
@@ -650,7 +667,21 @@ impl PropertyMap {
     ///
     /// New properties are placed according to ECMAScript enumeration order
     /// (see [`insert`][Self::insert]).
+    ///
+    /// The key is interned; use [`insert_with_attrs_rc`](Self::insert_with_attrs_rc)
+    /// when you already have an `Rc<str>`.
     pub fn insert_with_attrs(&mut self, key: String, value: JsValue, attrs: PropertyAttributes) {
+        self.insert_with_attrs_rc(intern(&key), value, attrs);
+    }
+
+    /// Like [`insert_with_attrs`](Self::insert_with_attrs) but takes a
+    /// pre-interned key.
+    pub fn insert_with_attrs_rc(
+        &mut self,
+        key: Rc<str>,
+        value: JsValue,
+        attrs: PropertyAttributes,
+    ) {
         if let Some(i) = self.lookup_slot_cached(&key) {
             self.values[i] = value;
             self.attrs[i] = attrs;
@@ -739,7 +770,7 @@ impl PropertyMap {
     }
 
     /// Returns an iterator over only the enumerable property keys.
-    pub fn enumerable_keys(&self) -> impl Iterator<Item = &String> {
+    pub fn enumerable_keys(&self) -> impl Iterator<Item = &Rc<str>> {
         self.keys
             .iter()
             .zip(self.attrs.iter())
@@ -751,7 +782,7 @@ impl PropertyMap {
 
     /// Returns an iterator over `(key, value)` pairs for only enumerable
     /// properties — the set that ES `EnumerableOwnProperties` would return.
-    pub fn enumerable_iter(&self) -> impl Iterator<Item = (&String, &JsValue)> {
+    pub fn enumerable_iter(&self) -> impl Iterator<Item = (&Rc<str>, &JsValue)> {
         self.keys
             .iter()
             .zip(self.values.iter())
@@ -763,7 +794,9 @@ impl PropertyMap {
     }
 
     /// Returns an iterator over `(key, value, attrs)` triples.
-    pub fn iter_with_attrs(&self) -> impl Iterator<Item = (&String, &JsValue, PropertyAttributes)> {
+    pub fn iter_with_attrs(
+        &self,
+    ) -> impl Iterator<Item = (&Rc<str>, &JsValue, PropertyAttributes)> {
         self.keys
             .iter()
             .zip(self.values.iter())

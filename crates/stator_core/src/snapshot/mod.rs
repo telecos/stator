@@ -518,8 +518,9 @@ fn write_jsvalue(buf: &mut Vec<u8>, value: &JsValue, ctx: &mut SerContext) {
                 write_u8(buf, TAG_PLAIN_OBJECT);
                 write_u32(buf, borrow.len() as u32);
                 // Sort for determinism.
-                let mut entries: Vec<(&String, &JsValue)> = borrow.iter().collect();
-                entries.sort_by_key(|(k, _)| k.as_str());
+                let mut entries: Vec<(&str, &JsValue)> =
+                    borrow.iter().map(|(k, v)| (&**k, v)).collect();
+                entries.sort_by_key(|(k, _)| *k);
                 for (k, v) in entries {
                     write_str32(buf, k);
                     write_jsvalue(buf, v, ctx);
