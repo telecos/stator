@@ -29,7 +29,7 @@ use super::{
     number_to_jsvalue, plain_object_to_array_items, populate_self_name, proto_lookup, resolve_jump,
     restore_closure_context, set_function_name_if_missing, set_pending_exception,
     settle_async_iterator_result, strict_eq, to_array_index, to_bigint, to_property_key,
-    try_execute_best_jit, walk_context_chain,
+    try_execute_best_jit, try_fast_named_property_lookup, walk_context_chain,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
@@ -2167,85 +2167,14 @@ fn handle_call_property(
         return Err(err_bad_operand("CallProperty", 2));
     };
     let callee = ctx.frame.read_reg(callee_v)?.clone();
+    let this_val = ctx.frame.read_reg(recv_v)?.clone();
     // Arguments reside in the registers immediately following
     // the callee register in the flat register file.
     let callee_flat = ctx.frame.reg_index(callee_v)?;
     let args = (0..arg_count as usize)
         .map(|i| ctx.frame.registers[callee_flat + 1 + i].clone())
         .collect::<CallArgs>();
-    match callee {
-        JsValue::Function(ba) => {
-            let this_val = ctx.frame.read_reg(recv_v)?.clone();
-            // ── Tiering ──────────────────────────────────────
-            let count = ba.increment_invocation_count();
-            if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
-                maybe_compile_baseline(&ba);
-            }
-            if count >= MAGLEV_TIERING_THRESHOLD {
-                maybe_compile_maglev(&ba);
-            }
-            if count >= TURBOFAN_TIERING_THRESHOLD {
-                maybe_compile_turbofan(&ba);
-            }
-            let mut tried_jit = false;
-            if let Some(jit_result) = try_execute_best_jit(&ba, &args) {
-                ctx.frame.accumulator = jit_result?;
-                tried_jit = true;
-            }
-            if !tried_jit {
-                let mut callee_frame = InterpreterFrame::new_with_globals(
-                    Rc::clone(&ba),
-                    args,
-                    Rc::clone(&ctx.frame.global_env),
-                );
-                restore_closure_context(&mut callee_frame, &ba);
-                if ba.is_arrow() {
-                    callee_frame.new_target = fn_props_get(&ba, ".new_target");
-                }
-                populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
-                // Arrow functions use lexical `this` — do NOT override.
-                if !ba.is_arrow() {
-                    callee_frame
-                        .global_env
-                        .borrow_mut()
-                        .insert("this".to_string(), this_val);
-                }
-                push_call_frame("<anonymous>")?;
-                let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
-                    Interpreter::run(&mut callee_frame)
-                });
-                pop_call_frame();
-                ctx.frame.global_cache_invalidate();
-                ctx.frame.accumulator = result?;
-            }
-        }
-        JsValue::NativeFunction(f) => {
-            ctx.frame.accumulator = f(args.into_vec())?;
-            ctx.frame.global_cache_invalidate();
-        }
-        JsValue::PlainObject(ref map) => {
-            let call_val = map.borrow().get("__call__").cloned();
-            match call_val {
-                Some(JsValue::NativeFunction(f)) => {
-                    ctx.frame.accumulator = f(args.into_vec())?;
-                    ctx.frame.global_cache_invalidate();
-                }
-                Some(JsValue::Function(ba)) => {
-                    call_plain_object_function(ctx, &ba, map, args)?;
-                }
-                _ => {
-                    return Err(StatorError::TypeError(
-                        "CallProperty: callee is not a function (got PlainObject)".to_string(),
-                    ));
-                }
-            }
-        }
-        other => {
-            return Err(StatorError::TypeError(format!(
-                "CallProperty: callee is not a function (got {other:?})"
-            )));
-        }
-    }
+    dispatch_call_property(ctx.frame, &callee, this_val, args)?;
     Ok(DispatchAction::Continue)
 }
 
@@ -3290,7 +3219,8 @@ fn handle_lda_named_property(
             }
         )));
     }
-    let result = proto_lookup(&obj, &prop_name);
+    let result = try_fast_named_property_lookup(&obj, &prop_name)
+        .unwrap_or_else(|| proto_lookup(&obj, &prop_name));
     // ── Populate shape IC for own-property hits on PlainObject ───────────
     // Skip caching when the property has an accessor (__get_<key>__)
     // because the IC fast-path would return the placeholder data value
