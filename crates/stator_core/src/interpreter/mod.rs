@@ -184,8 +184,8 @@ use crate::builtins::error::{pop_call_frame, push_call_frame};
 use crate::builtins::function::{function_bound_name, function_length, function_to_string};
 use crate::builtins::proxy::{proxy_apply, proxy_get_with_receiver, proxy_set_with_receiver};
 use crate::bytecode::bytecode_array::{
-    BytecodeArray, ConstantPoolEntry, HandlerTableEntry, MAGLEV_TIERING_THRESHOLD,
-    TIERING_THRESHOLD, TURBOFAN_TIERING_THRESHOLD,
+    BytecodeArray, ConstantPoolEntry, ConstructBoilerplate, HandlerTableEntry,
+    MAGLEV_TIERING_THRESHOLD, TIERING_THRESHOLD, TURBOFAN_TIERING_THRESHOLD,
 };
 #[cfg(all(target_arch = "x86_64", unix))]
 use crate::bytecode::bytecode_array::{MaglevJitCodeCache, TurbofanJitCodeCache};
@@ -8217,6 +8217,56 @@ pub(super) fn wire_construct_prototype(result: JsValue, ctor_proto: &JsValue) ->
         }
     }
     result
+}
+
+// ─── Constructor fast-path helpers ───────────────────────────────────────
+
+/// Resolve the constructor's `.prototype` value, using the per-bytecode-array
+/// cache when available to avoid a property lookup on every `new` call.
+pub(super) fn resolve_construct_proto(ctor: &JsValue, ba: &Rc<BytecodeArray>) -> JsValue {
+    if let Some(cached) = ba.cached_construct_proto() {
+        return cached;
+    }
+    let proto = proto_lookup(ctor, "prototype");
+    ba.set_construct_proto_cache(proto.clone());
+    proto
+}
+
+/// Create the `this` object for a `[[Construct]]` call, optionally using
+/// the boilerplate shape cache on `ba` to pre-allocate property slots.
+pub(super) fn make_construct_this(ba: &Rc<BytecodeArray>, ctor_proto: &JsValue) -> JsValue {
+    let this_obj: Rc<RefCell<PropertyMap>> = if let Some(bp) = ba.cached_construct_boilerplate() {
+        Rc::new(RefCell::new(PropertyMap::from_boilerplate(
+            &bp.keys, &bp.attrs,
+        )))
+    } else {
+        Rc::new(RefCell::new(PropertyMap::new()))
+    };
+    if !matches!(ctor_proto, JsValue::Undefined) {
+        this_obj
+            .borrow_mut()
+            .insert("__proto__".to_string(), ctor_proto.clone());
+    }
+    JsValue::PlainObject(this_obj)
+}
+
+/// After a successful `[[Construct]]` where `this_val` was used (not an
+/// explicitly returned object), capture the object's shape as a
+/// boilerplate for future constructions.
+pub(super) fn maybe_cache_construct_boilerplate(ba: &Rc<BytecodeArray>, this_val: &JsValue) {
+    // Only cache once — the first execution defines the expected shape.
+    if ba.cached_construct_boilerplate().is_some() {
+        return;
+    }
+    if let JsValue::PlainObject(map) = this_val {
+        let borrow = map.borrow();
+        // Skip trivially empty objects — nothing to cache.
+        if borrow.is_empty() {
+            return;
+        }
+        let (keys, attrs) = borrow.boilerplate_snapshot();
+        ba.set_construct_boilerplate(ConstructBoilerplate { keys, attrs });
+    }
 }
 
 pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> {

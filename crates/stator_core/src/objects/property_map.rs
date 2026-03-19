@@ -298,6 +298,64 @@ impl PropertyMap {
         Self::from_buffers(capacity, acquire_storage_buffers(capacity))
     }
 
+    /// Creates a property map pre-populated with the given boilerplate
+    /// keys and attribute flags.  All values are initialised to
+    /// [`JsValue::Undefined`] and are expected to be overwritten by the
+    /// constructor body.
+    pub fn from_boilerplate(
+        keys: &[String],
+        attrs: &[crate::objects::map::PropertyAttributes],
+    ) -> Self {
+        debug_assert_eq!(keys.len(), attrs.len());
+        let cap = keys.len();
+        let mut buffers = acquire_storage_buffers(cap);
+        buffers.keys.extend_from_slice(keys);
+        buffers.values.resize(cap, JsValue::Undefined);
+        buffers.attrs.extend_from_slice(attrs);
+
+        let integer_key_count = keys
+            .iter()
+            .filter(|k| parse_integer_index(k).is_some())
+            .count();
+
+        let index = if cap > SMALL_PROPERTY_LINEAR_SCAN_CAP {
+            let mut map = HashMap::with_capacity(cap);
+            for (slot, key) in keys.iter().enumerate() {
+                map.insert(key.clone(), slot);
+            }
+            PropertyIndex::Map(map)
+        } else {
+            PropertyIndex::Inline
+        };
+
+        Self {
+            keys: buffers.keys,
+            values: buffers.values,
+            attrs: buffers.attrs,
+            integer_key_count,
+            index,
+            cache_hashes: Default::default(),
+            cache_slots: Default::default(),
+            cache_len: Cell::new(0),
+            cache_cursor: Cell::new(0),
+            shape_id: NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed),
+            layout_id: layout_hash(keys, attrs),
+            proto_generation: Cell::new(0),
+            proto_epoch: Cell::new(0),
+            proto_global_epoch: Cell::new(0),
+            extensible: true,
+            has_accessors: false,
+        }
+    }
+
+    /// Returns a snapshot of the property keys and their attribute flags,
+    /// suitable for caching as a constructor boilerplate.
+    pub fn boilerplate_snapshot(
+        &self,
+    ) -> (Vec<String>, Vec<crate::objects::map::PropertyAttributes>) {
+        (self.keys.clone(), self.attrs.clone())
+    }
+
     // ── Inline cache helpers ──────────────────────────────────────────────
 
     /// Probes the inline cache for `key`, returning its slot index on hit.

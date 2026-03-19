@@ -325,6 +325,31 @@ pub struct BytecodeArray {
     /// function declarations (which are hoisted into the enclosing scope
     /// instead).
     self_name_register: Option<i32>,
+    // ─── Constructor fast-path caches (shared across clones via Rc) ──────
+    /// Cached `.prototype` value resolved during the first `[[Construct]]`
+    /// call.  Avoids repeated `proto_lookup(&ctor, "prototype")` on
+    /// subsequent `new` invocations of the same constructor.
+    construct_proto_cache: Rc<RefCell<Option<crate::objects::value::JsValue>>>,
+    /// Cached "boilerplate" shape (property keys + attributes) of the
+    /// `this` object produced by the first successful `[[Construct]]` call.
+    /// Subsequent constructions clone this shape and fill in fresh values,
+    /// avoiding per-property `insert` overhead.
+    construct_boilerplate: Rc<RefCell<Option<ConstructBoilerplate>>>,
+}
+
+/// Cached property-key layout captured after the first successful
+/// `[[Construct]]` execution of a constructor function.
+///
+/// On subsequent `new` calls the interpreter pre-allocates a
+/// [`crate::objects::property_map::PropertyMap`] with this shape so that
+/// the constructor body only needs to overwrite slot values instead of
+/// performing full property insertions.
+#[derive(Debug, Clone)]
+pub struct ConstructBoilerplate {
+    /// Property key names in insertion order.
+    pub keys: Vec<String>,
+    /// Per-key attribute flags.
+    pub attrs: Vec<crate::objects::map::PropertyAttributes>,
 }
 
 impl PartialEq for BytecodeArray {
@@ -403,6 +428,8 @@ impl BytecodeArray {
             turbofan_compile_started: Arc::new(AtomicBool::new(false)),
             closure_context: None,
             self_name_register: None,
+            construct_proto_cache: Rc::new(RefCell::new(None)),
+            construct_boilerplate: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -521,6 +548,30 @@ impl BytecodeArray {
     pub fn with_self_name_register(mut self, reg: i32) -> Self {
         self.self_name_register = Some(reg);
         self
+    }
+
+    // ─── Constructor fast-path cache accessors ───────────────────────────
+
+    /// Returns the cached constructor `.prototype` value, if populated.
+    pub fn cached_construct_proto(&self) -> Option<crate::objects::value::JsValue> {
+        self.construct_proto_cache.borrow().clone()
+    }
+
+    /// Stores a constructor `.prototype` value for reuse on subsequent
+    /// `[[Construct]]` calls.
+    pub fn set_construct_proto_cache(&self, proto: crate::objects::value::JsValue) {
+        *self.construct_proto_cache.borrow_mut() = Some(proto);
+    }
+
+    /// Returns a clone of the cached construct boilerplate, if populated.
+    pub fn cached_construct_boilerplate(&self) -> Option<ConstructBoilerplate> {
+        self.construct_boilerplate.borrow().clone()
+    }
+
+    /// Stores a construct boilerplate captured from the first successful
+    /// `[[Construct]]` execution.
+    pub fn set_construct_boilerplate(&self, bp: ConstructBoilerplate) {
+        *self.construct_boilerplate.borrow_mut() = Some(bp);
     }
 
     /// The raw encoded bytecode bytes.
