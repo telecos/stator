@@ -400,10 +400,50 @@ fn is_jump_target(
 }
 
 fn instruction_mentions_register(instruction: &Instruction, register: u32) -> bool {
-    instruction
+    // Check explicit register operands.
+    if instruction
         .operands
         .iter()
         .any(|operand| matches!(operand, Operand::Register(value) if *value == register))
+    {
+        return true;
+    }
+
+    // Instructions with a (Register, RegisterCount) pair implicitly access a
+    // contiguous range of registers.  Check whether `register` falls inside
+    // that range so dead-store elimination doesn't incorrectly remove a store
+    // to a register used as a call argument.
+    if uses_register_range(instruction.opcode)
+        && let Some(range_start) = get_register(instruction, 1)
+        && let Some(Operand::RegisterCount(count)) = instruction.operands.get(2)
+        && register >= range_start
+        && register < range_start + count
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Returns `true` for opcodes whose operand layout includes a register-range
+/// pair at operand positions 1 (start register) and 2 (count).
+fn uses_register_range(opcode: Opcode) -> bool {
+    matches!(
+        opcode,
+        Opcode::CallAnyReceiver
+            | Opcode::CallProperty
+            | Opcode::CallWithSpread
+            | Opcode::CallRuntime
+            | Opcode::CallRuntimeForPair
+            | Opcode::CallJSRuntime
+            | Opcode::InvokeIntrinsic
+            | Opcode::CallDirectEval
+            | Opcode::TailCall
+            | Opcode::Construct
+            | Opcode::ConstructWithSpread
+            | Opcode::ResumeGenerator
+            | Opcode::SuspendGenerator
+    )
 }
 
 fn is_pure_accumulator_load(instruction: &Instruction) -> bool {
@@ -596,6 +636,47 @@ mod tests {
                 .map(|instruction| instruction.opcode)
                 .collect::<Vec<_>>(),
             vec![Opcode::Ldar, Opcode::Star, Opcode::Nop]
+        );
+    }
+
+    #[test]
+    fn test_dead_store_not_eliminated_when_register_in_call_range() {
+        // Star r1 followed by CallAnyReceiver that uses r0..r2 (RegisterCount 3).
+        // The register r1 is inside the call's implicit range, so the Star must
+        // NOT be eliminated even though a later Star r1 overwrites it.
+        let original = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(7)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(
+                Opcode::CallAnyReceiver,
+                vec![
+                    Operand::Register(5),
+                    Operand::Register(0),
+                    Operand::RegisterCount(3),
+                    Operand::FeedbackSlot(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+        ];
+
+        let (mut instructions, byte_offsets) = decode_with_offsets(&original);
+        let jump_target_bytes = collect_jump_target_bytes(&instructions, &byte_offsets);
+        apply_local_optimizations(&mut instructions, &byte_offsets, &jump_target_bytes);
+
+        // The first Star r1 must survive — the Call reads r1 as an argument.
+        assert_eq!(
+            instructions
+                .iter()
+                .map(|instruction| instruction.opcode)
+                .collect::<Vec<_>>(),
+            vec![
+                Opcode::LdaSmi,
+                Opcode::Star,
+                Opcode::CallAnyReceiver,
+                Opcode::LdaSmi,
+                Opcode::Star,
+            ]
         );
     }
 
