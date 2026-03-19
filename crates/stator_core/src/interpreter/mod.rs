@@ -2005,6 +2005,38 @@ impl InterpreterFrame {
         Ok(s)
     }
 
+    #[inline(always)]
+    pub(super) fn load_global(&mut self, name: &str) -> StatorResult<JsValue> {
+        if let Some(value) = self.global_cache_get(name).cloned() {
+            if name == "this" && value == JsValue::TheHole {
+                return Err(StatorError::ReferenceError(
+                    "Must call super constructor in derived class before accessing 'this'".into(),
+                ));
+            }
+            return Ok(value);
+        }
+
+        let value = self
+            .global_env
+            .borrow()
+            .get(name)
+            .cloned()
+            .unwrap_or(JsValue::Undefined);
+        self.global_cache_put(name, value.clone());
+        if name == "this" && value == JsValue::TheHole {
+            return Err(StatorError::ReferenceError(
+                "Must call super constructor in derived class before accessing 'this'".into(),
+            ));
+        }
+        Ok(value)
+    }
+
+    #[inline(always)]
+    pub(super) fn sync_hot_accumulator(&mut self, value: &JsValue) {
+        self.hot_accumulator =
+            HotRegisters::try_encode(value).unwrap_or(NanBoxedValue::undefined());
+    }
+
     /// Try to read a global from the per-frame direct-mapped cache.
     ///
     /// Returns `None` when the cache is stale (another frame mutated
@@ -2201,6 +2233,23 @@ impl Interpreter {
                                     frame.hot_accumulator = NanBoxedValue::from_smi(val);
                                     continue 'dispatch;
                                 }
+                                Opcode::LdaGlobal => {
+                                    // SAFETY: Bytecode generator guarantees operand[0]
+                                    // is ConstantPoolIdx for LdaGlobal.
+                                    let name_idx =
+                                        unsafe { operand_constant_pool_idx_unchecked(instr, 0) };
+                                    let name = frame.get_string_constant(name_idx)?;
+                                    let value = frame.load_global(name.as_ref())?;
+                                    acc = value;
+                                    if let JsValue::Smi(val) = acc {
+                                        frame.hot_accumulator = NanBoxedValue::from_smi(val);
+                                    } else {
+                                        frame.smi_mode = false;
+                                        frame.loop_end_pc = 0;
+                                        frame.sync_hot_accumulator(&acc);
+                                    }
+                                    continue 'dispatch;
+                                }
                                 Opcode::Star => {
                                     // SAFETY: Bytecode generator guarantees operand[0]
                                     // is Register for Star, and register is in bounds.
@@ -2332,6 +2381,7 @@ impl Interpreter {
                                 Opcode::TestLessThan
                                 | Opcode::TestGreaterThan
                                 | Opcode::TestEqual
+                                | Opcode::TestEqualStrict
                                 | Opcode::TestLessThanOrEqual
                                 | Opcode::TestGreaterThanOrEqual => {
                                     let reg = unsafe { operand_reg_unchecked(instr, 0) };
@@ -2344,12 +2394,48 @@ impl Interpreter {
                                         Opcode::TestLessThan => a < b,
                                         Opcode::TestGreaterThan => a > b,
                                         Opcode::TestEqual => a == b,
+                                        Opcode::TestEqualStrict => a == b,
                                         Opcode::TestLessThanOrEqual => a <= b,
                                         Opcode::TestGreaterThanOrEqual => a >= b,
-                                        // SAFETY: The outer match arm guarantees one of the five
+                                        // SAFETY: The outer match arm guarantees one of the six
                                         // comparison opcodes.
                                         _ => unsafe { std::hint::unreachable_unchecked() },
                                     };
+                                    if let Some(next_instr) = instructions.get(pc) {
+                                        match next_instr.opcode {
+                                            Opcode::JumpIfTrue => {
+                                                if result {
+                                                    // SAFETY: `pc + 1` is the instruction after
+                                                    // the looked-ahead jump, so `pc` is its slot.
+                                                    pc = unsafe {
+                                                        resolve_jump_unchecked(pc + 1, jump_targets)
+                                                    };
+                                                } else {
+                                                    pc += 1;
+                                                }
+                                                acc = JsValue::Boolean(result);
+                                                frame.hot_accumulator =
+                                                    NanBoxedValue::from_boolean(result);
+                                                continue 'dispatch;
+                                            }
+                                            Opcode::JumpIfFalse => {
+                                                if !result {
+                                                    // SAFETY: `pc + 1` is the instruction after
+                                                    // the looked-ahead jump, so `pc` is its slot.
+                                                    pc = unsafe {
+                                                        resolve_jump_unchecked(pc + 1, jump_targets)
+                                                    };
+                                                } else {
+                                                    pc += 1;
+                                                }
+                                                acc = JsValue::Boolean(result);
+                                                frame.hot_accumulator =
+                                                    NanBoxedValue::from_boolean(result);
+                                                continue 'dispatch;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
                                     acc = JsValue::Boolean(result);
                                     frame.hot_accumulator = NanBoxedValue::from_boolean(result);
                                     continue 'dispatch;
@@ -2454,6 +2540,88 @@ impl Interpreter {
                                     let result = a & b;
                                     acc = JsValue::Smi(result);
                                     frame.hot_accumulator = NanBoxedValue::from_smi(result);
+                                    continue 'dispatch;
+                                }
+                                Opcode::BitwiseXor | Opcode::BitwiseXorSmi => {
+                                    let (a, b) = if instr.opcode == Opcode::BitwiseXor {
+                                        let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                        let a = unsafe { acc.as_smi_unchecked() };
+                                        let b = unsafe {
+                                            frame.read_reg_unchecked(reg).as_smi_unchecked()
+                                        };
+                                        (a, b)
+                                    } else {
+                                        let a = unsafe { acc.as_smi_unchecked() };
+                                        let b = unsafe { operand_imm_unchecked(instr, 0) };
+                                        (a, b)
+                                    };
+                                    let result = a ^ b;
+                                    acc = JsValue::Smi(result);
+                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
+                                    continue 'dispatch;
+                                }
+                                Opcode::BitwiseNot => {
+                                    let result = !unsafe { acc.as_smi_unchecked() };
+                                    acc = JsValue::Smi(result);
+                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
+                                    continue 'dispatch;
+                                }
+                                Opcode::ShiftLeft | Opcode::ShiftLeftSmi => {
+                                    let (a, b) = if instr.opcode == Opcode::ShiftLeft {
+                                        let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                        let a = unsafe { acc.as_smi_unchecked() };
+                                        let b = unsafe {
+                                            frame.read_reg_unchecked(reg).as_smi_unchecked()
+                                        };
+                                        (a, b)
+                                    } else {
+                                        let a = unsafe { acc.as_smi_unchecked() };
+                                        let b = unsafe { operand_imm_unchecked(instr, 0) };
+                                        (a, b)
+                                    };
+                                    let result = a << ((b as u32) & 0x1f);
+                                    acc = JsValue::Smi(result);
+                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
+                                    continue 'dispatch;
+                                }
+                                Opcode::ShiftRight | Opcode::ShiftRightSmi => {
+                                    let (a, b) = if instr.opcode == Opcode::ShiftRight {
+                                        let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                        let a = unsafe { acc.as_smi_unchecked() };
+                                        let b = unsafe {
+                                            frame.read_reg_unchecked(reg).as_smi_unchecked()
+                                        };
+                                        (a, b)
+                                    } else {
+                                        let a = unsafe { acc.as_smi_unchecked() };
+                                        let b = unsafe { operand_imm_unchecked(instr, 0) };
+                                        (a, b)
+                                    };
+                                    let result = a >> ((b as u32) & 0x1f);
+                                    acc = JsValue::Smi(result);
+                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
+                                    continue 'dispatch;
+                                }
+                                Opcode::ShiftRightLogical | Opcode::ShiftRightLogicalSmi => {
+                                    let (a, b) = if instr.opcode == Opcode::ShiftRightLogical {
+                                        let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                        let a = unsafe { acc.as_smi_unchecked() };
+                                        let b = unsafe {
+                                            frame.read_reg_unchecked(reg).as_smi_unchecked()
+                                        };
+                                        (a, b)
+                                    } else {
+                                        let a = unsafe { acc.as_smi_unchecked() };
+                                        let b = unsafe { operand_imm_unchecked(instr, 0) };
+                                        (a, b)
+                                    };
+                                    let result = (a as u32) >> ((b as u32) & 0x1f);
+                                    acc = number_to_jsvalue(result as f64);
+                                    frame.sync_hot_accumulator(&acc);
+                                    if !matches!(acc, JsValue::Smi(_)) {
+                                        frame.smi_mode = false;
+                                        frame.loop_end_pc = 0;
+                                    }
                                     continue 'dispatch;
                                 }
                                 Opcode::Inc => {
@@ -4118,6 +4286,25 @@ unsafe fn operand_imm_unchecked(
     match *unsafe { instr.operands.get_unchecked(idx) } {
         crate::bytecode::bytecodes::Operand::Immediate(v) => v,
         // SAFETY: The bytecode generator guarantees the operand is Immediate.
+        _ => unsafe { std::hint::unreachable_unchecked() },
+    }
+}
+
+/// Extract a `ConstantPoolIdx(u32)` operand without checking the variant tag.
+///
+/// # Safety
+///
+/// The bytecode generator guarantees `instr.operands[idx]` is
+/// [`Operand::ConstantPoolIdx`] for the calling opcode. `idx` must be in bounds.
+#[inline(always)]
+unsafe fn operand_constant_pool_idx_unchecked(
+    instr: &crate::bytecode::bytecodes::Instruction,
+    idx: usize,
+) -> u32 {
+    // SAFETY: Caller guarantees idx < operands.len() and the variant is ConstantPoolIdx.
+    match *unsafe { instr.operands.get_unchecked(idx) } {
+        crate::bytecode::bytecodes::Operand::ConstantPoolIdx(v) => v,
+        // SAFETY: The bytecode generator guarantees the operand is ConstantPoolIdx.
         _ => unsafe { std::hint::unreachable_unchecked() },
     }
 }
@@ -8229,6 +8416,25 @@ mod tests {
         Interpreter::run(&mut frame)
     }
 
+    fn run_smi_mode_bytecode_with_globals(
+        instrs: Vec<Instruction>,
+        pool: Vec<ConstantPoolEntry>,
+        frame_size: u32,
+        globals: &[(&str, JsValue)],
+    ) -> StatorResult<(JsValue, InterpreterFrame)> {
+        let ba = make_bytecode_with_pool(instrs, pool, frame_size, 0);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
+        for (name, value) in globals {
+            frame
+                .global_env
+                .borrow_mut()
+                .insert((*name).to_string(), value.clone());
+        }
+        frame.smi_mode = true;
+        let result = Interpreter::run(&mut frame)?;
+        Ok((result, frame))
+    }
+
     // ── LdaSmi / LdaUndefined / Return ──────────────────────────────────────
 
     #[test]
@@ -8385,6 +8591,129 @@ mod tests {
         // JS: 1 / 0 = Infinity
         let result = arith_op(1, 0, Opcode::Div).unwrap();
         assert_eq!(result, JsValue::HeapNumber(f64::INFINITY));
+    }
+
+    #[test]
+    fn test_smi_mode_lda_global_shift_left_and_bitwise_not() {
+        let pool = vec![ConstantPoolEntry::String("value".to_string())];
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(
+                Opcode::LdaGlobal,
+                vec![Operand::ConstantPoolIdx(0), Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(
+                Opcode::ShiftLeft,
+                vec![Operand::Register(0), Operand::FeedbackSlot(1)],
+            ),
+            Instruction::new_unchecked(Opcode::BitwiseNot, vec![Operand::FeedbackSlot(2)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let (result, frame) =
+            run_smi_mode_bytecode_with_globals(instrs, pool, 1, &[("value", JsValue::Smi(3))])
+                .unwrap();
+
+        assert_eq!(result, JsValue::Smi(-7));
+        assert!(frame.smi_mode);
+    }
+
+    #[test]
+    fn test_smi_mode_bitwise_xor_and_shift_right_logical() {
+        let pool = vec![ConstantPoolEntry::String("value".to_string())];
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(
+                Opcode::LdaGlobal,
+                vec![Operand::ConstantPoolIdx(0), Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(
+                Opcode::BitwiseXor,
+                vec![Operand::Register(0), Operand::FeedbackSlot(1)],
+            ),
+            Instruction::new_unchecked(
+                Opcode::ShiftRightLogical,
+                vec![Operand::Register(0), Operand::FeedbackSlot(2)],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let (result, frame) =
+            run_smi_mode_bytecode_with_globals(instrs, pool, 1, &[("value", JsValue::Smi(10))])
+                .unwrap();
+
+        assert_eq!(result, JsValue::Smi(5));
+        assert!(frame.smi_mode);
+    }
+
+    fn run_smi_compare_branch(
+        compare_opcode: Opcode,
+        jump_opcode: Opcode,
+        lhs: i32,
+        rhs: i32,
+    ) -> StatorResult<JsValue> {
+        use crate::bytecode::bytecodes::decode_with_byte_offsets;
+
+        let base_instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(rhs)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(lhs)]),
+            Instruction::new_unchecked(
+                compare_opcode,
+                vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(jump_opcode, vec![Operand::JumpOffset(0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(0)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let raw = encode(&base_instrs);
+        let (_, offsets) = decode_with_byte_offsets(&raw)?;
+        let jump_delta = offsets[7] as i32 - offsets[5] as i32;
+
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(rhs)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(lhs)]),
+            Instruction::new_unchecked(
+                compare_opcode,
+                vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(jump_opcode, vec![Operand::JumpOffset(jump_delta)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(0)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let ba = make_bytecode(instrs, 1, 0);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
+        frame.smi_mode = true;
+        Interpreter::run(&mut frame)
+    }
+
+    #[test]
+    fn test_smi_mode_compare_branch_fusion() {
+        assert_eq!(
+            run_smi_compare_branch(Opcode::TestLessThan, Opcode::JumpIfTrue, 3, 5).unwrap(),
+            JsValue::Smi(1)
+        );
+        assert_eq!(
+            run_smi_compare_branch(Opcode::TestGreaterThan, Opcode::JumpIfFalse, 3, 5).unwrap(),
+            JsValue::Smi(1)
+        );
+        assert_eq!(
+            run_smi_compare_branch(Opcode::TestEqual, Opcode::JumpIfTrue, 7, 7).unwrap(),
+            JsValue::Smi(1)
+        );
+        assert_eq!(
+            run_smi_compare_branch(Opcode::TestEqualStrict, Opcode::JumpIfTrue, 7, 7).unwrap(),
+            JsValue::Smi(1)
+        );
     }
 
     // ── TestEqual ────────────────────────────────────────────────────────────
