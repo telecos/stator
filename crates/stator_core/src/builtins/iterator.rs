@@ -1016,7 +1016,7 @@ mod tests {
             vec![],
         )
         .with_generator_flag(true);
-        JsValue::Generator(GeneratorState::new(ba))
+        JsValue::Generator(GeneratorState::new(Rc::new(ba)))
     }
 
     #[test]

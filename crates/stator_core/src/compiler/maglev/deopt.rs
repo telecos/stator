@@ -195,7 +195,7 @@ pub fn deoptimize(
     // `InterpreterFrame::new_with_globals` initialises parameters from `args`
     // and locals to `Undefined`.  We then overwrite the register file with the
     // captured frame state so the interpreter resumes with the correct values.
-    let mut frame = InterpreterFrame::new_with_globals(bytecode_array, vec![], global_env);
+    let mut frame = InterpreterFrame::new_with_globals(Rc::new(bytecode_array), vec![], global_env);
 
     for (i, v) in deopt_info.frame_state.registers.iter().enumerate() {
         if i < frame.registers.len() {

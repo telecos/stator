@@ -112,7 +112,7 @@ impl GeneratorStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct GeneratorState {
     /// Bytecode for the generator function body.
-    pub bytecode_array: BytecodeArray,
+    pub bytecode_array: Rc<BytecodeArray>,
     /// Prototype for the generator object returned by the call.
     ///
     /// This is usually the callee's own `.prototype` object, falling back to
@@ -140,7 +140,7 @@ impl GeneratorState {
     /// Create a new generator ready to execute `bytecode_array` from the
     /// beginning on the first call to
     /// [`crate::interpreter::Interpreter::run_generator_step`].
-    pub fn new(bytecode_array: BytecodeArray) -> Rc<RefCell<Self>> {
+    pub fn new(bytecode_array: Rc<BytecodeArray>) -> Rc<RefCell<Self>> {
         Rc::new(RefCell::new(Self {
             bytecode_array,
             prototype: None,

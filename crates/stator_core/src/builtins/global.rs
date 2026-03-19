@@ -474,7 +474,7 @@ pub fn global_eval_strict(
     // scope but writes new bindings to its own map, preventing leakage.
     let child_env = caller_env.borrow().clone();
     let child_rc = Rc::new(RefCell::new(child_env));
-    let mut frame = InterpreterFrame::new_with_globals(bytecode, vec![], child_rc);
+    let mut frame = InterpreterFrame::new_with_globals(Rc::new(bytecode), vec![], child_rc);
     Interpreter::run(&mut frame)
 }
 
@@ -498,7 +498,8 @@ fn eval_core(
             let bytecode = BytecodeGenerator::compile_program_with_source(&program, Some(source))?;
             let env = caller_env.expect("direct eval requires a caller environment");
             let child_env = Rc::new(RefCell::new(env.borrow().clone()));
-            let mut frame = InterpreterFrame::new_with_globals(bytecode, vec![], child_env);
+            let mut frame =
+                InterpreterFrame::new_with_globals(Rc::new(bytecode), vec![], child_env);
             frame.context = caller_context;
             frame
         }
@@ -508,16 +509,16 @@ fn eval_core(
             let bytecode =
                 BytecodeGenerator::compile_eval_program_with_source(&program, Some(source))?;
             let env = caller_env.expect("direct eval requires a caller environment");
-            let mut frame = InterpreterFrame::new_with_globals(bytecode, vec![], env);
+            let mut frame = InterpreterFrame::new_with_globals(Rc::new(bytecode), vec![], env);
             frame.context = caller_context;
             frame
         }
         EvalMode::Indirect => {
             let bytecode = BytecodeGenerator::compile_program_with_source(&program, Some(source))?;
             if let Some(env) = current_global_env() {
-                InterpreterFrame::new_with_globals(bytecode, vec![], env)
+                InterpreterFrame::new_with_globals(Rc::new(bytecode), vec![], env)
             } else {
-                InterpreterFrame::new(bytecode, vec![])
+                InterpreterFrame::new(Rc::new(bytecode), vec![])
             }
         }
     };

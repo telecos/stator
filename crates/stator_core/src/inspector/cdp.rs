@@ -281,8 +281,11 @@ impl CdpSession {
         let bytecodes =
             parser::parse(expression).and_then(|p| BytecodeGenerator::compile_program(&p))?;
 
-        let mut frame =
-            InterpreterFrame::new_with_globals(bytecodes, vec![], Rc::clone(&self.globals));
+        let mut frame = InterpreterFrame::new_with_globals(
+            Rc::new(bytecodes),
+            vec![],
+            Rc::clone(&self.globals),
+        );
         let js_result = Interpreter::run(&mut frame)?;
 
         Ok(json!({
@@ -326,8 +329,11 @@ impl CdpSession {
         let bytecodes =
             parser::parse(&expression).and_then(|p| BytecodeGenerator::compile_program(&p))?;
 
-        let mut frame =
-            InterpreterFrame::new_with_globals(bytecodes, vec![], Rc::clone(&self.globals));
+        let mut frame = InterpreterFrame::new_with_globals(
+            Rc::new(bytecodes),
+            vec![],
+            Rc::clone(&self.globals),
+        );
         let js_result = Interpreter::run(&mut frame)?;
 
         Ok(json!({

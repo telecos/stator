@@ -14906,8 +14906,11 @@ fn make_shadow_realm() -> JsValue {
                         .unwrap_or_default();
                     let program = crate::parser::recursive_descent::parse(&source)?;
                     let bc = BytecodeGenerator::compile_program(&program)?;
-                    let mut frame =
-                        InterpreterFrame::new_with_globals(bc, vec![], Rc::clone(&globals));
+                    let mut frame = InterpreterFrame::new_with_globals(
+                        Rc::new(bc),
+                        vec![],
+                        Rc::clone(&globals),
+                    );
                     let result = Interpreter::run(&mut frame)?;
                     // ShadowRealm boundary: only primitives pass through.
                     match &result {
@@ -23803,8 +23806,11 @@ mod tests {
         let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
         let mut ge = crate::interpreter::GlobalEnv::new();
         install_globals(&mut ge.vars);
-        let mut frame =
-            InterpreterFrame::new_with_globals(bytecode, vec![], Rc::new(RefCell::new(ge)));
+        let mut frame = InterpreterFrame::new_with_globals(
+            Rc::new(bytecode),
+            vec![],
+            Rc::new(RefCell::new(ge)),
+        );
         let result = Interpreter::run(&mut frame).unwrap();
         drain_active_microtask_queue();
         match result {

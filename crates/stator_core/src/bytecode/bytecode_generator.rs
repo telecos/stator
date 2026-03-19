@@ -1729,7 +1729,7 @@ impl FunctionCompiler {
                 source_span: Some(decl.loc),
             },
         )?;
-        let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
+        let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Rc::new(func_array)));
         // Emit CreateClosure: [func_idx, slot, flags]
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         self.emit(Instruction::new_unchecked(
@@ -1878,7 +1878,7 @@ impl FunctionCompiler {
         } else {
             ctor_array
         };
-        let ctor_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(ctor_array)));
+        let ctor_idx = self.add_constant_raw(ConstantPoolEntry::Function(Rc::new(ctor_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
 
         // 3. Emit CreateClass.
@@ -2324,7 +2324,7 @@ impl FunctionCompiler {
             true,
             self.private_names.clone(),
         )?;
-        let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(block_array)));
+        let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Rc::new(block_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         self.emit(Instruction::new_unchecked(
             Opcode::CreateClosure,
@@ -2381,7 +2381,7 @@ impl FunctionCompiler {
             true,
             self.private_names.clone(),
         )?;
-        let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(value_array)));
+        let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Rc::new(value_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         self.emit(Instruction::new_unchecked(
             Opcode::CreateClosure,
@@ -2634,7 +2634,7 @@ impl FunctionCompiler {
         }
 
         let init_array = ic.finalize()?;
-        let init_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(init_array)));
+        let init_idx = self.add_constant_raw(ConstantPoolEntry::Function(Rc::new(init_array)));
         let closure_slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         self.emit(Instruction::new_unchecked(
             Opcode::CreateClosure,
@@ -5013,7 +5013,7 @@ impl FunctionCompiler {
         } else {
             func_array
         };
-        let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
+        let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Rc::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         self.emit(Instruction::new_unchecked(
             Opcode::CreateClosure,
@@ -5052,7 +5052,7 @@ impl FunctionCompiler {
             },
         )?
         .with_function_name(name);
-        let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
+        let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Rc::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         self.emit(Instruction::new_unchecked(
             Opcode::CreateClosure,
@@ -5101,7 +5101,7 @@ impl FunctionCompiler {
         )?
         .with_arrow_flag(true)
         .with_function_name(name);
-        let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
+        let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Rc::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         self.emit(Instruction::new_unchecked(
             Opcode::CreateClosure,
@@ -5180,7 +5180,7 @@ impl FunctionCompiler {
             },
         )?
         .with_arrow_flag(true);
-        let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Box::new(func_array)));
+        let pool_idx = self.add_constant_raw(ConstantPoolEntry::Function(Rc::new(func_array)));
         let slot = self.alloc_slot(FeedbackSlotKind::CreateClosure);
         // Flag(1) marks this as an arrow function (no .prototype property).
         self.emit(Instruction::new_unchecked(
@@ -8481,7 +8481,7 @@ mod tests {
     fn run(prog: &Program) -> crate::objects::value::JsValue {
         use crate::interpreter::{Interpreter, InterpreterFrame};
         let arr = BytecodeGenerator::compile_program(prog).unwrap();
-        let mut frame = InterpreterFrame::new(arr, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(arr), vec![]);
         Interpreter::run(&mut frame).unwrap()
     }
 
@@ -8586,7 +8586,7 @@ mod tests {
             JsValue::Smi(2),
             JsValue::Smi(3),
         ]));
-        let mut frame = InterpreterFrame::new(ba, vec![iter]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![iter]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(
             result,

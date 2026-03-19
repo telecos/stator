@@ -1293,6 +1293,7 @@ mod tests {
     use crate::bytecode::feedback::FeedbackMetadata;
     use crate::interpreter::{Interpreter, InterpreterFrame};
     use crate::objects::value::JsValue;
+    use std::rc::Rc;
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
@@ -1313,7 +1314,7 @@ mod tests {
 
     /// Run `ba` through the Stator interpreter and return the accumulator.
     fn interp_run(ba: BytecodeArray) -> JsValue {
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         Interpreter::run(&mut frame).expect("interpreter error")
     }
 

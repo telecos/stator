@@ -108,7 +108,7 @@ pub enum ConstantPoolEntry {
     /// A BigInt literal (128-bit signed integer).
     BigInt(i128),
     /// A compiled nested function or closure.
-    Function(Box<BytecodeArray>),
+    Function(Rc<BytecodeArray>),
     /// A template-literal descriptor for [`Opcode::GetTemplateObject`](super::bytecodes::Opcode::GetTemplateObject).
     ///
     /// Holds the cooked strings (`None` when the segment has an invalid escape)

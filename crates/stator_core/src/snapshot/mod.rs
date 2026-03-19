@@ -1036,7 +1036,7 @@ fn read_constant_pool_entry(bytes: &[u8], cursor: &mut usize) -> StatorResult<Co
         }
         CPE_FUNCTION => {
             let ba = read_bytecode_array(bytes, cursor)?;
-            Ok(ConstantPoolEntry::Function(Box::new(ba)))
+            Ok(ConstantPoolEntry::Function(Rc::new(ba)))
         }
         CPE_TEMPLATE_OBJECT => {
             let len = read_u32(bytes, cursor)? as usize;
@@ -1403,7 +1403,7 @@ mod tests {
             FeedbackMetadata::empty(),
             vec![],
         );
-        let pool = vec![ConstantPoolEntry::Function(Box::new(inner_ba.clone()))];
+        let pool = vec![ConstantPoolEntry::Function(Rc::new(inner_ba.clone()))];
         let outer_ba = BytecodeArray::new(
             vec![0x20],
             pool,

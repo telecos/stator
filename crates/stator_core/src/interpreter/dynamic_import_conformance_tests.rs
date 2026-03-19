@@ -20,6 +20,7 @@ mod tests {
     use crate::builtins::global::global_eval;
     use crate::objects::value::JsValue;
     use crate::parser::{parse, parse_module, parse_script};
+    use std::rc::Rc;
 
     /// Evaluate `src` and assert the result is boolean `true`.
     fn assert_eval_true(src: &str) {
@@ -267,7 +268,7 @@ mod tests {
             vec![],
         )
         .with_module_flag(true);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert!(
             matches!(result, JsValue::PlainObject(_)),

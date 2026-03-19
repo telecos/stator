@@ -1615,12 +1615,12 @@ fn handle_call_any_receiver(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
-                let state = GeneratorState::new((*ba).clone());
+                let state = GeneratorState::new(Rc::clone(&ba));
                 super::init_generator_state_prototype(&state, &ba);
                 ctx.frame.accumulator = JsValue::Generator(state);
             } else if ba.is_async() {
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                ctx.frame.accumulator = Interpreter::run_async_function((*ba).clone(), args)?;
+                ctx.frame.accumulator = Interpreter::run_async_function(Rc::clone(&ba), args)?;
             } else {
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
                 // ── Tiering ──────────────────────────────────
@@ -1642,7 +1642,7 @@ fn handle_call_any_receiver(
                 if !tried_jit {
                     let callee_val = JsValue::Function(Rc::clone(&ba));
                     let mut callee_frame = InterpreterFrame::new_with_globals(
-                        (*ba).clone(),
+                        Rc::clone(&ba),
                         args,
                         Rc::clone(&ctx.frame.global_env),
                     );
@@ -1718,11 +1718,11 @@ fn handle_tail_call(
                 // fall back to a normal call.
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
                 if ba.is_generator() {
-                    let state = GeneratorState::new((*ba).clone());
+                    let state = GeneratorState::new(Rc::clone(&ba));
                     super::init_generator_state_prototype(&state, &ba);
                     ctx.frame.accumulator = JsValue::Generator(state);
                 } else {
-                    ctx.frame.accumulator = Interpreter::run_async_function((*ba).clone(), args)?;
+                    ctx.frame.accumulator = Interpreter::run_async_function(Rc::clone(&ba), args)?;
                 }
             } else {
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
@@ -1748,7 +1748,7 @@ fn handle_tail_call(
                     let frame_size = ba.frame_size() as usize;
                     let total_regs = param_count + frame_size;
                     let inherited_new_target = ctx.frame.new_target.clone();
-                    ctx.frame.bytecode_array = (*ba).clone();
+                    ctx.frame.bytecode_array = Rc::clone(&ba);
                     ctx.frame.call_args = args;
                     ctx.frame.registers.clear();
                     ctx.frame.registers.resize(total_regs, JsValue::Undefined);
@@ -1831,11 +1831,11 @@ fn handle_call_undefined_receiver0(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
-                let state = GeneratorState::new((*ba).clone());
+                let state = GeneratorState::new(Rc::clone(&ba));
                 super::init_generator_state_prototype(&state, &ba);
                 ctx.frame.accumulator = JsValue::Generator(state);
             } else if ba.is_async() {
-                ctx.frame.accumulator = Interpreter::run_async_function((*ba).clone(), vec![])?;
+                ctx.frame.accumulator = Interpreter::run_async_function(Rc::clone(&ba), vec![])?;
             } else {
                 let args = CallArgs::new();
                 let count = ba.increment_invocation_count();
@@ -1867,7 +1867,7 @@ fn handle_call_undefined_receiver0(
                         None
                     };
                     let mut callee_frame = InterpreterFrame::new_with_globals(
-                        (*ba).clone(),
+                        Rc::clone(&ba),
                         args,
                         Rc::clone(&ctx.frame.global_env),
                     );
@@ -1937,12 +1937,13 @@ fn handle_call_undefined_receiver1(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
-                let state = GeneratorState::new((*ba).clone());
+                let state = GeneratorState::new(Rc::clone(&ba));
                 super::init_generator_state_prototype(&state, &ba);
                 ctx.frame.accumulator = JsValue::Generator(state);
             } else if ba.is_async() {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
-                ctx.frame.accumulator = Interpreter::run_async_function((*ba).clone(), vec![arg1])?;
+                ctx.frame.accumulator =
+                    Interpreter::run_async_function(Rc::clone(&ba), vec![arg1])?;
             } else {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
                 let args = vec![arg1];
@@ -1974,7 +1975,7 @@ fn handle_call_undefined_receiver1(
                         None
                     };
                     let mut callee_frame = InterpreterFrame::new_with_globals(
-                        (*ba).clone(),
+                        Rc::clone(&ba),
                         args,
                         Rc::clone(&ctx.frame.global_env),
                     );
@@ -2049,14 +2050,14 @@ fn handle_call_undefined_receiver2(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
-                let state = GeneratorState::new((*ba).clone());
+                let state = GeneratorState::new(Rc::clone(&ba));
                 super::init_generator_state_prototype(&state, &ba);
                 ctx.frame.accumulator = JsValue::Generator(state);
             } else if ba.is_async() {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
                 let arg2 = ctx.frame.read_reg(arg2_v)?.clone();
                 ctx.frame.accumulator =
-                    Interpreter::run_async_function((*ba).clone(), vec![arg1, arg2])?;
+                    Interpreter::run_async_function(Rc::clone(&ba), vec![arg1, arg2])?;
             } else {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
                 let arg2 = ctx.frame.read_reg(arg2_v)?.clone();
@@ -2090,7 +2091,7 @@ fn handle_call_undefined_receiver2(
                         None
                     };
                     let mut callee_frame = InterpreterFrame::new_with_globals(
-                        (*ba).clone(),
+                        Rc::clone(&ba),
                         args,
                         Rc::clone(&ctx.frame.global_env),
                     );
@@ -2191,7 +2192,7 @@ fn handle_call_property(
             }
             if !tried_jit {
                 let mut callee_frame = InterpreterFrame::new_with_globals(
-                    (*ba).clone(),
+                    Rc::clone(&ba),
                     args,
                     Rc::clone(&ctx.frame.global_env),
                 );
@@ -2409,7 +2410,7 @@ fn handle_call_with_spread(
             }
             if !tried_jit {
                 let mut callee_frame = InterpreterFrame::new_with_globals(
-                    (*ba).clone(),
+                    Rc::clone(&ba),
                     args,
                     Rc::clone(&ctx.frame.global_env),
                 );
@@ -2497,7 +2498,7 @@ fn call_plain_object_function(
         }
     }
     let mut callee_frame =
-        InterpreterFrame::new_with_globals((**ba).clone(), args, Rc::clone(&ctx.frame.global_env));
+        InterpreterFrame::new_with_globals(Rc::clone(ba), args, Rc::clone(&ctx.frame.global_env));
     restore_closure_context(&mut callee_frame, ba);
     callee_frame.new_target = ctx.frame.new_target.clone();
     push_call_frame("<anonymous>")?;
@@ -2540,7 +2541,7 @@ fn construct_class_from_plain_object(
 
     // 2. Set up callee frame.
     let mut callee_frame =
-        InterpreterFrame::new_with_globals((**ba).clone(), args, Rc::clone(&ctx.frame.global_env));
+        InterpreterFrame::new_with_globals(Rc::clone(ba), args, Rc::clone(&ctx.frame.global_env));
     restore_closure_context(&mut callee_frame, ba);
     callee_frame.new_target = JsValue::PlainObject(Rc::clone(class_map));
 
@@ -2576,7 +2577,7 @@ fn construct_class_from_plain_object(
             class_map.borrow().get(".class_field_initializer").cloned()
         {
             let mut init_frame = InterpreterFrame::new_with_globals(
-                (*init_ba).clone(),
+                Rc::clone(&init_ba),
                 vec![this.clone()],
                 Rc::clone(env),
             );
@@ -2683,7 +2684,7 @@ fn handle_construct(
             }
             let this_val = JsValue::PlainObject(this_obj);
             let mut callee_frame = InterpreterFrame::new_with_globals(
-                (*ba).clone(),
+                Rc::clone(&ba),
                 args,
                 Rc::clone(&ctx.frame.global_env),
             );
@@ -2787,7 +2788,7 @@ fn handle_construct_with_spread(
             }
             let this_val = JsValue::PlainObject(this_obj);
             let mut callee_frame = InterpreterFrame::new_with_globals(
-                (*ba).clone(),
+                Rc::clone(&ba),
                 args,
                 Rc::clone(&ctx.frame.global_env),
             );
@@ -5575,7 +5576,7 @@ fn handle_create_mapped_arguments(
     // callee: reference to the executing function (sloppy mode only)
     map.insert(
         "callee".to_string(),
-        JsValue::Function(Rc::new(ctx.frame.bytecode_array.clone())),
+        JsValue::Function(Rc::clone(&ctx.frame.bytecode_array)),
     );
     // @@iterator: array-like iteration support via NativeIterator
     let args_for_iter = args.clone();
@@ -6532,7 +6533,7 @@ fn handle_construct_forward_all_args(
             }
             let this_val = JsValue::PlainObject(this_obj);
             let mut callee_frame = InterpreterFrame::new_with_globals(
-                (*ba).clone(),
+                Rc::clone(&ba),
                 args,
                 Rc::clone(&ctx.frame.global_env),
             );
@@ -6726,12 +6727,12 @@ fn handle_call_direct_eval(
         match callee {
             JsValue::Function(ba) => {
                 if ba.is_generator() {
-                    let state = GeneratorState::new((*ba).clone());
+                    let state = GeneratorState::new(Rc::clone(&ba));
                     super::init_generator_state_prototype(&state, &ba);
                     ctx.frame.accumulator = JsValue::Generator(state);
                 } else {
                     let mut callee_frame = InterpreterFrame::new_with_globals(
-                        (*ba).clone(),
+                        Rc::clone(&ba),
                         args,
                         Rc::clone(&ctx.frame.global_env),
                     );
@@ -6822,7 +6823,7 @@ fn handle_create_class(
     // 3. Create the class constructor as a PlainObject wrapping the
     //    bytecode in __call__ so it can be invoked via both `new` and
     //    direct calls.
-    let ctor_ba_rc = Rc::new((**ctor_ba).clone());
+    let ctor_ba_rc = Rc::clone(ctor_ba);
     let class_obj: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
     class_obj.borrow_mut().insert(
         "__call__".to_string(),
@@ -7638,6 +7639,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
 #[cfg(test)]
 mod tests {
     use crate::objects::value::JsValue;
+    use std::rc::Rc;
 
     fn assert_eval_true(source: &str) {
         let result = crate::builtins::global::global_eval(source).unwrap();
@@ -8736,7 +8738,7 @@ mod tests {
             vec![],
         )
         .with_module_flag(true);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert!(
             matches!(result, JsValue::PlainObject(_)),
@@ -8775,7 +8777,7 @@ mod tests {
             vec![],
         )
         .with_module_flag(true);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(99));
     }
@@ -8805,7 +8807,7 @@ mod tests {
             vec![],
         )
         .with_module_flag(true);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert!(
             matches!(result, JsValue::PlainObject(_)),

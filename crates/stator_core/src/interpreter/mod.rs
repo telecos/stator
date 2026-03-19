@@ -917,7 +917,7 @@ fn pool_for_compile_thread(pool: &[ConstantPoolEntry]) -> Vec<ConstantPoolEntry>
     pool.iter()
         .map(|e: &ConstantPoolEntry| match e {
             ConstantPoolEntry::Function(_) => {
-                ConstantPoolEntry::Function(Box::new(BytecodeArray::new(
+                ConstantPoolEntry::Function(Rc::new(BytecodeArray::new(
                     vec![],
                     vec![],
                     0,
@@ -1516,7 +1516,7 @@ impl HotRegisters {
 /// - an optional **context** value for future scope/closure support.
 pub struct InterpreterFrame {
     /// The bytecode for the currently-executing function.
-    pub bytecode_array: BytecodeArray,
+    pub bytecode_array: Rc<BytecodeArray>,
     /// Flat register file: `[params…, locals/temps…]`.
     ///
     /// Length = `bytecode_array.parameter_count() + bytecode_array.frame_size()`.
@@ -1629,7 +1629,7 @@ impl InterpreterFrame {
     /// If `args` has fewer entries than the declared `parameter_count`, the
     /// remaining parameter registers are initialised to `undefined`.  Extra
     /// arguments beyond `parameter_count` are silently discarded.
-    pub fn new(bytecode_array: BytecodeArray, args: impl IntoIterator<Item = JsValue>) -> Self {
+    pub fn new(bytecode_array: Rc<BytecodeArray>, args: impl IntoIterator<Item = JsValue>) -> Self {
         let args: CallArgs = args.into_iter().collect();
         let param_count = bytecode_array.parameter_count() as usize;
         let frame_size = bytecode_array.frame_size() as usize;
@@ -1692,7 +1692,7 @@ impl InterpreterFrame {
     /// that supply only application-specific globals (e.g. `print`) still
     /// get a fully functional JavaScript environment.
     pub fn new_with_globals(
-        bytecode_array: BytecodeArray,
+        bytecode_array: Rc<BytecodeArray>,
         args: impl IntoIterator<Item = JsValue>,
         global_env: Rc<RefCell<GlobalEnv>>,
     ) -> Self {
@@ -3069,7 +3069,7 @@ impl Interpreter {
         };
         // Restore the captured closure context so generators can access outer
         // scope variables through the context chain.
-        let ba_ref = Rc::new(frame.bytecode_array.clone());
+        let ba_ref = Rc::clone(&frame.bytecode_array);
         restore_closure_context(&mut frame, &ba_ref);
         // Named generator expressions: populate the self-name register so
         // the body can reference the generator function by its own name.
@@ -3130,7 +3130,7 @@ impl Interpreter {
     /// Returns a `JsValue::Promise` that is already fulfilled with the return
     /// value, or already rejected if the async body threw.
     pub fn run_async_function(
-        bytecode_array: BytecodeArray,
+        bytecode_array: Rc<BytecodeArray>,
         _args: impl IntoIterator<Item = JsValue>,
     ) -> StatorResult<JsValue> {
         use crate::builtins::promise::{MicrotaskQueue, promise_reject, promise_resolve};
@@ -3586,7 +3586,7 @@ pub(super) fn constant_to_value(entry: &ConstantPoolEntry) -> JsValue {
         ConstantPoolEntry::Null => JsValue::Null,
         ConstantPoolEntry::Undefined => JsValue::Undefined,
         ConstantPoolEntry::BigInt(n) => JsValue::BigInt(*n),
-        ConstantPoolEntry::Function(ba) => JsValue::Function(Rc::new((**ba).clone())),
+        ConstantPoolEntry::Function(ba) => JsValue::Function(Rc::clone(ba)),
         ConstantPoolEntry::TemplateObject { cooked, raw } => build_template_object(cooked, raw),
     }
 }
@@ -4130,13 +4130,13 @@ pub(super) fn dispatch_call(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
-                let state = GeneratorState::new((**ba).clone());
+                let state = GeneratorState::new(Rc::clone(ba));
                 init_generator_state_prototype(&state, ba);
                 frame.accumulator = JsValue::Generator(state);
             } else if ba.is_async() {
                 // Async (non-generator) function: drive the internal generator
                 // to completion and return a Promise.
-                frame.accumulator = Interpreter::run_async_function((**ba).clone(), args)?;
+                frame.accumulator = Interpreter::run_async_function(Rc::clone(ba), args)?;
             } else {
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
@@ -4155,7 +4155,7 @@ pub(super) fn dispatch_call(
                 }
                 if !tried_jit {
                     let mut callee_frame = InterpreterFrame::new_with_globals(
-                        (**ba).clone(),
+                        Rc::clone(ba),
                         args,
                         Rc::clone(&frame.global_env),
                     );
@@ -4206,11 +4206,11 @@ pub(super) fn dispatch_call_property(
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
-                let state = GeneratorState::new((**ba).clone());
+                let state = GeneratorState::new(Rc::clone(ba));
                 init_generator_state_prototype(&state, ba);
                 frame.accumulator = JsValue::Generator(state);
             } else if ba.is_async() {
-                frame.accumulator = Interpreter::run_async_function((**ba).clone(), args)?;
+                frame.accumulator = Interpreter::run_async_function(Rc::clone(ba), args)?;
             } else {
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
@@ -4229,7 +4229,7 @@ pub(super) fn dispatch_call_property(
                 }
                 if !tried_jit {
                     let mut callee_frame = InterpreterFrame::new_with_globals(
-                        (**ba).clone(),
+                        Rc::clone(ba),
                         args,
                         Rc::clone(&frame.global_env),
                     );
@@ -7444,9 +7444,9 @@ fn dispatch_getter(getter: &JsValue, this: &JsValue) -> StatorResult<JsValue> {
         JsValue::Function(ba) => {
             push_call_frame("<getter>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                InterpreterFrame::new_with_globals((**ba).clone(), vec![], globals)
+                InterpreterFrame::new_with_globals(Rc::clone(ba), vec![], globals)
             } else {
-                InterpreterFrame::new((**ba).clone(), vec![])
+                InterpreterFrame::new(Rc::clone(ba), vec![])
             };
             restore_closure_context(&mut frame, ba);
             frame
@@ -7469,9 +7469,9 @@ pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) ->
         JsValue::Function(ba) => {
             push_call_frame("<setter>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                InterpreterFrame::new_with_globals((**ba).clone(), vec![val], globals)
+                InterpreterFrame::new_with_globals(Rc::clone(ba), vec![val], globals)
             } else {
-                InterpreterFrame::new((**ba).clone(), vec![val])
+                InterpreterFrame::new(Rc::clone(ba), vec![val])
             };
             restore_closure_context(&mut frame, ba);
             frame
@@ -7510,15 +7510,15 @@ pub fn dispatch_call_value(
             // Generator functions return a suspended generator object instead
             // of executing the body (§27.3.3.1).
             if ba.is_generator() {
-                let state = GeneratorState::new((**ba).clone());
+                let state = GeneratorState::new(Rc::clone(ba));
                 init_generator_state_prototype(&state, ba);
                 return Ok(JsValue::Generator(state));
             }
             push_call_frame("<anonymous>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                InterpreterFrame::new_with_globals((**ba).clone(), args, globals)
+                InterpreterFrame::new_with_globals(Rc::clone(ba), args, globals)
             } else {
-                InterpreterFrame::new((**ba).clone(), args)
+                InterpreterFrame::new(Rc::clone(ba), args)
             };
             restore_closure_context(&mut frame, ba);
             populate_self_name(&mut frame, ba, &JsValue::Function(Rc::clone(ba)));
@@ -7555,15 +7555,15 @@ pub fn dispatch_call_with_this(
             // Generator functions return a suspended generator object instead
             // of executing the body (§27.3.3.1).
             if ba.is_generator() {
-                let state = GeneratorState::new((**ba).clone());
+                let state = GeneratorState::new(Rc::clone(ba));
                 init_generator_state_prototype(&state, ba);
                 return Ok(JsValue::Generator(state));
             }
             push_call_frame("<anonymous>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                InterpreterFrame::new_with_globals((**ba).clone(), args, globals)
+                InterpreterFrame::new_with_globals(Rc::clone(ba), args, globals)
             } else {
-                InterpreterFrame::new((**ba).clone(), args)
+                InterpreterFrame::new(Rc::clone(ba), args)
             };
             restore_closure_context(&mut frame, ba);
             populate_self_name(&mut frame, ba, &JsValue::Function(Rc::clone(ba)));
@@ -7640,9 +7640,9 @@ pub fn dispatch_construct_call(
         JsValue::Function(ba) => {
             push_call_frame("<anonymous>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                InterpreterFrame::new_with_globals((**ba).clone(), args, globals)
+                InterpreterFrame::new_with_globals(Rc::clone(ba), args, globals)
             } else {
-                InterpreterFrame::new((**ba).clone(), args)
+                InterpreterFrame::new(Rc::clone(ba), args)
             };
             restore_closure_context(&mut frame, ba);
             populate_self_name(&mut frame, ba, &JsValue::Function(Rc::clone(ba)));
@@ -7987,7 +7987,7 @@ mod tests {
     /// Run a zero-argument bytecode and return the result.
     fn run_bytecode(instrs: Vec<Instruction>, frame_size: u32) -> StatorResult<JsValue> {
         let ba = make_bytecode(instrs, frame_size, 0);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         Interpreter::run(&mut frame)
     }
 
@@ -8247,7 +8247,7 @@ mod tests {
             0,
             1, // 1 parameter
         );
-        let mut frame = InterpreterFrame::new(ba, vec![JsValue::Smi(99)]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![JsValue::Smi(99)]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(99));
     }
@@ -8664,7 +8664,7 @@ mod tests {
             is_strict: false,
         };
         let ba = BytecodeGenerator::compile_program(&program)?;
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         Interpreter::run(&mut frame)
     }
 
@@ -8988,9 +8988,9 @@ mod tests {
             ),
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
-        let pool = vec![ConstantPoolEntry::Function(Box::new(inner_ba))];
+        let pool = vec![ConstantPoolEntry::Function(Rc::new(inner_ba))];
         let outer_ba = make_bytecode_with_pool(outer_instrs, pool, 3, 0);
-        let mut frame = InterpreterFrame::new(outer_ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(outer_ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(7));
     }
@@ -9319,7 +9319,7 @@ mod tests {
             is_finally: false,
         }];
         let ba = make_bytecode_with_handlers(instrs_patched, 1, 0, handler_table);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(42));
     }
@@ -9383,7 +9383,7 @@ mod tests {
             is_finally: true,
         }];
         let ba = make_bytecode_with_handlers(instrs, 2, 0, handler_table);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         // Normal path returns value from try body (r0 = 1).
         assert_eq!(result, JsValue::Smi(1));
@@ -9404,7 +9404,7 @@ mod tests {
         let src = "try { throw 5; } finally { }";
         let program = parse(src).unwrap();
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let err = Interpreter::run(&mut frame).unwrap_err();
         // The exception value "5" should propagate.
         assert!(
@@ -9424,7 +9424,7 @@ mod tests {
         let src = "try { throw 7; } catch(e) { return e; }";
         let program = parse(src).unwrap();
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(7));
     }
@@ -9448,7 +9448,7 @@ mod tests {
         ";
         let program = parse(src).unwrap();
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(2));
     }
@@ -9472,7 +9472,7 @@ mod tests {
         ";
         let program = parse(src).unwrap();
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(11));
     }
@@ -9530,7 +9530,7 @@ mod tests {
             is_finally: false,
         }];
         let ba = make_bytecode_with_handlers(instrs, 2, 0, handler_table);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         // The caught value should be a JsValue::Error with kind TypeError.
         assert!(
@@ -9553,7 +9553,7 @@ mod tests {
         "#;
         let program = parse(src).unwrap();
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         crate::builtins::install_globals::install_globals(&mut frame.global_env.borrow_mut().vars);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::String("TypeError".to_string().into()));
@@ -9570,7 +9570,7 @@ mod tests {
         let src = "try { throw 42; } catch(e) { return e; }";
         let program = parse(src).unwrap();
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(42));
     }
@@ -9584,7 +9584,7 @@ mod tests {
         let src = r#"try { throw "message"; } catch(e) { return e; }"#;
         let program = parse(src).unwrap();
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::String("message".to_string().into()));
     }
@@ -9600,7 +9600,7 @@ mod tests {
         "#;
         let program = parse(src).unwrap();
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::String("msg".to_string().into()));
     }
@@ -9614,7 +9614,7 @@ mod tests {
         let src = "try { throw {custom: true}; } catch(e) { return e.custom; }";
         let program = parse(src).unwrap();
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
@@ -9635,7 +9635,7 @@ mod tests {
         ";
         let program = parse(src).unwrap();
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
@@ -9650,7 +9650,7 @@ mod tests {
         let src = "try { throw 1; } catch(e) { throw e + 1; }";
         let program = parse(src).unwrap();
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let err = Interpreter::run(&mut frame).unwrap_err();
         assert!(
             matches!(err, StatorError::JsException(_)),
@@ -9672,7 +9672,7 @@ mod tests {
         ";
         let program = parse(src).unwrap();
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         // catch sets ran = 3, finally adds 10 → 13
         assert_eq!(result, JsValue::Smi(13));
@@ -9695,7 +9695,7 @@ mod tests {
         ";
         let program = parse(src).unwrap();
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
@@ -9714,7 +9714,7 @@ mod tests {
         ";
         let program = parse(src).unwrap();
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(42));
     }
@@ -9731,7 +9731,7 @@ mod tests {
         "#;
         let program = parse(src).unwrap();
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::String("boom".to_string().into()));
     }
@@ -9801,7 +9801,7 @@ mod tests {
     fn test_generator_yield_sequence() {
         // Drives: function*() { yield 1; yield 2; }
         let ba = gen_bytecode_yield_1_yield_2();
-        let gs = GeneratorState::new(ba);
+        let gs = GeneratorState::new(Rc::new(ba));
 
         // First .next() → yields 1
         let step1 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 1 ok");
@@ -9868,7 +9868,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode(instrs, 3, 0); // r0, r1, r2
-        let gs = GeneratorState::new(ba);
+        let gs = GeneratorState::new(Rc::new(ba));
 
         // First .next() → yields 10
         let step1 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 1 ok");
@@ -9923,7 +9923,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode(instrs, 3, 0);
-        let gs = GeneratorState::new(ba);
+        let gs = GeneratorState::new(Rc::new(ba));
 
         // Model "async call": first .next() runs until the await point.
         let step1 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 1 ok");
@@ -9946,10 +9946,10 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode(instrs, 1, 0);
-        let gs = GeneratorState::new(ba.clone());
+        let gs = GeneratorState::new(Rc::new(ba.clone()));
 
         // Attach generator state and run one step (not a generator step — direct frame).
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         frame.generator_state = Some(Rc::clone(&gs));
         let result = Interpreter::run(&mut frame).unwrap();
         // SuspendedAtStart = 0
@@ -9966,9 +9966,9 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode(instrs, 1, 0);
-        let gs = GeneratorState::new(ba.clone());
+        let gs = GeneratorState::new(Rc::new(ba.clone()));
 
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         frame.generator_state = Some(Rc::clone(&gs));
         Interpreter::run(&mut frame).unwrap();
 
@@ -9992,9 +9992,9 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode(instrs, 1, 0);
-        let gs = GeneratorState::new(ba.clone());
+        let gs = GeneratorState::new(Rc::new(ba.clone()));
 
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         frame.generator_state = Some(Rc::clone(&gs));
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(99));
@@ -10032,7 +10032,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode(instrs, 1, 0);
-        let gs = GeneratorState::new(ba.clone());
+        let gs = GeneratorState::new(Rc::new(ba.clone()));
 
         // First step: SwitchOnGeneratorState falls through (resume_pc==0),
         // runs LdaSmi 1, yields 1, and saves resume_pc=3 (ResumeGenerator).
@@ -10047,7 +10047,7 @@ mod tests {
         // Directly test the SwitchOnGeneratorState jump: run from PC 0
         // with resume_pc=3 already set in the generator state.  The switch
         // should jump to instruction 3, bypassing LdaSmi 1 and SuspendGenerator.
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         gs.borrow_mut().status = GeneratorStatus::SuspendedAtYield;
         frame.generator_state = Some(Rc::clone(&gs));
         let result = Interpreter::run(&mut frame).unwrap();
@@ -10122,14 +10122,14 @@ mod tests {
             ),
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
-        let pool = vec![ConstantPoolEntry::Function(Box::new(add_ba))];
+        let pool = vec![ConstantPoolEntry::Function(Rc::new(add_ba))];
         let outer_ba = make_bytecode_with_pool(outer_instrs, pool, 3, 0);
 
         // Call add(1, 2) enough times to cross the tiering threshold.
         let call_count = TIERING_THRESHOLD + 10;
         let mut last_result = JsValue::Undefined;
         for _ in 0..call_count {
-            let mut frame = InterpreterFrame::new(outer_ba.clone(), vec![]);
+            let mut frame = InterpreterFrame::new(Rc::new(outer_ba.clone()), vec![]);
             last_result = Interpreter::run(&mut frame).unwrap();
         }
 
@@ -10144,7 +10144,7 @@ mod tests {
             // Rc tiering state, so the invocation counter and JIT cache are
             // visible through any clone.
             let inner_ba: &BytecodeArray = match outer_ba.constant_pool().first().unwrap() {
-                ConstantPoolEntry::Function(ba) => ba,
+                ConstantPoolEntry::Function(Rc::new(ba)) => ba,
                 _ => panic!("expected Function in constant pool"),
             };
             assert!(
@@ -10190,13 +10190,13 @@ mod tests {
             ),
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
-        let pool = vec![ConstantPoolEntry::Function(Box::new(add_ba))];
+        let pool = vec![ConstantPoolEntry::Function(Rc::new(add_ba))];
         let outer_ba = make_bytecode_with_pool(outer_instrs, pool, 3, 0);
 
         // Warm up past the threshold, then verify the result is still correct.
         let warm_up = TIERING_THRESHOLD + 20;
         for i in 0..warm_up {
-            let mut frame = InterpreterFrame::new(outer_ba.clone(), vec![]);
+            let mut frame = InterpreterFrame::new(Rc::new(outer_ba.clone()), vec![]);
             let result = Interpreter::run(&mut frame).unwrap();
             assert_eq!(
                 result,
@@ -10322,7 +10322,7 @@ mod tests {
 
         // Run the loop function once; it iterates 2000 times which exceeds
         // OSR_LOOP_THRESHOLD (100), so a compilation should be triggered.
-        let mut frame = InterpreterFrame::new(looper_ba.clone(), vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(looper_ba.clone()), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
 
         // The loop result must be correct.
@@ -10372,14 +10372,14 @@ mod tests {
             ),
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
-        let pool = vec![ConstantPoolEntry::Function(Box::new(add_ba))];
+        let pool = vec![ConstantPoolEntry::Function(Rc::new(add_ba))];
         let outer_ba = make_bytecode_with_pool(outer_instrs, pool, 3, 0);
 
         let (count_before, bytes_before) = jit_stats();
 
         // Call enough times to cross the tiering threshold and trigger JIT.
         for _ in 0..(TIERING_THRESHOLD + 10) {
-            let mut frame = InterpreterFrame::new(outer_ba.clone(), vec![]);
+            let mut frame = InterpreterFrame::new(Rc::new(outer_ba.clone()), vec![]);
             Interpreter::run(&mut frame).unwrap();
         }
 
@@ -10449,14 +10449,14 @@ mod tests {
             ),
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
-        let pool = vec![ConstantPoolEntry::Function(Box::new(add_ba))];
+        let pool = vec![ConstantPoolEntry::Function(Rc::new(add_ba))];
         let outer_ba = make_bytecode_with_pool(outer_instrs, pool, 3, 0);
 
         // Exceed the Maglev threshold so a background compilation is triggered.
         let call_count = MAGLEV_TIERING_THRESHOLD + 10;
         let mut last_result = JsValue::Undefined;
         for _ in 0..call_count {
-            let mut frame = InterpreterFrame::new(outer_ba.clone(), vec![]);
+            let mut frame = InterpreterFrame::new(Rc::new(outer_ba.clone()), vec![]);
             last_result = Interpreter::run(&mut frame).unwrap();
         }
 
@@ -10469,7 +10469,7 @@ mod tests {
         #[cfg(all(target_arch = "x86_64", unix))]
         {
             let inner_ba: &BytecodeArray = match outer_ba.constant_pool().first().unwrap() {
-                ConstantPoolEntry::Function(ba) => ba,
+                ConstantPoolEntry::Function(Rc::new(ba)) => ba,
                 _ => panic!("expected Function in constant pool"),
             };
 
@@ -10488,7 +10488,7 @@ mod tests {
             );
 
             // Verify the Maglev tier also returns the correct result.
-            let mut frame = InterpreterFrame::new(outer_ba.clone(), vec![]);
+            let mut frame = InterpreterFrame::new(Rc::new(outer_ba.clone()), vec![]);
             let result = Interpreter::run(&mut frame).unwrap();
             assert_eq!(result, JsValue::Smi(3), "Maglev add(1, 2) must return 3");
 
@@ -10535,13 +10535,13 @@ mod tests {
             ),
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
-        let pool = vec![ConstantPoolEntry::Function(Box::new(add_ba))];
+        let pool = vec![ConstantPoolEntry::Function(Rc::new(add_ba))];
         let outer_ba = make_bytecode_with_pool(outer_instrs, pool, 3, 0);
 
         // Warm up past the Maglev threshold.
         let warm_up = MAGLEV_TIERING_THRESHOLD + 20;
         for i in 0..warm_up {
-            let mut frame = InterpreterFrame::new(outer_ba.clone(), vec![]);
+            let mut frame = InterpreterFrame::new(Rc::new(outer_ba.clone()), vec![]);
             let result = Interpreter::run(&mut frame).unwrap();
             assert_eq!(
                 result,
@@ -10591,14 +10591,14 @@ mod tests {
             ),
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
-        let pool = vec![ConstantPoolEntry::Function(Box::new(add_ba))];
+        let pool = vec![ConstantPoolEntry::Function(Rc::new(add_ba))];
         let outer_ba = make_bytecode_with_pool(outer_instrs, pool, 3, 0);
 
         // Exceed the Turbofan threshold so a background compilation is triggered.
         let call_count = TURBOFAN_TIERING_THRESHOLD + 10;
         let mut last_result = JsValue::Undefined;
         for _ in 0..call_count {
-            let mut frame = InterpreterFrame::new(outer_ba.clone(), vec![]);
+            let mut frame = InterpreterFrame::new(Rc::new(outer_ba.clone()), vec![]);
             last_result = Interpreter::run(&mut frame).unwrap();
         }
 
@@ -10611,7 +10611,7 @@ mod tests {
         #[cfg(all(target_arch = "x86_64", unix))]
         {
             let inner_ba: &BytecodeArray = match outer_ba.constant_pool().first().unwrap() {
-                ConstantPoolEntry::Function(ba) => ba,
+                ConstantPoolEntry::Function(Rc::new(ba)) => ba,
                 _ => panic!("expected Function in constant pool"),
             };
 
@@ -10630,7 +10630,7 @@ mod tests {
             );
 
             // Verify the Turbofan tier also returns the correct result.
-            let mut frame = InterpreterFrame::new(outer_ba.clone(), vec![]);
+            let mut frame = InterpreterFrame::new(Rc::new(outer_ba.clone()), vec![]);
             let result = Interpreter::run(&mut frame).unwrap();
             assert_eq!(result, JsValue::Smi(3), "Turbofan add(1, 2) must return 3");
 
@@ -10676,13 +10676,13 @@ mod tests {
             ),
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
-        let pool = vec![ConstantPoolEntry::Function(Box::new(add_ba))];
+        let pool = vec![ConstantPoolEntry::Function(Rc::new(add_ba))];
         let outer_ba = make_bytecode_with_pool(outer_instrs, pool, 3, 0);
 
         // Warm up past the Turbofan threshold.
         let warm_up = TURBOFAN_TIERING_THRESHOLD + 20;
         for i in 0..warm_up {
-            let mut frame = InterpreterFrame::new(outer_ba.clone(), vec![]);
+            let mut frame = InterpreterFrame::new(Rc::new(outer_ba.clone()), vec![]);
             let result = Interpreter::run(&mut frame).unwrap();
             assert_eq!(
                 result,
@@ -10763,7 +10763,7 @@ mod tests {
         let pool = vec![ConstantPoolEntry::String("hello".to_owned())];
         let bytes = encode(&instrs);
         let ba = BytecodeArray::new(bytes, pool, 0, 0, vec![], FeedbackMetadata::empty(), vec![]);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::String("string".to_owned().into()));
     }
@@ -10880,7 +10880,7 @@ mod tests {
             FeedbackMetadata::empty(),
             vec![],
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(42));
     }
@@ -11091,7 +11091,7 @@ mod tests {
             FeedbackMetadata::empty(),
             vec![],
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::String("hello".to_string().into()));
     }
@@ -11749,7 +11749,7 @@ mod tests {
             1,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(42));
     }
@@ -11792,7 +11792,7 @@ mod tests {
             2,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(99));
     }
@@ -11864,7 +11864,7 @@ mod tests {
         let mut all = instrs;
         all.push(Instruction::new_unchecked(Opcode::Return, vec![]));
         let ba = make_bytecode(all, frame_size, 0);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         frame.accumulator = acc;
         for (i, val) in regs.iter().enumerate() {
             frame.write_reg(i as u32, val.clone()).unwrap();
@@ -12059,7 +12059,7 @@ mod tests {
         )];
         all.push(Instruction::new_unchecked(Opcode::Return, vec![]));
         let ba = make_bytecode(all, 1, 0);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         frame.accumulator = JsValue::String("x".to_string().into());
         frame.write_reg(0, JsValue::Smi(42)).unwrap();
         let result = Interpreter::run(&mut frame);
@@ -12084,7 +12084,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         // Should be a PlainObject with length=0
         if let JsValue::PlainObject(map) = &result {
@@ -12167,7 +12167,7 @@ mod tests {
             2,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         if let JsValue::PlainObject(map) = &result {
             let borrow = map.borrow();
@@ -12215,7 +12215,7 @@ mod tests {
             2,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(42));
     }
@@ -12252,7 +12252,7 @@ mod tests {
             1,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         if let JsValue::PlainObject(map) = &result {
             assert_eq!(map.borrow().get("x"), Some(&JsValue::Smi(42)));
@@ -12305,7 +12305,7 @@ mod tests {
             1,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         if let JsValue::PlainObject(map) = &result {
             let borrow = map.borrow();
@@ -12357,7 +12357,7 @@ mod tests {
             3,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         if let JsValue::PlainObject(map) = &result {
             assert_eq!(map.borrow().get("foo"), Some(&JsValue::Smi(99)));
@@ -12388,7 +12388,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         if let JsValue::PlainObject(map) = &result {
             let borrow = map.borrow();
@@ -12442,7 +12442,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         if let JsValue::PlainObject(map) = &result {
             let borrow = map.borrow();
@@ -12481,7 +12481,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         if let JsValue::PlainObject(map) = &result {
             let borrow = map.borrow();
@@ -12533,7 +12533,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         if let JsValue::PlainObject(map) = &result {
             assert_eq!(map.borrow().get("length"), Some(&JsValue::Smi(0)));
@@ -12561,7 +12561,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         if let JsValue::PlainObject(map) = &result {
             assert!(map.borrow().is_empty());
@@ -12627,7 +12627,7 @@ mod tests {
             2,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(20));
     }
@@ -12688,7 +12688,7 @@ mod tests {
             2,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(3));
     }
@@ -12826,7 +12826,7 @@ mod tests {
             6,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         // We did one single iteration without looping, so count = 1.
         assert_eq!(result, JsValue::Smi(1));
@@ -12887,7 +12887,7 @@ mod tests {
             2,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(3));
     }
@@ -13605,7 +13605,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode_with_pool(instrs, pool, 3, 0);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         // Re-install globals since make_bytecode_with_pool bypasses new()
         crate::builtins::install_globals::install_globals(&mut frame.global_env.borrow_mut().vars);
         Interpreter::run(&mut frame)
@@ -13725,7 +13725,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode_with_pool(instrs, pool, 2, 0);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         crate::builtins::install_globals::install_globals(&mut frame.global_env.borrow_mut().vars);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::String(String::new().into()));
@@ -13897,7 +13897,7 @@ mod tests {
             1,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
@@ -13919,7 +13919,7 @@ mod tests {
             1,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
@@ -13937,7 +13937,7 @@ mod tests {
             2,
             1,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![JsValue::Smi(1)]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![JsValue::Smi(1)]);
         let result = Interpreter::run(&mut frame).unwrap();
         if let JsValue::Array(arr) = result {
             assert!(arr.borrow().len() >= 0);
@@ -13959,7 +13959,8 @@ mod tests {
             0,
             2,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![JsValue::Smi(10), JsValue::Smi(20)]);
+        let mut frame =
+            InterpreterFrame::new(Rc::new(ba), vec![JsValue::Smi(10), JsValue::Smi(20)]);
         let result = Interpreter::run(&mut frame).unwrap();
         if let JsValue::PlainObject(map) = result {
             let m = map.borrow();
@@ -13987,7 +13988,7 @@ mod tests {
             0,
             2,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![JsValue::Smi(5), JsValue::Smi(6)]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![JsValue::Smi(5), JsValue::Smi(6)]);
         let result = Interpreter::run(&mut frame).unwrap();
         if let JsValue::PlainObject(map) = result {
             let m = map.borrow();
@@ -14021,7 +14022,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let err = Interpreter::run(&mut frame).unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -14045,7 +14046,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(7));
     }
@@ -14067,7 +14068,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Undefined);
     }
@@ -14186,7 +14187,7 @@ mod tests {
             1,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert!(
             matches!(result, JsValue::Promise(_)),
@@ -14225,7 +14226,7 @@ mod tests {
             1,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(77));
     }
@@ -14286,7 +14287,7 @@ mod tests {
             ]),
             vec![],
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         // Both objects have property "x"; the last LdaNamedProperty loads from
         // register 1 (which holds 22), so the result must be Smi(22).
@@ -14313,7 +14314,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let _result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(
             frame.global_env.borrow().get("globalVar"),
@@ -14344,7 +14345,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(99));
     }
@@ -14363,7 +14364,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let err = Interpreter::run(&mut frame).unwrap_err();
         assert!(matches!(err, StatorError::ReferenceError(_)));
     }
@@ -14389,7 +14390,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(42));
     }
@@ -14408,7 +14409,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Undefined);
     }
@@ -14438,7 +14439,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(7));
     }
@@ -14461,7 +14462,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let err = Interpreter::run(&mut frame).unwrap_err();
         assert!(matches!(err, StatorError::ReferenceError(_)));
     }
@@ -14486,7 +14487,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Undefined);
     }
@@ -14516,7 +14517,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(33));
     }
@@ -14539,7 +14540,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let err = Interpreter::run(&mut frame).unwrap_err();
         assert!(matches!(err, StatorError::ReferenceError(_)));
     }
@@ -14564,7 +14565,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Undefined);
     }
@@ -14604,7 +14605,7 @@ mod tests {
             1,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(10));
     }
@@ -14629,7 +14630,7 @@ mod tests {
             1,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Undefined);
     }
@@ -14650,7 +14651,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::String("hello".to_string().into()));
     }
@@ -14670,7 +14671,7 @@ mod tests {
             1,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::String("tpl".to_string().into()));
         assert_eq!(frame.bytecode_array.template_cache_len(), 1);
@@ -14693,9 +14694,9 @@ mod tests {
             0,
             0,
         );
-        let mut frame1 = InterpreterFrame::new(ba.clone(), vec![]);
+        let mut frame1 = InterpreterFrame::new(Rc::new(ba.clone()), vec![]);
         let result1 = Interpreter::run(&mut frame1).unwrap();
-        let mut frame2 = InterpreterFrame::new(ba, vec![]);
+        let mut frame2 = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result2 = Interpreter::run(&mut frame2).unwrap();
 
         match (&result1, &result2) {
@@ -14723,7 +14724,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Undefined);
         assert_eq!(frame.pending_message, JsValue::Smi(42));
@@ -14743,7 +14744,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(1));
         assert_eq!(frame.pending_message, JsValue::Smi(2));
@@ -14847,7 +14848,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert!(matches!(result, JsValue::PlainObject(_)));
     }
@@ -14900,7 +14901,7 @@ mod tests {
             0,
             0,
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(42));
     }
@@ -14936,7 +14937,7 @@ mod tests {
         assert_eq!(bytes[0], Opcode::Wide as u8);
         // Running this through the interpreter should work.
         let ba = make_bytecode(instrs, 0, 0);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(300));
     }
@@ -14958,7 +14959,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(42));
     }
@@ -14976,7 +14977,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Boolean(true));
     }
@@ -14994,7 +14995,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(99));
     }
@@ -15012,7 +15013,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Boolean(false));
     }
@@ -15030,7 +15031,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(1));
     }
@@ -15048,7 +15049,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(0));
     }
@@ -15066,7 +15067,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Null);
     }
@@ -15084,7 +15085,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(5));
     }
@@ -15102,7 +15103,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Undefined);
     }
@@ -15120,7 +15121,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(7));
     }
@@ -15138,7 +15139,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Null);
     }
@@ -15156,7 +15157,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode_with_pool(instrs, pool, 0, 0);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Undefined);
     }
@@ -15275,7 +15276,7 @@ mod tests {
 
         // Outer function: has 2 params, stores inner_ba in r0 via
         // LdaConstant, then calls ConstructForwardAllArgs.
-        let pool = vec![ConstantPoolEntry::Function(Box::new(inner_ba))];
+        let pool = vec![ConstantPoolEntry::Function(Rc::new(inner_ba))];
         let outer_instrs = vec![
             Instruction::new_unchecked(Opcode::LdaConstant, vec![Operand::ConstantPoolIdx(0)]),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
@@ -15286,7 +15287,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode_with_pool(outer_instrs, pool, 1, 2);
-        let mut frame = InterpreterFrame::new(ba, vec![JsValue::Smi(3), JsValue::Smi(4)]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![JsValue::Smi(3), JsValue::Smi(4)]);
         let result = Interpreter::run(&mut frame).unwrap();
         // [[Construct]] semantics: the inner function returns Smi(7) (a
         // primitive), so the freshly-created `this` object is returned.
@@ -15315,7 +15316,7 @@ mod tests {
             vec![],
         );
 
-        let pool = vec![ConstantPoolEntry::Function(Box::new(inner_ba))];
+        let pool = vec![ConstantPoolEntry::Function(Rc::new(inner_ba))];
         let outer_instrs = vec![
             Instruction::new_unchecked(Opcode::LdaConstant, vec![Operand::ConstantPoolIdx(0)]),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
@@ -15326,7 +15327,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode_with_pool(outer_instrs, pool, 1, 0);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         // [[Construct]] semantics: the inner function returns Smi(42) (a
         // primitive), so the freshly-created `this` object is returned.
@@ -15360,7 +15361,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode_with_pool(instrs, pool, 1, 0);
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         if let JsValue::PlainObject(obj) = &result {
             let map = obj.borrow();
@@ -15396,7 +15397,7 @@ mod tests {
         use crate::bytecode::bytecode_generator::BytecodeGenerator;
         let program = crate::parser::recursive_descent::parse(src)?;
         let ba = BytecodeGenerator::compile_program(&program)?;
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         Interpreter::run(&mut frame)
     }
 
@@ -16817,7 +16818,7 @@ mod tests {
     fn test_generator_return_method() {
         // Generator .return(val) should complete the generator.
         let ba = gen_bytecode_yield_1_yield_2();
-        let gs = GeneratorState::new(ba);
+        let gs = GeneratorState::new(Rc::new(ba));
 
         // Advance once.
         Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
@@ -16838,7 +16839,7 @@ mod tests {
     fn test_generator_throw_method() {
         // Generator .throw(val) should mark the generator as completed and error.
         let ba = gen_bytecode_yield_1_yield_2();
-        let gs = GeneratorState::new(ba);
+        let gs = GeneratorState::new(Rc::new(ba));
 
         // Advance once.
         Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
@@ -16855,7 +16856,7 @@ mod tests {
         // .return(val) on a completed generator returns { value: val, done: true }
         // per §27.5.3.4 GeneratorResumeAbrupt step 2a.
         let ba = gen_bytecode_yield_1_yield_2();
-        let gs = GeneratorState::new(ba);
+        let gs = GeneratorState::new(Rc::new(ba));
 
         // Drive to completion.
         Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
@@ -16878,7 +16879,7 @@ mod tests {
         // .return() with no argument on a completed generator returns
         // { value: undefined, done: true }.
         let ba = gen_bytecode_yield_1_yield_2();
-        let gs = GeneratorState::new(ba);
+        let gs = GeneratorState::new(Rc::new(ba));
         // Drive to completion.
         Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
         Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
@@ -16900,7 +16901,7 @@ mod tests {
     fn test_generator_not_resumable_after_return() {
         // After .return(), .next() should return { value: undefined, done: true }.
         let ba = gen_bytecode_yield_1_yield_2();
-        let gs = GeneratorState::new(ba);
+        let gs = GeneratorState::new(Rc::new(ba));
         // Advance once.
         Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
         // .return(42)
@@ -16915,7 +16916,7 @@ mod tests {
     fn test_generator_not_resumable_after_throw() {
         // After .throw(), .next() should return { value: undefined, done: true }.
         let ba = gen_bytecode_yield_1_yield_2();
-        let gs = GeneratorState::new(ba);
+        let gs = GeneratorState::new(Rc::new(ba));
         // Advance once.
         Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
         // .throw(err)
@@ -16930,7 +16931,7 @@ mod tests {
     fn test_generator_symbol_iterator_returns_self() {
         // gen[@@iterator]() must return the generator itself (§27.5.1.2).
         let ba = gen_bytecode_yield_1_yield_2();
-        let gs = GeneratorState::new(ba);
+        let gs = GeneratorState::new(Rc::new(ba));
         let generator = JsValue::Generator(gs);
         let iter_fn = proto_lookup(&generator, "@@iterator");
         if let JsValue::NativeFunction(f) = iter_fn {
@@ -16972,7 +16973,7 @@ mod tests {
     fn test_generator_throw_no_try_catch_propagates() {
         // .throw(err) on a generator without try/catch propagates the error.
         let ba = gen_bytecode_yield_1_yield_2();
-        let gs = GeneratorState::new(ba);
+        let gs = GeneratorState::new(Rc::new(ba));
 
         // Advance to first yield.
         Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
@@ -16988,7 +16989,7 @@ mod tests {
     fn test_generator_throw_on_completed_generator() {
         // .throw(err) on a completed generator throws the error.
         let ba = gen_bytecode_yield_1_yield_2();
-        let gs = GeneratorState::new(ba);
+        let gs = GeneratorState::new(Rc::new(ba));
 
         // Drive to completion.
         Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
@@ -17011,7 +17012,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode(instrs, 1, 0).with_async_flag(true);
-        let result = Interpreter::run_async_function(ba, vec![]).unwrap();
+        let result = Interpreter::run_async_function(Rc::new(ba), vec![]).unwrap();
         if let JsValue::Promise(p) = &result {
             assert_eq!(p.value(), Some(JsValue::Smi(42)));
         } else {
@@ -17052,7 +17053,7 @@ mod tests {
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
         let ba = make_bytecode(instrs, 3, 0).with_async_flag(true);
-        let result = Interpreter::run_async_function(ba, vec![]).unwrap();
+        let result = Interpreter::run_async_function(Rc::new(ba), vec![]).unwrap();
         if let JsValue::Promise(p) = &result {
             assert_eq!(
                 p.value(),
@@ -17080,7 +17081,7 @@ mod tests {
             0,
         )
         .with_async_flag(true);
-        let result = Interpreter::run_async_function(ba, vec![]).unwrap();
+        let result = Interpreter::run_async_function(Rc::new(ba), vec![]).unwrap();
         if let JsValue::Promise(p) = &result {
             assert!(
                 p.is_rejected(),
@@ -18694,7 +18695,7 @@ mod tests {
         use crate::parser::parse;
         let program = parse(src).unwrap();
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         Interpreter::run(&mut frame)
     }
 

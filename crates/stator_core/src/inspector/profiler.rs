@@ -564,7 +564,7 @@ mod tests {
             .and_then(|p| BytecodeGenerator::compile_program(&p))
             .expect("compile");
         let mut frame = InterpreterFrame::new_with_globals(
-            bytecodes,
+            Rc::new(bytecodes),
             vec![],
             Rc::new(RefCell::new(crate::interpreter::GlobalEnv::new())),
         );

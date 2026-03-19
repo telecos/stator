@@ -561,7 +561,7 @@ mod tests {
         dbg: Rc<RefCell<Debugger>>,
         max_pauses: usize,
     ) -> Vec<PauseReason> {
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let mut reasons = vec![];
         attach_debugger(Rc::clone(&dbg));
 
@@ -615,7 +615,7 @@ mod tests {
         // Breakpoint at offset 2 (LdaSmi(20) — immediately after LdaSmi(10)).
         dbg.borrow_mut().set_breakpoint_at_offset(2, 2, 1);
 
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         attach_debugger(Rc::clone(&dbg));
 
         let r = Interpreter::run(&mut frame);
@@ -647,7 +647,7 @@ mod tests {
         // Set a breakpoint at the first instruction to start stepping.
         dbg.borrow_mut().set_breakpoint_at_offset(0, 1, 1);
 
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let mut pause_count = 0;
         attach_debugger(Rc::clone(&dbg));
 
@@ -686,7 +686,7 @@ mod tests {
         let dbg = Rc::new(RefCell::new(Debugger::new()));
         dbg.borrow_mut().set_breakpoint_at_offset(0, 1, 1);
 
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let mut pauses = vec![];
         attach_debugger(Rc::clone(&dbg));
 
@@ -723,7 +723,7 @@ mod tests {
         let ba = make_bytecodes_with_positions(instructions);
 
         let dbg = Rc::new(RefCell::new(Debugger::new()));
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         attach_debugger(Rc::clone(&dbg));
 
         let r = Interpreter::run(&mut frame);
@@ -762,7 +762,7 @@ mod tests {
             FeedbackMetadata::empty(),
             vec![],
         );
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(99));
     }
@@ -791,7 +791,7 @@ mod tests {
         let dbg = Rc::new(RefCell::new(Debugger::new()));
         dbg.borrow_mut().set_pause_on_exceptions(true);
 
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         attach_debugger(Rc::clone(&dbg));
 
         let r = Interpreter::run(&mut frame);
@@ -823,7 +823,7 @@ mod tests {
         let ba = BytecodeGenerator::compile_program(&parsed).expect("compile");
 
         let dbg = Rc::new(RefCell::new(Debugger::new()));
-        let mut frame = InterpreterFrame::new(ba, vec![]);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         attach_debugger(Rc::clone(&dbg));
 
         // Run until the debugger; statement pauses execution.
@@ -844,8 +844,11 @@ mod tests {
         let eval_source = "1 + 2";
         let eval_parsed = parser::parse(eval_source).expect("parse eval");
         let eval_ba = BytecodeGenerator::compile_program(&eval_parsed).expect("compile eval");
-        let mut eval_frame =
-            InterpreterFrame::new_with_globals(eval_ba, vec![], Rc::clone(&frame.global_env));
+        let mut eval_frame = InterpreterFrame::new_with_globals(
+            Rc::new(eval_ba),
+            vec![],
+            Rc::clone(&frame.global_env),
+        );
         let eval_result = Interpreter::run(&mut eval_frame).expect("eval");
         assert_eq!(eval_result, JsValue::Smi(3));
 
