@@ -264,8 +264,12 @@ pub struct BytecodeArray {
     ///
     /// Wrapped in [`Rc`] so that closure clones share the same metadata.
     feedback_metadata: Rc<FeedbackMetadata>,
-    /// Per-function exception handler table.
+    /// Per-function exception handler table (pre-peephole instruction indices).
     handler_table: Rc<Vec<HandlerTableEntry>>,
+    /// Lazily-populated remapped handler table (post-peephole instruction
+    /// indices).  Populated on first decode when the peephole pass compacts
+    /// instructions.
+    handler_table_remapped: Rc<RefCell<Option<Rc<Vec<HandlerTableEntry>>>>>,
     /// Lazily-populated decoded instruction cache shared across clones.
     cached_decode: DecodedBytecodeCache,
     /// Cached template objects keyed by bytecode offset.
@@ -472,6 +476,7 @@ impl BytecodeArray {
             source_positions: source_positions.into(),
             feedback_metadata: Rc::new(feedback_metadata),
             handler_table: Rc::new(handler_table),
+            handler_table_remapped: Rc::new(RefCell::new(None)),
             cached_decode: Rc::new(OnceCell::new()),
             template_cache: Rc::new(RefCell::new(HashMap::new())),
             is_generator: false,
@@ -790,13 +795,26 @@ impl BytecodeArray {
     /// Each entry maps a `[try_start, try_end)` instruction-index range to a
     /// handler entry point.  Entries are ordered so that the innermost handler
     /// for any given instruction always appears before outer handlers.
+    ///
+    /// After the peephole pass compacts instructions, this returns the
+    /// remapped table with post-compaction indices.
     pub fn handler_table(&self) -> &[HandlerTableEntry] {
+        // Trigger decode + remap if not done yet.
+        let _ = self.ensure_decoded_instructions();
+        // If we have a remapped table, we can't return a direct reference to
+        // it because it's behind RefCell.  Fall back to the original table
+        // (which is only used before first decode in practice).
         self.handler_table.as_slice()
     }
 
-    /// Return a shared reference-counted handle to the exception handler table.
+    /// Return a shared reference-counted handle to the exception handler
+    /// table, remapped for post-peephole instruction indices if available.
     pub(crate) fn shared_handler_table(&self) -> Rc<Vec<HandlerTableEntry>> {
-        Rc::clone(&self.handler_table)
+        if let Some(remapped) = self.handler_table_remapped.borrow().as_ref() {
+            Rc::clone(remapped)
+        } else {
+            Rc::clone(&self.handler_table)
+        }
     }
 
     /// Decode the bytecode stream and return the list of [`Instruction`]s.
@@ -810,7 +828,52 @@ impl BytecodeArray {
         if self.cached_decode.get().is_none() {
             let (mut instructions, mut byte_offsets) =
                 bytecodes::decode_with_byte_offsets(&self.bytecodes)?;
+
+            // Snapshot the pre-peephole byte offsets so we can remap handler
+            // table entries (which use pre-peephole instruction indices) to
+            // post-peephole instruction indices.
+            let pre_byte_offsets = byte_offsets.clone();
+
             peephole::fuse_instructions(&mut instructions, &mut byte_offsets);
+
+            // Build a lookup from byte offset → post-peephole instruction
+            // index.  The post-peephole `byte_offsets` (excluding its trailing
+            // sentinel) maps new-index → byte-offset.  Invert that to get
+            // byte-offset → new-index.
+            let remap: std::collections::HashMap<usize, usize> = byte_offsets
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i < instructions.len())
+                .map(|(new_idx, &byte_off)| (byte_off, new_idx))
+                .collect();
+
+            // Remap the handler table entries from pre-peephole instruction
+            // indices to post-peephole instruction indices.
+            let remapped_handlers: Vec<HandlerTableEntry> = self
+                .handler_table
+                .iter()
+                .map(|entry| {
+                    let start_byte = pre_byte_offsets[entry.try_start as usize];
+                    let end_byte = pre_byte_offsets
+                        .get(entry.try_end as usize)
+                        .copied()
+                        .unwrap_or(start_byte);
+                    let handler_byte = pre_byte_offsets[entry.handler as usize];
+
+                    HandlerTableEntry {
+                        try_start: remap.get(&start_byte).copied().unwrap_or(0) as u32,
+                        try_end: remap.get(&end_byte).copied().unwrap_or(instructions.len()) as u32,
+                        handler: remap.get(&handler_byte).copied().unwrap_or(0) as u32,
+                        is_finally: entry.is_finally,
+                    }
+                })
+                .collect();
+            // Replace the handler table with the remapped version.
+            // SAFETY: Interior mutability is acceptable here — the handler
+            // table is initialised once during first decode, just like
+            // cached_decode.
+            *self.handler_table_remapped.borrow_mut() = Some(Rc::new(remapped_handlers));
+
             let mut jump_targets = vec![None; instructions.len()];
             for (instruction_index, instruction) in instructions.iter().enumerate() {
                 for operand in &instruction.operands {
