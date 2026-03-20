@@ -5835,7 +5835,10 @@ fn make_object() -> JsValue {
                         if key == "length" {
                             Ok(JsValue::Boolean(true))
                         } else if let Ok(idx) = key.parse::<usize>() {
-                            Ok(JsValue::Boolean(idx < items.borrow().len()))
+                            let borrow = items.borrow();
+                            Ok(JsValue::Boolean(
+                                idx < borrow.len() && !borrow[idx].is_the_hole(),
+                            ))
                         } else {
                             Ok(JsValue::Boolean(false))
                         }
@@ -12500,6 +12503,20 @@ fn make_proxy() -> JsValue {
                         }
                         (obj, false)
                     }
+                    JsValue::Array(arr) => {
+                        let mut obj = JsObject::new();
+                        let borrow = arr.borrow();
+                        for (idx, val) in borrow.iter().enumerate() {
+                            if !val.is_the_hole() {
+                                obj.set_property(&idx.to_string(), val.clone()).ok();
+                            }
+                        }
+                        obj.set_property("length", JsValue::Smi(borrow.len() as i32))
+                            .ok();
+                        obj.set_property("__is_array__", JsValue::Boolean(true))
+                            .ok();
+                        (obj, false)
+                    }
                     JsValue::Function(_) | JsValue::NativeFunction(_) => (JsObject::new(), true),
                     _ => {
                         return Err(StatorError::TypeError(
@@ -12531,6 +12548,20 @@ fn make_proxy() -> JsValue {
                         for (k, v) in map.borrow().iter() {
                             obj.set_property(k, v.clone()).ok();
                         }
+                        (obj, false)
+                    }
+                    JsValue::Array(arr) => {
+                        let mut obj = JsObject::new();
+                        let borrow = arr.borrow();
+                        for (idx, val) in borrow.iter().enumerate() {
+                            if !val.is_the_hole() {
+                                obj.set_property(&idx.to_string(), val.clone()).ok();
+                            }
+                        }
+                        obj.set_property("length", JsValue::Smi(borrow.len() as i32))
+                            .ok();
+                        obj.set_property("__is_array__", JsValue::Boolean(true))
+                            .ok();
                         (obj, false)
                     }
                     JsValue::Function(_) | JsValue::NativeFunction(_) => (JsObject::new(), true),

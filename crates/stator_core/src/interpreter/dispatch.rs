@@ -3843,7 +3843,9 @@ fn handle_sta_keyed_property(
     let val = ctx.frame.accumulator.clone();
     // Dense array slow-mode conversion: when storing a non-index property
     // (Symbol, string like "length", etc.) on a JsValue::Array, convert the
-    // array to a PlainObject so the property is preserved.
+    // array to a PlainObject so the property is preserved.  We must also
+    // update any global-env binding that references the same array so that
+    // subsequent `LdaGlobal` loads see the PlainObject.
     if let JsValue::Array(arr) = &obj {
         let is_index = match &key {
             JsValue::Smi(i) => *i >= 0,
@@ -3852,6 +3854,7 @@ fn handle_sta_keyed_property(
         };
         let is_length = matches!(&key, JsValue::String(s) if &**s == "length");
         if !is_index && !is_length {
+            let arr_ptr = Rc::as_ptr(arr);
             let items = arr.borrow().clone();
             let mut map = PropertyMap::new();
             map.insert_with_attrs(
@@ -3872,7 +3875,25 @@ fn handle_sta_keyed_property(
             let prop_name = to_property_key(&key)?;
             map.insert(prop_name, val);
             let new_obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
-            ctx.frame.write_reg(obj_v, new_obj)?;
+            ctx.frame.write_reg(obj_v, new_obj.clone())?;
+            // Patch any global-env binding that still references the
+            // original Array Rc so loads via LdaGlobal see the converted
+            // PlainObject.
+            let global_name = {
+                let env = ctx.frame.global_env.borrow();
+                env.vars.iter().find_map(|(name, v)| {
+                    if let JsValue::Array(other) = v
+                        && Rc::as_ptr(other) == arr_ptr
+                    {
+                        return Some(name.clone());
+                    }
+                    None
+                })
+            };
+            if let Some(name) = global_name {
+                ctx.frame.global_env.borrow_mut().insert(name, new_obj);
+                ctx.frame.global_cache_invalidate();
+            }
             return Ok(DispatchAction::Continue);
         }
     }
@@ -4924,7 +4945,17 @@ fn handle_create_array_from_iterable(
 ) -> StatorResult<DispatchAction> {
     let iterable = ctx.frame.accumulator.clone();
     let items: Vec<JsValue> = match &iterable {
-        JsValue::Array(arr) => arr.borrow().clone(),
+        JsValue::Array(arr) => arr
+            .borrow()
+            .iter()
+            .map(|v| {
+                if v.is_the_hole() {
+                    JsValue::Undefined
+                } else {
+                    v.clone()
+                }
+            })
+            .collect(),
         JsValue::Iterator(iter) => {
             let mut out = Vec::new();
             loop {
