@@ -8371,11 +8371,10 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
             }
             // Integer index
             if let Some(idx) = to_array_index(key) {
-                return Ok(items
-                    .borrow()
-                    .get(idx)
-                    .cloned()
-                    .unwrap_or(JsValue::Undefined));
+                return Ok(match items.borrow().get(idx) {
+                    Some(v) if !v.is_the_hole() => v.clone(),
+                    _ => JsValue::Undefined,
+                });
             }
             // Named property — delegate to proto_lookup for method access.
             let prop_name = to_property_key(key)?;

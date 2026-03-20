@@ -847,25 +847,38 @@ impl BytecodeArray {
                 .map(|(new_idx, &byte_off)| (byte_off, new_idx))
                 .collect();
 
+            // Helper: look up the byte offset for a pre-peephole instruction
+            // index, then find the closest post-peephole instruction index.
+            // Falls back gracefully when the index is out of range (e.g. in
+            // snapshot round-trip tests with synthetic bytecode).
+            let remap_index = |idx: u32, fallback: usize| -> u32 {
+                let Some(&byte_off) = pre_byte_offsets.get(idx as usize) else {
+                    return fallback as u32;
+                };
+                if let Some(&new_idx) = remap.get(&byte_off) {
+                    return new_idx as u32;
+                }
+                // Exact byte offset was removed by peephole — find the nearest
+                // post-peephole instruction at or after this byte offset.
+                let mut best = fallback;
+                for (&bo, &ni) in &remap {
+                    if bo >= byte_off && ni < best {
+                        best = ni;
+                    }
+                }
+                best as u32
+            };
+
             // Remap the handler table entries from pre-peephole instruction
             // indices to post-peephole instruction indices.
             let remapped_handlers: Vec<HandlerTableEntry> = self
                 .handler_table
                 .iter()
-                .map(|entry| {
-                    let start_byte = pre_byte_offsets[entry.try_start as usize];
-                    let end_byte = pre_byte_offsets
-                        .get(entry.try_end as usize)
-                        .copied()
-                        .unwrap_or(start_byte);
-                    let handler_byte = pre_byte_offsets[entry.handler as usize];
-
-                    HandlerTableEntry {
-                        try_start: remap.get(&start_byte).copied().unwrap_or(0) as u32,
-                        try_end: remap.get(&end_byte).copied().unwrap_or(instructions.len()) as u32,
-                        handler: remap.get(&handler_byte).copied().unwrap_or(0) as u32,
-                        is_finally: entry.is_finally,
-                    }
+                .map(|entry| HandlerTableEntry {
+                    try_start: remap_index(entry.try_start, 0),
+                    try_end: remap_index(entry.try_end, instructions.len()),
+                    handler: remap_index(entry.handler, 0),
+                    is_finally: entry.is_finally,
                 })
                 .collect();
             // Replace the handler table with the remapped version.

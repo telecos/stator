@@ -3763,7 +3763,10 @@ fn handle_lda_keyed_property(
         } else if let JsValue::Array(items) = obj {
             let borrow = items.borrow();
             let i = idx_val as usize;
-            let result = borrow.get(i).cloned().unwrap_or(JsValue::Undefined);
+            let result = match borrow.get(i) {
+                Some(v) if !v.is_the_hole() => v.clone(),
+                _ => JsValue::Undefined,
+            };
             drop(borrow);
             ctx.frame.accumulator = result;
             return Ok(DispatchAction::Continue);
@@ -3828,7 +3831,7 @@ fn handle_sta_keyed_property(
             let i = idx_val as usize;
             let mut v = items_rc.borrow_mut();
             if i >= v.len() {
-                v.resize(i + 1, JsValue::Undefined);
+                v.resize(i + 1, JsValue::TheHole);
             }
             v[i] = val;
             return Ok(DispatchAction::Continue);
@@ -5092,7 +5095,7 @@ fn handle_sta_in_array_literal(
         if let Some(idx) = to_array_index(&key) {
             let mut v = items.borrow_mut();
             if idx >= v.len() {
-                v.resize(idx + 1, JsValue::Undefined);
+                v.resize(idx + 1, JsValue::TheHole);
             }
             v[idx] = val;
         }
