@@ -1,0 +1,65 @@
+﻿2026-03-20T09:01:13.7224584Z ##[group]Run Swatinem/rust-cache@v2
+2026-03-20T09:01:13.7224871Z with:
+2026-03-20T09:01:13.7225062Z   shared-key: ci-debug
+2026-03-20T09:01:13.7225284Z   prefix-key: v0-rust
+2026-03-20T09:01:13.7225489Z   add-job-id-key: true
+2026-03-20T09:01:13.7225720Z   add-rust-environment-hash-key: true
+2026-03-20T09:01:13.7225983Z   cache-targets: true
+2026-03-20T09:01:13.7226199Z   cache-all-crates: false
+2026-03-20T09:01:13.7226441Z   cache-workspace-crates: false
+2026-03-20T09:01:13.7226676Z   save-if: true
+2026-03-20T09:01:13.7226865Z   cache-provider: github
+2026-03-20T09:01:13.7227078Z   cache-bin: true
+2026-03-20T09:01:13.7227264Z   lookup-only: false
+2026-03-20T09:01:13.7227460Z   cmd-format: {0}
+2026-03-20T09:01:13.7227638Z env:
+2026-03-20T09:01:13.7227822Z   CARGO_HOME: /home/runner/.cargo
+2026-03-20T09:01:13.7228070Z   CARGO_INCREMENTAL: 0
+2026-03-20T09:01:13.7228279Z   CARGO_TERM_COLOR: always
+2026-03-20T09:01:13.7228501Z ##[endgroup]
+2026-03-20T09:01:13.9965616Z (node:2402) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-03-20T09:01:13.9967470Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-03-20T09:01:15.1877045Z ##[group]Cache Configuration
+2026-03-20T09:01:15.1877557Z Cache Provider:
+2026-03-20T09:01:15.1877890Z     github
+2026-03-20T09:01:15.1878165Z Workspaces:
+2026-03-20T09:01:15.1878473Z     /home/runner/work/stator/stator
+2026-03-20T09:01:15.1879203Z Cache Paths:
+2026-03-20T09:01:15.1879511Z     /home/runner/.cargo/bin
+2026-03-20T09:01:15.1879877Z     /home/runner/.cargo/.crates.toml
+2026-03-20T09:01:15.1880305Z     /home/runner/.cargo/.crates2.json
+2026-03-20T09:01:15.1880719Z     /home/runner/.cargo/registry
+2026-03-20T09:01:15.1881099Z     /home/runner/.cargo/git
+2026-03-20T09:01:15.1881763Z     /home/runner/work/stator/stator/target
+2026-03-20T09:01:15.1882181Z Restore Key:
+2026-03-20T09:01:15.1882505Z     v0-rust-ci-debug-Linux-x64-c6e2f863
+2026-03-20T09:01:15.1882910Z Cache Key:
+2026-03-20T09:01:15.1883277Z     v0-rust-ci-debug-Linux-x64-c6e2f863-df5b01d5
+2026-03-20T09:01:15.1883728Z .. Prefix:
+2026-03-20T09:01:15.1884035Z   - v0-rust-ci-debug-Linux-x64
+2026-03-20T09:01:15.1884422Z .. Environment considered:
+2026-03-20T09:01:15.1884775Z   - Rust Versions:
+2026-03-20T09:01:15.1885261Z     - 1.94.0 x86_64-unknown-linux-gnu 4a4ef493e3a1488c6e321570238084b38948f6db
+2026-03-20T09:01:15.1886053Z     - 1.94.0 x86_64-unknown-linux-gnu 4a4ef493e3a1488c6e321570238084b38948f6db
+2026-03-20T09:01:15.1886653Z   - CARGO_HOME
+2026-03-20T09:01:15.1886946Z   - CARGO_INCREMENTAL
+2026-03-20T09:01:15.1887273Z   - CARGO_TERM_COLOR
+2026-03-20T09:01:15.1887596Z .. Lockfiles considered:
+2026-03-20T09:01:15.1887996Z   - /home/runner/work/stator/stator/Cargo.lock
+2026-03-20T09:01:15.1888533Z   - /home/runner/work/stator/stator/crates/st8/Cargo.toml
+2026-03-20T09:01:15.1889199Z   - /home/runner/work/stator/stator/crates/stator_core/Cargo.toml
+2026-03-20T09:01:15.1889899Z   - /home/runner/work/stator/stator/crates/stator_ffi/Cargo.toml
+2026-03-20T09:01:15.1890613Z   - /home/runner/work/stator/stator/crates/stator_test262/Cargo.toml
+2026-03-20T09:01:15.1891305Z   - /home/runner/work/stator/stator/fuzz/rust-toolchain.toml
+2026-03-20T09:01:15.1892124Z   - /home/runner/work/stator/stator/rust-toolchain.toml
+2026-03-20T09:01:15.1892866Z ##[endgroup]
+2026-03-20T09:01:15.1893039Z 
+2026-03-20T09:01:15.1893180Z ... Restoring cache ...
+2026-03-20T09:01:15.4635771Z Cache hit for: v0-rust-ci-debug-Linux-x64-c6e2f863-df5b01d5
+2026-03-20T09:01:16.7571124Z Received 0 of 240413630 (0.0%), 0.0 MBs/sec
+2026-03-20T09:01:17.7551854Z Received 121634816 of 240413630 (50.6%), 58.0 MBs/sec
+2026-03-20T09:01:18.7860471Z Received 240413630 of 240413630 (100.0%), 75.6 MBs/sec
+2026-03-20T09:01:18.7861934Z Cache Size: ~229 MB (240413630 B)
+2026-03-20T09:01:18.7900088Z [command]/usr/bin/tar -xf /home/runner/work/_temp/5a85c645-b19d-4484-9342-f37dcc452f14/cache.tzst -P -C /home/runner/work/stator/stator --use-compress-program unzstd
+2026-03-20T09:01:20.2136787Z Cache restored successfully
+2026-03-20T09:01:20.2628298Z Restored from cache key "v0-rust-ci-debug-Linux-x64-c6e2f863-df5b01d5" full match: true.

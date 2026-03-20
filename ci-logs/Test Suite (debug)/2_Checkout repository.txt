@@ -1,0 +1,72 @@
+﻿2026-03-20T09:01:09.3687248Z ##[group]Run actions/checkout@v4
+2026-03-20T09:01:09.3688255Z with:
+2026-03-20T09:01:09.3688735Z   repository: telecos/stator
+2026-03-20T09:01:09.3689572Z   token: ***
+2026-03-20T09:01:09.3690034Z   ssh-strict: true
+2026-03-20T09:01:09.3690517Z   ssh-user: git
+2026-03-20T09:01:09.3691015Z   persist-credentials: true
+2026-03-20T09:01:09.3691602Z   clean: true
+2026-03-20T09:01:09.3692104Z   sparse-checkout-cone-mode: true
+2026-03-20T09:01:09.3692762Z   fetch-depth: 1
+2026-03-20T09:01:09.3693234Z   fetch-tags: false
+2026-03-20T09:01:09.3693909Z   show-progress: true
+2026-03-20T09:01:09.3694432Z   lfs: false
+2026-03-20T09:01:09.3694884Z   submodules: false
+2026-03-20T09:01:09.3695402Z   set-safe-directory: true
+2026-03-20T09:01:09.3696211Z ##[endgroup]
+2026-03-20T09:01:09.4790463Z Syncing repository: telecos/stator
+2026-03-20T09:01:09.4792554Z ##[group]Getting Git version info
+2026-03-20T09:01:09.4793517Z Working directory is '/home/runner/work/stator/stator'
+2026-03-20T09:01:09.4795060Z [command]/usr/bin/git version
+2026-03-20T09:01:09.4880611Z git version 2.53.0
+2026-03-20T09:01:09.4907109Z ##[endgroup]
+2026-03-20T09:01:09.4922618Z Temporarily overriding HOME='/home/runner/work/_temp/f7ec2365-f788-4cde-98c2-dd50afdd6bee' before making global git config changes
+2026-03-20T09:01:09.4925864Z Adding repository directory to the temporary git global config as a safe directory
+2026-03-20T09:01:09.4935807Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/stator/stator
+2026-03-20T09:01:09.4978468Z Deleting the contents of '/home/runner/work/stator/stator'
+2026-03-20T09:01:09.4982139Z ##[group]Initializing the repository
+2026-03-20T09:01:09.4986241Z [command]/usr/bin/git init /home/runner/work/stator/stator
+2026-03-20T09:01:09.5111111Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-03-20T09:01:09.5113872Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-03-20T09:01:09.5115932Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-03-20T09:01:09.5118239Z hint: call:
+2026-03-20T09:01:09.5118971Z hint:
+2026-03-20T09:01:09.5119958Z hint: 	git config --global init.defaultBranch <name>
+2026-03-20T09:01:09.5121002Z hint:
+2026-03-20T09:01:09.5122139Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-03-20T09:01:09.5123873Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-03-20T09:01:09.5125391Z hint:
+2026-03-20T09:01:09.5125979Z hint: 	git branch -m <name>
+2026-03-20T09:01:09.5126593Z hint:
+2026-03-20T09:01:09.5127902Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-03-20T09:01:09.5129813Z Initialized empty Git repository in /home/runner/work/stator/stator/.git/
+2026-03-20T09:01:09.5131973Z [command]/usr/bin/git remote add origin https://github.com/telecos/stator
+2026-03-20T09:01:09.5165530Z ##[endgroup]
+2026-03-20T09:01:09.5166463Z ##[group]Disabling automatic garbage collection
+2026-03-20T09:01:09.5169940Z [command]/usr/bin/git config --local gc.auto 0
+2026-03-20T09:01:09.5199861Z ##[endgroup]
+2026-03-20T09:01:09.5200733Z ##[group]Setting up auth
+2026-03-20T09:01:09.5209257Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-03-20T09:01:09.5242922Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-03-20T09:01:09.5630838Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-03-20T09:01:09.5665636Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-03-20T09:01:09.5898048Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-03-20T09:01:09.5930596Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-03-20T09:01:09.6179436Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-03-20T09:01:09.6216737Z ##[endgroup]
+2026-03-20T09:01:09.6217729Z ##[group]Fetching the repository
+2026-03-20T09:01:09.6226136Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +2b30a7f7fd5c2a5f9f75fb69c7ada4a2518f3fa3:refs/remotes/origin/main
+2026-03-20T09:01:10.0563079Z From https://github.com/telecos/stator
+2026-03-20T09:01:10.0565495Z  * [new ref]         2b30a7f7fd5c2a5f9f75fb69c7ada4a2518f3fa3 -> origin/main
+2026-03-20T09:01:10.0602719Z ##[endgroup]
+2026-03-20T09:01:10.0604703Z ##[group]Determining the checkout info
+2026-03-20T09:01:10.0606789Z ##[endgroup]
+2026-03-20T09:01:10.0609559Z [command]/usr/bin/git sparse-checkout disable
+2026-03-20T09:01:10.0653982Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-03-20T09:01:10.0681095Z ##[group]Checking out the ref
+2026-03-20T09:01:10.0683996Z [command]/usr/bin/git checkout --progress --force -B main refs/remotes/origin/main
+2026-03-20T09:01:10.1441862Z Switched to a new branch 'main'
+2026-03-20T09:01:10.1443448Z branch 'main' set up to track 'origin/main'.
+2026-03-20T09:01:10.1453888Z ##[endgroup]
+2026-03-20T09:01:10.1494321Z [command]/usr/bin/git log -1 --format=%H
+2026-03-20T09:01:10.1517701Z 2b30a7f7fd5c2a5f9f75fb69c7ada4a2518f3fa3

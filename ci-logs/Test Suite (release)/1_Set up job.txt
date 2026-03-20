@@ -1,0 +1,32 @@
+﻿2026-03-20T09:01:07.6926033Z Current runner version: '2.332.0'
+2026-03-20T09:01:07.6952298Z ##[group]Runner Image Provisioner
+2026-03-20T09:01:07.6953061Z Hosted Compute Agent
+2026-03-20T09:01:07.6953703Z Version: 20260213.493
+2026-03-20T09:01:07.6954267Z Commit: 5c115507f6dd24b8de37d8bbe0bb4509d0cc0fa3
+2026-03-20T09:01:07.6954993Z Build Date: 2026-02-13T00:28:41Z
+2026-03-20T09:01:07.6955631Z Worker ID: {14772061-83df-4d16-97d7-265f3318e24c}
+2026-03-20T09:01:07.6956371Z Azure Region: centralus
+2026-03-20T09:01:07.6957231Z ##[endgroup]
+2026-03-20T09:01:07.6958729Z ##[group]Operating System
+2026-03-20T09:01:07.6959447Z Ubuntu
+2026-03-20T09:01:07.6959958Z 24.04.3
+2026-03-20T09:01:07.6960455Z LTS
+2026-03-20T09:01:07.6960885Z ##[endgroup]
+2026-03-20T09:01:07.6961381Z ##[group]Runner Image
+2026-03-20T09:01:07.6961872Z Image: ubuntu-24.04
+2026-03-20T09:01:07.6962465Z Version: 20260309.50.1
+2026-03-20T09:01:07.6963448Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260309.50/images/ubuntu/Ubuntu2404-Readme.md
+2026-03-20T09:01:07.6965116Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260309.50
+2026-03-20T09:01:07.6966017Z ##[endgroup]
+2026-03-20T09:01:07.6967234Z ##[group]GITHUB_TOKEN Permissions
+2026-03-20T09:01:07.6969345Z Contents: read
+2026-03-20T09:01:07.6969886Z Metadata: read
+2026-03-20T09:01:07.6970438Z ##[endgroup]
+2026-03-20T09:01:07.6973085Z Secret source: Actions
+2026-03-20T09:01:07.6973780Z Prepare workflow directory
+2026-03-20T09:01:07.7300604Z Prepare all required actions
+2026-03-20T09:01:07.7340794Z Getting action download info
+2026-03-20T09:01:08.0960978Z Download action repository 'actions/checkout@v4' (SHA:34e114876b0b11c390a56381ad16ebd13914f8d5)
+2026-03-20T09:01:08.2453828Z Download action repository 'dtolnay/rust-toolchain@stable' (SHA:631a55b12751854ce901bb631d5902ceb48146f7)
+2026-03-20T09:01:08.5295073Z Download action repository 'Swatinem/rust-cache@v2' (SHA:e18b497796c12c097a38f9edb9d0641fb99eee32)
+2026-03-20T09:01:09.3274168Z Complete job name: Test Suite (release)

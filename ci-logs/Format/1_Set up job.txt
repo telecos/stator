@@ -1,0 +1,31 @@
+﻿2026-03-20T09:01:08.0522589Z Current runner version: '2.332.0'
+2026-03-20T09:01:08.0548106Z ##[group]Runner Image Provisioner
+2026-03-20T09:01:08.0549247Z Hosted Compute Agent
+2026-03-20T09:01:08.0549861Z Version: 20260213.493
+2026-03-20T09:01:08.0550491Z Commit: 5c115507f6dd24b8de37d8bbe0bb4509d0cc0fa3
+2026-03-20T09:01:08.0551156Z Build Date: 2026-02-13T00:28:41Z
+2026-03-20T09:01:08.0551892Z Worker ID: {cc51a8be-af9d-409a-bf82-a3b50a3511b8}
+2026-03-20T09:01:08.0552605Z Azure Region: westcentralus
+2026-03-20T09:01:08.0553155Z ##[endgroup]
+2026-03-20T09:01:08.0554636Z ##[group]Operating System
+2026-03-20T09:01:08.0555245Z Ubuntu
+2026-03-20T09:01:08.0555741Z 24.04.3
+2026-03-20T09:01:08.0556190Z LTS
+2026-03-20T09:01:08.0556746Z ##[endgroup]
+2026-03-20T09:01:08.0557218Z ##[group]Runner Image
+2026-03-20T09:01:08.0557762Z Image: ubuntu-24.04
+2026-03-20T09:01:08.0558351Z Version: 20260309.50.1
+2026-03-20T09:01:08.0559497Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260309.50/images/ubuntu/Ubuntu2404-Readme.md
+2026-03-20T09:01:08.0561263Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260309.50
+2026-03-20T09:01:08.0562172Z ##[endgroup]
+2026-03-20T09:01:08.0563199Z ##[group]GITHUB_TOKEN Permissions
+2026-03-20T09:01:08.0564949Z Contents: read
+2026-03-20T09:01:08.0565567Z Metadata: read
+2026-03-20T09:01:08.0566168Z ##[endgroup]
+2026-03-20T09:01:08.0568299Z Secret source: Actions
+2026-03-20T09:01:08.0569375Z Prepare workflow directory
+2026-03-20T09:01:08.0911322Z Prepare all required actions
+2026-03-20T09:01:08.0950618Z Getting action download info
+2026-03-20T09:01:08.5129416Z Download action repository 'actions/checkout@v4' (SHA:34e114876b0b11c390a56381ad16ebd13914f8d5)
+2026-03-20T09:01:08.6820124Z Download action repository 'dtolnay/rust-toolchain@stable' (SHA:631a55b12751854ce901bb631d5902ceb48146f7)
+2026-03-20T09:01:09.2714588Z Complete job name: Format

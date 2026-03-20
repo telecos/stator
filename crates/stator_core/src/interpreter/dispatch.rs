@@ -5144,9 +5144,12 @@ fn handle_define_named_own_property(
         set_named_property_function_metadata(&val, &obj, &prop_name);
         if let Some(attrs) = private_named_property_attrs(&prop_name) {
             map.borrow_mut().insert_with_attrs(prop_name, val, attrs);
-        } else if let Err(val) = map.borrow_mut().try_template_fill(&prop_name, val) {
-            // Template fill missed — fall back to normal insert.
-            map.borrow_mut().insert(prop_name, val);
+        } else {
+            let fill_result = map.borrow_mut().try_template_fill(&prop_name, val);
+            if let Err(val) = fill_result {
+                // Template fill missed — fall back to normal insert.
+                map.borrow_mut().insert(prop_name, val);
+            }
         }
     }
     // Accumulator stays unchanged.
