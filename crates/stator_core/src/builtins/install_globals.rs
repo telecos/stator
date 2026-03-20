@@ -54704,6 +54704,66 @@ mod tests {
     }
 
     #[test]
+    fn e2e_debug_global_mutation_basic() {
+        // Test 1: Basic global mutation through function call
+        let r1 = global_eval("var x = 0; function inc() { x = x + 1; } inc(); x").unwrap();
+        eprintln!("DEBUG T1 basic mutation: {:?}", r1);
+        assert_eq!(
+            r1,
+            JsValue::Smi(1),
+            "basic global var mutation through function call"
+        );
+    }
+
+    #[test]
+    fn e2e_debug_global_mutation_string_concat() {
+        // Test 2: String concat global mutation
+        let r2 = global_eval("var s = ''; function add(v) { s = s + v; } add('a'); s").unwrap();
+        eprintln!("DEBUG T2 string concat: {:?}", r2);
+        assert_eq!(
+            r2,
+            JsValue::String("a".into()),
+            "string concat global mutation"
+        );
+    }
+
+    #[test]
+    fn e2e_debug_global_mutation_multi_call() {
+        // Test 3: Multiple calls
+        let r3 = global_eval("var s = ''; function add(v) { s = s + v; } add('a'); add('b'); s")
+            .unwrap();
+        eprintln!("DEBUG T3 multi call: {:?}", r3);
+        assert_eq!(r3, JsValue::String("ab".into()), "multi-call string concat");
+    }
+
+    #[test]
+    fn e2e_debug_global_mutation_with_return() {
+        // Test 4: Function returns AND mutates global
+        let r4 = global_eval(
+            "var s = ''; function tag(n) { s = s + n; return n; } var r = tag(1); s + ':' + r",
+        )
+        .unwrap();
+        eprintln!("DEBUG T4 return+mutate: {:?}", r4);
+        assert_eq!(
+            r4,
+            JsValue::String("1:1".into()),
+            "function return + global mutation"
+        );
+    }
+
+    #[test]
+    fn e2e_debug_global_mutation_in_switch_expr() {
+        // Test 5: Minimal switch with function call in case expr
+        let r5 = global_eval("var s = ''; function tag(n) { s = s + n; return n; } switch(1) { case tag(1): break; } s").unwrap();
+        eprintln!("DEBUG T5 switch case expr: {:?}", r5);
+        assert_eq!(
+            r5,
+            JsValue::String("1".into()),
+            "global mutation in switch case expression"
+        );
+    }
+
+    #[test]
     fn e2e_break_inside_switch_only_exits_switch() {
         let result = global_eval(
             "var hits = 0; for (var i = 0; i < 3; i++) { switch (i) { case 1: break; default: hits = hits + 1; } } hits",

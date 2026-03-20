@@ -2182,16 +2182,20 @@ impl InterpreterFrame {
         self.global_cache[slot] = (h, Some(Rc::from(name)), value);
     }
 
-    /// Mark the per-frame global variable cache as potentially stale.
+    /// Mark the per-frame global variable cache as stale.
     ///
-    /// With the generation-counter check in [`global_cache_get`], callers
-    /// no longer need to rebuild 8 cache entries after every function call.
-    /// Setting `cache_generation` to `u64::MAX` guarantees a mismatch on
-    /// the next get, which will re-read from the HashMap and re-snapshot
-    /// the real generation.
+    /// Clears all 8 direct-mapped cache entries **and** sets the generation
+    /// sentinel to `u64::MAX`.  Both steps are necessary: clearing entries
+    /// prevents a subsequent [`global_cache_put`] for *one* variable from
+    /// re-validating stale entries for *other* variables (the put snapshots
+    /// the current generation, which would make every surviving entry look
+    /// fresh even though the callee may have mutated the underlying global).
     #[inline(always)]
     pub fn global_cache_invalidate(&mut self) {
         self.cache_generation = u64::MAX;
+        for entry in &mut self.global_cache {
+            entry.1 = None;
+        }
     }
 }
 
@@ -7058,9 +7062,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         let arr_val = JsValue::Array(Rc::clone(&a));
                         let items = a.borrow().clone();
                         for (i, v) in items.iter().enumerate().rev() {
+                            let elem = if v.is_the_hole() {
+                                JsValue::Undefined
+                            } else {
+                                v.clone()
+                            };
                             let result = dispatch_call_value(
                                 &cb,
-                                vec![v.clone(), JsValue::Smi(i as i32), arr_val.clone()],
+                                vec![elem, JsValue::Smi(i as i32), arr_val.clone()],
                             )?;
                             if to_boolean_val(&result) {
                                 return Ok(JsValue::Smi(i as i32));
@@ -7072,7 +7081,17 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 "toReversed" => {
                     let a = Rc::clone(&arr_rc);
                     return JsValue::NativeFunction(Rc::new(move |_args| {
-                        let mut rev = a.borrow().clone();
+                        let mut rev: Vec<JsValue> = a
+                            .borrow()
+                            .iter()
+                            .map(|v| {
+                                if v.is_the_hole() {
+                                    JsValue::Undefined
+                                } else {
+                                    v.clone()
+                                }
+                            })
+                            .collect();
                         rev.reverse();
                         Ok(JsValue::new_array(rev))
                     }));
