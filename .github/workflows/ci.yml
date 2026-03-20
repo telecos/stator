@@ -35,6 +35,30 @@ jobs:
       - name: Run tests (debug)
         run: cargo test --workspace
 
+  test-windows:
+    name: Test Suite (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Disable Windows Defender on build dirs
+        run: |
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "ci-windows"
+
+      - name: Run tests (debug)
+        run: cargo test --workspace
+
   test-release:
     name: Test Suite (release)
     runs-on: ubuntu-latest
