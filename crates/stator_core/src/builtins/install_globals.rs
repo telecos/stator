@@ -3568,44 +3568,6 @@ fn json_serialize_value(
             in_progress.remove(&identity);
             result
         }
-        JsValue::SmiArray(items) => {
-            let identity = Rc::as_ptr(items) as usize;
-            if !in_progress.insert(identity) {
-                return Err(StatorError::TypeError(
-                    "Converting circular structure to JSON".to_string(),
-                ));
-            }
-            let result = (|| {
-                let values = value.dense_array_clone().unwrap_or_default();
-                let holder = value.clone();
-                let use_indent = !indent.is_empty();
-                let inner_indent = indent.repeat(depth + 1);
-                let outer_indent = indent.repeat(depth);
-                let mut parts = Vec::with_capacity(values.len());
-                for index in 0..values.len() {
-                    let serialized = json_serialize_property(
-                        &holder,
-                        &index.to_string(),
-                        replacer_fn,
-                        property_list,
-                        indent,
-                        depth + 1,
-                        in_progress,
-                    )?;
-                    parts.push(serialized.unwrap_or_else(|| "null".to_string()));
-                }
-                if use_indent {
-                    Ok(Some(format!(
-                        "[\n{inner_indent}{}\n{outer_indent}]",
-                        parts.join(&format!(",\n{inner_indent}"))
-                    )))
-                } else {
-                    Ok(Some(format!("[{}]", parts.join(","))))
-                }
-            })();
-            in_progress.remove(&identity);
-            result
-        }
         JsValue::PlainObject(map) => {
             let Some(identity) = json_identity_key(value) else {
                 unreachable!("plain objects must have an identity key");

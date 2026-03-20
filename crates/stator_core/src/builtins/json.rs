@@ -1072,22 +1072,6 @@ fn js_value_to_json_inner(
             seen.remove(&ptr);
             Ok(Some(JsonValue::Array(Rc::new(RefCell::new(arr)))))
         }
-        JsValue::SmiArray(items) => {
-            let ptr = Rc::as_ptr(items) as usize;
-            if seen.contains(&ptr) {
-                return Err(StatorError::TypeError(
-                    "Converting circular structure to JSON".to_string(),
-                ));
-            }
-            seen.insert(ptr);
-            let mut arr: Vec<JsonValue> = Vec::with_capacity(value.dense_array_len().unwrap_or(0));
-            for item in value.dense_array_clone().unwrap_or_default() {
-                let json_item = js_value_to_json_inner(&item, seen)?;
-                arr.push(json_item.unwrap_or(JsonValue::Null));
-            }
-            seen.remove(&ptr);
-            Ok(Some(JsonValue::Array(Rc::new(RefCell::new(arr)))))
-        }
         // Object values are inaccessible without a GC context; emit an empty
         // object to indicate the value is object-shaped.
         JsValue::Object(_) => Ok(Some(JsonValue::Object(Rc::new(RefCell::new(Vec::new()))))),
