@@ -15,9 +15,7 @@ use smallvec::{SmallVec, smallvec};
 
 use crate::builtins::string::{string_char_at, utf16_len};
 use crate::objects::map::PropertyAttributes;
-use crate::objects::property_map::{
-    INTERNAL_PROTO_PROPERTY_KEY, PropertyMap, acquire_plain_object,
-};
+use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 
 use super::{
     ACTIVE_DEBUGGER, CallArgs, GlobalEnv, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD,
@@ -4839,7 +4837,8 @@ fn handle_create_empty_object_literal(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    ctx.frame.accumulator = JsValue::PlainObject(acquire_plain_object());
+    ctx.frame.accumulator =
+        JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::with_capacity(4))));
     Ok(DispatchAction::Continue)
 }
 
@@ -5028,7 +5027,7 @@ fn handle_create_object_literal(
         Some(Operand::FeedbackSlot(s)) => Some(*s),
         _ => None,
     };
-    let _capacity = match instr.operands.get(2) {
+    let capacity = match instr.operands.get(2) {
         Some(Operand::Flag(count)) if *count > 0 => *count as usize,
         _ => 4,
     };
@@ -5049,7 +5048,8 @@ fn handle_create_object_literal(
             return Ok(DispatchAction::Continue);
         }
         // First execution: create normally and record as pending.
-        let rc = acquire_plain_object();
+        let map = PropertyMap::with_capacity(capacity);
+        let rc = Rc::new(RefCell::new(map));
         ctx.frame
             .bytecode_array
             .set_object_literal_pending(slot, Rc::clone(&rc));
@@ -5058,7 +5058,8 @@ fn handle_create_object_literal(
     }
 
     // No feedback slot — fall back to uncached creation.
-    ctx.frame.accumulator = JsValue::PlainObject(acquire_plain_object());
+    ctx.frame.accumulator =
+        JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::with_capacity(capacity))));
     Ok(DispatchAction::Continue)
 }
 
