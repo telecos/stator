@@ -426,7 +426,13 @@ pub fn dispatch_set_property_value(
 /// Return the immediate prototype of an object-like value.
 pub(crate) fn get_object_prototype(obj: &JsValue) -> Option<JsValue> {
     match obj {
-        JsValue::PlainObject(map) => map.borrow().get(INTERNAL_PROTO_PROPERTY_KEY).cloned(),
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            borrow
+                .get(INTERNAL_PROTO_PROPERTY_KEY)
+                .or_else(|| borrow.get("__proto__"))
+                .cloned()
+        }
         JsValue::Promise(promise) => promise.prototype().or_else(|| {
             let ctor = lookup_global_constructor("Promise");
             let proto = proto_lookup(&ctor, "prototype");
@@ -531,8 +537,11 @@ pub(crate) fn ordinary_set_prototype_of(obj: &JsValue, proto: JsValue) -> Stator
             if !matches!(proto, JsValue::Null) && has_prototype_in_chain(&proto, obj) {
                 return Err(StatorError::TypeError("Cyclic __proto__ value".to_string()));
             }
-            map.borrow_mut()
-                .insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), proto);
+            let mut m = map.borrow_mut();
+            // Remove legacy "__proto__" key if present so it doesn't
+            // shadow the canonical INTERNAL_PROTO_PROPERTY_KEY.
+            m.remove("__proto__");
+            m.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), proto);
         }
         JsValue::Error(e) => {
             if !e.props.borrow().extensible {

@@ -13015,6 +13015,16 @@ fn make_reflect() -> JsValue {
                 let result = match &target {
                     JsValue::PlainObject(_) => plain_has(&target, &key),
                     JsValue::Proxy(proxy) => proxy_has(&proxy.borrow(), &key)?,
+                    JsValue::Array(items) => {
+                        if key == "length" {
+                            true
+                        } else if let Ok(idx) = key.parse::<usize>() {
+                            let arr = items.borrow();
+                            idx < arr.len() && !arr[idx].is_the_hole()
+                        } else {
+                            false
+                        }
+                    }
                     _ => false,
                 };
                 Ok(JsValue::Boolean(result))

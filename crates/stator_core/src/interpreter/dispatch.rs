@@ -3841,6 +3841,41 @@ fn handle_sta_keyed_property(
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     let key = ctx.frame.read_reg(key_v)?.clone();
     let val = ctx.frame.accumulator.clone();
+    // Dense array slow-mode conversion: when storing a non-index property
+    // (Symbol, string like "length", etc.) on a JsValue::Array, convert the
+    // array to a PlainObject so the property is preserved.
+    if let JsValue::Array(arr) = &obj {
+        let is_index = match &key {
+            JsValue::Smi(i) => *i >= 0,
+            JsValue::String(s) => s.parse::<usize>().is_ok(),
+            _ => false,
+        };
+        let is_length = matches!(&key, JsValue::String(s) if &**s == "length");
+        if !is_index && !is_length {
+            let items = arr.borrow().clone();
+            let mut map = PropertyMap::new();
+            map.insert_with_attrs(
+                "__is_array__".to_string(),
+                JsValue::Boolean(true),
+                PropertyAttributes::empty(),
+            );
+            map.insert_with_attrs(
+                "length".to_string(),
+                JsValue::Smi(items.len() as i32),
+                PropertyAttributes::WRITABLE,
+            );
+            for (i, item) in items.iter().enumerate() {
+                if !item.is_the_hole() {
+                    map.insert(i.to_string(), item.clone());
+                }
+            }
+            let prop_name = to_property_key(&key)?;
+            map.insert(prop_name, val);
+            let new_obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+            ctx.frame.write_reg(obj_v, new_obj)?;
+            return Ok(DispatchAction::Continue);
+        }
+    }
     // TypeError for property store on null or undefined.
     if matches!(obj, JsValue::Null | JsValue::Undefined) {
         let key_str = key.to_js_string().unwrap_or_default();
