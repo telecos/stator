@@ -664,10 +664,18 @@ fn is_js_array(val: &JsValue) -> bool {
             .borrow()
             .get("__is_array__")
             .is_some_and(|v| matches!(v, JsValue::Boolean(true))),
-        JsValue::Proxy(proxy) => proxy_get_own_property_descriptor(&proxy.borrow(), "__is_array__")
-            .ok()
-            .flatten()
-            .is_some_and(|(value, _)| matches!(value, JsValue::Boolean(true))),
+        JsValue::Proxy(proxy) => {
+            // §7.2.2 IsArray: unwrap Proxy to check the underlying target.
+            let borrowed = proxy.borrow();
+            if let Some(tv) = &borrowed.target_value {
+                return is_js_array(tv);
+            }
+            // Fallback: check __is_array__ marker on the internal target.
+            borrowed
+                .target
+                .get_own_property_descriptor("__is_array__")
+                .is_some_and(|(value, _)| matches!(value, JsValue::Boolean(true)))
+        }
         _ => false,
     }
 }
@@ -6401,14 +6409,7 @@ fn make_array() -> JsValue {
             "isArray".into(),
             builtin_fn("isArray", 1, |args| {
                 let val = args.first().unwrap_or(&JsValue::Undefined);
-                let is_arr = match val {
-                    JsValue::Proxy(proxy) => {
-                        proxy_get_own_property_descriptor(&proxy.borrow(), "__is_array__")?
-                            .is_some_and(|(value, _)| matches!(value, JsValue::Boolean(true)))
-                    }
-                    _ => is_js_array(val),
-                };
-                Ok(JsValue::Boolean(is_arr))
+                Ok(JsValue::Boolean(is_js_array(val)))
             }),
         );
 
@@ -9787,6 +9788,16 @@ fn make_string() -> JsValue {
                 // §22.1.1.1: If value is a Symbol, return SymbolDescriptiveString.
                 if let JsValue::Symbol(id) = val {
                     return Ok(JsValue::String(format!("Symbol({id})").into()));
+                }
+                // For objects (e.g. Object(Symbol('x'))), ToPrimitive may
+                // return a Symbol.  String() must still produce the
+                // descriptive string rather than throwing a TypeError.
+                if !val.is_primitive() {
+                    let prim = val.to_primitive(ToPrimitiveHint::String)?;
+                    if let JsValue::Symbol(id) = &prim {
+                        return Ok(JsValue::String(format!("Symbol({id})").into()));
+                    }
+                    return Ok(JsValue::String(prim.to_js_string()?.into()));
                 }
                 Ok(JsValue::String(val.to_js_string()?.into()))
             }),

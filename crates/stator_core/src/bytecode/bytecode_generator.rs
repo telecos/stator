@@ -5313,7 +5313,12 @@ impl FunctionCompiler {
                 .map_err(|e| StatorError::Internal(e.to_string()))?;
         }
 
-        if !a.elements.is_empty() {
+        // Set the array length for the no-spread path only.  When spreads
+        // are present the dynamic index counter already sizes the Vec
+        // correctly via StaInArrayLiteral, and the static element count
+        // (a.elements.len()) would be wrong (it counts AST nodes, not the
+        // expanded element count).
+        if !has_spread && !a.elements.is_empty() {
             let len_slot = self.alloc_slot(FeedbackSlotKind::StoreProperty);
             let length_name = self.add_string("length");
             self.emit(Instruction::new_unchecked(
