@@ -1875,6 +1875,21 @@ impl InterpreterFrame {
             }
             env.rebuild_slots();
         }
+        Self::new_callee_frame(bytecode_array, args, global_env)
+    }
+
+    /// Build a callee frame for an internal function call.
+    ///
+    /// This is the fast path used by [`dispatch_call`] when the caller
+    /// already has a fully-initialised global environment.  It skips the
+    /// `install_globals` sentinel check that [`new_with_globals`] performs.
+    #[inline]
+    pub(super) fn new_callee_frame(
+        bytecode_array: Rc<BytecodeArray>,
+        args: impl IntoIterator<Item = JsValue>,
+        global_env: Rc<RefCell<GlobalEnv>>,
+    ) -> Self {
+        let args: CallArgs = args.into_iter().collect();
         // Build the frame directly with the shared global_env, avoiding the
         // redundant install_globals call that `new()` would perform.
         let param_count = bytecode_array.parameter_count() as usize;
@@ -4555,7 +4570,7 @@ pub(super) fn dispatch_call(
                     tried_jit = true;
                 }
                 if !tried_jit {
-                    let mut callee_frame = InterpreterFrame::new_with_globals(
+                    let mut callee_frame = InterpreterFrame::new_callee_frame(
                         Rc::clone(ba),
                         args,
                         Rc::clone(&frame.global_env),
@@ -4635,7 +4650,7 @@ pub(super) fn dispatch_call_property(
                     tried_jit = true;
                 }
                 if !tried_jit {
-                    let mut callee_frame = InterpreterFrame::new_with_globals(
+                    let mut callee_frame = InterpreterFrame::new_callee_frame(
                         Rc::clone(ba),
                         args,
                         Rc::clone(&frame.global_env),
@@ -4936,6 +4951,16 @@ pub(super) fn restore_closure_context(
 ) {
     if let Some(ctx) = ba.closure_context() {
         frame.context = Some(JsValue::Context(Rc::clone(ctx)));
+    }
+    // Fast path: skip the expensive fn_props_get + global_env borrow when
+    // the function has no side-table properties at all (the common case for
+    // ordinary closures that don't use `super`).
+    let has_props = FUNCTION_PROPS.with(|fp| {
+        let table = fp.borrow();
+        table.contains_key(&fn_props_key(ba))
+    });
+    if !has_props {
+        return;
     }
     let home_object = fn_props_get(ba, ".home_object");
     match home_object {
@@ -8040,7 +8065,7 @@ fn dispatch_getter(getter: &JsValue, this: &JsValue) -> StatorResult<JsValue> {
         JsValue::Function(ba) => {
             push_call_frame("<getter>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                InterpreterFrame::new_with_globals(Rc::clone(ba), vec![], globals)
+                InterpreterFrame::new_callee_frame(Rc::clone(ba), vec![], globals)
             } else {
                 InterpreterFrame::new(Rc::clone(ba), vec![])
             };
@@ -8065,7 +8090,7 @@ pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) ->
         JsValue::Function(ba) => {
             push_call_frame("<setter>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                InterpreterFrame::new_with_globals(Rc::clone(ba), vec![val], globals)
+                InterpreterFrame::new_callee_frame(Rc::clone(ba), vec![val], globals)
             } else {
                 InterpreterFrame::new(Rc::clone(ba), vec![val])
             };
@@ -8112,7 +8137,7 @@ pub fn dispatch_call_value(
             }
             push_call_frame("<anonymous>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                InterpreterFrame::new_with_globals(Rc::clone(ba), args, globals)
+                InterpreterFrame::new_callee_frame(Rc::clone(ba), args, globals)
             } else {
                 InterpreterFrame::new(Rc::clone(ba), args)
             };
@@ -8157,7 +8182,7 @@ pub fn dispatch_call_with_this(
             }
             push_call_frame("<anonymous>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                InterpreterFrame::new_with_globals(Rc::clone(ba), args, globals)
+                InterpreterFrame::new_callee_frame(Rc::clone(ba), args, globals)
             } else {
                 InterpreterFrame::new(Rc::clone(ba), args)
             };
@@ -8236,7 +8261,7 @@ pub fn dispatch_construct_call(
         JsValue::Function(ba) => {
             push_call_frame("<anonymous>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                InterpreterFrame::new_with_globals(Rc::clone(ba), args, globals)
+                InterpreterFrame::new_callee_frame(Rc::clone(ba), args, globals)
             } else {
                 InterpreterFrame::new(Rc::clone(ba), args)
             };
