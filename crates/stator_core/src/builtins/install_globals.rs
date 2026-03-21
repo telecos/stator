@@ -657,26 +657,31 @@ fn apply_array_like_slots(target: &JsValue, slots: &[Option<JsValue>]) {
 
 /// Check whether a value is a JavaScript array — either a native
 /// `JsValue::Array` or a `PlainObject` carrying the `__is_array__` marker.
-fn is_js_array(val: &JsValue) -> bool {
+fn is_js_array(val: &JsValue) -> StatorResult<bool> {
     match val {
-        JsValue::Array(_) => true,
-        JsValue::PlainObject(map) => map
+        JsValue::Array(_) => Ok(true),
+        JsValue::PlainObject(map) => Ok(map
             .borrow()
             .get("__is_array__")
-            .is_some_and(|v| matches!(v, JsValue::Boolean(true))),
+            .is_some_and(|v| matches!(v, JsValue::Boolean(true)))),
         JsValue::Proxy(proxy) => {
-            // §7.2.2 IsArray: unwrap Proxy to check the underlying target.
+            // §7.2.2 IsArray step 3: if proxy is revoked, throw TypeError.
             let borrowed = proxy.borrow();
+            if borrowed.is_revoked() {
+                return Err(StatorError::TypeError(
+                    "Cannot perform 'IsArray' on a proxy that has been revoked".to_string(),
+                ));
+            }
             if let Some(tv) = &borrowed.target_value {
                 return is_js_array(tv);
             }
             // Fallback: check __is_array__ marker on the internal target.
-            borrowed
+            Ok(borrowed
                 .target
                 .get_own_property_descriptor("__is_array__")
-                .is_some_and(|(value, _)| matches!(value, JsValue::Boolean(true)))
+                .is_some_and(|(value, _)| matches!(value, JsValue::Boolean(true))))
         }
-        _ => false,
+        _ => Ok(false),
     }
 }
 
@@ -707,7 +712,7 @@ fn flatten_array_like_into(
             continue;
         }
         let item = array_like_get_index(source, index);
-        if depth > 0 && is_js_array(&item) {
+        if depth > 0 && is_js_array(&item)? {
             flatten_array_like_into(&item, depth - 1, out)?;
         } else {
             out.push(item);
@@ -1509,7 +1514,7 @@ fn collect_iterable_values(iterable: &JsValue) -> StatorResult<Vec<JsValue>> {
             .chars()
             .map(|c| JsValue::String(c.to_string().into()))
             .collect()),
-        JsValue::PlainObject(_) if is_js_array(iterable) => Ok(to_array_like_elements(iterable).0),
+        JsValue::PlainObject(_) if is_js_array(iterable)? => Ok(to_array_like_elements(iterable).0),
         JsValue::PlainObject(_) | JsValue::Proxy(_) => {
             for key in ["@@iterator", "entries"] {
                 let method = dispatch_get_property_value(iterable, JsValue::String(key.into()))?;
@@ -3338,12 +3343,12 @@ fn json_stringify_indent(space: Option<&JsValue>) -> String {
 }
 
 /// Collect the property allow-list from a replacer array.
-fn json_stringify_property_list(replacer: Option<&JsValue>) -> Vec<String> {
+fn json_stringify_property_list(replacer: Option<&JsValue>) -> StatorResult<Vec<String>> {
     let Some(replacer) = replacer else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    if !is_js_array(replacer) {
-        return Vec::new();
+    if !is_js_array(replacer)? {
+        return Ok(Vec::new());
     }
 
     let (elements, _) = to_array_like_elements(replacer);
@@ -3361,7 +3366,7 @@ fn json_stringify_property_list(replacer: Option<&JsValue>) -> Vec<String> {
             properties.push(property);
         }
     }
-    properties
+    Ok(properties)
 }
 
 /// Read a JSON-visible property from `holder`.
@@ -3644,7 +3649,7 @@ fn json_stringify_runtime(
     space: Option<&JsValue>,
 ) -> StatorResult<Option<String>> {
     let replacer_fn = replacer.filter(|candidate| is_callable(candidate));
-    let property_list_storage = json_stringify_property_list(replacer);
+    let property_list_storage = json_stringify_property_list(replacer)?;
     let property_list =
         (!property_list_storage.is_empty()).then_some(property_list_storage.as_slice());
     let indent = json_stringify_indent(space);
@@ -6409,7 +6414,7 @@ fn make_array() -> JsValue {
             "isArray".into(),
             builtin_fn("isArray", 1, |args| {
                 let val = args.first().unwrap_or(&JsValue::Undefined);
-                Ok(JsValue::Boolean(is_js_array(val)))
+                Ok(JsValue::Boolean(is_js_array(val)?))
             }),
         );
 
@@ -6975,7 +6980,7 @@ fn make_array() -> JsValue {
                             arr_val.clone(),
                         ],
                     )?;
-                    if is_js_array(&mapped) {
+                    if is_js_array(&mapped)? {
                         flatten_array_like_into(&mapped, 1, &mut result)?;
                     } else {
                         result.push(mapped);
@@ -9787,7 +9792,8 @@ fn make_string() -> JsValue {
                 let val = args.first().unwrap_or(&JsValue::Undefined);
                 // §22.1.1.1: If value is a Symbol, return SymbolDescriptiveString.
                 if let JsValue::Symbol(id) = val {
-                    return Ok(JsValue::String(format!("Symbol({id})").into()));
+                    let desc = symbol_description(*id).unwrap_or_default();
+                    return Ok(JsValue::String(format!("Symbol({desc})").into()));
                 }
                 // For objects (e.g. Object(Symbol('x'))), ToPrimitive may
                 // return a Symbol.  String() must still produce the
@@ -9795,7 +9801,8 @@ fn make_string() -> JsValue {
                 if !val.is_primitive() {
                     let prim = val.to_primitive(ToPrimitiveHint::String)?;
                     if let JsValue::Symbol(id) = &prim {
-                        return Ok(JsValue::String(format!("Symbol({id})").into()));
+                        let desc = symbol_description(*id).unwrap_or_default();
+                        return Ok(JsValue::String(format!("Symbol({desc})").into()));
                     }
                     return Ok(JsValue::String(prim.to_js_string()?.into()));
                 }
