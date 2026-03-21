@@ -42,7 +42,7 @@
 //!     dbg.borrow_mut().set_breakpoint_at_offset(0, 1, 1);
 //!
 //!     attach_debugger(Rc::clone(&dbg));
-//!     let mut frame = InterpreterFrame::new(bytecodes, vec![]);
+//!     let mut frame = InterpreterFrame::new(Rc::new(bytecodes), vec![]);
 //!
 //!     // First run: pauses at the breakpoint.
 //!     let r = Interpreter::run(&mut frame);
