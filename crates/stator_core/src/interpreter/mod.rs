@@ -604,6 +604,7 @@ fn fn_props_key(ba: &Rc<BytecodeArray>) -> usize {
 
 /// Store a named property on a `Function` value's side-table entry.
 pub(crate) fn fn_props_set(ba: &Rc<BytecodeArray>, name: String, val: JsValue) {
+    ba.mark_has_fn_props();
     FUNCTION_PROPS.with(|fp| {
         let mut table = fp.borrow_mut();
         let map = table
@@ -6148,9 +6149,14 @@ pub(super) fn restore_closure_context(
     if let Some(ctx) = ba.closure_context() {
         frame.context = Some(JsValue::Context(Rc::clone(ctx)));
     }
-    // Fast path: skip the expensive fn_props_get + global_env borrow when
-    // the function has no side-table properties at all (the common case for
-    // ordinary closures that don't use `super`).
+    // Fast path: skip the expensive FUNCTION_PROPS thread-local HashMap
+    // lookup when this BytecodeArray has never had fn_props_set called on it.
+    // This is the common case for ordinary closures that don't use `super`.
+    if !ba.has_fn_props() {
+        return;
+    }
+    // Secondary check: the BytecodeArray may have been cloned from one that
+    // had fn_props, but THIS instance (by pointer key) may not have entries.
     let has_props = FUNCTION_PROPS.with(|fp| {
         let table = fp.borrow();
         table.contains_key(&fn_props_key(ba))

@@ -342,6 +342,12 @@ pub struct BytecodeArray {
     /// bytecode data with the template, because the closure only *reads*
     /// from captured variables.
     writes_closure_vars: bool,
+    /// `true` if `fn_props_set` has been called on this `BytecodeArray`.
+    ///
+    /// When `false`, `restore_closure_context` can skip the expensive
+    /// `FUNCTION_PROPS` thread-local HashMap lookup entirely.  Set to
+    /// `true` by `fn_props_set` on first write.
+    has_fn_props: Cell<bool>,
     /// Register index for the named function expression self-reference.
     ///
     /// When a named function expression (`var f = function g() { … }`) is
@@ -504,6 +510,7 @@ impl BytecodeArray {
             turbofan_compile_started: Arc::new(AtomicBool::new(false)),
             closure_context: None,
             writes_closure_vars: false,
+            has_fn_props: Cell::new(false),
             self_name_register: None,
             construct_proto_cache: Rc::new(RefCell::new(None)),
             construct_boilerplate: Rc::new(RefCell::new(None)),
@@ -625,6 +632,20 @@ impl BytecodeArray {
     /// closure variable.
     pub fn writes_closure_vars(&self) -> bool {
         self.writes_closure_vars
+    }
+
+    /// Returns `true` if `fn_props_set` has been called on this bytecode
+    /// array (or any clone sharing the same `has_fn_props` flag).
+    #[inline(always)]
+    pub fn has_fn_props(&self) -> bool {
+        self.has_fn_props.get()
+    }
+
+    /// Mark that function-properties side-table entries exist for this
+    /// bytecode array.
+    #[inline(always)]
+    pub fn mark_has_fn_props(&self) {
+        self.has_fn_props.set(true);
     }
 
     /// Mark whether this function writes to captured closure variables.

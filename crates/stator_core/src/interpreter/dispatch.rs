@@ -1702,7 +1702,7 @@ fn handle_call_any_receiver(
                         Rc::clone(&ctx.frame.global_env),
                     );
                     restore_closure_context(&mut callee_frame, &ba);
-                    if ba.is_arrow() {
+                    if ba.is_arrow() && ba.has_fn_props() {
                         callee_frame.new_target = fn_props_get(&ba, ".new_target");
                     }
                     populate_self_name(&mut callee_frame, &ba, &callee_val);
@@ -1925,7 +1925,7 @@ fn handle_call_undefined_receiver0(
                         Rc::clone(&ctx.frame.global_env),
                     );
                     restore_closure_context(&mut callee_frame, &ba);
-                    if ba.is_arrow() {
+                    if ba.is_arrow() && ba.has_fn_props() {
                         callee_frame.new_target = fn_props_get(&ba, ".new_target");
                     }
                     populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
@@ -2033,7 +2033,7 @@ fn handle_call_undefined_receiver1(
                         Rc::clone(&ctx.frame.global_env),
                     );
                     restore_closure_context(&mut callee_frame, &ba);
-                    if ba.is_arrow() {
+                    if ba.is_arrow() && ba.has_fn_props() {
                         callee_frame.new_target = fn_props_get(&ba, ".new_target");
                     }
                     populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
@@ -2151,7 +2151,7 @@ fn handle_call_undefined_receiver2(
                         Rc::clone(&ctx.frame.global_env),
                     );
                     restore_closure_context(&mut callee_frame, &ba);
-                    if ba.is_arrow() {
+                    if ba.is_arrow() && ba.has_fn_props() {
                         callee_frame.new_target = fn_props_get(&ba, ".new_target");
                     }
                     populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
