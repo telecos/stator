@@ -3363,6 +3363,81 @@ impl Interpreter {
                                 }
                             }
 
+                            // ── LdaNamedProperty: inline mega-IC hit ─────
+                            Opcode::LdaNamedProperty => {
+                                if let Operand::Register(obj_v) = instr.operands[0]
+                                    && let Operand::FeedbackSlot(slot) = instr.operands[2]
+                                {
+                                    // Clone the register value to release the frame borrow.
+                                    let obj =
+                                        unsafe { frame.read_reg_unchecked(obj_v) }.cheap_clone();
+                                    if let JsValue::PlainObject(map) = &obj
+                                        && let Some(ic) =
+                                            frame.mega_load_ic.as_ref().and_then(|cache| {
+                                                cache.probe(slot, map.borrow().layout_id())
+                                            })
+                                    {
+                                        if !ic.is_proto {
+                                            let pm = map.borrow();
+                                            if let Some(val) =
+                                                pm.get_by_offset(ic.cached_offset as usize)
+                                            {
+                                                acc = val.clone();
+                                                continue 'dispatch;
+                                            }
+                                        } else {
+                                            let proto_layout = ic.proto_layout;
+                                            let offset = ic.cached_offset;
+                                            let pm = map.borrow();
+                                            if let Some(JsValue::PlainObject(proto_map)) =
+                                                pm.get(INTERNAL_PROTO_PROPERTY_KEY)
+                                            {
+                                                let proto_pm = proto_map.borrow();
+                                                if proto_pm.layout_id() == proto_layout
+                                                    && let Some(val) =
+                                                        proto_pm.get_by_offset(offset as usize)
+                                                {
+                                                    acc = val.clone();
+                                                    continue 'dispatch;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // Fall through to table dispatch for misses and
+                                // non-PlainObject receivers.
+                                frame.pc = pc;
+                                frame.accumulator = acc;
+                                match dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
+                            }
+
                             // ── All other opcodes: dispatch table ────
                             _ => {
                                 // Write back locals before cold-path dispatch.
