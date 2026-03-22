@@ -1626,20 +1626,18 @@ fn handle_create_closure(
     // Arrow functions lexically capture `new.target` from the enclosing scope
     // (ES §15.3.4) so it survives even when the arrow is called later from a
     // different context.
-    if is_arrow {
+    if is_arrow && !matches!(ctx.frame.new_target, JsValue::Undefined) {
         fn_props_set(
             &func_rc,
             ".new_target".to_string(),
             ctx.frame.new_target.clone(),
         );
     }
-    if !is_arrow {
+    if !is_arrow && func_rc.is_generator() {
         let func_val = JsValue::Function(Rc::clone(&func_rc));
         let mut proto = PropertyMap::new();
         proto.insert("constructor".to_string(), func_val);
-        if func_rc.is_generator()
-            && let Some(generator_proto) = super::default_generator_object_prototype()
-        {
+        if let Some(generator_proto) = super::default_generator_object_prototype() {
             proto.insert("__proto__".to_string(), generator_proto);
         }
         fn_props_set(
@@ -1648,6 +1646,8 @@ fn handle_create_closure(
             JsValue::PlainObject(Rc::new(RefCell::new(proto))),
         );
     }
+    // Non-generator closures: prototype is created lazily on first
+    // `new` call or `.prototype` access.
 
     ctx.frame.accumulator = JsValue::Function(func_rc);
     Ok(DispatchAction::Continue)

@@ -8728,6 +8728,16 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         if !matches!(val, JsValue::Undefined) {
             return val;
         }
+        // Lazy prototype creation: non-arrow, non-generator functions get
+        // a .prototype object on first access (ES §10.2.5).
+        if key == "prototype" && !ba.is_arrow() && !ba.is_generator() {
+            let func_val = JsValue::Function(Rc::clone(ba));
+            let mut proto_map = PropertyMap::new();
+            proto_map.insert("constructor".to_string(), func_val);
+            let proto_obj = JsValue::PlainObject(Rc::new(RefCell::new(proto_map)));
+            fn_props_set(ba, "prototype".to_string(), proto_obj.clone());
+            return proto_obj;
+        }
         let function_proto = if ba.is_generator() {
             generator_function_prototype()
         } else {
@@ -9525,6 +9535,17 @@ pub(super) fn resolve_construct_proto(ctor: &JsValue, ba: &Rc<BytecodeArray>) ->
         return cached;
     }
     let proto = proto_lookup(ctor, "prototype");
+    // Lazy prototype creation: if no prototype was set (e.g., non-generator
+    // closure), create one on-demand per ES §10.2.5.
+    if matches!(proto, JsValue::Undefined) && !ba.is_arrow() {
+        let func_val = JsValue::Function(Rc::clone(ba));
+        let mut proto_map = PropertyMap::new();
+        proto_map.insert("constructor".to_string(), func_val);
+        let proto_obj = JsValue::PlainObject(Rc::new(RefCell::new(proto_map)));
+        fn_props_set(ba, "prototype".to_string(), proto_obj.clone());
+        ba.set_construct_proto_cache(proto_obj.clone());
+        return proto_obj;
+    }
     ba.set_construct_proto_cache(proto.clone());
     proto
 }
