@@ -3183,6 +3183,204 @@ impl Interpreter {
                                     }
                                 }
                             }
+                            Opcode::MulSmi => {
+                                if let Operand::Immediate(imm) = instr.operands[0]
+                                    && let JsValue::Smi(n) = acc
+                                    && let Some(result) = n.checked_mul(imm)
+                                {
+                                    acc = JsValue::Smi(result);
+                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
+                                    continue 'dispatch;
+                                }
+                                frame.pc = pc;
+                                frame.accumulator = acc;
+                                match dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
+                            }
+
+                            // ── Inc / Dec (Smi fast path) ────────────
+                            Opcode::Inc => {
+                                if let JsValue::Smi(n) = acc
+                                    && let Some(result) = n.checked_add(1)
+                                {
+                                    acc = JsValue::Smi(result);
+                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
+                                    continue 'dispatch;
+                                }
+                                frame.pc = pc;
+                                frame.accumulator = acc;
+                                match dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                            Opcode::Dec => {
+                                if let JsValue::Smi(n) = acc
+                                    && let Some(result) = n.checked_sub(1)
+                                {
+                                    acc = JsValue::Smi(result);
+                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
+                                    continue 'dispatch;
+                                }
+                                frame.pc = pc;
+                                frame.accumulator = acc;
+                                match dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                            // ── BitwiseOr (Smi fast path) ────────────
+                            Opcode::BitwiseOr => {
+                                if let Operand::Register(v) = instr.operands[0] {
+                                    let rhs = unsafe { frame.read_reg_unchecked(v) };
+                                    if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
+                                        acc = JsValue::Smi(*a | *b);
+                                        continue 'dispatch;
+                                    }
+                                }
+                                frame.pc = pc;
+                                frame.accumulator = acc;
+                                match dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                            Opcode::BitwiseOrSmi => {
+                                if let Operand::Immediate(imm) = instr.operands[0]
+                                    && let JsValue::Smi(n) = acc
+                                {
+                                    acc = JsValue::Smi(n | imm);
+                                    continue 'dispatch;
+                                }
+                                frame.pc = pc;
+                                frame.accumulator = acc;
+                                match dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
+                            }
 
                             // ── LdaGlobal (IC fast path) ────────────
                             Opcode::LdaGlobal => {
@@ -3442,6 +3640,84 @@ impl Interpreter {
                                     let result = strict_eq(&acc, rhs);
                                     acc = JsValue::Boolean(result);
                                     continue 'dispatch;
+                                }
+                                frame.pc = pc;
+                                frame.accumulator = acc;
+                                match dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                            Opcode::TestLessThanOrEqual => {
+                                if let Operand::Register(v) = instr.operands[0] {
+                                    let rhs = unsafe { frame.read_reg_unchecked(v) };
+                                    if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
+                                        acc = JsValue::Boolean(*a <= *b);
+                                        continue 'dispatch;
+                                    }
+                                }
+                                frame.pc = pc;
+                                frame.accumulator = acc;
+                                match dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
+                            }
+                            Opcode::TestGreaterThanOrEqual => {
+                                if let Operand::Register(v) = instr.operands[0] {
+                                    let rhs = unsafe { frame.read_reg_unchecked(v) };
+                                    if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
+                                        acc = JsValue::Boolean(*a >= *b);
+                                        continue 'dispatch;
+                                    }
                                 }
                                 frame.pc = pc;
                                 frame.accumulator = acc;
