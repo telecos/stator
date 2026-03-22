@@ -656,22 +656,21 @@ impl JsValue {
     /// back to the derived [`Clone`] implementation.
     #[inline(always)]
     pub fn cheap_clone(&self) -> Self {
-        if self.is_smi()
-            || self.is_boolean()
-            || self.is_heap_number()
-            || std::mem::discriminant(self) == std::mem::discriminant(&Self::Undefined)
-            || std::mem::discriminant(self) == std::mem::discriminant(&Self::Null)
-            || std::mem::discriminant(self) == std::mem::discriminant(&Self::TheHole)
-            || std::mem::discriminant(self) == std::mem::discriminant(&Self::Symbol(0))
-            || std::mem::discriminant(self)
-                == std::mem::discriminant(&Self::Object(std::ptr::null_mut()))
-            || std::mem::discriminant(self) == std::mem::discriminant(&Self::BigInt(0))
-        {
-            // SAFETY: The checked variants are stack-only scalars or raw pointers with
-            // no reference-counted ownership to update, so bitwise copy is valid.
-            unsafe { self.stack_clone() }
-        } else {
-            self.clone()
+        match self {
+            Self::Undefined
+            | Self::Null
+            | Self::TheHole
+            | Self::Boolean(_)
+            | Self::Smi(_)
+            | Self::HeapNumber(_)
+            | Self::Symbol(_)
+            | Self::Object(_)
+            | Self::BigInt(_) => {
+                // SAFETY: The checked variants are stack-only scalars or raw pointers with
+                // no reference-counted ownership to update, so bitwise copy is valid.
+                unsafe { self.stack_clone() }
+            }
+            _ => self.clone(),
         }
     }
 
