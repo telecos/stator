@@ -2662,8 +2662,8 @@ impl Interpreter {
                                 }
                                 Opcode::Return => {
                                     frame.pc = pc;
-                                    frame.accumulator = acc.clone();
-                                    return Ok(frame.accumulator.clone());
+                                    frame.accumulator = acc.cheap_clone();
+                                    return Ok(acc);
                                 }
                                 Opcode::BitwiseOr | Opcode::BitwiseOrSmi => {
                                     let (a, b) = if instr.opcode == Opcode::BitwiseOr {
@@ -3117,8 +3117,8 @@ impl Interpreter {
                             // ── Return ───────────────────────────────
                             Opcode::Return => {
                                 frame.pc = pc;
-                                frame.accumulator = acc;
-                                return Ok(frame.accumulator.clone());
+                                frame.accumulator = acc.cheap_clone();
+                                return Ok(acc);
                             }
 
                             // ── Jumps (unsafe target resolution) ─────
