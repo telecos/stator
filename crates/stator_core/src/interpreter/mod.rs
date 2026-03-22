@@ -466,10 +466,7 @@ pub(crate) fn get_object_prototype(obj: &JsValue) -> Option<JsValue> {
 /// implementation's `__proto__` link does not.
 pub(crate) fn plain_object_has_own_property(map: &PropertyMap, key: &str) -> bool {
     key != INTERNAL_PROTO_PROPERTY_KEY
-        && (map.contains_key(key)
-            || (map.has_accessors
-                && (map.contains_key(&format!("__get_{key}__"))
-                    || map.contains_key(&format!("__set_{key}__")))))
+        && (map.contains_key(key) || map.has_getter_for(key) || map.has_setter_for(key))
 }
 
 /// Returns `true` if `key` exists anywhere on `obj`'s prototype chain.
@@ -6297,11 +6294,8 @@ fn proto_lookup_chain_depth(current: &JsValue, key: &str) -> Option<u8> {
         }
         if let JsValue::PlainObject(ref map) = current {
             let borrow = map.borrow();
-            if borrow.has_accessors {
-                let getter_key = format!("__get_{key}__");
-                if borrow.get(&getter_key).is_some() {
-                    return Some(depth);
-                }
+            if borrow.has_accessors && borrow.has_getter_for(key) {
+                return Some(depth);
             }
             if borrow.get(key).is_some() {
                 return Some(depth);
@@ -6332,15 +6326,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         // Check for getter accessor (__get_<key>__) BEFORE the data key so
         // that accessor properties defined via Object.defineProperty are
         // dispatched correctly even when a placeholder data key exists.
-        if borrow.has_accessors {
-            let getter_key = format!("__get_{key}__");
-            if let Some(getter) = borrow.get(&getter_key).cloned() {
-                drop(borrow);
-                return match dispatch_getter(&getter, obj) {
-                    Ok(v) => v,
-                    Err(_) => JsValue::Undefined,
-                };
-            }
+        if borrow.has_accessors
+            && let Some(getter) = borrow.get_getter_for(key).cloned()
+        {
+            drop(borrow);
+            return match dispatch_getter(&getter, obj) {
+                Ok(v) => v,
+                Err(_) => JsValue::Undefined,
+            };
         }
         if let Some(val) = borrow.get(key) {
             return val.clone();
@@ -9141,15 +9134,14 @@ fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsVal
             // Check for getter accessor BEFORE data key (same rationale
             // as proto_lookup: accessor properties may have a placeholder
             // data key that should not shadow the getter).
-            if borrow.has_accessors {
-                let getter_key = format!("__get_{key}__");
-                if let Some(getter) = borrow.get(&getter_key).cloned() {
-                    drop(borrow);
-                    return match dispatch_getter(&getter, this_obj) {
-                        Ok(v) => v,
-                        Err(_) => JsValue::Undefined,
-                    };
-                }
+            if borrow.has_accessors
+                && let Some(getter) = borrow.get_getter_for(key).cloned()
+            {
+                drop(borrow);
+                return match dispatch_getter(&getter, this_obj) {
+                    Ok(v) => v,
+                    Err(_) => JsValue::Undefined,
+                };
             }
             if let Some(val) = borrow.get(key) {
                 return val.clone();

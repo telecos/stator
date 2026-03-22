@@ -721,6 +721,100 @@ impl PropertyMap {
         self.lookup_slot_cached(key).is_some()
     }
 
+    /// Returns `true` if an accessor getter `__get_{key}__` exists in this
+    /// map.  Uses a stack-allocated buffer to avoid heap `format!()`.
+    #[inline]
+    pub fn has_getter_for(&self, key: &str) -> bool {
+        if !self.has_accessors {
+            return false;
+        }
+        // Build "__get_{key}__" on the stack (max 128 bytes, fall back to
+        // heap allocation for very long property names).
+        let prefix = "__get_";
+        let suffix = "__";
+        let total = prefix.len() + key.len() + suffix.len();
+        if total <= 128 {
+            let mut buf = [0u8; 128];
+            buf[..prefix.len()].copy_from_slice(prefix.as_bytes());
+            buf[prefix.len()..prefix.len() + key.len()].copy_from_slice(key.as_bytes());
+            buf[prefix.len() + key.len()..total].copy_from_slice(suffix.as_bytes());
+            // SAFETY: both prefix, key, and suffix are valid UTF-8.
+            let getter_key = unsafe { std::str::from_utf8_unchecked(&buf[..total]) };
+            self.contains_key(getter_key)
+        } else {
+            self.contains_key(&format!("__get_{key}__"))
+        }
+    }
+
+    /// Returns `true` if an accessor setter `__set_{key}__` exists in this
+    /// map.  Uses a stack-allocated buffer to avoid heap `format!()`.
+    #[inline]
+    pub fn has_setter_for(&self, key: &str) -> bool {
+        if !self.has_accessors {
+            return false;
+        }
+        let prefix = "__set_";
+        let suffix = "__";
+        let total = prefix.len() + key.len() + suffix.len();
+        if total <= 128 {
+            let mut buf = [0u8; 128];
+            buf[..prefix.len()].copy_from_slice(prefix.as_bytes());
+            buf[prefix.len()..prefix.len() + key.len()].copy_from_slice(key.as_bytes());
+            buf[prefix.len() + key.len()..total].copy_from_slice(suffix.as_bytes());
+            // SAFETY: both prefix, key, and suffix are valid UTF-8.
+            let setter_key = unsafe { std::str::from_utf8_unchecked(&buf[..total]) };
+            self.contains_key(setter_key)
+        } else {
+            self.contains_key(&format!("__set_{key}__"))
+        }
+    }
+
+    /// Returns the getter function for `key` (`__get_{key}__`) if one
+    /// exists.  Stack-allocated key avoids heap `format!()`.
+    #[inline]
+    pub fn get_getter_for(&self, key: &str) -> Option<&JsValue> {
+        if !self.has_accessors {
+            return None;
+        }
+        let prefix = "__get_";
+        let suffix = "__";
+        let total = prefix.len() + key.len() + suffix.len();
+        if total <= 128 {
+            let mut buf = [0u8; 128];
+            buf[..prefix.len()].copy_from_slice(prefix.as_bytes());
+            buf[prefix.len()..prefix.len() + key.len()].copy_from_slice(key.as_bytes());
+            buf[prefix.len() + key.len()..total].copy_from_slice(suffix.as_bytes());
+            // SAFETY: both prefix, key, and suffix are valid UTF-8.
+            let getter_key = unsafe { std::str::from_utf8_unchecked(&buf[..total]) };
+            self.get(getter_key)
+        } else {
+            self.get(&format!("__get_{key}__"))
+        }
+    }
+
+    /// Returns the setter function for `key` (`__set_{key}__`) if one
+    /// exists.  Stack-allocated key avoids heap `format!()`.
+    #[inline]
+    pub fn get_setter_for(&self, key: &str) -> Option<&JsValue> {
+        if !self.has_accessors {
+            return None;
+        }
+        let prefix = "__set_";
+        let suffix = "__";
+        let total = prefix.len() + key.len() + suffix.len();
+        if total <= 128 {
+            let mut buf = [0u8; 128];
+            buf[..prefix.len()].copy_from_slice(prefix.as_bytes());
+            buf[prefix.len()..prefix.len() + key.len()].copy_from_slice(key.as_bytes());
+            buf[prefix.len() + key.len()..total].copy_from_slice(suffix.as_bytes());
+            // SAFETY: both prefix, key, and suffix are valid UTF-8.
+            let setter_key = unsafe { std::str::from_utf8_unchecked(&buf[..total]) };
+            self.get(setter_key)
+        } else {
+            self.get(&format!("__set_{key}__"))
+        }
+    }
+
     /// Inserts a property with default attributes (writable, enumerable,
     /// configurable).  If the key already exists the value is replaced but
     /// the existing attributes are preserved.

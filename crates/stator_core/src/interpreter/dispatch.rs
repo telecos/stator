@@ -3391,7 +3391,7 @@ fn handle_lda_named_property(
         && let JsValue::PlainObject(ref map) = obj
     {
         let pm = map.borrow();
-        let has_accessor = pm.has_accessors && pm.contains_key(&format!("__get_{prop_name}__"));
+        let has_accessor = pm.has_getter_for(&prop_name);
         if !has_accessor {
             match pm.offset_of(&prop_name) {
                 Some(offset) if offset <= u16::MAX as usize => {
@@ -3411,8 +3411,7 @@ fn handle_lda_named_property(
                         pm.get(INTERNAL_PROTO_PROPERTY_KEY)
                     {
                         let proto_pm = proto_map.borrow();
-                        let proto_has_accessor = proto_pm.has_accessors
-                            && proto_pm.contains_key(&format!("__get_{prop_name}__"));
+                        let proto_has_accessor = proto_pm.has_getter_for(&prop_name);
                         if !proto_has_accessor
                             && let Some(proto_offset) = proto_pm.offset_of(&prop_name)
                             && proto_offset <= u16::MAX as usize
@@ -3581,9 +3580,7 @@ fn handle_sta_named_property(
             }
             // Check for setter accessor first (own object).
             if map.borrow().has_accessors {
-                let setter_key = format!("__set_{prop_name}__");
-                let getter_key = format!("__get_{prop_name}__");
-                let setter = map.borrow().get(&setter_key).cloned();
+                let setter = map.borrow().get_setter_for(&prop_name).cloned();
                 if let Some(setter_fn) = setter {
                     dispatch_setter(&setter_fn, &obj, val)?;
                     ctx.frame.global_cache_invalidate();
@@ -3591,7 +3588,7 @@ fn handle_sta_named_property(
                 }
                 // Getter-only accessor (own): no setter -> TypeError in strict,
                 // silent ignore in sloppy.
-                if map.borrow().contains_key(&getter_key) {
+                if map.borrow().has_getter_for(&prop_name) {
                     if ctx.frame.bytecode_array.is_strict() {
                         return Err(StatorError::TypeError(format!(
                             "Cannot set property {prop_name} which has only a getter"
@@ -3602,26 +3599,19 @@ fn handle_sta_named_property(
             }
             // Walk the prototype chain for inherited setters/getters.
             {
-                let mut accessor_keys: Option<(String, String)> = None;
                 let mut proto = map.borrow().get("__proto__").cloned();
                 for _ in 0..256 {
                     match proto.take() {
                         Some(JsValue::PlainObject(p)) => {
                             let pb = p.borrow();
                             if pb.has_accessors {
-                                let keys = accessor_keys.get_or_insert_with(|| {
-                                    (
-                                        format!("__set_{prop_name}__"),
-                                        format!("__get_{prop_name}__"),
-                                    )
-                                });
-                                if let Some(s) = pb.get(&keys.0).cloned() {
+                                if let Some(s) = pb.get_setter_for(&prop_name).cloned() {
                                     drop(pb);
                                     dispatch_setter(&s, &obj, val)?;
                                     ctx.frame.global_cache_invalidate();
                                     return Ok(DispatchAction::Continue);
                                 }
-                                if pb.contains_key(&keys.1) {
+                                if pb.has_getter_for(&prop_name) {
                                     if ctx.frame.bytecode_array.is_strict() {
                                         return Err(StatorError::TypeError(format!(
                                             "Cannot set property {prop_name} which has only a getter"
@@ -3901,9 +3891,7 @@ fn handle_sta_keyed_property(
         set_function_name_if_missing(&val, &key_str);
         // Check for setter accessor first (__set_<key>__).
         if map.borrow().has_accessors {
-            let setter_key = format!("__set_{key_str}__");
-            let getter_key = format!("__get_{key_str}__");
-            let setter = map.borrow().get(&setter_key).cloned();
+            let setter = map.borrow().get_setter_for(&key_str).cloned();
             if let Some(setter_fn) = setter {
                 dispatch_setter(&setter_fn, &obj, val)?;
                 ctx.frame.global_cache_invalidate();
@@ -3911,7 +3899,7 @@ fn handle_sta_keyed_property(
             }
             // Getter-only accessor: no setter -> TypeError in strict, silent
             // ignore in sloppy.
-            if map.borrow().contains_key(&getter_key) {
+            if map.borrow().has_getter_for(&key_str) {
                 if ctx.frame.bytecode_array.is_strict() {
                     return Err(StatorError::TypeError(format!(
                         "Cannot set property {key_str} which has only a getter"
@@ -3922,23 +3910,19 @@ fn handle_sta_keyed_property(
         }
         // Walk prototype chain for inherited setters/getters.
         {
-            let mut accessor_keys: Option<(String, String)> = None;
             let mut proto = map.borrow().get("__proto__").cloned();
             for _ in 0..256 {
                 match proto.take() {
                     Some(JsValue::PlainObject(p)) => {
                         let pb = p.borrow();
                         if pb.has_accessors {
-                            let keys = accessor_keys.get_or_insert_with(|| {
-                                (format!("__set_{key_str}__"), format!("__get_{key_str}__"))
-                            });
-                            if let Some(s) = pb.get(&keys.0).cloned() {
+                            if let Some(s) = pb.get_setter_for(&key_str).cloned() {
                                 drop(pb);
                                 dispatch_setter(&s, &obj, val)?;
                                 ctx.frame.global_cache_invalidate();
                                 return Ok(DispatchAction::Continue);
                             }
-                            if pb.contains_key(&keys.1) {
+                            if pb.has_getter_for(&key_str) {
                                 if ctx.frame.bytecode_array.is_strict() {
                                     return Err(StatorError::TypeError(format!(
                                         "Cannot set property {key_str} which has only a getter"
