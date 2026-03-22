@@ -3652,6 +3652,62 @@ impl Interpreter {
                                 }
                             }
 
+                            // ── StaKeyedProperty (Smi index on Array) ──
+                            Opcode::StaKeyedProperty => {
+                                if let Operand::Register(obj_v) = instr.operands[0]
+                                    && let Operand::Register(key_v) = instr.operands[1]
+                                {
+                                    let key_ref = unsafe { frame.read_reg_unchecked(key_v) };
+                                    if let JsValue::Smi(idx) = key_ref
+                                        && *idx >= 0
+                                    {
+                                        let i = *idx as usize;
+                                        let obj_ref = unsafe { frame.read_reg_unchecked(obj_v) };
+                                        if let JsValue::Array(items) = obj_ref {
+                                            let items_rc = Rc::clone(items);
+                                            let val = acc.cheap_clone();
+                                            let mut v = items_rc.borrow_mut();
+                                            if i >= v.len() {
+                                                v.resize(i + 1, JsValue::TheHole);
+                                            }
+                                            v[i] = val;
+                                            continue 'dispatch;
+                                        }
+                                    }
+                                }
+                                // Fall through to table dispatch.
+                                frame.pc = pc;
+                                frame.accumulator = acc;
+                                match dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
+                            }
+
                             // ── All other opcodes: dispatch table ────
                             _ => {
                                 // Write back locals before cold-path dispatch.
