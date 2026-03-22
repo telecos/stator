@@ -3146,8 +3146,7 @@ fn handle_lda_global(
         drop(env);
         if let Some((slot_idx, cached_gen)) = slot_gen {
             ctx.frame
-                .global_ic
-                .get_or_insert_with(Box::default)
+                .global_ic_mut()
                 .insert(name_idx, (slot_idx, cached_gen));
         }
     }
@@ -3211,8 +3210,7 @@ fn handle_lda_global_inside_typeof(
         drop(env);
         if let Some((slot_idx, cached_gen)) = slot_gen {
             ctx.frame
-                .global_ic
-                .get_or_insert_with(Box::default)
+                .global_ic_mut()
                 .insert(name_idx, (slot_idx, cached_gen));
         }
     }

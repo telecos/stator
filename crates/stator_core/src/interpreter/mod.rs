@@ -1846,10 +1846,6 @@ impl InterpreterFrame {
         let mut global_env = GlobalEnv::new();
         crate::builtins::install_globals::install_globals(&mut global_env.vars);
         global_env.rebuild_slots();
-        let mega_load_ic = bytecode_array.shared_mega_load_ic();
-        let mega_store_ic = bytecode_array.shared_mega_store_ic();
-        let proto_load_ic = bytecode_array.shared_proto_load_ic();
-        let global_ic = bytecode_array.shared_global_ic();
         Self {
             bytecode_array,
             registers,
@@ -1868,11 +1864,11 @@ impl InterpreterFrame {
             new_target: JsValue::Undefined,
             mono_load_cache: None,
             poly_load_cache: None,
-            mega_load_ic,
-            proto_load_ic,
-            mega_store_ic,
+            mega_load_ic: None,
+            proto_load_ic: None,
+            mega_store_ic: None,
             string_cache: None,
-            global_ic,
+            global_ic: None,
             global_cache: [
                 (0, None, JsValue::Undefined),
                 (0, None, JsValue::Undefined),
@@ -1942,12 +1938,10 @@ impl InterpreterFrame {
         for (i, arg) in args.iter().cloned().enumerate().take(param_count) {
             registers[i] = arg;
         }
-        // Seed per-frame ICs from the shared BytecodeArray cache
-        // so that subsequent invocations start warm instead of cold.
-        let mega_load_ic = bytecode_array.shared_mega_load_ic();
-        let mega_store_ic = bytecode_array.shared_mega_store_ic();
-        let proto_load_ic = bytecode_array.shared_proto_load_ic();
-        let global_ic = bytecode_array.shared_global_ic();
+        // ICs start as None and are seeded lazily from the shared
+        // BytecodeArray cache on first IC miss.  This avoids cloning
+        // (potentially large) IC HashMaps for every function call — a
+        // significant win for closures that never access named properties.
         Self {
             bytecode_array,
             registers,
@@ -1966,11 +1960,11 @@ impl InterpreterFrame {
             new_target: JsValue::Undefined,
             mono_load_cache: None,
             poly_load_cache: None,
-            mega_load_ic,
-            proto_load_ic,
-            mega_store_ic,
+            mega_load_ic: None,
+            proto_load_ic: None,
+            mega_store_ic: None,
             string_cache: None,
-            global_ic,
+            global_ic: None,
             global_cache: [
                 (0, None, JsValue::Undefined),
                 (0, None, JsValue::Undefined),
@@ -2137,23 +2131,46 @@ impl InterpreterFrame {
 
     #[inline]
     fn mega_load_ic_mut(&mut self) -> &mut MegamorphicIc {
-        self.mega_load_ic
-            .get_or_insert_with(|| Box::new(MegamorphicIc::new()))
-            .as_mut()
+        if self.mega_load_ic.is_none() {
+            self.mega_load_ic = self
+                .bytecode_array
+                .shared_mega_load_ic()
+                .or_else(|| Some(Box::new(MegamorphicIc::new())));
+        }
+        self.mega_load_ic.as_mut().unwrap()
     }
 
     #[inline]
     fn proto_load_ic_mut(&mut self) -> &mut ProtoLoadIcCache {
-        self.proto_load_ic
-            .get_or_insert_with(|| Box::new(HashMap::new()))
-            .as_mut()
+        if self.proto_load_ic.is_none() {
+            self.proto_load_ic = self
+                .bytecode_array
+                .shared_proto_load_ic()
+                .or_else(|| Some(Box::new(HashMap::new())));
+        }
+        self.proto_load_ic.as_mut().unwrap()
     }
 
     #[inline]
     fn mega_store_ic_mut(&mut self) -> &mut MegamorphicIc {
-        self.mega_store_ic
-            .get_or_insert_with(|| Box::new(MegamorphicIc::new()))
-            .as_mut()
+        if self.mega_store_ic.is_none() {
+            self.mega_store_ic = self
+                .bytecode_array
+                .shared_mega_store_ic()
+                .or_else(|| Some(Box::new(MegamorphicIc::new())));
+        }
+        self.mega_store_ic.as_mut().unwrap()
+    }
+
+    #[inline]
+    fn global_ic_mut(&mut self) -> &mut GlobalIcCache {
+        if self.global_ic.is_none() {
+            self.global_ic = self
+                .bytecode_array
+                .shared_global_ic()
+                .or_else(|| Some(Box::default()));
+        }
+        self.global_ic.as_mut().unwrap()
     }
 
     #[inline]
@@ -2235,8 +2252,7 @@ impl InterpreterFrame {
         let slot_gen = env.slot_index_for(name).map(|idx| (idx, env.generation()));
         drop(env);
         if let Some((slot_idx, cached_gen)) = slot_gen {
-            self.global_ic
-                .get_or_insert_with(Box::default)
+            self.global_ic_mut()
                 .insert(name_idx, (slot_idx, cached_gen));
         }
         self.global_cache_put(name, value);
@@ -2342,10 +2358,8 @@ impl Interpreter {
                         (&decoded.0[..], &decoded.1[..], decoded.2.as_slice());
                     let handler_table = frame.bytecode_array.shared_handler_table();
 
-                    // Ensure loop trip-count vector covers the instruction stream.
-                    if frame.loop_trip_counts.len() < instructions.len() {
-                        frame.loop_trip_counts.resize(instructions.len(), 0);
-                    }
+                    // loop_trip_counts is lazily grown on JumpLoop back-edge;
+                    // no pre-allocation needed here.
 
                     // Cache the debugger-attached flag so we avoid a thread-local
                     // read on every instruction.  Refreshed in the periodic block.
@@ -3781,19 +3795,23 @@ impl Interpreter {
                                     && let JsValue::Smi(_) = &acc
                                 {
                                     let target_pc = pc;
-                                    if target_pc < frame.loop_trip_counts.len() {
-                                        // SAFETY: bounds check just above.
-                                        let count = unsafe {
-                                            frame.loop_trip_counts.get_unchecked_mut(target_pc)
-                                        };
-                                        *count = count.saturating_add(1);
-                                        if *count >= 4 {
-                                            frame.smi_mode = true;
-                                            // Seed hot_accumulator for the first
-                                            // SMI-mode iteration.
-                                            if let JsValue::Smi(v) = &acc {
-                                                frame.hot_accumulator = NanBoxedValue::from_smi(*v);
-                                            }
+                                    // Lazily grow the trip-count vector on first
+                                    // JumpLoop — avoids Vec allocation for functions
+                                    // with no loops.
+                                    if frame.loop_trip_counts.len() <= target_pc {
+                                        frame.loop_trip_counts.resize(instructions.len(), 0);
+                                    }
+                                    // SAFETY: resize above guarantees target_pc < len.
+                                    let count = unsafe {
+                                        frame.loop_trip_counts.get_unchecked_mut(target_pc)
+                                    };
+                                    *count = count.saturating_add(1);
+                                    if *count >= 4 {
+                                        frame.smi_mode = true;
+                                        // Seed hot_accumulator for the first
+                                        // SMI-mode iteration.
+                                        if let JsValue::Smi(v) = &acc {
+                                            frame.hot_accumulator = NanBoxedValue::from_smi(*v);
                                         }
                                     }
                                 }
@@ -4605,11 +4623,11 @@ impl Interpreter {
             new_target: JsValue::Undefined,
             mono_load_cache: None,
             poly_load_cache: None,
-            mega_load_ic: bytecode_array.shared_mega_load_ic(),
-            proto_load_ic: bytecode_array.shared_proto_load_ic(),
-            mega_store_ic: bytecode_array.shared_mega_store_ic(),
+            mega_load_ic: None,
+            proto_load_ic: None,
+            mega_store_ic: None,
             string_cache: None,
-            global_ic: bytecode_array.shared_global_ic(),
+            global_ic: None,
             global_cache: [
                 (0, None, JsValue::Undefined),
                 (0, None, JsValue::Undefined),
