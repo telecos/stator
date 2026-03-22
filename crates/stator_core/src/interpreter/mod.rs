@@ -4607,21 +4607,24 @@ pub(super) fn dispatch_call(
                 frame.accumulator = Interpreter::run_async_function(Rc::clone(ba), args)?;
             } else {
                 let count = ba.increment_invocation_count();
-                if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
-                    maybe_compile_baseline(ba);
+                // Only check tiering/JIT when the function has been called
+                // enough times — cold calls skip all JIT overhead entirely.
+                if count >= TIERING_THRESHOLD {
+                    if ba.try_get_jit_code().is_none() {
+                        maybe_compile_baseline(ba);
+                    }
+                    if count >= MAGLEV_TIERING_THRESHOLD {
+                        maybe_compile_maglev(ba);
+                    }
+                    if count >= TURBOFAN_TIERING_THRESHOLD {
+                        maybe_compile_turbofan(ba);
+                    }
+                    if let Some(jit_result) = try_execute_best_jit(ba, &args) {
+                        frame.accumulator = jit_result?;
+                        return Ok(());
+                    }
                 }
-                if count >= MAGLEV_TIERING_THRESHOLD {
-                    maybe_compile_maglev(ba);
-                }
-                if count >= TURBOFAN_TIERING_THRESHOLD {
-                    maybe_compile_turbofan(ba);
-                }
-                let mut tried_jit = false;
-                if let Some(jit_result) = try_execute_best_jit(ba, &args) {
-                    frame.accumulator = jit_result?;
-                    tried_jit = true;
-                }
-                if !tried_jit {
+                {
                     let mut callee_frame = InterpreterFrame::new_callee_frame(
                         Rc::clone(ba),
                         args,
@@ -4687,21 +4690,22 @@ pub(super) fn dispatch_call_property(
                 frame.accumulator = Interpreter::run_async_function(Rc::clone(ba), args)?;
             } else {
                 let count = ba.increment_invocation_count();
-                if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
-                    maybe_compile_baseline(ba);
+                if count >= TIERING_THRESHOLD {
+                    if ba.try_get_jit_code().is_none() {
+                        maybe_compile_baseline(ba);
+                    }
+                    if count >= MAGLEV_TIERING_THRESHOLD {
+                        maybe_compile_maglev(ba);
+                    }
+                    if count >= TURBOFAN_TIERING_THRESHOLD {
+                        maybe_compile_turbofan(ba);
+                    }
+                    if let Some(jit_result) = try_execute_best_jit(ba, &args) {
+                        frame.accumulator = jit_result?;
+                        return Ok(());
+                    }
                 }
-                if count >= MAGLEV_TIERING_THRESHOLD {
-                    maybe_compile_maglev(ba);
-                }
-                if count >= TURBOFAN_TIERING_THRESHOLD {
-                    maybe_compile_turbofan(ba);
-                }
-                let mut tried_jit = false;
-                if let Some(jit_result) = try_execute_best_jit(ba, &args) {
-                    frame.accumulator = jit_result?;
-                    tried_jit = true;
-                }
-                if !tried_jit {
+                {
                     let mut callee_frame = InterpreterFrame::new_callee_frame(
                         Rc::clone(ba),
                         args,
