@@ -49,6 +49,7 @@ use stator_core::parser::recursive_descent;
 fn make_global_env() -> Rc<RefCell<GlobalEnv>> {
     let mut env = GlobalEnv::new();
     stator_core::builtins::install_globals::install_globals(&mut env.vars);
+    env.rebuild_slots();
     Rc::new(RefCell::new(env))
 }
 
