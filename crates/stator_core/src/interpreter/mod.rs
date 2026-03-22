@@ -1522,6 +1522,20 @@ impl GlobalEnv {
         self.slots[idx] = value;
     }
 
+    /// Store by slot index **and** sync the `vars` HashMap.
+    ///
+    /// Unlike [`insert`], this avoids allocating a new `String` key when the
+    /// variable already exists—which is the overwhelmingly common case for
+    /// `StaGlobal` in loops.
+    #[inline(always)]
+    pub fn store_by_index_sync(&mut self, idx: usize, key: &str, value: JsValue) {
+        self.slots[idx] = value.clone();
+        if let Some(v) = self.vars.get_mut(key) {
+            *v = value;
+        }
+        self.generation = self.generation.wrapping_add(1);
+    }
+
     /// Look up the slot index for a global variable name.
     #[inline(always)]
     pub fn slot_index_for(&self, key: &str) -> Option<usize> {
@@ -2196,6 +2210,41 @@ impl InterpreterFrame {
         Ok(value)
     }
 
+    /// Store a global variable, using the IC slot index when available.
+    ///
+    /// When the global IC has a valid entry for `name_idx`, this stores
+    /// directly via `store_by_index_sync` — avoiding the `String` allocation
+    /// that [`GlobalEnv::insert`] requires for the key.
+    #[inline]
+    pub(super) fn store_global(&mut self, name_idx: u32, name: &Rc<str>, value: JsValue) {
+        // IC fast path: known slot, generation matches.
+        if let Some(ref ic) = self.global_ic
+            && let Some(&(slot_idx, cached_gen)) = ic.get(&name_idx)
+        {
+            let current_gen = self.global_env.borrow().generation();
+            if current_gen == cached_gen {
+                set_function_name_if_missing(&value, name);
+                self.global_env
+                    .borrow_mut()
+                    .store_by_index_sync(slot_idx, name, value.clone());
+                self.global_cache_put(name, value);
+                return;
+            }
+        }
+        // Slow path: full insert + IC population.
+        set_function_name_if_missing(&value, name);
+        let mut env = self.global_env.borrow_mut();
+        env.insert(name.to_string(), value.clone());
+        let slot_gen = env.slot_index_for(name).map(|idx| (idx, env.generation()));
+        drop(env);
+        if let Some((slot_idx, cached_gen)) = slot_gen {
+            self.global_ic
+                .get_or_insert_with(Box::default)
+                .insert(name_idx, (slot_idx, cached_gen));
+        }
+        self.global_cache_put(name, value);
+    }
+
     #[inline(always)]
     pub(super) fn sync_hot_accumulator(&mut self, value: &JsValue) {
         self.hot_accumulator =
@@ -2853,6 +2902,17 @@ impl Interpreter {
                                     }
                                     continue 'dispatch;
                                 }
+                                Opcode::StaGlobal => {
+                                    let name_idx =
+                                        unsafe { operand_constant_pool_idx_unchecked(instr, 0) };
+                                    frame.pc = pc;
+                                    frame.accumulator = acc.cheap_clone();
+                                    let name = frame.get_string_constant(name_idx)?;
+                                    let val = acc.cheap_clone();
+                                    frame.store_global(name_idx, &name, val);
+                                    // Accumulator stays Smi — remain in SMI mode.
+                                    continue 'dispatch;
+                                }
                                 _ => {
                                     // Unsupported opcode — exit SMI mode and let the
                                     // regular dispatch handle it.
@@ -3406,6 +3466,56 @@ impl Interpreter {
                                 }
                                 // Fall through to table dispatch for misses and
                                 // non-PlainObject receivers.
+                                frame.pc = pc;
+                                frame.accumulator = acc;
+                                match dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
+                            }
+
+                            // ── StaGlobal (IC fast path) ────────────
+                            Opcode::StaGlobal => {
+                                if let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] {
+                                    frame.pc = pc;
+                                    frame.accumulator = acc.cheap_clone();
+                                    let name = frame.get_string_constant(name_idx)?;
+                                    let val = acc.cheap_clone();
+                                    if frame.bytecode_array.is_strict()
+                                        && !frame.global_env.borrow().contains_key(&name)
+                                    {
+                                        return Err(StatorError::ReferenceError(format!(
+                                            "{name} is not defined"
+                                        )));
+                                    }
+                                    frame.store_global(name_idx, &name, val);
+                                    continue 'dispatch;
+                                }
+                                // Write back locals before cold-path dispatch.
                                 frame.pc = pc;
                                 frame.accumulator = acc;
                                 match dispatch_via_table(

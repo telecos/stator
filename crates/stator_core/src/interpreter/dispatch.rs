@@ -3230,28 +3230,13 @@ fn handle_sta_global(
     };
     let name = ctx.frame.get_string_constant(name_idx)?;
     let val = ctx.frame.accumulator.clone();
-    let mut env = ctx.frame.global_env.borrow_mut();
     // Strict mode: assigning to an undeclared variable is a ReferenceError.
-    if ctx.frame.bytecode_array.is_strict() && !env.contains_key(&name) {
+    if ctx.frame.bytecode_array.is_strict() && !ctx.frame.global_env.borrow().contains_key(&name) {
         return Err(StatorError::ReferenceError(format!(
             "{name} is not defined"
         )));
     }
-    set_function_name_if_missing(&val, &name);
-    env.insert(name.to_string(), val.clone());
-    let slot_gen = env.slot_index_for(&name).map(|idx| (idx, env.generation()));
-    drop(env);
-
-    // Populate/update IC so subsequent loads hit the fast path.
-    if let Some((slot_idx, cached_gen)) = slot_gen {
-        ctx.frame
-            .global_ic
-            .get_or_insert_with(Box::default)
-            .insert(name_idx, (slot_idx, cached_gen));
-    }
-
-    // Keep the global cache in sync with the HashMap.
-    ctx.frame.global_cache_put(&name, val);
+    ctx.frame.store_global(name_idx, &name, val);
     Ok(DispatchAction::Continue)
 }
 
