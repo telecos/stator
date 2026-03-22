@@ -213,20 +213,18 @@ pub const MAGLEV_TIERING_THRESHOLD: u32 = 1_000;
 /// peak throughput.
 pub const TURBOFAN_TIERING_THRESHOLD: u32 = 10_000;
 
+/// Shared, lazily-allocated megamorphic IC state persisted on a
+/// [`BytecodeArray`] across invocations.
+type SharedMegamorphicIc = Rc<RefCell<Option<Box<crate::interpreter::MegamorphicIc>>>>;
+
+/// Shared, lazily-allocated prototype-chain IC state.
+type SharedProtoLoadIc = Rc<RefCell<Option<Box<HashMap<u32, crate::interpreter::ProtoLoadIc>>>>>;
+
+/// Shared, lazily-allocated global-variable IC state.
+type SharedGlobalIc = Rc<RefCell<Option<Box<HashMap<u32, (usize, u64)>>>>>;
+
 /// An immutable, compact representation of the bytecode for a single
 /// JavaScript function.
-///
-/// The raw bytes are the V8 Ignition-style encoding produced by
-/// [`bytecodes::encode`].  Use [`BytecodeArray::instructions`] to decode them
-/// back into a [`Vec<Instruction>`] when needed.
-///
-/// In addition to the static bytecode and metadata, a `BytecodeArray` carries
-/// **tiering state** that is shared across all clones via [`Rc`] (baseline)
-/// or [`Arc`] (Maglev, shared with the background compilation thread):
-///
-/// - An *invocation counter* that is incremented on every call.
-/// - A *baseline JIT code cache* once invocation count reaches [`TIERING_THRESHOLD`].
-/// - A *Maglev JIT code cache* once invocation count reaches [`MAGLEV_TIERING_THRESHOLD`].
 #[derive(Debug, Clone)]
 pub struct BytecodeArray {
     /// The encoded bytecode stream.
@@ -375,6 +373,20 @@ pub struct BytecodeArray {
     /// subsequent executions clone the cached template via
     /// [`PropertyMap::clone_template`] for O(1) object creation.
     object_literal_templates: Rc<RefCell<HashMap<u32, ObjectLiteralCacheEntry>>>,
+    /// Shared megamorphic IC state that persists across invocations of the same
+    /// function.  New [`InterpreterFrame`]s seed their per-frame IC from this
+    /// shared cache and write back on return, giving subsequent calls a warm IC
+    /// without the cost of re-populating from scratch.
+    ///
+    /// Protected by `RefCell` and lazily allocated on first IC miss.
+    shared_mega_load_ic: SharedMegamorphicIc,
+    /// Shared megamorphic IC for property stores, mirroring `shared_mega_load_ic`.
+    shared_mega_store_ic: SharedMegamorphicIc,
+    /// Shared prototype-chain IC that persists across invocations.
+    /// Maps feedback slot to cached inherited-property lookup results.
+    shared_proto_load_ic: SharedProtoLoadIc,
+    /// Shared global variable IC (constant_pool_idx → (slot_index, generation)).
+    shared_global_ic: SharedGlobalIc,
 }
 
 /// Cached property-key layout captured after the first successful
@@ -496,6 +508,10 @@ impl BytecodeArray {
             construct_proto_cache: Rc::new(RefCell::new(None)),
             construct_boilerplate: Rc::new(RefCell::new(None)),
             object_literal_templates: Rc::new(RefCell::new(HashMap::new())),
+            shared_mega_load_ic: Rc::new(RefCell::new(None)),
+            shared_mega_store_ic: Rc::new(RefCell::new(None)),
+            shared_proto_load_ic: Rc::new(RefCell::new(None)),
+            shared_global_ic: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -714,6 +730,54 @@ impl BytecodeArray {
         self.object_literal_templates
             .borrow_mut()
             .insert(slot, ObjectLiteralCacheEntry::Pending(map));
+    }
+
+    // ─── Shared megamorphic IC accessors ─────────────────────────────────
+
+    /// Returns a clone of the shared megamorphic load IC, if one has been
+    /// populated by a previous invocation.
+    pub fn shared_mega_load_ic(&self) -> Option<Box<crate::interpreter::MegamorphicIc>> {
+        self.shared_mega_load_ic.borrow().clone()
+    }
+
+    /// Writes back a megamorphic load IC to the shared cache so that
+    /// subsequent invocations start warm.
+    pub fn set_shared_mega_load_ic(&self, ic: Box<crate::interpreter::MegamorphicIc>) {
+        *self.shared_mega_load_ic.borrow_mut() = Some(ic);
+    }
+
+    /// Returns a clone of the shared megamorphic store IC, if one has been
+    /// populated by a previous invocation.
+    pub fn shared_mega_store_ic(&self) -> Option<Box<crate::interpreter::MegamorphicIc>> {
+        self.shared_mega_store_ic.borrow().clone()
+    }
+
+    /// Writes back a megamorphic store IC to the shared cache so that
+    /// subsequent invocations start warm.
+    pub fn set_shared_mega_store_ic(&self, ic: Box<crate::interpreter::MegamorphicIc>) {
+        *self.shared_mega_store_ic.borrow_mut() = Some(ic);
+    }
+
+    /// Returns a clone of the shared prototype-chain load IC, if populated.
+    pub fn shared_proto_load_ic(
+        &self,
+    ) -> Option<Box<HashMap<u32, crate::interpreter::ProtoLoadIc>>> {
+        self.shared_proto_load_ic.borrow().clone()
+    }
+
+    /// Writes back a prototype-chain load IC to the shared cache.
+    pub fn set_shared_proto_load_ic(&self, ic: Box<HashMap<u32, crate::interpreter::ProtoLoadIc>>) {
+        *self.shared_proto_load_ic.borrow_mut() = Some(ic);
+    }
+
+    /// Returns a clone of the shared global variable IC, if populated.
+    pub fn shared_global_ic(&self) -> Option<Box<HashMap<u32, (usize, u64)>>> {
+        self.shared_global_ic.borrow().clone()
+    }
+
+    /// Writes back a global variable IC to the shared cache.
+    pub fn set_shared_global_ic(&self, ic: Box<HashMap<u32, (usize, u64)>>) {
+        *self.shared_global_ic.borrow_mut() = Some(ic);
     }
 
     /// The raw encoded bytecode bytes.

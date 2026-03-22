@@ -1835,6 +1835,10 @@ impl InterpreterFrame {
         let mut global_env = GlobalEnv::new();
         crate::builtins::install_globals::install_globals(&mut global_env.vars);
         global_env.rebuild_slots();
+        let mega_load_ic = bytecode_array.shared_mega_load_ic();
+        let mega_store_ic = bytecode_array.shared_mega_store_ic();
+        let proto_load_ic = bytecode_array.shared_proto_load_ic();
+        let global_ic = bytecode_array.shared_global_ic();
         Self {
             bytecode_array,
             registers,
@@ -1853,11 +1857,11 @@ impl InterpreterFrame {
             new_target: JsValue::Undefined,
             mono_load_cache: None,
             poly_load_cache: None,
-            mega_load_ic: None,
-            proto_load_ic: None,
-            mega_store_ic: None,
+            mega_load_ic,
+            proto_load_ic,
+            mega_store_ic,
             string_cache: None,
-            global_ic: None,
+            global_ic,
             global_cache: [
                 (0, None, JsValue::Undefined),
                 (0, None, JsValue::Undefined),
@@ -1927,6 +1931,12 @@ impl InterpreterFrame {
         for (i, arg) in args.iter().cloned().enumerate().take(param_count) {
             registers[i] = arg;
         }
+        // Seed per-frame ICs from the shared BytecodeArray cache
+        // so that subsequent invocations start warm instead of cold.
+        let mega_load_ic = bytecode_array.shared_mega_load_ic();
+        let mega_store_ic = bytecode_array.shared_mega_store_ic();
+        let proto_load_ic = bytecode_array.shared_proto_load_ic();
+        let global_ic = bytecode_array.shared_global_ic();
         Self {
             bytecode_array,
             registers,
@@ -1945,11 +1955,11 @@ impl InterpreterFrame {
             new_target: JsValue::Undefined,
             mono_load_cache: None,
             poly_load_cache: None,
-            mega_load_ic: None,
-            proto_load_ic: None,
-            mega_store_ic: None,
+            mega_load_ic,
+            proto_load_ic,
+            mega_store_ic,
             string_cache: None,
-            global_ic: None,
+            global_ic,
             global_cache: [
                 (0, None, JsValue::Undefined),
                 (0, None, JsValue::Undefined),
@@ -3392,6 +3402,20 @@ impl Interpreter {
                 } // 'tail_call
             }) // stacker::maybe_grow
         })();
+        // Write back the per-frame IC state to the shared BytecodeArray cache
+        // so that subsequent invocations of the same function start warm.
+        if let Some(ic) = frame.mega_load_ic.take() {
+            frame.bytecode_array.set_shared_mega_load_ic(ic);
+        }
+        if let Some(ic) = frame.mega_store_ic.take() {
+            frame.bytecode_array.set_shared_mega_store_ic(ic);
+        }
+        if let Some(ic) = frame.proto_load_ic.take() {
+            frame.bytecode_array.set_shared_proto_load_ic(ic);
+        }
+        if let Some(ic) = frame.global_ic.take() {
+            frame.bytecode_array.set_shared_global_ic(ic);
+        }
         release_registers(std::mem::take(&mut frame.registers));
         result
     }
@@ -3449,7 +3473,7 @@ impl Interpreter {
         registers.resize(total, JsValue::Undefined);
 
         let mut frame = InterpreterFrame {
-            bytecode_array,
+            bytecode_array: bytecode_array.clone(),
             registers,
             call_args: CallArgs::new(),
             accumulator: input,
@@ -3470,11 +3494,11 @@ impl Interpreter {
             new_target: JsValue::Undefined,
             mono_load_cache: None,
             poly_load_cache: None,
-            mega_load_ic: None,
-            proto_load_ic: None,
-            mega_store_ic: None,
+            mega_load_ic: bytecode_array.shared_mega_load_ic(),
+            proto_load_ic: bytecode_array.shared_proto_load_ic(),
+            mega_store_ic: bytecode_array.shared_mega_store_ic(),
             string_cache: None,
-            global_ic: None,
+            global_ic: bytecode_array.shared_global_ic(),
             global_cache: [
                 (0, None, JsValue::Undefined),
                 (0, None, JsValue::Undefined),
