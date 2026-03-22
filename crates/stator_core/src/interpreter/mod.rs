@@ -1551,25 +1551,63 @@ impl Default for GlobalEnv {
 /// all values are Smi.
 pub struct HotRegisters {
     /// NaN-boxed values, indexed the same as the flat register file.
-    values: Vec<NanBoxedValue>,
-    /// Bitset: entry `i` is `true` if `values[i]` mirrors `registers[i]`.
-    /// When `false`, the caller must fall back to the full [`JsValue`] register.
-    valid: Vec<bool>,
+    /// Inline for ≤32 registers (covers nearly all frames), spills to heap
+    /// only for unusually large frames.
+    values: SmallVec<[NanBoxedValue; SMALL_REG_THRESHOLD]>,
+    /// Bitset: bit `i` is set if `values[i]` mirrors `registers[i]`.
+    /// Supports up to 64 registers without allocation; a second word
+    /// covers frames up to 128 registers.
+    valid_lo: u64,
+    valid_hi: u64,
+    len: usize,
 }
 
 impl HotRegisters {
     /// Create a new hot register cache of the given `size`.
     ///
-    /// All slots start as valid `undefined` (which is NaN-boxable).
+    /// All slots start INVALID so Ldar falls through to the real register
+    /// file until a write (via `write_reg_unchecked`) populates the hot
+    /// cache.
     fn new(size: usize) -> Self {
+        let mut values = SmallVec::with_capacity(size);
+        values.resize(size, NanBoxedValue::undefined());
         Self {
-            values: vec![NanBoxedValue::undefined(); size],
-            // All slots start INVALID so Ldar falls through to the real
-            // register file until a write (via write_reg_unchecked) populates
-            // the hot cache.  This is critical for call frames where argument
-            // registers are populated by the call handler before this cache
-            // exists.
-            valid: vec![false; size],
+            values,
+            valid_lo: 0,
+            valid_hi: 0,
+            len: size,
+        }
+    }
+
+    /// Test whether bit `idx` is set in the valid bitset.
+    #[inline(always)]
+    fn is_valid(&self, idx: usize) -> bool {
+        if idx < 64 {
+            (self.valid_lo >> idx) & 1 != 0
+        } else if idx < 128 {
+            (self.valid_hi >> (idx - 64)) & 1 != 0
+        } else {
+            false
+        }
+    }
+
+    /// Set bit `idx` in the valid bitset.
+    #[inline(always)]
+    fn set_valid(&mut self, idx: usize) {
+        if idx < 64 {
+            self.valid_lo |= 1u64 << idx;
+        } else if idx < 128 {
+            self.valid_hi |= 1u64 << (idx - 64);
+        }
+    }
+
+    /// Clear bit `idx` in the valid bitset.
+    #[inline(always)]
+    fn clear_valid(&mut self, idx: usize) {
+        if idx < 64 {
+            self.valid_lo &= !(1u64 << idx);
+        } else if idx < 128 {
+            self.valid_hi &= !(1u64 << (idx - 64));
         }
     }
 
@@ -1578,14 +1616,10 @@ impl HotRegisters {
     /// Returns `Some(JsValue)` if the hot register is valid, `None` otherwise.
     #[inline(always)]
     fn try_read(&self, idx: usize) -> Option<JsValue> {
-        if idx < self.valid.len() {
-            // SAFETY: idx is bounds-checked above.
-            if unsafe { *self.valid.get_unchecked(idx) } {
-                let nb = unsafe { *self.values.get_unchecked(idx) };
-                Some(Self::decode(nb))
-            } else {
-                None
-            }
+        if idx < self.len && self.is_valid(idx) {
+            // SAFETY: idx < self.len ≤ self.values.len().
+            let nb = unsafe { *self.values.get_unchecked(idx) };
+            Some(Self::decode(nb))
         } else {
             None
         }
@@ -1595,21 +1629,18 @@ impl HotRegisters {
     /// NaN-boxable and was stored.
     #[inline(always)]
     fn try_write(&mut self, idx: usize, value: &JsValue) -> bool {
-        if idx >= self.values.len() {
+        if idx >= self.len {
             return false;
         }
         if let Some(nb) = Self::try_encode(value) {
-            // SAFETY: idx < self.values.len() checked above.
+            // SAFETY: idx < self.len ≤ self.values.len().
             unsafe {
                 *self.values.get_unchecked_mut(idx) = nb;
-                *self.valid.get_unchecked_mut(idx) = true;
             }
+            self.set_valid(idx);
             true
         } else {
-            // Not NaN-boxable (String, Object, Array, etc.)
-            unsafe {
-                *self.valid.get_unchecked_mut(idx) = false;
-            }
+            self.clear_valid(idx);
             false
         }
     }
@@ -1619,11 +1650,8 @@ impl HotRegisters {
     #[inline(always)]
     #[allow(dead_code)]
     fn invalidate(&mut self, idx: usize) {
-        if idx < self.valid.len() {
-            // SAFETY: idx is bounds-checked above.
-            unsafe {
-                *self.valid.get_unchecked_mut(idx) = false;
-            }
+        if idx < self.len {
+            self.clear_valid(idx);
         }
     }
 
