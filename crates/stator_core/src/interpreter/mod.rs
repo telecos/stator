@@ -180,7 +180,7 @@ use std::time::Instant;
 
 use smallvec::SmallVec;
 
-use crate::builtins::error::{pop_call_frame, push_call_frame};
+use crate::builtins::error::{call_stack_depth, pop_call_frame, push_call_frame};
 use crate::builtins::function::{function_bound_name, function_length, function_to_string};
 use crate::builtins::proxy::{proxy_apply, proxy_get_with_receiver, proxy_set_with_receiver};
 use crate::bytecode::bytecode_array::{
@@ -4586,6 +4586,21 @@ pub(super) fn is_js_receiver(value: &JsValue) -> bool {
     )
 }
 
+/// Run the interpreter for a callee frame, using `stacker::maybe_grow` only
+/// when the call depth is large enough that stack overflow is a real risk.
+/// For shallow call stacks (< 64 deep) we skip the stack probe entirely.
+#[inline(always)]
+fn run_callee(callee_frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
+    const STACK_GUARD_DEPTH: usize = 64;
+    if call_stack_depth() < STACK_GUARD_DEPTH {
+        Interpreter::run(callee_frame)
+    } else {
+        stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+            Interpreter::run(callee_frame)
+        })
+    }
+}
+
 /// Dispatch a function call with the given arguments, writing the result to
 /// the frame's accumulator.  Handles `Function`, `NativeFunction`, and
 /// callable `PlainObject` values (those with a `__call__` property).
@@ -4633,9 +4648,7 @@ pub(super) fn dispatch_call(
                     restore_closure_context(&mut callee_frame, ba);
                     populate_self_name(&mut callee_frame, ba, &JsValue::Function(Rc::clone(ba)));
                     push_call_frame("<anonymous>")?;
-                    let result = stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
-                        Interpreter::run(&mut callee_frame)
-                    });
+                    let result = run_callee(&mut callee_frame);
                     pop_call_frame();
                     frame.global_cache_invalidate();
                     frame.accumulator = result?;
@@ -4721,9 +4734,7 @@ pub(super) fn dispatch_call_property(
                             .insert("this".to_string(), this_val);
                     }
                     push_call_frame("<anonymous>")?;
-                    let result = stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
-                        Interpreter::run(&mut callee_frame)
-                    });
+                    let result = run_callee(&mut callee_frame);
                     pop_call_frame();
                     frame.global_cache_invalidate();
                     frame.accumulator = result?;
