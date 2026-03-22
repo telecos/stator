@@ -4624,6 +4624,119 @@ impl Interpreter {
                                 }
                             }
 
+                            // ── Inline CallUndefinedReceiver1 (hot path) ────
+                            //
+                            // The second most common call opcode: `f(arg)`.
+                            Opcode::CallUndefinedReceiver1 => {
+                                let callee_reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                let arg_reg = unsafe { operand_reg_unchecked(instr, 1) };
+                                let callee = unsafe { frame.read_reg_unchecked(callee_reg) };
+                                if let JsValue::Function(ba) = callee
+                                    && !ba.is_generator()
+                                    && !ba.is_async()
+                                {
+                                    let ba = Rc::clone(ba);
+                                    let arg1 =
+                                        unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
+                                    frame.pc = pc;
+                                    let args: CallArgs = smallvec::smallvec![arg1];
+                                    let saved_this = if !ba.is_arrow() && ba.is_strict() {
+                                        let old = frame.global_env.borrow().get("this").cloned();
+                                        frame
+                                            .global_env
+                                            .borrow_mut()
+                                            .insert("this".to_string(), JsValue::Undefined);
+                                        old
+                                    } else {
+                                        None
+                                    };
+                                    let mut callee_frame = InterpreterFrame::new_callee_frame(
+                                        Rc::clone(&ba),
+                                        args,
+                                        Rc::clone(&frame.global_env),
+                                    );
+                                    restore_closure_context(&mut callee_frame, &ba);
+                                    if ba.is_arrow() && ba.has_fn_props() {
+                                        callee_frame.new_target = fn_props_get(&ba, ".new_target");
+                                    }
+                                    populate_self_name(
+                                        &mut callee_frame,
+                                        &ba,
+                                        &JsValue::Function(Rc::clone(&ba)),
+                                    );
+                                    push_call_frame("<anonymous>")?;
+                                    let gen_before = frame.cache_generation;
+                                    let result = run_callee(&mut callee_frame);
+                                    pop_call_frame();
+                                    if gen_before != frame.global_env.borrow().generation() {
+                                        frame.global_cache_invalidate();
+                                    }
+                                    if !ba.is_arrow() && ba.is_strict() {
+                                        match saved_this {
+                                            Some(v) => {
+                                                frame
+                                                    .global_env
+                                                    .borrow_mut()
+                                                    .insert("this".to_string(), v);
+                                            }
+                                            None => {
+                                                frame.global_env.borrow_mut().remove("this");
+                                            }
+                                        }
+                                    }
+                                    match result {
+                                        Ok(v) => {
+                                            acc = v;
+                                            continue 'dispatch;
+                                        }
+                                        Err(e) => {
+                                            frame.accumulator = JsValue::Undefined;
+                                            if let Some(resume_pc) = handle_dispatch_error(
+                                                &e,
+                                                frame,
+                                                handler_table.as_slice(),
+                                            ) {
+                                                pc = resume_pc;
+                                                acc = frame.accumulator.cheap_clone();
+                                                continue 'dispatch;
+                                            }
+                                            return Err(e);
+                                        }
+                                    }
+                                }
+                                // Fall through for generator/async/native/PlainObject
+                                frame.pc = pc;
+                                frame.accumulator = acc;
+                                match dispatch_via_table(
+                                    frame,
+                                    instructions,
+                                    byte_offsets,
+                                    jump_targets,
+                                    handler_table.as_slice(),
+                                    instr,
+                                ) {
+                                    Ok(dispatch::DispatchAction::Continue) => {
+                                        pc = frame.pc;
+                                        acc = frame.accumulator.cheap_clone();
+                                        continue 'dispatch;
+                                    }
+                                    Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                                    Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                                    Err(e) => {
+                                        if let Some(resume_pc) = handle_dispatch_error(
+                                            &e,
+                                            frame,
+                                            handler_table.as_slice(),
+                                        ) {
+                                            pc = resume_pc;
+                                            acc = frame.accumulator.cheap_clone();
+                                            continue 'dispatch;
+                                        }
+                                        return Err(e);
+                                    }
+                                }
+                            }
+
                             // ── All other opcodes: dispatch table ────
                             _ => {
                                 // Write back locals before cold-path dispatch.
