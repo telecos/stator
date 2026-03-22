@@ -2338,8 +2338,16 @@ impl Interpreter {
     pub fn run(frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
         let result = (|| {
             // Publish the global environment for proto_lookup's constructor resolution.
+            // Only write when the pointer actually changed to avoid refcount churn.
             CURRENT_GLOBALS.with(|g| {
-                *g.borrow_mut() = Some(Rc::clone(&frame.global_env));
+                let existing = g.borrow();
+                let same = existing
+                    .as_ref()
+                    .is_some_and(|e| Rc::ptr_eq(e, &frame.global_env));
+                drop(existing);
+                if !same {
+                    *g.borrow_mut() = Some(Rc::clone(&frame.global_env));
+                }
             });
             if frame.bytecode_array.is_async() && frame.generator_state.is_none() {
                 return Self::run_async_function(frame.bytecode_array.clone(), CallArgs::new());
@@ -4108,37 +4116,43 @@ impl Interpreter {
                                 if let Operand::Register(obj_v) = instr.operands[0]
                                     && let Operand::FeedbackSlot(slot) = instr.operands[2]
                                 {
-                                    // Clone the register value to release the frame borrow.
-                                    let obj =
-                                        unsafe { frame.read_reg_unchecked(obj_v) }.cheap_clone();
-                                    if let JsValue::PlainObject(map) = &obj
-                                        && let Some(ic) =
-                                            frame.mega_load_ic.as_ref().and_then(|cache| {
-                                                cache.probe(slot, map.borrow().layout_id())
-                                            })
-                                    {
-                                        if !ic.is_proto {
-                                            let pm = map.borrow();
-                                            if let Some(val) =
-                                                pm.get_by_offset(ic.cached_offset as usize)
-                                            {
-                                                acc = val.clone();
-                                                continue 'dispatch;
-                                            }
-                                        } else {
-                                            let proto_layout = ic.proto_layout;
-                                            let offset = ic.cached_offset;
-                                            let pm = map.borrow();
-                                            if let Some(JsValue::PlainObject(proto_map)) =
-                                                pm.get(INTERNAL_PROTO_PROPERTY_KEY)
-                                            {
-                                                let proto_pm = proto_map.borrow();
-                                                if proto_pm.layout_id() == proto_layout
-                                                    && let Some(val) =
-                                                        proto_pm.get_by_offset(offset as usize)
+                                    // SAFETY: read_reg_unchecked returns a reference into
+                                    // frame.registers.  We use a raw pointer so we can
+                                    // simultaneously access frame.mega_load_ic (a different
+                                    // field).  The register file is not mutated in this block.
+                                    let obj_ptr = unsafe { frame.read_reg_unchecked(obj_v) }
+                                        as *const JsValue;
+                                    let obj = unsafe { &*obj_ptr };
+                                    if let JsValue::PlainObject(map) = obj {
+                                        // Single borrow for both IC probe and value lookup.
+                                        let pm = map.borrow();
+                                        let layout = pm.layout_id();
+                                        if let Some(ic) = frame
+                                            .mega_load_ic
+                                            .as_ref()
+                                            .and_then(|cache| cache.probe(slot, layout))
+                                        {
+                                            if !ic.is_proto {
+                                                if let Some(val) =
+                                                    pm.get_by_offset(ic.cached_offset as usize)
                                                 {
                                                     acc = val.clone();
                                                     continue 'dispatch;
+                                                }
+                                            } else {
+                                                let proto_layout = ic.proto_layout;
+                                                let offset = ic.cached_offset;
+                                                if let Some(JsValue::PlainObject(proto_map)) =
+                                                    pm.get(INTERNAL_PROTO_PROPERTY_KEY)
+                                                {
+                                                    let proto_pm = proto_map.borrow();
+                                                    if proto_pm.layout_id() == proto_layout
+                                                        && let Some(val) =
+                                                            proto_pm.get_by_offset(offset as usize)
+                                                    {
+                                                        acc = val.clone();
+                                                        continue 'dispatch;
+                                                    }
                                                 }
                                             }
                                         }
@@ -4237,13 +4251,15 @@ impl Interpreter {
                                     let obj_ref = unsafe { frame.read_reg_unchecked(obj_v) };
                                     if let JsValue::PlainObject(map) = obj_ref {
                                         let map_rc = Rc::clone(map);
-                                        if let Some(ic) =
-                                            frame.mega_store_ic.as_ref().and_then(|cache| {
-                                                cache.probe(slot, map_rc.borrow().layout_id())
-                                            })
+                                        // Single borrow for IC probe + key validation.
+                                        let pm = map_rc.borrow();
+                                        let layout = pm.layout_id();
+                                        if let Some(ic) = frame
+                                            .mega_store_ic
+                                            .as_ref()
+                                            .and_then(|cache| cache.probe(slot, layout))
                                         {
                                             let offset = ic.cached_offset as usize;
-                                            let pm = map_rc.borrow();
                                             if let Some(ConstantPoolEntry::String(key_str)) =
                                                 frame.bytecode_array.get_constant(name_idx)
                                                 && pm
@@ -4535,12 +4551,13 @@ impl Interpreter {
                                         &JsValue::Function(Rc::clone(&ba)),
                                     );
                                     push_call_frame("<anonymous>")?;
-                                    let result =
-                                        stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
-                                            Interpreter::run(&mut callee_frame)
-                                        });
+                                    let gen_before = frame.cache_generation;
+                                    let result = run_callee(&mut callee_frame);
                                     pop_call_frame();
-                                    frame.global_cache_invalidate();
+                                    // Only invalidate if the callee actually mutated globals.
+                                    if gen_before != frame.global_env.borrow().generation() {
+                                        frame.global_cache_invalidate();
+                                    }
                                     if !ba.is_arrow() && ba.is_strict() {
                                         match saved_this {
                                             Some(v) => {
@@ -4786,8 +4803,7 @@ impl Interpreter {
         state.borrow_mut().status = GeneratorStatus::Executing;
 
         push_call_frame("<generator>")?;
-        let return_val =
-            stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Interpreter::run(&mut frame));
+        let return_val = run_callee(&mut frame);
         pop_call_frame();
         let return_val = match return_val {
             Ok(value) => value,
@@ -5892,9 +5908,12 @@ pub(super) fn dispatch_call(
                     restore_closure_context(&mut callee_frame, ba);
                     populate_self_name(&mut callee_frame, ba, &JsValue::Function(Rc::clone(ba)));
                     push_call_frame("<anonymous>")?;
+                    let gen_before = frame.cache_generation;
                     let result = run_callee(&mut callee_frame);
                     pop_call_frame();
-                    frame.global_cache_invalidate();
+                    if gen_before != frame.global_env.borrow().generation() {
+                        frame.global_cache_invalidate();
+                    }
                     frame.accumulator = result?;
                 }
             }
@@ -5978,9 +5997,12 @@ pub(super) fn dispatch_call_property(
                             .insert("this".to_string(), this_val);
                     }
                     push_call_frame("<anonymous>")?;
+                    let gen_before = frame.cache_generation;
                     let result = run_callee(&mut callee_frame);
                     pop_call_frame();
-                    frame.global_cache_invalidate();
+                    if gen_before != frame.global_env.borrow().generation() {
+                        frame.global_cache_invalidate();
+                    }
                     frame.accumulator = result?;
                 }
             }
@@ -9395,8 +9417,7 @@ fn dispatch_getter(getter: &JsValue, this: &JsValue) -> StatorResult<JsValue> {
                 .global_env
                 .borrow_mut()
                 .insert("this".to_string(), this.clone());
-            let result =
-                stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Interpreter::run(&mut frame));
+            let result = run_callee(&mut frame);
             pop_call_frame();
             result
         }
@@ -9420,8 +9441,7 @@ pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) ->
                 .global_env
                 .borrow_mut()
                 .insert("this".to_string(), this.clone());
-            let result =
-                stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Interpreter::run(&mut frame));
+            let result = run_callee(&mut frame);
             pop_call_frame();
             result?;
             Ok(())
@@ -9464,8 +9484,7 @@ pub fn dispatch_call_value(
             };
             restore_closure_context(&mut frame, ba);
             populate_self_name(&mut frame, ba, &JsValue::Function(Rc::clone(ba)));
-            let result =
-                stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Interpreter::run(&mut frame));
+            let result = run_callee(&mut frame);
             pop_call_frame();
             result
         }
@@ -9531,8 +9550,7 @@ pub fn dispatch_call_with_this(
                     .borrow_mut()
                     .insert("this".to_string(), effective_this);
             }
-            let result =
-                stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Interpreter::run(&mut frame));
+            let result = run_callee(&mut frame);
             pop_call_frame();
             result
         }
@@ -9593,8 +9611,7 @@ pub fn dispatch_construct_call(
                 .global_env
                 .borrow_mut()
                 .insert("this".to_string(), this_val);
-            let result =
-                stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Interpreter::run(&mut frame));
+            let result = run_callee(&mut frame);
             pop_call_frame();
             result
         }

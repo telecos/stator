@@ -29,8 +29,8 @@ use super::{
     maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator, number_to_jsvalue,
     plain_object_has_own_property, plain_object_to_array_items, populate_self_name, proto_lookup,
     proto_lookup_chain_depth, resolve_construct_proto, resolve_jump, restore_closure_context,
-    set_function_name_if_missing, set_pending_exception, settle_async_iterator_result, strict_eq,
-    to_array_index, to_bigint, to_property_key, try_execute_best_jit,
+    run_callee, set_function_name_if_missing, set_pending_exception, settle_async_iterator_result,
+    strict_eq, to_array_index, to_bigint, to_property_key, try_execute_best_jit,
     try_fast_named_property_lookup, walk_context_chain,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
@@ -1707,9 +1707,7 @@ fn handle_call_any_receiver(
                     }
                     populate_self_name(&mut callee_frame, &ba, &callee_val);
                     push_call_frame("<anonymous>")?;
-                    let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
-                        Interpreter::run(&mut callee_frame)
-                    });
+                    let result = run_callee(&mut callee_frame);
                     pop_call_frame();
                     ctx.frame.global_cache_invalidate();
                     ctx.frame.accumulator = result?;
@@ -1930,9 +1928,7 @@ fn handle_call_undefined_receiver0(
                     }
                     populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                     push_call_frame("<anonymous>")?;
-                    let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
-                        Interpreter::run(&mut callee_frame)
-                    });
+                    let result = run_callee(&mut callee_frame);
                     pop_call_frame();
                     ctx.frame.global_cache_invalidate();
                     if !ba.is_arrow() && ba.is_strict() {
@@ -2038,9 +2034,7 @@ fn handle_call_undefined_receiver1(
                     }
                     populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                     push_call_frame("<anonymous>")?;
-                    let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
-                        Interpreter::run(&mut callee_frame)
-                    });
+                    let result = run_callee(&mut callee_frame);
                     pop_call_frame();
                     ctx.frame.global_cache_invalidate();
                     if !ba.is_arrow() && ba.is_strict() {
@@ -2156,9 +2150,7 @@ fn handle_call_undefined_receiver2(
                     }
                     populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                     push_call_frame("<anonymous>")?;
-                    let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
-                        Interpreter::run(&mut callee_frame)
-                    });
+                    let result = run_callee(&mut callee_frame);
                     pop_call_frame();
                     ctx.frame.global_cache_invalidate();
                     if !ba.is_arrow() && ba.is_strict() {
@@ -2403,9 +2395,7 @@ fn handle_call_with_spread(
                 restore_closure_context(&mut callee_frame, &ba);
                 populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                 push_call_frame("<anonymous>")?;
-                let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
-                    Interpreter::run(&mut callee_frame)
-                });
+                let result = run_callee(&mut callee_frame);
                 pop_call_frame();
                 ctx.frame.global_cache_invalidate();
                 ctx.frame.accumulator = result?;
@@ -2488,9 +2478,7 @@ fn call_plain_object_function(
     restore_closure_context(&mut callee_frame, ba);
     callee_frame.new_target = ctx.frame.new_target.clone();
     push_call_frame("<anonymous>")?;
-    let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
-        Interpreter::run(&mut callee_frame)
-    });
+    let result = run_callee(&mut callee_frame);
     pop_call_frame();
     ctx.frame.global_cache_invalidate();
     ctx.frame.accumulator = result?;
@@ -2578,8 +2566,7 @@ fn construct_class_from_plain_object(
                 );
             }
             push_call_frame("<field_init>")?;
-            let result =
-                stacker::maybe_grow(64 * 1024, 1024 * 1024, || Interpreter::run(&mut init_frame));
+            let result = run_callee(&mut init_frame);
             pop_call_frame();
             init_frame
                 .global_env
@@ -2601,9 +2588,7 @@ fn construct_class_from_plain_object(
 
     // 5. Run constructor body.
     push_call_frame("<anonymous>")?;
-    let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
-        Interpreter::run(&mut callee_frame)
-    });
+    let result = run_callee(&mut callee_frame);
     pop_call_frame();
     ctx.frame.global_cache_invalidate();
     let val = result?;
@@ -2674,9 +2659,7 @@ fn handle_construct(
                 .borrow_mut()
                 .insert("this".to_string(), this_val.clone());
             push_call_frame("<anonymous>")?;
-            let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
-                Interpreter::run(&mut callee_frame)
-            });
+            let result = run_callee(&mut callee_frame);
             pop_call_frame();
             ctx.frame.global_cache_invalidate();
             let val = result?;
@@ -2782,9 +2765,7 @@ fn handle_construct_with_spread(
                 .borrow_mut()
                 .insert("this".to_string(), this_val.clone());
             push_call_frame("<anonymous>")?;
-            let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
-                Interpreter::run(&mut callee_frame)
-            });
+            let result = run_callee(&mut callee_frame);
             pop_call_frame();
             ctx.frame.global_cache_invalidate();
             let val = result?;
@@ -6787,9 +6768,7 @@ fn handle_construct_forward_all_args(
                 .borrow_mut()
                 .insert("this".to_string(), this_val.clone());
             push_call_frame("<anonymous>")?;
-            let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
-                Interpreter::run(&mut callee_frame)
-            });
+            let result = run_callee(&mut callee_frame);
             pop_call_frame();
             ctx.frame.global_cache_invalidate();
             let val = result?;
@@ -6985,9 +6964,7 @@ fn handle_call_direct_eval(
                     restore_closure_context(&mut callee_frame, &ba);
                     populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                     push_call_frame("<eval-fallback>")?;
-                    let result = stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
-                        Interpreter::run(&mut callee_frame)
-                    });
+                    let result = run_callee(&mut callee_frame);
                     pop_call_frame();
                     ctx.frame.global_cache_invalidate();
                     ctx.frame.accumulator = result?;
