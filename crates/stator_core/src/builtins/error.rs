@@ -62,11 +62,18 @@ pub fn set_stack_trace_limit(limit: usize) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 thread_local! {
+    /// The JavaScript call stack, maintained by the interpreter.
+    ///
+    /// Only **named** frames (name ≠ `"<anonymous>"`) are pushed here;
+    /// the vast majority of function calls use `"<anonymous>"` and are
+    /// tracked via the lightweight [`CALL_DEPTH`] counter alone.
+    /// [`capture_call_stack`] and [`capture_stack_trace`] reconstruct
+    /// the full stack from both sources.
+    static CALL_STACK: RefCell<Vec<(usize, &'static str)>> = const { RefCell::new(Vec::new()) };
+
     /// Depth counter for the JavaScript call stack.
     ///
     /// Incremented by `push_call_frame` and decremented by `pop_call_frame`.
-    /// [`capture_call_stack`] reconstructs a stack trace from this depth
-    /// (all frames are `"<anonymous>"`).
     static CALL_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -95,7 +102,7 @@ pub const MAX_CALL_STACK_DEPTH: usize = 128;
 /// JavaScript `RangeError` instead of aborting on a native stack overflow.
 ///
 /// Call this immediately before entering a nested interpreter call.
-pub fn push_call_frame(_name: &'static str) -> StatorResult<()> {
+pub fn push_call_frame(name: &'static str) -> StatorResult<()> {
     CALL_DEPTH.with(|d| {
         let depth = d.get();
         if depth >= MAX_CALL_STACK_DEPTH {
@@ -104,6 +111,10 @@ pub fn push_call_frame(_name: &'static str) -> StatorResult<()> {
             ));
         }
         d.set(depth + 1);
+        // Only record named frames (skip the hot-path "<anonymous>" case).
+        if name != "<anonymous>" {
+            CALL_STACK.with(|cs| cs.borrow_mut().push((depth + 1, name)));
+        }
         Ok(())
     })
 }
@@ -126,6 +137,13 @@ pub fn pop_call_frame() {
     CALL_DEPTH.with(|d| {
         let cur = d.get();
         d.set(cur.saturating_sub(1));
+        // Pop any named frame that was recorded at this depth level.
+        CALL_STACK.with(|cs| {
+            let mut stack = cs.borrow_mut();
+            if stack.last().is_some_and(|&(depth, _)| depth == cur) {
+                stack.pop();
+            }
+        });
     });
 }
 
@@ -137,7 +155,20 @@ pub fn pop_call_frame() {
 /// Used by the CPU profiler to record samples at safe points.
 pub fn capture_call_stack() -> Vec<&'static str> {
     let depth = CALL_DEPTH.with(Cell::get);
-    vec!["<anonymous>"; depth]
+    CALL_STACK.with(|cs| {
+        let named = cs.borrow();
+        let mut result = Vec::with_capacity(depth);
+        let mut named_idx = 0;
+        for d in 1..=depth {
+            if named_idx < named.len() && named[named_idx].0 == d {
+                result.push(named[named_idx].1);
+                named_idx += 1;
+            } else {
+                result.push("<anonymous>");
+            }
+        }
+        result
+    })
 }
 
 /// Clear the thread-local call stack entirely.
@@ -150,6 +181,7 @@ pub fn capture_call_stack() -> Vec<&'static str> {
 /// function after each test guarantees a clean starting state.
 pub fn clear_call_stack() {
     CALL_DEPTH.with(|d| d.set(0));
+    CALL_STACK.with(|cs| cs.borrow_mut().clear());
 }
 
 /// Capture the current call stack as a formatted `stack` property string.
@@ -166,9 +198,11 @@ pub fn clear_call_stack() {
 pub fn capture_stack_trace(error_name: &str, message: &str) -> String {
     let limit = get_stack_trace_limit();
     let mut result = format!("{error_name}: {message}");
-    let depth = CALL_DEPTH.with(Cell::get);
-    for _ in 0..depth.min(limit) {
-        result.push_str("\n    at <anonymous>");
+    let stack = capture_call_stack();
+    // Most-recent frame is at the end; iterate in reverse order.
+    for frame in stack.iter().rev().take(limit) {
+        result.push_str("\n    at ");
+        result.push_str(frame);
     }
     result
 }
