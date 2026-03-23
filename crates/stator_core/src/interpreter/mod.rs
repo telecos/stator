@@ -3106,6 +3106,195 @@ impl Interpreter {
                                 pc -= 1;
                                 break 'smi;
                             }
+                            Opcode::LdaKeyedProperty => {
+                                // Array[Smi] fast path: sa is the index,
+                                // load value from the Array element.
+                                let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                let obj = unsafe { frame.read_reg_unchecked(reg) };
+                                if sa >= 0
+                                    && let JsValue::Array(items) = obj
+                                {
+                                    let items_rc = Rc::clone(items);
+                                    let borrow = items_rc.borrow();
+                                    if let Some(val) = borrow.get(sa as usize) {
+                                        if let JsValue::Smi(v) = val {
+                                            sa = *v;
+                                            continue 'smi;
+                                        }
+                                        // Non-Smi element — exit SMI mode
+                                        // with the loaded value.
+                                        acc = val.clone();
+                                        drop(borrow);
+                                        frame.smi_mode = false;
+                                        frame.loop_end_pc = 0;
+                                        break 'smi;
+                                    }
+                                    drop(borrow);
+                                    // Out-of-bounds → Undefined
+                                    acc = JsValue::Undefined;
+                                    frame.smi_mode = false;
+                                    frame.loop_end_pc = 0;
+                                    break 'smi;
+                                }
+                                // Non-Array or negative index — fall through
+                                acc = JsValue::Smi(sa);
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                pc -= 1;
+                                break 'smi;
+                            }
+                            Opcode::StaKeyedProperty => {
+                                // Array[Smi] store fast path: the key is in
+                                // a register, value in acc (sa).
+                                let obj_v = unsafe { operand_reg_unchecked(instr, 0) };
+                                let key_v = unsafe { operand_reg_unchecked(instr, 1) };
+                                let key_ref = unsafe { frame.read_reg_unchecked(key_v) };
+                                if let JsValue::Smi(idx) = key_ref
+                                    && *idx >= 0
+                                {
+                                    let i = *idx as usize;
+                                    let obj_ref = unsafe { frame.read_reg_unchecked(obj_v) };
+                                    if let JsValue::Array(items) = obj_ref {
+                                        let items_rc = Rc::clone(items);
+                                        let mut v = items_rc.borrow_mut();
+                                        if i >= v.len() {
+                                            v.resize(i + 1, JsValue::TheHole);
+                                        }
+                                        v[i] = JsValue::Smi(sa);
+                                        continue 'smi;
+                                    }
+                                }
+                                // Fall through
+                                acc = JsValue::Smi(sa);
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                pc -= 1;
+                                break 'smi;
+                            }
+                            Opcode::LdaContextSlot => {
+                                // Load from closure context — stay in SMI mode
+                                // if the loaded value is Smi.
+                                let ctx_reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                let ctx_val = unsafe { frame.read_reg_unchecked(ctx_reg) };
+                                if let JsValue::Context(ctx_rc) = ctx_val {
+                                    let slot =
+                                        unsafe { operand_constant_pool_idx_unchecked(instr, 1) }
+                                            as usize;
+                                    let depth = unsafe { operand_imm_unchecked(instr, 2) };
+                                    let ctx_ref = Rc::clone(ctx_rc);
+                                    let mut current = ctx_ref;
+                                    let mut d = depth;
+                                    while d > 0 {
+                                        let next = {
+                                            let borrow = current.borrow();
+                                            if let Some(p) = &borrow.parent {
+                                                Rc::clone(p)
+                                            } else {
+                                                break;
+                                            }
+                                        };
+                                        current = next;
+                                        d -= 1;
+                                    }
+                                    let borrow = current.borrow();
+                                    if let Some(val) = borrow.slots.get(slot) {
+                                        if let JsValue::Smi(v) = val {
+                                            sa = *v;
+                                            continue 'smi;
+                                        }
+                                        // Non-Smi value — exit SMI mode.
+                                        acc = val.clone();
+                                        frame.smi_mode = false;
+                                        frame.loop_end_pc = 0;
+                                        break 'smi;
+                                    }
+                                }
+                                // No context or missing slot — fall through.
+                                acc = JsValue::Smi(sa);
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                pc -= 1;
+                                break 'smi;
+                            }
+                            Opcode::StaContextSlot => {
+                                // Store Smi value into closure context slot.
+                                let ctx_reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                let ctx_val = unsafe { frame.read_reg_unchecked(ctx_reg) };
+                                if let JsValue::Context(ctx_rc) = ctx_val {
+                                    let slot =
+                                        unsafe { operand_constant_pool_idx_unchecked(instr, 1) }
+                                            as usize;
+                                    let depth = unsafe { operand_imm_unchecked(instr, 2) };
+                                    let ctx_ref = Rc::clone(ctx_rc);
+                                    let mut current = ctx_ref;
+                                    let mut d = depth;
+                                    while d > 0 {
+                                        let next = {
+                                            let borrow = current.borrow();
+                                            if let Some(p) = &borrow.parent {
+                                                Rc::clone(p)
+                                            } else {
+                                                break;
+                                            }
+                                        };
+                                        current = next;
+                                        d -= 1;
+                                    }
+                                    let mut borrow = current.borrow_mut();
+                                    if slot < borrow.slots.len() {
+                                        borrow.slots[slot] = JsValue::Smi(sa);
+                                        continue 'smi;
+                                    }
+                                }
+                                // No context or slot out of range — fall through.
+                                acc = JsValue::Smi(sa);
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                pc -= 1;
+                                break 'smi;
+                            }
+                            Opcode::LdaCurrentContextSlot => {
+                                // Load from depth-0 context — common for closures.
+                                if let Some(JsValue::Context(ctx_rc)) = &frame.context {
+                                    let slot =
+                                        unsafe { operand_constant_pool_idx_unchecked(instr, 0) }
+                                            as usize;
+                                    let borrow = ctx_rc.borrow();
+                                    if let Some(val) = borrow.slots.get(slot) {
+                                        if let JsValue::Smi(v) = val {
+                                            sa = *v;
+                                            continue 'smi;
+                                        }
+                                        acc = val.clone();
+                                        frame.smi_mode = false;
+                                        frame.loop_end_pc = 0;
+                                        break 'smi;
+                                    }
+                                }
+                                acc = JsValue::Smi(sa);
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                pc -= 1;
+                                break 'smi;
+                            }
+                            Opcode::StaCurrentContextSlot => {
+                                // Store to depth-0 context.
+                                if let Some(JsValue::Context(ctx_rc)) = &frame.context {
+                                    let slot =
+                                        unsafe { operand_constant_pool_idx_unchecked(instr, 0) }
+                                            as usize;
+                                    let mut borrow = ctx_rc.borrow_mut();
+                                    if slot < borrow.slots.len() {
+                                        borrow.slots[slot] = JsValue::Smi(sa);
+                                        continue 'smi;
+                                    }
+                                }
+                                acc = JsValue::Smi(sa);
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                pc -= 1;
+                                break 'smi;
+                            }
                             Opcode::Nop => {}
                             _ => {
                                 // Unsupported opcode — exit SMI loop and let
