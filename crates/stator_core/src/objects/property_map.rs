@@ -247,7 +247,9 @@ pub struct PropertyMap {
     /// Once set to `true` it is never cleared, so it is a conservative over-approximation.
     pub has_accessors: bool,
     /// Offset of the next property expected to be filled when this map was
-    /// created via [`clone_template`](Self::clone_template).
+    /// created via [`clone_shape`](Self::clone_shape),
+    /// [`clone_template`](Self::clone_template), or
+    /// [`from_boilerplate`](Self::from_boilerplate).
     ///
     /// When a `PropertyMap` is created from a cached object-literal
     /// template, all keys and attributes are pre-populated but values are
@@ -258,6 +260,9 @@ pub struct PropertyMap {
     /// A value of `usize::MAX` means this map is **not** in template-fill
     /// mode (the default for non-template-created maps).
     template_next_slot: usize,
+    /// Original requested capacity for this map, preserved so shape clones
+    /// can pre-size their secondary index consistently.
+    capacity_hint: usize,
 }
 
 impl PartialEq for PropertyMap {
@@ -279,11 +284,7 @@ impl PropertyMap {
     }
 
     fn from_buffers(capacity: usize, buffers: PropertyStorageBuffers) -> Self {
-        let index = if capacity > SMALL_PROPERTY_LINEAR_SCAN_CAP {
-            PropertyIndex::Map(HashMap::with_capacity(capacity))
-        } else {
-            PropertyIndex::Inline
-        };
+        let index = Self::build_index_from_keys(&[], capacity);
 
         Self {
             keys: buffers.keys,
@@ -303,6 +304,7 @@ impl PropertyMap {
             extensible: true,
             has_accessors: false,
             template_next_slot: usize::MAX,
+            capacity_hint: capacity,
         }
     }
 
@@ -314,7 +316,7 @@ impl PropertyMap {
     /// Creates a property map pre-populated with the given boilerplate
     /// keys and attribute flags.  All values are initialised to
     /// [`JsValue::Undefined`] and are expected to be overwritten by the
-    /// constructor body.
+    /// constructor body. The returned map starts in template-fill mode.
     pub fn from_boilerplate(
         keys: &[String],
         attrs: &[crate::objects::map::PropertyAttributes],
@@ -330,16 +332,11 @@ impl PropertyMap {
             .iter()
             .filter(|k| parse_integer_index(k).is_some())
             .count();
+        let has_accessors = keys
+            .iter()
+            .any(|key| key.starts_with("__get_") || key.starts_with("__set_"));
 
-        let index = if cap > SMALL_PROPERTY_LINEAR_SCAN_CAP {
-            let mut map = HashMap::with_capacity(cap);
-            for (slot, key) in keys.iter().enumerate() {
-                map.insert(key.clone(), slot);
-            }
-            PropertyIndex::Map(map)
-        } else {
-            PropertyIndex::Inline
-        };
+        let index = Self::build_index_from_keys(keys, cap);
 
         Self {
             keys: buffers.keys,
@@ -357,8 +354,9 @@ impl PropertyMap {
             proto_epoch: Cell::new(0),
             proto_global_epoch: Cell::new(0),
             extensible: true,
-            has_accessors: false,
-            template_next_slot: usize::MAX,
+            has_accessors,
+            template_next_slot: 0,
+            capacity_hint: cap,
         }
     }
     /// Returns a snapshot of the property keys and their attribute flags,
@@ -369,8 +367,7 @@ impl PropertyMap {
         (self.keys.clone(), self.attrs.clone())
     }
 
-    /// Creates a structural clone of this property map for object-literal
-    /// template caching.
+    /// Clones only the property-map shape for object/constructor templates.
     ///
     /// The returned map has the same key names, insertion order, and
     /// attribute flags as `self`, but every value slot is reset to
@@ -378,22 +375,15 @@ impl PropertyMap {
     /// The map is placed in *template-fill mode* so that subsequent calls
     /// to [`try_template_fill`](Self::try_template_fill) can populate
     /// values in O(1) without hash lookups.
-    pub fn clone_template(&self) -> Self {
+    pub fn clone_shape(&self) -> Self {
         let cap = self.keys.len();
         let mut buffers = acquire_storage_buffers(cap);
         buffers.keys.extend_from_slice(&self.keys);
         buffers.values.resize(cap, JsValue::Undefined);
         buffers.attrs.extend_from_slice(&self.attrs);
 
-        let index = if cap > SMALL_PROPERTY_LINEAR_SCAN_CAP {
-            let mut map = HashMap::with_capacity(cap);
-            for (slot, key) in self.keys.iter().enumerate() {
-                map.insert(key.clone(), slot);
-            }
-            PropertyIndex::Map(map)
-        } else {
-            PropertyIndex::Inline
-        };
+        let capacity_hint = self.capacity_hint.max(cap);
+        let index = Self::build_index_from_keys(&buffers.keys, capacity_hint);
 
         Self {
             keys: buffers.keys,
@@ -410,36 +400,59 @@ impl PropertyMap {
             proto_generation: Cell::new(0),
             proto_epoch: Cell::new(0),
             proto_global_epoch: Cell::new(0),
-            extensible: true,
-            has_accessors: false,
+            extensible: self.extensible,
+            has_accessors: self.has_accessors,
             template_next_slot: 0,
+            capacity_hint,
         }
+    }
+
+    /// Backwards-compatible alias for shape-only template cloning.
+    #[inline]
+    pub fn clone_template(&self) -> Self {
+        self.clone_shape()
     }
 
     /// Attempts to write `value` into the next expected template slot.
     ///
     /// When a `PropertyMap` is in template-fill mode (created via
-    /// [`clone_template`](Self::clone_template)), this method checks
+    /// [`clone_shape`](Self::clone_shape),
+    /// [`clone_template`](Self::clone_template), or
+    /// [`from_boilerplate`](Self::from_boilerplate)), this method checks
     /// whether `key` matches the property name at the next expected
     /// sequential position.  If so, the value is written directly by
     /// offset in O(1) — no hash lookup, no shape mutation, no prototype
     /// generation bump.
     ///
-    /// Returns `Ok(())` if the fast path succeeded and `value` was
+    /// Returns `Ok(offset)` if the fast path succeeded and `value` was
     /// consumed.  Returns `Err(value)` if the key did not match; the
     /// unconsumed value is returned to the caller for fallback via
     /// [`insert`](Self::insert).  On mismatch the template-fill mode is
     /// permanently disabled for this map.
     #[inline]
-    pub fn try_template_fill(&mut self, key: &str, value: JsValue) -> Result<(), JsValue> {
+    pub fn try_template_fill(&mut self, key: &str, value: JsValue) -> Result<usize, JsValue> {
         let slot = self.template_next_slot;
         if slot < self.keys.len() && self.keys[slot] == key {
             self.values[slot] = value;
             self.template_next_slot = slot + 1;
-            Ok(())
+            Ok(slot)
         } else {
             self.template_next_slot = usize::MAX;
             Err(value)
+        }
+    }
+
+    #[inline]
+    fn build_index_from_keys(keys: &[String], capacity_hint: usize) -> PropertyIndex {
+        let capacity = capacity_hint.max(keys.len());
+        if capacity > SMALL_PROPERTY_LINEAR_SCAN_CAP {
+            let mut map = HashMap::with_capacity(capacity);
+            for (slot, key) in keys.iter().enumerate() {
+                map.insert(key.clone(), slot);
+            }
+            PropertyIndex::Map(map)
+        } else {
+            PropertyIndex::Inline
         }
     }
 
@@ -583,7 +596,7 @@ impl PropertyMap {
         if matches!(self.index, PropertyIndex::Map(_)) {
             return;
         }
-        let mut index = HashMap::with_capacity(self.keys.len());
+        let mut index = HashMap::with_capacity(self.capacity_hint.max(self.keys.len()));
         for (slot, key) in self.keys.iter().enumerate() {
             index.insert(key.clone(), slot);
         }
@@ -683,6 +696,7 @@ impl PropertyMap {
         self.keys.insert(pos, key);
         self.values.insert(pos, value);
         self.attrs.insert(pos, attrs);
+        self.capacity_hint = self.capacity_hint.max(self.keys.len());
         if is_integer_key {
             self.integer_key_count += 1;
         }
@@ -1297,6 +1311,49 @@ mod tests {
     fn test_with_capacity() {
         let pm = PropertyMap::with_capacity(16);
         assert!(pm.is_empty());
+    }
+
+    #[test]
+    fn test_clone_shape_resets_values_and_preserves_layout() {
+        let mut pm = PropertyMap::with_capacity(SMALL_PROPERTY_LINEAR_SCAN_CAP + 4);
+        for idx in 0..(SMALL_PROPERTY_LINEAR_SCAN_CAP + 1) {
+            pm.insert(format!("k{idx}"), JsValue::Smi(idx as i32));
+        }
+        let shape_id = pm.shape_id();
+        let layout_id = pm.layout_id();
+
+        let cloned = pm.clone_shape();
+
+        assert_eq!(cloned.keys, pm.keys);
+        assert!(
+            cloned
+                .values
+                .iter()
+                .all(|value| matches!(value, JsValue::Undefined))
+        );
+        assert_eq!(cloned.attrs, pm.attrs);
+        assert_ne!(cloned.shape_id(), shape_id);
+        assert_eq!(cloned.layout_id(), layout_id);
+        assert!(matches!(cloned.index, PropertyIndex::Map(_)));
+        assert_eq!(cloned.template_next_slot, 0);
+        assert_eq!(cloned.capacity_hint, pm.capacity_hint);
+    }
+
+    #[test]
+    fn test_try_template_fill_returns_offset_and_disables_on_miss() {
+        let mut pm = PropertyMap::from_boilerplate(
+            &["first".to_string(), "second".to_string()],
+            &[DEFAULT_ATTRS, DEFAULT_ATTRS],
+        );
+
+        assert_eq!(pm.try_template_fill("first", JsValue::Smi(1)), Ok(0));
+        assert_eq!(pm.try_template_fill("second", JsValue::Smi(2)), Ok(1));
+        assert_eq!(pm.get("first"), Some(&JsValue::Smi(1)));
+        assert_eq!(pm.get("second"), Some(&JsValue::Smi(2)));
+
+        let err = pm.try_template_fill("third", JsValue::Smi(3));
+        assert_eq!(err, Err(JsValue::Smi(3)));
+        assert_eq!(pm.template_next_slot, usize::MAX);
     }
 
     // ── Inline cache tests ───────────────────────────────────────────────

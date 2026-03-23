@@ -3790,7 +3790,33 @@ fn handle_sta_named_property(
                 }
             }
             set_function_name_if_missing(&val, &prop_name);
-            map.borrow_mut().insert(prop_name.to_string(), val);
+            match map.borrow_mut().try_template_fill(&prop_name, val) {
+                Ok(offset) => {
+                    if slot != u32::MAX && offset <= u16::MAX as usize {
+                        let receiver_layout = map.borrow().layout_id();
+                        ctx.frame.mega_store_ic_mut().update(MegamorphicIcEntry {
+                            slot,
+                            receiver_layout,
+                            cached_offset: offset as u16,
+                            is_proto: false,
+                            proto_layout: 0,
+                        });
+                    }
+                    // Invalidate value-based caches for this object.
+                    let map_ptr = Rc::as_ptr(map) as usize;
+                    if let Some(cache) = &mut ctx.frame.mono_load_cache {
+                        cache.retain(|_, (ptr, _)| *ptr != map_ptr);
+                    }
+                    if let Some(cache) = &mut ctx.frame.poly_load_cache {
+                        cache.retain(|_, entries| {
+                            entries.retain(|(ptr, _)| *ptr != map_ptr);
+                            !entries.is_empty()
+                        });
+                    }
+                    return Ok(DispatchAction::Continue);
+                }
+                Err(val) => map.borrow_mut().insert(prop_name.to_string(), val),
+            }
             // Populate megamorphic store IC for future fast-path stores.
             if slot != u32::MAX {
                 let pm = map.borrow();

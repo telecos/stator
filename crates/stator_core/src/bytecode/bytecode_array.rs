@@ -377,7 +377,7 @@ pub struct BytecodeArray {
     /// promotes the entry to [`ObjectLiteralCacheEntry::Cached`] by
     /// capturing the first object's finalised key layout.  Third and
     /// subsequent executions clone the cached template via
-    /// [`PropertyMap::clone_template`] for O(1) object creation.
+    /// [`PropertyMap::clone_shape`] for O(1) object creation.
     object_literal_templates: Rc<RefCell<HashMap<u32, ObjectLiteralCacheEntry>>>,
     /// Shared megamorphic IC state that persists across invocations of the same
     /// function.  New [`InterpreterFrame`]s seed their per-frame IC from this
@@ -423,7 +423,7 @@ pub struct ConstructBoilerplate {
 ///    The first object's final key layout is captured as a template
 ///    [`PropertyMap`] (values reset to `Undefined`).  All further
 ///    executions clone this template via
-///    [`PropertyMap::clone_template`].
+///    [`PropertyMap::clone_shape`].
 #[derive(Debug)]
 pub enum ObjectLiteralCacheEntry {
     /// First execution recorded; waiting for second to promote.
@@ -706,11 +706,11 @@ impl BytecodeArray {
 
     /// If a cached object-literal template exists for `slot`, returns a
     /// fresh [`PropertyMap`] cloned from it via
-    /// [`PropertyMap::clone_template`].
+    /// [`PropertyMap::clone_shape`].
     pub fn clone_object_literal_template(&self, slot: u32) -> Option<PropertyMap> {
         let borrow = self.object_literal_templates.borrow();
         match borrow.get(&slot) {
-            Some(ObjectLiteralCacheEntry::Cached(template)) => Some(template.clone_template()),
+            Some(ObjectLiteralCacheEntry::Cached(template)) => Some(template.clone_shape()),
             _ => None,
         }
     }
@@ -735,10 +735,9 @@ impl BytecodeArray {
         if first_borrow.is_empty() {
             return None;
         }
-        let (keys, attrs) = first_borrow.boilerplate_snapshot();
+        let template = first_borrow.clone_shape();
         drop(first_borrow);
-        let template = PropertyMap::from_boilerplate(&keys, &attrs);
-        let cloned = template.clone_template();
+        let cloned = template.clone_shape();
         self.object_literal_templates
             .borrow_mut()
             .insert(slot, ObjectLiteralCacheEntry::Cached(Box::new(template)));

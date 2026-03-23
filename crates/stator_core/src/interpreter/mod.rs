@@ -10749,9 +10749,10 @@ pub(super) fn make_construct_this(ba: &Rc<BytecodeArray>, ctor_proto: &JsValue) 
         Rc::new(RefCell::new(PropertyMap::new()))
     };
     if !matches!(ctor_proto, JsValue::Undefined) {
-        this_obj
-            .borrow_mut()
-            .insert("__proto__".to_string(), ctor_proto.clone());
+        let mut map = this_obj.borrow_mut();
+        if let Err(ctor_proto) = map.try_template_fill("__proto__", ctor_proto.clone()) {
+            map.insert("__proto__".to_string(), ctor_proto);
+        }
     }
     JsValue::PlainObject(this_obj)
 }
