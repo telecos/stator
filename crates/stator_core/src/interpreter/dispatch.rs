@@ -20,18 +20,18 @@ use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 use super::{
     ACTIVE_DEBUGGER, CallArgs, GlobalEnv, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD,
     MegamorphicIcEntry, OSR_LOOP_THRESHOLD, ProtoLoadIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq,
-    bigint_pow, collect_args, concat_rc_strs, constant_pool_jump_delta, constant_to_value,
-    construct_builtin_result, decode_string_constant, dispatch_call_property, dispatch_call_value,
-    dispatch_call_with_this, dispatch_getter, dispatch_setter, err_bad_operand,
-    error_message_from_value, extract_context, find_handler, fn_props_get, fn_props_set,
-    has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
-    make_construct_this, maybe_cache_construct_boilerplate, maybe_compile_baseline,
+    acquire_frame, bigint_pow, collect_args, concat_rc_strs, constant_pool_jump_delta,
+    constant_to_value, construct_builtin_result, decode_string_constant, dispatch_call_property,
+    dispatch_call_value, dispatch_call_with_this, dispatch_getter, dispatch_setter,
+    err_bad_operand, error_message_from_value, extract_context, find_handler, fn_props_get,
+    fn_props_set, has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load,
+    keyed_store, make_construct_this, maybe_cache_construct_boilerplate, maybe_compile_baseline,
     maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator, number_to_jsvalue,
     plain_object_has_own_property, plain_object_to_array_items, populate_self_name, proto_lookup,
     proto_lookup_chain_depth, resolve_construct_proto, resolve_jump, restore_closure_context,
-    run_callee, set_function_name_if_missing, set_pending_exception, settle_async_iterator_result,
-    strict_eq, to_array_index, to_bigint, to_property_key, try_execute_best_jit,
-    try_fast_named_property_lookup, walk_context_chain,
+    run_callee_pooled, set_function_name_if_missing, set_pending_exception,
+    settle_async_iterator_result, strict_eq, to_array_index, to_bigint, to_property_key,
+    try_execute_best_jit, try_fast_named_property_lookup, walk_context_chain,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
@@ -1845,11 +1845,8 @@ fn handle_call_any_receiver(
                     }
                 }
                 let callee_val = JsValue::Function(Rc::clone(&ba));
-                let mut callee_frame = InterpreterFrame::new_callee_frame(
-                    Rc::clone(&ba),
-                    args,
-                    Rc::clone(&ctx.frame.global_env),
-                );
+                let mut callee_frame =
+                    acquire_frame(Rc::clone(&ba), args, Rc::clone(&ctx.frame.global_env));
                 restore_closure_context(&mut callee_frame, &ba);
                 if ba.is_arrow() && ba.has_fn_props() {
                     callee_frame.new_target = fn_props_get(&ba, ".new_target");
@@ -1857,7 +1854,7 @@ fn handle_call_any_receiver(
                 populate_self_name(&mut callee_frame, &ba, &callee_val);
                 push_call_frame("<anonymous>")?;
                 let gen_before = ctx.frame.cache_generation;
-                let result = run_callee(&mut callee_frame);
+                let result = run_callee_pooled(callee_frame);
                 pop_call_frame();
                 if gen_before != ctx.frame.global_env.borrow().generation() {
                     ctx.frame.global_cache_invalidate();
@@ -2072,11 +2069,8 @@ fn handle_call_undefined_receiver0(
                 } else {
                     None
                 };
-                let mut callee_frame = InterpreterFrame::new_callee_frame(
-                    Rc::clone(&ba),
-                    args,
-                    Rc::clone(&ctx.frame.global_env),
-                );
+                let mut callee_frame =
+                    acquire_frame(Rc::clone(&ba), args, Rc::clone(&ctx.frame.global_env));
                 restore_closure_context(&mut callee_frame, &ba);
                 if ba.is_arrow() && ba.has_fn_props() {
                     callee_frame.new_target = fn_props_get(&ba, ".new_target");
@@ -2086,7 +2080,7 @@ fn handle_call_undefined_receiver0(
                 }
                 push_call_frame("<anonymous>")?;
                 let gen_before = ctx.frame.cache_generation;
-                let result = run_callee(&mut callee_frame);
+                let result = run_callee_pooled(callee_frame);
                 pop_call_frame();
                 if gen_before != ctx.frame.global_env.borrow().generation() {
                     ctx.frame.global_cache_invalidate();
@@ -2180,11 +2174,8 @@ fn handle_call_undefined_receiver1(
                 } else {
                     None
                 };
-                let mut callee_frame = InterpreterFrame::new_callee_frame(
-                    Rc::clone(&ba),
-                    args,
-                    Rc::clone(&ctx.frame.global_env),
-                );
+                let mut callee_frame =
+                    acquire_frame(Rc::clone(&ba), args, Rc::clone(&ctx.frame.global_env));
                 restore_closure_context(&mut callee_frame, &ba);
                 if ba.is_arrow() && ba.has_fn_props() {
                     callee_frame.new_target = fn_props_get(&ba, ".new_target");
@@ -2194,7 +2185,7 @@ fn handle_call_undefined_receiver1(
                 }
                 push_call_frame("<anonymous>")?;
                 let gen_before = ctx.frame.cache_generation;
-                let result = run_callee(&mut callee_frame);
+                let result = run_callee_pooled(callee_frame);
                 pop_call_frame();
                 if gen_before != ctx.frame.global_env.borrow().generation() {
                     ctx.frame.global_cache_invalidate();
@@ -2297,11 +2288,8 @@ fn handle_call_undefined_receiver2(
                     } else {
                         None
                     };
-                    let mut callee_frame = InterpreterFrame::new_callee_frame(
-                        Rc::clone(&ba),
-                        args,
-                        Rc::clone(&ctx.frame.global_env),
-                    );
+                    let mut callee_frame =
+                        acquire_frame(Rc::clone(&ba), args, Rc::clone(&ctx.frame.global_env));
                     restore_closure_context(&mut callee_frame, &ba);
                     if ba.is_arrow() && ba.has_fn_props() {
                         callee_frame.new_target = fn_props_get(&ba, ".new_target");
@@ -2315,7 +2303,7 @@ fn handle_call_undefined_receiver2(
                     }
                     push_call_frame("<anonymous>")?;
                     let gen_before = ctx.frame.cache_generation;
-                    let result = run_callee(&mut callee_frame);
+                    let result = run_callee_pooled(callee_frame);
                     pop_call_frame();
                     if gen_before != ctx.frame.global_env.borrow().generation() {
                         ctx.frame.global_cache_invalidate();
@@ -2551,17 +2539,14 @@ fn handle_call_with_spread(
                 tried_jit = true;
             }
             if !tried_jit {
-                let mut callee_frame = InterpreterFrame::new_callee_frame(
-                    Rc::clone(&ba),
-                    args,
-                    Rc::clone(&ctx.frame.global_env),
-                );
+                let mut callee_frame =
+                    acquire_frame(Rc::clone(&ba), args, Rc::clone(&ctx.frame.global_env));
                 restore_closure_context(&mut callee_frame, &ba);
                 if ba.self_name_register().is_some() {
                     populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
                 }
                 push_call_frame("<anonymous>")?;
-                let result = run_callee(&mut callee_frame);
+                let result = run_callee_pooled(callee_frame);
                 pop_call_frame();
                 ctx.frame.global_cache_invalidate();
                 ctx.frame.accumulator = result?;
@@ -2636,12 +2621,11 @@ fn call_plain_object_function(
             }
         }
     }
-    let mut callee_frame =
-        InterpreterFrame::new_callee_frame(Rc::clone(ba), args, Rc::clone(&ctx.frame.global_env));
+    let mut callee_frame = acquire_frame(Rc::clone(ba), args, Rc::clone(&ctx.frame.global_env));
     restore_closure_context(&mut callee_frame, ba);
     callee_frame.new_target = ctx.frame.new_target.clone();
     push_call_frame("<anonymous>")?;
-    let result = run_callee(&mut callee_frame);
+    let result = run_callee_pooled(callee_frame);
     pop_call_frame();
     ctx.frame.global_cache_invalidate();
     ctx.frame.accumulator = result?;
@@ -2677,8 +2661,7 @@ fn construct_class_from_plain_object(
     let this_val = JsValue::PlainObject(Rc::clone(&this_obj));
 
     // 2. Set up callee frame.
-    let mut callee_frame =
-        InterpreterFrame::new_callee_frame(Rc::clone(ba), args, Rc::clone(&ctx.frame.global_env));
+    let mut callee_frame = acquire_frame(Rc::clone(ba), args, Rc::clone(&ctx.frame.global_env));
     restore_closure_context(&mut callee_frame, ba);
     callee_frame.new_target = JsValue::PlainObject(Rc::clone(class_map));
 
@@ -2713,11 +2696,8 @@ fn construct_class_from_plain_object(
         if let Some(JsValue::Function(init_ba)) =
             class_map.borrow().get(".class_field_initializer").cloned()
         {
-            let mut init_frame = InterpreterFrame::new_callee_frame(
-                Rc::clone(&init_ba),
-                vec![this.clone()],
-                Rc::clone(env),
-            );
+            let mut init_frame =
+                acquire_frame(Rc::clone(&init_ba), vec![this.clone()], Rc::clone(env));
             restore_closure_context(&mut init_frame, &init_ba);
             init_frame.new_target = new_target.clone();
             {
@@ -2729,12 +2709,9 @@ fn construct_class_from_plain_object(
                 );
             }
             push_call_frame("<field_init>")?;
-            let result = run_callee(&mut init_frame);
+            let result = run_callee_pooled(init_frame);
             pop_call_frame();
-            init_frame
-                .global_env
-                .borrow_mut()
-                .remove(".class_initializer_class");
+            env.borrow_mut().remove(".class_initializer_class");
             result?;
         }
         Ok(())
@@ -2751,7 +2728,7 @@ fn construct_class_from_plain_object(
 
     // 5. Run constructor body.
     push_call_frame("<anonymous>")?;
-    let result = run_callee(&mut callee_frame);
+    let result = run_callee_pooled(callee_frame);
     pop_call_frame();
     ctx.frame.global_cache_invalidate();
     let val = result?;
@@ -2759,7 +2736,8 @@ fn construct_class_from_plain_object(
     // 6. For derived classes, run field initializer after the constructor.
     if is_derived {
         // After `super()`, `this` is the constructed value.
-        let derived_this = callee_frame
+        let derived_this = ctx
+            .frame
             .global_env
             .borrow()
             .get_this()
@@ -2810,11 +2788,8 @@ fn handle_construct(
             // [[Construct]]: create `this` using the boilerplate shape
             // cache when available, then run the constructor body.
             let this_val = make_construct_this(&ba, &ctor_proto);
-            let mut callee_frame = InterpreterFrame::new_callee_frame(
-                Rc::clone(&ba),
-                args,
-                Rc::clone(&ctx.frame.global_env),
-            );
+            let mut callee_frame =
+                acquire_frame(Rc::clone(&ba), args, Rc::clone(&ctx.frame.global_env));
             restore_closure_context(&mut callee_frame, &ba);
             callee_frame.new_target = JsValue::Function(Rc::clone(&ba));
             callee_frame
@@ -2822,7 +2797,7 @@ fn handle_construct(
                 .borrow_mut()
                 .set_this(this_val.clone());
             push_call_frame("<anonymous>")?;
-            let result = run_callee(&mut callee_frame);
+            let result = run_callee_pooled(callee_frame);
             pop_call_frame();
             ctx.frame.global_cache_invalidate();
             let val = result?;
@@ -2916,11 +2891,8 @@ fn handle_construct_with_spread(
             // [[Construct]]: create `this` using the boilerplate shape
             // cache when available, then run the constructor body.
             let this_val = make_construct_this(&ba, &ctor_proto);
-            let mut callee_frame = InterpreterFrame::new_callee_frame(
-                Rc::clone(&ba),
-                args,
-                Rc::clone(&ctx.frame.global_env),
-            );
+            let mut callee_frame =
+                acquire_frame(Rc::clone(&ba), args, Rc::clone(&ctx.frame.global_env));
             restore_closure_context(&mut callee_frame, &ba);
             callee_frame.new_target = JsValue::Function(Rc::clone(&ba));
             callee_frame
@@ -2928,7 +2900,7 @@ fn handle_construct_with_spread(
                 .borrow_mut()
                 .set_this(this_val.clone());
             push_call_frame("<anonymous>")?;
-            let result = run_callee(&mut callee_frame);
+            let result = run_callee_pooled(callee_frame);
             pop_call_frame();
             ctx.frame.global_cache_invalidate();
             let val = result?;
@@ -6917,11 +6889,8 @@ fn handle_construct_forward_all_args(
             // [[Construct]]: create `this` using the boilerplate shape
             // cache when available, then run the constructor body.
             let this_val = make_construct_this(&ba, &ctor_proto);
-            let mut callee_frame = InterpreterFrame::new_callee_frame(
-                Rc::clone(&ba),
-                args,
-                Rc::clone(&ctx.frame.global_env),
-            );
+            let mut callee_frame =
+                acquire_frame(Rc::clone(&ba), args, Rc::clone(&ctx.frame.global_env));
             restore_closure_context(&mut callee_frame, &ba);
             callee_frame.new_target = JsValue::Function(Rc::clone(&ba));
             callee_frame
@@ -6929,7 +6898,7 @@ fn handle_construct_forward_all_args(
                 .borrow_mut()
                 .set_this(this_val.clone());
             push_call_frame("<anonymous>")?;
-            let result = run_callee(&mut callee_frame);
+            let result = run_callee_pooled(callee_frame);
             pop_call_frame();
             ctx.frame.global_cache_invalidate();
             let val = result?;
@@ -7122,11 +7091,8 @@ fn handle_call_direct_eval(
                     super::init_generator_state_prototype(&state, &ba);
                     ctx.frame.accumulator = JsValue::Generator(state);
                 } else {
-                    let mut callee_frame = InterpreterFrame::new_callee_frame(
-                        Rc::clone(&ba),
-                        args,
-                        Rc::clone(&ctx.frame.global_env),
-                    );
+                    let mut callee_frame =
+                        acquire_frame(Rc::clone(&ba), args, Rc::clone(&ctx.frame.global_env));
                     restore_closure_context(&mut callee_frame, &ba);
                     if ba.self_name_register().is_some() {
                         populate_self_name(
@@ -7136,7 +7102,7 @@ fn handle_call_direct_eval(
                         );
                     }
                     push_call_frame("<eval-fallback>")?;
-                    let result = run_callee(&mut callee_frame);
+                    let result = run_callee_pooled(callee_frame);
                     pop_call_frame();
                     ctx.frame.global_cache_invalidate();
                     ctx.frame.accumulator = result?;

@@ -250,6 +250,10 @@ thread_local! {
     /// Thread-local pool of spilled register file buffers.
     /// Avoids repeated heap allocation for large interpreter frames.
     static REGISTER_POOL: RefCell<Vec<Vec<JsValue>>> = const { RefCell::new(Vec::new()) };
+
+    /// Thread-local pool of reusable [`InterpreterFrame`] structs.
+    /// Avoids heap allocation for every function call by recycling frames.
+    static FRAME_POOL: RefCell<Vec<InterpreterFrame>> = const { RefCell::new(Vec::new()) };
 }
 
 thread_local! {
@@ -321,6 +325,7 @@ pub fn clear_interpreter_state() {
         *table.borrow_mut() = crate::objects::js_string::StringTable::new();
     });
     REGISTER_POOL.with(|pool| pool.borrow_mut().clear());
+    FRAME_POOL.with(|pool| pool.borrow_mut().clear());
     CURRENT_GLOBALS.with(|g| *g.borrow_mut() = None);
 }
 
@@ -1415,6 +1420,106 @@ fn release_registers(regs: RegisterFile) {
             }
         });
     }
+}
+
+/// Maximum number of [`InterpreterFrame`] structs kept in the thread-local pool.
+const FRAME_POOL_CAP: usize = 8;
+
+/// Acquire an [`InterpreterFrame`] from the thread-local pool, or allocate a
+/// new one.  When a pooled frame is available its fields are reset in-place,
+/// avoiding a fresh heap allocation for the register file, IC caches, and
+/// other per-frame state.
+#[inline]
+pub(super) fn acquire_frame(
+    bytecode_array: Rc<BytecodeArray>,
+    args: impl IntoIterator<Item = JsValue>,
+    global_env: Rc<RefCell<GlobalEnv>>,
+) -> InterpreterFrame {
+    let maybe_frame = FRAME_POOL.with(|pool| pool.borrow_mut().pop());
+
+    if let Some(mut frame) = maybe_frame {
+        let args: CallArgs = args.into_iter().collect();
+        let param_count = bytecode_array.parameter_count() as usize;
+        let frame_size = bytecode_array.frame_size() as usize;
+        let total_regs = param_count + frame_size;
+
+        // Reuse the register buffer via the register pool.
+        release_registers(std::mem::take(&mut frame.registers));
+        frame.registers = acquire_registers(total_regs);
+        for (i, arg) in args.iter().cloned().enumerate().take(param_count) {
+            frame.registers[i] = arg;
+        }
+
+        frame.bytecode_array = bytecode_array;
+        frame.call_args = args;
+        frame.accumulator = JsValue::Undefined;
+        frame.pc = 0;
+        frame.context = None;
+        frame.suspend_result = None;
+        frame.generator_state = None;
+        frame.global_env = global_env;
+        frame.osr_loop_count = 0;
+        frame.instruction_limit = 0;
+        frame.instructions_executed = 0;
+        frame.deadline = None;
+        frame.pending_message = JsValue::Undefined;
+        frame.new_target = JsValue::Undefined;
+        // IC caches are lazily allocated — reset to None.
+        frame.mono_load_cache = None;
+        frame.poly_load_cache = None;
+        frame.mega_load_ic = None;
+        frame.proto_load_ic = None;
+        frame.mega_store_ic = None;
+        frame.string_cache = None;
+        frame.global_ic = None;
+        frame.global_cache = None;
+        frame.cache_generation = 0;
+        frame.smi_mode = false;
+        frame.hot_registers = None;
+        frame.loop_end_pc = 0;
+        frame.loop_trip_counts.clear();
+        return frame;
+    }
+
+    // No pooled frame available — allocate a new one.
+    InterpreterFrame::new_callee_frame(bytecode_array, args, global_env)
+}
+
+/// Return an [`InterpreterFrame`] to the thread-local pool for reuse.
+///
+/// All `JsValue` fields are cleared to prevent reference leaks.  The frame's
+/// register buffer has already been returned to `REGISTER_POOL` by
+/// [`Interpreter::run_inner`], so we do not touch it here.
+#[inline]
+fn release_frame(mut frame: InterpreterFrame) {
+    // Clear all JsValue / Rc fields to allow them to be dropped.
+    frame.accumulator = JsValue::Undefined;
+    frame.context = None;
+    frame.call_args.clear();
+    frame.pending_message = JsValue::Undefined;
+    frame.new_target = JsValue::Undefined;
+    frame.suspend_result = None;
+    frame.generator_state = None;
+    // Drop remaining IC caches — they were already written back to
+    // the BytecodeArray in run_inner.
+    frame.mono_load_cache = None;
+    frame.poly_load_cache = None;
+    frame.mega_load_ic = None;
+    frame.proto_load_ic = None;
+    frame.mega_store_ic = None;
+    frame.string_cache = None;
+    frame.global_ic = None;
+    frame.global_cache = None;
+    frame.hot_registers = None;
+    frame.loop_trip_counts.clear();
+
+    FRAME_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < FRAME_POOL_CAP {
+            pool.push(frame);
+        }
+        // else: drop the frame, releasing its memory
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3187,11 +3292,8 @@ impl Interpreter {
                                     };
                                     // Move ba into the callee frame — avoids
                                     // a second Rc::clone.
-                                    let mut callee_frame = InterpreterFrame::new_callee_frame(
-                                        ba,
-                                        args,
-                                        Rc::clone(&frame.global_env),
-                                    );
+                                    let mut callee_frame =
+                                        acquire_frame(ba, args, Rc::clone(&frame.global_env));
                                     if let Some(ctx) = closure_ctx {
                                         callee_frame.context = Some(JsValue::Context(ctx));
                                     }
@@ -3216,6 +3318,7 @@ impl Interpreter {
                                             })
                                         }
                                     });
+                                    release_frame(callee_frame);
                                     if (frame.global_cache.is_some() || frame.global_ic.is_some())
                                         && gen_before != frame.global_env.borrow().generation()
                                     {
@@ -3287,11 +3390,8 @@ impl Interpreter {
                                     };
                                     // Move ba into callee frame — avoids a
                                     // second Rc::clone.
-                                    let mut callee_frame = InterpreterFrame::new_callee_frame(
-                                        ba,
-                                        args,
-                                        Rc::clone(&frame.global_env),
-                                    );
+                                    let mut callee_frame =
+                                        acquire_frame(ba, args, Rc::clone(&frame.global_env));
                                     if let Some(ctx) = closure_ctx {
                                         callee_frame.context = Some(JsValue::Context(ctx));
                                     }
@@ -3316,6 +3416,7 @@ impl Interpreter {
                                             })
                                         }
                                     });
+                                    release_frame(callee_frame);
                                     if (frame.global_cache.is_some() || frame.global_ic.is_some())
                                         && gen_before != frame.global_env.borrow().generation()
                                     {
@@ -5345,11 +5446,8 @@ impl Interpreter {
                             } else {
                                 None
                             };
-                            let mut callee_frame = InterpreterFrame::new_callee_frame(
-                                ba,
-                                args,
-                                Rc::clone(&frame.global_env),
-                            );
+                            let mut callee_frame =
+                                acquire_frame(ba, args, Rc::clone(&frame.global_env));
                             if let Some(ctx) = closure_ctx {
                                 callee_frame.context = Some(JsValue::Context(ctx));
                             }
@@ -5372,6 +5470,7 @@ impl Interpreter {
                                     })
                                 }
                             });
+                            release_frame(callee_frame);
                             // Only invalidate if the callee actually mutated globals.
                             if (frame.global_cache.is_some() || frame.global_ic.is_some())
                                 && gen_before != frame.global_env.borrow().generation()
@@ -5464,11 +5563,8 @@ impl Interpreter {
                             } else {
                                 None
                             };
-                            let mut callee_frame = InterpreterFrame::new_callee_frame(
-                                ba,
-                                args,
-                                Rc::clone(&frame.global_env),
-                            );
+                            let mut callee_frame =
+                                acquire_frame(ba, args, Rc::clone(&frame.global_env));
                             if let Some(ctx) = closure_ctx {
                                 callee_frame.context = Some(JsValue::Context(ctx));
                             }
@@ -5491,6 +5587,7 @@ impl Interpreter {
                                     })
                                 }
                             });
+                            release_frame(callee_frame);
                             if (frame.global_cache.is_some() || frame.global_ic.is_some())
                                 && gen_before != frame.global_env.borrow().generation()
                             {
@@ -6879,6 +6976,17 @@ fn run_callee(callee_frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
     }
 }
 
+/// Run a callee frame and return it to the thread-local pool afterward.
+///
+/// Takes ownership of the frame so it can be recycled.  Use this in call
+/// sites that do not need to inspect the frame after execution completes.
+#[inline(always)]
+fn run_callee_pooled(mut callee_frame: InterpreterFrame) -> StatorResult<JsValue> {
+    let result = run_callee(&mut callee_frame);
+    release_frame(callee_frame);
+    result
+}
+
 /// Dispatch a function call with the given arguments, writing the result to
 /// the frame's accumulator.  Handles `Function`, `NativeFunction`, and
 /// callable `PlainObject` values (those with a `__call__` property).
@@ -6918,11 +7026,8 @@ pub(super) fn dispatch_call(
                     }
                 }
                 {
-                    let mut callee_frame = InterpreterFrame::new_callee_frame(
-                        Rc::clone(ba),
-                        args,
-                        Rc::clone(&frame.global_env),
-                    );
+                    let mut callee_frame =
+                        acquire_frame(Rc::clone(ba), args, Rc::clone(&frame.global_env));
                     restore_closure_context(&mut callee_frame, ba);
                     // Only construct the JsValue::Function wrapper when the
                     // bytecode actually has a self-name register — avoids an
@@ -6944,6 +7049,7 @@ pub(super) fn dispatch_call(
                             })
                         }
                     });
+                    release_frame(callee_frame);
                     if (frame.global_cache.is_some() || frame.global_ic.is_some())
                         && gen_before != frame.global_env.borrow().generation()
                     {
@@ -7017,11 +7123,8 @@ pub(super) fn dispatch_call_property(
                     }
                 }
                 {
-                    let mut callee_frame = InterpreterFrame::new_callee_frame(
-                        Rc::clone(ba),
-                        args,
-                        Rc::clone(&frame.global_env),
-                    );
+                    let mut callee_frame =
+                        acquire_frame(Rc::clone(ba), args, Rc::clone(&frame.global_env));
                     restore_closure_context(&mut callee_frame, ba);
                     if ba.self_name_register().is_some() {
                         populate_self_name(
@@ -7044,6 +7147,7 @@ pub(super) fn dispatch_call_property(
                             })
                         }
                     });
+                    release_frame(callee_frame);
                     if (frame.global_cache.is_some() || frame.global_ic.is_some())
                         && gen_before != frame.global_env.borrow().generation()
                     {
@@ -10453,13 +10557,13 @@ fn dispatch_getter(getter: &JsValue, this: &JsValue) -> StatorResult<JsValue> {
         JsValue::Function(ba) => {
             push_call_frame("<getter>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                InterpreterFrame::new_callee_frame(Rc::clone(ba), vec![], globals)
+                acquire_frame(Rc::clone(ba), vec![], globals)
             } else {
                 InterpreterFrame::new(Rc::clone(ba), vec![])
             };
             restore_closure_context(&mut frame, ba);
             frame.global_env.borrow_mut().set_this(this.clone());
-            let result = run_callee(&mut frame);
+            let result = run_callee_pooled(frame);
             pop_call_frame();
             result
         }
@@ -10474,13 +10578,13 @@ pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) ->
         JsValue::Function(ba) => {
             push_call_frame("<setter>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                InterpreterFrame::new_callee_frame(Rc::clone(ba), vec![val], globals)
+                acquire_frame(Rc::clone(ba), vec![val], globals)
             } else {
                 InterpreterFrame::new(Rc::clone(ba), vec![val])
             };
             restore_closure_context(&mut frame, ba);
             frame.global_env.borrow_mut().set_this(this.clone());
-            let result = run_callee(&mut frame);
+            let result = run_callee_pooled(frame);
             pop_call_frame();
             result?;
             Ok(())
@@ -10517,13 +10621,13 @@ pub fn dispatch_call_value(
             }
             push_call_frame("<anonymous>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                InterpreterFrame::new_callee_frame(Rc::clone(ba), args, globals)
+                acquire_frame(Rc::clone(ba), args, globals)
             } else {
                 InterpreterFrame::new(Rc::clone(ba), args)
             };
             restore_closure_context(&mut frame, ba);
             populate_self_name(&mut frame, ba, &JsValue::Function(Rc::clone(ba)));
-            let result = run_callee(&mut frame);
+            let result = run_callee_pooled(frame);
             pop_call_frame();
             result
         }
@@ -10561,7 +10665,7 @@ pub fn dispatch_call_with_this(
             }
             push_call_frame("<anonymous>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                InterpreterFrame::new_callee_frame(Rc::clone(ba), args, globals)
+                acquire_frame(Rc::clone(ba), args, globals)
             } else {
                 InterpreterFrame::new(Rc::clone(ba), args)
             };
@@ -10586,7 +10690,7 @@ pub fn dispatch_call_with_this(
                 };
                 frame.global_env.borrow_mut().set_this(effective_this);
             }
-            let result = run_callee(&mut frame);
+            let result = run_callee_pooled(frame);
             pop_call_frame();
             result
         }
@@ -10636,7 +10740,7 @@ pub fn dispatch_construct_call(
         JsValue::Function(ba) => {
             push_call_frame("<anonymous>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                InterpreterFrame::new_callee_frame(Rc::clone(ba), args, globals)
+                acquire_frame(Rc::clone(ba), args, globals)
             } else {
                 InterpreterFrame::new(Rc::clone(ba), args)
             };
@@ -10644,7 +10748,7 @@ pub fn dispatch_construct_call(
             populate_self_name(&mut frame, ba, &JsValue::Function(Rc::clone(ba)));
             frame.new_target = new_target;
             frame.global_env.borrow_mut().set_this(this_val);
-            let result = run_callee(&mut frame);
+            let result = run_callee_pooled(frame);
             pop_call_frame();
             result
         }
