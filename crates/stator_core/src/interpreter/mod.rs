@@ -3081,7 +3081,9 @@ impl Interpreter {
                                     let gen_before = frame.cache_generation;
                                     let result = run_callee(&mut callee_frame);
                                     pop_call_frame_ex(false);
-                                    if gen_before != frame.global_env.borrow().generation() {
+                                    if (frame.global_cache.is_some() || frame.global_ic.is_some())
+                                        && gen_before != frame.global_env.borrow().generation()
+                                    {
                                         frame.global_cache_invalidate();
                                     }
                                     if !is_arrow && is_strict {
@@ -3174,7 +3176,9 @@ impl Interpreter {
                                     let gen_before = frame.cache_generation;
                                     let result = run_callee(&mut callee_frame);
                                     pop_call_frame_ex(false);
-                                    if gen_before != frame.global_env.borrow().generation() {
+                                    if (frame.global_cache.is_some() || frame.global_ic.is_some())
+                                        && gen_before != frame.global_env.borrow().generation()
+                                    {
                                         frame.global_cache_invalidate();
                                     }
                                     if !is_arrow && is_strict {
@@ -3525,6 +3529,34 @@ impl Interpreter {
                                 break 'smi;
                             }
                             Opcode::Nop => {}
+                            // Non-Smi loads: exit SMI loop cleanly without
+                            // rewinding pc.  The instruction is already
+                            // consumed, and the normal dispatch will handle
+                            // the next instruction with the correct `acc`.
+                            Opcode::LdaTrue => {
+                                acc = JsValue::Boolean(true);
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                break 'smi;
+                            }
+                            Opcode::LdaFalse => {
+                                acc = JsValue::Boolean(false);
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                break 'smi;
+                            }
+                            Opcode::LdaUndefined => {
+                                acc = JsValue::Undefined;
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                break 'smi;
+                            }
+                            Opcode::LdaNull => {
+                                acc = JsValue::Null;
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                break 'smi;
+                            }
                             _ => {
                                 // Unsupported opcode — exit SMI loop and let
                                 // the regular dispatch handle it.
@@ -5109,7 +5141,9 @@ impl Interpreter {
                             let result = run_callee(&mut callee_frame);
                             pop_call_frame_ex(false);
                             // Only invalidate if the callee actually mutated globals.
-                            if gen_before != frame.global_env.borrow().generation() {
+                            if (frame.global_cache.is_some() || frame.global_ic.is_some())
+                                && gen_before != frame.global_env.borrow().generation()
+                            {
                                 frame.global_cache_invalidate();
                             }
                             if !is_arrow && is_strict {
@@ -5219,7 +5253,9 @@ impl Interpreter {
                             let gen_before = frame.cache_generation;
                             let result = run_callee(&mut callee_frame);
                             pop_call_frame();
-                            if gen_before != frame.global_env.borrow().generation() {
+                            if (frame.global_cache.is_some() || frame.global_ic.is_some())
+                                && gen_before != frame.global_env.borrow().generation()
+                            {
                                 frame.global_cache_invalidate();
                             }
                             if !is_arrow && is_strict {
@@ -6655,7 +6691,9 @@ pub(super) fn dispatch_call(
                     let gen_before = frame.cache_generation;
                     let result = run_callee(&mut callee_frame);
                     pop_call_frame();
-                    if gen_before != frame.global_env.borrow().generation() {
+                    if (frame.global_cache.is_some() || frame.global_ic.is_some())
+                        && gen_before != frame.global_env.borrow().generation()
+                    {
                         frame.global_cache_invalidate();
                     }
                     frame.accumulator = result?;
@@ -6741,7 +6779,9 @@ pub(super) fn dispatch_call_property(
                     let gen_before = frame.cache_generation;
                     let result = run_callee(&mut callee_frame);
                     pop_call_frame();
-                    if gen_before != frame.global_env.borrow().generation() {
+                    if (frame.global_cache.is_some() || frame.global_ic.is_some())
+                        && gen_before != frame.global_env.borrow().generation()
+                    {
                         frame.global_cache_invalidate();
                     }
                     frame.accumulator = result?;
