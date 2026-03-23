@@ -2621,8 +2621,17 @@ impl Interpreter {
                 // Unsupported opcodes break out, convert back to
                 // JsValue, and let the regular match handle them.
                 if frame.smi_mode {
-                    // SAFETY: smi_mode invariant guarantees acc is Smi.
-                    let mut sa: i32 = unsafe { acc.as_smi_unchecked() };
+                    // Extract the raw i32 accumulator.  In production the
+                    // JumpLoop handler only sets `smi_mode` when `acc` is a
+                    // Smi, but test harnesses may set the flag before the
+                    // first instruction runs — guard against that.
+                    let mut sa: i32 = if let JsValue::Smi(v) = acc {
+                        v
+                    } else {
+                        frame.smi_mode = false;
+                        frame.loop_end_pc = 0;
+                        continue;
+                    };
                     'smi: loop {
                         if pc >= frame.loop_end_pc {
                             frame.loop_end_pc = 0;
@@ -10316,6 +10325,7 @@ mod tests {
                 .insert((*name).to_string(), value.clone());
         }
         frame.smi_mode = true;
+        frame.accumulator = JsValue::Smi(0);
         frame.hot_registers = Some(HotRegisters::new(frame.registers.len()));
         let result = Interpreter::run(&mut frame)?;
         Ok((result, frame))
@@ -10579,6 +10589,7 @@ mod tests {
         let ba = make_bytecode(instrs, 1, 0);
         let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         frame.smi_mode = true;
+        frame.accumulator = JsValue::Smi(0);
         frame.hot_registers = Some(HotRegisters::new(frame.registers.len()));
         Interpreter::run(&mut frame)
     }
