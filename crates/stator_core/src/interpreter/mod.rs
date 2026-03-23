@@ -3191,8 +3191,8 @@ impl Interpreter {
                                 break 'smi;
                             }
                             Opcode::LdaNamedProperty => {
-                                // Mega-IC fast path: stays in SMI mode when
-                                // the loaded value is Smi.
+                                // Mega-IC fast path (direct + proto): stays in
+                                // SMI mode when the loaded value is Smi.
                                 let obj_v = unsafe { operand_reg_unchecked(instr, 0) };
                                 let slot = unsafe {
                                     match *instr.operands.get_unchecked(2) {
@@ -3200,11 +3200,25 @@ impl Interpreter {
                                         _ => std::hint::unreachable_unchecked(),
                                     }
                                 };
-                                // Use a raw pointer so we can simultaneously
-                                // access frame.mega_load_ic (disjoint field).
+                                // Raw pointer avoids borrow conflict with
+                                // frame.mega_load_ic.
                                 let obj_ptr =
                                     unsafe { frame.read_reg_unchecked(obj_v) } as *const JsValue;
                                 let obj = unsafe { &*obj_ptr };
+
+                                // arr.length fast path
+                                if let JsValue::Array(items) = obj {
+                                    let name_idx =
+                                        unsafe { operand_constant_pool_idx_unchecked(instr, 1) };
+                                    if frame.is_length_constant(name_idx) {
+                                        let len = items.borrow().len();
+                                        if len <= i32::MAX as usize {
+                                            sa = len as i32;
+                                            continue 'smi;
+                                        }
+                                    }
+                                }
+
                                 if let JsValue::PlainObject(map) = obj {
                                     let pm = map.borrow();
                                     let layout = pm.layout_id();
@@ -3212,19 +3226,46 @@ impl Interpreter {
                                         .mega_load_ic
                                         .as_ref()
                                         .and_then(|cache| cache.probe(slot, layout))
-                                        && !ic.is_proto
-                                        && let Some(val) =
-                                            pm.get_by_offset(ic.cached_offset as usize)
                                     {
-                                        if let JsValue::Smi(v) = val {
-                                            sa = *v;
-                                            continue 'smi;
+                                        if !ic.is_proto {
+                                            if let Some(val) =
+                                                pm.get_by_offset(ic.cached_offset as usize)
+                                            {
+                                                if let JsValue::Smi(v) = val {
+                                                    sa = *v;
+                                                    continue 'smi;
+                                                }
+                                                acc = val.clone();
+                                                drop(pm);
+                                                frame.smi_mode = false;
+                                                frame.loop_end_pc = 0;
+                                                break 'smi;
+                                            }
+                                        } else {
+                                            // Proto-IC: load from prototype.
+                                            let proto_layout = ic.proto_layout;
+                                            let offset = ic.cached_offset;
+                                            if let Some(JsValue::PlainObject(proto_map)) =
+                                                pm.get(INTERNAL_PROTO_PROPERTY_KEY)
+                                            {
+                                                let proto_pm = proto_map.borrow();
+                                                if proto_pm.layout_id() == proto_layout
+                                                    && let Some(val) =
+                                                        proto_pm.get_by_offset(offset as usize)
+                                                {
+                                                    if let JsValue::Smi(v) = val {
+                                                        sa = *v;
+                                                        continue 'smi;
+                                                    }
+                                                    acc = val.clone();
+                                                    drop(proto_pm);
+                                                    drop(pm);
+                                                    frame.smi_mode = false;
+                                                    frame.loop_end_pc = 0;
+                                                    break 'smi;
+                                                }
+                                            }
                                         }
-                                        acc = val.clone();
-                                        drop(pm);
-                                        frame.smi_mode = false;
-                                        frame.loop_end_pc = 0;
-                                        break 'smi;
                                     }
                                 }
                                 // IC miss or non-PlainObject — exit SMI mode.
