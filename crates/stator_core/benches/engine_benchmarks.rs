@@ -26,8 +26,8 @@ use criterion::{Criterion, criterion_group, criterion_main};
 /// CI-friendly Criterion configuration with reduced samples to avoid timeouts.
 fn ci_config() -> Criterion {
     Criterion::default()
-        .warm_up_time(std::time::Duration::from_millis(500))
-        .measurement_time(std::time::Duration::from_secs(2))
+        .warm_up_time(std::time::Duration::from_millis(200))
+        .measurement_time(std::time::Duration::from_secs(1))
         .sample_size(10)
 }
 

@@ -47,5 +47,11 @@ opt-level = 1
 [profile.release]
 lto = false
 
+# Bench profile: strip debug info to reduce binary size (avoids OOM on
+# 7GB GitHub runners). Inherits from release.
+[profile.bench]
+debug = false
+strip = "debuginfo"
+
 [patch.crates-io]
 regress = { path = "vendor/regress" }
