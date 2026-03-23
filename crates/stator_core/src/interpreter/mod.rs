@@ -1443,7 +1443,7 @@ pub struct GlobalEnv {
     /// Cached flag: `true` once `install_globals` has populated this env.
     /// Avoids a HashMap lookup (`contains_key("eval")`) on every
     /// `new_with_globals` call.
-    globals_installed: bool,
+    pub globals_installed: bool,
 }
 
 impl GlobalEnv {
@@ -1912,6 +1912,7 @@ impl InterpreterFrame {
         let mut global_env = GlobalEnv::new();
         crate::builtins::install_globals::install_globals(&mut global_env.vars);
         global_env.rebuild_slots();
+        global_env.globals_installed = true;
         Self {
             bytecode_array,
             registers,

@@ -50,6 +50,7 @@ fn make_global_env() -> Rc<RefCell<GlobalEnv>> {
     let mut env = GlobalEnv::new();
     stator_core::builtins::install_globals::install_globals(&mut env.vars);
     env.rebuild_slots();
+    env.globals_installed = true;
     Rc::new(RefCell::new(env))
 }
 
