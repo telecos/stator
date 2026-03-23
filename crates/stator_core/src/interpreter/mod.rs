@@ -1440,6 +1440,10 @@ pub struct GlobalEnv {
     /// allocation on the hot call path.  `None` means `this` is not
     /// bound (equivalent to the old `remove("this")`).
     this_binding: Option<JsValue>,
+    /// Cached flag: `true` once `install_globals` has populated this env.
+    /// Avoids a HashMap lookup (`contains_key("eval")`) on every
+    /// `new_with_globals` call.
+    globals_installed: bool,
 }
 
 impl GlobalEnv {
@@ -1451,6 +1455,7 @@ impl GlobalEnv {
             slots: Vec::new(),
             name_to_index: HashMap::new(),
             this_binding: None,
+            globals_installed: false,
         }
     }
 
@@ -1463,6 +1468,7 @@ impl GlobalEnv {
             slots: Vec::new(),
             name_to_index: HashMap::new(),
             this_binding,
+            globals_installed: false,
         };
         env.rebuild_slots();
         env
@@ -1953,15 +1959,12 @@ impl InterpreterFrame {
         global_env: Rc<RefCell<GlobalEnv>>,
     ) -> Self {
         let args: CallArgs = args.into_iter().collect();
-        // Ensure engine builtins are present.  The `eval` key is used as a
-        // sentinel — if it exists the full set has already been installed.
-        if !global_env.borrow().contains_key("eval") {
+        // Fast check: skip the expensive HashMap lookup once globals are
+        // installed.  The flag is set below after install_globals completes.
+        if !global_env.borrow().globals_installed {
             let mut defaults = HashMap::new();
             crate::builtins::install_globals::install_globals(&mut defaults);
             let mut env = global_env.borrow_mut();
-            // Extract "this" from defaults into the dedicated binding —
-            // install_globals writes it into the HashMap but GlobalEnv
-            // stores it separately for O(1) access.
             if let Some(this_val) = defaults.remove("this")
                 && env.this_binding.is_none()
             {
@@ -1971,6 +1974,7 @@ impl InterpreterFrame {
                 env.vars.entry(k).or_insert(v);
             }
             env.rebuild_slots();
+            env.globals_installed = true;
         }
         Self::new_callee_frame(bytecode_array, args, global_env)
     }
