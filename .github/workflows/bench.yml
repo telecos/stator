@@ -39,12 +39,12 @@ jobs:
           echo "=== System Resources ==="
           free -h
           echo "=== Running precompiled benchmarks (interpreter-only) ==="
-          cargo bench --package stator_core -- _precompiled
+          cargo bench --package stator_core -- _precompiled --sample-size 5 --warm-up-time 1 --measurement-time 2 2>&1
 
       - name: Run V8-comparison benchmarks (Stator)
         run: |
           echo "=== Running V8-comparison benchmarks ==="
-          cargo bench --package stator_core -- "v8_comparison_benches"
+          cargo bench --package stator_core -- "v8_comparison_benches" --sample-size 5 --warm-up-time 1 --measurement-time 2 2>&1
         continue-on-error: true
 
       - name: Run V8 (Node.js) comparison benchmarks
