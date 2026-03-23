@@ -150,6 +150,34 @@ pub fn pop_call_frame_ex(named: bool) {
     });
 }
 
+/// Execute a closure within a pushed anonymous call frame using a single
+/// TLS access instead of the 3 separate accesses needed by
+/// `push_call_frame` + `call_stack_depth` + `pop_call_frame_ex`.
+///
+/// The closure receives the new call depth so it can decide whether to
+/// guard against native stack overflow (e.g. via `stacker::maybe_grow`).
+///
+/// On stack overflow (depth ≥ [`MAX_CALL_STACK_DEPTH`]) returns
+/// `Err(RangeError)` without invoking the closure.
+#[inline(always)]
+pub fn with_anon_call_frame<R, F>(f: F) -> StatorResult<R>
+where
+    F: FnOnce(usize) -> StatorResult<R>,
+{
+    CALL_DEPTH.with(|d| {
+        let depth = d.get();
+        if depth >= MAX_CALL_STACK_DEPTH {
+            return Err(StatorError::RangeError(
+                "Maximum call stack size exceeded".to_string(),
+            ));
+        }
+        d.set(depth + 1);
+        let result = f(depth + 1);
+        d.set(depth);
+        result
+    })
+}
+
 /// Pop the most recently pushed frame name from the thread-local call stack.
 ///
 /// Call this immediately after returning from a nested interpreter call.

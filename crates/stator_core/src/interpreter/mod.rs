@@ -181,7 +181,7 @@ use std::time::Instant;
 use smallvec::SmallVec;
 
 use crate::builtins::error::{
-    call_stack_depth, pop_call_frame, pop_call_frame_ex, push_call_frame,
+    call_stack_depth, pop_call_frame, push_call_frame, with_anon_call_frame,
 };
 use crate::builtins::function::{function_bound_name, function_length, function_to_string};
 use crate::builtins::proxy::{proxy_apply, proxy_get_with_receiver, proxy_set_with_receiver};
@@ -3078,10 +3078,16 @@ impl Interpreter {
                                         let ba_val = JsValue::Function(Rc::clone(&ba_rc));
                                         populate_self_name(&mut callee_frame, &ba_rc, &ba_val);
                                     }
-                                    push_call_frame("<anonymous>")?;
                                     let gen_before = frame.cache_generation;
-                                    let result = run_callee(&mut callee_frame);
-                                    pop_call_frame_ex(false);
+                                    let result = with_anon_call_frame(|depth| {
+                                        if depth < 64 {
+                                            Interpreter::run_same_env(&mut callee_frame)
+                                        } else {
+                                            stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+                                                Interpreter::run_same_env(&mut callee_frame)
+                                            })
+                                        }
+                                    });
                                     if (frame.global_cache.is_some() || frame.global_ic.is_some())
                                         && gen_before != frame.global_env.borrow().generation()
                                     {
@@ -3173,10 +3179,16 @@ impl Interpreter {
                                         let ba_val = JsValue::Function(Rc::clone(&ba_rc));
                                         populate_self_name(&mut callee_frame, &ba_rc, &ba_val);
                                     }
-                                    push_call_frame("<anonymous>")?;
                                     let gen_before = frame.cache_generation;
-                                    let result = run_callee(&mut callee_frame);
-                                    pop_call_frame_ex(false);
+                                    let result = with_anon_call_frame(|depth| {
+                                        if depth < 64 {
+                                            Interpreter::run_same_env(&mut callee_frame)
+                                        } else {
+                                            stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+                                                Interpreter::run_same_env(&mut callee_frame)
+                                            })
+                                        }
+                                    });
                                     if (frame.global_cache.is_some() || frame.global_ic.is_some())
                                         && gen_before != frame.global_env.borrow().generation()
                                     {
@@ -5223,10 +5235,16 @@ impl Interpreter {
                                 let ba_val = JsValue::Function(Rc::clone(&ba_rc));
                                 populate_self_name(&mut callee_frame, &ba_rc, &ba_val);
                             }
-                            push_call_frame("<anonymous>")?;
                             let gen_before = frame.cache_generation;
-                            let result = run_callee(&mut callee_frame);
-                            pop_call_frame_ex(false);
+                            let result = with_anon_call_frame(|depth| {
+                                if depth < 64 {
+                                    Interpreter::run_same_env(&mut callee_frame)
+                                } else {
+                                    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+                                        Interpreter::run_same_env(&mut callee_frame)
+                                    })
+                                }
+                            });
                             // Only invalidate if the callee actually mutated globals.
                             if (frame.global_cache.is_some() || frame.global_ic.is_some())
                                 && gen_before != frame.global_env.borrow().generation()
@@ -5336,10 +5354,16 @@ impl Interpreter {
                                 let ba_val = JsValue::Function(Rc::clone(&ba_rc));
                                 populate_self_name(&mut callee_frame, &ba_rc, &ba_val);
                             }
-                            push_call_frame("<anonymous>")?;
                             let gen_before = frame.cache_generation;
-                            let result = run_callee(&mut callee_frame);
-                            pop_call_frame();
+                            let result = with_anon_call_frame(|depth| {
+                                if depth < 64 {
+                                    Interpreter::run_same_env(&mut callee_frame)
+                                } else {
+                                    stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+                                        Interpreter::run_same_env(&mut callee_frame)
+                                    })
+                                }
+                            });
                             if (frame.global_cache.is_some() || frame.global_ic.is_some())
                                 && gen_before != frame.global_env.borrow().generation()
                             {
@@ -6774,10 +6798,16 @@ pub(super) fn dispatch_call(
                     );
                     restore_closure_context(&mut callee_frame, ba);
                     populate_self_name(&mut callee_frame, ba, &JsValue::Function(Rc::clone(ba)));
-                    push_call_frame("<anonymous>")?;
                     let gen_before = frame.cache_generation;
-                    let result = run_callee(&mut callee_frame);
-                    pop_call_frame();
+                    let result = with_anon_call_frame(|depth| {
+                        if depth < 64 {
+                            Interpreter::run_same_env(&mut callee_frame)
+                        } else {
+                            stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+                                Interpreter::run_same_env(&mut callee_frame)
+                            })
+                        }
+                    });
                     if (frame.global_cache.is_some() || frame.global_ic.is_some())
                         && gen_before != frame.global_env.borrow().generation()
                     {
@@ -6862,10 +6892,16 @@ pub(super) fn dispatch_call_property(
                     if !ba.is_arrow() {
                         callee_frame.global_env.borrow_mut().set_this(this_val);
                     }
-                    push_call_frame("<anonymous>")?;
                     let gen_before = frame.cache_generation;
-                    let result = run_callee(&mut callee_frame);
-                    pop_call_frame();
+                    let result = with_anon_call_frame(|depth| {
+                        if depth < 64 {
+                            Interpreter::run_same_env(&mut callee_frame)
+                        } else {
+                            stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+                                Interpreter::run_same_env(&mut callee_frame)
+                            })
+                        }
+                    });
                     if (frame.global_cache.is_some() || frame.global_ic.is_some())
                         && gen_before != frame.global_env.borrow().generation()
                     {
