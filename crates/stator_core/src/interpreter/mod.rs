@@ -1428,6 +1428,10 @@ pub struct GlobalEnv {
     slots: Vec<JsValue>,
     /// Maps global variable name to its slot index in `slots`.
     name_to_index: HashMap<String, usize>,
+    /// Dedicated `this` binding — avoids HashMap lookup and String
+    /// allocation on the hot call path.  `None` means `this` is not
+    /// bound (equivalent to the old `remove("this")`).
+    this_binding: Option<JsValue>,
 }
 
 impl GlobalEnv {
@@ -1438,6 +1442,7 @@ impl GlobalEnv {
             generation: 0,
             slots: Vec::new(),
             name_to_index: HashMap::new(),
+            this_binding: None,
         }
     }
 
@@ -1448,13 +1453,40 @@ impl GlobalEnv {
             generation: 0,
             slots: Vec::new(),
             name_to_index: HashMap::new(),
+            this_binding: None,
         };
         env.rebuild_slots();
         env
     }
 
+    /// Get the dedicated `this` binding (O(1), no HashMap lookup).
+    #[inline(always)]
+    pub fn get_this(&self) -> Option<&JsValue> {
+        self.this_binding.as_ref()
+    }
+
+    /// Set the dedicated `this` binding (O(1), no String alloc, no
+    /// generation bump).
+    #[inline(always)]
+    pub fn set_this(&mut self, value: JsValue) {
+        self.this_binding = Some(value);
+    }
+
+    /// Remove the `this` binding.
+    #[inline(always)]
+    pub fn remove_this(&mut self) {
+        self.this_binding = None;
+    }
+
     /// Insert a value, bumping the generation counter.
+    ///
+    /// For the `"this"` binding, prefer [`set_this`] which avoids
+    /// the `String` allocation and `HashMap` overhead.
     pub fn insert(&mut self, key: String, value: JsValue) {
+        if key == "this" {
+            self.this_binding = Some(value);
+            return;
+        }
         self.vars.insert(key.clone(), value.clone());
         if let Some(&idx) = self.name_to_index.get(&key) {
             self.slots[idx] = value;
@@ -1468,6 +1500,9 @@ impl GlobalEnv {
 
     /// Remove a key, bumping the generation counter.
     pub fn remove(&mut self, key: &str) -> Option<JsValue> {
+        if key == "this" {
+            return self.this_binding.take();
+        }
         let removed = self.vars.remove(key);
         if removed.is_some() {
             if let Some(idx) = self.name_to_index.remove(key) {
@@ -1479,12 +1514,19 @@ impl GlobalEnv {
     }
 
     /// Get a reference to a value.
+    #[inline(always)]
     pub fn get(&self, key: &str) -> Option<&JsValue> {
+        if key == "this" {
+            return self.this_binding.as_ref();
+        }
         self.vars.get(key)
     }
 
     /// Check if key exists.
     pub fn contains_key(&self, key: &str) -> bool {
+        if key == "this" {
+            return self.this_binding.is_some();
+        }
         self.vars.contains_key(key)
     }
 
@@ -4527,11 +4569,8 @@ impl Interpreter {
 
                                     let args = CallArgs::new();
                                     let saved_this = if !ba.is_arrow() && ba.is_strict() {
-                                        let old = frame.global_env.borrow().get("this").cloned();
-                                        frame
-                                            .global_env
-                                            .borrow_mut()
-                                            .insert("this".to_string(), JsValue::Undefined);
+                                        let old = frame.global_env.borrow().get_this().cloned();
+                                        frame.global_env.borrow_mut().set_this(JsValue::Undefined);
                                         old
                                     } else {
                                         None
@@ -4561,13 +4600,10 @@ impl Interpreter {
                                     if !ba.is_arrow() && ba.is_strict() {
                                         match saved_this {
                                             Some(v) => {
-                                                frame
-                                                    .global_env
-                                                    .borrow_mut()
-                                                    .insert("this".to_string(), v);
+                                                frame.global_env.borrow_mut().set_this(v);
                                             }
                                             None => {
-                                                frame.global_env.borrow_mut().remove("this");
+                                                frame.global_env.borrow_mut().remove_this();
                                             }
                                         }
                                     }
@@ -4641,11 +4677,8 @@ impl Interpreter {
                                     frame.pc = pc;
                                     let args: CallArgs = smallvec::smallvec![arg1];
                                     let saved_this = if !ba.is_arrow() && ba.is_strict() {
-                                        let old = frame.global_env.borrow().get("this").cloned();
-                                        frame
-                                            .global_env
-                                            .borrow_mut()
-                                            .insert("this".to_string(), JsValue::Undefined);
+                                        let old = frame.global_env.borrow().get_this().cloned();
+                                        frame.global_env.borrow_mut().set_this(JsValue::Undefined);
                                         old
                                     } else {
                                         None
@@ -4674,13 +4707,10 @@ impl Interpreter {
                                     if !ba.is_arrow() && ba.is_strict() {
                                         match saved_this {
                                             Some(v) => {
-                                                frame
-                                                    .global_env
-                                                    .borrow_mut()
-                                                    .insert("this".to_string(), v);
+                                                frame.global_env.borrow_mut().set_this(v);
                                             }
                                             None => {
-                                                frame.global_env.borrow_mut().remove("this");
+                                                frame.global_env.borrow_mut().remove_this();
                                             }
                                         }
                                     }
@@ -6104,10 +6134,7 @@ pub(super) fn dispatch_call_property(
                     populate_self_name(&mut callee_frame, ba, &JsValue::Function(Rc::clone(ba)));
                     // Arrow functions use lexical `this` — do NOT override.
                     if !ba.is_arrow() {
-                        callee_frame
-                            .global_env
-                            .borrow_mut()
-                            .insert("this".to_string(), this_val);
+                        callee_frame.global_env.borrow_mut().set_this(this_val);
                     }
                     push_call_frame("<anonymous>")?;
                     let gen_before = frame.cache_generation;
@@ -9526,10 +9553,7 @@ fn dispatch_getter(getter: &JsValue, this: &JsValue) -> StatorResult<JsValue> {
                 InterpreterFrame::new(Rc::clone(ba), vec![])
             };
             restore_closure_context(&mut frame, ba);
-            frame
-                .global_env
-                .borrow_mut()
-                .insert("this".to_string(), this.clone());
+            frame.global_env.borrow_mut().set_this(this.clone());
             let result = run_callee(&mut frame);
             pop_call_frame();
             result
@@ -9550,10 +9574,7 @@ pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) ->
                 InterpreterFrame::new(Rc::clone(ba), vec![val])
             };
             restore_closure_context(&mut frame, ba);
-            frame
-                .global_env
-                .borrow_mut()
-                .insert("this".to_string(), this.clone());
+            frame.global_env.borrow_mut().set_this(this.clone());
             let result = run_callee(&mut frame);
             pop_call_frame();
             result?;
@@ -9658,10 +9679,7 @@ pub fn dispatch_call_with_this(
                 } else {
                     this_val
                 };
-                frame
-                    .global_env
-                    .borrow_mut()
-                    .insert("this".to_string(), effective_this);
+                frame.global_env.borrow_mut().set_this(effective_this);
             }
             let result = run_callee(&mut frame);
             pop_call_frame();
@@ -9673,15 +9691,15 @@ pub fn dispatch_call_with_this(
                 .ok_or_else(|| {
                     StatorError::ReferenceError("global environment unavailable".into())
                 })?;
-            let old_this = globals.borrow().get("this").cloned();
-            globals.borrow_mut().insert("this".to_string(), this_val);
+            let old_this = globals.borrow().get_this().cloned();
+            globals.borrow_mut().set_this(this_val);
             let result = f(args.into_vec());
             match old_this {
                 Some(value) => {
-                    globals.borrow_mut().insert("this".to_string(), value);
+                    globals.borrow_mut().set_this(value);
                 }
                 None => {
-                    globals.borrow_mut().remove("this");
+                    globals.borrow_mut().remove_this();
                 }
             }
             result
@@ -9720,10 +9738,7 @@ pub fn dispatch_construct_call(
             restore_closure_context(&mut frame, ba);
             populate_self_name(&mut frame, ba, &JsValue::Function(Rc::clone(ba)));
             frame.new_target = new_target;
-            frame
-                .global_env
-                .borrow_mut()
-                .insert("this".to_string(), this_val);
+            frame.global_env.borrow_mut().set_this(this_val);
             let result = run_callee(&mut frame);
             pop_call_frame();
             result

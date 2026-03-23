@@ -1831,7 +1831,7 @@ fn handle_tail_call(
                         ctx.frame
                             .global_env
                             .borrow_mut()
-                            .insert("this".to_string(), JsValue::Undefined);
+                            .set_this(JsValue::Undefined);
                     }
                     restore_closure_context(ctx.frame, &ba);
                     populate_self_name(ctx.frame, &ba, &JsValue::Function(Rc::clone(&ba)));
@@ -1908,11 +1908,11 @@ fn handle_call_undefined_receiver0(
                     // Arrow functions use lexical `this` — skip override.
                     // Strict mode: `this` is undefined for free function calls.
                     let saved_this = if !ba.is_arrow() && ba.is_strict() {
-                        let old = ctx.frame.global_env.borrow().get("this").cloned();
+                        let old = ctx.frame.global_env.borrow().get_this().cloned();
                         ctx.frame
                             .global_env
                             .borrow_mut()
-                            .insert("this".to_string(), JsValue::Undefined);
+                            .set_this(JsValue::Undefined);
                         old
                     } else {
                         None
@@ -1934,13 +1934,10 @@ fn handle_call_undefined_receiver0(
                     if !ba.is_arrow() && ba.is_strict() {
                         match saved_this {
                             Some(v) => {
-                                ctx.frame
-                                    .global_env
-                                    .borrow_mut()
-                                    .insert("this".to_string(), v);
+                                ctx.frame.global_env.borrow_mut().set_this(v);
                             }
                             None => {
-                                ctx.frame.global_env.borrow_mut().remove("this");
+                                ctx.frame.global_env.borrow_mut().remove_this();
                             }
                         }
                     }
@@ -2014,11 +2011,11 @@ fn handle_call_undefined_receiver1(
                 if !tried_jit {
                     // Arrow functions use lexical `this` — skip override.
                     let saved_this = if !ba.is_arrow() && ba.is_strict() {
-                        let old = ctx.frame.global_env.borrow().get("this").cloned();
+                        let old = ctx.frame.global_env.borrow().get_this().cloned();
                         ctx.frame
                             .global_env
                             .borrow_mut()
-                            .insert("this".to_string(), JsValue::Undefined);
+                            .set_this(JsValue::Undefined);
                         old
                     } else {
                         None
@@ -2040,13 +2037,10 @@ fn handle_call_undefined_receiver1(
                     if !ba.is_arrow() && ba.is_strict() {
                         match saved_this {
                             Some(v) => {
-                                ctx.frame
-                                    .global_env
-                                    .borrow_mut()
-                                    .insert("this".to_string(), v);
+                                ctx.frame.global_env.borrow_mut().set_this(v);
                             }
                             None => {
-                                ctx.frame.global_env.borrow_mut().remove("this");
+                                ctx.frame.global_env.borrow_mut().remove_this();
                             }
                         }
                     }
@@ -2130,11 +2124,11 @@ fn handle_call_undefined_receiver2(
                 if !tried_jit {
                     // Arrow functions use lexical `this` — skip override.
                     let saved_this = if !ba.is_arrow() && ba.is_strict() {
-                        let old = ctx.frame.global_env.borrow().get("this").cloned();
+                        let old = ctx.frame.global_env.borrow().get_this().cloned();
                         ctx.frame
                             .global_env
                             .borrow_mut()
-                            .insert("this".to_string(), JsValue::Undefined);
+                            .set_this(JsValue::Undefined);
                         old
                     } else {
                         None
@@ -2156,13 +2150,10 @@ fn handle_call_undefined_receiver2(
                     if !ba.is_arrow() && ba.is_strict() {
                         match saved_this {
                             Some(v) => {
-                                ctx.frame
-                                    .global_env
-                                    .borrow_mut()
-                                    .insert("this".to_string(), v);
+                                ctx.frame.global_env.borrow_mut().set_this(v);
                             }
                             None => {
-                                ctx.frame.global_env.borrow_mut().remove("this");
+                                ctx.frame.global_env.borrow_mut().remove_this();
                             }
                         }
                     }
@@ -2453,7 +2444,7 @@ fn call_plain_object_function(
                     .frame
                     .global_env
                     .borrow()
-                    .get("this")
+                    .get_this()
                     .cloned()
                     .unwrap_or(JsValue::Undefined);
                 if current_this != JsValue::TheHole {
@@ -2461,10 +2452,7 @@ fn call_plain_object_function(
                         "Super constructor may only be called once".into(),
                     ));
                 }
-                ctx.frame
-                    .global_env
-                    .borrow_mut()
-                    .insert("this".to_string(), pending_this);
+                ctx.frame.global_env.borrow_mut().set_this(pending_this);
             }
             None => {
                 return Err(StatorError::TypeError(
@@ -2530,7 +2518,7 @@ fn construct_class_from_plain_object(
         callee_frame
             .global_env
             .borrow_mut()
-            .insert("this".to_string(), JsValue::TheHole);
+            .set_this(JsValue::TheHole);
         callee_frame
             .global_env
             .borrow_mut()
@@ -2540,7 +2528,7 @@ fn construct_class_from_plain_object(
         callee_frame
             .global_env
             .borrow_mut()
-            .insert("this".to_string(), this_val.clone());
+            .set_this(this_val.clone());
         false
     };
 
@@ -2559,7 +2547,7 @@ fn construct_class_from_plain_object(
             init_frame.new_target = new_target.clone();
             {
                 let mut globals = init_frame.global_env.borrow_mut();
-                globals.insert("this".to_string(), this.clone());
+                globals.set_this(this.clone());
                 globals.insert(
                     ".class_initializer_class".to_string(),
                     JsValue::PlainObject(Rc::clone(class_map)),
@@ -2599,7 +2587,7 @@ fn construct_class_from_plain_object(
         let derived_this = callee_frame
             .global_env
             .borrow()
-            .get("this")
+            .get_this()
             .cloned()
             .unwrap_or(this_val.clone());
         run_field_init(&ctx.frame.global_env, &derived_this)?;
@@ -2657,7 +2645,7 @@ fn handle_construct(
             callee_frame
                 .global_env
                 .borrow_mut()
-                .insert("this".to_string(), this_val.clone());
+                .set_this(this_val.clone());
             push_call_frame("<anonymous>")?;
             let result = run_callee(&mut callee_frame);
             pop_call_frame();
@@ -2763,7 +2751,7 @@ fn handle_construct_with_spread(
             callee_frame
                 .global_env
                 .borrow_mut()
-                .insert("this".to_string(), this_val.clone());
+                .set_this(this_val.clone());
             push_call_frame("<anonymous>")?;
             let result = run_callee(&mut callee_frame);
             pop_call_frame();
@@ -6766,7 +6754,7 @@ fn handle_construct_forward_all_args(
             callee_frame
                 .global_env
                 .borrow_mut()
-                .insert("this".to_string(), this_val.clone());
+                .set_this(this_val.clone());
             push_call_frame("<anonymous>")?;
             let result = run_callee(&mut callee_frame);
             pop_call_frame();
