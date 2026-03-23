@@ -2107,12 +2107,19 @@ impl InterpreterFrame {
     ///
     /// Falls back to [`HotRegisters`] when available.
     ///
+    /// Read a register as an i32 in the SMI loop, handling both
+    /// `Smi(v) → v` and `Boolean(b) → b as i32`.
+    ///
+    /// This is the correct accessor for SMI-loop arithmetic/comparison
+    /// operands because `Star` with `smi_acc_bool = true` may write
+    /// `JsValue::Boolean` into a register.
+    ///
     /// # Safety
     ///
-    /// The caller must ensure `reg` is in bounds **and** currently holds a
-    /// `JsValue::Smi`.
+    /// The caller must ensure `reg` maps to an in-bounds register that
+    /// contains either `JsValue::Smi` or `JsValue::Boolean`.
     #[inline(always)]
-    unsafe fn read_reg_smi_unchecked(&self, reg: u32) -> i32 {
+    unsafe fn read_reg_num_unchecked(&self, reg: u32) -> i32 {
         let signed = reg as i32;
         let idx = if signed >= 0 {
             self.bytecode_array.parameter_count() as usize + signed as usize
@@ -2120,8 +2127,13 @@ impl InterpreterFrame {
             (-(signed + 1)) as usize
         };
         debug_assert!(idx < self.registers.len());
-        // SAFETY: The caller guarantees `reg` maps to an in-bounds Smi register.
-        unsafe { self.registers.get_unchecked(idx).as_smi_unchecked() }
+        // SAFETY: Caller guarantees register is in bounds and holds Smi or Boolean.
+        let val = unsafe { self.registers.get_unchecked(idx) };
+        match val {
+            JsValue::Smi(v) => *v,
+            JsValue::Boolean(b) => *b as i32,
+            _ => unsafe { std::hint::unreachable_unchecked() },
+        }
     }
 
     /// Compute the flat index for a register operand without bounds checks.
@@ -2617,6 +2629,12 @@ impl Interpreter {
                 // Unsupported opcodes break out, convert back to
                 // JsValue, and let the regular match handle them.
                 if frame.smi_mode {
+                    // The 'dispatch loop header already consumed one
+                    // instruction (read + pc += 1).  Back up so the SMI
+                    // loop processes ALL loop-body instructions starting
+                    // from the one the outer loop consumed.
+                    pc -= 1;
+
                     // Extract the raw i32 accumulator.  The JumpLoop handler
                     // converts Boolean→Smi before setting smi_mode, but guard
                     // against Boolean anyway (defensive).
@@ -2705,7 +2723,7 @@ impl Interpreter {
                             }
                             Opcode::Add => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_smi_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
                                 smi_acc_bool = false;
                                 match sa.checked_add(b) {
                                     Some(r) => sa = r,
@@ -2732,7 +2750,7 @@ impl Interpreter {
                             }
                             Opcode::Sub => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_smi_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
                                 smi_acc_bool = false;
                                 match sa.checked_sub(b) {
                                     Some(r) => sa = r,
@@ -2759,7 +2777,7 @@ impl Interpreter {
                             }
                             Opcode::Mul => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_smi_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
                                 smi_acc_bool = false;
                                 match sa.checked_mul(b) {
                                     Some(r) => sa = r,
@@ -2786,7 +2804,7 @@ impl Interpreter {
                             }
                             Opcode::Div => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_smi_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
                                 smi_acc_bool = false;
                                 if b != 0 && sa % b == 0 {
                                     sa /= b;
@@ -2800,7 +2818,7 @@ impl Interpreter {
                             }
                             Opcode::Mod => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_smi_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
                                 smi_acc_bool = false;
                                 if b != 0 {
                                     sa %= b;
@@ -2825,7 +2843,7 @@ impl Interpreter {
                             }
                             Opcode::BitwiseOr => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                sa |= unsafe { frame.read_reg_smi_unchecked(reg) };
+                                sa |= unsafe { frame.read_reg_num_unchecked(reg) };
                                 smi_acc_bool = false;
                             }
                             Opcode::BitwiseOrSmi => {
@@ -2834,7 +2852,7 @@ impl Interpreter {
                             }
                             Opcode::BitwiseAnd => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                sa &= unsafe { frame.read_reg_smi_unchecked(reg) };
+                                sa &= unsafe { frame.read_reg_num_unchecked(reg) };
                                 smi_acc_bool = false;
                             }
                             Opcode::BitwiseAndSmi => {
@@ -2843,7 +2861,7 @@ impl Interpreter {
                             }
                             Opcode::BitwiseXor => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                sa ^= unsafe { frame.read_reg_smi_unchecked(reg) };
+                                sa ^= unsafe { frame.read_reg_num_unchecked(reg) };
                                 smi_acc_bool = false;
                             }
                             Opcode::BitwiseXorSmi => {
@@ -2856,7 +2874,7 @@ impl Interpreter {
                             }
                             Opcode::ShiftLeft => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_smi_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
                                 sa <<= (b as u32) & 0x1f;
                                 smi_acc_bool = false;
                             }
@@ -2867,7 +2885,7 @@ impl Interpreter {
                             }
                             Opcode::ShiftRight => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_smi_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
                                 sa >>= (b as u32) & 0x1f;
                                 smi_acc_bool = false;
                             }
@@ -2879,7 +2897,7 @@ impl Interpreter {
                             Opcode::ShiftRightLogical | Opcode::ShiftRightLogicalSmi => {
                                 let b = if instr.opcode == Opcode::ShiftRightLogical {
                                     let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                    unsafe { frame.read_reg_smi_unchecked(reg) }
+                                    unsafe { frame.read_reg_num_unchecked(reg) }
                                 } else {
                                     unsafe { operand_imm_unchecked(instr, 0) }
                                 };
@@ -2933,15 +2951,14 @@ impl Interpreter {
                             Opcode::TestLessThan
                             | Opcode::TestGreaterThan
                             | Opcode::TestEqual
-                            | Opcode::TestEqualStrict
                             | Opcode::TestLessThanOrEqual
                             | Opcode::TestGreaterThanOrEqual => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_smi_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
                                 let cmp = match instr.opcode {
                                     Opcode::TestLessThan => sa < b,
                                     Opcode::TestGreaterThan => sa > b,
-                                    Opcode::TestEqual | Opcode::TestEqualStrict => sa == b,
+                                    Opcode::TestEqual => sa == b,
                                     Opcode::TestLessThanOrEqual => sa <= b,
                                     Opcode::TestGreaterThanOrEqual => sa >= b,
                                     _ => unsafe { std::hint::unreachable_unchecked() },
@@ -2980,9 +2997,50 @@ impl Interpreter {
                                 frame.loop_end_pc = 0;
                                 break 'smi;
                             }
+                            Opcode::TestEqualStrict => {
+                                // Strict equality requires same type: Smi===Smi
+                                // or Boolean===Boolean.  Mixed types → always
+                                // false.
+                                let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                let rhs = unsafe { frame.read_reg_unchecked(reg) };
+                                let cmp = match (smi_acc_bool, rhs) {
+                                    (false, JsValue::Smi(b)) => sa == *b,
+                                    (true, JsValue::Boolean(b)) => (sa != 0) == *b,
+                                    _ => false,
+                                };
+                                if let Some(next) = instructions.get(pc) {
+                                    match next.opcode {
+                                        Opcode::JumpIfTrue | Opcode::JumpIfToBooleanTrue => {
+                                            if cmp {
+                                                pc = unsafe {
+                                                    resolve_jump_unchecked(pc + 1, jump_targets)
+                                                };
+                                            } else {
+                                                pc += 1;
+                                            }
+                                            continue 'smi;
+                                        }
+                                        Opcode::JumpIfFalse | Opcode::JumpIfToBooleanFalse => {
+                                            if !cmp {
+                                                pc = unsafe {
+                                                    resolve_jump_unchecked(pc + 1, jump_targets)
+                                                };
+                                            } else {
+                                                pc += 1;
+                                            }
+                                            continue 'smi;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                acc = JsValue::Boolean(cmp);
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                break 'smi;
+                            }
                             Opcode::TestNotEqual => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_smi_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
                                 let cmp = sa != b;
                                 if let Some(next) = instructions.get(pc) {
                                     match next.opcode {
@@ -3033,7 +3091,13 @@ impl Interpreter {
                                 let loop_end = pc;
                                 pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
                                 frame.osr_loop_count = frame.osr_loop_count.saturating_add(1);
-                                frame.loop_end_pc = loop_end;
+                                // Only EXPAND loop_end_pc — never shrink it.
+                                // Nested loops have smaller loop_end values;
+                                // shrinking would cause the outer loop to
+                                // exit SMI mode prematurely.
+                                if loop_end > frame.loop_end_pc {
+                                    frame.loop_end_pc = loop_end;
+                                }
                                 frame.instructions_executed += (loop_end - pc) as u64;
                                 if frame.instruction_limit > 0
                                     && frame.instructions_executed > frame.instruction_limit
@@ -4517,6 +4581,7 @@ impl Interpreter {
                     Opcode::JumpLoop => {
                         // SAFETY: Bytecode compiler guarantees all JumpLoop
                         // instructions have pre-computed targets.
+                        let loop_end = pc; // Position after this JumpLoop
                         pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
                         frame.osr_loop_count = frame.osr_loop_count.saturating_add(1);
                         if frame.osr_loop_count >= OSR_LOOP_THRESHOLD
@@ -4557,6 +4622,10 @@ impl Interpreter {
                                     acc = JsValue::Smi(*b as i32);
                                 }
                                 frame.smi_mode = true;
+                                // Tell the SMI loop where the loop body ends
+                                // so it can detect when execution flows past
+                                // the back-edge (e.g. loop exit).
+                                frame.loop_end_pc = loop_end;
                                 if frame.hot_registers.is_none() {
                                     frame.hot_registers =
                                         Some(HotRegisters::new(frame.registers.len()));
