@@ -37,10 +37,12 @@ jobs:
       - name: Run benchmarks
         run: |
           echo "=== System Resources ==="
-          free -h || true
-          df -h . || true
-          echo "=== Starting cargo bench ==="
-          timeout 1200 cargo bench --package stator_core 2>&1 || echo "cargo bench exit code: $?"
+          free -h
+          df -h .
+          echo "=== Running precompiled benchmarks (interpreter-only) ==="
+          cargo bench --package stator_core -- _precompiled
+          echo "=== Running V8-comparison benchmarks ==="
+          cargo bench --package stator_core -- "v8_comparison_benches"
 
       - name: Run V8 (Node.js) comparison benchmarks
         run: |
