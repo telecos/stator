@@ -2150,9 +2150,6 @@ impl InterpreterFrame {
     #[inline(always)]
     fn write_reg(&mut self, v: u32, value: JsValue) -> StatorResult<()> {
         let idx = self.reg_index(v)?;
-        if let Some(ref mut hr) = self.hot_registers {
-            hr.try_write(idx, &value);
-        }
         self.registers[idx] = value;
         Ok(())
     }
@@ -2172,9 +2169,6 @@ impl InterpreterFrame {
             (-(signed + 1)) as usize
         };
         debug_assert!(idx < self.registers.len());
-        if let Some(ref mut hr) = self.hot_registers {
-            hr.try_write(idx, &value);
-        }
         // SAFETY: The caller guarantees `reg` maps to an in-bounds register.
         *unsafe { self.registers.get_unchecked_mut(idx) } = value;
     }
@@ -2188,9 +2182,6 @@ impl InterpreterFrame {
         let dst_idx = self.reg_index(dst)?;
         if src_idx != dst_idx {
             let val = self.registers[src_idx].cheap_clone();
-            if let Some(ref mut hr) = self.hot_registers {
-                hr.try_write(dst_idx, &val);
-            }
             self.registers[dst_idx] = val;
         }
         Ok(())
@@ -4058,10 +4049,7 @@ impl Interpreter {
                                 acc = JsValue::Smi(*a | *b);
                                 // Re-enter SMI mode if we recently exited
                                 // (common pattern: `(expr) | 0` coerces back to int)
-                                if !frame.smi_mode
-                                    && !frame.loop_trip_counts.is_empty()
-                                    && frame.hot_registers.is_some()
-                                {
+                                if !frame.smi_mode && !frame.loop_trip_counts.is_empty() {
                                     frame.smi_mode = true;
                                     continue 'dispatch;
                                 }
@@ -4103,10 +4091,7 @@ impl Interpreter {
                         {
                             acc = JsValue::Smi(n | imm);
                             // Re-enter SMI mode if we recently exited
-                            if !frame.smi_mode
-                                && !frame.loop_trip_counts.is_empty()
-                                && frame.hot_registers.is_some()
-                            {
+                            if !frame.smi_mode && !frame.loop_trip_counts.is_empty() {
                                 frame.smi_mode = true;
                             }
                             continue 'dispatch;
