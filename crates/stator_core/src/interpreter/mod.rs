@@ -3696,6 +3696,17 @@ impl Interpreter {
                     Opcode::Nop => {
                         continue 'dispatch;
                     }
+                    // ── Array creation (inline, no table dispatch) ──
+                    Opcode::CreateEmptyArrayLiteral | Opcode::CreateArrayLiteral => {
+                        acc = JsValue::Array(Rc::new(RefCell::new(Vec::new())));
+                        continue 'dispatch;
+                    }
+                    Opcode::CreateEmptyObjectLiteral => {
+                        acc = JsValue::PlainObject(Rc::new(RefCell::new(
+                            PropertyMap::with_capacity(4),
+                        )));
+                        continue 'dispatch;
+                    }
                     Opcode::Mov => {
                         // SAFETY: Bytecode generator guarantees operand[0]
                         // and operand[1] are Register, and both are in bounds.
