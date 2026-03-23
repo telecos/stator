@@ -4041,17 +4041,33 @@ impl Interpreter {
                             }
                         }
                     }
-                    // ── BitwiseOr (Smi fast path) ────────────
+                    // ── BitwiseOr (Smi fast path + HeapNumber→Smi coercion) ──
                     Opcode::BitwiseOr => {
                         if let Operand::Register(v) = instr.operands[0] {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
+                            // Fast path: Smi | Smi
                             if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
                                 acc = JsValue::Smi(*a | *b);
                                 // Re-enter SMI mode if we recently exited
                                 // (common pattern: `(expr) | 0` coerces back to int)
                                 if !frame.smi_mode && !frame.loop_trip_counts.is_empty() {
                                     frame.smi_mode = true;
-                                    continue 'dispatch;
+                                }
+                                continue 'dispatch;
+                            }
+                            // HeapNumber | Smi — common after float division: `(a/b) | 0`
+                            if let (JsValue::HeapNumber(a), JsValue::Smi(b)) = (&acc, rhs) {
+                                acc = JsValue::Smi((*a as i32) | *b);
+                                if !frame.smi_mode && !frame.loop_trip_counts.is_empty() {
+                                    frame.smi_mode = true;
+                                }
+                                continue 'dispatch;
+                            }
+                            // Smi | HeapNumber
+                            if let (JsValue::Smi(a), JsValue::HeapNumber(b)) = (&acc, rhs) {
+                                acc = JsValue::Smi(*a | (*b as i32));
+                                if !frame.smi_mode && !frame.loop_trip_counts.is_empty() {
+                                    frame.smi_mode = true;
                                 }
                                 continue 'dispatch;
                             }
@@ -4086,15 +4102,24 @@ impl Interpreter {
                         }
                     }
                     Opcode::BitwiseOrSmi => {
-                        if let Operand::Immediate(imm) = instr.operands[0]
-                            && let JsValue::Smi(n) = acc
-                        {
-                            acc = JsValue::Smi(n | imm);
-                            // Re-enter SMI mode if we recently exited
-                            if !frame.smi_mode && !frame.loop_trip_counts.is_empty() {
-                                frame.smi_mode = true;
+                        if let Operand::Immediate(imm) = instr.operands[0] {
+                            match acc {
+                                JsValue::Smi(n) => {
+                                    acc = JsValue::Smi(n | imm);
+                                    if !frame.smi_mode && !frame.loop_trip_counts.is_empty() {
+                                        frame.smi_mode = true;
+                                    }
+                                    continue 'dispatch;
+                                }
+                                JsValue::HeapNumber(n) => {
+                                    acc = JsValue::Smi((n as i32) | imm);
+                                    if !frame.smi_mode && !frame.loop_trip_counts.is_empty() {
+                                        frame.smi_mode = true;
+                                    }
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
-                            continue 'dispatch;
                         }
                         frame.pc = pc;
                         frame.accumulator = acc;
