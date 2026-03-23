@@ -1369,7 +1369,10 @@ pub struct ProtoLoadIc {
 pub type CallArgs = SmallVec<[JsValue; 4]>;
 
 /// Register files with up to this many slots stay inline in the frame.
-pub const SMALL_REG_THRESHOLD: usize = 32;
+/// 16 slots (384 bytes) covers the vast majority of closures and small
+/// functions while keeping `InterpreterFrame` compact.  Larger register
+/// files spill to the thread-local register pool.
+pub const SMALL_REG_THRESHOLD: usize = 16;
 
 /// Inline-buffered register storage for interpreter frames.
 pub type RegisterFile = SmallVec<[JsValue; SMALL_REG_THRESHOLD]>;

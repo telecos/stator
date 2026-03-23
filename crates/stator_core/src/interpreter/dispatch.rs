@@ -1454,16 +1454,16 @@ fn handle_jump_loop(
     };
     ctx.frame.pc = resolve_cached_jump(ctx, "JumpLoop")?;
     ctx.frame.osr_loop_count = ctx.frame.osr_loop_count.saturating_add(1);
-    if ctx.frame.osr_loop_count >= OSR_LOOP_THRESHOLD
-        && ctx.frame.bytecode_array.try_get_jit_code().is_none()
-    {
-        maybe_compile_baseline(&ctx.frame.bytecode_array);
-    }
-    if ctx.frame.osr_loop_count >= MAGLEV_OSR_LOOP_THRESHOLD {
-        maybe_compile_maglev(&ctx.frame.bytecode_array);
-    }
-    if ctx.frame.osr_loop_count >= TURBOFAN_OSR_LOOP_THRESHOLD {
-        maybe_compile_turbofan(&ctx.frame.bytecode_array);
+    if ctx.frame.osr_loop_count >= OSR_LOOP_THRESHOLD {
+        if ctx.frame.bytecode_array.try_get_jit_code().is_none() {
+            maybe_compile_baseline(&ctx.frame.bytecode_array);
+        }
+        if ctx.frame.osr_loop_count >= MAGLEV_OSR_LOOP_THRESHOLD {
+            maybe_compile_maglev(&ctx.frame.bytecode_array);
+        }
+        if ctx.frame.osr_loop_count >= TURBOFAN_OSR_LOOP_THRESHOLD {
+            maybe_compile_turbofan(&ctx.frame.bytecode_array);
+        }
     }
     Ok(DispatchAction::Continue)
 }
@@ -1678,40 +1678,39 @@ fn handle_call_any_receiver(
                 ctx.frame.accumulator = Interpreter::run_async_function(Rc::clone(&ba), args)?;
             } else {
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                // ── Tiering ──────────────────────────────────
+                // ── Tiering (cold path: gated on reaching baseline threshold) ──
                 let count = ba.increment_invocation_count();
-                if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
-                    maybe_compile_baseline(&ba);
-                }
-                if count >= MAGLEV_TIERING_THRESHOLD {
-                    maybe_compile_maglev(&ba);
-                }
-                if count >= TURBOFAN_TIERING_THRESHOLD {
-                    maybe_compile_turbofan(&ba);
-                }
-                let mut tried_jit = false;
-                if let Some(jit_result) = try_execute_best_jit(&ba, &args) {
-                    ctx.frame.accumulator = jit_result?;
-                    tried_jit = true;
-                }
-                if !tried_jit {
-                    let callee_val = JsValue::Function(Rc::clone(&ba));
-                    let mut callee_frame = InterpreterFrame::new_callee_frame(
-                        Rc::clone(&ba),
-                        args,
-                        Rc::clone(&ctx.frame.global_env),
-                    );
-                    restore_closure_context(&mut callee_frame, &ba);
-                    if ba.is_arrow() && ba.has_fn_props() {
-                        callee_frame.new_target = fn_props_get(&ba, ".new_target");
+                if count >= TIERING_THRESHOLD {
+                    if ba.try_get_jit_code().is_none() {
+                        maybe_compile_baseline(&ba);
                     }
-                    populate_self_name(&mut callee_frame, &ba, &callee_val);
-                    push_call_frame("<anonymous>")?;
-                    let result = run_callee(&mut callee_frame);
-                    pop_call_frame();
-                    ctx.frame.global_cache_invalidate();
-                    ctx.frame.accumulator = result?;
+                    if count >= MAGLEV_TIERING_THRESHOLD {
+                        maybe_compile_maglev(&ba);
+                    }
+                    if count >= TURBOFAN_TIERING_THRESHOLD {
+                        maybe_compile_turbofan(&ba);
+                    }
+                    if let Some(jit_result) = try_execute_best_jit(&ba, &args) {
+                        ctx.frame.accumulator = jit_result?;
+                        return Ok(DispatchAction::Continue);
+                    }
                 }
+                let callee_val = JsValue::Function(Rc::clone(&ba));
+                let mut callee_frame = InterpreterFrame::new_callee_frame(
+                    Rc::clone(&ba),
+                    args,
+                    Rc::clone(&ctx.frame.global_env),
+                );
+                restore_closure_context(&mut callee_frame, &ba);
+                if ba.is_arrow() && ba.has_fn_props() {
+                    callee_frame.new_target = fn_props_get(&ba, ".new_target");
+                }
+                populate_self_name(&mut callee_frame, &ba, &callee_val);
+                push_call_frame("<anonymous>")?;
+                let result = run_callee(&mut callee_frame);
+                pop_call_frame();
+                ctx.frame.global_cache_invalidate();
+                ctx.frame.accumulator = result?;
             }
         }
         JsValue::NativeFunction(f) => {
@@ -1779,71 +1778,70 @@ fn handle_tail_call(
                 }
             } else {
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                // ── Tiering ──────────────────────────────
+                // ── Tiering (cold path: gated on reaching baseline threshold) ──
                 let count = ba.increment_invocation_count();
-                if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
-                    maybe_compile_baseline(&ba);
-                }
-                if count >= MAGLEV_TIERING_THRESHOLD {
-                    maybe_compile_maglev(&ba);
-                }
-                if count >= TURBOFAN_TIERING_THRESHOLD {
-                    maybe_compile_turbofan(&ba);
-                }
-                let mut tried_jit = false;
-                if let Some(jit_result) = try_execute_best_jit(&ba, &args) {
-                    ctx.frame.accumulator = jit_result?;
-                    tried_jit = true;
-                }
-                if !tried_jit {
-                    // ── Proper tail call: reuse the frame ─
-                    let param_count = ba.parameter_count() as usize;
-                    let frame_size = ba.frame_size() as usize;
-                    let total_regs = param_count + frame_size;
-                    let inherited_new_target = ctx.frame.new_target.clone();
-                    ctx.frame.bytecode_array = Rc::clone(&ba);
-                    ctx.frame.call_args = args;
-                    ctx.frame.registers.clear();
-                    ctx.frame.registers.resize(total_regs, JsValue::Undefined);
-                    for (i, arg) in ctx
-                        .frame
-                        .call_args
-                        .iter()
-                        .cloned()
-                        .enumerate()
-                        .take(param_count)
-                    {
-                        ctx.frame.registers[i] = arg;
+                if count >= TIERING_THRESHOLD {
+                    if ba.try_get_jit_code().is_none() {
+                        maybe_compile_baseline(&ba);
                     }
-                    ctx.frame.accumulator = JsValue::Undefined;
-                    ctx.frame.pc = 0;
-                    ctx.frame.context = None;
-                    ctx.frame.suspend_result = None;
-                    ctx.frame.generator_state = None;
-                    ctx.frame.osr_loop_count = 0;
-                    ctx.frame.pending_message = JsValue::Undefined;
-                    ctx.frame.new_target = if ba.is_arrow() {
-                        inherited_new_target
-                    } else {
-                        JsValue::Undefined
-                    };
-                    if !ba.is_arrow() && ba.is_strict() {
-                        ctx.frame
-                            .global_env
-                            .borrow_mut()
-                            .set_this(JsValue::Undefined);
+                    if count >= MAGLEV_TIERING_THRESHOLD {
+                        maybe_compile_maglev(&ba);
                     }
-                    restore_closure_context(ctx.frame, &ba);
-                    populate_self_name(ctx.frame, &ba, &JsValue::Function(Rc::clone(&ba)));
-                    ctx.frame.string_cache = None;
-                    ctx.frame.mono_load_cache = None;
-                    ctx.frame.poly_load_cache = None;
-                    ctx.frame.mega_load_ic = None;
-                    ctx.frame.proto_load_ic = None;
-                    ctx.frame.mega_store_ic = None;
-                    ctx.frame.global_cache_invalidate();
-                    return Ok(DispatchAction::TailCall);
+                    if count >= TURBOFAN_TIERING_THRESHOLD {
+                        maybe_compile_turbofan(&ba);
+                    }
+                    if let Some(jit_result) = try_execute_best_jit(&ba, &args) {
+                        ctx.frame.accumulator = jit_result?;
+                        return Ok(DispatchAction::Continue);
+                    }
                 }
+                // ── Proper tail call: reuse the frame ─
+                let param_count = ba.parameter_count() as usize;
+                let frame_size = ba.frame_size() as usize;
+                let total_regs = param_count + frame_size;
+                let inherited_new_target = ctx.frame.new_target.clone();
+                ctx.frame.bytecode_array = Rc::clone(&ba);
+                ctx.frame.call_args = args;
+                ctx.frame.registers.clear();
+                ctx.frame.registers.resize(total_regs, JsValue::Undefined);
+                for (i, arg) in ctx
+                    .frame
+                    .call_args
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .take(param_count)
+                {
+                    ctx.frame.registers[i] = arg;
+                }
+                ctx.frame.accumulator = JsValue::Undefined;
+                ctx.frame.pc = 0;
+                ctx.frame.context = None;
+                ctx.frame.suspend_result = None;
+                ctx.frame.generator_state = None;
+                ctx.frame.osr_loop_count = 0;
+                ctx.frame.pending_message = JsValue::Undefined;
+                ctx.frame.new_target = if ba.is_arrow() {
+                    inherited_new_target
+                } else {
+                    JsValue::Undefined
+                };
+                if !ba.is_arrow() && ba.is_strict() {
+                    ctx.frame
+                        .global_env
+                        .borrow_mut()
+                        .set_this(JsValue::Undefined);
+                }
+                restore_closure_context(ctx.frame, &ba);
+                populate_self_name(ctx.frame, &ba, &JsValue::Function(Rc::clone(&ba)));
+                ctx.frame.string_cache = None;
+                ctx.frame.mono_load_cache = None;
+                ctx.frame.poly_load_cache = None;
+                ctx.frame.mega_load_ic = None;
+                ctx.frame.proto_load_ic = None;
+                ctx.frame.mega_store_ic = None;
+                ctx.frame.global_cache_invalidate();
+                return Ok(DispatchAction::TailCall);
             }
         }
         JsValue::NativeFunction(f) => {
@@ -1890,60 +1888,60 @@ fn handle_call_undefined_receiver0(
                     Interpreter::run_async_function(Rc::clone(&ba), CallArgs::new())?;
             } else {
                 let args = CallArgs::new();
+                // ── Tiering (cold path: gated on reaching baseline threshold) ──
                 let count = ba.increment_invocation_count();
-                if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
-                    maybe_compile_baseline(&ba);
-                }
-                if count >= MAGLEV_TIERING_THRESHOLD {
-                    maybe_compile_maglev(&ba);
-                }
-                if count >= TURBOFAN_TIERING_THRESHOLD {
-                    maybe_compile_turbofan(&ba);
-                }
-                let mut tried_jit = false;
-                if let Some(jit_result) = try_execute_best_jit(&ba, &args) {
-                    ctx.frame.accumulator = jit_result?;
-                    tried_jit = true;
-                }
-                if !tried_jit {
-                    // Arrow functions use lexical `this` — skip override.
-                    // Strict mode: `this` is undefined for free function calls.
-                    let saved_this = if !ba.is_arrow() && ba.is_strict() {
-                        let old = ctx.frame.global_env.borrow().get_this().cloned();
-                        ctx.frame
-                            .global_env
-                            .borrow_mut()
-                            .set_this(JsValue::Undefined);
-                        old
-                    } else {
-                        None
-                    };
-                    let mut callee_frame = InterpreterFrame::new_callee_frame(
-                        Rc::clone(&ba),
-                        args,
-                        Rc::clone(&ctx.frame.global_env),
-                    );
-                    restore_closure_context(&mut callee_frame, &ba);
-                    if ba.is_arrow() && ba.has_fn_props() {
-                        callee_frame.new_target = fn_props_get(&ba, ".new_target");
+                if count >= TIERING_THRESHOLD {
+                    if ba.try_get_jit_code().is_none() {
+                        maybe_compile_baseline(&ba);
                     }
-                    populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
-                    push_call_frame("<anonymous>")?;
-                    let result = run_callee(&mut callee_frame);
-                    pop_call_frame();
-                    ctx.frame.global_cache_invalidate();
-                    if !ba.is_arrow() && ba.is_strict() {
-                        match saved_this {
-                            Some(v) => {
-                                ctx.frame.global_env.borrow_mut().set_this(v);
-                            }
-                            None => {
-                                ctx.frame.global_env.borrow_mut().remove_this();
-                            }
+                    if count >= MAGLEV_TIERING_THRESHOLD {
+                        maybe_compile_maglev(&ba);
+                    }
+                    if count >= TURBOFAN_TIERING_THRESHOLD {
+                        maybe_compile_turbofan(&ba);
+                    }
+                    if let Some(jit_result) = try_execute_best_jit(&ba, &args) {
+                        ctx.frame.accumulator = jit_result?;
+                        return Ok(DispatchAction::Continue);
+                    }
+                }
+                // Arrow functions use lexical `this` — skip override.
+                // Strict mode: `this` is undefined for free function calls.
+                let saved_this = if !ba.is_arrow() && ba.is_strict() {
+                    let old = ctx.frame.global_env.borrow().get_this().cloned();
+                    ctx.frame
+                        .global_env
+                        .borrow_mut()
+                        .set_this(JsValue::Undefined);
+                    old
+                } else {
+                    None
+                };
+                let mut callee_frame = InterpreterFrame::new_callee_frame(
+                    Rc::clone(&ba),
+                    args,
+                    Rc::clone(&ctx.frame.global_env),
+                );
+                restore_closure_context(&mut callee_frame, &ba);
+                if ba.is_arrow() && ba.has_fn_props() {
+                    callee_frame.new_target = fn_props_get(&ba, ".new_target");
+                }
+                populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
+                push_call_frame("<anonymous>")?;
+                let result = run_callee(&mut callee_frame);
+                pop_call_frame();
+                ctx.frame.global_cache_invalidate();
+                if !ba.is_arrow() && ba.is_strict() {
+                    match saved_this {
+                        Some(v) => {
+                            ctx.frame.global_env.borrow_mut().set_this(v);
+                        }
+                        None => {
+                            ctx.frame.global_env.borrow_mut().remove_this();
                         }
                     }
-                    ctx.frame.accumulator = result?;
                 }
+                ctx.frame.accumulator = result?;
             }
         }
         JsValue::NativeFunction(f) => {
@@ -1994,59 +1992,59 @@ fn handle_call_undefined_receiver1(
             } else {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
                 let args: CallArgs = smallvec![arg1];
+                // ── Tiering (cold path: gated on reaching baseline threshold) ──
                 let count = ba.increment_invocation_count();
-                if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
-                    maybe_compile_baseline(&ba);
-                }
-                if count >= MAGLEV_TIERING_THRESHOLD {
-                    maybe_compile_maglev(&ba);
-                }
-                if count >= TURBOFAN_TIERING_THRESHOLD {
-                    maybe_compile_turbofan(&ba);
-                }
-                let mut tried_jit = false;
-                if let Some(jit_result) = try_execute_best_jit(&ba, &args) {
-                    ctx.frame.accumulator = jit_result?;
-                    tried_jit = true;
-                }
-                if !tried_jit {
-                    // Arrow functions use lexical `this` — skip override.
-                    let saved_this = if !ba.is_arrow() && ba.is_strict() {
-                        let old = ctx.frame.global_env.borrow().get_this().cloned();
-                        ctx.frame
-                            .global_env
-                            .borrow_mut()
-                            .set_this(JsValue::Undefined);
-                        old
-                    } else {
-                        None
-                    };
-                    let mut callee_frame = InterpreterFrame::new_callee_frame(
-                        Rc::clone(&ba),
-                        args,
-                        Rc::clone(&ctx.frame.global_env),
-                    );
-                    restore_closure_context(&mut callee_frame, &ba);
-                    if ba.is_arrow() && ba.has_fn_props() {
-                        callee_frame.new_target = fn_props_get(&ba, ".new_target");
+                if count >= TIERING_THRESHOLD {
+                    if ba.try_get_jit_code().is_none() {
+                        maybe_compile_baseline(&ba);
                     }
-                    populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
-                    push_call_frame("<anonymous>")?;
-                    let result = run_callee(&mut callee_frame);
-                    pop_call_frame();
-                    ctx.frame.global_cache_invalidate();
-                    if !ba.is_arrow() && ba.is_strict() {
-                        match saved_this {
-                            Some(v) => {
-                                ctx.frame.global_env.borrow_mut().set_this(v);
-                            }
-                            None => {
-                                ctx.frame.global_env.borrow_mut().remove_this();
-                            }
+                    if count >= MAGLEV_TIERING_THRESHOLD {
+                        maybe_compile_maglev(&ba);
+                    }
+                    if count >= TURBOFAN_TIERING_THRESHOLD {
+                        maybe_compile_turbofan(&ba);
+                    }
+                    if let Some(jit_result) = try_execute_best_jit(&ba, &args) {
+                        ctx.frame.accumulator = jit_result?;
+                        return Ok(DispatchAction::Continue);
+                    }
+                }
+                // Arrow functions use lexical `this` — skip override.
+                let saved_this = if !ba.is_arrow() && ba.is_strict() {
+                    let old = ctx.frame.global_env.borrow().get_this().cloned();
+                    ctx.frame
+                        .global_env
+                        .borrow_mut()
+                        .set_this(JsValue::Undefined);
+                    old
+                } else {
+                    None
+                };
+                let mut callee_frame = InterpreterFrame::new_callee_frame(
+                    Rc::clone(&ba),
+                    args,
+                    Rc::clone(&ctx.frame.global_env),
+                );
+                restore_closure_context(&mut callee_frame, &ba);
+                if ba.is_arrow() && ba.has_fn_props() {
+                    callee_frame.new_target = fn_props_get(&ba, ".new_target");
+                }
+                populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
+                push_call_frame("<anonymous>")?;
+                let result = run_callee(&mut callee_frame);
+                pop_call_frame();
+                ctx.frame.global_cache_invalidate();
+                if !ba.is_arrow() && ba.is_strict() {
+                    match saved_this {
+                        Some(v) => {
+                            ctx.frame.global_env.borrow_mut().set_this(v);
+                        }
+                        None => {
+                            ctx.frame.global_env.borrow_mut().remove_this();
                         }
                     }
-                    ctx.frame.accumulator = result?;
                 }
+                ctx.frame.accumulator = result?;
             }
         }
         JsValue::NativeFunction(f) => {
