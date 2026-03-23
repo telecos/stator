@@ -1845,10 +1845,6 @@ pub struct InterpreterFrame {
     /// NaN-boxed hot register cache (8 bytes per slot vs 24 bytes for JsValue).
     /// Mirrors the regular register file for values that can be NaN-boxed.
     pub hot_registers: HotRegisters,
-    /// NaN-boxed accumulator for SMI mode.  Avoids constructing a full
-    /// `JsValue::Smi` on every arithmetic operation inside tight loops.
-    /// Only valid when `smi_mode` is true.
-    pub hot_accumulator: NanBoxedValue,
     /// When non-zero, the dispatch loop is inside a validated loop body.
     /// The value is the instruction index one past the `JumpLoop` — we
     /// skip the bounds check for every PC strictly below this point
@@ -1925,7 +1921,6 @@ impl InterpreterFrame {
             cache_generation: 0,
             smi_mode: false,
             hot_registers: HotRegisters::new(total_regs),
-            hot_accumulator: NanBoxedValue::undefined(),
             loop_end_pc: 0,
             loop_trip_counts: Vec::new(),
         }
@@ -2021,7 +2016,6 @@ impl InterpreterFrame {
             cache_generation: 0,
             smi_mode: false,
             hot_registers: HotRegisters::new(total_regs),
-            hot_accumulator: NanBoxedValue::undefined(),
             loop_end_pc: 0,
             loop_trip_counts: Vec::new(),
         }
@@ -2301,12 +2295,6 @@ impl InterpreterFrame {
         self.global_cache_put(name, value);
     }
 
-    #[inline(always)]
-    pub(super) fn sync_hot_accumulator(&mut self, value: &JsValue) {
-        self.hot_accumulator =
-            HotRegisters::try_encode(value).unwrap_or(NanBoxedValue::undefined());
-    }
-
     /// Try to read a global from the per-frame direct-mapped cache.
     ///
     /// Returns `None` when the cache is stale (another frame mutated
@@ -2510,7 +2498,6 @@ impl Interpreter {
                                     // is Immediate for LdaSmi.
                                     let val = unsafe { operand_imm_unchecked(instr, 0) };
                                     acc = JsValue::Smi(val);
-                                    frame.hot_accumulator = NanBoxedValue::from_smi(val);
                                     continue 'dispatch;
                                 }
                                 Opcode::LdaGlobal => {
@@ -2521,12 +2508,9 @@ impl Interpreter {
                                     let name = frame.get_string_constant(name_idx)?;
                                     let value = frame.load_global(name.as_ref())?;
                                     acc = value;
-                                    if let JsValue::Smi(val) = acc {
-                                        frame.hot_accumulator = NanBoxedValue::from_smi(val);
-                                    } else {
+                                    if !matches!(acc, JsValue::Smi(_)) {
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
-                                        frame.sync_hot_accumulator(&acc);
                                     }
                                     continue 'dispatch;
                                 }
@@ -2554,8 +2538,6 @@ impl Interpreter {
                                         let val = unsafe { frame.read_reg_unchecked(reg) };
                                         acc = val.cheap_clone();
                                     }
-                                    frame.hot_accumulator = HotRegisters::try_encode(&acc)
-                                        .unwrap_or(NanBoxedValue::undefined());
                                     continue 'dispatch;
                                 }
                                 Opcode::Add | Opcode::AddSmi => {
@@ -2579,7 +2561,6 @@ impl Interpreter {
                                     match a.checked_add(b) {
                                         Some(result) => {
                                             acc = JsValue::Smi(result);
-                                            frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                         }
                                         None => {
                                             // Overflow — exit SMI mode.
@@ -2587,7 +2568,6 @@ impl Interpreter {
                                             frame.loop_end_pc = 0;
                                             let f = (a as f64) + (b as f64);
                                             acc = JsValue::HeapNumber(f);
-                                            frame.hot_accumulator = NanBoxedValue::from_double(f);
                                         }
                                     }
                                     continue 'dispatch;
@@ -2613,14 +2593,12 @@ impl Interpreter {
                                     match a.checked_sub(b) {
                                         Some(result) => {
                                             acc = JsValue::Smi(result);
-                                            frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                         }
                                         None => {
                                             frame.smi_mode = false;
                                             frame.loop_end_pc = 0;
                                             let f = (a as f64) - (b as f64);
                                             acc = JsValue::HeapNumber(f);
-                                            frame.hot_accumulator = NanBoxedValue::from_double(f);
                                         }
                                     }
                                     continue 'dispatch;
@@ -2646,14 +2624,12 @@ impl Interpreter {
                                     match a.checked_mul(b) {
                                         Some(result) => {
                                             acc = JsValue::Smi(result);
-                                            frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                         }
                                         None => {
                                             frame.smi_mode = false;
                                             frame.loop_end_pc = 0;
                                             let f = (a as f64) * (b as f64);
                                             acc = JsValue::HeapNumber(f);
-                                            frame.hot_accumulator = NanBoxedValue::from_double(f);
                                         }
                                     }
                                     continue 'dispatch;
@@ -2694,8 +2670,6 @@ impl Interpreter {
                                                     pc += 1;
                                                 }
                                                 acc = JsValue::Boolean(result);
-                                                frame.hot_accumulator =
-                                                    NanBoxedValue::from_boolean(result);
                                                 continue 'dispatch;
                                             }
                                             Opcode::JumpIfFalse => {
@@ -2709,15 +2683,12 @@ impl Interpreter {
                                                     pc += 1;
                                                 }
                                                 acc = JsValue::Boolean(result);
-                                                frame.hot_accumulator =
-                                                    NanBoxedValue::from_boolean(result);
                                                 continue 'dispatch;
                                             }
                                             _ => {}
                                         }
                                     }
                                     acc = JsValue::Boolean(result);
-                                    frame.hot_accumulator = NanBoxedValue::from_boolean(result);
                                     continue 'dispatch;
                                 }
                                 Opcode::JumpIfTrue => {
@@ -2801,7 +2772,6 @@ impl Interpreter {
                                     };
                                     let result = a | b;
                                     acc = JsValue::Smi(result);
-                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                     continue 'dispatch;
                                 }
                                 Opcode::BitwiseAnd | Opcode::BitwiseAndSmi => {
@@ -2819,7 +2789,6 @@ impl Interpreter {
                                     };
                                     let result = a & b;
                                     acc = JsValue::Smi(result);
-                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                     continue 'dispatch;
                                 }
                                 Opcode::BitwiseXor | Opcode::BitwiseXorSmi => {
@@ -2837,13 +2806,11 @@ impl Interpreter {
                                     };
                                     let result = a ^ b;
                                     acc = JsValue::Smi(result);
-                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                     continue 'dispatch;
                                 }
                                 Opcode::BitwiseNot => {
                                     let result = !unsafe { acc.as_smi_unchecked() };
                                     acc = JsValue::Smi(result);
-                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                     continue 'dispatch;
                                 }
                                 Opcode::ShiftLeft | Opcode::ShiftLeftSmi => {
@@ -2861,7 +2828,6 @@ impl Interpreter {
                                     };
                                     let result = a << ((b as u32) & 0x1f);
                                     acc = JsValue::Smi(result);
-                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                     continue 'dispatch;
                                 }
                                 Opcode::ShiftRight | Opcode::ShiftRightSmi => {
@@ -2879,7 +2845,6 @@ impl Interpreter {
                                     };
                                     let result = a >> ((b as u32) & 0x1f);
                                     acc = JsValue::Smi(result);
-                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                     continue 'dispatch;
                                 }
                                 Opcode::ShiftRightLogical | Opcode::ShiftRightLogicalSmi => {
@@ -2897,7 +2862,6 @@ impl Interpreter {
                                     };
                                     let result = (a as u32) >> ((b as u32) & 0x1f);
                                     acc = number_to_jsvalue(result as f64);
-                                    frame.sync_hot_accumulator(&acc);
                                     if !matches!(acc, JsValue::Smi(_)) {
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
@@ -2910,14 +2874,12 @@ impl Interpreter {
                                     match val.checked_add(1) {
                                         Some(result) => {
                                             acc = JsValue::Smi(result);
-                                            frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                         }
                                         None => {
                                             frame.smi_mode = false;
                                             frame.loop_end_pc = 0;
                                             let f = (val as f64) + 1.0;
                                             acc = JsValue::HeapNumber(f);
-                                            frame.hot_accumulator = NanBoxedValue::from_double(f);
                                         }
                                     }
                                     continue 'dispatch;
@@ -2928,14 +2890,12 @@ impl Interpreter {
                                     match val.checked_sub(1) {
                                         Some(result) => {
                                             acc = JsValue::Smi(result);
-                                            frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                         }
                                         None => {
                                             frame.smi_mode = false;
                                             frame.loop_end_pc = 0;
                                             let f = (val as f64) - 1.0;
                                             acc = JsValue::HeapNumber(f);
-                                            frame.hot_accumulator = NanBoxedValue::from_double(f);
                                         }
                                     }
                                     continue 'dispatch;
@@ -2956,7 +2916,6 @@ impl Interpreter {
                                     if b != 0 {
                                         let result = a % b;
                                         acc = JsValue::Smi(result);
-                                        frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                     } else {
                                         acc = JsValue::HeapNumber(f64::NAN);
                                         frame.smi_mode = false;
@@ -2991,7 +2950,6 @@ impl Interpreter {
                                 // is Immediate for LdaSmi.
                                 let val = unsafe { operand_imm_unchecked(instr, 0) };
                                 acc = JsValue::Smi(val);
-                                frame.hot_accumulator = NanBoxedValue::from_smi(val);
                                 continue 'dispatch;
                             }
                             Opcode::Star => {
@@ -3017,12 +2975,10 @@ impl Interpreter {
                             }
                             Opcode::LdaUndefined => {
                                 acc = JsValue::Undefined;
-                                frame.hot_accumulator = NanBoxedValue::undefined();
                                 continue 'dispatch;
                             }
                             Opcode::LdaZero => {
                                 acc = JsValue::Smi(0);
-                                frame.hot_accumulator = NanBoxedValue::from_smi(0);
                                 continue 'dispatch;
                             }
                             Opcode::LdaTrue => {
@@ -3065,7 +3021,6 @@ impl Interpreter {
                                         && let Some(result) = a.checked_add(*b)
                                     {
                                         acc = JsValue::Smi(result);
-                                        frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                         continue 'dispatch;
                                     }
                                 }
@@ -3110,7 +3065,6 @@ impl Interpreter {
                                         && let Some(result) = a.checked_sub(*b)
                                     {
                                         acc = JsValue::Smi(result);
-                                        frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                         continue 'dispatch;
                                     }
                                 }
@@ -3154,7 +3108,6 @@ impl Interpreter {
                                         && let Some(result) = a.checked_mul(*b)
                                     {
                                         acc = JsValue::Smi(result);
-                                        frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                         continue 'dispatch;
                                     }
                                 }
@@ -3195,7 +3148,6 @@ impl Interpreter {
                                     && let Some(result) = n.checked_add(imm)
                                 {
                                     acc = JsValue::Smi(result);
-                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                     continue 'dispatch;
                                 }
                                 frame.pc = pc;
@@ -3235,7 +3187,6 @@ impl Interpreter {
                                     && let Some(result) = n.checked_sub(imm)
                                 {
                                     acc = JsValue::Smi(result);
-                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                     continue 'dispatch;
                                 }
                                 frame.pc = pc;
@@ -3275,7 +3226,6 @@ impl Interpreter {
                                     && let Some(result) = n.checked_mul(imm)
                                 {
                                     acc = JsValue::Smi(result);
-                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                     continue 'dispatch;
                                 }
                                 frame.pc = pc;
@@ -3316,7 +3266,6 @@ impl Interpreter {
                                     && let Some(result) = n.checked_add(1)
                                 {
                                     acc = JsValue::Smi(result);
-                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                     continue 'dispatch;
                                 }
                                 frame.pc = pc;
@@ -3355,7 +3304,6 @@ impl Interpreter {
                                     && let Some(result) = n.checked_sub(1)
                                 {
                                     acc = JsValue::Smi(result);
-                                    frame.hot_accumulator = NanBoxedValue::from_smi(result);
                                     continue 'dispatch;
                                 }
                                 frame.pc = pc;
@@ -3720,7 +3668,6 @@ impl Interpreter {
                                             let value = env.get_by_index(slot_idx).clone();
                                             drop(env);
                                             if value != JsValue::TheHole {
-                                                frame.sync_hot_accumulator(&value);
                                                 acc = value;
                                                 continue 'dispatch;
                                             }
@@ -3859,11 +3806,6 @@ impl Interpreter {
                                     *count = count.saturating_add(1);
                                     if *count >= 4 {
                                         frame.smi_mode = true;
-                                        // Seed hot_accumulator for the first
-                                        // SMI-mode iteration.
-                                        if let JsValue::Smi(v) = &acc {
-                                            frame.hot_accumulator = NanBoxedValue::from_smi(*v);
-                                        }
                                     }
                                 }
                                 continue 'dispatch;
@@ -4916,7 +4858,6 @@ impl Interpreter {
             cache_generation: 0,
             smi_mode: false,
             hot_registers: HotRegisters::new(total),
-            hot_accumulator: NanBoxedValue::undefined(),
             loop_end_pc: 0,
             loop_trip_counts: Vec::new(),
         };

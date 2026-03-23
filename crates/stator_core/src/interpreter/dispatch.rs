@@ -3095,7 +3095,6 @@ fn handle_lda_global(
             // TheHole means uninitialized `this` — fall through to slow path
             // which produces the proper ReferenceError.
             if value != JsValue::TheHole {
-                ctx.frame.sync_hot_accumulator(&value);
                 ctx.frame.accumulator = value;
                 return Ok(DispatchAction::Continue);
             }
@@ -3120,7 +3119,6 @@ fn handle_lda_global(
         }
     }
 
-    ctx.frame.sync_hot_accumulator(&value);
     ctx.frame.accumulator = value;
     Ok(DispatchAction::Continue)
 }
