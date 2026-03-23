@@ -2432,17 +2432,25 @@ impl Interpreter {
     pub fn run(frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
         let result = (|| {
             // Publish the global environment for proto_lookup's constructor resolution.
-            // Only write when the pointer actually changed to avoid refcount churn.
-            CURRENT_GLOBALS.with(|g| {
-                let existing = g.borrow();
-                let same = existing
-                    .as_ref()
-                    .is_some_and(|e| Rc::ptr_eq(e, &frame.global_env));
-                drop(existing);
-                if !same {
+            // For nested calls (depth > 0), the env is nearly always the same
+            // pointer, so only touch the TLS when it actually differs.
+            let depth = call_stack_depth();
+            if depth == 0 {
+                // Top-level: always publish.
+                CURRENT_GLOBALS.with(|g| {
                     *g.borrow_mut() = Some(Rc::clone(&frame.global_env));
-                }
-            });
+                });
+            } else {
+                CURRENT_GLOBALS.with(|g| {
+                    let same = g
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|e| Rc::ptr_eq(e, &frame.global_env));
+                    if !same {
+                        *g.borrow_mut() = Some(Rc::clone(&frame.global_env));
+                    }
+                });
+            }
             if frame.bytecode_array.is_async() && frame.generator_state.is_none() {
                 return Self::run_async_function(frame.bytecode_array.clone(), CallArgs::new());
             }
@@ -2451,7 +2459,7 @@ impl Interpreter {
             // run_callee() already handles the stacker guard, so skip it
             // here to avoid the closure indirection that prevents LLVM
             // from inlining across the dispatch boundary.
-            if call_stack_depth() == 0 {
+            if depth == 0 {
                 stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Self::run_dispatch(frame))
             } else {
                 Self::run_dispatch(frame)
