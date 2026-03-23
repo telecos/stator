@@ -3106,6 +3106,134 @@ impl Interpreter {
                                 pc -= 1;
                                 break 'smi;
                             }
+                            Opcode::CallUndefinedReceiver1 => {
+                                // f(arg) inside SMI loop — stays in SMI mode
+                                // when the callee returns a Smi result.
+                                let callee_reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                let arg_reg = unsafe { operand_reg_unchecked(instr, 1) };
+                                let callee = unsafe { frame.read_reg_unchecked(callee_reg) };
+                                if let JsValue::Function(ba) = callee
+                                    && !ba.is_generator()
+                                    && !ba.is_async()
+                                {
+                                    let is_arrow = ba.is_arrow();
+                                    let is_strict = ba.is_strict();
+                                    let ba = Rc::clone(ba);
+                                    let arg1 =
+                                        unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
+                                    acc = JsValue::Smi(sa);
+                                    frame.pc = pc;
+                                    frame.accumulator = acc.cheap_clone();
+                                    let args: CallArgs = smallvec::smallvec![arg1];
+                                    let saved_this = if !is_arrow && is_strict {
+                                        let old = frame.global_env.borrow().get_this().cloned();
+                                        frame.global_env.borrow_mut().set_this(JsValue::Undefined);
+                                        old
+                                    } else {
+                                        None
+                                    };
+                                    let has_self_name = ba.self_name_register().is_some();
+                                    let has_fn_props = is_arrow && ba.has_fn_props();
+                                    let mut callee_frame = InterpreterFrame::new_callee_frame(
+                                        Rc::clone(&ba),
+                                        args,
+                                        Rc::clone(&frame.global_env),
+                                    );
+                                    restore_closure_context(&mut callee_frame, &ba);
+                                    if has_fn_props {
+                                        callee_frame.new_target = fn_props_get(&ba, ".new_target");
+                                    }
+                                    if has_self_name {
+                                        let ba_val = JsValue::Function(Rc::clone(&ba));
+                                        populate_self_name(&mut callee_frame, &ba, &ba_val);
+                                    }
+                                    push_call_frame("<anonymous>")?;
+                                    let gen_before = frame.cache_generation;
+                                    let result = run_callee(&mut callee_frame);
+                                    pop_call_frame_ex(false);
+                                    if gen_before != frame.global_env.borrow().generation() {
+                                        frame.global_cache_invalidate();
+                                    }
+                                    if !is_arrow && is_strict {
+                                        match saved_this {
+                                            Some(v) => {
+                                                frame.global_env.borrow_mut().set_this(v);
+                                            }
+                                            None => {
+                                                frame.global_env.borrow_mut().remove_this();
+                                            }
+                                        }
+                                    }
+                                    match result {
+                                        Ok(JsValue::Smi(v)) => {
+                                            sa = v;
+                                            continue 'smi;
+                                        }
+                                        Ok(v) => {
+                                            acc = v;
+                                            frame.smi_mode = false;
+                                            frame.loop_end_pc = 0;
+                                            break 'smi;
+                                        }
+                                        Err(e) => {
+                                            acc = JsValue::Smi(sa);
+                                            frame.pc = pc;
+                                            frame.accumulator = acc.cheap_clone();
+                                            return Err(e);
+                                        }
+                                    }
+                                }
+                                // Non-function callee — exit SMI mode.
+                                acc = JsValue::Smi(sa);
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                pc -= 1;
+                                break 'smi;
+                            }
+                            Opcode::LdaNamedProperty => {
+                                // Mega-IC fast path: stays in SMI mode when
+                                // the loaded value is Smi.
+                                let obj_v = unsafe { operand_reg_unchecked(instr, 0) };
+                                let slot = unsafe {
+                                    match *instr.operands.get_unchecked(2) {
+                                        Operand::FeedbackSlot(s) => s,
+                                        _ => std::hint::unreachable_unchecked(),
+                                    }
+                                };
+                                // Use a raw pointer so we can simultaneously
+                                // access frame.mega_load_ic (disjoint field).
+                                let obj_ptr =
+                                    unsafe { frame.read_reg_unchecked(obj_v) } as *const JsValue;
+                                let obj = unsafe { &*obj_ptr };
+                                if let JsValue::PlainObject(map) = obj {
+                                    let pm = map.borrow();
+                                    let layout = pm.layout_id();
+                                    if let Some(ic) = frame
+                                        .mega_load_ic
+                                        .as_ref()
+                                        .and_then(|cache| cache.probe(slot, layout))
+                                        && !ic.is_proto
+                                        && let Some(val) =
+                                            pm.get_by_offset(ic.cached_offset as usize)
+                                    {
+                                        if let JsValue::Smi(v) = val {
+                                            sa = *v;
+                                            continue 'smi;
+                                        }
+                                        acc = val.clone();
+                                        drop(pm);
+                                        frame.smi_mode = false;
+                                        frame.loop_end_pc = 0;
+                                        break 'smi;
+                                    }
+                                }
+                                // IC miss or non-PlainObject — exit SMI mode.
+                                acc = JsValue::Smi(sa);
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                pc -= 1;
+                                break 'smi;
+                            }
                             Opcode::LdaKeyedProperty => {
                                 // Array[Smi] fast path: sa is the index,
                                 // load value from the Array element.
@@ -3165,6 +3293,43 @@ impl Interpreter {
                                     }
                                 }
                                 // Fall through
+                                acc = JsValue::Smi(sa);
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                pc -= 1;
+                                break 'smi;
+                            }
+                            Opcode::StaNamedProperty => {
+                                // Mega-IC store fast path: write Smi(sa) into
+                                // the receiver's PropertyMap at cached offset.
+                                let obj_v = unsafe { operand_reg_unchecked(instr, 0) };
+                                let slot = unsafe {
+                                    match *instr.operands.get_unchecked(2) {
+                                        Operand::FeedbackSlot(s) => s,
+                                        _ => std::hint::unreachable_unchecked(),
+                                    }
+                                };
+                                let obj_ptr =
+                                    unsafe { frame.read_reg_unchecked(obj_v) } as *const JsValue;
+                                let obj = unsafe { &*obj_ptr };
+                                if let JsValue::PlainObject(map) = obj {
+                                    let mut pm = map.borrow_mut();
+                                    let layout = pm.layout_id();
+                                    if let Some(ic) = frame
+                                        .mega_store_ic
+                                        .as_ref()
+                                        .and_then(|cache| cache.probe(slot, layout))
+                                        && !ic.is_proto
+                                        && pm.set_by_offset(
+                                            ic.cached_offset as usize,
+                                            JsValue::Smi(sa),
+                                        )
+                                    {
+                                        continue 'smi;
+                                    }
+                                }
+                                // IC miss — exit SMI mode and let normal
+                                // dispatch handle the store.
                                 acc = JsValue::Smi(sa);
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
