@@ -3541,8 +3541,8 @@ impl Interpreter {
                                 pc -= 1;
                                 break 'smi;
                             }
-                            Opcode::LdaCurrentContextSlot => {
-                                // Load from depth-0 context — common for closures.
+                            Opcode::LdaCurrentContextSlot
+                            | Opcode::LdaImmutableCurrentContextSlot => {
                                 if let Some(JsValue::Context(ctx_rc)) = &frame.context {
                                     let slot =
                                         unsafe { operand_constant_pool_idx_unchecked(instr, 0) }
@@ -5097,7 +5097,7 @@ impl Interpreter {
                     }
 
                     // ── LdaCurrentContextSlot (closure var load) ──
-                    Opcode::LdaCurrentContextSlot => {
+                    Opcode::LdaCurrentContextSlot | Opcode::LdaImmutableCurrentContextSlot => {
                         if let Operand::ConstantPoolIdx(slot_idx) = instr.operands[0]
                             && let Some(JsValue::Context(js_ctx)) = &frame.context
                         {
