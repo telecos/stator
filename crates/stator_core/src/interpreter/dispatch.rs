@@ -6904,6 +6904,11 @@ fn handle_call_direct_eval(
         let original_global_names: HashSet<String> =
             ctx.frame.global_env.borrow().vars.keys().cloned().collect();
         let mut eval_bindings = ctx.frame.global_env.borrow().vars.clone();
+        // Re-inject the dedicated this_binding so the eval'd code can
+        // see `this` (it lives outside `vars` since commit a4272e8).
+        if let Some(this_val) = ctx.frame.global_env.borrow().get_this().cloned() {
+            eval_bindings.insert("this".to_string(), this_val);
+        }
         for (name, reg) in &binding_registers {
             eval_bindings.insert(name.clone(), ctx.frame.read_reg(*reg as u32)?.clone());
         }

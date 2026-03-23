@@ -1453,13 +1453,14 @@ impl GlobalEnv {
     }
 
     /// Create a `GlobalEnv` pre-populated with the given bindings.
-    pub fn with_vars(vars: HashMap<String, JsValue>) -> Self {
+    pub fn with_vars(mut vars: HashMap<String, JsValue>) -> Self {
+        let this_binding = vars.remove("this");
         let mut env = Self {
             vars,
             generation: 0,
             slots: Vec::new(),
             name_to_index: HashMap::new(),
-            this_binding: None,
+            this_binding,
         };
         env.rebuild_slots();
         env
@@ -1546,6 +1547,13 @@ impl GlobalEnv {
     /// Call after bulk-inserting into `vars` directly (e.g. via
     /// [`install_globals`](crate::builtins::install_globals::install_globals)).
     pub fn rebuild_slots(&mut self) {
+        // Sync the dedicated this_binding from vars — install_globals
+        // writes "this" directly into vars bypassing set_this().
+        if self.this_binding.is_none()
+            && let Some(v) = self.vars.remove("this")
+        {
+            self.this_binding = Some(v);
+        }
         self.slots.clear();
         self.name_to_index.clear();
         self.slots.reserve(self.vars.len());
@@ -1948,6 +1956,14 @@ impl InterpreterFrame {
             let mut defaults = HashMap::new();
             crate::builtins::install_globals::install_globals(&mut defaults);
             let mut env = global_env.borrow_mut();
+            // Extract "this" from defaults into the dedicated binding —
+            // install_globals writes it into the HashMap but GlobalEnv
+            // stores it separately for O(1) access.
+            if let Some(this_val) = defaults.remove("this")
+                && env.this_binding.is_none()
+            {
+                env.this_binding = Some(this_val);
+            }
             for (k, v) in defaults {
                 env.vars.entry(k).or_insert(v);
             }
