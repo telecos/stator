@@ -1726,7 +1726,7 @@ fn ordinary_to_primitive(value: &JsValue, hint: ToPrimitiveHint) -> StatorResult
 }
 
 /// ECMAScript §7.1.6 helper: truncate an `f64` to a signed 32-bit integer.
-fn f64_to_int32(n: f64) -> i32 {
+pub(crate) fn f64_to_int32(n: f64) -> i32 {
     if n.is_nan() || n.is_infinite() || n == 0.0 {
         return 0;
     }
