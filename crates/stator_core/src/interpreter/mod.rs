@@ -2275,6 +2275,19 @@ impl InterpreterFrame {
         Ok(s)
     }
 
+    /// Check if a constant pool entry is the string "length" without
+    /// allocating or interning.
+    #[inline(always)]
+    pub(super) fn is_length_constant(&self, idx: u32) -> bool {
+        if let Some(cached) = self.string_cache.as_ref().and_then(|cache| cache.get(&idx)) {
+            return &**cached == "length";
+        }
+        matches!(
+            self.bytecode_array.get_constant(idx),
+            Some(ConstantPoolEntry::String(s)) if s == "length"
+        )
+    }
+
     #[inline(always)]
     pub(super) fn load_global(&mut self, name: &str) -> StatorResult<JsValue> {
         if let Some(value) = self.global_cache_get(name).cloned() {
@@ -4219,6 +4232,35 @@ impl Interpreter {
                             let obj_ptr =
                                 unsafe { frame.read_reg_unchecked(obj_v) } as *const JsValue;
                             let obj = unsafe { &*obj_ptr };
+
+                            // Fast path: arr.length on JsValue::Array — avoids
+                            // prototype chain walk and string comparison.
+                            if let Operand::ConstantPoolIdx(name_idx) = instr.operands[1]
+                                && frame.is_length_constant(name_idx)
+                            {
+                                match obj {
+                                    JsValue::Array(items) => {
+                                        let len = items.borrow().len();
+                                        acc = if len <= i32::MAX as usize {
+                                            JsValue::Smi(len as i32)
+                                        } else {
+                                            JsValue::HeapNumber(len as f64)
+                                        };
+                                        continue 'dispatch;
+                                    }
+                                    JsValue::String(s) => {
+                                        let len = s.len();
+                                        acc = if len <= i32::MAX as usize {
+                                            JsValue::Smi(len as i32)
+                                        } else {
+                                            JsValue::HeapNumber(len as f64)
+                                        };
+                                        continue 'dispatch;
+                                    }
+                                    _ => {}
+                                }
+                            }
+
                             if let JsValue::PlainObject(map) = obj {
                                 // Single borrow for both IC probe and value lookup.
                                 let pm = map.borrow();
