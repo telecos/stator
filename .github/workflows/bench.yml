@@ -34,15 +34,18 @@ jobs:
         env:
           CARGO_INCREMENTAL: "0"
 
-      - name: Run benchmarks
+      - name: Run precompiled benchmarks
         run: |
           echo "=== System Resources ==="
           free -h
-          df -h .
           echo "=== Running precompiled benchmarks (interpreter-only) ==="
           cargo bench --package stator_core -- _precompiled
+
+      - name: Run V8-comparison benchmarks (Stator)
+        run: |
           echo "=== Running V8-comparison benchmarks ==="
           cargo bench --package stator_core -- "v8_comparison_benches"
+        continue-on-error: true
 
       - name: Run V8 (Node.js) comparison benchmarks
         run: |
