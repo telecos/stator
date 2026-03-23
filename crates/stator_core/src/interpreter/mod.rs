@@ -3038,6 +3038,9 @@ impl Interpreter {
                                 {
                                     let is_arrow = ba.is_arrow();
                                     let is_strict = ba.is_strict();
+                                    let has_self_name = ba.self_name_register().is_some();
+                                    let has_fn_props = is_arrow && ba.has_fn_props();
+                                    let closure_ctx = ba.closure_context().map(Rc::clone);
                                     let ba = Rc::clone(ba);
                                     // Sync frame state for nested call.
                                     acc = JsValue::Smi(sa);
@@ -3052,20 +3055,26 @@ impl Interpreter {
                                     } else {
                                         None
                                     };
-                                    let has_self_name = ba.self_name_register().is_some();
-                                    let has_fn_props = is_arrow && ba.has_fn_props();
+                                    // Move ba into the callee frame — avoids
+                                    // a second Rc::clone.
                                     let mut callee_frame = InterpreterFrame::new_callee_frame(
-                                        Rc::clone(&ba),
+                                        ba,
                                         args,
                                         Rc::clone(&frame.global_env),
                                     );
-                                    restore_closure_context(&mut callee_frame, &ba);
+                                    if let Some(ctx) = closure_ctx {
+                                        callee_frame.context = Some(JsValue::Context(ctx));
+                                    }
                                     if has_fn_props {
-                                        callee_frame.new_target = fn_props_get(&ba, ".new_target");
+                                        callee_frame.new_target = fn_props_get(
+                                            &callee_frame.bytecode_array,
+                                            ".new_target",
+                                        );
                                     }
                                     if has_self_name {
-                                        let ba_val = JsValue::Function(Rc::clone(&ba));
-                                        populate_self_name(&mut callee_frame, &ba, &ba_val);
+                                        let ba_rc = Rc::clone(&callee_frame.bytecode_array);
+                                        let ba_val = JsValue::Function(Rc::clone(&ba_rc));
+                                        populate_self_name(&mut callee_frame, &ba_rc, &ba_val);
                                     }
                                     push_call_frame("<anonymous>")?;
                                     let gen_before = frame.cache_generation;
@@ -3122,6 +3131,9 @@ impl Interpreter {
                                 {
                                     let is_arrow = ba.is_arrow();
                                     let is_strict = ba.is_strict();
+                                    let has_self_name = ba.self_name_register().is_some();
+                                    let has_fn_props = is_arrow && ba.has_fn_props();
+                                    let closure_ctx = ba.closure_context().map(Rc::clone);
                                     let ba = Rc::clone(ba);
                                     let arg1 =
                                         unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
@@ -3136,20 +3148,26 @@ impl Interpreter {
                                     } else {
                                         None
                                     };
-                                    let has_self_name = ba.self_name_register().is_some();
-                                    let has_fn_props = is_arrow && ba.has_fn_props();
+                                    // Move ba into callee frame — avoids a
+                                    // second Rc::clone.
                                     let mut callee_frame = InterpreterFrame::new_callee_frame(
-                                        Rc::clone(&ba),
+                                        ba,
                                         args,
                                         Rc::clone(&frame.global_env),
                                     );
-                                    restore_closure_context(&mut callee_frame, &ba);
+                                    if let Some(ctx) = closure_ctx {
+                                        callee_frame.context = Some(JsValue::Context(ctx));
+                                    }
                                     if has_fn_props {
-                                        callee_frame.new_target = fn_props_get(&ba, ".new_target");
+                                        callee_frame.new_target = fn_props_get(
+                                            &callee_frame.bytecode_array,
+                                            ".new_target",
+                                        );
                                     }
                                     if has_self_name {
-                                        let ba_val = JsValue::Function(Rc::clone(&ba));
-                                        populate_self_name(&mut callee_frame, &ba, &ba_val);
+                                        let ba_rc = Rc::clone(&callee_frame.bytecode_array);
+                                        let ba_val = JsValue::Function(Rc::clone(&ba_rc));
+                                        populate_self_name(&mut callee_frame, &ba_rc, &ba_val);
                                     }
                                     push_call_frame("<anonymous>")?;
                                     let gen_before = frame.cache_generation;
@@ -5054,6 +5072,9 @@ impl Interpreter {
                         {
                             let is_arrow = ba.is_arrow();
                             let is_strict = ba.is_strict();
+                            let has_self_name = ba.self_name_register().is_some();
+                            let has_fn_props = is_arrow && ba.has_fn_props();
+                            let closure_ctx = ba.closure_context().map(Rc::clone);
                             let ba = Rc::clone(ba);
                             frame.pc = pc;
 
@@ -5065,20 +5086,22 @@ impl Interpreter {
                             } else {
                                 None
                             };
-                            let has_self_name = ba.self_name_register().is_some();
-                            let has_fn_props = is_arrow && ba.has_fn_props();
                             let mut callee_frame = InterpreterFrame::new_callee_frame(
-                                Rc::clone(&ba),
+                                ba,
                                 args,
                                 Rc::clone(&frame.global_env),
                             );
-                            restore_closure_context(&mut callee_frame, &ba);
+                            if let Some(ctx) = closure_ctx {
+                                callee_frame.context = Some(JsValue::Context(ctx));
+                            }
                             if has_fn_props {
-                                callee_frame.new_target = fn_props_get(&ba, ".new_target");
+                                callee_frame.new_target =
+                                    fn_props_get(&callee_frame.bytecode_array, ".new_target");
                             }
                             if has_self_name {
-                                let ba_val = JsValue::Function(Rc::clone(&ba));
-                                populate_self_name(&mut callee_frame, &ba, &ba_val);
+                                let ba_rc = Rc::clone(&callee_frame.bytecode_array);
+                                let ba_val = JsValue::Function(Rc::clone(&ba_rc));
+                                populate_self_name(&mut callee_frame, &ba_rc, &ba_val);
                             }
                             push_call_frame("<anonymous>")?;
                             let gen_before = frame.cache_generation;
@@ -5158,11 +5181,16 @@ impl Interpreter {
                             && !ba.is_generator()
                             && !ba.is_async()
                         {
+                            let is_arrow = ba.is_arrow();
+                            let is_strict = ba.is_strict();
+                            let has_self_name = ba.self_name_register().is_some();
+                            let has_fn_props = is_arrow && ba.has_fn_props();
+                            let closure_ctx = ba.closure_context().map(Rc::clone);
                             let ba = Rc::clone(ba);
                             let arg1 = unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
                             frame.pc = pc;
                             let args: CallArgs = smallvec::smallvec![arg1];
-                            let saved_this = if !ba.is_arrow() && ba.is_strict() {
+                            let saved_this = if !is_arrow && is_strict {
                                 let old = frame.global_env.borrow().get_this().cloned();
                                 frame.global_env.borrow_mut().set_this(JsValue::Undefined);
                                 old
@@ -5170,20 +5198,21 @@ impl Interpreter {
                                 None
                             };
                             let mut callee_frame = InterpreterFrame::new_callee_frame(
-                                Rc::clone(&ba),
+                                ba,
                                 args,
                                 Rc::clone(&frame.global_env),
                             );
-                            restore_closure_context(&mut callee_frame, &ba);
-                            if ba.is_arrow() && ba.has_fn_props() {
-                                callee_frame.new_target = fn_props_get(&ba, ".new_target");
+                            if let Some(ctx) = closure_ctx {
+                                callee_frame.context = Some(JsValue::Context(ctx));
                             }
-                            if ba.self_name_register().is_some() {
-                                populate_self_name(
-                                    &mut callee_frame,
-                                    &ba,
-                                    &JsValue::Function(Rc::clone(&ba)),
-                                );
+                            if has_fn_props {
+                                callee_frame.new_target =
+                                    fn_props_get(&callee_frame.bytecode_array, ".new_target");
+                            }
+                            if has_self_name {
+                                let ba_rc = Rc::clone(&callee_frame.bytecode_array);
+                                let ba_val = JsValue::Function(Rc::clone(&ba_rc));
+                                populate_self_name(&mut callee_frame, &ba_rc, &ba_val);
                             }
                             push_call_frame("<anonymous>")?;
                             let gen_before = frame.cache_generation;
@@ -5192,7 +5221,7 @@ impl Interpreter {
                             if gen_before != frame.global_env.borrow().generation() {
                                 frame.global_cache_invalidate();
                             }
-                            if !ba.is_arrow() && ba.is_strict() {
+                            if !is_arrow && is_strict {
                                 match saved_this {
                                     Some(v) => {
                                         frame.global_env.borrow_mut().set_this(v);
