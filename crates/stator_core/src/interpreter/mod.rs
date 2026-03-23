@@ -2629,10 +2629,27 @@ impl Interpreter {
                             continue;
                         }
                     };
+                    // Track whether sa represents a Boolean (true=1,
+                    // false=0) rather than a Smi.  This lets LdaTrue /
+                    // LdaFalse stay in SMI mode while preserving the
+                    // correct JsValue type when spilling to registers
+                    // or arrays.
+                    let mut smi_acc_bool = false;
+                    // Helper: materialize the accumulator as the correct
+                    // JsValue type (Boolean when smi_acc_bool, Smi otherwise).
+                    macro_rules! smi_to_val {
+                        () => {
+                            if smi_acc_bool {
+                                JsValue::Boolean(sa != 0)
+                            } else {
+                                JsValue::Smi(sa)
+                            }
+                        };
+                    }
                     'smi: loop {
                         if pc >= frame.loop_end_pc {
                             frame.loop_end_pc = 0;
-                            acc = JsValue::Smi(sa);
+                            acc = smi_to_val!();
                             frame.smi_mode = false;
                             break 'smi;
                         }
@@ -2642,13 +2659,24 @@ impl Interpreter {
                         match instr.opcode {
                             Opcode::LdaSmi => {
                                 sa = unsafe { operand_imm_unchecked(instr, 0) };
+                                smi_acc_bool = false;
                             }
                             Opcode::LdaZero => {
                                 sa = 0;
+                                smi_acc_bool = false;
+                            }
+                            Opcode::LdaTrue => {
+                                sa = 1;
+                                smi_acc_bool = true;
+                            }
+                            Opcode::LdaFalse => {
+                                sa = 0;
+                                smi_acc_bool = true;
                             }
                             Opcode::Star => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                unsafe { frame.write_reg_unchecked(reg, JsValue::Smi(sa)) };
+                                let val = smi_to_val!();
+                                unsafe { frame.write_reg_unchecked(reg, val) };
                             }
                             Opcode::Ldar => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
@@ -2658,6 +2686,10 @@ impl Interpreter {
                                 let val = unsafe { frame.read_reg_unchecked(reg) };
                                 if let JsValue::Smi(v) = val {
                                     sa = *v;
+                                    smi_acc_bool = false;
+                                } else if let JsValue::Boolean(b) = val {
+                                    sa = *b as i32;
+                                    smi_acc_bool = true;
                                 } else {
                                     acc = val.cheap_clone();
                                     frame.smi_mode = false;
@@ -2674,6 +2706,7 @@ impl Interpreter {
                             Opcode::Add => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
                                 let b = unsafe { frame.read_reg_smi_unchecked(reg) };
+                                smi_acc_bool = false;
                                 match sa.checked_add(b) {
                                     Some(r) => sa = r,
                                     None => {
@@ -2686,6 +2719,7 @@ impl Interpreter {
                             }
                             Opcode::AddSmi => {
                                 let b = unsafe { operand_imm_unchecked(instr, 0) };
+                                smi_acc_bool = false;
                                 match sa.checked_add(b) {
                                     Some(r) => sa = r,
                                     None => {
@@ -2699,6 +2733,7 @@ impl Interpreter {
                             Opcode::Sub => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
                                 let b = unsafe { frame.read_reg_smi_unchecked(reg) };
+                                smi_acc_bool = false;
                                 match sa.checked_sub(b) {
                                     Some(r) => sa = r,
                                     None => {
@@ -2711,6 +2746,7 @@ impl Interpreter {
                             }
                             Opcode::SubSmi => {
                                 let b = unsafe { operand_imm_unchecked(instr, 0) };
+                                smi_acc_bool = false;
                                 match sa.checked_sub(b) {
                                     Some(r) => sa = r,
                                     None => {
@@ -2724,6 +2760,7 @@ impl Interpreter {
                             Opcode::Mul => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
                                 let b = unsafe { frame.read_reg_smi_unchecked(reg) };
+                                smi_acc_bool = false;
                                 match sa.checked_mul(b) {
                                     Some(r) => sa = r,
                                     None => {
@@ -2736,6 +2773,7 @@ impl Interpreter {
                             }
                             Opcode::MulSmi => {
                                 let b = unsafe { operand_imm_unchecked(instr, 0) };
+                                smi_acc_bool = false;
                                 match sa.checked_mul(b) {
                                     Some(r) => sa = r,
                                     None => {
@@ -2749,6 +2787,7 @@ impl Interpreter {
                             Opcode::Div => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
                                 let b = unsafe { frame.read_reg_smi_unchecked(reg) };
+                                smi_acc_bool = false;
                                 if b != 0 && sa % b == 0 {
                                     sa /= b;
                                 } else {
@@ -2762,6 +2801,7 @@ impl Interpreter {
                             Opcode::Mod => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
                                 let b = unsafe { frame.read_reg_smi_unchecked(reg) };
+                                smi_acc_bool = false;
                                 if b != 0 {
                                     sa %= b;
                                 } else {
@@ -2773,6 +2813,7 @@ impl Interpreter {
                             }
                             Opcode::ModSmi => {
                                 let b = unsafe { operand_imm_unchecked(instr, 0) };
+                                smi_acc_bool = false;
                                 if b != 0 {
                                     sa %= b;
                                 } else {
@@ -2785,44 +2826,55 @@ impl Interpreter {
                             Opcode::BitwiseOr => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
                                 sa |= unsafe { frame.read_reg_smi_unchecked(reg) };
+                                smi_acc_bool = false;
                             }
                             Opcode::BitwiseOrSmi => {
                                 sa |= unsafe { operand_imm_unchecked(instr, 0) };
+                                smi_acc_bool = false;
                             }
                             Opcode::BitwiseAnd => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
                                 sa &= unsafe { frame.read_reg_smi_unchecked(reg) };
+                                smi_acc_bool = false;
                             }
                             Opcode::BitwiseAndSmi => {
                                 sa &= unsafe { operand_imm_unchecked(instr, 0) };
+                                smi_acc_bool = false;
                             }
                             Opcode::BitwiseXor => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
                                 sa ^= unsafe { frame.read_reg_smi_unchecked(reg) };
+                                smi_acc_bool = false;
                             }
                             Opcode::BitwiseXorSmi => {
                                 sa ^= unsafe { operand_imm_unchecked(instr, 0) };
+                                smi_acc_bool = false;
                             }
                             Opcode::BitwiseNot => {
                                 sa = !sa;
+                                smi_acc_bool = false;
                             }
                             Opcode::ShiftLeft => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
                                 let b = unsafe { frame.read_reg_smi_unchecked(reg) };
                                 sa <<= (b as u32) & 0x1f;
+                                smi_acc_bool = false;
                             }
                             Opcode::ShiftLeftSmi => {
                                 let b = unsafe { operand_imm_unchecked(instr, 0) };
                                 sa <<= (b as u32) & 0x1f;
+                                smi_acc_bool = false;
                             }
                             Opcode::ShiftRight => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
                                 let b = unsafe { frame.read_reg_smi_unchecked(reg) };
                                 sa >>= (b as u32) & 0x1f;
+                                smi_acc_bool = false;
                             }
                             Opcode::ShiftRightSmi => {
                                 let b = unsafe { operand_imm_unchecked(instr, 0) };
                                 sa >>= (b as u32) & 0x1f;
+                                smi_acc_bool = false;
                             }
                             Opcode::ShiftRightLogical | Opcode::ShiftRightLogicalSmi => {
                                 let b = if instr.opcode == Opcode::ShiftRightLogical {
@@ -2831,6 +2883,7 @@ impl Interpreter {
                                 } else {
                                     unsafe { operand_imm_unchecked(instr, 0) }
                                 };
+                                smi_acc_bool = false;
                                 let r = (sa as u32) >> ((b as u32) & 0x1f);
                                 if r <= i32::MAX as u32 {
                                     sa = r as i32;
@@ -2841,33 +2894,42 @@ impl Interpreter {
                                     break 'smi;
                                 }
                             }
-                            Opcode::Inc => match sa.checked_add(1) {
-                                Some(r) => sa = r,
-                                None => {
-                                    acc = JsValue::HeapNumber(sa as f64 + 1.0);
-                                    frame.smi_mode = false;
-                                    frame.loop_end_pc = 0;
-                                    break 'smi;
+                            Opcode::Inc => {
+                                smi_acc_bool = false;
+                                match sa.checked_add(1) {
+                                    Some(r) => sa = r,
+                                    None => {
+                                        acc = JsValue::HeapNumber(sa as f64 + 1.0);
+                                        frame.smi_mode = false;
+                                        frame.loop_end_pc = 0;
+                                        break 'smi;
+                                    }
                                 }
-                            },
-                            Opcode::Dec => match sa.checked_sub(1) {
-                                Some(r) => sa = r,
-                                None => {
-                                    acc = JsValue::HeapNumber(sa as f64 - 1.0);
-                                    frame.smi_mode = false;
-                                    frame.loop_end_pc = 0;
-                                    break 'smi;
+                            }
+                            Opcode::Dec => {
+                                smi_acc_bool = false;
+                                match sa.checked_sub(1) {
+                                    Some(r) => sa = r,
+                                    None => {
+                                        acc = JsValue::HeapNumber(sa as f64 - 1.0);
+                                        frame.smi_mode = false;
+                                        frame.loop_end_pc = 0;
+                                        break 'smi;
+                                    }
                                 }
-                            },
-                            Opcode::Negate => match 0i32.checked_sub(sa) {
-                                Some(r) => sa = r,
-                                None => {
-                                    acc = JsValue::HeapNumber(-(sa as f64));
-                                    frame.smi_mode = false;
-                                    frame.loop_end_pc = 0;
-                                    break 'smi;
+                            }
+                            Opcode::Negate => {
+                                smi_acc_bool = false;
+                                match 0i32.checked_sub(sa) {
+                                    Some(r) => sa = r,
+                                    None => {
+                                        acc = JsValue::HeapNumber(-(sa as f64));
+                                        frame.smi_mode = false;
+                                        frame.loop_end_pc = 0;
+                                        break 'smi;
+                                    }
                                 }
-                            },
+                            }
                             Opcode::TestLessThan
                             | Opcode::TestGreaterThan
                             | Opcode::TestEqual
@@ -2976,7 +3038,7 @@ impl Interpreter {
                                 if frame.instruction_limit > 0
                                     && frame.instructions_executed > frame.instruction_limit
                                 {
-                                    acc = JsValue::Smi(sa);
+                                    acc = smi_to_val!();
                                     frame.pc = pc;
                                     frame.accumulator = acc.cheap_clone();
                                     return Err(instruction_limit_error());
@@ -2988,7 +3050,7 @@ impl Interpreter {
                                         if frame.deadline.is_some_and(|dl| now > dl)
                                             || thread_deadline.is_some_and(|dl| now > dl)
                                         {
-                                            acc = JsValue::Smi(sa);
+                                            acc = smi_to_val!();
                                             frame.pc = pc;
                                             frame.accumulator = acc.cheap_clone();
                                             return Err(execution_timeout_error());
@@ -3000,13 +3062,13 @@ impl Interpreter {
                             }
                             Opcode::Return => {
                                 frame.pc = pc;
-                                return Ok(JsValue::Smi(sa));
+                                return Ok(smi_to_val!());
                             }
                             Opcode::LdaGlobal => {
                                 let name_idx =
                                     unsafe { operand_constant_pool_idx_unchecked(instr, 0) };
                                 // Sync state before fallible frame methods.
-                                acc = JsValue::Smi(sa);
+                                acc = smi_to_val!();
                                 frame.pc = pc;
                                 frame.accumulator = acc.cheap_clone();
                                 let name = frame.get_string_constant(name_idx)?;
@@ -3023,11 +3085,11 @@ impl Interpreter {
                             Opcode::StaGlobal => {
                                 let name_idx =
                                     unsafe { operand_constant_pool_idx_unchecked(instr, 0) };
-                                acc = JsValue::Smi(sa);
+                                acc = smi_to_val!();
                                 frame.pc = pc;
                                 frame.accumulator = acc.cheap_clone();
                                 let name = frame.get_string_constant(name_idx)?;
-                                let val = JsValue::Smi(sa);
+                                let val = smi_to_val!();
                                 frame.store_global(name_idx, &name, val);
                             }
                             Opcode::CallUndefinedReceiver0 => {
@@ -3117,7 +3179,7 @@ impl Interpreter {
                                             break 'smi;
                                         }
                                         Err(e) => {
-                                            acc = JsValue::Smi(sa);
+                                            acc = smi_to_val!();
                                             frame.pc = pc;
                                             frame.accumulator = acc.cheap_clone();
                                             return Err(e);
@@ -3125,7 +3187,7 @@ impl Interpreter {
                                     }
                                 }
                                 // Non-function callee — exit SMI mode.
-                                acc = JsValue::Smi(sa);
+                                acc = smi_to_val!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -3217,7 +3279,7 @@ impl Interpreter {
                                             break 'smi;
                                         }
                                         Err(e) => {
-                                            acc = JsValue::Smi(sa);
+                                            acc = smi_to_val!();
                                             frame.pc = pc;
                                             frame.accumulator = acc.cheap_clone();
                                             return Err(e);
@@ -3225,7 +3287,7 @@ impl Interpreter {
                                     }
                                 }
                                 // Non-function callee — exit SMI mode.
-                                acc = JsValue::Smi(sa);
+                                acc = smi_to_val!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -3310,7 +3372,7 @@ impl Interpreter {
                                     }
                                 }
                                 // IC miss or non-PlainObject — exit SMI mode.
-                                acc = JsValue::Smi(sa);
+                                acc = smi_to_val!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -3392,7 +3454,7 @@ impl Interpreter {
                                     break 'smi;
                                 }
                                 // Non-Array or negative index — fall through
-                                acc = JsValue::Smi(sa);
+                                acc = smi_to_val!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -3415,12 +3477,12 @@ impl Interpreter {
                                         if i >= v.len() {
                                             v.resize(i + 1, JsValue::TheHole);
                                         }
-                                        v[i] = JsValue::Smi(sa);
+                                        v[i] = smi_to_val!();
                                         continue 'smi;
                                     }
                                 }
                                 // Fall through
-                                acc = JsValue::Smi(sa);
+                                acc = smi_to_val!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -3447,17 +3509,15 @@ impl Interpreter {
                                         .as_ref()
                                         .and_then(|cache| cache.probe(slot, layout))
                                         && !ic.is_proto
-                                        && pm.set_by_offset(
-                                            ic.cached_offset as usize,
-                                            JsValue::Smi(sa),
-                                        )
+                                        && pm
+                                            .set_by_offset(ic.cached_offset as usize, smi_to_val!())
                                     {
                                         continue 'smi;
                                     }
                                 }
                                 // IC miss — exit SMI mode and let normal
                                 // dispatch handle the store.
-                                acc = JsValue::Smi(sa);
+                                acc = smi_to_val!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -3502,7 +3562,7 @@ impl Interpreter {
                                     }
                                 }
                                 // No context or missing slot — fall through.
-                                acc = JsValue::Smi(sa);
+                                acc = smi_to_val!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -3534,12 +3594,12 @@ impl Interpreter {
                                     }
                                     let mut borrow = current.borrow_mut();
                                     if slot < borrow.slots.len() {
-                                        borrow.slots[slot] = JsValue::Smi(sa);
+                                        borrow.slots[slot] = smi_to_val!();
                                         continue 'smi;
                                     }
                                 }
                                 // No context or slot out of range — fall through.
-                                acc = JsValue::Smi(sa);
+                                acc = smi_to_val!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -3563,7 +3623,7 @@ impl Interpreter {
                                         break 'smi;
                                     }
                                 }
-                                acc = JsValue::Smi(sa);
+                                acc = smi_to_val!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -3577,54 +3637,17 @@ impl Interpreter {
                                             as usize;
                                     let mut borrow = ctx_rc.borrow_mut();
                                     if slot < borrow.slots.len() {
-                                        borrow.slots[slot] = JsValue::Smi(sa);
+                                        borrow.slots[slot] = smi_to_val!();
                                         continue 'smi;
                                     }
                                 }
-                                acc = JsValue::Smi(sa);
+                                acc = smi_to_val!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
                                 break 'smi;
                             }
                             Opcode::Nop => {}
-                            // Non-Smi loads with look-ahead fusion.
-                            // Common pattern in sieve-like code:
-                            //   LdaTrue; StaKeyedProperty arr, idx, slot
-                            // Fuse into a single operation that stays in SMI
-                            // mode, avoiding the SMI→normal→SMI transition.
-                            Opcode::LdaTrue | Opcode::LdaFalse => {
-                                let bool_val = instr.opcode == Opcode::LdaTrue;
-                                // Try to fuse with a following StaKeyedProperty.
-                                if let Some(next) = instructions.get(pc)
-                                    && next.opcode == Opcode::StaKeyedProperty
-                                {
-                                    let obj_v = unsafe { operand_reg_unchecked(next, 0) };
-                                    let key_v = unsafe { operand_reg_unchecked(next, 1) };
-                                    let key_ref = unsafe { frame.read_reg_unchecked(key_v) };
-                                    if let JsValue::Smi(idx) = key_ref
-                                        && *idx >= 0
-                                    {
-                                        let i = *idx as usize;
-                                        let obj_ref = unsafe { frame.read_reg_unchecked(obj_v) };
-                                        if let JsValue::Array(items) = obj_ref {
-                                            let items_rc = Rc::clone(items);
-                                            let mut v = items_rc.borrow_mut();
-                                            if i >= v.len() {
-                                                v.resize(i + 1, JsValue::TheHole);
-                                            }
-                                            v[i] = JsValue::Boolean(bool_val);
-                                            pc += 1; // skip StaKeyedProperty
-                                            continue 'smi;
-                                        }
-                                    }
-                                }
-                                // No fusion — exit SMI cleanly.
-                                acc = JsValue::Boolean(bool_val);
-                                frame.smi_mode = false;
-                                frame.loop_end_pc = 0;
-                                break 'smi;
-                            }
                             Opcode::LdaUndefined => {
                                 acc = JsValue::Undefined;
                                 frame.smi_mode = false;
@@ -3640,7 +3663,7 @@ impl Interpreter {
                             _ => {
                                 // Unsupported opcode — exit SMI loop and let
                                 // the regular dispatch handle it.
-                                acc = JsValue::Smi(sa);
+                                acc = smi_to_val!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1; // re-process this instruction
