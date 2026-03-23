@@ -3042,10 +3042,10 @@ impl Interpreter {
                                     let has_fn_props = is_arrow && ba.has_fn_props();
                                     let closure_ctx = ba.closure_context().map(Rc::clone);
                                     let ba = Rc::clone(ba);
-                                    // Sync frame state for nested call.
-                                    acc = JsValue::Smi(sa);
+                                    // Only sync the PC for error traces — the
+                                    // accumulator is dead here (overwritten by
+                                    // the call result or rebuilt on Err).
                                     frame.pc = pc;
-                                    frame.accumulator = acc.cheap_clone();
 
                                     let args = CallArgs::new();
                                     let saved_this = if !is_arrow && is_strict {
@@ -3145,9 +3145,8 @@ impl Interpreter {
                                     let ba = Rc::clone(ba);
                                     let arg1 =
                                         unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
-                                    acc = JsValue::Smi(sa);
+                                    // Only sync the PC for error traces.
                                     frame.pc = pc;
-                                    frame.accumulator = acc.cheap_clone();
                                     let args: CallArgs = smallvec::smallvec![arg1];
                                     let saved_this = if !is_arrow && is_strict {
                                         let old = frame.global_env.borrow().get_this().cloned();
@@ -6794,7 +6793,16 @@ pub(super) fn dispatch_call(
                         Rc::clone(&frame.global_env),
                     );
                     restore_closure_context(&mut callee_frame, ba);
-                    populate_self_name(&mut callee_frame, ba, &JsValue::Function(Rc::clone(ba)));
+                    // Only construct the JsValue::Function wrapper when the
+                    // bytecode actually has a self-name register — avoids an
+                    // Rc::clone per call for anonymous closures.
+                    if ba.self_name_register().is_some() {
+                        populate_self_name(
+                            &mut callee_frame,
+                            ba,
+                            &JsValue::Function(Rc::clone(ba)),
+                        );
+                    }
                     let gen_before = frame.cache_generation;
                     let result = with_anon_call_frame(|depth| {
                         if depth < 64 {
@@ -6884,7 +6892,13 @@ pub(super) fn dispatch_call_property(
                         Rc::clone(&frame.global_env),
                     );
                     restore_closure_context(&mut callee_frame, ba);
-                    populate_self_name(&mut callee_frame, ba, &JsValue::Function(Rc::clone(ba)));
+                    if ba.self_name_register().is_some() {
+                        populate_self_name(
+                            &mut callee_frame,
+                            ba,
+                            &JsValue::Function(Rc::clone(ba)),
+                        );
+                    }
                     // Arrow functions use lexical `this` — do NOT override.
                     if !ba.is_arrow() {
                         callee_frame.global_env.borrow_mut().set_this(this_val);
