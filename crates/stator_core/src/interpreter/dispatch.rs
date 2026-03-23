@@ -1707,9 +1707,12 @@ fn handle_call_any_receiver(
                 }
                 populate_self_name(&mut callee_frame, &ba, &callee_val);
                 push_call_frame("<anonymous>")?;
+                let gen_before = ctx.frame.cache_generation;
                 let result = run_callee(&mut callee_frame);
                 pop_call_frame();
-                ctx.frame.global_cache_invalidate();
+                if gen_before != ctx.frame.global_env.borrow().generation() {
+                    ctx.frame.global_cache_invalidate();
+                }
                 ctx.frame.accumulator = result?;
             }
         }
@@ -1833,13 +1836,16 @@ fn handle_tail_call(
                         .set_this(JsValue::Undefined);
                 }
                 restore_closure_context(ctx.frame, &ba);
-                populate_self_name(ctx.frame, &ba, &JsValue::Function(Rc::clone(&ba)));
+                if ba.self_name_register().is_some() {
+                    populate_self_name(ctx.frame, &ba, &JsValue::Function(Rc::clone(&ba)));
+                }
                 ctx.frame.string_cache = None;
                 ctx.frame.mono_load_cache = None;
                 ctx.frame.poly_load_cache = None;
                 ctx.frame.mega_load_ic = None;
                 ctx.frame.proto_load_ic = None;
                 ctx.frame.mega_store_ic = None;
+                ctx.frame.global_ic = None;
                 ctx.frame.global_cache_invalidate();
                 return Ok(DispatchAction::TailCall);
             }
@@ -1926,11 +1932,16 @@ fn handle_call_undefined_receiver0(
                 if ba.is_arrow() && ba.has_fn_props() {
                     callee_frame.new_target = fn_props_get(&ba, ".new_target");
                 }
-                populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
+                if ba.self_name_register().is_some() {
+                    populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
+                }
                 push_call_frame("<anonymous>")?;
+                let gen_before = ctx.frame.cache_generation;
                 let result = run_callee(&mut callee_frame);
                 pop_call_frame();
-                ctx.frame.global_cache_invalidate();
+                if gen_before != ctx.frame.global_env.borrow().generation() {
+                    ctx.frame.global_cache_invalidate();
+                }
                 if !ba.is_arrow() && ba.is_strict() {
                     match saved_this {
                         Some(v) => {
@@ -2029,11 +2040,16 @@ fn handle_call_undefined_receiver1(
                 if ba.is_arrow() && ba.has_fn_props() {
                     callee_frame.new_target = fn_props_get(&ba, ".new_target");
                 }
-                populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
+                if ba.self_name_register().is_some() {
+                    populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
+                }
                 push_call_frame("<anonymous>")?;
+                let gen_before = ctx.frame.cache_generation;
                 let result = run_callee(&mut callee_frame);
                 pop_call_frame();
-                ctx.frame.global_cache_invalidate();
+                if gen_before != ctx.frame.global_env.borrow().generation() {
+                    ctx.frame.global_cache_invalidate();
+                }
                 if !ba.is_arrow() && ba.is_strict() {
                     match saved_this {
                         Some(v) => {
@@ -2141,11 +2157,20 @@ fn handle_call_undefined_receiver2(
                     if ba.is_arrow() && ba.has_fn_props() {
                         callee_frame.new_target = fn_props_get(&ba, ".new_target");
                     }
-                    populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
+                    if ba.self_name_register().is_some() {
+                        populate_self_name(
+                            &mut callee_frame,
+                            &ba,
+                            &JsValue::Function(Rc::clone(&ba)),
+                        );
+                    }
                     push_call_frame("<anonymous>")?;
+                    let gen_before = ctx.frame.cache_generation;
                     let result = run_callee(&mut callee_frame);
                     pop_call_frame();
-                    ctx.frame.global_cache_invalidate();
+                    if gen_before != ctx.frame.global_env.borrow().generation() {
+                        ctx.frame.global_cache_invalidate();
+                    }
                     if !ba.is_arrow() && ba.is_strict() {
                         match saved_this {
                             Some(v) => {
@@ -2383,7 +2408,9 @@ fn handle_call_with_spread(
                     Rc::clone(&ctx.frame.global_env),
                 );
                 restore_closure_context(&mut callee_frame, &ba);
-                populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
+                if ba.self_name_register().is_some() {
+                    populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
+                }
                 push_call_frame("<anonymous>")?;
                 let result = run_callee(&mut callee_frame);
                 pop_call_frame();
@@ -6952,7 +6979,13 @@ fn handle_call_direct_eval(
                         Rc::clone(&ctx.frame.global_env),
                     );
                     restore_closure_context(&mut callee_frame, &ba);
-                    populate_self_name(&mut callee_frame, &ba, &JsValue::Function(Rc::clone(&ba)));
+                    if ba.self_name_register().is_some() {
+                        populate_self_name(
+                            &mut callee_frame,
+                            &ba,
+                            &JsValue::Function(Rc::clone(&ba)),
+                        );
+                    }
                     push_call_frame("<eval-fallback>")?;
                     let result = run_callee(&mut callee_frame);
                     pop_call_frame();
