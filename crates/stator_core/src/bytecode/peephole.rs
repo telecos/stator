@@ -388,6 +388,72 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         continue;
                     }
                 }
+                (Opcode::TestGreaterThan, Opcode::JumpIfTrue | Opcode::JumpIfFalse) => {
+                    if let (
+                        Operand::Register(reg),
+                        Operand::FeedbackSlot(slot),
+                        Operand::JumpOffset(offset),
+                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    {
+                        let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
+                        fused_offsets.push(byte_offsets[index]);
+                        fused_instructions.push(Instruction::new_unchecked(
+                            Opcode::TestGreaterThanJump,
+                            vec![
+                                Operand::Register(reg),
+                                Operand::FeedbackSlot(slot),
+                                Operand::JumpOffset(offset),
+                                Operand::Flag(is_true),
+                            ],
+                        ));
+                        index += 2;
+                        continue;
+                    }
+                }
+                (Opcode::TestEqual, Opcode::JumpIfTrue | Opcode::JumpIfFalse) => {
+                    if let (
+                        Operand::Register(reg),
+                        Operand::FeedbackSlot(slot),
+                        Operand::JumpOffset(offset),
+                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    {
+                        let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
+                        fused_offsets.push(byte_offsets[index]);
+                        fused_instructions.push(Instruction::new_unchecked(
+                            Opcode::TestEqualJump,
+                            vec![
+                                Operand::Register(reg),
+                                Operand::FeedbackSlot(slot),
+                                Operand::JumpOffset(offset),
+                                Operand::Flag(is_true),
+                            ],
+                        ));
+                        index += 2;
+                        continue;
+                    }
+                }
+                (Opcode::TestEqualStrict, Opcode::JumpIfTrue | Opcode::JumpIfFalse) => {
+                    if let (
+                        Operand::Register(reg),
+                        Operand::FeedbackSlot(slot),
+                        Operand::JumpOffset(offset),
+                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    {
+                        let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
+                        fused_offsets.push(byte_offsets[index]);
+                        fused_instructions.push(Instruction::new_unchecked(
+                            Opcode::TestEqualStrictJump,
+                            vec![
+                                Operand::Register(reg),
+                                Operand::FeedbackSlot(slot),
+                                Operand::JumpOffset(offset),
+                                Operand::Flag(is_true),
+                            ],
+                        ));
+                        index += 2;
+                        continue;
+                    }
+                }
                 (Opcode::AddSmi, Opcode::Star) => {
                     if let (
                         Operand::Immediate(imm),
@@ -398,6 +464,26 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         fused_offsets.push(byte_offsets[index]);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::AddSmiStar,
+                            vec![
+                                Operand::Immediate(imm),
+                                Operand::FeedbackSlot(slot),
+                                Operand::Register(dst),
+                            ],
+                        ));
+                        index += 2;
+                        continue;
+                    }
+                }
+                (Opcode::SubSmi, Opcode::Star) => {
+                    if let (
+                        Operand::Immediate(imm),
+                        Operand::FeedbackSlot(slot),
+                        Operand::Register(dst),
+                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    {
+                        fused_offsets.push(byte_offsets[index]);
+                        fused_instructions.push(Instruction::new_unchecked(
+                            Opcode::SubSmiStar,
                             vec![
                                 Operand::Immediate(imm),
                                 Operand::FeedbackSlot(slot),

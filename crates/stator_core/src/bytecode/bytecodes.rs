@@ -735,8 +735,19 @@ pub enum Opcode {
     /// `TestLessThan(reg, slot); JumpIf{True,False}(offset)`.
     /// `[reg, slot, offset, is_true]`
     TestLessThanJump,
+    /// `TestGreaterThan(reg, slot); JumpIf{True,False}(offset)`.
+    /// `[reg, slot, offset, is_true]`
+    TestGreaterThanJump,
+    /// `TestEqual(reg, slot); JumpIf{True,False}(offset)`.
+    /// `[reg, slot, offset, is_true]`
+    TestEqualJump,
+    /// `TestEqualStrict(reg, slot); JumpIf{True,False}(offset)`.
+    /// `[reg, slot, offset, is_true]`
+    TestEqualStrictJump,
     /// `AddSmi(imm, slot); Star(dst)`. `[imm, slot, dst]`
     AddSmiStar,
+    /// `SubSmi(imm, slot); Star(dst)`. `[imm, slot, dst]`
+    SubSmiStar,
     /// No-op placeholder used by bytecode optimization before final compaction.
     Nop,
 }
@@ -1007,7 +1018,11 @@ impl Opcode {
             Opcode::LdarAddStar => &[Register, Register, Register, FeedbackSlot],
             Opcode::LdarSubStar => &[Register, Register, Register, FeedbackSlot],
             Opcode::TestLessThanJump => &[Register, FeedbackSlot, JumpOffset, Flag],
+            Opcode::TestGreaterThanJump => &[Register, FeedbackSlot, JumpOffset, Flag],
+            Opcode::TestEqualJump => &[Register, FeedbackSlot, JumpOffset, Flag],
+            Opcode::TestEqualStrictJump => &[Register, FeedbackSlot, JumpOffset, Flag],
             Opcode::AddSmiStar => &[Immediate, FeedbackSlot, Register],
+            Opcode::SubSmiStar => &[Immediate, FeedbackSlot, Register],
             Opcode::Nop => &[],
         }
     }

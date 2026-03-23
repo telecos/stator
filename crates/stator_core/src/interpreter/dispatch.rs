@@ -1328,6 +1328,155 @@ fn handle_test_less_than_jump(
 }
 
 #[inline(always)]
+fn handle_test_greater_than_jump(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(v) = instr.operands[0] else {
+        return Err(err_bad_operand("TestGreaterThanJump", 0));
+    };
+    let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+        return Err(err_bad_operand("TestGreaterThanJump", 1));
+    };
+    let Operand::JumpOffset(_delta) = instr.operands[2] else {
+        return Err(err_bad_operand("TestGreaterThanJump", 2));
+    };
+    let Operand::Flag(is_true_flag) = instr.operands[3] else {
+        return Err(err_bad_operand("TestGreaterThanJump", 3));
+    };
+
+    let rhs = ctx.frame.read_reg(v)?;
+    let comparison = if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        a > *b
+    } else {
+        let rhs = rhs.clone();
+        JsValue::abstract_relational_comparison(&rhs, &ctx.frame.accumulator, false)?
+            .unwrap_or(false)
+    };
+
+    ctx.frame.accumulator = JsValue::Boolean(comparison);
+    let should_jump = if is_true_flag == 0 {
+        !comparison
+    } else {
+        comparison
+    };
+    if should_jump {
+        ctx.frame.pc = resolve_cached_jump(ctx, "TestGreaterThanJump")?;
+    }
+    Ok(DispatchAction::Continue)
+}
+
+#[inline(always)]
+fn handle_test_equal_jump(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(v) = instr.operands[0] else {
+        return Err(err_bad_operand("TestEqualJump", 0));
+    };
+    let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+        return Err(err_bad_operand("TestEqualJump", 1));
+    };
+    let Operand::JumpOffset(_delta) = instr.operands[2] else {
+        return Err(err_bad_operand("TestEqualJump", 2));
+    };
+    let Operand::Flag(is_true_flag) = instr.operands[3] else {
+        return Err(err_bad_operand("TestEqualJump", 3));
+    };
+
+    let rhs = ctx.frame.read_reg(v)?;
+    let comparison = abstract_eq(&ctx.frame.accumulator, rhs);
+
+    ctx.frame.accumulator = JsValue::Boolean(comparison);
+    let should_jump = if is_true_flag == 0 {
+        !comparison
+    } else {
+        comparison
+    };
+    if should_jump {
+        ctx.frame.pc = resolve_cached_jump(ctx, "TestEqualJump")?;
+    }
+    Ok(DispatchAction::Continue)
+}
+
+#[inline(always)]
+fn handle_test_equal_strict_jump(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(v) = instr.operands[0] else {
+        return Err(err_bad_operand("TestEqualStrictJump", 0));
+    };
+    let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+        return Err(err_bad_operand("TestEqualStrictJump", 1));
+    };
+    let Operand::JumpOffset(_delta) = instr.operands[2] else {
+        return Err(err_bad_operand("TestEqualStrictJump", 2));
+    };
+    let Operand::Flag(is_true_flag) = instr.operands[3] else {
+        return Err(err_bad_operand("TestEqualStrictJump", 3));
+    };
+
+    let rhs = ctx.frame.read_reg(v)?;
+    let comparison = if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        a == *b
+    } else {
+        let rhs = rhs.clone();
+        strict_eq(&ctx.frame.accumulator, &rhs)
+    };
+
+    ctx.frame.accumulator = JsValue::Boolean(comparison);
+    let should_jump = if is_true_flag == 0 {
+        !comparison
+    } else {
+        comparison
+    };
+    if should_jump {
+        ctx.frame.pc = resolve_cached_jump(ctx, "TestEqualStrictJump")?;
+    }
+    Ok(DispatchAction::Continue)
+}
+
+#[inline(always)]
+fn handle_sub_smi_star(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Immediate(imm) = instr.operands[0] else {
+        return Err(err_bad_operand("SubSmiStar", 0));
+    };
+    let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+        return Err(err_bad_operand("SubSmiStar", 1));
+    };
+    let Operand::Register(dst) = instr.operands[2] else {
+        return Err(err_bad_operand("SubSmiStar", 2));
+    };
+
+    if let JsValue::Smi(n) = &ctx.frame.accumulator
+        && let Some(result) = n.checked_sub(imm)
+    {
+        let value = JsValue::Smi(result);
+        ctx.frame.accumulator = value.cheap_clone();
+        ctx.frame.write_reg(dst, value)?;
+        return Ok(DispatchAction::Continue);
+    }
+
+    if let JsValue::BigInt(n) = &ctx.frame.accumulator {
+        ctx.frame.accumulator = JsValue::BigInt(n.wrapping_sub(i128::from(imm)));
+    } else {
+        let lhs_n = ctx.frame.accumulator.to_number()?;
+        ctx.frame.accumulator = number_to_jsvalue(lhs_n - imm as f64);
+    }
+    ctx.frame
+        .write_reg(dst, ctx.frame.accumulator.cheap_clone())?;
+    Ok(DispatchAction::Continue)
+}
+
+#[inline(always)]
 fn handle_test_greater_than(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -7763,6 +7912,10 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::TestEqualStrict as usize] = handle_test_equal_strict;
     table[Opcode::TestLessThan as usize] = handle_test_less_than;
     table[Opcode::TestLessThanJump as usize] = handle_test_less_than_jump;
+    table[Opcode::TestGreaterThanJump as usize] = handle_test_greater_than_jump;
+    table[Opcode::TestEqualJump as usize] = handle_test_equal_jump;
+    table[Opcode::TestEqualStrictJump as usize] = handle_test_equal_strict_jump;
+    table[Opcode::SubSmiStar as usize] = handle_sub_smi_star;
     table[Opcode::TestGreaterThan as usize] = handle_test_greater_than;
     table[Opcode::TestLessThanOrEqual as usize] = handle_test_less_than_or_equal;
     table[Opcode::TestGreaterThanOrEqual as usize] = handle_test_greater_than_or_equal;

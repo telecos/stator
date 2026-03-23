@@ -882,6 +882,109 @@ impl<'a> BaselineCompiler<'a> {
                 self.masm.cmp_rr(Reg64::R12, Reg64::R11);
                 self.emit_cond_jump(CondCode::Equal, target);
             }
+            Opcode::TestGreaterThanJump => {
+                let Operand::Register(v) = instr.operands[0] else {
+                    return Err(bad_operand("TestGreaterThanJump", 0));
+                };
+                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                    return Err(bad_operand("TestGreaterThanJump", 1));
+                };
+                let Operand::JumpOffset(delta) = instr.operands[2] else {
+                    return Err(bad_operand("TestGreaterThanJump", 2));
+                };
+                let Operand::Flag(is_true_flag) = instr.operands[3] else {
+                    return Err(bad_operand("TestGreaterThanJump", 3));
+                };
+                let target = Self::resolve_target(
+                    jump_target_byte(idx, delta, byte_offsets),
+                    byte_offsets,
+                    n,
+                )?;
+                self.emit_compare_and_set(v, CondCode::Greater);
+                self.masm.mov_ri(
+                    Reg64::R11,
+                    if is_true_flag == 0 {
+                        JIT_FALSE
+                    } else {
+                        JIT_TRUE
+                    },
+                );
+                self.masm.cmp_rr(Reg64::R12, Reg64::R11);
+                self.emit_cond_jump(CondCode::Equal, target);
+            }
+            Opcode::TestEqualJump => {
+                let Operand::Register(v) = instr.operands[0] else {
+                    return Err(bad_operand("TestEqualJump", 0));
+                };
+                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                    return Err(bad_operand("TestEqualJump", 1));
+                };
+                let Operand::JumpOffset(delta) = instr.operands[2] else {
+                    return Err(bad_operand("TestEqualJump", 2));
+                };
+                let Operand::Flag(is_true_flag) = instr.operands[3] else {
+                    return Err(bad_operand("TestEqualJump", 3));
+                };
+                let target = Self::resolve_target(
+                    jump_target_byte(idx, delta, byte_offsets),
+                    byte_offsets,
+                    n,
+                )?;
+                self.emit_compare_and_set(v, CondCode::Equal);
+                self.masm.mov_ri(
+                    Reg64::R11,
+                    if is_true_flag == 0 {
+                        JIT_FALSE
+                    } else {
+                        JIT_TRUE
+                    },
+                );
+                self.masm.cmp_rr(Reg64::R12, Reg64::R11);
+                self.emit_cond_jump(CondCode::Equal, target);
+            }
+            Opcode::TestEqualStrictJump => {
+                let Operand::Register(v) = instr.operands[0] else {
+                    return Err(bad_operand("TestEqualStrictJump", 0));
+                };
+                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                    return Err(bad_operand("TestEqualStrictJump", 1));
+                };
+                let Operand::JumpOffset(delta) = instr.operands[2] else {
+                    return Err(bad_operand("TestEqualStrictJump", 2));
+                };
+                let Operand::Flag(is_true_flag) = instr.operands[3] else {
+                    return Err(bad_operand("TestEqualStrictJump", 3));
+                };
+                let target = Self::resolve_target(
+                    jump_target_byte(idx, delta, byte_offsets),
+                    byte_offsets,
+                    n,
+                )?;
+                self.emit_compare_and_set(v, CondCode::Equal);
+                self.masm.mov_ri(
+                    Reg64::R11,
+                    if is_true_flag == 0 {
+                        JIT_FALSE
+                    } else {
+                        JIT_TRUE
+                    },
+                );
+                self.masm.cmp_rr(Reg64::R12, Reg64::R11);
+                self.emit_cond_jump(CondCode::Equal, target);
+            }
+            Opcode::SubSmiStar => {
+                let Operand::Immediate(imm) = instr.operands[0] else {
+                    return Err(bad_operand("SubSmiStar", 0));
+                };
+                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                    return Err(bad_operand("SubSmiStar", 1));
+                };
+                let Operand::Register(dst) = instr.operands[2] else {
+                    return Err(bad_operand("SubSmiStar", 2));
+                };
+                self.masm.sub_ri(Reg64::R12, imm);
+                self.emit_store_reg(dst, Reg64::R12);
+            }
             Opcode::TestGreaterThan => {
                 let Operand::Register(v) = instr.operands[0] else {
                     return Err(bad_operand("TestGreaterThan", 0));
