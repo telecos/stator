@@ -2755,6 +2755,19 @@ impl Interpreter {
                                     }
                                 }
                             }
+                            Opcode::Div => {
+                                let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                let b = unsafe { frame.read_reg_smi_unchecked(reg) };
+                                if b != 0 && sa % b == 0 {
+                                    sa /= b;
+                                } else {
+                                    // Non-exact or div-by-zero → float result
+                                    acc = JsValue::HeapNumber(sa as f64 / b as f64);
+                                    frame.smi_mode = false;
+                                    frame.loop_end_pc = 0;
+                                    break 'smi;
+                                }
+                            }
                             Opcode::Mod => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
                                 let b = unsafe { frame.read_reg_smi_unchecked(reg) };
@@ -4043,6 +4056,15 @@ impl Interpreter {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
                             if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
                                 acc = JsValue::Smi(*a | *b);
+                                // Re-enter SMI mode if we recently exited
+                                // (common pattern: `(expr) | 0` coerces back to int)
+                                if !frame.smi_mode
+                                    && !frame.loop_trip_counts.is_empty()
+                                    && frame.hot_registers.is_some()
+                                {
+                                    frame.smi_mode = true;
+                                    continue 'dispatch;
+                                }
                                 continue 'dispatch;
                             }
                         }
@@ -4080,6 +4102,13 @@ impl Interpreter {
                             && let JsValue::Smi(n) = acc
                         {
                             acc = JsValue::Smi(n | imm);
+                            // Re-enter SMI mode if we recently exited
+                            if !frame.smi_mode
+                                && !frame.loop_trip_counts.is_empty()
+                                && frame.hot_registers.is_some()
+                            {
+                                frame.smi_mode = true;
+                            }
                             continue 'dispatch;
                         }
                         frame.pc = pc;
