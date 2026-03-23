@@ -4843,6 +4843,123 @@ impl Interpreter {
                         }
                     }
 
+                    // ── Inline CallProperty1 (array method fast path) ────
+                    //
+                    // The common pattern for `arr.push(val)`, `arr.pop()`, etc.
+                    // When callee is a fast-array-method PlainObject AND the
+                    // receiver is a JsValue::Array, handle directly without
+                    // building a callee frame.
+                    Opcode::CallProperty1 => {
+                        let callee_reg = unsafe { operand_reg_unchecked(instr, 0) };
+                        let recv_reg = unsafe { operand_reg_unchecked(instr, 1) };
+                        let arg_reg = unsafe { operand_reg_unchecked(instr, 2) };
+                        let callee = unsafe { frame.read_reg_unchecked(callee_reg) };
+                        if let JsValue::PlainObject(callee_map) = callee {
+                            let method_name = callee_map
+                                .borrow()
+                                .get(FAST_ARRAY_METHOD_KEY)
+                                .and_then(|v| {
+                                    if let JsValue::String(s) = v {
+                                        Some(Rc::clone(s))
+                                    } else {
+                                        None
+                                    }
+                                });
+                            if let Some(name) = method_name {
+                                let recv = unsafe { frame.read_reg_unchecked(recv_reg) };
+                                if let JsValue::Array(arr) = recv {
+                                    let arg =
+                                        unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
+                                    acc = match &*name {
+                                        "push" => {
+                                            let mut items = arr.borrow_mut();
+                                            items.push(arg);
+                                            JsValue::Smi(items.len() as i32)
+                                        }
+                                        _ => {
+                                            let recv_clone = recv.cheap_clone();
+                                            if let Some(result) = dispatch_fast_array_method(
+                                                &recv_clone,
+                                                &name,
+                                                &[arg],
+                                            )? {
+                                                result
+                                            } else {
+                                                // Unknown method — fall through to dispatch table.
+                                                frame.pc = pc;
+                                                frame.accumulator = acc;
+                                                match dispatch_via_table(
+                                                    frame,
+                                                    instructions,
+                                                    byte_offsets,
+                                                    jump_targets,
+                                                    handler_table.as_slice(),
+                                                    instr,
+                                                ) {
+                                                    Ok(dispatch::DispatchAction::Continue) => {
+                                                        pc = frame.pc;
+                                                        acc = frame.accumulator.cheap_clone();
+                                                        continue 'dispatch;
+                                                    }
+                                                    Ok(dispatch::DispatchAction::Return(v)) => {
+                                                        return Ok(v);
+                                                    }
+                                                    Ok(dispatch::DispatchAction::TailCall) => {
+                                                        continue 'tail_call;
+                                                    }
+                                                    Err(e) => {
+                                                        if let Some(resume_pc) =
+                                                            handle_dispatch_error(
+                                                                &e,
+                                                                frame,
+                                                                handler_table.as_slice(),
+                                                            )
+                                                        {
+                                                            pc = resume_pc;
+                                                            acc = frame.accumulator.cheap_clone();
+                                                            continue 'dispatch;
+                                                        }
+                                                        return Err(e);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    };
+                                    continue 'dispatch;
+                                }
+                            }
+                        }
+                        // Fall through to table dispatch.
+                        frame.pc = pc;
+                        frame.accumulator = acc;
+                        match dispatch_via_table(
+                            frame,
+                            instructions,
+                            byte_offsets,
+                            jump_targets,
+                            handler_table.as_slice(),
+                            instr,
+                        ) {
+                            Ok(dispatch::DispatchAction::Continue) => {
+                                pc = frame.pc;
+                                acc = frame.accumulator.cheap_clone();
+                                continue 'dispatch;
+                            }
+                            Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                            Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                            Err(e) => {
+                                if let Some(resume_pc) =
+                                    handle_dispatch_error(&e, frame, handler_table.as_slice())
+                                {
+                                    pc = resume_pc;
+                                    acc = frame.accumulator.cheap_clone();
+                                    continue 'dispatch;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+
                     // ── All other opcodes: dispatch table ────
                     _ => {
                         // Write back locals before cold-path dispatch.
