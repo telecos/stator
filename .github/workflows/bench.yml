@@ -29,6 +29,11 @@ jobs:
         with:
           shared-key: "bench"
 
+      - name: Build benchmarks
+        run: cargo bench --package stator_core --no-run --jobs 2
+        env:
+          CARGO_INCREMENTAL: "0"
+
       - name: Run benchmarks
         run: cargo bench --package stator_core
 

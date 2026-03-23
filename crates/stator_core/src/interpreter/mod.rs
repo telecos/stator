@@ -2995,10 +2995,8 @@ impl Interpreter {
                                 }
                             }
                             Opcode::Return => {
-                                acc = JsValue::Smi(sa);
                                 frame.pc = pc;
-                                frame.accumulator = acc.cheap_clone();
-                                return Ok(acc);
+                                return Ok(JsValue::Smi(sa));
                             }
                             Opcode::LdaGlobal => {
                                 let name_idx =
@@ -4395,7 +4393,6 @@ impl Interpreter {
                     // ── Return ───────────────────────────────
                     Opcode::Return => {
                         frame.pc = pc;
-                        frame.accumulator = acc.cheap_clone();
                         return Ok(acc);
                     }
 
