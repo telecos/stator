@@ -133,18 +133,28 @@ pub fn call_stack_depth() -> usize {
 /// Pop the most recently pushed frame name from the thread-local call stack.
 ///
 /// Call this immediately after returning from a nested interpreter call.
-pub fn pop_call_frame() {
+/// When `named` is `false` (the common anonymous-closure path), the
+/// expensive `CALL_STACK` TLS access is skipped entirely.
+pub fn pop_call_frame_ex(named: bool) {
     CALL_DEPTH.with(|d| {
         let cur = d.get();
         d.set(cur.saturating_sub(1));
-        // Pop any named frame that was recorded at this depth level.
-        CALL_STACK.with(|cs| {
-            let mut stack = cs.borrow_mut();
-            if stack.last().is_some_and(|&(depth, _)| depth == cur) {
-                stack.pop();
-            }
-        });
+        if named {
+            CALL_STACK.with(|cs| {
+                let mut stack = cs.borrow_mut();
+                if stack.last().is_some_and(|&(depth, _)| depth == cur) {
+                    stack.pop();
+                }
+            });
+        }
     });
+}
+
+/// Pop the most recently pushed frame name from the thread-local call stack.
+///
+/// Call this immediately after returning from a nested interpreter call.
+pub fn pop_call_frame() {
+    pop_call_frame_ex(true);
 }
 
 /// Return a snapshot of the current JS call stack as a `Vec<String>`.

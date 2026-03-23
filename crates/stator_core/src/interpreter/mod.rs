@@ -180,7 +180,9 @@ use std::time::Instant;
 
 use smallvec::SmallVec;
 
-use crate::builtins::error::{call_stack_depth, pop_call_frame, push_call_frame};
+use crate::builtins::error::{
+    call_stack_depth, pop_call_frame, pop_call_frame_ex, push_call_frame,
+};
 use crate::builtins::function::{function_bound_name, function_length, function_to_string};
 use crate::builtins::proxy::{proxy_apply, proxy_get_with_receiver, proxy_set_with_receiver};
 use crate::bytecode::bytecode_array::{
@@ -2430,39 +2432,50 @@ impl Interpreter {
     /// - an unimplemented opcode is encountered, or
     /// - a type error occurs during arithmetic.
     pub fn run(frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
+        Self::run_inner(frame, false)
+    }
+
+    /// Run a callee frame, skipping the `CURRENT_GLOBALS` TLS check when the
+    /// caller guarantees the environment is already published.
+    pub(super) fn run_same_env(frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
+        Self::run_inner(frame, true)
+    }
+
+    fn run_inner(frame: &mut InterpreterFrame, skip_globals: bool) -> StatorResult<JsValue> {
         let result = (|| {
-            // Publish the global environment for proto_lookup's constructor resolution.
-            // For nested calls (depth > 0), the env is nearly always the same
-            // pointer, so only touch the TLS when it actually differs.
-            let depth = call_stack_depth();
-            if depth == 0 {
-                // Top-level: always publish.
-                CURRENT_GLOBALS.with(|g| {
-                    *g.borrow_mut() = Some(Rc::clone(&frame.global_env));
-                });
+            if skip_globals {
+                // Caller guarantees CURRENT_GLOBALS is already published.
             } else {
-                CURRENT_GLOBALS.with(|g| {
-                    let same = g
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|e| Rc::ptr_eq(e, &frame.global_env));
-                    if !same {
+                // Publish the global environment for proto_lookup's constructor resolution.
+                // For nested calls (depth > 0), the env is nearly always the same
+                // pointer, so only touch the TLS when it actually differs.
+                let depth = call_stack_depth();
+                if depth == 0 {
+                    CURRENT_GLOBALS.with(|g| {
                         *g.borrow_mut() = Some(Rc::clone(&frame.global_env));
-                    }
-                });
+                    });
+                } else {
+                    CURRENT_GLOBALS.with(|g| {
+                        let same = g
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|e| Rc::ptr_eq(e, &frame.global_env));
+                        if !same {
+                            *g.borrow_mut() = Some(Rc::clone(&frame.global_env));
+                        }
+                    });
+                }
             }
             if frame.bytecode_array.is_async() && frame.generator_state.is_none() {
                 return Self::run_async_function(frame.bytecode_array.clone(), CallArgs::new());
             }
-            // For top-level calls (depth 0), wrap in stacker to guard
-            // against stack overflow.  For nested calls (depth > 0),
-            // run_callee() already handles the stacker guard, so skip it
-            // here to avoid the closure indirection that prevents LLVM
-            // from inlining across the dispatch boundary.
-            if depth == 0 {
-                stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Self::run_dispatch(frame))
-            } else {
+            // run_callee() handles the stacker guard for deep recursion.
+            // Top-level calls (via `run()`) also need it.
+            if skip_globals {
+                // Nested call: run_callee already guarded the stack.
                 Self::run_dispatch(frame)
+            } else {
+                stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || Self::run_dispatch(frame))
             }
         })();
         // Write back the per-frame IC state to the shared BytecodeArray cache
@@ -2997,6 +3010,8 @@ impl Interpreter {
                                     && !ba.is_generator()
                                     && !ba.is_async()
                                 {
+                                    let is_arrow = ba.is_arrow();
+                                    let is_strict = ba.is_strict();
                                     let ba = Rc::clone(ba);
                                     // Sync frame state for nested call.
                                     acc = JsValue::Smi(sa);
@@ -3004,37 +3019,36 @@ impl Interpreter {
                                     frame.accumulator = acc.cheap_clone();
 
                                     let args = CallArgs::new();
-                                    let saved_this = if !ba.is_arrow() && ba.is_strict() {
+                                    let saved_this = if !is_arrow && is_strict {
                                         let old = frame.global_env.borrow().get_this().cloned();
                                         frame.global_env.borrow_mut().set_this(JsValue::Undefined);
                                         old
                                     } else {
                                         None
                                     };
+                                    let has_self_name = ba.self_name_register().is_some();
+                                    let has_fn_props = is_arrow && ba.has_fn_props();
                                     let mut callee_frame = InterpreterFrame::new_callee_frame(
                                         Rc::clone(&ba),
                                         args,
                                         Rc::clone(&frame.global_env),
                                     );
                                     restore_closure_context(&mut callee_frame, &ba);
-                                    if ba.is_arrow() && ba.has_fn_props() {
+                                    if has_fn_props {
                                         callee_frame.new_target = fn_props_get(&ba, ".new_target");
                                     }
-                                    if ba.self_name_register().is_some() {
-                                        populate_self_name(
-                                            &mut callee_frame,
-                                            &ba,
-                                            &JsValue::Function(Rc::clone(&ba)),
-                                        );
+                                    if has_self_name {
+                                        let ba_val = JsValue::Function(Rc::clone(&ba));
+                                        populate_self_name(&mut callee_frame, &ba, &ba_val);
                                     }
                                     push_call_frame("<anonymous>")?;
                                     let gen_before = frame.cache_generation;
                                     let result = run_callee(&mut callee_frame);
-                                    pop_call_frame();
+                                    pop_call_frame_ex(false);
                                     if gen_before != frame.global_env.borrow().generation() {
                                         frame.global_cache_invalidate();
                                     }
-                                    if !ba.is_arrow() && ba.is_strict() {
+                                    if !is_arrow && is_strict {
                                         match saved_this {
                                             Some(v) => {
                                                 frame.global_env.borrow_mut().set_this(v);
@@ -4588,42 +4602,43 @@ impl Interpreter {
                             && !ba.is_generator()
                             && !ba.is_async()
                         {
+                            let is_arrow = ba.is_arrow();
+                            let is_strict = ba.is_strict();
                             let ba = Rc::clone(ba);
                             frame.pc = pc;
 
                             let args = CallArgs::new();
-                            let saved_this = if !ba.is_arrow() && ba.is_strict() {
+                            let saved_this = if !is_arrow && is_strict {
                                 let old = frame.global_env.borrow().get_this().cloned();
                                 frame.global_env.borrow_mut().set_this(JsValue::Undefined);
                                 old
                             } else {
                                 None
                             };
+                            let has_self_name = ba.self_name_register().is_some();
+                            let has_fn_props = is_arrow && ba.has_fn_props();
                             let mut callee_frame = InterpreterFrame::new_callee_frame(
                                 Rc::clone(&ba),
                                 args,
                                 Rc::clone(&frame.global_env),
                             );
                             restore_closure_context(&mut callee_frame, &ba);
-                            if ba.is_arrow() && ba.has_fn_props() {
+                            if has_fn_props {
                                 callee_frame.new_target = fn_props_get(&ba, ".new_target");
                             }
-                            if ba.self_name_register().is_some() {
-                                populate_self_name(
-                                    &mut callee_frame,
-                                    &ba,
-                                    &JsValue::Function(Rc::clone(&ba)),
-                                );
+                            if has_self_name {
+                                let ba_val = JsValue::Function(Rc::clone(&ba));
+                                populate_self_name(&mut callee_frame, &ba, &ba_val);
                             }
                             push_call_frame("<anonymous>")?;
                             let gen_before = frame.cache_generation;
                             let result = run_callee(&mut callee_frame);
-                            pop_call_frame();
+                            pop_call_frame_ex(false);
                             // Only invalidate if the callee actually mutated globals.
                             if gen_before != frame.global_env.borrow().generation() {
                                 frame.global_cache_invalidate();
                             }
-                            if !ba.is_arrow() && ba.is_strict() {
+                            if !is_arrow && is_strict {
                                 match saved_this {
                                     Some(v) => {
                                         frame.global_env.borrow_mut().set_this(v);
@@ -5985,10 +6000,10 @@ pub(super) fn is_js_receiver(value: &JsValue) -> bool {
 fn run_callee(callee_frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
     const STACK_GUARD_DEPTH: usize = 64;
     if call_stack_depth() < STACK_GUARD_DEPTH {
-        Interpreter::run(callee_frame)
+        Interpreter::run_same_env(callee_frame)
     } else {
         stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
-            Interpreter::run(callee_frame)
+            Interpreter::run_same_env(callee_frame)
         })
     }
 }
