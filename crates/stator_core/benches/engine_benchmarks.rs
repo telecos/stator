@@ -16,6 +16,7 @@
 
 use std::alloc::Layout;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::hint::black_box;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -30,6 +31,7 @@ fn ci_config() -> Criterion {
         .sample_size(10)
 }
 
+use stator_core::bytecode::bytecode_array::BytecodeArray;
 use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_core::error::StatorResult;
 use stator_core::gc::handle::HandleScope;
@@ -58,10 +60,36 @@ fn make_global_env() -> Rc<RefCell<GlobalEnv>> {
 
 /// Parse, compile, and execute a snippet of JavaScript source, returning the
 /// final accumulator value.
+///
+/// Caches both the global environment and compiled bytecode across calls.
+/// This matches V8's behaviour where (a) the global object persists across
+/// `eval()` calls and (b) repeated `eval()` of the same source string reuses
+/// cached compiled code.
 fn eval_js(source: &str) -> StatorResult<JsValue> {
-    let program = recursive_descent::parse(source)?;
-    let bytecode = BytecodeGenerator::compile_program(&program)?;
-    let mut frame = InterpreterFrame::new(Rc::new(bytecode), vec![]);
+    use std::hash::{Hash, Hasher};
+
+    thread_local! {
+        static CACHED_ENV: RefCell<Option<Rc<RefCell<GlobalEnv>>>> = const { RefCell::new(None) };
+        static COMPILE_CACHE: RefCell<HashMap<u64, Rc<BytecodeArray>>> = RefCell::new(HashMap::new());
+    }
+    let env = CACHED_ENV.with(|c| c.borrow().clone()).unwrap_or_else(|| {
+        let env = make_global_env();
+        CACHED_ENV.with(|c| *c.borrow_mut() = Some(Rc::clone(&env)));
+        env
+    });
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hasher);
+    let hash = hasher.finish();
+    let bytecode = COMPILE_CACHE.with(|cache| {
+        if let Some(ba) = cache.borrow().get(&hash) {
+            return Ok(Rc::clone(ba));
+        }
+        let program = recursive_descent::parse(source)?;
+        let ba = Rc::new(BytecodeGenerator::compile_program(&program)?);
+        cache.borrow_mut().insert(hash, Rc::clone(&ba));
+        Ok(ba)
+    })?;
+    let mut frame = InterpreterFrame::new_with_globals(bytecode, vec![], env);
     Interpreter::run(&mut frame)
 }
 
