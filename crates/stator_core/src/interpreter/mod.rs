@@ -2979,6 +2979,89 @@ impl Interpreter {
                                 let val = JsValue::Smi(sa);
                                 frame.store_global(name_idx, &name, val);
                             }
+                            Opcode::CallUndefinedReceiver0 => {
+                                // Handle function calls inside SMI-mode loops
+                                // so that the outer loop stays in SMI mode when
+                                // the callee returns a Smi result.
+                                let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                let callee = unsafe { frame.read_reg_unchecked(reg) };
+                                if let JsValue::Function(ba) = callee
+                                    && !ba.is_generator()
+                                    && !ba.is_async()
+                                {
+                                    let ba = Rc::clone(ba);
+                                    // Sync frame state for nested call.
+                                    acc = JsValue::Smi(sa);
+                                    frame.pc = pc;
+                                    frame.accumulator = acc.cheap_clone();
+
+                                    let args = CallArgs::new();
+                                    let saved_this = if !ba.is_arrow() && ba.is_strict() {
+                                        let old = frame.global_env.borrow().get_this().cloned();
+                                        frame.global_env.borrow_mut().set_this(JsValue::Undefined);
+                                        old
+                                    } else {
+                                        None
+                                    };
+                                    let mut callee_frame = InterpreterFrame::new_callee_frame(
+                                        Rc::clone(&ba),
+                                        args,
+                                        Rc::clone(&frame.global_env),
+                                    );
+                                    restore_closure_context(&mut callee_frame, &ba);
+                                    if ba.is_arrow() && ba.has_fn_props() {
+                                        callee_frame.new_target = fn_props_get(&ba, ".new_target");
+                                    }
+                                    if ba.self_name_register().is_some() {
+                                        populate_self_name(
+                                            &mut callee_frame,
+                                            &ba,
+                                            &JsValue::Function(Rc::clone(&ba)),
+                                        );
+                                    }
+                                    push_call_frame("<anonymous>")?;
+                                    let gen_before = frame.cache_generation;
+                                    let result = run_callee(&mut callee_frame);
+                                    pop_call_frame();
+                                    if gen_before != frame.global_env.borrow().generation() {
+                                        frame.global_cache_invalidate();
+                                    }
+                                    if !ba.is_arrow() && ba.is_strict() {
+                                        match saved_this {
+                                            Some(v) => {
+                                                frame.global_env.borrow_mut().set_this(v);
+                                            }
+                                            None => {
+                                                frame.global_env.borrow_mut().remove_this();
+                                            }
+                                        }
+                                    }
+                                    match result {
+                                        Ok(JsValue::Smi(v)) => {
+                                            sa = v;
+                                            continue 'smi;
+                                        }
+                                        Ok(v) => {
+                                            acc = v;
+                                            frame.smi_mode = false;
+                                            frame.loop_end_pc = 0;
+                                            break 'smi;
+                                        }
+                                        Err(e) => {
+                                            acc = JsValue::Smi(sa);
+                                            frame.pc = pc;
+                                            frame.accumulator = acc.cheap_clone();
+                                            return Err(e);
+                                        }
+                                    }
+                                }
+                                // Non-function callee — exit SMI mode.
+                                acc = JsValue::Smi(sa);
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                pc -= 1;
+                                break 'smi;
+                            }
                             Opcode::Nop => {}
                             _ => {
                                 // Unsupported opcode — exit SMI loop and let
@@ -4405,7 +4488,7 @@ impl Interpreter {
                             acc = borrowed
                                 .slots
                                 .get(slot)
-                                .cloned()
+                                .map(|v| v.cheap_clone())
                                 .unwrap_or(JsValue::Undefined);
                             continue 'dispatch;
                         }
@@ -4445,8 +4528,7 @@ impl Interpreter {
                         if let Operand::ConstantPoolIdx(slot_idx) = instr.operands[0]
                             && let Some(JsValue::Context(js_ctx)) = &frame.context
                         {
-                            let js_ctx_rc = Rc::clone(js_ctx);
-                            let mut borrowed = js_ctx_rc.borrow_mut();
+                            let mut borrowed = js_ctx.borrow_mut();
                             let slot = slot_idx as usize;
                             if slot >= borrowed.slots.len() {
                                 borrowed.slots.resize(slot + 1, JsValue::Undefined);
