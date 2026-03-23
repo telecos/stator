@@ -34,20 +34,53 @@ jobs:
         env:
           CARGO_INCREMENTAL: "0"
 
-      - name: Run precompiled benchmarks
+      - name: Run precompiled benchmarks (one-by-one to avoid OOM)
         run: |
           echo "=== System Resources ==="
           free -h
+          echo ""
           echo "=== Running precompiled benchmarks (interpreter-only) ==="
-          # Run with glibc arena limit to prevent memory fragmentation OOM
-          MALLOC_ARENA_MAX=2 cargo bench --package stator_core -- _precompiled 2>&1
+          echo "Running each benchmark separately to stay within 7GB memory limit."
+          echo ""
+          exit_code=0
+          for bench in fib_40_iterative_precompiled \
+                       arithmetic_loop_10k_precompiled \
+                       property_access_1k_precompiled \
+                       object_creation_1k_precompiled \
+                       array_push_sum_1k_precompiled \
+                       closure_counter_1k_precompiled \
+                       prototype_chain_1k_precompiled \
+                       sieve_primes_1k_precompiled \
+                       deep_object_access_1k_precompiled; do
+            echo "--- $bench ---"
+            if timeout 120 cargo bench --package stator_core -- "^${bench}$" 2>&1; then
+              echo "OK: $bench"
+            else
+              echo "FAILED or TIMEOUT: $bench"
+              exit_code=1
+            fi
+            echo ""
+          done
+          exit $exit_code
         env:
           MALLOC_ARENA_MAX: "2"
 
-      - name: Run V8-comparison benchmarks (Stator)
+      - name: Run V8-comparison benchmarks (one-by-one)
         run: |
           echo "=== Running V8-comparison benchmarks ==="
-          MALLOC_ARENA_MAX=2 cargo bench --package stator_core -- "v8_comparison_benches" 2>&1
+          for bench in fib_40_iterative \
+                       arithmetic_loop_10k \
+                       property_access_1k \
+                       object_creation_1k \
+                       array_push_sum_1k \
+                       closure_counter_1k \
+                       prototype_chain_1k \
+                       sieve_primes_1k \
+                       deep_object_access_1k; do
+            echo "--- $bench ---"
+            timeout 120 cargo bench --package stator_core -- "^${bench}$" 2>&1 || echo "FAILED: $bench"
+            echo ""
+          done
         continue-on-error: true
         env:
           MALLOC_ARENA_MAX: "2"
