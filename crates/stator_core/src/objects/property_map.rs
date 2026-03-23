@@ -566,6 +566,12 @@ impl PropertyMap {
         generation
     }
 
+    /// Returns the global epoch used to invalidate prototype-dependent caches.
+    #[inline]
+    pub fn global_proto_mutation_epoch() -> u64 {
+        GLOBAL_PROTO_MUTATION_EPOCH.load(Ordering::Relaxed)
+    }
+
     /// Returns the slot index (offset) for `key`, or `None` if absent.
     ///
     /// The offset is valid as long as `shape_id()` does not change.

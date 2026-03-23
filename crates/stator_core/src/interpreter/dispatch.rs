@@ -28,10 +28,11 @@ use super::{
     js_less_than, keyed_load, keyed_store, make_construct_this, maybe_cache_construct_boilerplate,
     maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator,
     number_to_jsvalue, plain_object_has_own_property, plain_object_to_array_items,
-    populate_self_name, proto_lookup, proto_lookup_chain_depth, resolve_construct_proto,
-    resolve_jump, restore_closure_context, run_callee, set_function_name_if_missing,
-    set_pending_exception, settle_async_iterator_result, strict_eq, to_array_index, to_bigint,
-    to_property_key, try_execute_best_jit, try_fast_named_property_lookup, walk_context_chain,
+    populate_self_name, proto_lookup, proto_lookup_cached_resolution, proto_lookup_chain_depth,
+    resolve_construct_proto, resolve_jump, restore_closure_context, run_callee,
+    set_function_name_if_missing, set_pending_exception, settle_async_iterator_result, strict_eq,
+    to_array_index, to_bigint, to_property_key, try_execute_best_jit,
+    try_fast_named_property_lookup, walk_context_chain,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
@@ -3526,14 +3527,19 @@ fn handle_lda_named_property(
         if let JsValue::PlainObject(ref map) = obj
             && !matches!(result, JsValue::Undefined)
         {
-            let explicit_proto = {
-                let pm = map.borrow();
-                pm.get(INTERNAL_PROTO_PROPERTY_KEY)
-                    .or_else(|| pm.get("__proto__"))
-                    .cloned()
-            };
-            if let Some(proto) = explicit_proto {
-                inherited_proto_depth = proto_lookup_chain_depth(&proto, &prop_name);
+            inherited_proto_depth = proto_lookup_cached_resolution(map, &prop_name)
+                .map(|(_, depth)| depth)
+                .filter(|depth| *depth != 0);
+            if inherited_proto_depth.is_none() {
+                let explicit_proto = {
+                    let pm = map.borrow();
+                    pm.get(INTERNAL_PROTO_PROPERTY_KEY)
+                        .or_else(|| pm.get("__proto__"))
+                        .cloned()
+                };
+                if let Some(proto) = explicit_proto {
+                    inherited_proto_depth = proto_lookup_chain_depth(&proto, &prop_name);
+                }
             }
         }
         result
