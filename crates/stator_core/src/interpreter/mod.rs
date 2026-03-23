@@ -10240,15 +10240,14 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             if let Some(val) = borrow.get(key) {
                 return val.clone();
             }
-            if borrow.has_accessors {
-                let getter_key = format!("__get_{key}__");
-                if let Some(getter) = borrow.get(&getter_key).cloned() {
-                    drop(borrow);
-                    return match dispatch_getter(&getter, obj) {
-                        Ok(v) => v,
-                        Err(_) => JsValue::Undefined,
-                    };
-                }
+            if borrow.has_accessors
+                && let Some(getter) = borrow.get_getter_for(key).cloned()
+            {
+                drop(borrow);
+                return match dispatch_getter(&getter, obj) {
+                    Ok(v) => v,
+                    Err(_) => JsValue::Undefined,
+                };
             }
             if let Some(next) = plain_object_proto_value(&borrow) {
                 drop(borrow);
@@ -10878,13 +10877,11 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
             // Check for setter accessor (__set_<key>__) first — accessor
             // properties take precedence over data properties.
             if map.borrow().has_accessors {
-                let setter_key = format!("__set_{prop_name}__");
-                let getter_key = format!("__get_{prop_name}__");
                 let pm = map.borrow();
-                let has_setter = pm.contains_key(&setter_key);
-                let has_getter = pm.contains_key(&getter_key);
+                let has_setter = pm.get_setter_for(&prop_name).is_some();
+                let has_getter = pm.get_getter_for(&prop_name).is_some();
                 if has_setter {
-                    let setter_fn = pm.get(&setter_key).cloned();
+                    let setter_fn = pm.get_setter_for(&prop_name).cloned();
                     drop(pm);
                     if let Some(setter) = setter_fn {
                         dispatch_setter(&setter, obj, value)?;
