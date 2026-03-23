@@ -1374,6 +1374,9 @@ pub const SMALL_REG_THRESHOLD: usize = 32;
 /// Inline-buffered register storage for interpreter frames.
 pub type RegisterFile = SmallVec<[JsValue; SMALL_REG_THRESHOLD]>;
 
+/// Direct-mapped global variable cache: 8 entries of (name_hash, name, value).
+type GlobalCacheArray = [(u64, Option<Rc<str>>, JsValue); 8];
+
 /// Acquire a register file from the pool, or allocate a new one.
 fn acquire_registers(count: usize) -> RegisterFile {
     if count <= SMALL_REG_THRESHOLD {
@@ -1834,7 +1837,9 @@ pub struct InterpreterFrame {
     /// Cache of recently-accessed global variable values.
     /// Avoids repeated `Rc→RefCell→HashMap` lookups for hot globals.
     /// Format: `[(name_hash, name, value); 8]` — direct-mapped by hash.
-    pub global_cache: [(u64, Option<Rc<str>>, JsValue); 8],
+    /// Lazily allocated on first `global_cache_put` so closure frames that
+    /// never access globals pay zero initialization cost (~320 bytes saved).
+    pub global_cache: Option<Box<GlobalCacheArray>>,
     /// Generation snapshot taken when the cache was last populated.
     /// Compared against `global_env.generation` to detect staleness.
     pub cache_generation: u64,
@@ -1844,7 +1849,9 @@ pub struct InterpreterFrame {
     pub smi_mode: bool,
     /// NaN-boxed hot register cache (8 bytes per slot vs 24 bytes for JsValue).
     /// Mirrors the regular register file for values that can be NaN-boxed.
-    pub hot_registers: HotRegisters,
+    /// Lazily allocated on first SMI-mode entry so closure and non-loop
+    /// frames pay zero cost.
+    pub hot_registers: Option<HotRegisters>,
     /// When non-zero, the dispatch loop is inside a validated loop body.
     /// The value is the instruction index one past the `JumpLoop` — we
     /// skip the bounds check for every PC strictly below this point
@@ -1908,19 +1915,10 @@ impl InterpreterFrame {
             mega_store_ic: None,
             string_cache: None,
             global_ic: None,
-            global_cache: [
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-            ],
+            global_cache: None,
             cache_generation: 0,
             smi_mode: false,
-            hot_registers: HotRegisters::new(total_regs),
+            hot_registers: None,
             loop_end_pc: 0,
             loop_trip_counts: Vec::new(),
         }
@@ -2003,19 +2001,10 @@ impl InterpreterFrame {
             mega_store_ic: None,
             string_cache: None,
             global_ic: None,
-            global_cache: [
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-            ],
+            global_cache: None,
             cache_generation: 0,
             smi_mode: false,
-            hot_registers: HotRegisters::new(total_regs),
+            hot_registers: None,
             loop_end_pc: 0,
             loop_trip_counts: Vec::new(),
         }
@@ -2111,7 +2100,9 @@ impl InterpreterFrame {
     #[inline(always)]
     fn write_reg(&mut self, v: u32, value: JsValue) -> StatorResult<()> {
         let idx = self.reg_index(v)?;
-        self.hot_registers.try_write(idx, &value);
+        if let Some(ref mut hr) = self.hot_registers {
+            hr.try_write(idx, &value);
+        }
         self.registers[idx] = value;
         Ok(())
     }
@@ -2131,7 +2122,9 @@ impl InterpreterFrame {
             (-(signed + 1)) as usize
         };
         debug_assert!(idx < self.registers.len());
-        self.hot_registers.try_write(idx, &value);
+        if let Some(ref mut hr) = self.hot_registers {
+            hr.try_write(idx, &value);
+        }
         // SAFETY: The caller guarantees `reg` maps to an in-bounds register.
         *unsafe { self.registers.get_unchecked_mut(idx) } = value;
     }
@@ -2145,7 +2138,9 @@ impl InterpreterFrame {
         let dst_idx = self.reg_index(dst)?;
         if src_idx != dst_idx {
             let val = self.registers[src_idx].cheap_clone();
-            self.hot_registers.try_write(dst_idx, &val);
+            if let Some(ref mut hr) = self.hot_registers {
+                hr.try_write(dst_idx, &val);
+            }
             self.registers[dst_idx] = val;
         }
         Ok(())
@@ -2309,7 +2304,8 @@ impl InterpreterFrame {
         }
         let h = fxhash(name);
         let slot = (h as usize) & 7;
-        let (sh, ref sn, ref sv) = self.global_cache[slot];
+        let cache = self.global_cache.as_ref()?;
+        let (sh, ref sn, ref sv) = cache[slot];
         if sh == h && sn.as_deref() == Some(name) {
             Some(sv)
         } else {
@@ -2320,12 +2316,25 @@ impl InterpreterFrame {
     /// Insert or update a global in the per-frame direct-mapped cache.
     ///
     /// Snapshots the current generation so subsequent gets can validate.
+    /// Lazily allocates the cache array on first use.
     #[inline(always)]
     pub fn global_cache_put(&mut self, name: &str, value: JsValue) {
         self.cache_generation = self.global_env.borrow().generation();
         let h = fxhash(name);
         let slot = (h as usize) & 7;
-        self.global_cache[slot] = (h, Some(Rc::from(name)), value);
+        let cache = self.global_cache.get_or_insert_with(|| {
+            Box::new([
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+                (0, None, JsValue::Undefined),
+            ])
+        });
+        cache[slot] = (h, Some(Rc::from(name)), value);
     }
 
     /// Mark the per-frame global variable cache as stale.
@@ -2339,8 +2348,10 @@ impl InterpreterFrame {
     #[inline(always)]
     pub fn global_cache_invalidate(&mut self) {
         self.cache_generation = u64::MAX;
-        for entry in &mut self.global_cache {
-            entry.1 = None;
+        if let Some(ref mut cache) = self.global_cache {
+            for entry in cache.iter_mut() {
+                entry.1 = None;
+            }
         }
     }
 }
@@ -2558,7 +2569,11 @@ impl Interpreter {
                             // is Register for Ldar, and register is in bounds.
                             let reg = unsafe { operand_reg_unchecked(instr, 0) };
                             let flat = frame.reg_flat_index_unchecked(reg);
-                            if let Some(val) = frame.hot_registers.try_read(flat) {
+                            if let Some(val) = frame
+                                .hot_registers
+                                .as_ref()
+                                .and_then(|hr| hr.try_read(flat))
+                            {
                                 acc = val;
                             } else {
                                 // SAFETY: Bytecode validator guarantees register
@@ -3777,6 +3792,10 @@ impl Interpreter {
                             *count = count.saturating_add(1);
                             if *count >= 4 {
                                 frame.smi_mode = true;
+                                if frame.hot_registers.is_none() {
+                                    frame.hot_registers =
+                                        Some(HotRegisters::new(frame.registers.len()));
+                                }
                             }
                         }
                         continue 'dispatch;
@@ -4758,19 +4777,10 @@ impl Interpreter {
             mega_store_ic: None,
             string_cache: None,
             global_ic: None,
-            global_cache: [
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-                (0, None, JsValue::Undefined),
-            ],
+            global_cache: None,
             cache_generation: 0,
             smi_mode: false,
-            hot_registers: HotRegisters::new(total),
+            hot_registers: None,
             loop_end_pc: 0,
             loop_trip_counts: Vec::new(),
         };
@@ -10007,6 +10017,7 @@ mod tests {
                 .insert((*name).to_string(), value.clone());
         }
         frame.smi_mode = true;
+        frame.hot_registers = Some(HotRegisters::new(frame.registers.len()));
         let result = Interpreter::run(&mut frame)?;
         Ok((result, frame))
     }
@@ -10269,6 +10280,7 @@ mod tests {
         let ba = make_bytecode(instrs, 1, 0);
         let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         frame.smi_mode = true;
+        frame.hot_registers = Some(HotRegisters::new(frame.registers.len()));
         Interpreter::run(&mut frame)
     }
 
