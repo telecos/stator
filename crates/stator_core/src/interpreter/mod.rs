@@ -3797,8 +3797,16 @@ impl Interpreter {
                         continue 'dispatch;
                     }
                     // ── Array creation (inline, no table dispatch) ──
-                    Opcode::CreateEmptyArrayLiteral | Opcode::CreateArrayLiteral => {
+                    Opcode::CreateEmptyArrayLiteral => {
                         acc = JsValue::Array(Rc::new(RefCell::new(Vec::new())));
+                        continue 'dispatch;
+                    }
+                    Opcode::CreateArrayLiteral => {
+                        let capacity = match instr.operands.get(2) {
+                            Some(Operand::Flag(hint)) => usize::from(*hint),
+                            _ => 0,
+                        };
+                        acc = JsValue::Array(Rc::new(RefCell::new(Vec::with_capacity(capacity))));
                         continue 'dispatch;
                     }
                     Opcode::CreateEmptyObjectLiteral => {
@@ -5133,10 +5141,7 @@ impl Interpreter {
                             if let JsValue::Array(items) = obj {
                                 let borrow = items.borrow();
                                 let i = *idx as usize;
-                                let result = match borrow.get(i) {
-                                    Some(v) if !v.is_the_hole() => v.clone(),
-                                    _ => JsValue::Undefined,
-                                };
+                                let result = borrow.get(i).cloned().unwrap_or(JsValue::Undefined);
                                 drop(borrow);
                                 acc = result;
                                 continue 'dispatch;
@@ -5188,10 +5193,14 @@ impl Interpreter {
                                     let items_rc = Rc::clone(items);
                                     let val = acc.cheap_clone();
                                     let mut v = items_rc.borrow_mut();
-                                    if i >= v.len() {
-                                        v.resize(i + 1, JsValue::TheHole);
+                                    if i < v.len() {
+                                        v[i] = val;
+                                    } else if i == v.len() {
+                                        v.push(val);
+                                    } else {
+                                        v.resize(i, JsValue::Undefined);
+                                        v.push(val);
                                     }
-                                    v[i] = val;
                                     continue 'dispatch;
                                 }
                             }
@@ -5444,6 +5453,15 @@ impl Interpreter {
                         let callee_reg = unsafe { operand_reg_unchecked(instr, 0) };
                         let arg_reg = unsafe { operand_reg_unchecked(instr, 1) };
                         let callee = unsafe { frame.read_reg_unchecked(callee_reg) };
+                        if fast_array_method_name(callee).as_deref() == Some("push")
+                            && let Some(JsValue::Array(arr)) = fast_array_method_target(callee)
+                        {
+                            let arg1 = unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
+                            let mut items = arr.borrow_mut();
+                            items.push(arg1);
+                            acc = JsValue::Smi(items.len() as i32);
+                            continue 'dispatch;
+                        }
                         if let JsValue::Function(ba) = callee
                             && !ba.is_generator()
                             && !ba.is_async()
@@ -7077,6 +7095,7 @@ pub(super) fn dispatch_call_property(
 }
 
 const FAST_ARRAY_METHOD_KEY: &str = "\0stator.fast_array_method";
+const FAST_ARRAY_METHOD_TARGET_KEY: &str = "\0stator.fast_array_target";
 
 fn array_like_length_from_property_map(map: &PropertyMap) -> usize {
     match map.get("length") {
@@ -7104,6 +7123,11 @@ fn make_fast_array_method(target: &JsValue, name: &str, length: i32) -> JsValue 
         PropertyAttributes::empty(),
     );
     props.insert_with_attrs(
+        FAST_ARRAY_METHOD_TARGET_KEY.into(),
+        target.clone(),
+        PropertyAttributes::empty(),
+    );
+    props.insert_with_attrs(
         "__call__".into(),
         JsValue::NativeFunction(Rc::new(move |args| {
             dispatch_fast_array_method(&bound_target, method_name.as_ref(), &args)?.ok_or_else(
@@ -7124,6 +7148,13 @@ fn fast_array_method_name(callee: &JsValue) -> Option<Rc<str>> {
         Some(JsValue::String(name)) => Some(Rc::clone(name)),
         _ => None,
     }
+}
+
+fn fast_array_method_target(callee: &JsValue) -> Option<JsValue> {
+    let JsValue::PlainObject(map) = callee else {
+        return None;
+    };
+    map.borrow().get(FAST_ARRAY_METHOD_TARGET_KEY).cloned()
 }
 
 fn normalize_from_index(len: usize, arg: Option<&JsValue>) -> usize {
@@ -15757,6 +15788,33 @@ mod tests {
     }
 
     #[test]
+    fn test_create_array_literal_uses_capacity_hint() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::CreateArrayLiteral,
+                    vec![
+                        Operand::ConstantPoolIdx(0),
+                        Operand::FeedbackSlot(0),
+                        Operand::Flag(4),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::Undefined],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        if let JsValue::Array(items) = &result {
+            assert!(items.borrow().capacity() >= 4);
+        } else {
+            panic!("expected Array, got {result:?}");
+        }
+    }
+
+    #[test]
     fn test_create_object_literal_stub() {
         // CreateObjectLiteral [idx=0, slot=0, flags=0] → empty object
         let ba = make_bytecode_with_pool(
@@ -15905,6 +15963,106 @@ mod tests {
         let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
         assert_eq!(result, JsValue::Smi(3));
+    }
+
+    #[test]
+    fn test_lda_named_property_array_length_fast_path() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::LdaNamedProperty,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstantPoolIdx(0),
+                        Operand::FeedbackSlot(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("length".to_string())],
+            1,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
+        frame
+            .write_reg(
+                0,
+                JsValue::new_array(vec![JsValue::Smi(1), JsValue::Smi(2)]),
+            )
+            .unwrap();
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_sta_keyed_property_array_gap_fills_undefined() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::CreateEmptyArrayLiteral,
+                    vec![Operand::FeedbackSlot(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(2)]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+                Instruction::new_unchecked(
+                    Opcode::StaKeyedProperty,
+                    vec![
+                        Operand::Register(0),
+                        Operand::Register(1),
+                        Operand::FeedbackSlot(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![],
+            2,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        if let JsValue::Array(items) = result {
+            let borrow = items.borrow();
+            assert_eq!(
+                borrow.as_slice(),
+                &[JsValue::Undefined, JsValue::Undefined, JsValue::Smi(99)]
+            );
+        } else {
+            panic!("expected Array, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_call_undefined_receiver1_fast_array_push() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::CallUndefinedReceiver1,
+                    vec![
+                        Operand::Register(0),
+                        Operand::Register(1),
+                        Operand::FeedbackSlot(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![],
+            2,
+            0,
+        );
+        let array = JsValue::new_array(vec![]);
+        let push = make_fast_array_method(&array, "push", 1);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
+        frame.write_reg(0, push).unwrap();
+        frame.write_reg(1, JsValue::Smi(7)).unwrap();
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+        let JsValue::Array(items) = array else {
+            panic!("expected Array");
+        };
+        assert_eq!(&*items.borrow(), &[JsValue::Smi(7)]);
     }
 
     // ── PlainObject array iteration via GetIterator ─────────────────────────

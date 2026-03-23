@@ -23,15 +23,15 @@ use super::{
     bigint_pow, collect_args, concat_rc_strs, constant_pool_jump_delta, constant_to_value,
     construct_builtin_result, decode_string_constant, dispatch_call_property, dispatch_call_value,
     dispatch_call_with_this, dispatch_getter, dispatch_setter, err_bad_operand,
-    error_message_from_value, extract_context, find_handler, fn_props_get, fn_props_set,
-    has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
-    make_construct_this, maybe_cache_construct_boilerplate, maybe_compile_baseline,
-    maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator, number_to_jsvalue,
-    plain_object_has_own_property, plain_object_to_array_items, populate_self_name, proto_lookup,
-    proto_lookup_chain_depth, resolve_construct_proto, resolve_jump, restore_closure_context,
-    run_callee, set_function_name_if_missing, set_pending_exception, settle_async_iterator_result,
-    strict_eq, to_array_index, to_bigint, to_property_key, try_execute_best_jit,
-    try_fast_named_property_lookup, walk_context_chain,
+    error_message_from_value, extract_context, fast_array_method_name, fast_array_method_target,
+    find_handler, fn_props_get, fn_props_set, has_prototype_in_chain, is_js_receiver, js_add,
+    js_less_than, keyed_load, keyed_store, make_construct_this, maybe_cache_construct_boilerplate,
+    maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator,
+    number_to_jsvalue, plain_object_has_own_property, plain_object_to_array_items,
+    populate_self_name, proto_lookup, proto_lookup_chain_depth, resolve_construct_proto,
+    resolve_jump, restore_closure_context, run_callee, set_function_name_if_missing,
+    set_pending_exception, settle_async_iterator_result, strict_eq, to_array_index, to_bigint,
+    to_property_key, try_execute_best_jit, try_fast_named_property_lookup, walk_context_chain,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
@@ -2139,6 +2139,15 @@ fn handle_call_undefined_receiver1(
         return Err(err_bad_operand("CallUndefinedReceiver1", 1));
     };
     let callee = ctx.frame.read_reg(callee_v)?.clone();
+    if fast_array_method_name(&callee).as_deref() == Some("push")
+        && let Some(JsValue::Array(arr)) = fast_array_method_target(&callee)
+    {
+        let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
+        let mut items = arr.borrow_mut();
+        items.push(arg1);
+        ctx.frame.accumulator = JsValue::Smi(items.len() as i32);
+        return Ok(DispatchAction::Continue);
+    }
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
@@ -3404,6 +3413,12 @@ fn handle_lda_named_property(
     };
     let prop_name = ctx.frame.get_string_constant(name_idx)?;
     let obj = ctx.frame.read_reg(obj_v)?.clone();
+    if prop_name.as_ref() == "length"
+        && let JsValue::Array(arr) = &obj
+    {
+        ctx.frame.accumulator = JsValue::Smi(arr.borrow().len() as i32);
+        return Ok(DispatchAction::Continue);
+    }
     if is_private_storage_key(&prop_name) {
         ctx.frame.accumulator = load_private_named_property(&obj, &prop_name)?;
         return Ok(DispatchAction::Continue);
@@ -3878,10 +3893,7 @@ fn handle_lda_keyed_property(
         } else if let JsValue::Array(items) = obj {
             let borrow = items.borrow();
             let i = idx_val as usize;
-            let result = match borrow.get(i) {
-                Some(v) if !v.is_the_hole() => v.clone(),
-                _ => JsValue::Undefined,
-            };
+            let result = borrow.get(i).cloned().unwrap_or(JsValue::Undefined);
             drop(borrow);
             ctx.frame.accumulator = result;
             return Ok(DispatchAction::Continue);
@@ -3945,10 +3957,14 @@ fn handle_sta_keyed_property(
             let val = ctx.frame.accumulator.clone();
             let i = idx_val as usize;
             let mut v = items_rc.borrow_mut();
-            if i >= v.len() {
-                v.resize(i + 1, JsValue::TheHole);
+            if i < v.len() {
+                v[i] = val;
+            } else if i == v.len() {
+                v.push(val);
+            } else {
+                v.resize(i, JsValue::Undefined);
+                v.push(val);
             }
-            v[i] = val;
             return Ok(DispatchAction::Continue);
         }
     }
@@ -4991,12 +5007,16 @@ fn handle_create_empty_array_literal(
 
 fn handle_create_array_literal(
     ctx: &mut DispatchContext,
-    _instr: &Instruction,
+    instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     // operands: [ConstantPoolIdx, FeedbackSlot, Flag]
     //
     // Dense Vec storage — see handle_create_empty_array_literal for rationale.
-    ctx.frame.accumulator = JsValue::Array(Rc::new(RefCell::new(Vec::new())));
+    let capacity = match instr.operands.get(2) {
+        Some(Operand::Flag(hint)) => usize::from(*hint),
+        _ => 0,
+    };
+    ctx.frame.accumulator = JsValue::Array(Rc::new(RefCell::new(Vec::with_capacity(capacity))));
     Ok(DispatchAction::Continue)
 }
 
