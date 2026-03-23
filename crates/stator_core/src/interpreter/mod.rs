@@ -4487,11 +4487,13 @@ impl Interpreter {
                             if ba.is_arrow() && ba.has_fn_props() {
                                 callee_frame.new_target = fn_props_get(&ba, ".new_target");
                             }
-                            populate_self_name(
-                                &mut callee_frame,
-                                &ba,
-                                &JsValue::Function(Rc::clone(&ba)),
-                            );
+                            if ba.self_name_register().is_some() {
+                                populate_self_name(
+                                    &mut callee_frame,
+                                    &ba,
+                                    &JsValue::Function(Rc::clone(&ba)),
+                                );
+                            }
                             push_call_frame("<anonymous>")?;
                             let gen_before = frame.cache_generation;
                             let result = run_callee(&mut callee_frame);
@@ -4590,11 +4592,13 @@ impl Interpreter {
                             if ba.is_arrow() && ba.has_fn_props() {
                                 callee_frame.new_target = fn_props_get(&ba, ".new_target");
                             }
-                            populate_self_name(
-                                &mut callee_frame,
-                                &ba,
-                                &JsValue::Function(Rc::clone(&ba)),
-                            );
+                            if ba.self_name_register().is_some() {
+                                populate_self_name(
+                                    &mut callee_frame,
+                                    &ba,
+                                    &JsValue::Function(Rc::clone(&ba)),
+                                );
+                            }
                             push_call_frame("<anonymous>")?;
                             let gen_before = frame.cache_generation;
                             let result = run_callee(&mut callee_frame);
