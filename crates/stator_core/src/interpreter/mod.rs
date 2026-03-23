@@ -2317,8 +2317,18 @@ impl InterpreterFrame {
     ///
     /// Snapshots the current generation so subsequent gets can validate.
     /// Lazily allocates the cache array on first use.
+    ///
+    /// **Note:** `"this"` is never cached because it uses the dedicated
+    /// `this_binding` field on [`GlobalEnv`] which bypasses the generation
+    /// counter.
     #[inline(always)]
     pub fn global_cache_put(&mut self, name: &str, value: JsValue) {
+        // The "this" binding lives outside the HashMap and its mutations
+        // don't bump GlobalEnv::generation, so caching it here would
+        // serve stale values after set_this/remove_this.
+        if name == "this" {
+            return;
+        }
         self.cache_generation = self.global_env.borrow().generation();
         let h = fxhash(name);
         let slot = (h as usize) & 7;
