@@ -2626,16 +2626,17 @@ impl Interpreter {
                 // Unsupported opcodes break out, convert back to
                 // JsValue, and let the regular match handle them.
                 if frame.smi_mode {
-                    // Extract the raw i32 accumulator.  In production the
-                    // JumpLoop handler only sets `smi_mode` when `acc` is a
-                    // Smi, but test harnesses may set the flag before the
-                    // first instruction runs — guard against that.
-                    let mut sa: i32 = if let JsValue::Smi(v) = acc {
-                        v
-                    } else {
-                        frame.smi_mode = false;
-                        frame.loop_end_pc = 0;
-                        continue;
+                    // Extract the raw i32 accumulator.  The JumpLoop handler
+                    // converts Boolean→Smi before setting smi_mode, but guard
+                    // against Boolean anyway (defensive).
+                    let mut sa: i32 = match acc {
+                        JsValue::Smi(v) => v,
+                        JsValue::Boolean(b) => b as i32,
+                        _ => {
+                            frame.smi_mode = false;
+                            frame.loop_end_pc = 0;
+                            continue;
+                        }
                     };
                     'smi: loop {
                         if pc >= frame.loop_end_pc {
@@ -3317,8 +3318,53 @@ impl Interpreter {
                                             sa = *v;
                                             continue 'smi;
                                         }
-                                        // Non-Smi element — exit SMI mode
-                                        // with the loaded value.
+                                        // Boolean element — try to fuse with
+                                        // JumpIfToBooleanFalse/True to stay
+                                        // in SMI mode (sieve pattern).
+                                        if let JsValue::Boolean(b) = val {
+                                            let bv = *b;
+                                            drop(borrow);
+                                            if let Some(next) = instructions.get(pc) {
+                                                match next.opcode {
+                                                    Opcode::JumpIfToBooleanFalse
+                                                    | Opcode::JumpIfFalse => {
+                                                        if !bv {
+                                                            pc = unsafe {
+                                                                resolve_jump_unchecked(
+                                                                    pc + 1,
+                                                                    jump_targets,
+                                                                )
+                                                            };
+                                                        } else {
+                                                            pc += 1;
+                                                        }
+                                                        continue 'smi;
+                                                    }
+                                                    Opcode::JumpIfToBooleanTrue
+                                                    | Opcode::JumpIfTrue => {
+                                                        if bv {
+                                                            pc = unsafe {
+                                                                resolve_jump_unchecked(
+                                                                    pc + 1,
+                                                                    jump_targets,
+                                                                )
+                                                            };
+                                                        } else {
+                                                            pc += 1;
+                                                        }
+                                                        continue 'smi;
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                            // No fusion — exit with boolean.
+                                            acc = JsValue::Boolean(bv);
+                                            frame.smi_mode = false;
+                                            frame.loop_end_pc = 0;
+                                            break 'smi;
+                                        }
+                                        // Non-Smi, non-Boolean element —
+                                        // exit SMI mode with the loaded value.
                                         acc = val.clone();
                                         drop(borrow);
                                         frame.smi_mode = false;
@@ -3529,18 +3575,39 @@ impl Interpreter {
                                 break 'smi;
                             }
                             Opcode::Nop => {}
-                            // Non-Smi loads: exit SMI loop cleanly without
-                            // rewinding pc.  The instruction is already
-                            // consumed, and the normal dispatch will handle
-                            // the next instruction with the correct `acc`.
-                            Opcode::LdaTrue => {
-                                acc = JsValue::Boolean(true);
-                                frame.smi_mode = false;
-                                frame.loop_end_pc = 0;
-                                break 'smi;
-                            }
-                            Opcode::LdaFalse => {
-                                acc = JsValue::Boolean(false);
+                            // Non-Smi loads with look-ahead fusion.
+                            // Common pattern in sieve-like code:
+                            //   LdaTrue; StaKeyedProperty arr, idx, slot
+                            // Fuse into a single operation that stays in SMI
+                            // mode, avoiding the SMI→normal→SMI transition.
+                            Opcode::LdaTrue | Opcode::LdaFalse => {
+                                let bool_val = instr.opcode == Opcode::LdaTrue;
+                                // Try to fuse with a following StaKeyedProperty.
+                                if let Some(next) = instructions.get(pc)
+                                    && next.opcode == Opcode::StaKeyedProperty
+                                {
+                                    let obj_v = unsafe { operand_reg_unchecked(next, 0) };
+                                    let key_v = unsafe { operand_reg_unchecked(next, 1) };
+                                    let key_ref = unsafe { frame.read_reg_unchecked(key_v) };
+                                    if let JsValue::Smi(idx) = key_ref
+                                        && *idx >= 0
+                                    {
+                                        let i = *idx as usize;
+                                        let obj_ref = unsafe { frame.read_reg_unchecked(obj_v) };
+                                        if let JsValue::Array(items) = obj_ref {
+                                            let items_rc = Rc::clone(items);
+                                            let mut v = items_rc.borrow_mut();
+                                            if i >= v.len() {
+                                                v.resize(i + 1, JsValue::TheHole);
+                                            }
+                                            v[i] = JsValue::Boolean(bool_val);
+                                            pc += 1; // skip StaKeyedProperty
+                                            continue 'smi;
+                                        }
+                                    }
+                                }
+                                // No fusion — exit SMI cleanly.
+                                acc = JsValue::Boolean(bool_val);
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 break 'smi;
@@ -4382,10 +4449,11 @@ impl Interpreter {
                         if frame.osr_loop_count >= TURBOFAN_OSR_LOOP_THRESHOLD {
                             maybe_compile_turbofan(&frame.bytecode_array);
                         }
-                        // SMI-mode detection: if the accumulator is still Smi
-                        // after several back-edge trips, enter SMI fast dispatch.
-                        if !frame.smi_mode
-                            && let JsValue::Smi(_) = &acc
+                        // SMI-mode detection: if the accumulator is Smi
+                        // (or Boolean — common for comparison-terminated
+                        // loops like `for(;;i++){if(cond) ...}`) after
+                        // several back-edge trips, enter SMI fast dispatch.
+                        if !frame.smi_mode && matches!(&acc, JsValue::Smi(_) | JsValue::Boolean(_))
                         {
                             let target_pc = pc;
                             // Lazily grow the trip-count vector on first
@@ -4399,6 +4467,14 @@ impl Interpreter {
                                 unsafe { frame.loop_trip_counts.get_unchecked_mut(target_pc) };
                             *count = count.saturating_add(1);
                             if *count >= 4 {
+                                // Convert Boolean → Smi so the SMI loop entry
+                                // succeeds.  Inside the loop, comparisons
+                                // produce 0/1 which is equivalent to
+                                // false/true for control-flow purposes
+                                // (JumpIfFalse checks sa == 0).
+                                if let JsValue::Boolean(b) = &acc {
+                                    acc = JsValue::Smi(*b as i32);
+                                }
                                 frame.smi_mode = true;
                                 if frame.hot_registers.is_none() {
                                     frame.hot_registers =
