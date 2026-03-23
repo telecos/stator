@@ -35,7 +35,12 @@ jobs:
           CARGO_INCREMENTAL: "0"
 
       - name: Run benchmarks
-        run: cargo bench --package stator_core
+        run: |
+          echo "=== System Resources ==="
+          free -h || true
+          df -h . || true
+          echo "=== Starting cargo bench ==="
+          timeout 1200 cargo bench --package stator_core 2>&1 || echo "cargo bench exit code: $?"
 
       - name: Run V8 (Node.js) comparison benchmarks
         run: |

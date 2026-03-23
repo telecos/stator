@@ -267,7 +267,7 @@ pub struct BytecodeArray {
     /// Lazily-populated remapped handler table (post-peephole instruction
     /// indices).  Populated on first decode when the peephole pass compacts
     /// instructions.
-    handler_table_remapped: Rc<RefCell<Option<Rc<Vec<HandlerTableEntry>>>>>,
+    handler_table_remapped: Rc<OnceCell<Rc<Vec<HandlerTableEntry>>>>,
     /// Lazily-populated decoded instruction cache shared across clones.
     cached_decode: DecodedBytecodeCache,
     /// Cached template objects keyed by bytecode offset.
@@ -494,7 +494,7 @@ impl BytecodeArray {
             source_positions: source_positions.into(),
             feedback_metadata: Rc::new(feedback_metadata),
             handler_table: Rc::new(handler_table),
-            handler_table_remapped: Rc::new(RefCell::new(None)),
+            handler_table_remapped: Rc::new(OnceCell::new()),
             cached_decode: Rc::new(OnceCell::new()),
             template_cache: Rc::new(RefCell::new(HashMap::new())),
             is_generator: false,
@@ -895,7 +895,7 @@ impl BytecodeArray {
     /// Return a shared reference-counted handle to the exception handler
     /// table, remapped for post-peephole instruction indices if available.
     pub(crate) fn shared_handler_table(&self) -> Rc<Vec<HandlerTableEntry>> {
-        if let Some(remapped) = self.handler_table_remapped.borrow().as_ref() {
+        if let Some(remapped) = self.handler_table_remapped.get() {
             Rc::clone(remapped)
         } else {
             Rc::clone(&self.handler_table)
@@ -970,7 +970,7 @@ impl BytecodeArray {
             // SAFETY: Interior mutability is acceptable here — the handler
             // table is initialised once during first decode, just like
             // cached_decode.
-            *self.handler_table_remapped.borrow_mut() = Some(Rc::new(remapped_handlers));
+            let _ = self.handler_table_remapped.set(Rc::new(remapped_handlers));
 
             let mut jump_targets = vec![None; instructions.len()];
             for (instruction_index, instruction) in instructions.iter().enumerate() {
