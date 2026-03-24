@@ -3078,7 +3078,14 @@ impl Interpreter {
                                         hot_acc = Some(NanBoxedValue::from_smi(r));
                                     }
                                     None => {
-                                        acc = JsValue::HeapNumber(sa as f64 + b as f64);
+                                        acc = number_to_jsvalue(sa as f64 + b as f64);
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3094,7 +3101,14 @@ impl Interpreter {
                                         hot_acc = Some(NanBoxedValue::from_smi(r));
                                     }
                                     None => {
-                                        acc = JsValue::HeapNumber(sa as f64 + b as f64);
+                                        acc = number_to_jsvalue(sa as f64 + b as f64);
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3111,7 +3125,14 @@ impl Interpreter {
                                         hot_acc = Some(NanBoxedValue::from_smi(r));
                                     }
                                     None => {
-                                        acc = JsValue::HeapNumber(sa as f64 - b as f64);
+                                        acc = number_to_jsvalue(sa as f64 - b as f64);
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3127,7 +3148,14 @@ impl Interpreter {
                                         hot_acc = Some(NanBoxedValue::from_smi(r));
                                     }
                                     None => {
-                                        acc = JsValue::HeapNumber(sa as f64 - b as f64);
+                                        acc = number_to_jsvalue(sa as f64 - b as f64);
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3144,7 +3172,14 @@ impl Interpreter {
                                         hot_acc = Some(NanBoxedValue::from_smi(r));
                                     }
                                     None => {
-                                        acc = JsValue::HeapNumber(sa as f64 * b as f64);
+                                        acc = number_to_jsvalue(sa as f64 * b as f64);
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3160,7 +3195,14 @@ impl Interpreter {
                                         hot_acc = Some(NanBoxedValue::from_smi(r));
                                     }
                                     None => {
-                                        acc = JsValue::HeapNumber(sa as f64 * b as f64);
+                                        acc = number_to_jsvalue(sa as f64 * b as f64);
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3177,11 +3219,18 @@ impl Interpreter {
                                         unsafe { frame.write_reg_unchecked(dst, JsValue::Smi(sa)) };
                                     }
                                     None => {
-                                        acc = JsValue::HeapNumber(sa as f64 * b as f64);
                                         let dst = unsafe { operand_reg_unchecked(instr, 2) };
+                                        acc = number_to_jsvalue(sa as f64 * b as f64);
                                         unsafe {
                                             frame.write_reg_unchecked(dst, acc.cheap_clone())
                                         };
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3201,11 +3250,18 @@ impl Interpreter {
                                         unsafe { frame.write_reg_unchecked(dst, JsValue::Smi(sa)) };
                                     }
                                     None => {
-                                        acc = JsValue::HeapNumber(sa as f64 * b as f64);
                                         let dst = unsafe { operand_reg_unchecked(instr, 2) };
+                                        acc = number_to_jsvalue(sa as f64 * b as f64);
                                         unsafe {
                                             frame.write_reg_unchecked(dst, acc.cheap_clone())
                                         };
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3345,7 +3401,14 @@ impl Interpreter {
                                         hot_acc = Some(NanBoxedValue::from_smi(r));
                                     }
                                     None => {
-                                        acc = JsValue::HeapNumber(sa as f64 + 1.0);
+                                        acc = number_to_jsvalue(sa as f64 + 1.0);
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3361,11 +3424,18 @@ impl Interpreter {
                                         unsafe { frame.write_reg_unchecked(dst, JsValue::Smi(sa)) };
                                     }
                                     None => {
-                                        acc = JsValue::HeapNumber(sa as f64 + 1.0);
                                         let dst = unsafe { operand_reg_unchecked(instr, 1) };
+                                        acc = number_to_jsvalue(sa as f64 + 1.0);
                                         unsafe {
                                             frame.write_reg_unchecked(dst, acc.cheap_clone())
                                         };
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3380,7 +3450,14 @@ impl Interpreter {
                                         hot_acc = Some(NanBoxedValue::from_smi(r));
                                     }
                                     None => {
-                                        acc = JsValue::HeapNumber(sa as f64 - 1.0);
+                                        acc = number_to_jsvalue(sa as f64 - 1.0);
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3395,7 +3472,14 @@ impl Interpreter {
                                         hot_acc = Some(NanBoxedValue::from_smi(r));
                                     }
                                     None => {
-                                        acc = JsValue::HeapNumber(-(sa as f64));
+                                        acc = number_to_jsvalue(-(sa as f64));
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -4585,11 +4669,28 @@ impl Interpreter {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
-                            if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs)
-                                && let Some(result) = a.checked_add(*b)
-                            {
-                                acc = JsValue::Smi(result);
-                                continue 'dispatch;
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = if let Some(result) = a.checked_add(*b) {
+                                        JsValue::Smi(result)
+                                    } else {
+                                        JsValue::HeapNumber(*a as f64 + *b as f64)
+                                    };
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = number_to_jsvalue(*a + *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = number_to_jsvalue(*a as f64 + *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = number_to_jsvalue(*a + *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
                         }
                         // Write back locals before cold-path dispatch.
@@ -4630,11 +4731,28 @@ impl Interpreter {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
-                            if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs)
-                                && let Some(result) = a.checked_sub(*b)
-                            {
-                                acc = JsValue::Smi(result);
-                                continue 'dispatch;
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = if let Some(result) = a.checked_sub(*b) {
+                                        JsValue::Smi(result)
+                                    } else {
+                                        JsValue::HeapNumber(*a as f64 - *b as f64)
+                                    };
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = number_to_jsvalue(*a - *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = number_to_jsvalue(*a as f64 - *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = number_to_jsvalue(*a - *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
                         }
                         frame.pc = pc;
@@ -4674,11 +4792,28 @@ impl Interpreter {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
-                            if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs)
-                                && let Some(result) = a.checked_mul(*b)
-                            {
-                                acc = JsValue::Smi(result);
-                                continue 'dispatch;
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = if let Some(result) = a.checked_mul(*b) {
+                                        JsValue::Smi(result)
+                                    } else {
+                                        JsValue::HeapNumber(*a as f64 * *b as f64)
+                                    };
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = number_to_jsvalue(*a * *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = number_to_jsvalue(*a as f64 * *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = number_to_jsvalue(*a * *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
                         }
                         frame.pc = pc;
@@ -4714,12 +4849,22 @@ impl Interpreter {
                         }
                     }
                     Opcode::AddSmi => {
-                        if let Operand::Immediate(imm) = *instr.operand(0)
-                            && let JsValue::Smi(n) = acc
-                            && let Some(result) = n.checked_add(imm)
-                        {
-                            acc = JsValue::Smi(result);
-                            continue 'dispatch;
+                        if let Operand::Immediate(imm) = *instr.operand(0) {
+                            match &acc {
+                                JsValue::Smi(n) => {
+                                    acc = if let Some(result) = n.checked_add(imm) {
+                                        JsValue::Smi(result)
+                                    } else {
+                                        JsValue::HeapNumber(*n as f64 + imm as f64)
+                                    };
+                                    continue 'dispatch;
+                                }
+                                JsValue::HeapNumber(n) => {
+                                    acc = number_to_jsvalue(*n + imm as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
+                            }
                         }
                         frame.pc = pc;
                         frame.accumulator = acc;
@@ -4754,12 +4899,22 @@ impl Interpreter {
                         }
                     }
                     Opcode::SubSmi => {
-                        if let Operand::Immediate(imm) = *instr.operand(0)
-                            && let JsValue::Smi(n) = acc
-                            && let Some(result) = n.checked_sub(imm)
-                        {
-                            acc = JsValue::Smi(result);
-                            continue 'dispatch;
+                        if let Operand::Immediate(imm) = *instr.operand(0) {
+                            match &acc {
+                                JsValue::Smi(n) => {
+                                    acc = if let Some(result) = n.checked_sub(imm) {
+                                        JsValue::Smi(result)
+                                    } else {
+                                        JsValue::HeapNumber(*n as f64 - imm as f64)
+                                    };
+                                    continue 'dispatch;
+                                }
+                                JsValue::HeapNumber(n) => {
+                                    acc = number_to_jsvalue(*n - imm as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
+                            }
                         }
                         frame.pc = pc;
                         frame.accumulator = acc;
@@ -4794,12 +4949,22 @@ impl Interpreter {
                         }
                     }
                     Opcode::MulSmi => {
-                        if let Operand::Immediate(imm) = *instr.operand(0)
-                            && let JsValue::Smi(n) = acc
-                            && let Some(result) = n.checked_mul(imm)
-                        {
-                            acc = JsValue::Smi(result);
-                            continue 'dispatch;
+                        if let Operand::Immediate(imm) = *instr.operand(0) {
+                            match &acc {
+                                JsValue::Smi(n) => {
+                                    acc = if let Some(result) = n.checked_mul(imm) {
+                                        JsValue::Smi(result)
+                                    } else {
+                                        JsValue::HeapNumber(*n as f64 * imm as f64)
+                                    };
+                                    continue 'dispatch;
+                                }
+                                JsValue::HeapNumber(n) => {
+                                    acc = number_to_jsvalue(*n * imm as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
+                            }
                         }
                         frame.pc = pc;
                         frame.accumulator = acc;
@@ -5032,12 +5197,28 @@ impl Interpreter {
                     Opcode::Div => {
                         if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
-                            if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs)
-                                && *b != 0
-                                && *a % *b == 0
-                            {
-                                acc = JsValue::Smi(*a / *b);
-                                continue 'dispatch;
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = if *b != 0 && *a % *b == 0 {
+                                        JsValue::Smi(*a / *b)
+                                    } else {
+                                        number_to_jsvalue(*a as f64 / *b as f64)
+                                    };
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = number_to_jsvalue(*a / *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = number_to_jsvalue(*a as f64 / *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = number_to_jsvalue(*a / *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
                         }
                         frame.pc = pc;
@@ -5117,11 +5298,28 @@ impl Interpreter {
                     Opcode::Mod => {
                         if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
-                            if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs)
-                                && *b != 0
-                            {
-                                acc = JsValue::Smi(*a % *b);
-                                continue 'dispatch;
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = if *b != 0 {
+                                        JsValue::Smi(*a % *b)
+                                    } else {
+                                        number_to_jsvalue(*a as f64 % *b as f64)
+                                    };
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = number_to_jsvalue(*a % *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = number_to_jsvalue(*a as f64 % *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = number_to_jsvalue(*a % *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
                         }
                         frame.pc = pc;
@@ -5483,9 +5681,24 @@ impl Interpreter {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
-                            if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
-                                acc = JsValue::Boolean(*a < *b);
-                                continue 'dispatch;
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a < *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean(*a < *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean((*a as f64) < *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a < *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
                         }
                         frame.pc = pc;
@@ -5525,9 +5738,24 @@ impl Interpreter {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
-                            if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
-                                acc = JsValue::Boolean(*a > *b);
-                                continue 'dispatch;
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a > *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean(*a > *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean((*a as f64) > *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a > *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
                         }
                         frame.pc = pc;
@@ -5567,6 +5795,25 @@ impl Interpreter {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a == *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean(*a == *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean((*a as f64) == *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a == *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
+                            }
                             let result = abstract_eq(&acc, rhs);
                             acc = JsValue::Boolean(result);
                             continue 'dispatch;
@@ -5608,9 +5855,24 @@ impl Interpreter {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
-                            if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
-                                acc = JsValue::Boolean(*a == *b);
-                                continue 'dispatch;
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a == *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean(*a == *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean((*a as f64) == *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a == *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
                             let result = strict_eq(&acc, rhs);
                             acc = JsValue::Boolean(result);
@@ -5651,6 +5913,25 @@ impl Interpreter {
                     Opcode::TestNotEqual => {
                         if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a != *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean(*a != *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean((*a as f64) != *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a != *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
+                            }
                             let result = abstract_eq(&acc, rhs);
                             acc = JsValue::Boolean(!result);
                             continue 'dispatch;
@@ -5690,9 +5971,24 @@ impl Interpreter {
                     Opcode::TestLessThanOrEqual => {
                         if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
-                            if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
-                                acc = JsValue::Boolean(*a <= *b);
-                                continue 'dispatch;
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a <= *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean(*a <= *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean((*a as f64) <= *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a <= *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
                         }
                         frame.pc = pc;
@@ -5730,9 +6026,24 @@ impl Interpreter {
                     Opcode::TestGreaterThanOrEqual => {
                         if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
-                            if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
-                                acc = JsValue::Boolean(*a >= *b);
-                                continue 'dispatch;
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a >= *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean(*a >= *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean((*a as f64) >= *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a >= *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
                         }
                         frame.pc = pc;
@@ -7508,11 +7819,13 @@ pub(super) fn number_to_jsvalue(n: f64) -> JsValue {
     if n == 0.0 && n.is_sign_negative() {
         return JsValue::HeapNumber(n);
     }
-    if n.is_finite() && n.fract() == 0.0 && (i32::MIN as f64..=i32::MAX as f64).contains(&n) {
-        JsValue::Smi(n as i32)
-    } else {
-        JsValue::HeapNumber(n)
+    if n >= i32::MIN as f64 && n <= i32::MAX as f64 {
+        let i = n as i32;
+        if i as f64 == n {
+            return JsValue::Smi(i);
+        }
     }
+    JsValue::HeapNumber(n)
 }
 
 /// Convert a JsValue to boolean (ECMAScript §7.1.2).
