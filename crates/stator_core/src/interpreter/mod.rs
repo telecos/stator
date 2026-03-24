@@ -6454,7 +6454,7 @@ impl Interpreter {
                                     } else if i == v.len() {
                                         v.push(val);
                                     } else {
-                                        v.resize(i, JsValue::Undefined);
+                                        v.resize(i, JsValue::TheHole);
                                         v.push(val);
                                     }
                                     continue 'dispatch;
@@ -18218,7 +18218,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sta_keyed_property_array_gap_fills_undefined() {
+    fn test_sta_keyed_property_array_gap_fills_the_hole() {
         let ba = make_bytecode_with_pool(
             vec![
                 Instruction::new_unchecked(
@@ -18250,7 +18250,7 @@ mod tests {
             let borrow = items.borrow();
             assert_eq!(
                 borrow.as_slice(),
-                &[JsValue::Undefined, JsValue::Undefined, JsValue::Smi(99)]
+                &[JsValue::TheHole, JsValue::TheHole, JsValue::Smi(99)]
             );
         } else {
             panic!("expected Array, got {result:?}");
