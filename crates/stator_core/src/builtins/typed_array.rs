@@ -1761,8 +1761,8 @@ mod tests {
     #[test]
     fn test_typed_array_bigint64() {
         let ta = typed_array_new_from_length(TypedArrayKind::BigInt64, 1);
-        typed_array_set(&ta, 0, &JsValue::BigInt(42)).unwrap();
-        assert_eq!(typed_array_get(&ta, 0), JsValue::BigInt(42));
+        typed_array_set(&ta, 0, &JsValue::BigInt(Box::new(42))).unwrap();
+        assert_eq!(typed_array_get(&ta, 0), JsValue::BigInt(Box::new(42)));
     }
 
     #[test]

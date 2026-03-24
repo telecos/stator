@@ -1760,7 +1760,7 @@ mod tests {
 
     #[test]
     fn test_js_value_stringify_bigint_throws_type_error() {
-        let result = json_stringify_js_value(&JsValue::BigInt(42), None, None);
+        let result = json_stringify_js_value(&JsValue::BigInt(Box::new(42)), None, None);
         assert!(
             matches!(&result, Err(StatorError::TypeError(msg)) if msg.contains("BigInt")),
             "expected BigInt TypeError, got {result:?}"

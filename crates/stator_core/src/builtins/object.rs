@@ -3251,8 +3251,14 @@ mod tests {
 
     #[test]
     fn test_e2e_object_is_bigint_equality() {
-        assert!(object_is(&JsValue::BigInt(42), &JsValue::BigInt(42)));
-        assert!(!object_is(&JsValue::BigInt(1), &JsValue::BigInt(2)));
+        assert!(object_is(
+            &JsValue::BigInt(Box::new(42)),
+            &JsValue::BigInt(Box::new(42))
+        ));
+        assert!(!object_is(
+            &JsValue::BigInt(Box::new(1)),
+            &JsValue::BigInt(Box::new(2))
+        ));
     }
 
     #[test]

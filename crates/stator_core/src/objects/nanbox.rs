@@ -848,10 +848,10 @@ mod tests {
 
     #[test]
     fn test_pack_unpack_bigint() {
-        let packed = NanBoxedValue::pack(JsValue::BigInt(42));
+        let packed = NanBoxedValue::pack(JsValue::BigInt(Box::new(42)));
         assert!(packed.is_heap_ptr());
         let unpacked = unsafe { packed.unpack() };
-        assert!(matches!(unpacked, JsValue::BigInt(42)));
+        assert!(matches!(unpacked, JsValue::BigInt(Box::new(42))));
     }
 
     #[test]
