@@ -191,6 +191,7 @@ use crate::bytecode::bytecode_array::{
 };
 #[cfg(all(target_arch = "x86_64", unix))]
 use crate::bytecode::bytecode_array::{MaglevJitCodeCache, TurbofanJitCodeCache};
+use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
 use crate::error::{StatorError, StatorResult};
 use crate::inspector::debugger::Debugger;
 use crate::objects::map::PropertyAttributes;
@@ -3515,6 +3516,22 @@ impl Interpreter {
                                 // the callee returns a Smi result.
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
                                 let callee = unsafe { frame.read_reg_unchecked(reg) };
+                                if let JsValue::NativeFunction(native_fn) = callee {
+                                    match native_fn(Vec::new())? {
+                                        JsValue::Smi(v) => {
+                                            sa = v;
+                                            frame.global_cache_invalidate();
+                                            continue 'smi;
+                                        }
+                                        v => {
+                                            acc = v;
+                                            frame.global_cache_invalidate();
+                                            frame.smi_mode = false;
+                                            frame.loop_end_pc = 0;
+                                            break 'smi;
+                                        }
+                                    }
+                                }
                                 if let JsValue::Function(ba) = callee
                                     && !ba.is_generator()
                                     && !ba.is_async()
@@ -3525,12 +3542,32 @@ impl Interpreter {
                                     let has_fn_props = is_arrow && ba.has_fn_props();
                                     let closure_ctx = ba.closure_context().map(Rc::clone);
                                     let ba = Rc::clone(ba);
+                                    if ba.bytecode_count() <= 5
+                                        && !ba.has_exception_handler()
+                                        && let Some(result) = try_inline_small_function(
+                                            ba.as_ref(),
+                                            &[],
+                                            &frame.global_env,
+                                        )
+                                    {
+                                        match result {
+                                            JsValue::Smi(v) => {
+                                                sa = v;
+                                                continue 'smi;
+                                            }
+                                            v => {
+                                                acc = v;
+                                                frame.smi_mode = false;
+                                                frame.loop_end_pc = 0;
+                                                break 'smi;
+                                            }
+                                        }
+                                    }
                                     // Only sync the PC for error traces — the
                                     // accumulator is dead here (overwritten by
                                     // the call result or rebuilt on Err).
                                     frame.pc = pc;
 
-                                    let args = CallArgs::new();
                                     let saved_this = if !is_arrow && is_strict {
                                         let old = frame.global_env.borrow().get_this().cloned();
                                         frame.global_env.borrow_mut().set_this(JsValue::Undefined);
@@ -3540,8 +3577,19 @@ impl Interpreter {
                                     };
                                     // Move ba into the callee frame — avoids
                                     // a second Rc::clone.
-                                    let mut callee_frame =
-                                        acquire_frame(ba, args, Rc::clone(&frame.global_env));
+                                    let mut callee_frame = if ba.parameter_count() == 0 {
+                                        acquire_frame(
+                                            ba,
+                                            std::iter::empty(),
+                                            clone_shared_global_env(&frame.global_env),
+                                        )
+                                    } else {
+                                        acquire_frame(
+                                            ba,
+                                            CallArgs::new(),
+                                            clone_shared_global_env(&frame.global_env),
+                                        )
+                                    };
                                     if let Some(ctx) = closure_ctx {
                                         callee_frame.context = Some(JsValue::Context(ctx));
                                     }
@@ -3616,6 +3664,24 @@ impl Interpreter {
                                 let callee_reg = unsafe { operand_reg_unchecked(instr, 0) };
                                 let arg_reg = unsafe { operand_reg_unchecked(instr, 1) };
                                 let callee = unsafe { frame.read_reg_unchecked(callee_reg) };
+                                if let JsValue::NativeFunction(native_fn) = callee {
+                                    let arg1 =
+                                        unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
+                                    match native_fn(vec![arg1])? {
+                                        JsValue::Smi(v) => {
+                                            sa = v;
+                                            frame.global_cache_invalidate();
+                                            continue 'smi;
+                                        }
+                                        v => {
+                                            acc = v;
+                                            frame.global_cache_invalidate();
+                                            frame.smi_mode = false;
+                                            frame.loop_end_pc = 0;
+                                            break 'smi;
+                                        }
+                                    }
+                                }
                                 if let JsValue::Function(ba) = callee
                                     && !ba.is_generator()
                                     && !ba.is_async()
@@ -3628,6 +3694,28 @@ impl Interpreter {
                                     let ba = Rc::clone(ba);
                                     let arg1 =
                                         unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
+                                    let inline_args = [arg1.cheap_clone()];
+                                    if ba.bytecode_count() <= 5
+                                        && !ba.has_exception_handler()
+                                        && let Some(result) = try_inline_small_function(
+                                            ba.as_ref(),
+                                            &inline_args,
+                                            &frame.global_env,
+                                        )
+                                    {
+                                        match result {
+                                            JsValue::Smi(v) => {
+                                                sa = v;
+                                                continue 'smi;
+                                            }
+                                            v => {
+                                                acc = v;
+                                                frame.smi_mode = false;
+                                                frame.loop_end_pc = 0;
+                                                break 'smi;
+                                            }
+                                        }
+                                    }
                                     // Only sync the PC for error traces.
                                     frame.pc = pc;
                                     let args: CallArgs = smallvec::smallvec![arg1];
@@ -3640,8 +3728,11 @@ impl Interpreter {
                                     };
                                     // Move ba into callee frame — avoids a
                                     // second Rc::clone.
-                                    let mut callee_frame =
-                                        acquire_frame(ba, args, Rc::clone(&frame.global_env));
+                                    let mut callee_frame = acquire_frame(
+                                        ba,
+                                        args,
+                                        clone_shared_global_env(&frame.global_env),
+                                    );
                                     if let Some(ctx) = closure_ctx {
                                         callee_frame.context = Some(JsValue::Context(ctx));
                                     }
@@ -5843,6 +5934,11 @@ impl Interpreter {
                     Opcode::CallUndefinedReceiver0 => {
                         let reg = unsafe { operand_reg_unchecked(instr, 0) };
                         let callee = unsafe { frame.read_reg_unchecked(reg) };
+                        if let JsValue::NativeFunction(native_fn) = callee {
+                            acc = native_fn(Vec::new())?;
+                            frame.global_cache_invalidate();
+                            continue 'dispatch;
+                        }
                         if let JsValue::Function(ba) = callee
                             && !ba.is_generator()
                             && !ba.is_async()
@@ -5853,9 +5949,16 @@ impl Interpreter {
                             let has_fn_props = is_arrow && ba.has_fn_props();
                             let closure_ctx = ba.closure_context().map(Rc::clone);
                             let ba = Rc::clone(ba);
+                            if ba.bytecode_count() <= 5
+                                && !ba.has_exception_handler()
+                                && let Some(result) =
+                                    try_inline_small_function(ba.as_ref(), &[], &frame.global_env)
+                            {
+                                acc = result;
+                                continue 'dispatch;
+                            }
                             frame.pc = pc;
 
-                            let args = CallArgs::new();
                             let saved_this = if !is_arrow && is_strict {
                                 let old = frame.global_env.borrow().get_this().cloned();
                                 frame.global_env.borrow_mut().set_this(JsValue::Undefined);
@@ -5863,8 +5966,19 @@ impl Interpreter {
                             } else {
                                 None
                             };
-                            let mut callee_frame =
-                                acquire_frame(ba, args, Rc::clone(&frame.global_env));
+                            let mut callee_frame = if ba.parameter_count() == 0 {
+                                acquire_frame(
+                                    ba,
+                                    std::iter::empty(),
+                                    clone_shared_global_env(&frame.global_env),
+                                )
+                            } else {
+                                acquire_frame(
+                                    ba,
+                                    CallArgs::new(),
+                                    clone_shared_global_env(&frame.global_env),
+                                )
+                            };
                             if let Some(ctx) = closure_ctx {
                                 callee_frame.context = Some(JsValue::Context(ctx));
                             }
@@ -5969,6 +6083,12 @@ impl Interpreter {
                             acc = JsValue::Smi(items.len() as i32);
                             continue 'dispatch;
                         }
+                        if let JsValue::NativeFunction(native_fn) = callee {
+                            let arg1 = unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
+                            acc = native_fn(vec![arg1])?;
+                            frame.global_cache_invalidate();
+                            continue 'dispatch;
+                        }
                         if let JsValue::Function(ba) = callee
                             && !ba.is_generator()
                             && !ba.is_async()
@@ -5980,8 +6100,19 @@ impl Interpreter {
                             let closure_ctx = ba.closure_context().map(Rc::clone);
                             let ba = Rc::clone(ba);
                             let arg1 = unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
+                            let inline_args = [arg1.cheap_clone()];
+                            if ba.bytecode_count() <= 5
+                                && !ba.has_exception_handler()
+                                && let Some(result) = try_inline_small_function(
+                                    ba.as_ref(),
+                                    &inline_args,
+                                    &frame.global_env,
+                                )
+                            {
+                                acc = result;
+                                continue 'dispatch;
+                            }
                             frame.pc = pc;
-                            let args: CallArgs = smallvec::smallvec![arg1];
                             let saved_this = if !is_arrow && is_strict {
                                 let old = frame.global_env.borrow().get_this().cloned();
                                 frame.global_env.borrow_mut().set_this(JsValue::Undefined);
@@ -5989,8 +6120,9 @@ impl Interpreter {
                             } else {
                                 None
                             };
+                            let args: CallArgs = smallvec::smallvec![arg1];
                             let mut callee_frame =
-                                acquire_frame(ba, args, Rc::clone(&frame.global_env));
+                                acquire_frame(ba, args, clone_shared_global_env(&frame.global_env));
                             if let Some(ctx) = closure_ctx {
                                 callee_frame.context = Some(JsValue::Context(ctx));
                             }
@@ -7922,6 +8054,193 @@ pub(super) fn restore_closure_context(
         _ => {
             frame.global_env.borrow_mut().remove(".super_lookup_start");
         }
+    }
+}
+
+#[inline(always)]
+pub(super) fn clone_shared_global_env(
+    global_env: &Rc<RefCell<GlobalEnv>>,
+) -> Rc<RefCell<GlobalEnv>> {
+    let ptr = Rc::as_ptr(global_env);
+    // SAFETY: `ptr` was produced by `Rc::as_ptr` from a live allocation. We
+    // increment the strong count before reconstructing the cloned handle, so
+    // the returned `Rc` shares ownership with the original value.
+    unsafe {
+        Rc::increment_strong_count(ptr);
+        Rc::from_raw(ptr)
+    }
+}
+
+#[inline(always)]
+fn inline_arg_from_reg(args: &[JsValue], reg: u32) -> Option<JsValue> {
+    let signed = reg as i32;
+    if signed >= 0 {
+        return None;
+    }
+    let index = (-(signed + 1)) as usize;
+    Some(args.get(index).cloned().unwrap_or(JsValue::Undefined))
+}
+
+#[inline(always)]
+fn checked_operand_reg(instr: &Instruction, idx: usize) -> Option<u32> {
+    match instr.operands.get(idx)? {
+        Operand::Register(reg) => Some(*reg),
+        _ => None,
+    }
+}
+
+#[inline(always)]
+fn checked_operand_imm(instr: &Instruction, idx: usize) -> Option<i32> {
+    match instr.operands.get(idx)? {
+        Operand::Immediate(imm) => Some(*imm),
+        _ => None,
+    }
+}
+
+#[inline(always)]
+fn checked_operand_constant_pool_idx(instr: &Instruction, idx: usize) -> Option<u32> {
+    match instr.operands.get(idx)? {
+        Operand::ConstantPoolIdx(const_idx) => Some(*const_idx),
+        _ => None,
+    }
+}
+
+#[inline(always)]
+fn inline_property_lookup(obj: &JsValue, key: &str) -> Option<JsValue> {
+    if let Some(value) = try_fast_named_property_lookup(obj, key) {
+        return Some(value);
+    }
+
+    match obj {
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            if borrow.has_accessors {
+                None
+            } else {
+                borrow.get(key).cloned()
+            }
+        }
+        _ => None,
+    }
+}
+
+#[inline(always)]
+fn is_inline_primitive(value: &JsValue) -> bool {
+    matches!(
+        value,
+        JsValue::Smi(_)
+            | JsValue::HeapNumber(_)
+            | JsValue::Boolean(_)
+            | JsValue::Undefined
+            | JsValue::Null
+            | JsValue::String(_)
+            | JsValue::BigInt(_)
+    )
+}
+
+#[inline(always)]
+fn inline_binary_op(opcode: Opcode, lhs: &JsValue, rhs: &JsValue) -> Option<JsValue> {
+    if !is_inline_primitive(lhs) || !is_inline_primitive(rhs) {
+        return None;
+    }
+
+    match opcode {
+        Opcode::Add => js_add(lhs, rhs).ok(),
+        Opcode::Sub => Some(number_to_jsvalue(
+            lhs.to_number().ok()? - rhs.to_number().ok()?,
+        )),
+        Opcode::Mul => Some(number_to_jsvalue(
+            lhs.to_number().ok()? * rhs.to_number().ok()?,
+        )),
+        Opcode::Div => Some(number_to_jsvalue(
+            lhs.to_number().ok()? / rhs.to_number().ok()?,
+        )),
+        Opcode::Mod => Some(number_to_jsvalue(
+            lhs.to_number().ok()? % rhs.to_number().ok()?,
+        )),
+        _ => None,
+    }
+}
+
+#[inline(always)]
+fn inline_smi_binary_opcode(opcode: Opcode) -> Option<Opcode> {
+    match opcode {
+        Opcode::AddSmi => Some(Opcode::Add),
+        Opcode::SubSmi => Some(Opcode::Sub),
+        Opcode::MulSmi => Some(Opcode::Mul),
+        Opcode::DivSmi => Some(Opcode::Div),
+        Opcode::ModSmi => Some(Opcode::Mod),
+        _ => None,
+    }
+}
+
+pub(super) fn try_inline_small_function(
+    ba: &BytecodeArray,
+    args: &[JsValue],
+    _global_env: &Rc<RefCell<GlobalEnv>>,
+) -> Option<JsValue> {
+    if ba.bytecode_count() > 5 || ba.has_exception_handler() {
+        return None;
+    }
+
+    let decoded = ba.shared_decoded_instructions().ok()?;
+    let instrs = decoded.0.as_slice();
+
+    match instrs {
+        [lda, ret] if lda.opcode == Opcode::LdaSmi && ret.opcode == Opcode::Return => {
+            Some(JsValue::Smi(checked_operand_imm(lda, 0)?))
+        }
+        [lda, ret] if lda.opcode == Opcode::LdaUndefined && ret.opcode == Opcode::Return => {
+            Some(JsValue::Undefined)
+        }
+        [lda, ret] if lda.opcode == Opcode::LdaZero && ret.opcode == Opcode::Return => {
+            Some(JsValue::Smi(0))
+        }
+        [lda, ret] if lda.opcode == Opcode::LdaNull && ret.opcode == Opcode::Return => {
+            Some(JsValue::Null)
+        }
+        [lda, ret] if lda.opcode == Opcode::LdaTrue && ret.opcode == Opcode::Return => {
+            Some(JsValue::Boolean(true))
+        }
+        [lda, ret] if lda.opcode == Opcode::LdaFalse && ret.opcode == Opcode::Return => {
+            Some(JsValue::Boolean(false))
+        }
+        [lda, ret] if lda.opcode == Opcode::LdaConstant && ret.opcode == Opcode::Return => Some(
+            constant_to_value(ba.get_constant(checked_operand_constant_pool_idx(lda, 0)?)?),
+        ),
+        [lda, ret] if lda.opcode == Opcode::Ldar && ret.opcode == Opcode::Return => {
+            inline_arg_from_reg(args, checked_operand_reg(lda, 0)?)
+        }
+        [lda, ret] if lda.opcode == Opcode::LdaNamedProperty && ret.opcode == Opcode::Return => {
+            let obj = inline_arg_from_reg(args, checked_operand_reg(lda, 0)?)?;
+            let ConstantPoolEntry::String(key) =
+                ba.get_constant(checked_operand_constant_pool_idx(lda, 1)?)?
+            else {
+                return None;
+            };
+            inline_property_lookup(&obj, key)
+        }
+        [ret] if ret.opcode == Opcode::Return => Some(JsValue::Undefined),
+        [lhs, op, ret] if lhs.opcode == Opcode::Ldar && ret.opcode == Opcode::Return => {
+            let opcode = inline_smi_binary_opcode(op.opcode)?;
+            let lhs = inline_arg_from_reg(args, checked_operand_reg(lhs, 0)?)?;
+            inline_binary_op(opcode, &lhs, &JsValue::Smi(checked_operand_imm(op, 0)?))
+        }
+        [rhs, star, lhs, op, ret]
+            if rhs.opcode == Opcode::Ldar
+                && star.opcode == Opcode::Star
+                && lhs.opcode == Opcode::Ldar
+                && ret.opcode == Opcode::Return =>
+        {
+            let temp = checked_operand_reg(star, 0)?;
+            if checked_operand_reg(op, 0)? != temp {
+                return None;
+            }
+            let lhs = inline_arg_from_reg(args, checked_operand_reg(lhs, 0)?)?;
+            let rhs = inline_arg_from_reg(args, checked_operand_reg(rhs, 0)?)?;
+            inline_binary_op(op.opcode, &lhs, &rhs)
+        }
+        _ => None,
     }
 }
 
@@ -11627,6 +11946,82 @@ mod tests {
         frame.hot_registers = Some(HotRegisters::new(frame.registers.len()));
         let result = Interpreter::run(&mut frame)?;
         Ok((result, frame))
+    }
+
+    #[test]
+    fn test_try_inline_small_function_constant() {
+        let ba = make_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+            0,
+        );
+        let global_env = Rc::new(RefCell::new(GlobalEnv::new()));
+
+        let result = try_inline_small_function(&ba, &[], &global_env);
+
+        assert_eq!(result, Some(JsValue::Smi(42)));
+    }
+
+    #[test]
+    fn test_try_inline_small_function_adds_parameters() {
+        let param0_v = (-1i32) as u32;
+        let param1_v = (-2i32) as u32;
+        let ba = make_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(param1_v)]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(param0_v)]),
+                Instruction::new_unchecked(
+                    Opcode::Add,
+                    vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            1,
+            2,
+        );
+        let global_env = Rc::new(RefCell::new(GlobalEnv::new()));
+
+        let result =
+            try_inline_small_function(&ba, &[JsValue::Smi(4), JsValue::Smi(3)], &global_env);
+
+        assert_eq!(result, Some(JsValue::Smi(7)));
+    }
+
+    #[test]
+    fn test_try_inline_small_function_named_property_accessor() {
+        let param0_v = (-1i32) as u32;
+        let instrs = vec![
+            Instruction::new_unchecked(
+                Opcode::LdaNamedProperty,
+                vec![
+                    Operand::Register(param0_v),
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = BytecodeArray::new(
+            encode(&instrs),
+            vec![ConstantPoolEntry::String("x".to_string())],
+            0,
+            1,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        );
+        let mut props = PropertyMap::new();
+        props.insert("x".to_string(), JsValue::Smi(9));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+        let global_env = Rc::new(RefCell::new(GlobalEnv::new()));
+
+        let result = try_inline_small_function(&ba, &[obj], &global_env);
+
+        assert_eq!(result, Some(JsValue::Smi(9)));
     }
 
     // ── LdaSmi / LdaUndefined / Return ──────────────────────────────────────
