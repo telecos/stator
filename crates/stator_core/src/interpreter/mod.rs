@@ -5339,7 +5339,7 @@ impl Interpreter {
                             JsValue::Undefined | JsValue::Null | JsValue::TheHole => false,
                             JsValue::HeapNumber(n) => !n.is_nan() && *n != 0.0,
                             JsValue::String(s) => !s.is_empty(),
-                            JsValue::BigInt(n) => *n != 0,
+                            JsValue::BigInt(n) => **n != 0,
                             // Objects, functions, arrays, etc. are always truthy.
                             _ => true,
                         };
@@ -5355,7 +5355,7 @@ impl Interpreter {
                             JsValue::Undefined | JsValue::Null | JsValue::TheHole => false,
                             JsValue::HeapNumber(n) => !n.is_nan() && *n != 0.0,
                             JsValue::String(s) => !s.is_empty(),
-                            JsValue::BigInt(n) => *n != 0,
+                            JsValue::BigInt(n) => **n != 0,
                             _ => true,
                         };
                         if !truthy {
@@ -7161,7 +7161,7 @@ pub(super) fn constant_to_value(entry: &ConstantPoolEntry) -> JsValue {
         ConstantPoolEntry::Boolean(b) => JsValue::Boolean(*b),
         ConstantPoolEntry::Null => JsValue::Null,
         ConstantPoolEntry::Undefined => JsValue::Undefined,
-        ConstantPoolEntry::BigInt(n) => JsValue::BigInt(*n),
+        ConstantPoolEntry::BigInt(n) => JsValue::BigInt(Box::new(*n)),
         ConstantPoolEntry::Function(ba) => JsValue::Function(Rc::clone(ba)),
         ConstantPoolEntry::TemplateObject { cooked, raw } => build_template_object(cooked, raw),
     }
@@ -7421,7 +7421,7 @@ fn mixed_bigint_number_error() -> StatorError {
 /// Extract the `i128` value from a BigInt, or return a TypeError for mixed operations.
 pub(super) fn to_bigint(val: &JsValue) -> StatorResult<i128> {
     match val {
-        JsValue::BigInt(n) => Ok(*n),
+        JsValue::BigInt(n) => Ok(**n),
         _ => Err(mixed_bigint_number_error()),
     }
 }
@@ -7512,7 +7512,7 @@ pub(super) fn js_add(lhs: &JsValue, rhs: &JsValue) -> StatorResult<JsValue> {
     } else if lprim.is_bigint() || rprim.is_bigint() {
         let l = to_bigint(&lprim)?;
         let r = to_bigint(&rprim)?;
-        Ok(JsValue::BigInt(l.wrapping_add(r)))
+        Ok(JsValue::BigInt(Box::new(l.wrapping_add(r))))
     } else {
         let l = lprim.to_number()?;
         let r = rprim.to_number()?;
@@ -10860,8 +10860,10 @@ pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }));
             }
             "valueOf" => {
-                let n = *n;
-                return JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::BigInt(n))));
+                let n = **n;
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::BigInt(Box::new(n)))
+                }));
             }
             _ => {}
         },

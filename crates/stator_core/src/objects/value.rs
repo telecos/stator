@@ -282,7 +282,10 @@ pub enum JsValue {
     /// A pointer to a GC-managed heap object.
     Object(*mut HeapObject),
     /// A JavaScript `BigInt` value (represented as a 128-bit signed integer).
-    BigInt(i128),
+    ///
+    /// Boxed to keep `JsValue` at 16 bytes (pointer-sized) instead of 24.
+    /// BigInt is rare in hot paths, so the extra indirection is negligible.
+    BigInt(Box<i128>),
     /// A callable JavaScript function backed by a [`BytecodeArray`] closure.
     ///
     /// The [`Rc`] allows function values to be cheaply cloned and shared
@@ -352,6 +355,12 @@ pub enum JsValue {
     /// A JavaScript `DataView` (ECMAScript §25.3) — byte-level buffer accessor.
     DataView(Rc<RefCell<crate::builtins::typed_array::JsDataView>>),
 }
+
+// Compile-time assertion: JsValue is 24 bytes (discriminant + 16-byte max payload).
+// Boxing BigInt removes i128 from the enum layout, but String(Rc<str>) and
+// NativeFunction(Rc<dyn Fn(…)>) are still 16-byte fat pointers.
+// TODO: Use thin-pointer wrappers for Rc<str>/Rc<dyn Fn> to reach 16 bytes.
+const _: () = assert!(std::mem::size_of::<JsValue>() == 24);
 
 /// A scope context representing the environment for captured variables.
 ///
@@ -806,7 +815,7 @@ impl JsValue {
             | Self::ArrayBuffer(_)
             | Self::TypedArray(_)
             | Self::DataView(_) => true,
-            Self::BigInt(n) => *n != 0,
+            Self::BigInt(n) => **n != 0,
         }
     }
 
@@ -1359,11 +1368,11 @@ impl JsValue {
 
         // Step 4a: BigInt × String
         if let (JsValue::BigInt(n), JsValue::String(s)) = (&px, &py) {
-            return Ok(s.trim().parse::<i128>().ok().map(|parsed| *n < parsed));
+            return Ok(s.trim().parse::<i128>().ok().map(|parsed| **n < parsed));
         }
         // Step 4b: String × BigInt
         if let (JsValue::String(s), JsValue::BigInt(n)) = (&px, &py) {
-            return Ok(s.trim().parse::<i128>().ok().map(|parsed| parsed < *n));
+            return Ok(s.trim().parse::<i128>().ok().map(|parsed| parsed < **n));
         }
 
         // Step 4d-e: ToNumeric on both sides.
@@ -1389,7 +1398,7 @@ impl JsValue {
                 if b.is_infinite() {
                     return Ok(Some(b.is_sign_positive()));
                 }
-                Ok(Some((*a as f64) < *b))
+                Ok(Some((**a as f64) < *b))
             }
             // Number × BigInt
             (JsValue::HeapNumber(a), JsValue::BigInt(b)) => {
@@ -1399,7 +1408,7 @@ impl JsValue {
                 if a.is_infinite() {
                     return Ok(Some(a.is_sign_negative()));
                 }
-                Ok(Some(*a < (*b as f64)))
+                Ok(Some(*a < (**b as f64)))
             }
             _ => Ok(None),
         }
@@ -1800,7 +1809,7 @@ fn is_loosely_equal_inner(lhs: &JsValue, rhs: &JsValue, depth: u8) -> StatorResu
         if let JsValue::String(s) = rhs
             && let Ok(n) = s.trim().parse::<i128>()
         {
-            return is_loosely_equal_inner(lhs, &JsValue::BigInt(n), depth + 1);
+            return is_loosely_equal_inner(lhs, &JsValue::BigInt(Box::new(n)), depth + 1);
         }
         return Ok(false);
     }
@@ -1839,7 +1848,7 @@ fn is_loosely_equal_inner(lhs: &JsValue, rhs: &JsValue, depth: u8) -> StatorResu
             return Ok(false);
         }
         // Compare exactly: the BigInt must equal the truncated f64.
-        return Ok(*x as f64 == y && y as i128 == *x);
+        return Ok(**x as f64 == y && y as i128 == **x);
     }
     if let (_, JsValue::BigInt(y)) = (lhs, rhs)
         && lhs.is_number()
@@ -1848,7 +1857,7 @@ fn is_loosely_equal_inner(lhs: &JsValue, rhs: &JsValue, depth: u8) -> StatorResu
         if x.is_nan() || x.is_infinite() {
             return Ok(false);
         }
-        return Ok(*y as f64 == x && x as i128 == *y);
+        return Ok(**y as f64 == x && x as i128 == **y);
     }
 
     // Step 13: Return false.

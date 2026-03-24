@@ -11657,18 +11657,18 @@ fn make_bigint() -> JsValue {
         native(|args| {
             let val = args.first().unwrap_or(&JsValue::Undefined);
             match val {
-                JsValue::BigInt(n) => Ok(JsValue::BigInt(*n)),
-                JsValue::Smi(n) => Ok(JsValue::BigInt(i128::from(*n))),
+                JsValue::BigInt(n) => Ok(JsValue::BigInt(n.clone())),
+                JsValue::Smi(n) => Ok(JsValue::BigInt(Box::new(i128::from(*n)))),
                 JsValue::HeapNumber(n) => {
                     if n.is_nan() || n.is_infinite() || n.fract() != 0.0 {
                         Err(StatorError::RangeError(format!(
                             "The number {n} cannot be converted to a BigInt because it is not an integer"
                         )))
                     } else {
-                        Ok(JsValue::BigInt(*n as i128))
+                        Ok(JsValue::BigInt(Box::new(*n as i128)))
                     }
                 }
-                JsValue::Boolean(b) => Ok(JsValue::BigInt(if *b { 1 } else { 0 })),
+                JsValue::Boolean(b) => Ok(JsValue::BigInt(Box::new(if *b { 1 } else { 0 }))),
                 JsValue::String(s) => {
                     let trimmed = s.trim();
                     if trimmed.is_empty() {
@@ -11691,7 +11691,7 @@ fn make_bigint() -> JsValue {
                     } else {
                         trimmed.parse::<i128>()
                     };
-                    parsed.map(JsValue::BigInt).map_err(|_| {
+                    parsed.map(|v| JsValue::BigInt(Box::new(v))).map_err(|_| {
                         StatorError::SyntaxError(format!(
                             "Cannot convert {s} to a BigInt"
                         ))
@@ -11711,7 +11711,7 @@ fn make_bigint() -> JsValue {
         native(|args| {
             let bits = args.first().unwrap_or(&JsValue::Undefined).to_number()? as u32;
             let bigint = match args.get(1) {
-                Some(JsValue::BigInt(n)) => *n,
+                Some(JsValue::BigInt(n)) => **n,
                 _ => {
                     return Err(StatorError::TypeError(
                         "Cannot convert a non-BigInt value to a BigInt".to_string(),
@@ -11719,18 +11719,18 @@ fn make_bigint() -> JsValue {
                 }
             };
             if bits == 0 {
-                return Ok(JsValue::BigInt(0));
+                return Ok(JsValue::BigInt(Box::new(0)));
             }
             if bits >= 128 {
-                return Ok(JsValue::BigInt(bigint));
+                return Ok(JsValue::BigInt(Box::new(bigint)));
             }
             let mask = (1i128 << bits) - 1;
             let truncated = bigint & mask;
             // Sign extension
             if truncated & (1i128 << (bits - 1)) != 0 {
-                Ok(JsValue::BigInt(truncated | !mask))
+                Ok(JsValue::BigInt(Box::new(truncated | !mask)))
             } else {
-                Ok(JsValue::BigInt(truncated))
+                Ok(JsValue::BigInt(Box::new(truncated)))
             }
         }),
     );
@@ -11741,7 +11741,7 @@ fn make_bigint() -> JsValue {
         native(|args| {
             let bits = args.first().unwrap_or(&JsValue::Undefined).to_number()? as u32;
             let bigint = match args.get(1) {
-                Some(JsValue::BigInt(n)) => *n,
+                Some(JsValue::BigInt(n)) => **n,
                 _ => {
                     return Err(StatorError::TypeError(
                         "Cannot convert a non-BigInt value to a BigInt".to_string(),
@@ -11749,13 +11749,13 @@ fn make_bigint() -> JsValue {
                 }
             };
             if bits == 0 {
-                return Ok(JsValue::BigInt(0));
+                return Ok(JsValue::BigInt(Box::new(0)));
             }
             if bits >= 128 {
-                return Ok(JsValue::BigInt(bigint));
+                return Ok(JsValue::BigInt(Box::new(bigint)));
             }
             let mask = (1i128 << bits) - 1;
-            Ok(JsValue::BigInt(bigint & mask))
+            Ok(JsValue::BigInt(Box::new(bigint & mask)))
         }),
     );
 
@@ -13505,7 +13505,7 @@ fn incompatible_receiver(display_name: &str) -> StatorError {
 
 fn dataview_bigint_argument(value: &JsValue) -> StatorResult<i128> {
     match value.to_numeric()? {
-        JsValue::BigInt(n) => Ok(n),
+        JsValue::BigInt(n) => Ok(*n),
         _ => Err(StatorError::TypeError(
             "Cannot convert a non-BigInt value to a BigInt".to_string(),
         )),
@@ -13985,7 +13985,7 @@ fn make_dataview() -> JsValue {
             };
             let little_endian = args.get(2).is_some_and(JsValue::to_boolean);
             let value = dataview_get_bigint64(&inner.borrow(), offset, little_endian)?;
-            Ok(JsValue::BigInt(i128::from(value)))
+            Ok(JsValue::BigInt(Box::new(i128::from(value))))
         }),
     );
     prototype.insert(
@@ -14001,7 +14001,7 @@ fn make_dataview() -> JsValue {
             };
             let little_endian = args.get(2).is_some_and(JsValue::to_boolean);
             let value = dataview_get_biguint64(&inner.borrow(), offset, little_endian)?;
-            Ok(JsValue::BigInt(i128::from(value)))
+            Ok(JsValue::BigInt(Box::new(i128::from(value))))
         }),
     );
     dataview_proto_setter!("setInt8", 2, dataview_set_int8, |v: &JsValue| Ok::<
@@ -15051,7 +15051,7 @@ fn atomics_kind_is_bigint(kind: TypedArrayKind) -> bool {
 
 fn atomics_extract_bigint(value: &JsValue) -> StatorResult<i128> {
     match value {
-        JsValue::BigInt(n) => Ok(*n),
+        JsValue::BigInt(n) => Ok(**n),
         _ => Err(StatorError::TypeError(
             "Atomics operation requires a BigInt value".into(),
         )),
@@ -15062,11 +15062,11 @@ fn atomics_coerce_value(kind: TypedArrayKind, value: &JsValue) -> StatorResult<J
     if atomics_kind_is_bigint(kind) {
         let numeric = value.to_numeric()?;
         let bigint = atomics_extract_bigint(&numeric)?;
-        return Ok(JsValue::BigInt(match kind {
+        return Ok(JsValue::BigInt(Box::new(match kind {
             TypedArrayKind::BigInt64 => (bigint as i64) as i128,
             TypedArrayKind::BigUint64 => (bigint as u64) as i128,
             _ => bigint,
-        }));
+        })));
     }
 
     match value.to_numeric()? {
@@ -15149,10 +15149,10 @@ fn atomics_apply_binary_number(
     op: impl FnOnce(i128, i128) -> i128,
 ) -> StatorResult<JsValue> {
     if atomics_kind_is_bigint(kind) {
-        return Ok(JsValue::BigInt(op(
+        return Ok(JsValue::BigInt(Box::new(op(
             atomics_extract_bigint(old)?,
             atomics_extract_bigint(operand)?,
-        )));
+        ))));
     }
 
     let lhs = match kind {
@@ -15218,7 +15218,9 @@ fn make_atomics() -> JsValue {
             let old = atomics_read(&ta.borrow(), index);
             let operand = atomics_coerce_value(kind, args.get(2).unwrap_or(&JsValue::Undefined))?;
             let next = if atomics_kind_is_bigint(kind) {
-                JsValue::BigInt(atomics_extract_bigint(&old)? + atomics_extract_bigint(&operand)?)
+                JsValue::BigInt(Box::new(
+                    atomics_extract_bigint(&old)? + atomics_extract_bigint(&operand)?,
+                ))
             } else {
                 JsValue::HeapNumber(old.to_number()? + operand.to_number()?)
             };
@@ -15236,7 +15238,9 @@ fn make_atomics() -> JsValue {
             let old = atomics_read(&ta.borrow(), index);
             let operand = atomics_coerce_value(kind, args.get(2).unwrap_or(&JsValue::Undefined))?;
             let next = if atomics_kind_is_bigint(kind) {
-                JsValue::BigInt(atomics_extract_bigint(&old)? - atomics_extract_bigint(&operand)?)
+                JsValue::BigInt(Box::new(
+                    atomics_extract_bigint(&old)? - atomics_extract_bigint(&operand)?,
+                ))
             } else {
                 JsValue::HeapNumber(old.to_number()? - operand.to_number()?)
             };
@@ -30066,7 +30070,7 @@ mod tests {
     #[test]
     fn e2e_bigint_constructor_large_positive() {
         let result = global_eval("BigInt('170141183460469231731687303715884105727')").unwrap();
-        assert_eq!(result, JsValue::BigInt(i128::MAX));
+        assert_eq!(result, JsValue::BigInt(Box::new(i128::MAX)));
     }
 
     // ── Prototype chain tests ───────────────────────────────────────────
