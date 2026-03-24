@@ -1943,6 +1943,66 @@ impl HotRegisters {
         }
     }
 
+    /// Read the raw [`NanBoxedValue`] from the cache if valid.
+    #[inline(always)]
+    fn read_raw(&self, idx: usize) -> Option<NanBoxedValue> {
+        if idx < self.len && self.is_valid(idx) {
+            // SAFETY: idx < self.len ≤ self.values.len().
+            Some(unsafe { *self.values.get_unchecked(idx) })
+        } else {
+            None
+        }
+    }
+
+    /// Read a register as `i32` for the SMI loop, handling both
+    /// Smi and Boolean NaN-boxed encodings.  Returns `None` if the slot
+    /// is invalid or holds a non-numeric type.
+    #[inline(always)]
+    fn read_as_i32(&self, idx: usize) -> Option<i32> {
+        if idx < self.len && self.is_valid(idx) {
+            // SAFETY: idx < self.len ≤ self.values.len().
+            let nb = unsafe { *self.values.get_unchecked(idx) };
+            if nb.is_smi() {
+                return Some(nb.as_smi());
+            }
+            if nb.is_boolean() {
+                return Some(nb.as_boolean() as i32);
+            }
+        }
+        None
+    }
+
+    /// Write an SMI value directly, avoiding the [`JsValue`] →
+    /// `try_encode` path.
+    #[inline(always)]
+    fn write_smi(&mut self, idx: usize, val: i32) {
+        if idx < self.len {
+            // SAFETY: idx < self.len ≤ self.values.len().
+            unsafe { *self.values.get_unchecked_mut(idx) = NanBoxedValue::from_smi(val) };
+            self.set_valid(idx);
+        }
+    }
+
+    /// Write a boolean value directly.
+    #[inline(always)]
+    fn write_bool(&mut self, idx: usize, val: bool) {
+        if idx < self.len {
+            // SAFETY: idx < self.len ≤ self.values.len().
+            unsafe { *self.values.get_unchecked_mut(idx) = NanBoxedValue::from_boolean(val) };
+            self.set_valid(idx);
+        }
+    }
+
+    /// Write a pre-encoded [`NanBoxedValue`] directly.
+    #[inline(always)]
+    fn write_nanboxed(&mut self, idx: usize, nb: NanBoxedValue) {
+        if idx < self.len {
+            // SAFETY: idx < self.len ≤ self.values.len().
+            unsafe { *self.values.get_unchecked_mut(idx) = nb };
+            self.set_valid(idx);
+        }
+    }
+
     /// Attempt to NaN-box a [`JsValue`].
     #[inline(always)]
     fn try_encode(value: &JsValue) -> Option<NanBoxedValue> {
@@ -2330,6 +2390,7 @@ impl InterpreterFrame {
     /// The caller must ensure `reg` maps to an in-bounds register that
     /// contains either `JsValue::Smi` or `JsValue::Boolean`.
     #[inline(always)]
+    #[allow(dead_code)]
     unsafe fn read_reg_num_unchecked(&self, reg: u32) -> i32 {
         let signed = reg as i32;
         let idx = if signed >= 0 {
@@ -2339,6 +2400,34 @@ impl InterpreterFrame {
         };
         debug_assert!(idx < self.registers.len());
         // SAFETY: Caller guarantees register is in bounds and holds Smi or Boolean.
+        let val = unsafe { self.registers.get_unchecked(idx) };
+        match val {
+            JsValue::Smi(v) => *v,
+            JsValue::Boolean(b) => *b as i32,
+            _ => unsafe { std::hint::unreachable_unchecked() },
+        }
+    }
+
+    /// Read a register as `i32` in the SMI loop, trying the
+    /// [`HotRegisters`] cache first for an 8-byte read instead of a
+    /// 24-byte [`JsValue`] pattern match.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `reg` maps to an in-bounds register that
+    /// contains either `JsValue::Smi` or `JsValue::Boolean`.
+    #[inline(always)]
+    unsafe fn read_reg_num_hot_unchecked(&self, reg: u32) -> i32 {
+        let idx = self.reg_flat_index_unchecked(reg);
+        // Try hot register cache first (8-byte read vs 24-byte JsValue).
+        if let Some(ref hr) = self.hot_registers
+            && let Some(v) = hr.read_as_i32(idx)
+        {
+            return v;
+        }
+        // Fall back to regular register file.
+        // SAFETY: Caller guarantees register is in bounds and holds
+        // Smi or Boolean.
         let val = unsafe { self.registers.get_unchecked(idx) };
         match val {
             JsValue::Smi(v) => *v,
@@ -2875,6 +2964,15 @@ impl Interpreter {
                             }
                         };
                     }
+                    // NaN-boxed shadow of the accumulator.  Stays in sync
+                    // with `sa` so that Star can write the 8-byte
+                    // NanBoxedValue directly into the hot register cache
+                    // without re-encoding.
+                    let mut hot_acc: Option<NanBoxedValue> = Some(if smi_acc_bool {
+                        NanBoxedValue::from_boolean(sa != 0)
+                    } else {
+                        NanBoxedValue::from_smi(sa)
+                    });
                     'smi: loop {
                         if pc >= frame.loop_end_pc {
                             frame.loop_end_pc = 0;
@@ -2889,36 +2987,65 @@ impl Interpreter {
                             Opcode::LdaSmi => {
                                 sa = unsafe { operand_imm_unchecked(instr, 0) };
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::LdaZero => {
                                 sa = 0;
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(0));
                             }
                             Opcode::LdaTrue => {
                                 sa = 1;
                                 smi_acc_bool = true;
+                                hot_acc = Some(NanBoxedValue::from_boolean(true));
                             }
                             Opcode::LdaFalse => {
                                 sa = 0;
                                 smi_acc_bool = true;
+                                hot_acc = Some(NanBoxedValue::from_boolean(false));
                             }
                             Opcode::Star => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                let idx = frame.reg_flat_index_unchecked(reg);
                                 let val = smi_to_val!();
                                 unsafe { frame.write_reg_unchecked(reg, val) };
+                                // Write pre-encoded NanBoxedValue to hot cache.
+                                if let Some(nb) = hot_acc
+                                    && let Some(ref mut hr) = frame.hot_registers
+                                {
+                                    hr.write_nanboxed(idx, nb);
+                                }
                             }
                             Opcode::Ldar => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                // In a hot integer loop the registers touched
-                                // by Ldar are the same ones written by Star
-                                // with Smi values.  Check anyway for safety.
+                                let idx = frame.reg_flat_index_unchecked(reg);
+                                // Try hot register cache first (8-byte read).
+                                if let Some(ref hr) = frame.hot_registers
+                                    && let Some(nb) = hr.read_raw(idx)
+                                {
+                                    if nb.is_smi() {
+                                        sa = nb.as_smi();
+                                        smi_acc_bool = false;
+                                        hot_acc = Some(nb);
+                                        continue 'smi;
+                                    }
+                                    if nb.is_boolean() {
+                                        sa = nb.as_boolean() as i32;
+                                        smi_acc_bool = true;
+                                        hot_acc = Some(nb);
+                                        continue 'smi;
+                                    }
+                                }
+                                // Fall back to frame register file.
                                 let val = unsafe { frame.read_reg_unchecked(reg) };
                                 if let JsValue::Smi(v) = val {
                                     sa = *v;
                                     smi_acc_bool = false;
+                                    hot_acc = Some(NanBoxedValue::from_smi(*v));
                                 } else if let JsValue::Boolean(b) = val {
                                     sa = *b as i32;
                                     smi_acc_bool = true;
+                                    hot_acc = Some(NanBoxedValue::from_boolean(*b));
                                 } else {
                                     acc = val.cheap_clone();
                                     frame.smi_mode = false;
@@ -2929,15 +3056,29 @@ impl Interpreter {
                             Opcode::Mov => {
                                 let src = unsafe { operand_reg_unchecked(instr, 0) };
                                 let dst = unsafe { operand_reg_unchecked(instr, 1) };
+                                let src_idx = frame.reg_flat_index_unchecked(src);
+                                let dst_idx = frame.reg_flat_index_unchecked(dst);
                                 let val = unsafe { frame.read_reg_unchecked(src) }.cheap_clone();
                                 unsafe { frame.write_reg_unchecked(dst, val) };
+                                // Propagate hot register cache entry.
+                                if let Some(ref mut hr) = frame.hot_registers {
+                                    let cached = hr.read_raw(src_idx);
+                                    if let Some(nb) = cached {
+                                        hr.write_nanboxed(dst_idx, nb);
+                                    } else {
+                                        hr.invalidate(dst_idx);
+                                    }
+                                }
                             }
                             Opcode::Add => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 smi_acc_bool = false;
                                 match sa.checked_add(b) {
-                                    Some(r) => sa = r,
+                                    Some(r) => {
+                                        sa = r;
+                                        hot_acc = Some(NanBoxedValue::from_smi(r));
+                                    }
                                     None => {
                                         acc = JsValue::HeapNumber(sa as f64 + b as f64);
                                         frame.smi_mode = false;
@@ -2950,7 +3091,10 @@ impl Interpreter {
                                 let b = unsafe { operand_imm_unchecked(instr, 0) };
                                 smi_acc_bool = false;
                                 match sa.checked_add(b) {
-                                    Some(r) => sa = r,
+                                    Some(r) => {
+                                        sa = r;
+                                        hot_acc = Some(NanBoxedValue::from_smi(r));
+                                    }
                                     None => {
                                         acc = JsValue::HeapNumber(sa as f64 + b as f64);
                                         frame.smi_mode = false;
@@ -2961,10 +3105,13 @@ impl Interpreter {
                             }
                             Opcode::Sub => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 smi_acc_bool = false;
                                 match sa.checked_sub(b) {
-                                    Some(r) => sa = r,
+                                    Some(r) => {
+                                        sa = r;
+                                        hot_acc = Some(NanBoxedValue::from_smi(r));
+                                    }
                                     None => {
                                         acc = JsValue::HeapNumber(sa as f64 - b as f64);
                                         frame.smi_mode = false;
@@ -2977,7 +3124,10 @@ impl Interpreter {
                                 let b = unsafe { operand_imm_unchecked(instr, 0) };
                                 smi_acc_bool = false;
                                 match sa.checked_sub(b) {
-                                    Some(r) => sa = r,
+                                    Some(r) => {
+                                        sa = r;
+                                        hot_acc = Some(NanBoxedValue::from_smi(r));
+                                    }
                                     None => {
                                         acc = JsValue::HeapNumber(sa as f64 - b as f64);
                                         frame.smi_mode = false;
@@ -2988,10 +3138,13 @@ impl Interpreter {
                             }
                             Opcode::Mul => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 smi_acc_bool = false;
                                 match sa.checked_mul(b) {
-                                    Some(r) => sa = r,
+                                    Some(r) => {
+                                        sa = r;
+                                        hot_acc = Some(NanBoxedValue::from_smi(r));
+                                    }
                                     None => {
                                         acc = JsValue::HeapNumber(sa as f64 * b as f64);
                                         frame.smi_mode = false;
@@ -3004,7 +3157,10 @@ impl Interpreter {
                                 let b = unsafe { operand_imm_unchecked(instr, 0) };
                                 smi_acc_bool = false;
                                 match sa.checked_mul(b) {
-                                    Some(r) => sa = r,
+                                    Some(r) => {
+                                        sa = r;
+                                        hot_acc = Some(NanBoxedValue::from_smi(r));
+                                    }
                                     None => {
                                         acc = JsValue::HeapNumber(sa as f64 * b as f64);
                                         frame.smi_mode = false;
@@ -3015,12 +3171,12 @@ impl Interpreter {
                             }
                             Opcode::Div => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 smi_acc_bool = false;
                                 if b != 0 && sa % b == 0 {
                                     sa /= b;
+                                    hot_acc = Some(NanBoxedValue::from_smi(sa));
                                 } else {
-                                    // Non-exact or div-by-zero → float result
                                     acc = JsValue::HeapNumber(sa as f64 / b as f64);
                                     frame.smi_mode = false;
                                     frame.loop_end_pc = 0;
@@ -3029,10 +3185,11 @@ impl Interpreter {
                             }
                             Opcode::Mod => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 smi_acc_bool = false;
                                 if b != 0 {
                                     sa %= b;
+                                    hot_acc = Some(NanBoxedValue::from_smi(sa));
                                 } else {
                                     acc = JsValue::HeapNumber(f64::NAN);
                                     frame.smi_mode = false;
@@ -3045,6 +3202,7 @@ impl Interpreter {
                                 smi_acc_bool = false;
                                 if b != 0 {
                                     sa %= b;
+                                    hot_acc = Some(NanBoxedValue::from_smi(sa));
                                 } else {
                                     acc = JsValue::HeapNumber(f64::NAN);
                                     frame.smi_mode = false;
@@ -3054,61 +3212,72 @@ impl Interpreter {
                             }
                             Opcode::BitwiseOr => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                sa |= unsafe { frame.read_reg_num_unchecked(reg) };
+                                sa |= unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::BitwiseOrSmi => {
                                 sa |= unsafe { operand_imm_unchecked(instr, 0) };
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::BitwiseAnd => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                sa &= unsafe { frame.read_reg_num_unchecked(reg) };
+                                sa &= unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::BitwiseAndSmi => {
                                 sa &= unsafe { operand_imm_unchecked(instr, 0) };
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::BitwiseXor => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                sa ^= unsafe { frame.read_reg_num_unchecked(reg) };
+                                sa ^= unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::BitwiseXorSmi => {
                                 sa ^= unsafe { operand_imm_unchecked(instr, 0) };
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::BitwiseNot => {
                                 sa = !sa;
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::ShiftLeft => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 sa <<= (b as u32) & 0x1f;
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::ShiftLeftSmi => {
                                 let b = unsafe { operand_imm_unchecked(instr, 0) };
                                 sa <<= (b as u32) & 0x1f;
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::ShiftRight => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 sa >>= (b as u32) & 0x1f;
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::ShiftRightSmi => {
                                 let b = unsafe { operand_imm_unchecked(instr, 0) };
                                 sa >>= (b as u32) & 0x1f;
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::ShiftRightLogical | Opcode::ShiftRightLogicalSmi => {
                                 let b = if instr.opcode == Opcode::ShiftRightLogical {
                                     let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                    unsafe { frame.read_reg_num_unchecked(reg) }
+                                    unsafe { frame.read_reg_num_hot_unchecked(reg) }
                                 } else {
                                     unsafe { operand_imm_unchecked(instr, 0) }
                                 };
@@ -3116,6 +3285,7 @@ impl Interpreter {
                                 let r = (sa as u32) >> ((b as u32) & 0x1f);
                                 if r <= i32::MAX as u32 {
                                     sa = r as i32;
+                                    hot_acc = Some(NanBoxedValue::from_smi(sa));
                                 } else {
                                     acc = JsValue::HeapNumber(r as f64);
                                     frame.smi_mode = false;
@@ -3126,7 +3296,10 @@ impl Interpreter {
                             Opcode::Inc => {
                                 smi_acc_bool = false;
                                 match sa.checked_add(1) {
-                                    Some(r) => sa = r,
+                                    Some(r) => {
+                                        sa = r;
+                                        hot_acc = Some(NanBoxedValue::from_smi(r));
+                                    }
                                     None => {
                                         acc = JsValue::HeapNumber(sa as f64 + 1.0);
                                         frame.smi_mode = false;
@@ -3138,7 +3311,10 @@ impl Interpreter {
                             Opcode::Dec => {
                                 smi_acc_bool = false;
                                 match sa.checked_sub(1) {
-                                    Some(r) => sa = r,
+                                    Some(r) => {
+                                        sa = r;
+                                        hot_acc = Some(NanBoxedValue::from_smi(r));
+                                    }
                                     None => {
                                         acc = JsValue::HeapNumber(sa as f64 - 1.0);
                                         frame.smi_mode = false;
@@ -3150,7 +3326,10 @@ impl Interpreter {
                             Opcode::Negate => {
                                 smi_acc_bool = false;
                                 match 0i32.checked_sub(sa) {
-                                    Some(r) => sa = r,
+                                    Some(r) => {
+                                        sa = r;
+                                        hot_acc = Some(NanBoxedValue::from_smi(r));
+                                    }
                                     None => {
                                         acc = JsValue::HeapNumber(-(sa as f64));
                                         frame.smi_mode = false;
@@ -3165,7 +3344,7 @@ impl Interpreter {
                             | Opcode::TestLessThanOrEqual
                             | Opcode::TestGreaterThanOrEqual => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 let cmp = match instr.opcode {
                                     Opcode::TestLessThan => sa < b,
                                     Opcode::TestGreaterThan => sa > b,
@@ -3213,12 +3392,32 @@ impl Interpreter {
                                 // or Boolean===Boolean.  Mixed types → always
                                 // false.
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let rhs = unsafe { frame.read_reg_unchecked(reg) };
-                                let cmp = match (smi_acc_bool, rhs) {
-                                    (false, JsValue::Smi(b)) => sa == *b,
-                                    (true, JsValue::Boolean(b)) => (sa != 0) == *b,
-                                    _ => false,
+                                let idx = frame.reg_flat_index_unchecked(reg);
+                                // Try hot register cache for NanBoxedValue
+                                // comparison without JsValue dispatch.
+                                let cmp = if let Some(ref hr) = frame.hot_registers {
+                                    if let Some(nb) = hr.read_raw(idx) {
+                                        if nb.is_smi() && !smi_acc_bool {
+                                            Some(sa == nb.as_smi())
+                                        } else if nb.is_boolean() && smi_acc_bool {
+                                            Some((sa != 0) == nb.as_boolean())
+                                        } else {
+                                            Some(false)
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
                                 };
+                                let cmp = cmp.unwrap_or_else(|| {
+                                    let rhs = unsafe { frame.read_reg_unchecked(reg) };
+                                    match (smi_acc_bool, rhs) {
+                                        (false, JsValue::Smi(b)) => sa == *b,
+                                        (true, JsValue::Boolean(b)) => (sa != 0) == *b,
+                                        _ => false,
+                                    }
+                                });
                                 if let Some(next) = instructions.get(pc) {
                                     match next.opcode {
                                         Opcode::JumpIfTrue | Opcode::JumpIfToBooleanTrue => {
@@ -3251,7 +3450,7 @@ impl Interpreter {
                             }
                             Opcode::TestNotEqual => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 let cmp = sa != b;
                                 if let Some(next) = instructions.get(pc) {
                                     match next.opcode {
@@ -3350,6 +3549,7 @@ impl Interpreter {
                                 let value = frame.load_global(name.as_ref())?;
                                 if let JsValue::Smi(v) = value {
                                     sa = v;
+                                    hot_acc = Some(NanBoxedValue::from_smi(v));
                                 } else {
                                     acc = value;
                                     frame.smi_mode = false;
@@ -3443,6 +3643,7 @@ impl Interpreter {
                                     match result {
                                         Ok(JsValue::Smi(v)) => {
                                             sa = v;
+                                            hot_acc = Some(NanBoxedValue::from_smi(v));
                                             continue 'smi;
                                         }
                                         Ok(v) => {
@@ -3541,6 +3742,7 @@ impl Interpreter {
                                     match result {
                                         Ok(JsValue::Smi(v)) => {
                                             sa = v;
+                                            hot_acc = Some(NanBoxedValue::from_smi(v));
                                             continue 'smi;
                                         }
                                         Ok(v) => {
@@ -3588,6 +3790,7 @@ impl Interpreter {
                                         let len = items.borrow().len();
                                         if len <= i32::MAX as usize {
                                             sa = len as i32;
+                                            hot_acc = Some(NanBoxedValue::from_smi(sa));
                                             continue 'smi;
                                         }
                                     }
@@ -3607,6 +3810,7 @@ impl Interpreter {
                                             {
                                                 if let JsValue::Smi(v) = val {
                                                     sa = *v;
+                                                    hot_acc = Some(NanBoxedValue::from_smi(*v));
                                                     continue 'smi;
                                                 }
                                                 acc = val.clone();
@@ -3629,6 +3833,7 @@ impl Interpreter {
                                                 {
                                                     if let JsValue::Smi(v) = val {
                                                         sa = *v;
+                                                        hot_acc = Some(NanBoxedValue::from_smi(*v));
                                                         continue 'smi;
                                                     }
                                                     acc = val.clone();
@@ -3684,6 +3889,7 @@ impl Interpreter {
                                     if let Some(val) = borrow.get(sa as usize) {
                                         if let JsValue::Smi(v) = val {
                                             sa = *v;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*v));
                                             continue 'smi;
                                         }
                                         // Boolean element — try to fuse with
@@ -3845,6 +4051,7 @@ impl Interpreter {
                                     if let Some(val) = borrow.slots.get(slot) {
                                         if let JsValue::Smi(v) = val {
                                             sa = *v;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*v));
                                             continue 'smi;
                                         }
                                         // Non-Smi value — exit SMI mode.
@@ -3908,6 +4115,7 @@ impl Interpreter {
                                     if let Some(val) = borrow.slots.get(slot) {
                                         if let JsValue::Smi(v) = val {
                                             sa = *v;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*v));
                                             continue 'smi;
                                         }
                                         acc = val.clone();
