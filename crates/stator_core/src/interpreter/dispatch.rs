@@ -4112,7 +4112,8 @@ fn handle_sta_named_property(
                 }
             }
             set_function_name_if_missing(&val, &prop_name);
-            match map.borrow_mut().try_template_fill(&prop_name, val) {
+            let fill_result = map.borrow_mut().try_template_fill(&prop_name, val);
+            match fill_result {
                 Ok(offset) => {
                     if slot != u32::MAX && offset <= u16::MAX as usize {
                         let receiver_layout = map.borrow().layout_id();
