@@ -20,19 +20,20 @@ use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 use super::{
     ACTIVE_DEBUGGER, CallArgs, GlobalEnv, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD,
     MegamorphicIcEntry, OSR_LOOP_THRESHOLD, ProtoLoadIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq,
-    acquire_frame, bigint_pow, collect_args, concat_rc_strs, constant_pool_jump_delta,
-    constant_to_value, construct_builtin_result, decode_string_constant, dispatch_call_property,
-    dispatch_call_value, dispatch_call_with_this, dispatch_getter, dispatch_setter,
-    err_bad_operand, error_message_from_value, extract_context, fast_array_method_name,
-    fast_array_method_target, find_handler, fn_props_get, fn_props_set, has_prototype_in_chain,
-    is_js_receiver, js_add, js_less_than, keyed_load, keyed_store, make_construct_this,
-    maybe_cache_construct_boilerplate, maybe_compile_baseline, maybe_compile_maglev,
-    maybe_compile_turbofan, normalize_async_iterator, number_to_jsvalue,
+    acquire_frame, bigint_pow, clone_shared_global_env, collect_args, concat_rc_strs,
+    constant_pool_jump_delta, constant_to_value, construct_builtin_result, decode_string_constant,
+    dispatch_call_property, dispatch_call_value, dispatch_call_with_this, dispatch_getter,
+    dispatch_setter, err_bad_operand, error_message_from_value, extract_context,
+    fast_array_method_name, fast_array_method_target, find_handler, fn_props_get, fn_props_set,
+    has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
+    make_construct_this, maybe_cache_construct_boilerplate, maybe_compile_baseline,
+    maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator, number_to_jsvalue,
     plain_object_has_own_property, plain_object_to_array_items, populate_self_name, proto_lookup,
     proto_lookup_cached_resolution, proto_lookup_chain_depth, resolve_construct_proto,
     resolve_jump, restore_closure_context, run_callee_pooled, set_function_name_if_missing,
     set_pending_exception, settle_async_iterator_result, strict_eq, to_array_index, to_bigint,
-    to_property_key, try_execute_best_jit, try_fast_named_property_lookup, walk_context_chain,
+    to_property_key, try_execute_best_jit, try_fast_named_property_lookup,
+    try_inline_small_function, walk_context_chain,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
@@ -2040,7 +2041,7 @@ fn handle_call_undefined_receiver0(
                 ctx.frame.accumulator =
                     Interpreter::run_async_function(Rc::clone(&ba), CallArgs::new())?;
             } else {
-                let args = CallArgs::new();
+                let no_args: &[JsValue] = &[];
                 // ── Tiering (cold path: gated on reaching baseline threshold) ──
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD {
@@ -2053,10 +2054,18 @@ fn handle_call_undefined_receiver0(
                     if count >= TURBOFAN_TIERING_THRESHOLD {
                         maybe_compile_turbofan(&ba);
                     }
-                    if let Some(jit_result) = try_execute_best_jit(&ba, &args) {
+                    if let Some(jit_result) = try_execute_best_jit(&ba, no_args) {
                         ctx.frame.accumulator = jit_result?;
                         return Ok(DispatchAction::Continue);
                     }
+                }
+                if ba.bytecode_count() <= 5
+                    && !ba.has_exception_handler()
+                    && let Some(result) =
+                        try_inline_small_function(ba.as_ref(), no_args, &ctx.frame.global_env)
+                {
+                    ctx.frame.accumulator = result;
+                    return Ok(DispatchAction::Continue);
                 }
                 // Arrow functions use lexical `this` — skip override.
                 // Strict mode: `this` is undefined for free function calls.
@@ -2070,8 +2079,19 @@ fn handle_call_undefined_receiver0(
                 } else {
                     None
                 };
-                let mut callee_frame =
-                    acquire_frame(Rc::clone(&ba), args, Rc::clone(&ctx.frame.global_env));
+                let mut callee_frame = if ba.parameter_count() == 0 {
+                    acquire_frame(
+                        Rc::clone(&ba),
+                        std::iter::empty(),
+                        clone_shared_global_env(&ctx.frame.global_env),
+                    )
+                } else {
+                    acquire_frame(
+                        Rc::clone(&ba),
+                        CallArgs::new(),
+                        clone_shared_global_env(&ctx.frame.global_env),
+                    )
+                };
                 restore_closure_context(&mut callee_frame, &ba);
                 if ba.is_arrow() && ba.has_fn_props() {
                     callee_frame.new_target = fn_props_get(&ba, ".new_target");
@@ -2155,7 +2175,7 @@ fn handle_call_undefined_receiver1(
                 ctx.frame.accumulator = Interpreter::run_async_function(Rc::clone(&ba), args)?;
             } else {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
-                let args: CallArgs = smallvec![arg1];
+                let inline_args = [arg1.clone()];
                 // ── Tiering (cold path: gated on reaching baseline threshold) ──
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD {
@@ -2168,10 +2188,18 @@ fn handle_call_undefined_receiver1(
                     if count >= TURBOFAN_TIERING_THRESHOLD {
                         maybe_compile_turbofan(&ba);
                     }
-                    if let Some(jit_result) = try_execute_best_jit(&ba, &args) {
+                    if let Some(jit_result) = try_execute_best_jit(&ba, &inline_args) {
                         ctx.frame.accumulator = jit_result?;
                         return Ok(DispatchAction::Continue);
                     }
+                }
+                if ba.bytecode_count() <= 5
+                    && !ba.has_exception_handler()
+                    && let Some(result) =
+                        try_inline_small_function(ba.as_ref(), &inline_args, &ctx.frame.global_env)
+                {
+                    ctx.frame.accumulator = result;
+                    return Ok(DispatchAction::Continue);
                 }
                 // Arrow functions use lexical `this` — skip override.
                 let saved_this = if !ba.is_arrow() && ba.is_strict() {
@@ -2184,8 +2212,12 @@ fn handle_call_undefined_receiver1(
                 } else {
                     None
                 };
-                let mut callee_frame =
-                    acquire_frame(Rc::clone(&ba), args, Rc::clone(&ctx.frame.global_env));
+                let args: CallArgs = smallvec![arg1];
+                let mut callee_frame = acquire_frame(
+                    Rc::clone(&ba),
+                    args,
+                    clone_shared_global_env(&ctx.frame.global_env),
+                );
                 restore_closure_context(&mut callee_frame, &ba);
                 if ba.is_arrow() && ba.has_fn_props() {
                     callee_frame.new_target = fn_props_get(&ba, ".new_target");

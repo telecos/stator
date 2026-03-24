@@ -820,6 +820,21 @@ impl BytecodeArray {
         self.parameter_count
     }
 
+    /// Number of decoded bytecode instructions after peephole fusion.
+    ///
+    /// Returns [`usize::MAX`] for malformed bytecode so hot-path callers can
+    /// conservatively skip optimizations that depend on a valid instruction
+    /// count.
+    pub fn bytecode_count(&self) -> usize {
+        self.ensure_decoded_instructions()
+            .map_or(usize::MAX, |decoded| decoded.0.len())
+    }
+
+    /// Returns `true` when this function has at least one exception handler.
+    pub fn has_exception_handler(&self) -> bool {
+        !self.handler_table.is_empty()
+    }
+
     /// `Function.prototype.length` for this function.
     pub fn function_length(&self) -> u32 {
         self.function_length
