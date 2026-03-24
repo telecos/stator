@@ -2864,6 +2864,7 @@ impl Interpreter {
                     // correct JsValue type when spilling to registers
                     // or arrays.
                     let mut smi_acc_bool = false;
+                    let mut smi_acc_spilled = false;
                     // Helper: materialize the accumulator as the correct
                     // JsValue type (Boolean when smi_acc_bool, Smi otherwise).
                     macro_rules! smi_to_val {
@@ -2875,42 +2876,87 @@ impl Interpreter {
                             }
                         };
                     }
+                    macro_rules! materialize_acc {
+                        () => {
+                            if smi_acc_spilled {
+                                acc.cheap_clone()
+                            } else {
+                                smi_to_val!()
+                            }
+                        };
+                    }
                     'smi: loop {
                         if pc >= frame.loop_end_pc {
                             frame.loop_end_pc = 0;
-                            acc = smi_to_val!();
+                            acc = materialize_acc!();
                             frame.smi_mode = false;
                             break 'smi;
                         }
                         let instr = unsafe { instructions.get_unchecked(pc) };
                         pc += 1;
 
+                        if smi_acc_spilled
+                            && !matches!(
+                                instr.opcode,
+                                Opcode::LdaSmi
+                                    | Opcode::LdaZero
+                                    | Opcode::LdaTrue
+                                    | Opcode::LdaFalse
+                                    | Opcode::Star
+                                    | Opcode::Ldar
+                                    | Opcode::Mov
+                                    | Opcode::StaGlobal
+                                    | Opcode::StaKeyedProperty
+                                    | Opcode::StaNamedProperty
+                                    | Opcode::StaContextSlot
+                                    | Opcode::StaCurrentContextSlot
+                                    | Opcode::CreateEmptyArrayLiteral
+                                    | Opcode::CreateArrayLiteral
+                                    | Opcode::TypeOf
+                                    | Opcode::CallUndefinedReceiver0
+                                    | Opcode::CallUndefinedReceiver1
+                                    | Opcode::CallUndefinedReceiver2
+                                    | Opcode::Nop
+                            )
+                        {
+                            acc = materialize_acc!();
+                            frame.smi_mode = false;
+                            frame.loop_end_pc = 0;
+                            pc -= 1;
+                            break 'smi;
+                        }
+
                         match instr.opcode {
                             Opcode::LdaSmi => {
                                 sa = unsafe { operand_imm_unchecked(instr, 0) };
                                 smi_acc_bool = false;
+                                smi_acc_spilled = false;
                             }
                             Opcode::LdaSmiStar => {
                                 sa = unsafe { operand_imm_unchecked(instr, 0) };
                                 smi_acc_bool = false;
+                                smi_acc_spilled = false;
                                 let reg = unsafe { operand_reg_unchecked(instr, 1) };
                                 unsafe { frame.write_reg_unchecked(reg, JsValue::Smi(sa)) };
                             }
                             Opcode::LdaZero => {
                                 sa = 0;
                                 smi_acc_bool = false;
+                                smi_acc_spilled = false;
                             }
                             Opcode::LdaTrue => {
                                 sa = 1;
                                 smi_acc_bool = true;
+                                smi_acc_spilled = false;
                             }
                             Opcode::LdaFalse => {
                                 sa = 0;
                                 smi_acc_bool = true;
+                                smi_acc_spilled = false;
                             }
                             Opcode::Star => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let val = smi_to_val!();
+                                let val = materialize_acc!();
                                 unsafe { frame.write_reg_unchecked(reg, val) };
                             }
                             Opcode::Ldar => {
@@ -2922,9 +2968,11 @@ impl Interpreter {
                                 if let JsValue::Smi(v) = val {
                                     sa = *v;
                                     smi_acc_bool = false;
+                                    smi_acc_spilled = false;
                                 } else if let JsValue::Boolean(b) = val {
                                     sa = *b as i32;
                                     smi_acc_bool = true;
+                                    smi_acc_spilled = false;
                                 } else {
                                     acc = val.cheap_clone();
                                     frame.smi_mode = false;
@@ -3455,12 +3503,11 @@ impl Interpreter {
                             Opcode::StaGlobal => {
                                 let name_idx =
                                     unsafe { operand_constant_pool_idx_unchecked(instr, 0) };
-                                acc = smi_to_val!();
+                                acc = materialize_acc!();
                                 frame.pc = pc;
                                 frame.accumulator = acc.cheap_clone();
                                 let name = frame.get_string_constant(name_idx)?;
-                                let val = smi_to_val!();
-                                frame.store_global(name_idx, &name, val);
+                                frame.store_global(name_idx, &name, acc.cheap_clone());
                             }
                             Opcode::CallUndefinedReceiver0 => {
                                 // Handle function calls inside SMI-mode loops
@@ -3538,6 +3585,8 @@ impl Interpreter {
                                     match result {
                                         Ok(JsValue::Smi(v)) => {
                                             sa = v;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
                                             continue 'smi;
                                         }
                                         Ok(v) => {
@@ -3547,7 +3596,7 @@ impl Interpreter {
                                             break 'smi;
                                         }
                                         Err(e) => {
-                                            acc = smi_to_val!();
+                                            acc = materialize_acc!();
                                             frame.pc = pc;
                                             frame.accumulator = acc.cheap_clone();
                                             return Err(e);
@@ -3555,7 +3604,7 @@ impl Interpreter {
                                     }
                                 }
                                 // Non-function callee — exit SMI mode.
-                                acc = smi_to_val!();
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -3636,6 +3685,8 @@ impl Interpreter {
                                     match result {
                                         Ok(JsValue::Smi(v)) => {
                                             sa = v;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
                                             continue 'smi;
                                         }
                                         Ok(v) => {
@@ -3645,7 +3696,7 @@ impl Interpreter {
                                             break 'smi;
                                         }
                                         Err(e) => {
-                                            acc = smi_to_val!();
+                                            acc = materialize_acc!();
                                             frame.pc = pc;
                                             frame.accumulator = acc.cheap_clone();
                                             return Err(e);
@@ -3653,7 +3704,104 @@ impl Interpreter {
                                     }
                                 }
                                 // Non-function callee — exit SMI mode.
-                                acc = smi_to_val!();
+                                acc = materialize_acc!();
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                pc -= 1;
+                                break 'smi;
+                            }
+                            Opcode::CallUndefinedReceiver2 => {
+                                let callee_reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                let arg1_reg = unsafe { operand_reg_unchecked(instr, 1) };
+                                let arg2_reg = unsafe { operand_reg_unchecked(instr, 2) };
+                                let callee = unsafe { frame.read_reg_unchecked(callee_reg) };
+                                if let JsValue::Function(ba) = callee
+                                    && !ba.is_generator()
+                                    && !ba.is_async()
+                                {
+                                    let is_arrow = ba.is_arrow();
+                                    let is_strict = ba.is_strict();
+                                    let has_self_name = ba.self_name_register().is_some();
+                                    let has_fn_props = is_arrow && ba.has_fn_props();
+                                    let closure_ctx = ba.closure_context().map(Rc::clone);
+                                    let ba = Rc::clone(ba);
+                                    let arg1 =
+                                        unsafe { frame.read_reg_unchecked(arg1_reg) }.cheap_clone();
+                                    let arg2 =
+                                        unsafe { frame.read_reg_unchecked(arg2_reg) }.cheap_clone();
+                                    frame.pc = pc;
+                                    let args: CallArgs = smallvec::smallvec![arg1, arg2];
+                                    let saved_this = if !is_arrow && is_strict {
+                                        let old = frame.global_env.borrow().get_this().cloned();
+                                        frame.global_env.borrow_mut().set_this(JsValue::Undefined);
+                                        old
+                                    } else {
+                                        None
+                                    };
+                                    let mut callee_frame =
+                                        acquire_frame(ba, args, Rc::clone(&frame.global_env));
+                                    if let Some(ctx) = closure_ctx {
+                                        callee_frame.context = Some(JsValue::Context(ctx));
+                                    }
+                                    if has_fn_props {
+                                        callee_frame.new_target = fn_props_get(
+                                            &callee_frame.bytecode_array,
+                                            ".new_target",
+                                        );
+                                    }
+                                    if has_self_name {
+                                        let ba_rc = Rc::clone(&callee_frame.bytecode_array);
+                                        let ba_val = JsValue::Function(Rc::clone(&ba_rc));
+                                        populate_self_name(&mut callee_frame, &ba_rc, &ba_val);
+                                    }
+                                    let gen_before = frame.cache_generation;
+                                    let result = with_anon_call_frame(|depth| {
+                                        if depth < 64 {
+                                            Interpreter::run_same_env(&mut callee_frame)
+                                        } else {
+                                            stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+                                                Interpreter::run_same_env(&mut callee_frame)
+                                            })
+                                        }
+                                    });
+                                    release_frame(callee_frame);
+                                    if (frame.global_cache.is_some() || frame.global_ic.is_some())
+                                        && gen_before != frame.global_env.borrow().generation()
+                                    {
+                                        frame.global_cache_invalidate();
+                                    }
+                                    if !is_arrow && is_strict {
+                                        match saved_this {
+                                            Some(v) => {
+                                                frame.global_env.borrow_mut().set_this(v);
+                                            }
+                                            None => {
+                                                frame.global_env.borrow_mut().remove_this();
+                                            }
+                                        }
+                                    }
+                                    match result {
+                                        Ok(JsValue::Smi(v)) => {
+                                            sa = v;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            continue 'smi;
+                                        }
+                                        Ok(v) => {
+                                            acc = v;
+                                            frame.smi_mode = false;
+                                            frame.loop_end_pc = 0;
+                                            break 'smi;
+                                        }
+                                        Err(e) => {
+                                            acc = materialize_acc!();
+                                            frame.pc = pc;
+                                            frame.accumulator = acc.cheap_clone();
+                                            return Err(e);
+                                        }
+                                    }
+                                }
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -3760,7 +3908,7 @@ impl Interpreter {
                                     }
                                 }
                                 // IC miss or non-PlainObject — exit SMI mode.
-                                acc = smi_to_val!();
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -3774,75 +3922,24 @@ impl Interpreter {
                                 if sa >= 0
                                     && let JsValue::Array(items) = obj
                                 {
-                                    let items_rc = Rc::clone(items);
-                                    let borrow = items_rc.borrow();
-                                    if let Some(val) = borrow.get(sa as usize) {
-                                        if let JsValue::Smi(v) = val {
-                                            sa = *v;
-                                            continue 'smi;
-                                        }
-                                        // Boolean element — try to fuse with
-                                        // JumpIfToBooleanFalse/True to stay
-                                        // in SMI mode (sieve pattern).
-                                        if let JsValue::Boolean(b) = val {
-                                            let bv = *b;
-                                            drop(borrow);
-                                            if let Some(next) = instructions.get(pc) {
-                                                match next.opcode {
-                                                    Opcode::JumpIfToBooleanFalse
-                                                    | Opcode::JumpIfFalse => {
-                                                        if !bv {
-                                                            pc = unsafe {
-                                                                resolve_jump_unchecked(
-                                                                    pc + 1,
-                                                                    jump_targets,
-                                                                )
-                                                            };
-                                                        } else {
-                                                            pc += 1;
-                                                        }
-                                                        continue 'smi;
-                                                    }
-                                                    Opcode::JumpIfToBooleanTrue
-                                                    | Opcode::JumpIfTrue => {
-                                                        if bv {
-                                                            pc = unsafe {
-                                                                resolve_jump_unchecked(
-                                                                    pc + 1,
-                                                                    jump_targets,
-                                                                )
-                                                            };
-                                                        } else {
-                                                            pc += 1;
-                                                        }
-                                                        continue 'smi;
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                            // No fusion — exit with boolean.
-                                            acc = JsValue::Boolean(bv);
-                                            frame.smi_mode = false;
-                                            frame.loop_end_pc = 0;
-                                            break 'smi;
-                                        }
-                                        // Non-Smi, non-Boolean element —
-                                        // exit SMI mode with the loaded value.
-                                        acc = val.clone();
-                                        drop(borrow);
-                                        frame.smi_mode = false;
-                                        frame.loop_end_pc = 0;
-                                        break 'smi;
-                                    }
+                                    let borrow = items.borrow();
+                                    let result = borrow
+                                        .get(sa as usize)
+                                        .cloned()
+                                        .unwrap_or(JsValue::Undefined);
                                     drop(borrow);
-                                    // Out-of-bounds → Undefined
-                                    acc = JsValue::Undefined;
-                                    frame.smi_mode = false;
-                                    frame.loop_end_pc = 0;
-                                    break 'smi;
+                                    if let JsValue::Smi(v) = result {
+                                        sa = v;
+                                        smi_acc_bool = false;
+                                        smi_acc_spilled = false;
+                                    } else {
+                                        acc = result;
+                                        smi_acc_spilled = true;
+                                    }
+                                    continue 'smi;
                                 }
                                 // Non-Array or negative index — fall through
-                                acc = smi_to_val!();
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -3865,12 +3962,12 @@ impl Interpreter {
                                         if i >= v.len() {
                                             v.resize(i + 1, JsValue::TheHole);
                                         }
-                                        v[i] = smi_to_val!();
+                                        v[i] = materialize_acc!();
                                         continue 'smi;
                                     }
                                 }
                                 // Fall through
-                                acc = smi_to_val!();
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -3897,15 +3994,17 @@ impl Interpreter {
                                         .as_ref()
                                         .and_then(|cache| cache.probe(slot, layout))
                                         && !ic.is_proto
-                                        && pm
-                                            .set_by_offset(ic.cached_offset as usize, smi_to_val!())
+                                        && pm.set_by_offset(
+                                            ic.cached_offset as usize,
+                                            materialize_acc!(),
+                                        )
                                     {
                                         continue 'smi;
                                     }
                                 }
                                 // IC miss — exit SMI mode and let normal
                                 // dispatch handle the store.
-                                acc = smi_to_val!();
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -3950,7 +4049,7 @@ impl Interpreter {
                                     }
                                 }
                                 // No context or missing slot — fall through.
-                                acc = smi_to_val!();
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -3982,12 +4081,12 @@ impl Interpreter {
                                     }
                                     let mut borrow = current.borrow_mut();
                                     if slot < borrow.slots.len() {
-                                        borrow.slots[slot] = smi_to_val!();
+                                        borrow.slots[slot] = materialize_acc!();
                                         continue 'smi;
                                     }
                                 }
                                 // No context or slot out of range — fall through.
-                                acc = smi_to_val!();
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -4011,7 +4110,7 @@ impl Interpreter {
                                         break 'smi;
                                     }
                                 }
-                                acc = smi_to_val!();
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -4025,17 +4124,80 @@ impl Interpreter {
                                             as usize;
                                     let mut borrow = ctx_rc.borrow_mut();
                                     if slot < borrow.slots.len() {
-                                        borrow.slots[slot] = smi_to_val!();
+                                        borrow.slots[slot] = materialize_acc!();
                                         continue 'smi;
                                     }
                                 }
-                                acc = smi_to_val!();
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
                                 break 'smi;
                             }
                             Opcode::Nop => {}
+                            Opcode::CreateEmptyArrayLiteral => {
+                                acc = JsValue::Array(Rc::new(RefCell::new(Vec::new())));
+                                smi_acc_spilled = true;
+                                continue 'smi;
+                            }
+                            Opcode::CreateArrayLiteral => {
+                                let capacity = match instr.operands.get(2) {
+                                    Some(Operand::Flag(hint)) => usize::from(*hint),
+                                    _ => 0,
+                                };
+                                acc = JsValue::Array(Rc::new(RefCell::new(Vec::with_capacity(
+                                    capacity,
+                                ))));
+                                smi_acc_spilled = true;
+                                continue 'smi;
+                            }
+                            Opcode::TypeOf => {
+                                let type_str = if smi_acc_spilled {
+                                    match &acc {
+                                        JsValue::Undefined | JsValue::TheHole => "undefined",
+                                        JsValue::Null => "object",
+                                        JsValue::Boolean(_) => "boolean",
+                                        JsValue::Smi(_) | JsValue::HeapNumber(_) => "number",
+                                        JsValue::String(_) => "string",
+                                        JsValue::Symbol(_) => "symbol",
+                                        JsValue::BigInt(_) => "bigint",
+                                        JsValue::Function(_) | JsValue::NativeFunction(_) => {
+                                            "function"
+                                        }
+                                        JsValue::Object(_)
+                                        | JsValue::Array(_)
+                                        | JsValue::Error(_)
+                                        | JsValue::Generator(_)
+                                        | JsValue::Iterator(_)
+                                        | JsValue::Promise(_)
+                                        | JsValue::Context(_)
+                                        | JsValue::ArrayBuffer(_)
+                                        | JsValue::TypedArray(_)
+                                        | JsValue::DataView(_) => "object",
+                                        JsValue::PlainObject(map) => {
+                                            if map.borrow().get("__call__").is_some() {
+                                                "function"
+                                            } else {
+                                                "object"
+                                            }
+                                        }
+                                        JsValue::Proxy(proxy) => {
+                                            if proxy.borrow().is_callable() {
+                                                "function"
+                                            } else {
+                                                "object"
+                                            }
+                                        }
+                                    }
+                                } else if smi_acc_bool {
+                                    "boolean"
+                                } else {
+                                    "number"
+                                };
+                                acc = JsValue::String(type_str.to_owned().into());
+                                smi_acc_spilled = true;
+                                continue 'smi;
+                            }
                             Opcode::LdaUndefined => {
                                 acc = JsValue::Undefined;
                                 frame.smi_mode = false;
@@ -4051,7 +4213,7 @@ impl Interpreter {
                             _ => {
                                 // Unsupported opcode — exit SMI loop and let
                                 // the regular dispatch handle it.
-                                acc = smi_to_val!();
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1; // re-process this instruction
@@ -11682,6 +11844,131 @@ mod tests {
         // smi_mode is cleared when the SMI loop hits an unsupported
         // opcode (Return) — checking the result is sufficient.
         let _ = frame;
+    }
+
+    fn run_forced_smi_loop_bytecode(
+        instrs: Vec<Instruction>,
+        frame_size: u32,
+        registers: &[(u32, JsValue)],
+    ) -> StatorResult<JsValue> {
+        let loop_end_pc = instrs.len().saturating_sub(1);
+        let ba = make_bytecode(instrs, frame_size, 0);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
+        for (reg, value) in registers {
+            unsafe { frame.write_reg_unchecked(*reg, value.clone()) };
+        }
+        frame.smi_mode = true;
+        frame.loop_end_pc = loop_end_pc;
+        frame.accumulator = JsValue::Smi(0);
+        frame.hot_registers = Some(HotRegisters::new(frame.registers.len()));
+        Interpreter::run(&mut frame)
+    }
+
+    #[test]
+    fn test_smi_mode_call_undefined_receiver2_reenters_on_smi_result() {
+        let add = Rc::new(make_add_bytecode());
+        let instrs = vec![
+            Instruction::new_unchecked(
+                Opcode::CallUndefinedReceiver2,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                    Operand::FeedbackSlot(0),
+                ],
+            ),
+            Instruction::new_unchecked(
+                Opcode::AddSmi,
+                vec![Operand::Immediate(1), Operand::FeedbackSlot(1)],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let result = run_forced_smi_loop_bytecode(
+            instrs,
+            3,
+            &[
+                (0, JsValue::Function(add)),
+                (1, JsValue::Smi(3)),
+                (2, JsValue::Smi(4)),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(result, JsValue::Smi(8));
+    }
+
+    #[test]
+    fn test_smi_mode_lda_keyed_property_array_smi_stays_in_loop() {
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            Instruction::new_unchecked(
+                Opcode::LdaKeyedProperty,
+                vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(
+                Opcode::AddSmi,
+                vec![Operand::Immediate(1), Operand::FeedbackSlot(1)],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let result = run_forced_smi_loop_bytecode(
+            instrs,
+            1,
+            &[(
+                0,
+                JsValue::Array(Rc::new(RefCell::new(vec![
+                    JsValue::Smi(10),
+                    JsValue::Smi(20),
+                ]))),
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(result, JsValue::Smi(21));
+    }
+
+    #[test]
+    fn test_smi_mode_create_empty_array_keyed_load_and_typeof() {
+        let instrs = vec![
+            Instruction::new_unchecked(
+                Opcode::CreateEmptyArrayLiteral,
+                vec![Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(0)]),
+            Instruction::new_unchecked(
+                Opcode::LdaKeyedProperty,
+                vec![Operand::Register(0), Operand::FeedbackSlot(1)],
+            ),
+            Instruction::new_unchecked(Opcode::TypeOf, vec![Operand::FeedbackSlot(2)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let result = run_forced_smi_loop_bytecode(instrs, 1, &[]).unwrap();
+
+        assert_eq!(result, JsValue::String("undefined".to_owned().into()));
+    }
+
+    #[test]
+    fn test_smi_mode_create_array_literal_and_typeof() {
+        let instrs = vec![
+            Instruction::new_unchecked(
+                Opcode::CreateArrayLiteral,
+                vec![
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(0),
+                    Operand::Flag(4),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::TypeOf, vec![Operand::FeedbackSlot(1)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let result = run_forced_smi_loop_bytecode(instrs, 0, &[]).unwrap();
+
+        assert_eq!(result, JsValue::String("object".to_owned().into()));
     }
 
     fn run_smi_compare_branch(
