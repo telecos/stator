@@ -928,44 +928,20 @@ impl BytecodeArray {
             let (mut instructions, mut byte_offsets) =
                 bytecodes::decode_with_byte_offsets(&self.bytecodes)?;
 
-            // Snapshot the pre-peephole byte offsets so we can remap handler
-            // table entries (which use pre-peephole instruction indices) to
-            // post-peephole instruction indices.
-            let pre_byte_offsets = byte_offsets.clone();
+            let remap = peephole::fuse_instructions_with_remap(
+                &mut instructions,
+                &mut byte_offsets,
+                Some(self.constant_pool()),
+            );
 
-            peephole::fuse_instructions(&mut instructions, &mut byte_offsets);
-
-            // Build a lookup from byte offset → post-peephole instruction
-            // index.  The post-peephole `byte_offsets` (excluding its trailing
-            // sentinel) maps new-index → byte-offset.  Invert that to get
-            // byte-offset → new-index.
-            let remap: std::collections::HashMap<usize, usize> = byte_offsets
-                .iter()
-                .enumerate()
-                .filter(|&(i, _)| i < instructions.len())
-                .map(|(new_idx, &byte_off)| (byte_off, new_idx))
-                .collect();
-
-            // Helper: look up the byte offset for a pre-peephole instruction
-            // index, then find the closest post-peephole instruction index.
-            // Falls back gracefully when the index is out of range (e.g. in
-            // snapshot round-trip tests with synthetic bytecode).
+            // Helper: map a pre-peephole instruction index to the first
+            // surviving post-peephole instruction at or after that position.
             let remap_index = |idx: u32, fallback: usize| -> u32 {
-                let Some(&byte_off) = pre_byte_offsets.get(idx as usize) else {
-                    return fallback as u32;
-                };
-                if let Some(&new_idx) = remap.get(&byte_off) {
-                    return new_idx as u32;
-                }
-                // Exact byte offset was removed by peephole — find the nearest
-                // post-peephole instruction at or after this byte offset.
-                let mut best = fallback;
-                for (&bo, &ni) in &remap {
-                    if bo >= byte_off && ni < best {
-                        best = ni;
-                    }
-                }
-                best as u32
+                remap
+                    .iter()
+                    .skip(idx as usize)
+                    .find_map(|mapped| *mapped)
+                    .unwrap_or(fallback) as u32
             };
 
             // Remap the handler table entries from pre-peephole instruction

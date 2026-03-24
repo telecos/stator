@@ -4,22 +4,54 @@
 // `fuse_instructions`).  Allow the helper functions to remain for future use.
 #![allow(dead_code)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
+use crate::bytecode::{
+    bytecode_array::ConstantPoolEntry,
+    bytecodes::{Instruction, Opcode, Operand, decode_with_byte_offsets, encode},
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LoopInfo {
+    header: usize,
+    back_edge: usize,
+}
+
+#[derive(Clone, Debug)]
+struct HoistCandidate {
+    load_idx: usize,
+    star_idx: usize,
+    hoisted_load: Instruction,
+    hoisted_star: Instruction,
+    replacement: Instruction,
+}
 
 /// Scan decoded instruction stream and fuse recognized patterns.
 pub fn fuse_instructions(instructions: &mut Vec<Instruction>, byte_offsets: &mut Vec<usize>) {
+    let _ = fuse_instructions_with_remap(instructions, byte_offsets, None);
+}
+
+pub(crate) fn fuse_instructions_with_remap(
+    instructions: &mut Vec<Instruction>,
+    byte_offsets: &mut Vec<usize>,
+    constant_pool: Option<&[ConstantPoolEntry]>,
+) -> Vec<Option<usize>> {
     if instructions.is_empty() || byte_offsets.len() != instructions.len() + 1 {
-        return;
+        return Vec::new();
     }
+
+    let original_len = instructions.len();
+    let mut origins = (0..original_len).map(Some).collect::<Vec<_>>();
 
     // Dead-store elimination and constant folding are disabled until the
     // remaining correctness issues are resolved (423 test failures from
     // incorrect store elimination across exception-throwing paths).
     // optimize_bytecode(instructions, byte_offsets);
-    eliminate_redundant_moves(instructions, byte_offsets);
-    fuse_superinstructions(instructions, byte_offsets);
+    hoist_loop_invariants(instructions, byte_offsets, &mut origins, constant_pool);
+    eliminate_redundant_moves_with_origins(instructions, byte_offsets, &mut origins);
+    fuse_superinstructions_with_origins(instructions, byte_offsets, &mut origins);
+
+    build_old_to_new_map(&origins, original_len)
 }
 
 /// Eliminate provably redundant register-to-accumulator moves.
@@ -43,6 +75,15 @@ pub fn fuse_instructions(instructions: &mut Vec<Instruction>, byte_offsets: &mut
 ///
 /// Eliminated instructions are replaced with `Nop` and then compacted out.
 fn eliminate_redundant_moves(instructions: &mut Vec<Instruction>, byte_offsets: &mut Vec<usize>) {
+    let mut origins = (0..instructions.len()).map(Some).collect::<Vec<_>>();
+    eliminate_redundant_moves_with_origins(instructions, byte_offsets, &mut origins);
+}
+
+fn eliminate_redundant_moves_with_origins(
+    instructions: &mut Vec<Instruction>,
+    byte_offsets: &mut Vec<usize>,
+    origins: &mut Vec<Option<usize>>,
+) {
     if instructions.len() < 2 || byte_offsets.len() != instructions.len() + 1 {
         return;
     }
@@ -107,7 +148,7 @@ fn eliminate_redundant_moves(instructions: &mut Vec<Instruction>, byte_offsets: 
     }
 
     if changed {
-        compact_nops(instructions, byte_offsets);
+        compact_nops_with_origins(instructions, byte_offsets, origins);
     }
 }
 
@@ -262,25 +303,46 @@ fn apply_local_optimizations(
 }
 
 fn compact_nops(instructions: &mut Vec<Instruction>, byte_offsets: &mut Vec<usize>) {
+    let mut origins = (0..instructions.len()).map(Some).collect::<Vec<_>>();
+    compact_nops_with_origins(instructions, byte_offsets, &mut origins);
+}
+
+fn compact_nops_with_origins(
+    instructions: &mut Vec<Instruction>,
+    byte_offsets: &mut Vec<usize>,
+    origins: &mut Vec<Option<usize>>,
+) {
     let sentinel = match byte_offsets.last().copied() {
         Some(sentinel) => sentinel,
         None => return,
     };
     let mut compacted_instructions = Vec::with_capacity(instructions.len());
     let mut compacted_offsets = Vec::with_capacity(byte_offsets.len());
+    let mut compacted_origins = Vec::with_capacity(origins.len());
     for (index, instruction) in instructions.iter().enumerate() {
         if instruction.opcode == Opcode::Nop {
             continue;
         }
         compacted_offsets.push(byte_offsets[index]);
         compacted_instructions.push(instruction.clone());
+        compacted_origins.push(origins[index]);
     }
     compacted_offsets.push(sentinel);
     *instructions = compacted_instructions;
     *byte_offsets = compacted_offsets;
+    *origins = compacted_origins;
 }
 
 fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mut Vec<usize>) {
+    let mut origins = (0..instructions.len()).map(Some).collect::<Vec<_>>();
+    fuse_superinstructions_with_origins(instructions, byte_offsets, &mut origins);
+}
+
+fn fuse_superinstructions_with_origins(
+    instructions: &mut Vec<Instruction>,
+    byte_offsets: &mut Vec<usize>,
+    origins: &mut Vec<Option<usize>>,
+) {
     if instructions.len() < 2 || byte_offsets.len() != instructions.len() + 1 {
         return;
     }
@@ -293,6 +355,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
 
     let mut fused_instructions = Vec::with_capacity(instructions.len());
     let mut fused_offsets = Vec::with_capacity(byte_offsets.len());
+    let mut fused_origins = Vec::with_capacity(origins.len());
     let mut index = 0usize;
 
     while index < instructions.len() {
@@ -318,6 +381,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         third.operands[0],
                     ) {
                         fused_offsets.push(byte_offsets[index]);
+                        fused_origins.push(origins[index]);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::LdarAddStar,
                             vec![
@@ -344,6 +408,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         third.operands[0],
                     ) {
                         fused_offsets.push(byte_offsets[index]);
+                        fused_origins.push(origins[index]);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::LdarSubStar,
                             vec![
@@ -370,6 +435,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         third.operands[0],
                     ) {
                         fused_offsets.push(byte_offsets[index]);
+                        fused_origins.push(origins[index]);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::LdarMulStar,
                             vec![
@@ -401,6 +467,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
+                        fused_origins.push(origins[index]);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::TestLessThanJump,
                             vec![
@@ -423,6 +490,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
+                        fused_origins.push(origins[index]);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::TestGreaterThanJump,
                             vec![
@@ -445,6 +513,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
+                        fused_origins.push(origins[index]);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::TestEqualJump,
                             vec![
@@ -467,6 +536,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
+                        fused_origins.push(origins[index]);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::TestNotEqualJump,
                             vec![
@@ -489,6 +559,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
+                        fused_origins.push(origins[index]);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::TestEqualStrictJump,
                             vec![
@@ -511,6 +582,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
+                        fused_origins.push(origins[index]);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::TestLessThanOrEqualJump,
                             vec![
@@ -533,6 +605,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
+                        fused_origins.push(origins[index]);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::TestGreaterThanOrEqualJump,
                             vec![
@@ -554,6 +627,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                     ) = (first.operands[0], first.operands[1], second.operands[0])
                     {
                         fused_offsets.push(byte_offsets[index]);
+                        fused_origins.push(origins[index]);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::AddSmiStar,
                             vec![
@@ -574,6 +648,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                     ) = (first.operands[0], first.operands[1], second.operands[0])
                     {
                         fused_offsets.push(byte_offsets[index]);
+                        fused_origins.push(origins[index]);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::SubSmiStar,
                             vec![
@@ -594,6 +669,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                     ) = (first.operands[0], first.operands[1], second.operands[0])
                     {
                         fused_offsets.push(byte_offsets[index]);
+                        fused_origins.push(origins[index]);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::MulSmiStar,
                             vec![
@@ -611,6 +687,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         (first.operands[0], second.operands[0])
                     {
                         fused_offsets.push(byte_offsets[index]);
+                        fused_origins.push(origins[index]);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::IncStar,
                             vec![Operand::FeedbackSlot(slot), Operand::Register(dst)],
@@ -624,6 +701,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         (first.operands[0], second.operands[0])
                     {
                         fused_offsets.push(byte_offsets[index]);
+                        fused_origins.push(origins[index]);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::LdaSmiStar,
                             vec![Operand::Immediate(imm), Operand::Register(dst)],
@@ -640,6 +718,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                     ) = (first.operands[0], first.operands[1], second.operands[0])
                     {
                         fused_offsets.push(byte_offsets[index]);
+                        fused_origins.push(origins[index]);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::LdaGlobalStar,
                             vec![
@@ -658,12 +737,486 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
 
         fused_offsets.push(byte_offsets[index]);
         fused_instructions.push(instructions[index].clone());
+        fused_origins.push(origins[index]);
         index += 1;
     }
 
     fused_offsets.push(sentinel);
     *instructions = fused_instructions;
     *byte_offsets = fused_offsets;
+    *origins = fused_origins;
+}
+
+fn hoist_loop_invariants(
+    instructions: &mut Vec<Instruction>,
+    byte_offsets: &mut Vec<usize>,
+    origins: &mut Vec<Option<usize>>,
+    constant_pool: Option<&[ConstantPoolEntry]>,
+) {
+    if instructions.is_empty()
+        || byte_offsets.len() != instructions.len() + 1
+        || contains_constant_pool_jump(instructions)
+    {
+        return;
+    }
+
+    loop {
+        let mut loops = find_loops(instructions, byte_offsets);
+        loops.sort_by_key(|loop_info| (loop_info.header, loop_info.back_edge));
+
+        let mut changed = false;
+        for loop_info in loops.into_iter().rev() {
+            if loop_info.back_edge >= instructions.len() || loop_info.header >= loop_info.back_edge
+            {
+                continue;
+            }
+
+            let candidates =
+                find_hoist_candidates(instructions, byte_offsets, loop_info, constant_pool);
+            if candidates.is_empty() {
+                continue;
+            }
+
+            apply_hoists_for_loop(instructions, byte_offsets, origins, loop_info, &candidates);
+            changed = true;
+            break;
+        }
+
+        if !changed {
+            break;
+        }
+    }
+}
+
+fn find_loops(instructions: &[Instruction], byte_offsets: &[usize]) -> Vec<LoopInfo> {
+    instructions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| {
+            (instruction.opcode == Opcode::JumpLoop)
+                .then(|| resolve_jump_target_index(instructions, byte_offsets, index))
+                .flatten()
+                .filter(|&header| header < index)
+                .map(|header| LoopInfo {
+                    header,
+                    back_edge: index,
+                })
+        })
+        .collect()
+}
+
+fn find_hoist_candidates(
+    instructions: &[Instruction],
+    byte_offsets: &[usize],
+    loop_info: LoopInfo,
+    constant_pool: Option<&[ConstantPoolEntry]>,
+) -> Vec<HoistCandidate> {
+    let jump_target_bytes = collect_jump_target_bytes(instructions, byte_offsets);
+    let mut candidates = Vec::new();
+    let mut reserved_registers = HashSet::new();
+    let mut index = loop_info.header;
+
+    while index < loop_info.back_edge {
+        if is_jump_target(byte_offsets, &jump_target_bytes, index)
+            || is_jump_target(byte_offsets, &jump_target_bytes, index + 1)
+        {
+            index += 1;
+            continue;
+        }
+
+        let load = &instructions[index];
+        let star = &instructions[index + 1];
+        if star.opcode != Opcode::Star {
+            index += 1;
+            continue;
+        }
+
+        let Some(dst) = get_register(star, 0) else {
+            index += 1;
+            continue;
+        };
+        if reserved_registers.contains(&dst) {
+            index += 1;
+            continue;
+        }
+
+        let candidate = match load.opcode {
+            Opcode::LdaGlobal => is_loop_invariant_global(instructions, loop_info, index, dst)
+                .then(|| build_hoist_candidate(load, star, index)),
+            Opcode::LdaNamedProperty => {
+                is_loop_invariant_length_load(instructions, loop_info, index, dst, constant_pool)
+                    .then(|| build_hoist_candidate(load, star, index))
+            }
+            _ => None,
+        };
+
+        if let Some(candidate) = candidate {
+            reserved_registers.insert(dst);
+            candidates.push(candidate);
+            index += 2;
+            continue;
+        }
+
+        index += 1;
+    }
+
+    candidates
+}
+
+fn build_hoist_candidate(
+    load: &Instruction,
+    star: &Instruction,
+    load_idx: usize,
+) -> HoistCandidate {
+    let dst = get_register(star, 0).expect("Star must have a destination register");
+    HoistCandidate {
+        load_idx,
+        star_idx: load_idx + 1,
+        hoisted_load: load.clone(),
+        hoisted_star: star.clone(),
+        replacement: Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(dst)]),
+    }
+}
+
+fn is_loop_invariant_global(
+    instructions: &[Instruction],
+    loop_info: LoopInfo,
+    load_idx: usize,
+    dst: u32,
+) -> bool {
+    let Some(name_idx) = get_constant_pool_idx(&instructions[load_idx], 0) else {
+        return false;
+    };
+
+    !loop_writes_register(instructions, loop_info, dst, &[load_idx + 1])
+        && !loop_invalidates_global(instructions, loop_info, load_idx, name_idx)
+}
+
+fn is_loop_invariant_length_load(
+    instructions: &[Instruction],
+    loop_info: LoopInfo,
+    load_idx: usize,
+    dst: u32,
+    constant_pool: Option<&[ConstantPoolEntry]>,
+) -> bool {
+    let Some(obj_reg) = get_register(&instructions[load_idx], 0) else {
+        return false;
+    };
+    let Some(name_idx) = get_constant_pool_idx(&instructions[load_idx], 1) else {
+        return false;
+    };
+
+    matches!(
+        constant_pool.and_then(|pool| pool.get(name_idx as usize)),
+        Some(ConstantPoolEntry::String(name)) if name == "length"
+    ) && !loop_writes_register(instructions, loop_info, dst, &[load_idx + 1])
+        && !loop_writes_register(instructions, loop_info, obj_reg, &[])
+        && !loop_invalidates_named_property(instructions, loop_info, load_idx, obj_reg)
+}
+
+fn apply_hoists_for_loop(
+    instructions: &mut Vec<Instruction>,
+    byte_offsets: &mut Vec<usize>,
+    origins: &mut Vec<Option<usize>>,
+    loop_info: LoopInfo,
+    candidates: &[HoistCandidate],
+) {
+    let old_targets = collect_jump_target_indices(instructions, byte_offsets);
+    let old_origins = origins.clone();
+    let old_instructions = std::mem::take(instructions);
+
+    let replacements = candidates
+        .iter()
+        .map(|candidate| (candidate.load_idx, candidate))
+        .collect::<HashMap<_, _>>();
+    let removed_star_indices = candidates
+        .iter()
+        .map(|candidate| candidate.star_idx)
+        .collect::<HashSet<_>>();
+
+    let mut new_instructions = Vec::with_capacity(old_instructions.len() + candidates.len() * 2);
+    let mut new_origins = Vec::with_capacity(old_origins.len() + candidates.len() * 2);
+
+    for (index, instruction) in old_instructions.into_iter().enumerate() {
+        if index == loop_info.header {
+            for candidate in candidates {
+                new_instructions.push(candidate.hoisted_load.clone());
+                new_origins.push(None);
+                new_instructions.push(candidate.hoisted_star.clone());
+                new_origins.push(None);
+            }
+        }
+
+        if let Some(candidate) = replacements.get(&index) {
+            new_instructions.push(candidate.replacement.clone());
+            new_origins.push(old_origins[index]);
+            continue;
+        }
+
+        if removed_star_indices.contains(&index) {
+            continue;
+        }
+
+        new_origins.push(old_origins[index]);
+        new_instructions.push(instruction);
+    }
+
+    *instructions = new_instructions;
+    *origins = new_origins;
+    *byte_offsets = resolve_jump_offsets(instructions, origins, &old_targets);
+}
+
+fn loop_writes_register(
+    instructions: &[Instruction],
+    loop_info: LoopInfo,
+    register: u32,
+    ignored_indices: &[usize],
+) -> bool {
+    (loop_info.header..=loop_info.back_edge)
+        .filter(|index| !ignored_indices.contains(index))
+        .any(|index| instruction_writes_register(&instructions[index], register))
+}
+
+fn loop_invalidates_global(
+    instructions: &[Instruction],
+    loop_info: LoopInfo,
+    load_idx: usize,
+    name_idx: u32,
+) -> bool {
+    (loop_info.header..=loop_info.back_edge)
+        .filter(|&index| index != load_idx && index != load_idx + 1)
+        .any(|index| {
+            writes_same_global(&instructions[index], name_idx)
+                || instruction_has_unknown_global_side_effect(&instructions[index])
+        })
+}
+
+fn loop_invalidates_named_property(
+    instructions: &[Instruction],
+    loop_info: LoopInfo,
+    load_idx: usize,
+    obj_reg: u32,
+) -> bool {
+    (loop_info.header..=loop_info.back_edge)
+        .filter(|&index| index != load_idx && index != load_idx + 1)
+        .any(|index| {
+            instruction_has_unknown_global_side_effect(&instructions[index])
+                || instruction_writes_property_of_register(&instructions[index], obj_reg)
+        })
+}
+
+fn instruction_writes_register(instruction: &Instruction, register: u32) -> bool {
+    match instruction.opcode {
+        Opcode::Star => get_register(instruction, 0) == Some(register),
+        Opcode::Mov => get_register(instruction, 1) == Some(register),
+        Opcode::IteratorNext => get_register(instruction, 1) == Some(register),
+        Opcode::CallRuntimeForPair => get_register(instruction, 3) == Some(register),
+        Opcode::ResumeGenerator => {
+            if let (Some(start), Some(Operand::RegisterCount(count))) =
+                (get_register(instruction, 1), instruction.operands.get(2))
+            {
+                register >= start && register < start + count
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn writes_same_global(instruction: &Instruction, name_idx: u32) -> bool {
+    instruction.opcode == Opcode::StaGlobal
+        && get_constant_pool_idx(instruction, 0) == Some(name_idx)
+}
+
+fn instruction_has_unknown_global_side_effect(instruction: &Instruction) -> bool {
+    matches!(
+        instruction.opcode,
+        Opcode::StaLookupSlot
+            | Opcode::DeleteLookupSlot
+            | Opcode::StaContextSlot
+            | Opcode::StaCurrentContextSlot
+            | Opcode::StaModuleVariable
+            | Opcode::StaNamedProperty
+            | Opcode::StaNamedOwnProperty
+            | Opcode::StaKeyedProperty
+            | Opcode::DefineNamedOwnProperty
+            | Opcode::DefineKeyedOwnProperty
+            | Opcode::DefineKeyedOwnPropertyInLiteral
+            | Opcode::DefineGetterProperty
+            | Opcode::DefineSetterProperty
+            | Opcode::DefineKeyedGetterProperty
+            | Opcode::DefineKeyedSetterProperty
+            | Opcode::DefinePrivateBrand
+            | Opcode::DefineClassNamedOwnProperty
+            | Opcode::DefineClassGetterProperty
+            | Opcode::DefineClassSetterProperty
+            | Opcode::DefineClassKeyedOwnProperty
+            | Opcode::DefineClassKeyedGetterProperty
+            | Opcode::DefineClassKeyedSetterProperty
+            | Opcode::SetLiteralPrototype
+            | Opcode::DeletePropertyStrict
+            | Opcode::DeletePropertySloppy
+            | Opcode::CallAnyReceiver
+            | Opcode::CallProperty
+            | Opcode::CallProperty0
+            | Opcode::CallProperty1
+            | Opcode::CallProperty2
+            | Opcode::CallUndefinedReceiver0
+            | Opcode::CallUndefinedReceiver1
+            | Opcode::CallUndefinedReceiver2
+            | Opcode::CallWithSpread
+            | Opcode::CallRuntime
+            | Opcode::CallRuntimeForPair
+            | Opcode::CallJSRuntime
+            | Opcode::InvokeIntrinsic
+            | Opcode::CallDirectEval
+            | Opcode::TailCall
+            | Opcode::Construct
+            | Opcode::ConstructWithSpread
+            | Opcode::ConstructForwardAllArgs
+    )
+}
+
+fn instruction_writes_property_of_register(instruction: &Instruction, register: u32) -> bool {
+    match instruction.opcode {
+        Opcode::StaNamedProperty
+        | Opcode::StaNamedOwnProperty
+        | Opcode::StaKeyedProperty
+        | Opcode::DefineNamedOwnProperty
+        | Opcode::DefineKeyedOwnProperty
+        | Opcode::DefineKeyedOwnPropertyInLiteral
+        | Opcode::DefineGetterProperty
+        | Opcode::DefineSetterProperty
+        | Opcode::DefineKeyedGetterProperty
+        | Opcode::DefineKeyedSetterProperty
+        | Opcode::SetLiteralPrototype
+        | Opcode::DefinePrivateBrand
+        | Opcode::DefineClassNamedOwnProperty
+        | Opcode::DefineClassGetterProperty
+        | Opcode::DefineClassSetterProperty
+        | Opcode::DefineClassKeyedOwnProperty
+        | Opcode::DefineClassKeyedGetterProperty
+        | Opcode::DefineClassKeyedSetterProperty
+        | Opcode::DeletePropertyStrict
+        | Opcode::DeletePropertySloppy => get_register(instruction, 0) == Some(register),
+        _ => false,
+    }
+}
+
+fn contains_constant_pool_jump(instructions: &[Instruction]) -> bool {
+    instructions.iter().any(|instruction| {
+        matches!(
+            instruction.opcode,
+            Opcode::JumpConstant
+                | Opcode::JumpIfTrueConstant
+                | Opcode::JumpIfFalseConstant
+                | Opcode::JumpIfToBooleanTrueConstant
+                | Opcode::JumpIfToBooleanFalseConstant
+                | Opcode::JumpIfNullConstant
+                | Opcode::JumpIfNotNullConstant
+                | Opcode::JumpIfUndefinedConstant
+                | Opcode::JumpIfNotUndefinedConstant
+                | Opcode::JumpIfUndefinedOrNullConstant
+                | Opcode::JumpIfJSReceiverConstant
+        )
+    })
+}
+
+fn collect_jump_target_indices(
+    instructions: &[Instruction],
+    byte_offsets: &[usize],
+) -> Vec<Option<usize>> {
+    instructions
+        .iter()
+        .enumerate()
+        .map(|(index, _)| resolve_jump_target_index(instructions, byte_offsets, index))
+        .collect()
+}
+
+fn resolve_jump_target_index(
+    instructions: &[Instruction],
+    byte_offsets: &[usize],
+    index: usize,
+) -> Option<usize> {
+    let instruction = instructions.get(index)?;
+    let delta = instruction
+        .operands
+        .iter()
+        .find_map(|operand| match operand {
+            Operand::JumpOffset(delta) => Some(*delta),
+            _ => None,
+        })?;
+    let end_byte = byte_offsets.get(index + 1).copied()?;
+    let target_byte = end_byte as i64 + i64::from(delta);
+    usize::try_from(target_byte)
+        .ok()
+        .and_then(|target_byte| byte_offsets.binary_search(&target_byte).ok())
+}
+
+fn resolve_jump_offsets(
+    instructions: &mut [Instruction],
+    origins: &[Option<usize>],
+    old_targets: &[Option<usize>],
+) -> Vec<usize> {
+    const MAX_ITERS: usize = 20;
+    let old_to_new = build_old_to_new_map(origins, old_targets.len());
+    let mut offsets = recompute_byte_offsets(instructions);
+
+    for _ in 0..MAX_ITERS {
+        let mut changed = false;
+
+        for (old_index, target) in old_targets.iter().enumerate() {
+            let (Some(new_index), Some(target_old_index)) = (old_to_new[old_index], *target) else {
+                continue;
+            };
+            let Some(target_new_index) = old_to_new[target_old_index] else {
+                continue;
+            };
+            let delta = offsets[target_new_index] as i64 - offsets[new_index + 1] as i64;
+            if set_jump_offset(&mut instructions[new_index], delta as i32) {
+                changed = true;
+            }
+        }
+
+        if !changed {
+            return offsets;
+        }
+
+        offsets = recompute_byte_offsets(instructions);
+    }
+
+    offsets
+}
+
+fn set_jump_offset(instruction: &mut Instruction, new_delta: i32) -> bool {
+    for operand in &mut instruction.operands {
+        if let Operand::JumpOffset(delta) = operand {
+            if *delta == new_delta {
+                return false;
+            }
+            *delta = new_delta;
+            return true;
+        }
+    }
+    false
+}
+
+fn recompute_byte_offsets(instructions: &[Instruction]) -> Vec<usize> {
+    let bytes = encode(instructions);
+    let (_, byte_offsets) =
+        decode_with_byte_offsets(&bytes).expect("encoding transformed peephole bytecode");
+    byte_offsets
+}
+
+fn build_old_to_new_map(origins: &[Option<usize>], original_len: usize) -> Vec<Option<usize>> {
+    let mut map = vec![None; original_len];
+    for (new_index, origin) in origins.iter().enumerate() {
+        if let Some(old_index) = origin {
+            map[*old_index] = Some(new_index);
+        }
+    }
+    map
 }
 
 fn try_fold_constant(
@@ -822,6 +1375,13 @@ fn get_register(instruction: &Instruction, operand_index: usize) -> Option<u32> 
     }
 }
 
+fn get_constant_pool_idx(instruction: &Instruction, operand_index: usize) -> Option<u32> {
+    match instruction.operands.get(operand_index).copied()? {
+        Operand::ConstantPoolIdx(index) => Some(index),
+        _ => None,
+    }
+}
+
 fn is_jump_target(
     byte_offsets: &[usize],
     jump_target_bytes: &HashSet<usize>,
@@ -960,6 +1520,20 @@ mod tests {
     fn decode_with_offsets(instructions: &[Instruction]) -> (Vec<Instruction>, Vec<usize>) {
         let bytes = encode(instructions);
         crate::bytecode::bytecodes::decode_with_byte_offsets(&bytes).expect("valid bytecode")
+    }
+
+    fn resolve_jump_offsets_for_test(
+        instructions: &mut [Instruction],
+        jumps: &[(usize, usize)],
+    ) -> Vec<usize> {
+        let (_, offsets) = decode_with_offsets(instructions);
+        for &(jump_index, target_index) in jumps {
+            let target_byte = offsets[target_index];
+            let jump_end_byte = offsets[jump_index + 1];
+            instructions[jump_index].operands[0] =
+                Operand::JumpOffset(target_byte as i32 - jump_end_byte as i32);
+        }
+        decode_with_offsets(instructions).1
     }
 
     #[test]
@@ -1366,5 +1940,189 @@ mod tests {
             opcodes.contains(&Opcode::Ldar),
             "Ldar at a jump target must not be eliminated"
         );
+    }
+
+    #[test]
+    fn test_licm_hoists_invariant_global_load() {
+        let mut original = vec![
+            Instruction::new_unchecked(Opcode::LdaZero, vec![]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(
+                Opcode::LdaGlobal,
+                vec![Operand::ConstantPoolIdx(0), Operand::FeedbackSlot(1)],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(
+                Opcode::TestLessThan,
+                vec![Operand::Register(1), Operand::FeedbackSlot(2)],
+            ),
+            Instruction::new_unchecked(Opcode::JumpIfFalse, vec![Operand::JumpOffset(0)]),
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(
+                Opcode::AddSmi,
+                vec![Operand::Immediate(1), Operand::FeedbackSlot(3)],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(
+                Opcode::JumpLoop,
+                vec![
+                    Operand::JumpOffset(0),
+                    Operand::Immediate(0),
+                    Operand::FeedbackSlot(4),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        resolve_jump_offsets_for_test(&mut original, &[(6, 11), (10, 2)]);
+
+        let (mut instructions, mut byte_offsets) = decode_with_offsets(&original);
+        let mut origins = (0..instructions.len()).map(Some).collect::<Vec<_>>();
+        hoist_loop_invariants(&mut instructions, &mut byte_offsets, &mut origins, None);
+
+        assert_eq!(
+            instructions
+                .iter()
+                .map(|instr| instr.opcode)
+                .collect::<Vec<_>>(),
+            vec![
+                Opcode::LdaZero,
+                Opcode::Star,
+                Opcode::LdaGlobal,
+                Opcode::Star,
+                Opcode::Ldar,
+                Opcode::Ldar,
+                Opcode::TestLessThan,
+                Opcode::JumpIfFalse,
+                Opcode::Ldar,
+                Opcode::AddSmi,
+                Opcode::Star,
+                Opcode::JumpLoop,
+                Opcode::Return,
+            ]
+        );
+        assert_eq!(get_register(&instructions[3], 0), Some(1));
+        assert_eq!(get_register(&instructions[4], 0), Some(1));
+        assert_eq!(
+            resolve_jump_target_index(&instructions, &byte_offsets, 11),
+            Some(4),
+            "JumpLoop must still target the loop header after hoisting"
+        );
+    }
+
+    #[test]
+    fn test_licm_hoists_length_load_with_constant_pool() {
+        let mut original = vec![
+            Instruction::new_unchecked(Opcode::LdaZero, vec![]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(
+                Opcode::LdaNamedProperty,
+                vec![
+                    Operand::Register(2),
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(1),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(
+                Opcode::TestLessThan,
+                vec![Operand::Register(1), Operand::FeedbackSlot(2)],
+            ),
+            Instruction::new_unchecked(Opcode::JumpIfFalse, vec![Operand::JumpOffset(0)]),
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(
+                Opcode::AddSmi,
+                vec![Operand::Immediate(1), Operand::FeedbackSlot(3)],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(
+                Opcode::JumpLoop,
+                vec![
+                    Operand::JumpOffset(0),
+                    Operand::Immediate(0),
+                    Operand::FeedbackSlot(4),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        resolve_jump_offsets_for_test(&mut original, &[(6, 11), (10, 2)]);
+
+        let pool = vec![ConstantPoolEntry::String("length".into())];
+        let (mut instructions, mut byte_offsets) = decode_with_offsets(&original);
+        let mut origins = (0..instructions.len()).map(Some).collect::<Vec<_>>();
+        hoist_loop_invariants(
+            &mut instructions,
+            &mut byte_offsets,
+            &mut origins,
+            Some(&pool),
+        );
+
+        assert_eq!(
+            instructions
+                .iter()
+                .map(|instr| instr.opcode)
+                .collect::<Vec<_>>(),
+            vec![
+                Opcode::LdaZero,
+                Opcode::Star,
+                Opcode::LdaNamedProperty,
+                Opcode::Star,
+                Opcode::Ldar,
+                Opcode::Ldar,
+                Opcode::TestLessThan,
+                Opcode::JumpIfFalse,
+                Opcode::Ldar,
+                Opcode::AddSmi,
+                Opcode::Star,
+                Opcode::JumpLoop,
+                Opcode::Return,
+            ]
+        );
+        assert_eq!(
+            resolve_jump_target_index(&instructions, &byte_offsets, 11),
+            Some(4),
+            "JumpLoop must target the new loop header after hoisting length"
+        );
+    }
+
+    #[test]
+    fn test_licm_skips_global_load_when_loop_writes_same_global() {
+        let mut original = vec![
+            Instruction::new_unchecked(Opcode::LdaZero, vec![]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(
+                Opcode::LdaGlobal,
+                vec![Operand::ConstantPoolIdx(0), Operand::FeedbackSlot(1)],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(7)]),
+            Instruction::new_unchecked(
+                Opcode::StaGlobal,
+                vec![Operand::ConstantPoolIdx(0), Operand::FeedbackSlot(2)],
+            ),
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(
+                Opcode::TestLessThan,
+                vec![Operand::Register(1), Operand::FeedbackSlot(3)],
+            ),
+            Instruction::new_unchecked(Opcode::JumpIfFalse, vec![Operand::JumpOffset(0)]),
+            Instruction::new_unchecked(
+                Opcode::JumpLoop,
+                vec![
+                    Operand::JumpOffset(0),
+                    Operand::Immediate(0),
+                    Operand::FeedbackSlot(4),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        resolve_jump_offsets_for_test(&mut original, &[(8, 10), (9, 2)]);
+
+        let (mut instructions, mut byte_offsets) = decode_with_offsets(&original);
+        let mut origins = (0..instructions.len()).map(Some).collect::<Vec<_>>();
+        hoist_loop_invariants(&mut instructions, &mut byte_offsets, &mut origins, None);
+
+        assert_eq!(instructions, original);
     }
 }
