@@ -357,6 +357,32 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         continue;
                     }
                 }
+                (Opcode::Ldar, Opcode::Mul, Opcode::Star) => {
+                    if let (
+                        Operand::Register(src),
+                        Operand::Register(mul_reg),
+                        Operand::FeedbackSlot(slot),
+                        Operand::Register(dst),
+                    ) = (
+                        first.operands[0],
+                        second.operands[0],
+                        second.operands[1],
+                        third.operands[0],
+                    ) {
+                        fused_offsets.push(byte_offsets[index]);
+                        fused_instructions.push(Instruction::new_unchecked(
+                            Opcode::LdarMulStar,
+                            vec![
+                                Operand::Register(src),
+                                Operand::Register(mul_reg),
+                                Operand::Register(dst),
+                                Operand::FeedbackSlot(slot),
+                            ],
+                        ));
+                        index += 3;
+                        continue;
+                    }
+                }
                 _ => {}
             }
         }
@@ -432,6 +458,28 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         continue;
                     }
                 }
+                (Opcode::TestNotEqual, Opcode::JumpIfTrue | Opcode::JumpIfFalse) => {
+                    if let (
+                        Operand::Register(reg),
+                        Operand::FeedbackSlot(slot),
+                        Operand::JumpOffset(offset),
+                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    {
+                        let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
+                        fused_offsets.push(byte_offsets[index]);
+                        fused_instructions.push(Instruction::new_unchecked(
+                            Opcode::TestNotEqualJump,
+                            vec![
+                                Operand::Register(reg),
+                                Operand::FeedbackSlot(slot),
+                                Operand::JumpOffset(offset),
+                                Operand::Flag(is_true),
+                            ],
+                        ));
+                        index += 2;
+                        continue;
+                    }
+                }
                 (Opcode::TestEqualStrict, Opcode::JumpIfTrue | Opcode::JumpIfFalse) => {
                     if let (
                         Operand::Register(reg),
@@ -443,6 +491,50 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         fused_offsets.push(byte_offsets[index]);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::TestEqualStrictJump,
+                            vec![
+                                Operand::Register(reg),
+                                Operand::FeedbackSlot(slot),
+                                Operand::JumpOffset(offset),
+                                Operand::Flag(is_true),
+                            ],
+                        ));
+                        index += 2;
+                        continue;
+                    }
+                }
+                (Opcode::TestLessThanOrEqual, Opcode::JumpIfTrue | Opcode::JumpIfFalse) => {
+                    if let (
+                        Operand::Register(reg),
+                        Operand::FeedbackSlot(slot),
+                        Operand::JumpOffset(offset),
+                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    {
+                        let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
+                        fused_offsets.push(byte_offsets[index]);
+                        fused_instructions.push(Instruction::new_unchecked(
+                            Opcode::TestLessThanOrEqualJump,
+                            vec![
+                                Operand::Register(reg),
+                                Operand::FeedbackSlot(slot),
+                                Operand::JumpOffset(offset),
+                                Operand::Flag(is_true),
+                            ],
+                        ));
+                        index += 2;
+                        continue;
+                    }
+                }
+                (Opcode::TestGreaterThanOrEqual, Opcode::JumpIfTrue | Opcode::JumpIfFalse) => {
+                    if let (
+                        Operand::Register(reg),
+                        Operand::FeedbackSlot(slot),
+                        Operand::JumpOffset(offset),
+                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    {
+                        let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
+                        fused_offsets.push(byte_offsets[index]);
+                        fused_instructions.push(Instruction::new_unchecked(
+                            Opcode::TestGreaterThanOrEqualJump,
                             vec![
                                 Operand::Register(reg),
                                 Operand::FeedbackSlot(slot),
@@ -486,6 +578,72 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                             Opcode::SubSmiStar,
                             vec![
                                 Operand::Immediate(imm),
+                                Operand::FeedbackSlot(slot),
+                                Operand::Register(dst),
+                            ],
+                        ));
+                        index += 2;
+                        continue;
+                    }
+                }
+                (Opcode::MulSmi, Opcode::Star) => {
+                    if let (
+                        Operand::Immediate(imm),
+                        Operand::FeedbackSlot(slot),
+                        Operand::Register(dst),
+                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    {
+                        fused_offsets.push(byte_offsets[index]);
+                        fused_instructions.push(Instruction::new_unchecked(
+                            Opcode::MulSmiStar,
+                            vec![
+                                Operand::Immediate(imm),
+                                Operand::FeedbackSlot(slot),
+                                Operand::Register(dst),
+                            ],
+                        ));
+                        index += 2;
+                        continue;
+                    }
+                }
+                (Opcode::Inc, Opcode::Star) => {
+                    if let (Operand::FeedbackSlot(slot), Operand::Register(dst)) =
+                        (first.operands[0], second.operands[0])
+                    {
+                        fused_offsets.push(byte_offsets[index]);
+                        fused_instructions.push(Instruction::new_unchecked(
+                            Opcode::IncStar,
+                            vec![Operand::FeedbackSlot(slot), Operand::Register(dst)],
+                        ));
+                        index += 2;
+                        continue;
+                    }
+                }
+                (Opcode::LdaSmi, Opcode::Star) => {
+                    if let (Operand::Immediate(imm), Operand::Register(dst)) =
+                        (first.operands[0], second.operands[0])
+                    {
+                        fused_offsets.push(byte_offsets[index]);
+                        fused_instructions.push(Instruction::new_unchecked(
+                            Opcode::LdaSmiStar,
+                            vec![Operand::Immediate(imm), Operand::Register(dst)],
+                        ));
+                        index += 2;
+                        continue;
+                    }
+                }
+                (Opcode::LdaGlobal, Opcode::Star) => {
+                    if let (
+                        Operand::ConstantPoolIdx(name_idx),
+                        Operand::FeedbackSlot(slot),
+                        Operand::Register(dst),
+                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    {
+                        fused_offsets.push(byte_offsets[index]);
+                        fused_instructions.push(Instruction::new_unchecked(
+                            Opcode::LdaGlobalStar,
+                            vec![
+                                Operand::ConstantPoolIdx(name_idx),
                                 Operand::FeedbackSlot(slot),
                                 Operand::Register(dst),
                             ],
@@ -838,6 +996,70 @@ mod tests {
                 Opcode::LdarAddStar,
                 Opcode::TestLessThanJump,
                 Opcode::AddSmiStar,
+                Opcode::Return,
+            ]
+        );
+        assert_eq!(byte_offsets.len(), instructions.len() + 1);
+    }
+
+    #[test]
+    fn test_fuse_additional_patterns() {
+        let original = vec![
+            Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(
+                Opcode::Mul,
+                vec![Operand::Register(1), Operand::FeedbackSlot(2)],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(3)]),
+            Instruction::new_unchecked(
+                Opcode::TestLessThanOrEqual,
+                vec![Operand::Register(4), Operand::FeedbackSlot(5)],
+            ),
+            Instruction::new_unchecked(Opcode::JumpIfTrue, vec![Operand::JumpOffset(0)]),
+            Instruction::new_unchecked(
+                Opcode::TestGreaterThanOrEqual,
+                vec![Operand::Register(6), Operand::FeedbackSlot(7)],
+            ),
+            Instruction::new_unchecked(Opcode::JumpIfFalse, vec![Operand::JumpOffset(0)]),
+            Instruction::new_unchecked(
+                Opcode::TestNotEqual,
+                vec![Operand::Register(8), Operand::FeedbackSlot(9)],
+            ),
+            Instruction::new_unchecked(Opcode::JumpIfTrue, vec![Operand::JumpOffset(0)]),
+            Instruction::new_unchecked(
+                Opcode::MulSmi,
+                vec![Operand::Immediate(10), Operand::FeedbackSlot(11)],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(12)]),
+            Instruction::new_unchecked(Opcode::Inc, vec![Operand::FeedbackSlot(13)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(14)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(15)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(16)]),
+            Instruction::new_unchecked(
+                Opcode::LdaGlobal,
+                vec![Operand::ConstantPoolIdx(17), Operand::FeedbackSlot(18)],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(19)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let (mut instructions, mut byte_offsets) = decode_with_offsets(&original);
+        fuse_instructions(&mut instructions, &mut byte_offsets);
+
+        assert_eq!(
+            instructions
+                .iter()
+                .map(|instr| instr.opcode)
+                .collect::<Vec<_>>(),
+            vec![
+                Opcode::LdarMulStar,
+                Opcode::TestLessThanOrEqualJump,
+                Opcode::TestGreaterThanOrEqualJump,
+                Opcode::TestNotEqualJump,
+                Opcode::MulSmiStar,
+                Opcode::IncStar,
+                Opcode::LdaSmiStar,
+                Opcode::LdaGlobalStar,
                 Opcode::Return,
             ]
         );

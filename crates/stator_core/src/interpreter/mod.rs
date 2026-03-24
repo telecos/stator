@@ -2890,6 +2890,12 @@ impl Interpreter {
                                 sa = unsafe { operand_imm_unchecked(instr, 0) };
                                 smi_acc_bool = false;
                             }
+                            Opcode::LdaSmiStar => {
+                                sa = unsafe { operand_imm_unchecked(instr, 0) };
+                                smi_acc_bool = false;
+                                let reg = unsafe { operand_reg_unchecked(instr, 1) };
+                                unsafe { frame.write_reg_unchecked(reg, JsValue::Smi(sa)) };
+                            }
                             Opcode::LdaZero => {
                                 sa = 0;
                                 smi_acc_bool = false;
@@ -3007,6 +3013,51 @@ impl Interpreter {
                                     Some(r) => sa = r,
                                     None => {
                                         acc = JsValue::HeapNumber(sa as f64 * b as f64);
+                                        frame.smi_mode = false;
+                                        frame.loop_end_pc = 0;
+                                        break 'smi;
+                                    }
+                                }
+                            }
+                            Opcode::MulSmiStar => {
+                                let b = unsafe { operand_imm_unchecked(instr, 0) };
+                                smi_acc_bool = false;
+                                match sa.checked_mul(b) {
+                                    Some(r) => {
+                                        sa = r;
+                                        let dst = unsafe { operand_reg_unchecked(instr, 2) };
+                                        unsafe { frame.write_reg_unchecked(dst, JsValue::Smi(sa)) };
+                                    }
+                                    None => {
+                                        acc = JsValue::HeapNumber(sa as f64 * b as f64);
+                                        let dst = unsafe { operand_reg_unchecked(instr, 2) };
+                                        unsafe {
+                                            frame.write_reg_unchecked(dst, acc.cheap_clone())
+                                        };
+                                        frame.smi_mode = false;
+                                        frame.loop_end_pc = 0;
+                                        break 'smi;
+                                    }
+                                }
+                            }
+                            Opcode::LdarMulStar => {
+                                let src = unsafe { operand_reg_unchecked(instr, 0) };
+                                sa = unsafe { frame.read_reg_num_unchecked(src) };
+                                let mul_reg = unsafe { operand_reg_unchecked(instr, 1) };
+                                let b = unsafe { frame.read_reg_num_unchecked(mul_reg) };
+                                smi_acc_bool = false;
+                                match sa.checked_mul(b) {
+                                    Some(r) => {
+                                        sa = r;
+                                        let dst = unsafe { operand_reg_unchecked(instr, 2) };
+                                        unsafe { frame.write_reg_unchecked(dst, JsValue::Smi(sa)) };
+                                    }
+                                    None => {
+                                        acc = JsValue::HeapNumber(sa as f64 * b as f64);
+                                        let dst = unsafe { operand_reg_unchecked(instr, 2) };
+                                        unsafe {
+                                            frame.write_reg_unchecked(dst, acc.cheap_clone())
+                                        };
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3135,6 +3186,26 @@ impl Interpreter {
                                     }
                                 }
                             }
+                            Opcode::IncStar => {
+                                smi_acc_bool = false;
+                                match sa.checked_add(1) {
+                                    Some(r) => {
+                                        sa = r;
+                                        let dst = unsafe { operand_reg_unchecked(instr, 1) };
+                                        unsafe { frame.write_reg_unchecked(dst, JsValue::Smi(sa)) };
+                                    }
+                                    None => {
+                                        acc = JsValue::HeapNumber(sa as f64 + 1.0);
+                                        let dst = unsafe { operand_reg_unchecked(instr, 1) };
+                                        unsafe {
+                                            frame.write_reg_unchecked(dst, acc.cheap_clone())
+                                        };
+                                        frame.smi_mode = false;
+                                        frame.loop_end_pc = 0;
+                                        break 'smi;
+                                    }
+                                }
+                            }
                             Opcode::Dec => {
                                 smi_acc_bool = false;
                                 match sa.checked_sub(1) {
@@ -3207,6 +3278,30 @@ impl Interpreter {
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 break 'smi;
+                            }
+                            Opcode::TestLessThanJump
+                            | Opcode::TestGreaterThanJump
+                            | Opcode::TestEqualJump
+                            | Opcode::TestNotEqualJump
+                            | Opcode::TestLessThanOrEqualJump
+                            | Opcode::TestGreaterThanOrEqualJump => {
+                                let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
+                                let cmp = match instr.opcode {
+                                    Opcode::TestLessThanJump => sa < b,
+                                    Opcode::TestGreaterThanJump => sa > b,
+                                    Opcode::TestEqualJump => sa == b,
+                                    Opcode::TestNotEqualJump => sa != b,
+                                    Opcode::TestLessThanOrEqualJump => sa <= b,
+                                    Opcode::TestGreaterThanOrEqualJump => sa >= b,
+                                    _ => unsafe { std::hint::unreachable_unchecked() },
+                                };
+                                smi_acc_bool = true;
+                                sa = cmp as i32;
+                                let is_true = unsafe { operand_flag_unchecked(instr, 3) } != 0;
+                                if cmp == is_true {
+                                    pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
+                                }
                             }
                             Opcode::TestEqualStrict => {
                                 // Strict equality requires same type: Smi===Smi
@@ -3975,6 +4070,13 @@ impl Interpreter {
                         // is Immediate for LdaSmi.
                         let val = unsafe { operand_imm_unchecked(instr, 0) };
                         acc = JsValue::Smi(val);
+                        continue 'dispatch;
+                    }
+                    Opcode::LdaSmiStar => {
+                        let val = unsafe { operand_imm_unchecked(instr, 0) };
+                        let dst = unsafe { operand_reg_unchecked(instr, 1) };
+                        acc = JsValue::Smi(val);
+                        unsafe { frame.write_reg_unchecked(dst, acc.cheap_clone()) };
                         continue 'dispatch;
                     }
                     Opcode::Star => {
@@ -7027,6 +7129,23 @@ unsafe fn operand_constant_pool_idx_unchecked(
     match *unsafe { instr.operands.get_unchecked(idx) } {
         crate::bytecode::bytecodes::Operand::ConstantPoolIdx(v) => v,
         // SAFETY: The bytecode generator guarantees the operand is ConstantPoolIdx.
+        _ => unsafe { std::hint::unreachable_unchecked() },
+    }
+}
+
+/// Extract a `Flag(u8)` operand without checking the variant tag.
+///
+/// # Safety
+///
+/// The bytecode generator guarantees `instr.operands[idx]` is
+/// [`Operand::Flag`] for the calling opcode. `idx` must be in bounds.
+#[inline(always)]
+unsafe fn operand_flag_unchecked(
+    instr: &crate::bytecode::bytecodes::Instruction,
+    idx: usize,
+) -> u8 {
+    match *unsafe { instr.operands.get_unchecked(idx) } {
+        crate::bytecode::bytecodes::Operand::Flag(v) => v,
         _ => unsafe { std::hint::unreachable_unchecked() },
     }
 }

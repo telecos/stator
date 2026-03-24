@@ -360,6 +360,23 @@ fn handle_lda_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
     Ok(DispatchAction::Continue)
 }
 
+#[inline(always)]
+fn handle_lda_smi_star(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Immediate(v) = instr.operands[0] else {
+        return Err(err_bad_operand("LdaSmiStar", 0));
+    };
+    let Operand::Register(dst) = instr.operands[1] else {
+        return Err(err_bad_operand("LdaSmiStar", 1));
+    };
+    let value = JsValue::Smi(v);
+    ctx.frame.accumulator = value.cheap_clone();
+    ctx.frame.write_reg(dst, value)?;
+    Ok(DispatchAction::Continue)
+}
+
 #[inline]
 fn handle_lda_undefined(
     ctx: &mut DispatchContext,
@@ -504,6 +521,54 @@ fn handle_ldar_sub_star(
         let lhs_n = lhs.to_number()?;
         let rhs_n = rhs.to_number()?;
         ctx.frame.accumulator = number_to_jsvalue(lhs_n - rhs_n);
+    }
+    ctx.frame
+        .write_reg(dst, ctx.frame.accumulator.cheap_clone())?;
+    Ok(DispatchAction::Continue)
+}
+
+#[inline(always)]
+fn handle_ldar_mul_star(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(src) = instr.operands[0] else {
+        return Err(err_bad_operand("LdarMulStar", 0));
+    };
+    let Operand::Register(mul_reg) = instr.operands[1] else {
+        return Err(err_bad_operand("LdarMulStar", 1));
+    };
+    let Operand::Register(dst) = instr.operands[2] else {
+        return Err(err_bad_operand("LdarMulStar", 2));
+    };
+    let Operand::FeedbackSlot(_slot) = instr.operands[3] else {
+        return Err(err_bad_operand("LdarMulStar", 3));
+    };
+
+    let lhs = ctx.frame.read_reg(src)?.cheap_clone();
+    let rhs = ctx.frame.read_reg(mul_reg)?;
+
+    if let Some(value) = JsValue::try_mul_smi(&lhs, rhs) {
+        ctx.frame.accumulator = value.cheap_clone();
+        ctx.frame.write_reg(dst, value)?;
+        return Ok(DispatchAction::Continue);
+    }
+
+    if let (Some(a), Some(b)) = (lhs.try_as_heap_number(), rhs.try_as_heap_number()) {
+        let value = number_to_jsvalue(a * b);
+        ctx.frame.accumulator = value.cheap_clone();
+        ctx.frame.write_reg(dst, value)?;
+        return Ok(DispatchAction::Continue);
+    }
+
+    if lhs.is_bigint() || rhs.is_bigint() {
+        let left = to_bigint(&lhs)?;
+        let right = to_bigint(rhs)?;
+        ctx.frame.accumulator = JsValue::BigInt(left.wrapping_mul(right));
+    } else {
+        let lhs_n = lhs.to_number()?;
+        let rhs_n = rhs.to_number()?;
+        ctx.frame.accumulator = number_to_jsvalue(lhs_n * rhs_n);
     }
     ctx.frame
         .write_reg(dst, ctx.frame.accumulator.cheap_clone())?;
@@ -1001,6 +1066,41 @@ fn handle_mul_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
     Ok(DispatchAction::Continue)
 }
 
+#[inline]
+fn handle_mul_smi_star(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Immediate(imm) = instr.operands[0] else {
+        return Err(err_bad_operand("MulSmiStar", 0));
+    };
+    let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+        return Err(err_bad_operand("MulSmiStar", 1));
+    };
+    let Operand::Register(dst) = instr.operands[2] else {
+        return Err(err_bad_operand("MulSmiStar", 2));
+    };
+
+    if let JsValue::Smi(n) = &ctx.frame.accumulator
+        && let Some(result) = n.checked_mul(imm)
+    {
+        let value = JsValue::Smi(result);
+        ctx.frame.accumulator = value.cheap_clone();
+        ctx.frame.write_reg(dst, value)?;
+        return Ok(DispatchAction::Continue);
+    }
+
+    if let JsValue::BigInt(n) = &ctx.frame.accumulator {
+        ctx.frame.accumulator = JsValue::BigInt(n.wrapping_mul(i128::from(imm)));
+    } else {
+        let lhs_n = ctx.frame.accumulator.to_number()?;
+        ctx.frame.accumulator = number_to_jsvalue(lhs_n * imm as f64);
+    }
+    ctx.frame
+        .write_reg(dst, ctx.frame.accumulator.cheap_clone())?;
+    Ok(DispatchAction::Continue)
+}
+
 fn handle_div_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
     let Operand::Immediate(imm) = instr.operands[0] else {
         return Err(err_bad_operand("DivSmi", 0));
@@ -1194,6 +1294,33 @@ fn handle_inc(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<D
         let n = ctx.frame.accumulator.to_number()?;
         ctx.frame.accumulator = number_to_jsvalue(n + 1.0);
     }
+    Ok(DispatchAction::Continue)
+}
+
+#[inline(always)]
+fn handle_inc_star(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
+    let Operand::FeedbackSlot(_slot) = instr.operands[0] else {
+        return Err(err_bad_operand("IncStar", 0));
+    };
+    let Operand::Register(dst) = instr.operands[1] else {
+        return Err(err_bad_operand("IncStar", 1));
+    };
+    if let JsValue::Smi(n) = ctx.frame.accumulator {
+        if let Some(result) = n.checked_add(1) {
+            let value = JsValue::Smi(result);
+            ctx.frame.accumulator = value.cheap_clone();
+            ctx.frame.write_reg(dst, value)?;
+            return Ok(DispatchAction::Continue);
+        }
+        ctx.frame.accumulator = JsValue::HeapNumber((n as f64) + 1.0);
+    } else if let JsValue::BigInt(n) = &ctx.frame.accumulator {
+        ctx.frame.accumulator = JsValue::BigInt(n.wrapping_add(1));
+    } else {
+        let n = ctx.frame.accumulator.to_number()?;
+        ctx.frame.accumulator = number_to_jsvalue(n + 1.0);
+    }
+    ctx.frame
+        .write_reg(dst, ctx.frame.accumulator.cheap_clone())?;
     Ok(DispatchAction::Continue)
 }
 
@@ -1403,6 +1530,39 @@ fn handle_test_equal_jump(
 }
 
 #[inline(always)]
+fn handle_test_not_equal_jump(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(v) = instr.operands[0] else {
+        return Err(err_bad_operand("TestNotEqualJump", 0));
+    };
+    let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+        return Err(err_bad_operand("TestNotEqualJump", 1));
+    };
+    let Operand::JumpOffset(_delta) = instr.operands[2] else {
+        return Err(err_bad_operand("TestNotEqualJump", 2));
+    };
+    let Operand::Flag(is_true_flag) = instr.operands[3] else {
+        return Err(err_bad_operand("TestNotEqualJump", 3));
+    };
+
+    let rhs = ctx.frame.read_reg(v)?;
+    let comparison = !abstract_eq(&ctx.frame.accumulator, rhs);
+
+    ctx.frame.accumulator = JsValue::Boolean(comparison);
+    let should_jump = if is_true_flag == 0 {
+        !comparison
+    } else {
+        comparison
+    };
+    if should_jump {
+        ctx.frame.pc = resolve_cached_jump(ctx, "TestNotEqualJump")?;
+    }
+    Ok(DispatchAction::Continue)
+}
+
+#[inline(always)]
 fn handle_test_equal_strict_jump(
     ctx: &mut DispatchContext,
     instr: &Instruction,
@@ -1438,6 +1598,90 @@ fn handle_test_equal_strict_jump(
     };
     if should_jump {
         ctx.frame.pc = resolve_cached_jump(ctx, "TestEqualStrictJump")?;
+    }
+    Ok(DispatchAction::Continue)
+}
+
+#[inline(always)]
+fn handle_test_less_than_or_equal_jump(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(v) = instr.operands[0] else {
+        return Err(err_bad_operand("TestLessThanOrEqualJump", 0));
+    };
+    let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+        return Err(err_bad_operand("TestLessThanOrEqualJump", 1));
+    };
+    let Operand::JumpOffset(_delta) = instr.operands[2] else {
+        return Err(err_bad_operand("TestLessThanOrEqualJump", 2));
+    };
+    let Operand::Flag(is_true_flag) = instr.operands[3] else {
+        return Err(err_bad_operand("TestLessThanOrEqualJump", 3));
+    };
+
+    let rhs = ctx.frame.read_reg(v)?;
+    let comparison = if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        a <= *b
+    } else {
+        let rhs = rhs.clone();
+        JsValue::abstract_relational_comparison(&rhs, &ctx.frame.accumulator, false)?
+            .map(|result| !result)
+            .unwrap_or(false)
+    };
+
+    ctx.frame.accumulator = JsValue::Boolean(comparison);
+    let should_jump = if is_true_flag == 0 {
+        !comparison
+    } else {
+        comparison
+    };
+    if should_jump {
+        ctx.frame.pc = resolve_cached_jump(ctx, "TestLessThanOrEqualJump")?;
+    }
+    Ok(DispatchAction::Continue)
+}
+
+#[inline(always)]
+fn handle_test_greater_than_or_equal_jump(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::Register(v) = instr.operands[0] else {
+        return Err(err_bad_operand("TestGreaterThanOrEqualJump", 0));
+    };
+    let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+        return Err(err_bad_operand("TestGreaterThanOrEqualJump", 1));
+    };
+    let Operand::JumpOffset(_delta) = instr.operands[2] else {
+        return Err(err_bad_operand("TestGreaterThanOrEqualJump", 2));
+    };
+    let Operand::Flag(is_true_flag) = instr.operands[3] else {
+        return Err(err_bad_operand("TestGreaterThanOrEqualJump", 3));
+    };
+
+    let rhs = ctx.frame.read_reg(v)?;
+    let comparison = if let JsValue::Smi(a) = ctx.frame.accumulator
+        && let JsValue::Smi(b) = rhs
+    {
+        a >= *b
+    } else {
+        let rhs = rhs.clone();
+        JsValue::abstract_relational_comparison(&ctx.frame.accumulator, &rhs, true)?
+            .map(|result| !result)
+            .unwrap_or(false)
+    };
+
+    ctx.frame.accumulator = JsValue::Boolean(comparison);
+    let should_jump = if is_true_flag == 0 {
+        !comparison
+    } else {
+        comparison
+    };
+    if should_jump {
+        ctx.frame.pc = resolve_cached_jump(ctx, "TestGreaterThanOrEqualJump")?;
     }
     Ok(DispatchAction::Continue)
 }
@@ -3277,6 +3521,59 @@ fn handle_lda_global(
     }
 
     ctx.frame.accumulator = value;
+    Ok(DispatchAction::Continue)
+}
+
+fn handle_lda_global_star(
+    ctx: &mut DispatchContext,
+    instr: &Instruction,
+) -> StatorResult<DispatchAction> {
+    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+        return Err(err_bad_operand("LdaGlobalStar", 0));
+    };
+    let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+        return Err(err_bad_operand("LdaGlobalStar", 1));
+    };
+    let Operand::Register(dst) = instr.operands[2] else {
+        return Err(err_bad_operand("LdaGlobalStar", 2));
+    };
+
+    let ic_hit = ctx
+        .frame
+        .global_ic
+        .as_ref()
+        .and_then(|ic| ic.get(&name_idx).copied());
+    if let Some((slot_idx, cached_gen)) = ic_hit {
+        let env = ctx.frame.global_env.borrow();
+        if env.generation() == cached_gen {
+            let value = env.get_by_index(slot_idx).clone();
+            drop(env);
+            if value != JsValue::TheHole {
+                ctx.frame.accumulator = value.cheap_clone();
+                ctx.frame.write_reg(dst, value)?;
+                return Ok(DispatchAction::Continue);
+            }
+        }
+    }
+
+    let name = ctx.frame.get_string_constant(name_idx)?;
+    let value = ctx.frame.load_global(name.as_ref())?;
+
+    {
+        let env = ctx.frame.global_env.borrow();
+        let slot_gen = env
+            .slot_index_for(name.as_ref())
+            .map(|idx| (idx, env.generation()));
+        drop(env);
+        if let Some((slot_idx, cached_gen)) = slot_gen {
+            ctx.frame
+                .global_ic_mut()
+                .insert(name_idx, (slot_idx, cached_gen));
+        }
+    }
+
+    ctx.frame.accumulator = value.cheap_clone();
+    ctx.frame.write_reg(dst, value)?;
     Ok(DispatchAction::Continue)
 }
 
@@ -7863,6 +8160,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::Ldar as usize] = handle_ldar;
     table[Opcode::LdarAddStar as usize] = handle_ldar_add_star;
     table[Opcode::LdarSubStar as usize] = handle_ldar_sub_star;
+    table[Opcode::LdarMulStar as usize] = handle_ldar_mul_star;
     table[Opcode::Star as usize] = handle_star;
     table[Opcode::Mov as usize] = handle_mov;
     table[Opcode::LdaNamedProperty as usize] = handle_lda_named_property;
@@ -7907,6 +8205,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::Nop as usize] = handle_nop;
     table[Opcode::SubSmi as usize] = handle_sub_smi;
     table[Opcode::MulSmi as usize] = handle_mul_smi;
+    table[Opcode::MulSmiStar as usize] = handle_mul_smi_star;
     table[Opcode::DivSmi as usize] = handle_div_smi;
     table[Opcode::ModSmi as usize] = handle_mod_smi;
     table[Opcode::ExpSmi as usize] = handle_exp_smi;
@@ -7917,6 +8216,7 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::ShiftRightSmi as usize] = handle_shift_right_smi;
     table[Opcode::ShiftRightLogicalSmi as usize] = handle_shift_right_logical_smi;
     table[Opcode::Inc as usize] = handle_inc;
+    table[Opcode::IncStar as usize] = handle_inc_star;
     table[Opcode::Dec as usize] = handle_dec;
     table[Opcode::Negate as usize] = handle_negate;
     table[Opcode::BitwiseNot as usize] = handle_bitwise_not;
@@ -7932,7 +8232,10 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::TestLessThanJump as usize] = handle_test_less_than_jump;
     table[Opcode::TestGreaterThanJump as usize] = handle_test_greater_than_jump;
     table[Opcode::TestEqualJump as usize] = handle_test_equal_jump;
+    table[Opcode::TestNotEqualJump as usize] = handle_test_not_equal_jump;
     table[Opcode::TestEqualStrictJump as usize] = handle_test_equal_strict_jump;
+    table[Opcode::TestLessThanOrEqualJump as usize] = handle_test_less_than_or_equal_jump;
+    table[Opcode::TestGreaterThanOrEqualJump as usize] = handle_test_greater_than_or_equal_jump;
     table[Opcode::SubSmiStar as usize] = handle_sub_smi_star;
     table[Opcode::TestGreaterThan as usize] = handle_test_greater_than;
     table[Opcode::TestLessThanOrEqual as usize] = handle_test_less_than_or_equal;
@@ -7944,6 +8247,8 @@ pub(super) static DISPATCH_TABLE: [OpcodeHandler; OPCODE_COUNT] = {
     table[Opcode::TestNull as usize] = handle_test_null;
     table[Opcode::TestUndefined as usize] = handle_test_undefined;
     table[Opcode::TestTypeOf as usize] = handle_test_type_of;
+    table[Opcode::LdaSmiStar as usize] = handle_lda_smi_star;
+    table[Opcode::LdaGlobalStar as usize] = handle_lda_global_star;
     table[Opcode::ToName as usize] = handle_to_name;
     table[Opcode::ToNumber as usize] = handle_to_number;
     table[Opcode::ToNumeric as usize] = handle_to_numeric;

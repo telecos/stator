@@ -732,6 +732,8 @@ pub enum Opcode {
     LdarAddStar,
     /// `Ldar(src); Sub(sub_reg, slot); Star(dst)`. `[src, sub_reg, dst, slot]`
     LdarSubStar,
+    /// `Ldar(src); Mul(mul_reg, slot); Star(dst)`. `[src, mul_reg, dst, slot]`
+    LdarMulStar,
     /// `TestLessThan(reg, slot); JumpIf{True,False}(offset)`.
     /// `[reg, slot, offset, is_true]`
     TestLessThanJump,
@@ -741,13 +743,30 @@ pub enum Opcode {
     /// `TestEqual(reg, slot); JumpIf{True,False}(offset)`.
     /// `[reg, slot, offset, is_true]`
     TestEqualJump,
+    /// `TestNotEqual(reg, slot); JumpIf{True,False}(offset)`.
+    /// `[reg, slot, offset, is_true]`
+    TestNotEqualJump,
     /// `TestEqualStrict(reg, slot); JumpIf{True,False}(offset)`.
     /// `[reg, slot, offset, is_true]`
     TestEqualStrictJump,
+    /// `TestLessThanOrEqual(reg, slot); JumpIf{True,False}(offset)`.
+    /// `[reg, slot, offset, is_true]`
+    TestLessThanOrEqualJump,
+    /// `TestGreaterThanOrEqual(reg, slot); JumpIf{True,False}(offset)`.
+    /// `[reg, slot, offset, is_true]`
+    TestGreaterThanOrEqualJump,
     /// `AddSmi(imm, slot); Star(dst)`. `[imm, slot, dst]`
     AddSmiStar,
     /// `SubSmi(imm, slot); Star(dst)`. `[imm, slot, dst]`
     SubSmiStar,
+    /// `MulSmi(imm, slot); Star(dst)`. `[imm, slot, dst]`
+    MulSmiStar,
+    /// `Inc(slot); Star(dst)`. `[slot, dst]`
+    IncStar,
+    /// `LdaSmi(imm); Star(dst)`. `[imm, dst]`
+    LdaSmiStar,
+    /// `LdaGlobal(name_idx, slot); Star(dst)`. `[name_idx, slot, dst]`
+    LdaGlobalStar,
     /// No-op placeholder used by bytecode optimization before final compaction.
     Nop,
 }
@@ -1017,12 +1036,20 @@ impl Opcode {
             // Superinstructions
             Opcode::LdarAddStar => &[Register, Register, Register, FeedbackSlot],
             Opcode::LdarSubStar => &[Register, Register, Register, FeedbackSlot],
+            Opcode::LdarMulStar => &[Register, Register, Register, FeedbackSlot],
             Opcode::TestLessThanJump => &[Register, FeedbackSlot, JumpOffset, Flag],
             Opcode::TestGreaterThanJump => &[Register, FeedbackSlot, JumpOffset, Flag],
             Opcode::TestEqualJump => &[Register, FeedbackSlot, JumpOffset, Flag],
+            Opcode::TestNotEqualJump => &[Register, FeedbackSlot, JumpOffset, Flag],
             Opcode::TestEqualStrictJump => &[Register, FeedbackSlot, JumpOffset, Flag],
+            Opcode::TestLessThanOrEqualJump => &[Register, FeedbackSlot, JumpOffset, Flag],
+            Opcode::TestGreaterThanOrEqualJump => &[Register, FeedbackSlot, JumpOffset, Flag],
             Opcode::AddSmiStar => &[Immediate, FeedbackSlot, Register],
             Opcode::SubSmiStar => &[Immediate, FeedbackSlot, Register],
+            Opcode::MulSmiStar => &[Immediate, FeedbackSlot, Register],
+            Opcode::IncStar => &[FeedbackSlot, Register],
+            Opcode::LdaSmiStar => &[Immediate, Register],
+            Opcode::LdaGlobalStar => &[ConstantPoolIdx, FeedbackSlot, Register],
             Opcode::Nop => &[],
         }
     }
@@ -1533,20 +1560,88 @@ mod tests {
                 ],
             ),
             Instruction::new_unchecked(
-                Opcode::TestLessThanJump,
+                Opcode::LdarMulStar,
                 vec![
                     Operand::Register(9),
-                    Operand::FeedbackSlot(10),
-                    Operand::JumpOffset(-12),
+                    Operand::Register(10),
+                    Operand::Register(11),
+                    Operand::FeedbackSlot(12),
+                ],
+            ),
+            Instruction::new_unchecked(
+                Opcode::TestLessThanJump,
+                vec![
+                    Operand::Register(13),
+                    Operand::FeedbackSlot(14),
+                    Operand::JumpOffset(-15),
                     Operand::Flag(1),
+                ],
+            ),
+            Instruction::new_unchecked(
+                Opcode::TestNotEqualJump,
+                vec![
+                    Operand::Register(16),
+                    Operand::FeedbackSlot(17),
+                    Operand::JumpOffset(18),
+                    Operand::Flag(0),
+                ],
+            ),
+            Instruction::new_unchecked(
+                Opcode::TestLessThanOrEqualJump,
+                vec![
+                    Operand::Register(19),
+                    Operand::FeedbackSlot(20),
+                    Operand::JumpOffset(-21),
+                    Operand::Flag(1),
+                ],
+            ),
+            Instruction::new_unchecked(
+                Opcode::TestGreaterThanOrEqualJump,
+                vec![
+                    Operand::Register(22),
+                    Operand::FeedbackSlot(23),
+                    Operand::JumpOffset(24),
+                    Operand::Flag(0),
                 ],
             ),
             Instruction::new_unchecked(
                 Opcode::AddSmiStar,
                 vec![
-                    Operand::Immediate(11),
-                    Operand::FeedbackSlot(12),
-                    Operand::Register(13),
+                    Operand::Immediate(25),
+                    Operand::FeedbackSlot(26),
+                    Operand::Register(27),
+                ],
+            ),
+            Instruction::new_unchecked(
+                Opcode::SubSmiStar,
+                vec![
+                    Operand::Immediate(-28),
+                    Operand::FeedbackSlot(29),
+                    Operand::Register(30),
+                ],
+            ),
+            Instruction::new_unchecked(
+                Opcode::MulSmiStar,
+                vec![
+                    Operand::Immediate(31),
+                    Operand::FeedbackSlot(32),
+                    Operand::Register(33),
+                ],
+            ),
+            Instruction::new_unchecked(
+                Opcode::IncStar,
+                vec![Operand::FeedbackSlot(34), Operand::Register(35)],
+            ),
+            Instruction::new_unchecked(
+                Opcode::LdaSmiStar,
+                vec![Operand::Immediate(-36), Operand::Register(37)],
+            ),
+            Instruction::new_unchecked(
+                Opcode::LdaGlobalStar,
+                vec![
+                    Operand::ConstantPoolIdx(38),
+                    Operand::FeedbackSlot(39),
+                    Operand::Register(40),
                 ],
             ),
         ]);
