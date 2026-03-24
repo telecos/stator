@@ -178,6 +178,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Instant;
 
+use arrayvec::ArrayVec;
 use smallvec::SmallVec;
 
 use crate::builtins::error::{
@@ -7434,31 +7435,45 @@ pub(super) fn bigint_pow(base: i128, exp: u32) -> i128 {
     result
 }
 
-thread_local! {
-    /// Reusable buffer for string concatenation.  Avoids a fresh allocation on
-    /// every `+` when building strings in a loop (e.g. `a + b + c + d`).  The
-    /// buffer is cleared before each use but retains its heap allocation across
-    /// calls within the same thread.
-    static STRING_BUILDER: RefCell<String> = RefCell::new(String::with_capacity(4096));
-}
+const SMALL_STRING_CONCAT_LIMIT: usize = 128;
 
-/// Concatenate two string slices, reusing a thread-local buffer.
+/// Concatenate two string slices with a stack buffer for small results and an
+/// exact-capacity `String` for larger ones.
 ///
 /// The caller must already have validated `MAX_STRING_LEN`.
 #[inline]
-pub(super) fn concat_rc_strs(l: &str, r: &str) -> JsValue {
-    STRING_BUILDER.with(|sb| {
-        let mut buf = sb.borrow_mut();
-        buf.clear();
-        let total = l.len() + r.len();
-        let cap = buf.capacity();
-        if total > cap {
-            buf.reserve(total - cap);
-        }
-        buf.push_str(l);
-        buf.push_str(r);
-        JsValue::String(Rc::from(buf.as_str()))
-    })
+fn concat_str_slices(l: &str, r: &str) -> JsValue {
+    let total = l.len() + r.len();
+    if total <= SMALL_STRING_CONCAT_LIMIT {
+        let mut buf = ArrayVec::<u8, SMALL_STRING_CONCAT_LIMIT>::new();
+        buf.try_extend_from_slice(l.as_bytes())
+            .expect("left string already fits in the stack concat buffer");
+        buf.try_extend_from_slice(r.as_bytes())
+            .expect("right string already fits in the stack concat buffer");
+        let s = std::str::from_utf8(buf.as_slice())
+            .expect("concatenating valid UTF-8 strings must stay valid UTF-8");
+        return JsValue::String(Rc::from(s));
+    }
+
+    let mut result = String::with_capacity(total);
+    result.push_str(l);
+    result.push_str(r);
+    JsValue::String(Rc::from(result))
+}
+
+/// Concatenate two `Rc<str>` values, reusing existing allocations for empty
+/// operands when possible.
+///
+/// The caller must already have validated `MAX_STRING_LEN`.
+#[inline]
+pub(super) fn concat_rc_strs(l: &Rc<str>, r: &Rc<str>) -> JsValue {
+    if l.is_empty() {
+        return JsValue::String(Rc::clone(r));
+    }
+    if r.is_empty() {
+        return JsValue::String(Rc::clone(l));
+    }
+    concat_str_slices(l, r)
 }
 
 /// ECMAScript §13.15.3 **ApplyStringOrNumericBinaryOperator** for `+`.
@@ -7470,9 +7485,8 @@ pub(super) fn concat_rc_strs(l: &str, r: &str) -> JsValue {
 ///
 /// BigInt operands are added together; mixing BigInt and Number is a TypeError.
 ///
-/// String concatenation reuses a thread-local buffer so that chains like
-/// `a + b + c + d` avoid allocating a fresh `String` for every intermediate
-/// result.
+/// String concatenation uses a stack buffer for small results and exact
+/// capacity pre-allocation for larger ones.
 pub(super) fn js_add(lhs: &JsValue, rhs: &JsValue) -> StatorResult<JsValue> {
     // §12.8.3 step 1-2: ToPrimitive on both operands.
     let lprim = lhs.to_primitive(crate::objects::value::ToPrimitiveHint::Default)?;
@@ -7480,13 +7494,21 @@ pub(super) fn js_add(lhs: &JsValue, rhs: &JsValue) -> StatorResult<JsValue> {
 
     // §12.8.3 step 3: if either primitive is a string, concatenate.
     if lprim.is_string() || rprim.is_string() {
+        if let (JsValue::String(l), JsValue::String(r)) = (&lprim, &rprim) {
+            let total = l.len().saturating_add(r.len());
+            if total > crate::builtins::string::MAX_STRING_LEN {
+                return Err(StatorError::RangeError("Invalid string length".into()));
+            }
+            return Ok(concat_rc_strs(l, r));
+        }
+
         let l = lprim.to_js_string()?;
         let r = rprim.to_js_string()?;
         let total = l.len().saturating_add(r.len());
         if total > crate::builtins::string::MAX_STRING_LEN {
             return Err(StatorError::RangeError("Invalid string length".into()));
         }
-        Ok(concat_rc_strs(&l, &r))
+        Ok(concat_str_slices(&l, &r))
     } else if lprim.is_bigint() || rprim.is_bigint() {
         let l = to_bigint(&lprim)?;
         let r = to_bigint(&rprim)?;
@@ -12342,6 +12364,36 @@ mod tests {
         assert_eq!(arith_op(0, 0, Opcode::Add).unwrap(), JsValue::Smi(0));
         assert_eq!(arith_op(-5, 5, Opcode::Add).unwrap(), JsValue::Smi(0));
         assert_eq!(arith_op(100, 200, Opcode::Add).unwrap(), JsValue::Smi(300));
+    }
+
+    #[test]
+    fn test_concat_rc_strs_reuses_empty_operand() {
+        let empty: Rc<str> = Rc::from("");
+        let text: Rc<str> = Rc::from("hello");
+
+        let left_empty = concat_rc_strs(&empty, &text);
+        let right_empty = concat_rc_strs(&text, &empty);
+
+        let JsValue::String(left_empty) = left_empty else {
+            panic!("expected string result");
+        };
+        let JsValue::String(right_empty) = right_empty else {
+            panic!("expected string result");
+        };
+
+        assert!(Rc::ptr_eq(&left_empty, &text));
+        assert!(Rc::ptr_eq(&right_empty, &text));
+    }
+
+    #[test]
+    fn test_js_add_fast_path_concatenates_strings() {
+        let lhs = JsValue::String(Rc::from("foo"));
+        let rhs = JsValue::String(Rc::from("bar"));
+
+        assert_eq!(
+            js_add(&lhs, &rhs).unwrap(),
+            JsValue::String(Rc::from("foobar"))
+        );
     }
 
     #[test]
