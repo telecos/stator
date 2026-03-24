@@ -11546,6 +11546,46 @@ fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsVal
     JsValue::Undefined
 }
 
+fn proto_lookup_chain_rc(current: &JsValue, key: &Rc<str>, this_obj: &JsValue) -> JsValue {
+    let key_str = key.as_ref();
+    let mut current = current.clone();
+    for _ in 0..256 {
+        if matches!(current, JsValue::Null | JsValue::Undefined) {
+            return JsValue::Undefined;
+        }
+        if let JsValue::PlainObject(ref map) = current {
+            let borrow = map.borrow();
+            if borrow.has_accessors
+                && let Some(getter) = borrow.get_getter_for(key_str).cloned()
+            {
+                drop(borrow);
+                return match dispatch_getter(&getter, this_obj) {
+                    Ok(v) => v,
+                    Err(_) => JsValue::Undefined,
+                };
+            }
+            if let Some(val) = borrow.get_by_rc(key) {
+                return val.clone();
+            }
+            let next = plain_object_proto_value(&borrow);
+            if next.is_none() && is_known_object_prototype_builtin(key_str) {
+                drop(borrow);
+                return object_prototype_builtin(this_obj, key_str).unwrap_or(JsValue::Undefined);
+            }
+            if let Some(next) = next {
+                drop(borrow);
+                current = next;
+                continue;
+            }
+        }
+        break;
+    }
+    if let Some(builtin) = object_prototype_builtin(this_obj, key_str) {
+        return builtin;
+    }
+    JsValue::Undefined
+}
+
 /// Invoke a getter accessor function.
 ///
 /// The getter may be a `JsValue::Function` (bytecode) or
@@ -11568,6 +11608,182 @@ fn dispatch_getter(getter: &JsValue, this: &JsValue) -> StatorResult<JsValue> {
         JsValue::NativeFunction(f) => f(vec![this.clone()]),
         _ => Ok(JsValue::Undefined),
     }
+}
+
+/// Variant of [`proto_lookup`] for interned property keys.
+pub(super) fn proto_lookup_rc(obj: &JsValue, key: &Rc<str>) -> JsValue {
+    if let JsValue::PlainObject(map) = obj {
+        let key_str = key.as_ref();
+        let borrow = map.borrow();
+        let proto_generation = borrow.proto_generation();
+        if let Some((cached, _depth)) = proto_cache_lookup(map, key_str, proto_generation) {
+            return cached;
+        }
+        if borrow.has_accessors
+            && let Some(getter) = borrow.get_getter_for(key_str).cloned()
+        {
+            drop(borrow);
+            return match dispatch_getter(&getter, obj) {
+                Ok(v) => v,
+                Err(_) => JsValue::Undefined,
+            };
+        }
+        if let Some(val) = borrow.get_by_rc(key) {
+            return val.clone();
+        }
+        if borrow
+            .get("__is_array__")
+            .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
+        {
+            drop(borrow);
+            return array_literal_proto_lookup(obj, key_str);
+        }
+        let explicit_proto = plain_object_proto_value(&borrow);
+        if key_str == "__proto__" {
+            if let Some(proto) = explicit_proto.clone() {
+                return proto;
+            }
+            drop(borrow);
+            return JsValue::Undefined;
+        }
+        if explicit_proto.is_none() {
+            if let Some(builtin) = object_prototype_builtin(obj, key_str) {
+                drop(borrow);
+                proto_cache_store(map, key_str, proto_generation, &builtin, 1);
+                return builtin;
+            }
+            match key_str {
+                "__lookupGetter__" => {
+                    let map = Rc::clone(map);
+                    let cache_map = Rc::clone(&map);
+                    drop(borrow);
+                    let value = JsValue::NativeFunction(Rc::new(move |args| {
+                        let prop = match args.first() {
+                            Some(JsValue::String(s)) => s.to_string(),
+                            Some(v) => js_to_string(v),
+                            None => return Ok(JsValue::Undefined),
+                        };
+                        let getter_key = format!("__get_{prop}__");
+                        let mut cur = JsValue::PlainObject(Rc::clone(&map));
+                        for _ in 0..256 {
+                            if let JsValue::PlainObject(ref m) = cur {
+                                let b = m.borrow();
+                                if b.has_accessors
+                                    && let Some(g) = b.get(&getter_key)
+                                {
+                                    return Ok(g.clone());
+                                }
+                                match plain_object_proto_value(&b) {
+                                    Some(next) => {
+                                        drop(b);
+                                        cur = next;
+                                        continue;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            break;
+                        }
+                        Ok(JsValue::Undefined)
+                    }));
+                    proto_cache_store(&cache_map, key_str, proto_generation, &value, 1);
+                    return value;
+                }
+                "__lookupSetter__" => {
+                    let map = Rc::clone(map);
+                    let cache_map = Rc::clone(&map);
+                    drop(borrow);
+                    let value = JsValue::NativeFunction(Rc::new(move |args| {
+                        let prop = match args.first() {
+                            Some(JsValue::String(s)) => s.to_string(),
+                            Some(v) => js_to_string(v),
+                            None => return Ok(JsValue::Undefined),
+                        };
+                        let setter_key = format!("__set_{prop}__");
+                        let mut cur = JsValue::PlainObject(Rc::clone(&map));
+                        for _ in 0..256 {
+                            if let JsValue::PlainObject(ref m) = cur {
+                                let b = m.borrow();
+                                if b.has_accessors
+                                    && let Some(s) = b.get(&setter_key)
+                                {
+                                    return Ok(s.clone());
+                                }
+                                match plain_object_proto_value(&b) {
+                                    Some(next) => {
+                                        drop(b);
+                                        cur = next;
+                                        continue;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            break;
+                        }
+                        Ok(JsValue::Undefined)
+                    }));
+                    proto_cache_store(&cache_map, key_str, proto_generation, &value, 1);
+                    return value;
+                }
+                "__defineGetter__" => {
+                    let map = Rc::clone(map);
+                    let cache_map = Rc::clone(&map);
+                    drop(borrow);
+                    let value = JsValue::NativeFunction(Rc::new(move |args| {
+                        let prop = match args.first() {
+                            Some(JsValue::String(s)) => s.to_string(),
+                            Some(v) => js_to_string(v),
+                            None => return Ok(JsValue::Undefined),
+                        };
+                        let getter = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        let getter_key = format!("__get_{prop}__");
+                        map.borrow_mut().insert(getter_key, getter);
+                        Ok(JsValue::Undefined)
+                    }));
+                    proto_cache_store(&cache_map, key_str, proto_generation, &value, 1);
+                    return value;
+                }
+                "__defineSetter__" => {
+                    let map = Rc::clone(map);
+                    let cache_map = Rc::clone(&map);
+                    drop(borrow);
+                    let value = JsValue::NativeFunction(Rc::new(move |args| {
+                        let prop = match args.first() {
+                            Some(JsValue::String(s)) => s.to_string(),
+                            Some(v) => js_to_string(v),
+                            None => return Ok(JsValue::Undefined),
+                        };
+                        let setter = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        let setter_key = format!("__set_{prop}__");
+                        map.borrow_mut().insert(setter_key, setter);
+                        Ok(JsValue::Undefined)
+                    }));
+                    proto_cache_store(&cache_map, key_str, proto_generation, &value, 1);
+                    return value;
+                }
+                _ => {}
+            }
+        }
+        if let Some(proto) = explicit_proto {
+            drop(borrow);
+            let result = proto_lookup_chain_rc(&proto, key, obj);
+            let depth = if matches!(result, JsValue::Undefined) {
+                0
+            } else if let Some(depth) = proto_lookup_chain_depth(&proto, key_str) {
+                depth
+            } else if is_known_object_prototype_builtin(key_str) {
+                implicit_object_prototype_depth(&proto)
+            } else {
+                0
+            };
+            proto_cache_store(map, key_str, proto_generation, &result, depth);
+            return result;
+        }
+        drop(borrow);
+        proto_cache_store(map, key_str, proto_generation, &JsValue::Undefined, 0);
+        return JsValue::Undefined;
+    }
+    proto_lookup(obj, key.as_ref())
 }
 
 /// Invoke a setter accessor function with the given value.

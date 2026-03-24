@@ -29,11 +29,11 @@ use super::{
     make_construct_this, maybe_cache_construct_boilerplate, maybe_compile_baseline,
     maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator, number_to_jsvalue,
     plain_object_has_own_property, plain_object_to_array_items, populate_self_name, proto_lookup,
-    proto_lookup_cached_resolution, proto_lookup_chain_depth, resolve_construct_proto,
-    resolve_jump, restore_closure_context, run_callee_pooled, set_function_name_if_missing,
-    set_pending_exception, settle_async_iterator_result, strict_eq, to_array_index, to_bigint,
-    to_property_key, try_execute_best_jit, try_fast_named_property_lookup,
-    try_inline_small_function, walk_context_chain,
+    proto_lookup_cached_resolution, proto_lookup_chain_depth, proto_lookup_rc,
+    resolve_construct_proto, resolve_jump, restore_closure_context, run_callee_pooled,
+    set_function_name_if_missing, set_pending_exception, settle_async_iterator_result, strict_eq,
+    to_array_index, to_bigint, to_property_key, try_execute_best_jit,
+    try_fast_named_property_lookup, try_inline_small_function, walk_context_chain,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
@@ -3824,7 +3824,7 @@ fn handle_lda_named_property(
     let result = if let Some(result) = try_fast_named_property_lookup(&obj, &prop_name) {
         result
     } else {
-        let result = proto_lookup(&obj, &prop_name);
+        let result = proto_lookup_rc(&obj, &prop_name);
         if let JsValue::PlainObject(ref map) = obj
             && !matches!(result, JsValue::Undefined)
         {
@@ -4137,7 +4137,7 @@ fn handle_sta_named_property(
                     }
                     return Ok(DispatchAction::Continue);
                 }
-                Err(val) => map.borrow_mut().insert(prop_name.to_string(), val),
+                Err(val) => map.borrow_mut().insert_rc(Rc::clone(&prop_name), val),
             }
             // Populate megamorphic store IC for future fast-path stores.
             if slot != u32::MAX {
@@ -4189,7 +4189,7 @@ fn handle_sta_named_property(
             }
         }
         JsValue::Error(ref e) => {
-            e.props.borrow_mut().insert(prop_name.to_string(), val);
+            e.props.borrow_mut().insert_rc(Rc::clone(&prop_name), val);
         }
         _ => {}
     }
@@ -4865,7 +4865,7 @@ fn handle_copy_data_properties(
                             || k.starts_with("Symbol(")
                             || k.starts_with('.'))
                     })
-                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .map(|(k, v)| (k.to_string(), v.clone()))
                     .collect();
                 for (k, v) in entries {
                     t.borrow_mut().insert(k, v);
@@ -5994,7 +5994,7 @@ fn handle_for_in_enumerate(
                     if let Some(prop) = k.strip_prefix("__get_").and_then(|s| s.strip_suffix("__"))
                     {
                         seen.insert(k.clone());
-                        if seen.insert(prop.to_string()) && is_enumerable {
+                        if seen.insert(prop.to_string().into()) && is_enumerable {
                             all_keys.push(JsValue::String(prop.to_string().into()));
                         }
                         continue;
@@ -6002,7 +6002,7 @@ fn handle_for_in_enumerate(
                     if let Some(prop) = k.strip_prefix("__set_").and_then(|s| s.strip_suffix("__"))
                     {
                         seen.insert(k.clone());
-                        if seen.insert(prop.to_string()) && is_enumerable {
+                        if seen.insert(prop.to_string().into()) && is_enumerable {
                             all_keys.push(JsValue::String(prop.to_string().into()));
                         }
                         continue;
@@ -6023,7 +6023,7 @@ fn handle_for_in_enumerate(
                     // Regular property: add to seen for shadowing, push if
                     // enumerable and not already seen at a higher level.
                     if seen.insert(k.clone()) && is_enumerable {
-                        all_keys.push(JsValue::String(k.clone().into()));
+                        all_keys.push(JsValue::String(k.clone()));
                     }
                 }
                 current_map = borrow.get("__proto__").and_then(|v| {
@@ -6629,7 +6629,7 @@ fn store_with_binding(context: &Option<JsValue>, name: &str, value: &JsValue) ->
         if let Some(JsValue::PlainObject(map)) = object
             && with_object_has_binding(&JsValue::PlainObject(Rc::clone(&map)), name)
         {
-            map.borrow_mut().insert(name.to_string(), value.clone());
+            map.borrow_mut().insert(name.into(), value.clone());
             return true;
         }
         current = parent;
@@ -6895,7 +6895,7 @@ fn handle_lda_named_property_from_super(
     ctx.frame.accumulator = if matches!(lookup_start, JsValue::Undefined | JsValue::Null) {
         JsValue::Undefined
     } else {
-        proto_lookup(&lookup_start, &prop_name)
+        proto_lookup_rc(&lookup_start, &prop_name)
     };
     Ok(DispatchAction::Continue)
 }

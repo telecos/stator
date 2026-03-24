@@ -532,7 +532,12 @@ impl DomObjectWrap {
             names.extend(enumerator(self.data_ptr()));
         }
         // Then own-property names.
-        let mut own: Vec<String> = self.properties.borrow().keys().cloned().collect();
+        let mut own: Vec<String> = self
+            .properties
+            .borrow()
+            .keys()
+            .map(|k| k.to_string())
+            .collect();
         own.sort();
         names.extend(own);
         names
