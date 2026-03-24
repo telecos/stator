@@ -354,7 +354,7 @@ fn handle_nop(_ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<
 
 #[inline(always)]
 fn handle_lda_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
-    let Operand::Immediate(v) = instr.operands[0] else {
+    let Operand::Immediate(v) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaSmi", 0));
     };
     ctx.frame.accumulator = JsValue::Smi(v);
@@ -366,10 +366,10 @@ fn handle_lda_smi_star(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Immediate(v) = instr.operands[0] else {
+    let Operand::Immediate(v) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaSmiStar", 0));
     };
-    let Operand::Register(dst) = instr.operands[1] else {
+    let Operand::Register(dst) = *instr.operand(1) else {
         return Err(err_bad_operand("LdaSmiStar", 1));
     };
     let value = JsValue::Smi(v);
@@ -428,7 +428,7 @@ fn handle_lda_constant(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(idx) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaConstant", 0));
     };
     let entry =
@@ -441,7 +441,7 @@ fn handle_lda_constant(
 
 #[inline(always)]
 fn handle_ldar(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("Ldar", 0));
     };
     ctx.frame.accumulator = ctx.frame.read_reg(v)?.cheap_clone();
@@ -453,16 +453,16 @@ fn handle_ldar_add_star(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(src) = instr.operands[0] else {
+    let Operand::Register(src) = *instr.operand(0) else {
         return Err(err_bad_operand("LdarAddStar", 0));
     };
-    let Operand::Register(add_reg) = instr.operands[1] else {
+    let Operand::Register(add_reg) = *instr.operand(1) else {
         return Err(err_bad_operand("LdarAddStar", 1));
     };
-    let Operand::Register(dst) = instr.operands[2] else {
+    let Operand::Register(dst) = *instr.operand(2) else {
         return Err(err_bad_operand("LdarAddStar", 2));
     };
-    let Operand::FeedbackSlot(_slot) = instr.operands[3] else {
+    let Operand::FeedbackSlot(_slot) = *instr.operand(3) else {
         return Err(err_bad_operand("LdarAddStar", 3));
     };
 
@@ -489,16 +489,16 @@ fn handle_ldar_sub_star(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(src) = instr.operands[0] else {
+    let Operand::Register(src) = *instr.operand(0) else {
         return Err(err_bad_operand("LdarSubStar", 0));
     };
-    let Operand::Register(sub_reg) = instr.operands[1] else {
+    let Operand::Register(sub_reg) = *instr.operand(1) else {
         return Err(err_bad_operand("LdarSubStar", 1));
     };
-    let Operand::Register(dst) = instr.operands[2] else {
+    let Operand::Register(dst) = *instr.operand(2) else {
         return Err(err_bad_operand("LdarSubStar", 2));
     };
-    let Operand::FeedbackSlot(_slot) = instr.operands[3] else {
+    let Operand::FeedbackSlot(_slot) = *instr.operand(3) else {
         return Err(err_bad_operand("LdarSubStar", 3));
     };
 
@@ -533,16 +533,16 @@ fn handle_ldar_mul_star(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(src) = instr.operands[0] else {
+    let Operand::Register(src) = *instr.operand(0) else {
         return Err(err_bad_operand("LdarMulStar", 0));
     };
-    let Operand::Register(mul_reg) = instr.operands[1] else {
+    let Operand::Register(mul_reg) = *instr.operand(1) else {
         return Err(err_bad_operand("LdarMulStar", 1));
     };
-    let Operand::Register(dst) = instr.operands[2] else {
+    let Operand::Register(dst) = *instr.operand(2) else {
         return Err(err_bad_operand("LdarMulStar", 2));
     };
-    let Operand::FeedbackSlot(_slot) = instr.operands[3] else {
+    let Operand::FeedbackSlot(_slot) = *instr.operand(3) else {
         return Err(err_bad_operand("LdarMulStar", 3));
     };
 
@@ -578,7 +578,7 @@ fn handle_ldar_mul_star(
 
 #[inline(always)]
 fn handle_star(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("Star", 0));
     };
     let val = ctx.frame.accumulator.cheap_clone();
@@ -588,10 +588,10 @@ fn handle_star(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<D
 
 #[inline]
 fn handle_mov(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
-    let Operand::Register(src) = instr.operands[0] else {
+    let Operand::Register(src) = *instr.operand(0) else {
         return Err(err_bad_operand("Mov", 0));
     };
-    let Operand::Register(dst) = instr.operands[1] else {
+    let Operand::Register(dst) = *instr.operand(1) else {
         return Err(err_bad_operand("Mov", 1));
     };
     ctx.frame.copy_reg(src, dst)?;
@@ -600,7 +600,7 @@ fn handle_mov(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
 
 #[inline(always)]
 fn handle_add(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("Add", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
@@ -636,7 +636,7 @@ fn handle_add(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
 
 #[inline(always)]
 fn handle_sub(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("Sub", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
@@ -667,7 +667,7 @@ fn handle_sub(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
 
 #[inline(always)]
 fn handle_mul(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("Mul", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
@@ -697,7 +697,7 @@ fn handle_mul(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
 }
 
 fn handle_div(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("Div", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
@@ -735,7 +735,7 @@ fn handle_div(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
 }
 
 fn handle_mod(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("Mod", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
@@ -778,7 +778,7 @@ fn handle_mod(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
 }
 
 fn handle_exp(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("Exp", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
@@ -811,7 +811,7 @@ fn handle_bitwise_or(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("BitwiseOr", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
@@ -838,7 +838,7 @@ fn handle_bitwise_xor(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("BitwiseXor", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
@@ -866,7 +866,7 @@ fn handle_bitwise_and(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("BitwiseAnd", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
@@ -893,7 +893,7 @@ fn handle_shift_left(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("ShiftLeft", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
@@ -921,7 +921,7 @@ fn handle_shift_right(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("ShiftRight", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
@@ -949,7 +949,7 @@ fn handle_shift_right_logical(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("ShiftRightLogical", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
@@ -972,7 +972,7 @@ fn handle_shift_right_logical(
 
 #[inline]
 fn handle_add_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
-    let Operand::Immediate(imm) = instr.operands[0] else {
+    let Operand::Immediate(imm) = *instr.operand(0) else {
         return Err(err_bad_operand("AddSmi", 0));
     };
     // SMI fast path: accumulator + immediate Smi.
@@ -996,13 +996,13 @@ fn handle_add_smi_star(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Immediate(imm) = instr.operands[0] else {
+    let Operand::Immediate(imm) = *instr.operand(0) else {
         return Err(err_bad_operand("AddSmiStar", 0));
     };
-    let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+    let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
         return Err(err_bad_operand("AddSmiStar", 1));
     };
-    let Operand::Register(dst) = instr.operands[2] else {
+    let Operand::Register(dst) = *instr.operand(2) else {
         return Err(err_bad_operand("AddSmiStar", 2));
     };
 
@@ -1028,7 +1028,7 @@ fn handle_add_smi_star(
 
 #[inline]
 fn handle_sub_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
-    let Operand::Immediate(imm) = instr.operands[0] else {
+    let Operand::Immediate(imm) = *instr.operand(0) else {
         return Err(err_bad_operand("SubSmi", 0));
     };
     // SMI fast path: accumulator - immediate Smi.
@@ -1048,7 +1048,7 @@ fn handle_sub_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
 }
 
 fn handle_mul_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
-    let Operand::Immediate(imm) = instr.operands[0] else {
+    let Operand::Immediate(imm) = *instr.operand(0) else {
         return Err(err_bad_operand("MulSmi", 0));
     };
     // SMI fast path: accumulator * immediate Smi.
@@ -1072,13 +1072,13 @@ fn handle_mul_smi_star(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Immediate(imm) = instr.operands[0] else {
+    let Operand::Immediate(imm) = *instr.operand(0) else {
         return Err(err_bad_operand("MulSmiStar", 0));
     };
-    let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+    let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
         return Err(err_bad_operand("MulSmiStar", 1));
     };
-    let Operand::Register(dst) = instr.operands[2] else {
+    let Operand::Register(dst) = *instr.operand(2) else {
         return Err(err_bad_operand("MulSmiStar", 2));
     };
 
@@ -1103,7 +1103,7 @@ fn handle_mul_smi_star(
 }
 
 fn handle_div_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
-    let Operand::Immediate(imm) = instr.operands[0] else {
+    let Operand::Immediate(imm) = *instr.operand(0) else {
         return Err(err_bad_operand("DivSmi", 0));
     };
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
@@ -1119,7 +1119,7 @@ fn handle_div_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
 }
 
 fn handle_mod_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
-    let Operand::Immediate(imm) = instr.operands[0] else {
+    let Operand::Immediate(imm) = *instr.operand(0) else {
         return Err(err_bad_operand("ModSmi", 0));
     };
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
@@ -1135,7 +1135,7 @@ fn handle_mod_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
 }
 
 fn handle_exp_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
-    let Operand::Immediate(imm) = instr.operands[0] else {
+    let Operand::Immediate(imm) = *instr.operand(0) else {
         return Err(err_bad_operand("ExpSmi", 0));
     };
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
@@ -1156,7 +1156,7 @@ fn handle_bitwise_or_smi(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Immediate(imm) = instr.operands[0] else {
+    let Operand::Immediate(imm) = *instr.operand(0) else {
         return Err(err_bad_operand("BitwiseOrSmi", 0));
     };
     if let JsValue::Smi(lhs) = &ctx.frame.accumulator {
@@ -1176,7 +1176,7 @@ fn handle_bitwise_xor_smi(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Immediate(imm) = instr.operands[0] else {
+    let Operand::Immediate(imm) = *instr.operand(0) else {
         return Err(err_bad_operand("BitwiseXorSmi", 0));
     };
     if let JsValue::Smi(lhs) = &ctx.frame.accumulator {
@@ -1196,7 +1196,7 @@ fn handle_bitwise_and_smi(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Immediate(imm) = instr.operands[0] else {
+    let Operand::Immediate(imm) = *instr.operand(0) else {
         return Err(err_bad_operand("BitwiseAndSmi", 0));
     };
     if let JsValue::Smi(lhs) = &ctx.frame.accumulator {
@@ -1216,7 +1216,7 @@ fn handle_shift_left_smi(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Immediate(imm) = instr.operands[0] else {
+    let Operand::Immediate(imm) = *instr.operand(0) else {
         return Err(err_bad_operand("ShiftLeftSmi", 0));
     };
     if let JsValue::Smi(lhs) = &ctx.frame.accumulator {
@@ -1238,7 +1238,7 @@ fn handle_shift_right_smi(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Immediate(imm) = instr.operands[0] else {
+    let Operand::Immediate(imm) = *instr.operand(0) else {
         return Err(err_bad_operand("ShiftRightSmi", 0));
     };
     if let JsValue::Smi(lhs) = &ctx.frame.accumulator {
@@ -1260,7 +1260,7 @@ fn handle_shift_right_logical_smi(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Immediate(imm) = instr.operands[0] else {
+    let Operand::Immediate(imm) = *instr.operand(0) else {
         return Err(err_bad_operand("ShiftRightLogicalSmi", 0));
     };
     if let JsValue::Smi(lhs) = &ctx.frame.accumulator {
@@ -1300,10 +1300,10 @@ fn handle_inc(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<D
 
 #[inline(always)]
 fn handle_inc_star(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
-    let Operand::FeedbackSlot(_slot) = instr.operands[0] else {
+    let Operand::FeedbackSlot(_slot) = *instr.operand(0) else {
         return Err(err_bad_operand("IncStar", 0));
     };
-    let Operand::Register(dst) = instr.operands[1] else {
+    let Operand::Register(dst) = *instr.operand(1) else {
         return Err(err_bad_operand("IncStar", 1));
     };
     if let JsValue::Smi(n) = ctx.frame.accumulator {
@@ -1351,7 +1351,7 @@ fn handle_test_equal(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestEqual", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
@@ -1364,7 +1364,7 @@ fn handle_test_not_equal(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestNotEqual", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
@@ -1377,7 +1377,7 @@ fn handle_test_equal_strict(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestEqualStrict", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
@@ -1399,7 +1399,7 @@ fn handle_test_less_than(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestLessThan", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
@@ -1421,16 +1421,16 @@ fn handle_test_less_than_jump(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestLessThanJump", 0));
     };
-    let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+    let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
         return Err(err_bad_operand("TestLessThanJump", 1));
     };
-    let Operand::JumpOffset(_delta) = instr.operands[2] else {
+    let Operand::JumpOffset(_delta) = *instr.operand(2) else {
         return Err(err_bad_operand("TestLessThanJump", 2));
     };
-    let Operand::Flag(is_true_flag) = instr.operands[3] else {
+    let Operand::Flag(is_true_flag) = *instr.operand(3) else {
         return Err(err_bad_operand("TestLessThanJump", 3));
     };
 
@@ -1461,16 +1461,16 @@ fn handle_test_greater_than_jump(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestGreaterThanJump", 0));
     };
-    let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+    let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
         return Err(err_bad_operand("TestGreaterThanJump", 1));
     };
-    let Operand::JumpOffset(_delta) = instr.operands[2] else {
+    let Operand::JumpOffset(_delta) = *instr.operand(2) else {
         return Err(err_bad_operand("TestGreaterThanJump", 2));
     };
-    let Operand::Flag(is_true_flag) = instr.operands[3] else {
+    let Operand::Flag(is_true_flag) = *instr.operand(3) else {
         return Err(err_bad_operand("TestGreaterThanJump", 3));
     };
 
@@ -1502,16 +1502,16 @@ fn handle_test_equal_jump(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestEqualJump", 0));
     };
-    let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+    let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
         return Err(err_bad_operand("TestEqualJump", 1));
     };
-    let Operand::JumpOffset(_delta) = instr.operands[2] else {
+    let Operand::JumpOffset(_delta) = *instr.operand(2) else {
         return Err(err_bad_operand("TestEqualJump", 2));
     };
-    let Operand::Flag(is_true_flag) = instr.operands[3] else {
+    let Operand::Flag(is_true_flag) = *instr.operand(3) else {
         return Err(err_bad_operand("TestEqualJump", 3));
     };
 
@@ -1535,16 +1535,16 @@ fn handle_test_not_equal_jump(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestNotEqualJump", 0));
     };
-    let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+    let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
         return Err(err_bad_operand("TestNotEqualJump", 1));
     };
-    let Operand::JumpOffset(_delta) = instr.operands[2] else {
+    let Operand::JumpOffset(_delta) = *instr.operand(2) else {
         return Err(err_bad_operand("TestNotEqualJump", 2));
     };
-    let Operand::Flag(is_true_flag) = instr.operands[3] else {
+    let Operand::Flag(is_true_flag) = *instr.operand(3) else {
         return Err(err_bad_operand("TestNotEqualJump", 3));
     };
 
@@ -1568,16 +1568,16 @@ fn handle_test_equal_strict_jump(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestEqualStrictJump", 0));
     };
-    let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+    let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
         return Err(err_bad_operand("TestEqualStrictJump", 1));
     };
-    let Operand::JumpOffset(_delta) = instr.operands[2] else {
+    let Operand::JumpOffset(_delta) = *instr.operand(2) else {
         return Err(err_bad_operand("TestEqualStrictJump", 2));
     };
-    let Operand::Flag(is_true_flag) = instr.operands[3] else {
+    let Operand::Flag(is_true_flag) = *instr.operand(3) else {
         return Err(err_bad_operand("TestEqualStrictJump", 3));
     };
 
@@ -1608,16 +1608,16 @@ fn handle_test_less_than_or_equal_jump(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestLessThanOrEqualJump", 0));
     };
-    let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+    let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
         return Err(err_bad_operand("TestLessThanOrEqualJump", 1));
     };
-    let Operand::JumpOffset(_delta) = instr.operands[2] else {
+    let Operand::JumpOffset(_delta) = *instr.operand(2) else {
         return Err(err_bad_operand("TestLessThanOrEqualJump", 2));
     };
-    let Operand::Flag(is_true_flag) = instr.operands[3] else {
+    let Operand::Flag(is_true_flag) = *instr.operand(3) else {
         return Err(err_bad_operand("TestLessThanOrEqualJump", 3));
     };
 
@@ -1650,16 +1650,16 @@ fn handle_test_greater_than_or_equal_jump(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestGreaterThanOrEqualJump", 0));
     };
-    let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+    let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
         return Err(err_bad_operand("TestGreaterThanOrEqualJump", 1));
     };
-    let Operand::JumpOffset(_delta) = instr.operands[2] else {
+    let Operand::JumpOffset(_delta) = *instr.operand(2) else {
         return Err(err_bad_operand("TestGreaterThanOrEqualJump", 2));
     };
-    let Operand::Flag(is_true_flag) = instr.operands[3] else {
+    let Operand::Flag(is_true_flag) = *instr.operand(3) else {
         return Err(err_bad_operand("TestGreaterThanOrEqualJump", 3));
     };
 
@@ -1692,13 +1692,13 @@ fn handle_sub_smi_star(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Immediate(imm) = instr.operands[0] else {
+    let Operand::Immediate(imm) = *instr.operand(0) else {
         return Err(err_bad_operand("SubSmiStar", 0));
     };
-    let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+    let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
         return Err(err_bad_operand("SubSmiStar", 1));
     };
-    let Operand::Register(dst) = instr.operands[2] else {
+    let Operand::Register(dst) = *instr.operand(2) else {
         return Err(err_bad_operand("SubSmiStar", 2));
     };
 
@@ -1727,7 +1727,7 @@ fn handle_test_greater_than(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestGreaterThan", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
@@ -1750,7 +1750,7 @@ fn handle_test_less_than_or_equal(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestLessThanOrEqual", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
@@ -1775,7 +1775,7 @@ fn handle_test_greater_than_or_equal(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestGreaterThanOrEqual", 0));
     };
     let rhs = ctx.frame.read_reg(v)?;
@@ -1833,7 +1833,7 @@ fn handle_to_boolean_logical_not(
 
 #[inline(always)]
 fn handle_jump(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(_delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = *instr.operand(0) else {
         return Err(err_bad_operand("Jump", 0));
     };
     ctx.frame.pc = resolve_cached_jump(ctx, "Jump")?;
@@ -1844,7 +1844,7 @@ fn handle_jump_loop(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(_delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpLoop", 0));
     };
     ctx.frame.pc = resolve_cached_jump(ctx, "JumpLoop")?;
@@ -1868,7 +1868,7 @@ fn handle_jump_if_true(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(_delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfTrue", 0));
     };
     if matches!(ctx.frame.accumulator, JsValue::Boolean(true)) {
@@ -1882,7 +1882,7 @@ fn handle_jump_if_false(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(_delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfFalse", 0));
     };
     if matches!(ctx.frame.accumulator, JsValue::Boolean(false)) {
@@ -1896,7 +1896,7 @@ fn handle_jump_if_to_boolean_true(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(_delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfToBooleanTrue", 0));
     };
     if ctx.frame.accumulator.to_boolean() {
@@ -1910,7 +1910,7 @@ fn handle_jump_if_to_boolean_false(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(_delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfToBooleanFalse", 0));
     };
     if !ctx.frame.accumulator.to_boolean() {
@@ -1923,7 +1923,7 @@ fn handle_jump_if_null(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(_delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfNull", 0));
     };
     if ctx.frame.accumulator.is_null() {
@@ -1936,7 +1936,7 @@ fn handle_jump_if_not_null(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(_delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfNotNull", 0));
     };
     if !ctx.frame.accumulator.is_null() {
@@ -1949,7 +1949,7 @@ fn handle_jump_if_undefined(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(_delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfUndefined", 0));
     };
     if ctx.frame.accumulator.is_undefined() {
@@ -1962,7 +1962,7 @@ fn handle_jump_if_not_undefined(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(_delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfNotUndefined", 0));
     };
     if !ctx.frame.accumulator.is_undefined() {
@@ -1975,7 +1975,7 @@ fn handle_jump_if_undefined_or_null(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(_delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfUndefinedOrNull", 0));
     };
     if ctx.frame.accumulator.is_nullish() {
@@ -1994,7 +1994,7 @@ fn handle_create_closure(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(idx) = *instr.operand(0) else {
         return Err(err_bad_operand("CreateClosure", 0));
     };
     let entry = ctx.frame.bytecode_array.get_constant(idx).ok_or_else(|| {
@@ -2017,7 +2017,7 @@ fn handle_create_closure(
     let func_rc = Rc::new(ba.clone_for_closure(closure_ctx));
 
     // Non-arrow functions (flag == 0) get a .prototype property per ES §10.2.5.
-    let is_arrow = matches!(instr.operands.get(2), Some(Operand::Flag(1)));
+    let is_arrow = matches!(instr.operand_at(2), Some(Operand::Flag(1)));
     // Arrow functions lexically capture `new.target` from the enclosing scope
     // (ES §15.3.4) so it survives even when the arrow is called later from a
     // different context.
@@ -2052,13 +2052,13 @@ fn handle_call_any_receiver(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(callee_v) = instr.operands[0] else {
+    let Operand::Register(callee_v) = *instr.operand(0) else {
         return Err(err_bad_operand("CallAnyReceiver", 0));
     };
-    let Operand::Register(args_start_v) = instr.operands[1] else {
+    let Operand::Register(args_start_v) = *instr.operand(1) else {
         return Err(err_bad_operand("CallAnyReceiver", 1));
     };
-    let Operand::RegisterCount(arg_count) = instr.operands[2] else {
+    let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
         return Err(err_bad_operand("CallAnyReceiver", 2));
     };
     let callee = ctx.frame.read_reg(callee_v)?.clone();
@@ -2148,13 +2148,13 @@ fn handle_tail_call(
     if !ctx.frame.bytecode_array.is_strict() {
         return handle_call_any_receiver(ctx, instr);
     }
-    let Operand::Register(callee_v) = instr.operands[0] else {
+    let Operand::Register(callee_v) = *instr.operand(0) else {
         return Err(err_bad_operand("TailCall", 0));
     };
-    let Operand::Register(args_start_v) = instr.operands[1] else {
+    let Operand::Register(args_start_v) = *instr.operand(1) else {
         return Err(err_bad_operand("TailCall", 1));
     };
-    let Operand::RegisterCount(arg_count) = instr.operands[2] else {
+    let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
         return Err(err_bad_operand("TailCall", 2));
     };
     let callee = ctx.frame.read_reg(callee_v)?.clone();
@@ -2271,7 +2271,7 @@ fn handle_call_undefined_receiver0(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(callee_v) = instr.operands[0] else {
+    let Operand::Register(callee_v) = *instr.operand(0) else {
         return Err(err_bad_operand("CallUndefinedReceiver0", 0));
     };
     let callee = ctx.frame.read_reg(callee_v)?.clone();
@@ -2391,10 +2391,10 @@ fn handle_call_undefined_receiver1(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(callee_v) = instr.operands[0] else {
+    let Operand::Register(callee_v) = *instr.operand(0) else {
         return Err(err_bad_operand("CallUndefinedReceiver1", 0));
     };
-    let Operand::Register(arg1_v) = instr.operands[1] else {
+    let Operand::Register(arg1_v) = *instr.operand(1) else {
         return Err(err_bad_operand("CallUndefinedReceiver1", 1));
     };
     let callee = ctx.frame.read_reg(callee_v)?.clone();
@@ -2521,13 +2521,13 @@ fn handle_call_undefined_receiver2(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(callee_v) = instr.operands[0] else {
+    let Operand::Register(callee_v) = *instr.operand(0) else {
         return Err(err_bad_operand("CallUndefinedReceiver2", 0));
     };
-    let Operand::Register(arg1_v) = instr.operands[1] else {
+    let Operand::Register(arg1_v) = *instr.operand(1) else {
         return Err(err_bad_operand("CallUndefinedReceiver2", 1));
     };
-    let Operand::Register(arg2_v) = instr.operands[2] else {
+    let Operand::Register(arg2_v) = *instr.operand(2) else {
         return Err(err_bad_operand("CallUndefinedReceiver2", 2));
     };
     let callee = ctx.frame.read_reg(callee_v)?.clone();
@@ -2642,13 +2642,13 @@ fn handle_call_property(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(callee_v) = instr.operands[0] else {
+    let Operand::Register(callee_v) = *instr.operand(0) else {
         return Err(err_bad_operand("CallProperty", 0));
     };
-    let Operand::Register(recv_v) = instr.operands[1] else {
+    let Operand::Register(recv_v) = *instr.operand(1) else {
         return Err(err_bad_operand("CallProperty", 1));
     };
-    let Operand::RegisterCount(arg_count) = instr.operands[2] else {
+    let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
         return Err(err_bad_operand("CallProperty", 2));
     };
     let callee = ctx.frame.read_reg(callee_v)?.clone();
@@ -2792,13 +2792,13 @@ fn handle_call_with_spread(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(callee_v) = instr.operands[0] else {
+    let Operand::Register(callee_v) = *instr.operand(0) else {
         return Err(err_bad_operand("CallWithSpread", 0));
     };
-    let Operand::Register(args_start_v) = instr.operands[1] else {
+    let Operand::Register(args_start_v) = *instr.operand(1) else {
         return Err(err_bad_operand("CallWithSpread", 1));
     };
-    let Operand::RegisterCount(arg_count) = instr.operands[2] else {
+    let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
         return Err(err_bad_operand("CallWithSpread", 2));
     };
     let callee = ctx.frame.read_reg(callee_v)?.clone();
@@ -3050,13 +3050,13 @@ fn handle_construct(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(ctor_v) = instr.operands[0] else {
+    let Operand::Register(ctor_v) = *instr.operand(0) else {
         return Err(err_bad_operand("Construct", 0));
     };
-    let Operand::Register(args_start_v) = instr.operands[1] else {
+    let Operand::Register(args_start_v) = *instr.operand(1) else {
         return Err(err_bad_operand("Construct", 1));
     };
-    let Operand::RegisterCount(arg_count) = instr.operands[2] else {
+    let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
         return Err(err_bad_operand("Construct", 2));
     };
     let ctor = ctx.frame.read_reg(ctor_v)?.clone();
@@ -3156,13 +3156,13 @@ fn handle_construct_with_spread(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(ctor_v) = instr.operands[0] else {
+    let Operand::Register(ctor_v) = *instr.operand(0) else {
         return Err(err_bad_operand("ConstructWithSpread", 0));
     };
-    let Operand::Register(args_start_v) = instr.operands[1] else {
+    let Operand::Register(args_start_v) = *instr.operand(1) else {
         return Err(err_bad_operand("ConstructWithSpread", 1));
     };
-    let Operand::RegisterCount(arg_count) = instr.operands[2] else {
+    let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
         return Err(err_bad_operand("ConstructWithSpread", 2));
     };
     let ctor = ctx.frame.read_reg(ctor_v)?.clone();
@@ -3247,7 +3247,7 @@ fn handle_push_context(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("PushContext", 0));
     };
     // Encode None as Undefined so it can be stored in a register.
@@ -3261,7 +3261,7 @@ fn handle_pop_context(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("PopContext", 0));
     };
     let saved = ctx.frame.read_reg(v)?.clone();
@@ -3277,13 +3277,13 @@ fn handle_lda_context_slot(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(ctx_v) = instr.operands[0] else {
+    let Operand::Register(ctx_v) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaContextSlot", 0));
     };
-    let Operand::ConstantPoolIdx(slot_idx) = instr.operands[1] else {
+    let Operand::ConstantPoolIdx(slot_idx) = *instr.operand(1) else {
         return Err(err_bad_operand("LdaContextSlot", 1));
     };
-    let Operand::Immediate(depth) = instr.operands[2] else {
+    let Operand::Immediate(depth) = *instr.operand(2) else {
         return Err(err_bad_operand("LdaContextSlot", 2));
     };
     let ctx_val = ctx.frame.read_reg(ctx_v)?.clone();
@@ -3303,7 +3303,7 @@ fn handle_lda_current_context_slot(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(slot_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(slot_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaCurrentContextSlot", 0));
     };
     let ctx_val = ctx
@@ -3327,13 +3327,13 @@ fn handle_sta_context_slot(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(ctx_v) = instr.operands[0] else {
+    let Operand::Register(ctx_v) = *instr.operand(0) else {
         return Err(err_bad_operand("StaContextSlot", 0));
     };
-    let Operand::ConstantPoolIdx(slot_idx) = instr.operands[1] else {
+    let Operand::ConstantPoolIdx(slot_idx) = *instr.operand(1) else {
         return Err(err_bad_operand("StaContextSlot", 1));
     };
-    let Operand::Immediate(depth) = instr.operands[2] else {
+    let Operand::Immediate(depth) = *instr.operand(2) else {
         return Err(err_bad_operand("StaContextSlot", 2));
     };
     let ctx_val = ctx.frame.read_reg(ctx_v)?.clone();
@@ -3352,7 +3352,7 @@ fn handle_sta_current_context_slot(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(slot_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(slot_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("StaCurrentContextSlot", 0));
     };
     let ctx_val = ctx
@@ -3376,7 +3376,7 @@ fn handle_create_function_context(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Immediate(slot_count) = instr.operands[1] else {
+    let Operand::Immediate(slot_count) = *instr.operand(1) else {
         return Err(err_bad_operand("CreateFunctionContext", 1));
     };
     let parent = match &ctx.frame.context {
@@ -3407,7 +3407,7 @@ fn handle_create_eval_context(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Immediate(slot_count) = instr.operands[1] else {
+    let Operand::Immediate(slot_count) = *instr.operand(1) else {
         return Err(err_bad_operand("CreateEvalContext", 1));
     };
     let parent = match &ctx.frame.context {
@@ -3424,7 +3424,7 @@ fn handle_create_catch_context(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(exc_v) = instr.operands[0] else {
+    let Operand::Register(exc_v) = *instr.operand(0) else {
         return Err(err_bad_operand("CreateCatchContext", 0));
     };
     let exception = ctx.frame.read_reg(exc_v)?.clone();
@@ -3443,7 +3443,7 @@ fn handle_create_with_context(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("CreateWithContext", 0));
     };
     let obj = ctx.frame.read_reg(obj_v)?.clone();
@@ -3510,7 +3510,7 @@ fn handle_lda_global(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaGlobal", 0));
     };
 
@@ -3560,13 +3560,13 @@ fn handle_lda_global_star(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaGlobalStar", 0));
     };
-    let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+    let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
         return Err(err_bad_operand("LdaGlobalStar", 1));
     };
-    let Operand::Register(dst) = instr.operands[2] else {
+    let Operand::Register(dst) = *instr.operand(2) else {
         return Err(err_bad_operand("LdaGlobalStar", 2));
     };
 
@@ -3618,7 +3618,7 @@ fn handle_lda_global_inside_typeof(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaGlobalInsideTypeof", 0));
     };
 
@@ -3676,7 +3676,7 @@ fn handle_sta_global(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("StaGlobal", 0));
     };
     let name = ctx.frame.get_string_constant(name_idx)?;
@@ -3702,13 +3702,13 @@ fn handle_lda_named_property(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaNamedProperty", 0));
     };
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1) else {
         return Err(err_bad_operand("LdaNamedProperty", 1));
     };
-    let slot = if let Operand::FeedbackSlot(s) = instr.operands[2] {
+    let slot = if let Operand::FeedbackSlot(s) = *instr.operand(2) {
         s
     } else {
         u32::MAX
@@ -3965,13 +3965,13 @@ fn handle_sta_named_property(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("StaNamedProperty", 0));
     };
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1) else {
         return Err(err_bad_operand("StaNamedProperty", 1));
     };
-    let slot = if let Operand::FeedbackSlot(s) = instr.operands[2] {
+    let slot = if let Operand::FeedbackSlot(s) = *instr.operand(2) {
         s
     } else {
         u32::MAX
@@ -4202,7 +4202,7 @@ fn handle_lda_keyed_property(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaKeyedProperty", 0));
     };
     // ── Fast path: Smi key on PlainObject — O(1) HashMap lookup ──────
@@ -4255,10 +4255,10 @@ fn handle_sta_keyed_property(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("StaKeyedProperty", 0));
     };
-    let Operand::Register(key_v) = instr.operands[1] else {
+    let Operand::Register(key_v) = *instr.operand(1) else {
         return Err(err_bad_operand("StaKeyedProperty", 1));
     };
     // ── Fast path: Smi key on PlainObject — direct HashMap store ─────
@@ -4456,7 +4456,7 @@ fn handle_get_iterator(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(iter_v) = instr.operands[0] else {
+    let Operand::Register(iter_v) = *instr.operand(0) else {
         return Err(err_bad_operand("GetIterator", 0));
     };
     let iterable = ctx.frame.read_reg(iter_v)?.clone();
@@ -4561,7 +4561,7 @@ fn handle_get_async_iterator(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(iter_v) = instr.operands[0] else {
+    let Operand::Register(iter_v) = *instr.operand(0) else {
         return Err(err_bad_operand("GetAsyncIterator", 0));
     };
     let iterable = ctx.frame.read_reg(iter_v)?.clone();
@@ -4639,10 +4639,10 @@ fn handle_iterator_next(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(iter_v) = instr.operands[0] else {
+    let Operand::Register(iter_v) = *instr.operand(0) else {
         return Err(err_bad_operand("IteratorNext", 0));
     };
-    let Operand::Register(value_out_v) = instr.operands[1] else {
+    let Operand::Register(value_out_v) = *instr.operand(1) else {
         return Err(err_bad_operand("IteratorNext", 1));
     };
     let iter = ctx.frame.read_reg(iter_v)?.clone();
@@ -4765,7 +4765,7 @@ fn handle_iterator_close(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(iter_v) = instr.operands[0] else {
+    let Operand::Register(iter_v) = *instr.operand(0) else {
         return Err(err_bad_operand("IteratorClose", 0));
     };
     let iter = ctx.frame.read_reg(iter_v)?.clone();
@@ -4843,10 +4843,10 @@ fn handle_copy_data_properties(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(target_v) = instr.operands[0] else {
+    let Operand::Register(target_v) = *instr.operand(0) else {
         return Err(err_bad_operand("CopyDataProperties", 0));
     };
-    let Operand::Register(source_v) = instr.operands[1] else {
+    let Operand::Register(source_v) = *instr.operand(1) else {
         return Err(err_bad_operand("CopyDataProperties", 1));
     };
     let target = ctx.frame.read_reg(target_v)?.clone();
@@ -5055,7 +5055,7 @@ fn handle_test_type_of(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Flag(flag) = instr.operands[0] else {
+    let Operand::Flag(flag) = *instr.operand(0) else {
         return Err(err_bad_operand("TestTypeOf", 0));
     };
     let matches_type = match flag {
@@ -5130,7 +5130,7 @@ fn handle_to_object(
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     // operands[0] is a Register destination.
-    let Operand::Register(dst) = instr.operands[0] else {
+    let Operand::Register(dst) = *instr.operand(0) else {
         return Err(err_bad_operand("ToObject", 0));
     };
     let wrapped = match &ctx.frame.accumulator {
@@ -5272,7 +5272,7 @@ fn handle_to_object(
 fn handle_to_name(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
     // operands[0] is a Register destination.
     // Convert accumulator to a property key (string or symbol).
-    let Operand::Register(dst) = instr.operands[0] else {
+    let Operand::Register(dst) = *instr.operand(0) else {
         return Err(err_bad_operand("ToName", 0));
     };
     let key = match &ctx.frame.accumulator {
@@ -5345,7 +5345,7 @@ fn handle_create_array_literal(
     // operands: [ConstantPoolIdx, FeedbackSlot, Flag]
     //
     // Dense Vec storage — see handle_create_empty_array_literal for rationale.
-    let capacity = match instr.operands.get(2) {
+    let capacity = match instr.operand_at(2) {
         Some(Operand::Flag(hint)) => usize::from(*hint),
         _ => 0,
     };
@@ -5518,11 +5518,11 @@ fn handle_create_object_literal(
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     // operands: [ConstantPoolIdx, FeedbackSlot, Flag]
-    let slot = match instr.operands.get(1) {
+    let slot = match instr.operand_at(1) {
         Some(Operand::FeedbackSlot(s)) => Some(*s),
         _ => None,
     };
-    let capacity = match instr.operands.get(2) {
+    let capacity = match instr.operand_at(2) {
         Some(Operand::Flag(count)) if *count > 0 => *count as usize,
         _ => 4,
     };
@@ -5562,11 +5562,11 @@ fn handle_create_reg_exp_literal(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(pattern_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(pattern_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("CreateRegExpLiteral", 0));
     };
     // operands[1] = FeedbackSlot (ignored)
-    let Operand::Flag(flags_val) = instr.operands[2] else {
+    let Operand::Flag(flags_val) = *instr.operand(2) else {
         return Err(err_bad_operand("CreateRegExpLiteral", 2));
     };
     let pattern = match ctx.frame.bytecode_array.get_constant(pattern_idx) {
@@ -5608,10 +5608,10 @@ fn handle_sta_in_array_literal(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(arr_v) = instr.operands[0] else {
+    let Operand::Register(arr_v) = *instr.operand(0) else {
         return Err(err_bad_operand("StaInArrayLiteral", 0));
     };
-    let Operand::Register(idx_v) = instr.operands[1] else {
+    let Operand::Register(idx_v) = *instr.operand(1) else {
         return Err(err_bad_operand("StaInArrayLiteral", 1));
     };
     // operands[2] is a FeedbackSlot, ignored at runtime.
@@ -5654,10 +5654,10 @@ fn handle_define_named_own_property(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("DefineNamedOwnProperty", 0));
     };
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1) else {
         return Err(err_bad_operand("DefineNamedOwnProperty", 1));
     };
     // operands[2] is a FeedbackSlot, ignored at runtime.
@@ -5691,10 +5691,10 @@ fn handle_define_keyed_own_property(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("DefineKeyedOwnProperty", 0));
     };
-    let Operand::Register(key_v) = instr.operands[1] else {
+    let Operand::Register(key_v) = *instr.operand(1) else {
         return Err(err_bad_operand("DefineKeyedOwnProperty", 1));
     };
     // operands[2] = Flag (ignored), operands[3] = FeedbackSlot (ignored).
@@ -5714,10 +5714,10 @@ fn handle_define_keyed_own_property_in_literal(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("DefineKeyedOwnPropertyInLiteral", 0));
     };
-    let Operand::Register(key_v) = instr.operands[1] else {
+    let Operand::Register(key_v) = *instr.operand(1) else {
         return Err(err_bad_operand("DefineKeyedOwnPropertyInLiteral", 1));
     };
     // operands[2] = Flag (ignored), operands[3] = FeedbackSlot (ignored).
@@ -5737,7 +5737,7 @@ fn handle_test_instance_of(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestInstanceOf", 0));
     };
     let constructor = ctx.frame.read_reg(v)?.clone();
@@ -5895,7 +5895,7 @@ fn handle_test_instance_of(
 }
 
 fn handle_test_in(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestIn", 0));
     };
     let object = ctx.frame.read_reg(v)?.clone();
@@ -5971,7 +5971,7 @@ fn handle_for_in_enumerate(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("ForInEnumerate", 0));
     };
     let obj = ctx.frame.read_reg(obj_v)?.clone();
@@ -6097,7 +6097,7 @@ fn handle_for_in_prepare(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(keys_v) = instr.operands[0] else {
+    let Operand::Register(keys_v) = *instr.operand(0) else {
         return Err(err_bad_operand("ForInPrepare", 0));
     };
     // operands[1] is a FeedbackSlot, ignored at runtime.
@@ -6114,13 +6114,13 @@ fn handle_for_in_next(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(_receiver_v) = instr.operands[0] else {
+    let Operand::Register(_receiver_v) = *instr.operand(0) else {
         return Err(err_bad_operand("ForInNext", 0));
     };
-    let Operand::Register(idx_v) = instr.operands[1] else {
+    let Operand::Register(idx_v) = *instr.operand(1) else {
         return Err(err_bad_operand("ForInNext", 1));
     };
-    let Operand::Register(keys_v) = instr.operands[2] else {
+    let Operand::Register(keys_v) = *instr.operand(2) else {
         return Err(err_bad_operand("ForInNext", 2));
     };
     // operands[3] is a FeedbackSlot, ignored at runtime.
@@ -6152,7 +6152,7 @@ fn handle_for_in_step(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(idx_v) = instr.operands[0] else {
+    let Operand::Register(idx_v) = *instr.operand(0) else {
         return Err(err_bad_operand("ForInStep", 0));
     };
     let idx = match ctx.frame.read_reg(idx_v)? {
@@ -6167,13 +6167,13 @@ fn handle_jump_if_for_in_done(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(_delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfForInDone", 0));
     };
-    let Operand::Register(idx_v) = instr.operands[1] else {
+    let Operand::Register(idx_v) = *instr.operand(1) else {
         return Err(err_bad_operand("JumpIfForInDone", 1));
     };
-    let Operand::Register(len_v) = instr.operands[2] else {
+    let Operand::Register(len_v) = *instr.operand(2) else {
         return Err(err_bad_operand("JumpIfForInDone", 2));
     };
     let idx = match ctx.frame.read_reg(idx_v)? {
@@ -6194,7 +6194,7 @@ fn handle_delete_property_sloppy(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("DeletePropertySloppy", 0));
     };
     let key = to_property_key(&ctx.frame.accumulator)?;
@@ -6241,7 +6241,7 @@ fn handle_delete_property_strict(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("DeletePropertyStrict", 0));
     };
     let key = to_property_key(&ctx.frame.accumulator)?;
@@ -6380,7 +6380,7 @@ fn handle_throw_reference_error_if_hole(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("ThrowReferenceErrorIfHole", 0));
     };
     if ctx.frame.accumulator == JsValue::TheHole {
@@ -6448,10 +6448,10 @@ fn handle_call_property0(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(callee_v) = instr.operands[0] else {
+    let Operand::Register(callee_v) = *instr.operand(0) else {
         return Err(err_bad_operand("CallProperty0", 0));
     };
-    let Operand::Register(recv_v) = instr.operands[1] else {
+    let Operand::Register(recv_v) = *instr.operand(1) else {
         return Err(err_bad_operand("CallProperty0", 1));
     };
     let callee = ctx.frame.read_reg(callee_v)?.clone();
@@ -6464,13 +6464,13 @@ fn handle_call_property1(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(callee_v) = instr.operands[0] else {
+    let Operand::Register(callee_v) = *instr.operand(0) else {
         return Err(err_bad_operand("CallProperty1", 0));
     };
-    let Operand::Register(recv_v) = instr.operands[1] else {
+    let Operand::Register(recv_v) = *instr.operand(1) else {
         return Err(err_bad_operand("CallProperty1", 1));
     };
-    let Operand::Register(arg0_v) = instr.operands[2] else {
+    let Operand::Register(arg0_v) = *instr.operand(2) else {
         return Err(err_bad_operand("CallProperty1", 2));
     };
     let callee = ctx.frame.read_reg(callee_v)?.clone();
@@ -6484,16 +6484,16 @@ fn handle_call_property2(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(callee_v) = instr.operands[0] else {
+    let Operand::Register(callee_v) = *instr.operand(0) else {
         return Err(err_bad_operand("CallProperty2", 0));
     };
-    let Operand::Register(recv_v) = instr.operands[1] else {
+    let Operand::Register(recv_v) = *instr.operand(1) else {
         return Err(err_bad_operand("CallProperty2", 1));
     };
-    let Operand::Register(arg0_v) = instr.operands[2] else {
+    let Operand::Register(arg0_v) = *instr.operand(2) else {
         return Err(err_bad_operand("CallProperty2", 2));
     };
-    let Operand::Register(arg1_v) = instr.operands[3] else {
+    let Operand::Register(arg1_v) = *instr.operand(3) else {
         return Err(err_bad_operand("CallProperty2", 3));
     };
     let callee = ctx.frame.read_reg(callee_v)?.clone();
@@ -6508,13 +6508,13 @@ fn handle_call_runtime(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::RuntimeId(runtime_id) = instr.operands[0] else {
+    let Operand::RuntimeId(runtime_id) = *instr.operand(0) else {
         return Err(err_bad_operand("CallRuntime", 0));
     };
-    let Operand::Register(args_start_v) = instr.operands[1] else {
+    let Operand::Register(args_start_v) = *instr.operand(1) else {
         return Err(err_bad_operand("CallRuntime", 1));
     };
-    let Operand::RegisterCount(arg_count) = instr.operands[2] else {
+    let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
         return Err(err_bad_operand("CallRuntime", 2));
     };
 
@@ -6541,10 +6541,10 @@ fn handle_sta_named_own_property(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("StaNamedOwnProperty", 0));
     };
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1) else {
         return Err(err_bad_operand("StaNamedOwnProperty", 1));
     };
     let prop_name = match ctx.frame.bytecode_array.get_constant(name_idx) {
@@ -6666,7 +6666,7 @@ fn handle_delete_lookup_slot(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("DeleteLookupSlot", 0));
     };
     let name = ctx.frame.get_string_constant(name_idx)?;
@@ -6682,7 +6682,7 @@ fn handle_sta_lookup_slot(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("StaLookupSlot", 0));
     };
     let name = ctx.frame.get_string_constant(name_idx)?;
@@ -6708,7 +6708,7 @@ fn handle_lda_lookup_slot(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaLookupSlot", 0));
     };
     let name = ctx.frame.get_string_constant(name_idx)?;
@@ -6731,7 +6731,7 @@ fn handle_lda_lookup_slot_inside_typeof(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaLookupSlotInsideTypeof", 0));
     };
     let name = ctx.frame.get_string_constant(name_idx)?;
@@ -6745,13 +6745,13 @@ fn handle_lda_lookup_context_slot(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaLookupContextSlot", 0));
     };
-    let Operand::ConstantPoolIdx(slot_idx) = instr.operands[1] else {
+    let Operand::ConstantPoolIdx(slot_idx) = *instr.operand(1) else {
         return Err(err_bad_operand("LdaLookupContextSlot", 1));
     };
-    let Operand::Immediate(depth) = instr.operands[2] else {
+    let Operand::Immediate(depth) = *instr.operand(2) else {
         return Err(err_bad_operand("LdaLookupContextSlot", 2));
     };
 
@@ -6785,13 +6785,13 @@ fn handle_lda_lookup_context_slot_inside_typeof(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaLookupContextSlotInsideTypeof", 0));
     };
-    let Operand::ConstantPoolIdx(slot_idx) = instr.operands[1] else {
+    let Operand::ConstantPoolIdx(slot_idx) = *instr.operand(1) else {
         return Err(err_bad_operand("LdaLookupContextSlotInsideTypeof", 1));
     };
-    let Operand::Immediate(depth) = instr.operands[2] else {
+    let Operand::Immediate(depth) = *instr.operand(2) else {
         return Err(err_bad_operand("LdaLookupContextSlotInsideTypeof", 2));
     };
 
@@ -6825,7 +6825,7 @@ fn handle_lda_lookup_global_slot(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaLookupGlobalSlot", 0));
     };
     let name = ctx.frame.get_string_constant(name_idx)?;
@@ -6854,7 +6854,7 @@ fn handle_lda_lookup_global_slot_inside_typeof(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaLookupGlobalSlotInsideTypeof", 0));
     };
     let name = ctx.frame.get_string_constant(name_idx)?;
@@ -6880,10 +6880,10 @@ fn handle_lda_named_property_from_super(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(_receiver_v) = instr.operands[0] else {
+    let Operand::Register(_receiver_v) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaNamedPropertyFromSuper", 0));
     };
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1) else {
         return Err(err_bad_operand("LdaNamedPropertyFromSuper", 1));
     };
     let prop_name = ctx.frame.get_string_constant(name_idx)?;
@@ -6904,7 +6904,7 @@ fn handle_get_template_object(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(tpl_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(tpl_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("GetTemplateObject", 0));
     };
     let cache_key = ctx.byte_offsets[ctx.frame.pc - 1] as u32;
@@ -6950,7 +6950,7 @@ fn handle_test_reference_equal(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(v) = instr.operands[0] else {
+    let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestReferenceEqual", 0));
     };
     let rhs = ctx.frame.read_reg(v)?.clone();
@@ -6972,7 +6972,7 @@ fn handle_jump_if_js_receiver(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::JumpOffset(_delta) = instr.operands[0] else {
+    let Operand::JumpOffset(_delta) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfJSReceiver", 0));
     };
     if is_js_receiver(&ctx.frame.accumulator) {
@@ -6985,7 +6985,7 @@ fn handle_jump_if_js_receiver_constant(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(idx) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfJSReceiverConstant", 0));
     };
     if is_js_receiver(&ctx.frame.accumulator) {
@@ -7023,7 +7023,7 @@ fn handle_jump_constant(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(idx) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpConstant", 0));
     };
     let delta = constant_pool_jump_delta(ctx.frame, idx, "JumpConstant")?;
@@ -7040,7 +7040,7 @@ fn handle_jump_if_true_constant(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(idx) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfTrueConstant", 0));
     };
     if matches!(ctx.frame.accumulator, JsValue::Boolean(true)) {
@@ -7059,7 +7059,7 @@ fn handle_jump_if_false_constant(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(idx) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfFalseConstant", 0));
     };
     if matches!(ctx.frame.accumulator, JsValue::Boolean(false)) {
@@ -7078,7 +7078,7 @@ fn handle_jump_if_to_boolean_true_constant(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(idx) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfToBooleanTrueConstant", 0));
     };
     if ctx.frame.accumulator.to_boolean() {
@@ -7097,7 +7097,7 @@ fn handle_jump_if_to_boolean_false_constant(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(idx) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfToBooleanFalseConstant", 0));
     };
     if !ctx.frame.accumulator.to_boolean() {
@@ -7116,7 +7116,7 @@ fn handle_jump_if_null_constant(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(idx) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfNullConstant", 0));
     };
     if ctx.frame.accumulator.is_null() {
@@ -7135,7 +7135,7 @@ fn handle_jump_if_not_null_constant(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(idx) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfNotNullConstant", 0));
     };
     if !ctx.frame.accumulator.is_null() {
@@ -7154,7 +7154,7 @@ fn handle_jump_if_undefined_constant(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(idx) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfUndefinedConstant", 0));
     };
     if ctx.frame.accumulator.is_undefined() {
@@ -7173,7 +7173,7 @@ fn handle_jump_if_not_undefined_constant(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(idx) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfNotUndefinedConstant", 0));
     };
     if !ctx.frame.accumulator.is_undefined() {
@@ -7192,7 +7192,7 @@ fn handle_jump_if_undefined_or_null_constant(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(idx) = *instr.operand(0) else {
         return Err(err_bad_operand("JumpIfUndefinedOrNullConstant", 0));
     };
     if ctx.frame.accumulator.is_nullish() {
@@ -7211,7 +7211,7 @@ fn handle_call_js_runtime(
     _ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(_ctx_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(_ctx_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("CallJSRuntime", 0));
     };
     // No-op: accumulator is left unchanged.
@@ -7222,7 +7222,7 @@ fn handle_invoke_intrinsic(
     _ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::RuntimeId(_runtime_id) = instr.operands[0] else {
+    let Operand::RuntimeId(_runtime_id) = *instr.operand(0) else {
         return Err(err_bad_operand("InvokeIntrinsic", 0));
     };
     // No-op: accumulator is left unchanged.
@@ -7233,7 +7233,7 @@ fn handle_call_runtime_for_pair(
     _ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::RuntimeId(_runtime_id) = instr.operands[0] else {
+    let Operand::RuntimeId(_runtime_id) = *instr.operand(0) else {
         return Err(err_bad_operand("CallRuntimeForPair", 0));
     };
     // No-op: accumulator is left unchanged.
@@ -7244,7 +7244,7 @@ fn handle_construct_forward_all_args(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(ctor_v) = instr.operands[0] else {
+    let Operand::Register(ctor_v) = *instr.operand(0) else {
         return Err(err_bad_operand("ConstructForwardAllArgs", 0));
     };
     // operands[1] is a FeedbackSlot, ignored at runtime.
@@ -7385,13 +7385,13 @@ fn handle_call_direct_eval(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(callee_v) = instr.operands[0] else {
+    let Operand::Register(callee_v) = *instr.operand(0) else {
         return Err(err_bad_operand("CallDirectEval", 0));
     };
-    let Operand::Register(args_start_v) = instr.operands[1] else {
+    let Operand::Register(args_start_v) = *instr.operand(1) else {
         return Err(err_bad_operand("CallDirectEval", 1));
     };
-    let Operand::RegisterCount(arg_count) = instr.operands[2] else {
+    let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
         return Err(err_bad_operand("CallDirectEval", 2));
     };
     let callee = ctx.frame.read_reg(callee_v)?.clone();
@@ -7535,10 +7535,10 @@ fn handle_create_class(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(ctor_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(ctor_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("CreateClass", 0));
     };
-    let Operand::Register(super_v) = instr.operands[1] else {
+    let Operand::Register(super_v) = *instr.operand(1) else {
         return Err(err_bad_operand("CreateClass", 1));
     };
     // operands[2] is a FeedbackSlot, ignored at runtime.
@@ -7628,10 +7628,10 @@ fn handle_define_getter_property(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("DefineGetterProperty", 0));
     };
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1) else {
         return Err(err_bad_operand("DefineGetterProperty", 1));
     };
     let prop_name = match ctx.frame.bytecode_array.get_constant(name_idx) {
@@ -7666,10 +7666,10 @@ fn handle_define_setter_property(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("DefineSetterProperty", 0));
     };
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1) else {
         return Err(err_bad_operand("DefineSetterProperty", 1));
     };
     let prop_name = match ctx.frame.bytecode_array.get_constant(name_idx) {
@@ -7702,10 +7702,10 @@ fn handle_define_keyed_getter_property(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("DefineKeyedGetterProperty", 0));
     };
-    let Operand::Register(key_v) = instr.operands[1] else {
+    let Operand::Register(key_v) = *instr.operand(1) else {
         return Err(err_bad_operand("DefineKeyedGetterProperty", 1));
     };
     let getter = ctx.frame.accumulator.clone();
@@ -7728,10 +7728,10 @@ fn handle_define_keyed_setter_property(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("DefineKeyedSetterProperty", 0));
     };
-    let Operand::Register(key_v) = instr.operands[1] else {
+    let Operand::Register(key_v) = *instr.operand(1) else {
         return Err(err_bad_operand("DefineKeyedSetterProperty", 1));
     };
     let setter = ctx.frame.accumulator.clone();
@@ -7754,10 +7754,10 @@ fn handle_define_class_named_own_property(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("DefineClassNamedOwnProperty", 0));
     };
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1) else {
         return Err(err_bad_operand("DefineClassNamedOwnProperty", 1));
     };
     let prop_name = match ctx.frame.bytecode_array.get_constant(name_idx) {
@@ -7786,10 +7786,10 @@ fn handle_define_class_getter_property(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("DefineClassGetterProperty", 0));
     };
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1) else {
         return Err(err_bad_operand("DefineClassGetterProperty", 1));
     };
     let prop_name = match ctx.frame.bytecode_array.get_constant(name_idx) {
@@ -7822,10 +7822,10 @@ fn handle_define_class_setter_property(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("DefineClassSetterProperty", 0));
     };
-    let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+    let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1) else {
         return Err(err_bad_operand("DefineClassSetterProperty", 1));
     };
     let prop_name = match ctx.frame.bytecode_array.get_constant(name_idx) {
@@ -7858,10 +7858,10 @@ fn handle_define_class_keyed_own_property(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("DefineClassKeyedOwnProperty", 0));
     };
-    let Operand::Register(key_v) = instr.operands[1] else {
+    let Operand::Register(key_v) = *instr.operand(1) else {
         return Err(err_bad_operand("DefineClassKeyedOwnProperty", 1));
     };
     let obj = ctx.frame.read_reg(obj_v)?.clone();
@@ -7880,10 +7880,10 @@ fn handle_define_class_keyed_getter_property(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("DefineClassKeyedGetterProperty", 0));
     };
-    let Operand::Register(key_v) = instr.operands[1] else {
+    let Operand::Register(key_v) = *instr.operand(1) else {
         return Err(err_bad_operand("DefineClassKeyedGetterProperty", 1));
     };
     let getter = ctx.frame.accumulator.clone();
@@ -7906,10 +7906,10 @@ fn handle_define_class_keyed_setter_property(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("DefineClassKeyedSetterProperty", 0));
     };
-    let Operand::Register(key_v) = instr.operands[1] else {
+    let Operand::Register(key_v) = *instr.operand(1) else {
         return Err(err_bad_operand("DefineClassKeyedSetterProperty", 1));
     };
     let setter = ctx.frame.accumulator.clone();
@@ -7934,10 +7934,10 @@ fn handle_lda_enumerated_keyed_property(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaEnumeratedKeyedProperty", 0));
     };
-    let Operand::Register(key_v) = instr.operands[1] else {
+    let Operand::Register(key_v) = *instr.operand(1) else {
         return Err(err_bad_operand("LdaEnumeratedKeyedProperty", 1));
     };
     let obj = ctx.frame.read_reg(obj_v)?.clone();
@@ -7957,10 +7957,10 @@ fn handle_test_private_brand(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestPrivateBrand", 0));
     };
-    let Operand::Register(brand_v) = instr.operands[1] else {
+    let Operand::Register(brand_v) = *instr.operand(1) else {
         return Err(err_bad_operand("TestPrivateBrand", 1));
     };
     let obj = ctx.frame.read_reg(obj_v)?.clone();
@@ -7998,7 +7998,7 @@ fn handle_define_private_brand(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::Register(obj_v) = instr.operands[0] else {
+    let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("DefinePrivateBrand", 0));
     };
     let obj = ctx.frame.read_reg(obj_v)?.clone();
@@ -8036,10 +8036,10 @@ fn handle_lda_module_variable(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(req_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(req_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaModuleVariable", 0));
     };
-    let Operand::Immediate(cell) = instr.operands[1] else {
+    let Operand::Immediate(cell) = *instr.operand(1) else {
         return Err(err_bad_operand("LdaModuleVariable", 1));
     };
     let specifier = match ctx.frame.bytecode_array.get_constant(req_idx) {
@@ -8073,10 +8073,10 @@ fn handle_sta_module_variable(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(req_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(req_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("StaModuleVariable", 0));
     };
-    let Operand::Immediate(cell) = instr.operands[1] else {
+    let Operand::Immediate(cell) = *instr.operand(1) else {
         return Err(err_bad_operand("StaModuleVariable", 1));
     };
     let specifier = match ctx.frame.bytecode_array.get_constant(req_idx) {
@@ -8138,7 +8138,7 @@ fn handle_get_module_namespace(
     ctx: &mut DispatchContext,
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let Operand::ConstantPoolIdx(_req_idx) = instr.operands[0] else {
+    let Operand::ConstantPoolIdx(_req_idx) = *instr.operand(0) else {
         return Err(err_bad_operand("GetModuleNamespace", 0));
     };
     ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));

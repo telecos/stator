@@ -52,8 +52,6 @@
 //! assert_eq!(decoded, instructions);
 //! ```
 
-use arrayvec::ArrayVec;
-
 use crate::error::{StatorError, StatorResult};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -164,10 +162,8 @@ impl Operand {
 // Instruction
 // ─────────────────────────────────────────────────────────────────────────────
 
-const INLINE_OPERAND_CAPACITY: usize = 5;
-
-/// Inline operand storage for decoded instructions.
-pub type InstructionOperands = ArrayVec<Operand, INLINE_OPERAND_CAPACITY>;
+const MAX_INSTRUCTION_OPERANDS: usize = 5;
+const EMPTY_OPERAND: Operand = Operand::Flag(0);
 
 /// A fully decoded bytecode instruction: an [`Opcode`] paired with its
 /// [`Operand`] list.
@@ -175,30 +171,35 @@ pub type InstructionOperands = ArrayVec<Operand, INLINE_OPERAND_CAPACITY>;
 /// The number and types of operands are always determined by
 /// [`Opcode::operand_types`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[repr(C)]
 pub struct Instruction {
     /// The operation to perform.
     pub opcode: Opcode,
-    /// Operands in the order specified by [`Opcode::operand_types`].
+    /// Number of live entries in [`Instruction::operands`].
+    operand_count: u8,
+    /// Inline operand storage in opcode-declared order.
     ///
-    /// All current opcodes fit entirely in this inline buffer, which avoids a
-    /// heap allocation for every decoded instruction.
-    pub operands: InstructionOperands,
+    /// Only the first [`Instruction::operand_count`] elements are valid.
+    operands: [Operand; MAX_INSTRUCTION_OPERANDS],
 }
 
 impl Instruction {
     fn collect_operands(
         opcode: Opcode,
         operands: impl IntoIterator<Item = Operand>,
-    ) -> StatorResult<InstructionOperands> {
-        let mut collected = InstructionOperands::new();
+    ) -> StatorResult<([Operand; MAX_INSTRUCTION_OPERANDS], u8)> {
+        let mut collected = [EMPTY_OPERAND; MAX_INSTRUCTION_OPERANDS];
+        let mut operand_count = 0usize;
         for operand in operands {
-            collected.try_push(operand).map_err(|_| {
-                StatorError::Internal(format!(
-                    "{opcode:?} exceeds inline operand capacity of {INLINE_OPERAND_CAPACITY}"
-                ))
-            })?;
+            if operand_count == MAX_INSTRUCTION_OPERANDS {
+                return Err(StatorError::Internal(format!(
+                    "{opcode:?} exceeds inline operand capacity of {MAX_INSTRUCTION_OPERANDS}"
+                )));
+            }
+            collected[operand_count] = operand;
+            operand_count += 1;
         }
-        Ok(collected)
+        Ok((collected, operand_count as u8))
     }
 
     /// Construct an instruction, verifying that the operand count matches the
@@ -206,15 +207,19 @@ impl Instruction {
     ///
     /// Returns an error if the wrong number of operands is supplied.
     pub fn new(opcode: Opcode, operands: impl IntoIterator<Item = Operand>) -> StatorResult<Self> {
-        let operands = Self::collect_operands(opcode, operands)?;
+        let (operands, operand_count) = Self::collect_operands(opcode, operands)?;
         let expected = opcode.operand_types().len();
-        if operands.len() != expected {
+        if usize::from(operand_count) != expected {
             return Err(StatorError::Internal(format!(
                 "{opcode:?} expects {expected} operand(s), got {}",
-                operands.len()
+                operand_count
             )));
         }
-        Ok(Self { opcode, operands })
+        Ok(Self {
+            opcode,
+            operand_count,
+            operands,
+        })
     }
 
     /// Construct an instruction without operand-count validation.
@@ -222,9 +227,144 @@ impl Instruction {
     /// Prefer [`Instruction::new`] unless you are certain the operand count
     /// is correct (e.g. inside the decoder).
     pub fn new_unchecked(opcode: Opcode, operands: impl IntoIterator<Item = Operand>) -> Self {
-        let operands = Self::collect_operands(opcode, operands)
+        let (operands, operand_count) = Self::collect_operands(opcode, operands)
             .expect("opcode operand metadata must fit in inline storage");
-        Self { opcode, operands }
+        Self {
+            opcode,
+            operand_count,
+            operands,
+        }
+    }
+
+    /// Return the number of operands carried by this instruction.
+    #[inline(always)]
+    pub fn operand_count(&self) -> usize {
+        usize::from(self.operand_count)
+    }
+
+    /// Return the live operand slice for this instruction.
+    #[inline(always)]
+    pub fn operands(&self) -> &[Operand] {
+        &self.operands[..self.operand_count()]
+    }
+
+    /// Return the operand at `idx`.
+    ///
+    /// Panics if `idx` is out of bounds for this instruction.
+    #[inline(always)]
+    pub fn operand(&self, idx: usize) -> &Operand {
+        self.operand_at(idx).unwrap_or_else(|| {
+            panic!(
+                "{:?} operand index {idx} out of bounds (len = {})",
+                self.opcode,
+                self.operand_count()
+            )
+        })
+    }
+
+    /// Return the operand at `idx`, if present.
+    #[inline(always)]
+    pub fn operand_at(&self, idx: usize) -> Option<&Operand> {
+        self.operands().get(idx)
+    }
+
+    /// Return the operand at `idx` mutably.
+    ///
+    /// Panics if `idx` is out of bounds for this instruction.
+    #[inline(always)]
+    pub fn operand_mut(&mut self, idx: usize) -> &mut Operand {
+        let len = self.operand_count();
+        if idx >= len {
+            panic!(
+                "{:?} operand index {idx} out of bounds (len = {len})",
+                self.opcode
+            );
+        }
+        &mut self.operands[idx]
+    }
+
+    /// Return the operand at `idx` without bounds checks.
+    ///
+    /// # Safety
+    ///
+    /// `idx` must be less than [`Instruction::operand_count`].
+    #[inline(always)]
+    pub unsafe fn operand_unchecked(&self, idx: usize) -> &Operand {
+        debug_assert!(idx < self.operand_count());
+        // SAFETY: The caller guarantees `idx` points at a live operand.
+        unsafe { self.operands.get_unchecked(idx) }
+    }
+
+    /// Return operand `idx` as a register index.
+    #[inline(always)]
+    pub fn reg(&self, idx: usize) -> u32 {
+        match self.operand(idx) {
+            Operand::Register(register) => *register,
+            operand => panic!("expected register operand, got {operand:?}"),
+        }
+    }
+
+    /// Return operand `idx` as a register-count operand.
+    #[inline(always)]
+    pub fn register_count(&self, idx: usize) -> u32 {
+        match self.operand(idx) {
+            Operand::RegisterCount(count) => *count,
+            operand => panic!("expected register-count operand, got {operand:?}"),
+        }
+    }
+
+    /// Return operand `idx` as an immediate value.
+    #[inline(always)]
+    pub fn immediate(&self, idx: usize) -> i32 {
+        match self.operand(idx) {
+            Operand::Immediate(immediate) => *immediate,
+            operand => panic!("expected immediate operand, got {operand:?}"),
+        }
+    }
+
+    /// Return operand `idx` as a constant-pool index.
+    #[inline(always)]
+    pub fn constant_pool_idx(&self, idx: usize) -> u32 {
+        match self.operand(idx) {
+            Operand::ConstantPoolIdx(index) => *index,
+            operand => panic!("expected constant-pool operand, got {operand:?}"),
+        }
+    }
+
+    /// Return operand `idx` as a feedback-slot index.
+    #[inline(always)]
+    pub fn feedback_slot(&self, idx: usize) -> u32 {
+        match self.operand(idx) {
+            Operand::FeedbackSlot(slot) => *slot,
+            operand => panic!("expected feedback-slot operand, got {operand:?}"),
+        }
+    }
+
+    /// Return operand `idx` as a runtime identifier.
+    #[inline(always)]
+    pub fn runtime_id(&self, idx: usize) -> u32 {
+        match self.operand(idx) {
+            Operand::RuntimeId(id) => *id,
+            operand => panic!("expected runtime-id operand, got {operand:?}"),
+        }
+    }
+
+    /// Return operand `idx` as a jump offset.
+    #[inline(always)]
+    pub fn jump_offset(&self, idx: usize) -> i32 {
+        match self.operand(idx) {
+            Operand::JumpOffset(offset) => *offset,
+            operand => panic!("expected jump-offset operand, got {operand:?}"),
+        }
+    }
+
+    /// Return operand `idx` as a flag value.
+    #[inline(always)]
+    pub fn flag(&self, idx: usize) -> u8 {
+        match self.operand(idx) {
+            Operand::Flag(flag) => *flag,
+            operand => panic!("expected flag operand, got {operand:?}"),
+        }
     }
 }
 
@@ -1175,14 +1315,14 @@ fn read_operand(
 pub fn encode(instructions: &[Instruction]) -> Vec<u8> {
     let mut out = Vec::new();
     for instr in instructions {
-        let width = required_width(&instr.operands);
+        let width = required_width(instr.operands());
         match width {
             OperandWidth::Wide => out.push(Opcode::Wide as u8),
             OperandWidth::ExtraWide => out.push(Opcode::ExtraWide as u8),
             OperandWidth::Narrow => {}
         }
         out.push(instr.opcode as u8);
-        for &operand in &instr.operands {
+        for &operand in instr.operands() {
             write_operand(&mut out, operand, width);
         }
     }
@@ -1245,18 +1385,21 @@ pub fn decode_with_byte_offsets(bytes: &[u8]) -> StatorResult<(Vec<Instruction>,
         }
 
         let op_types = opcode.operand_types();
-        let mut operands = InstructionOperands::new();
-        for &op_type in op_types {
-            operands
-                .try_push(read_operand(bytes, &mut pos, op_type, width)?)
-                .map_err(|_| {
-                    StatorError::Internal(format!(
-                        "{opcode:?} exceeds inline operand capacity of {INLINE_OPERAND_CAPACITY}"
-                    ))
-                })?;
+        let mut operands = [EMPTY_OPERAND; MAX_INSTRUCTION_OPERANDS];
+        for (operand_index, &op_type) in op_types.iter().enumerate() {
+            if operand_index == MAX_INSTRUCTION_OPERANDS {
+                return Err(StatorError::Internal(format!(
+                    "{opcode:?} exceeds inline operand capacity of {MAX_INSTRUCTION_OPERANDS}"
+                )));
+            }
+            operands[operand_index] = read_operand(bytes, &mut pos, op_type, width)?;
         }
         byte_offsets.push(instr_start);
-        instructions.push(Instruction::new_unchecked(opcode, operands));
+        instructions.push(Instruction {
+            opcode,
+            operand_count: op_types.len() as u8,
+            operands,
+        });
     }
 
     byte_offsets.push(pos); // sentinel: total byte length

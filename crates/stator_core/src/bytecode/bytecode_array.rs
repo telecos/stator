@@ -964,7 +964,7 @@ impl BytecodeArray {
 
             let mut jump_targets = vec![None; instructions.len()];
             for (instruction_index, instruction) in instructions.iter().enumerate() {
-                for operand in &instruction.operands {
+                for operand in instruction.operands() {
                     let Operand::JumpOffset(delta) = operand else {
                         continue;
                     };
@@ -1169,7 +1169,8 @@ mod tests {
         let target_byte = offsets[2];
         let jump_end_byte = offsets[1];
         let mut resolved = instructions;
-        resolved[0].operands[0] = Operand::JumpOffset(target_byte as i32 - jump_end_byte as i32);
+        *resolved[0].operand_mut(0) =
+            Operand::JumpOffset(target_byte as i32 - jump_end_byte as i32);
         BytecodeArray::new(
             encode(&resolved),
             vec![],
@@ -1395,7 +1396,8 @@ mod tests {
         let mut resolved = unresolved;
         let target_byte = offsets[6];
         let jump_end_byte = offsets[5];
-        resolved[4].operands[0] = Operand::JumpOffset(target_byte as i32 - jump_end_byte as i32);
+        *resolved[4].operand_mut(0) =
+            Operand::JumpOffset(target_byte as i32 - jump_end_byte as i32);
 
         let mut array = BytecodeArray::new(
             encode(&resolved),

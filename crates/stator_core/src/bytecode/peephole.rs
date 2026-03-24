@@ -375,10 +375,10 @@ fn fuse_superinstructions_with_origins(
                         Operand::FeedbackSlot(slot),
                         Operand::Register(dst),
                     ) = (
-                        first.operands[0],
-                        second.operands[0],
-                        second.operands[1],
-                        third.operands[0],
+                        *first.operand(0),
+                        *second.operand(0),
+                        *second.operand(1),
+                        *third.operand(0),
                     ) {
                         fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
@@ -402,10 +402,10 @@ fn fuse_superinstructions_with_origins(
                         Operand::FeedbackSlot(slot),
                         Operand::Register(dst),
                     ) = (
-                        first.operands[0],
-                        second.operands[0],
-                        second.operands[1],
-                        third.operands[0],
+                        *first.operand(0),
+                        *second.operand(0),
+                        *second.operand(1),
+                        *third.operand(0),
                     ) {
                         fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
@@ -429,10 +429,10 @@ fn fuse_superinstructions_with_origins(
                         Operand::FeedbackSlot(slot),
                         Operand::Register(dst),
                     ) = (
-                        first.operands[0],
-                        second.operands[0],
-                        second.operands[1],
-                        third.operands[0],
+                        *first.operand(0),
+                        *second.operand(0),
+                        *second.operand(1),
+                        *third.operand(0),
                     ) {
                         fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
@@ -463,7 +463,7 @@ fn fuse_superinstructions_with_origins(
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
@@ -486,7 +486,7 @@ fn fuse_superinstructions_with_origins(
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
@@ -509,7 +509,7 @@ fn fuse_superinstructions_with_origins(
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
@@ -532,7 +532,7 @@ fn fuse_superinstructions_with_origins(
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
@@ -555,7 +555,7 @@ fn fuse_superinstructions_with_origins(
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
@@ -578,7 +578,7 @@ fn fuse_superinstructions_with_origins(
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
@@ -601,7 +601,7 @@ fn fuse_superinstructions_with_origins(
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
@@ -624,7 +624,7 @@ fn fuse_superinstructions_with_origins(
                         Operand::Immediate(imm),
                         Operand::FeedbackSlot(slot),
                         Operand::Register(dst),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
@@ -645,7 +645,7 @@ fn fuse_superinstructions_with_origins(
                         Operand::Immediate(imm),
                         Operand::FeedbackSlot(slot),
                         Operand::Register(dst),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
@@ -666,7 +666,7 @@ fn fuse_superinstructions_with_origins(
                         Operand::Immediate(imm),
                         Operand::FeedbackSlot(slot),
                         Operand::Register(dst),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
@@ -684,7 +684,7 @@ fn fuse_superinstructions_with_origins(
                 }
                 (Opcode::Inc, Opcode::Star) => {
                     if let (Operand::FeedbackSlot(slot), Operand::Register(dst)) =
-                        (first.operands[0], second.operands[0])
+                        (*first.operand(0), *second.operand(0))
                     {
                         fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
@@ -698,7 +698,7 @@ fn fuse_superinstructions_with_origins(
                 }
                 (Opcode::LdaSmi, Opcode::Star) => {
                     if let (Operand::Immediate(imm), Operand::Register(dst)) =
-                        (first.operands[0], second.operands[0])
+                        (*first.operand(0), *second.operand(0))
                     {
                         fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
@@ -715,7 +715,7 @@ fn fuse_superinstructions_with_origins(
                         Operand::ConstantPoolIdx(name_idx),
                         Operand::FeedbackSlot(slot),
                         Operand::Register(dst),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
@@ -1013,7 +1013,7 @@ fn instruction_writes_register(instruction: &Instruction, register: u32) -> bool
         Opcode::CallRuntimeForPair => get_register(instruction, 3) == Some(register),
         Opcode::ResumeGenerator => {
             if let (Some(start), Some(Operand::RegisterCount(count))) =
-                (get_register(instruction, 1), instruction.operands.get(2))
+                (get_register(instruction, 1), instruction.operand_at(2))
             {
                 register >= start && register < start + count
             } else {
@@ -1141,7 +1141,7 @@ fn resolve_jump_target_index(
 ) -> Option<usize> {
     let instruction = instructions.get(index)?;
     let delta = instruction
-        .operands
+        .operands()
         .iter()
         .find_map(|operand| match operand {
             Operand::JumpOffset(delta) => Some(*delta),
@@ -1190,8 +1190,8 @@ fn resolve_jump_offsets(
 }
 
 fn set_jump_offset(instruction: &mut Instruction, new_delta: i32) -> bool {
-    for operand in &mut instruction.operands {
-        if let Operand::JumpOffset(delta) = operand {
+    for idx in 0..instruction.operand_count() {
+        if let Operand::JumpOffset(delta) = instruction.operand_mut(idx) {
             if *delta == new_delta {
                 return false;
             }
@@ -1362,21 +1362,21 @@ fn next_non_nop_index(instructions: &[Instruction], start: usize) -> Option<usiz
 }
 
 fn get_immediate(instruction: &Instruction, operand_index: usize) -> Option<i32> {
-    match instruction.operands.get(operand_index).copied()? {
+    match instruction.operand_at(operand_index).copied()? {
         Operand::Immediate(value) => Some(value),
         _ => None,
     }
 }
 
 fn get_register(instruction: &Instruction, operand_index: usize) -> Option<u32> {
-    match instruction.operands.get(operand_index).copied()? {
+    match instruction.operand_at(operand_index).copied()? {
         Operand::Register(register) => Some(register),
         _ => None,
     }
 }
 
 fn get_constant_pool_idx(instruction: &Instruction, operand_index: usize) -> Option<u32> {
-    match instruction.operands.get(operand_index).copied()? {
+    match instruction.operand_at(operand_index).copied()? {
         Operand::ConstantPoolIdx(index) => Some(index),
         _ => None,
     }
@@ -1395,7 +1395,7 @@ fn is_jump_target(
 fn instruction_mentions_register(instruction: &Instruction, register: u32) -> bool {
     // Check explicit register operands.
     if instruction
-        .operands
+        .operands()
         .iter()
         .any(|operand| matches!(operand, Operand::Register(value) if *value == register))
     {
@@ -1408,7 +1408,7 @@ fn instruction_mentions_register(instruction: &Instruction, register: u32) -> bo
     // to a register used as a call argument.
     if uses_register_range(instruction.opcode)
         && let Some(range_start) = get_register(instruction, 1)
-        && let Some(Operand::RegisterCount(count)) = instruction.operands.get(2)
+        && let Some(Operand::RegisterCount(count)) = instruction.operand_at(2)
         && register >= range_start
         && register < range_start + count
     {
@@ -1496,7 +1496,7 @@ fn collect_jump_target_bytes(
 ) -> HashSet<usize> {
     let mut target_bytes = HashSet::new();
     for (index, instruction) in instructions.iter().enumerate() {
-        for operand in &instruction.operands {
+        for operand in instruction.operands() {
             let Operand::JumpOffset(delta) = operand else {
                 continue;
             };
@@ -1530,7 +1530,7 @@ mod tests {
         for &(jump_index, target_index) in jumps {
             let target_byte = offsets[target_index];
             let jump_end_byte = offsets[jump_index + 1];
-            instructions[jump_index].operands[0] =
+            *instructions[jump_index].operand_mut(0) =
                 Operand::JumpOffset(target_byte as i32 - jump_end_byte as i32);
         }
         decode_with_offsets(instructions).1
@@ -1770,7 +1770,8 @@ mod tests {
         let mut resolved = unresolved;
         let target_byte = offsets[2];
         let jump_end_byte = offsets[1];
-        resolved[0].operands[0] = Operand::JumpOffset(target_byte as i32 - jump_end_byte as i32);
+        *resolved[0].operand_mut(0) =
+            Operand::JumpOffset(target_byte as i32 - jump_end_byte as i32);
 
         let (mut instructions, mut byte_offsets) = decode_with_offsets(&resolved);
         fuse_instructions(&mut instructions, &mut byte_offsets);
@@ -1929,7 +1930,8 @@ mod tests {
         let mut resolved = unresolved;
         let target_byte = offsets[3];
         let jump_end_byte = offsets[1];
-        resolved[0].operands[0] = Operand::JumpOffset(target_byte as i32 - jump_end_byte as i32);
+        *resolved[0].operand_mut(0) =
+            Operand::JumpOffset(target_byte as i32 - jump_end_byte as i32);
 
         let (mut instructions, mut byte_offsets) = decode_with_offsets(&resolved);
         fuse_instructions(&mut instructions, &mut byte_offsets);

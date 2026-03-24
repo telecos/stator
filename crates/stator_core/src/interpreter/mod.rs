@@ -4052,7 +4052,7 @@ impl Interpreter {
                                 // SMI mode when the loaded value is Smi.
                                 let obj_v = unsafe { operand_reg_unchecked(instr, 0) };
                                 let slot = unsafe {
-                                    match *instr.operands.get_unchecked(2) {
+                                    match *instr.operand_unchecked(2) {
                                         Operand::FeedbackSlot(s) => s,
                                         _ => std::hint::unreachable_unchecked(),
                                     }
@@ -4127,7 +4127,7 @@ impl Interpreter {
                                             }
                                         }
                                     }
-                                    if let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] {
+                                    if let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1) {
                                         let prop_name = frame.get_string_constant(name_idx)?;
                                         if let Some(ic) = frame
                                             .proto_load_ic
@@ -4222,7 +4222,7 @@ impl Interpreter {
                                 // the receiver's PropertyMap at cached offset.
                                 let obj_v = unsafe { operand_reg_unchecked(instr, 0) };
                                 let slot = unsafe {
-                                    match *instr.operands.get_unchecked(2) {
+                                    match *instr.operand_unchecked(2) {
                                         Operand::FeedbackSlot(s) => s,
                                         _ => std::hint::unreachable_unchecked(),
                                     }
@@ -4387,7 +4387,7 @@ impl Interpreter {
                                 continue 'smi;
                             }
                             Opcode::CreateArrayLiteral => {
-                                let capacity = match instr.operands.get(2) {
+                                let capacity = match instr.operand_at(2) {
                                     Some(Operand::Flag(hint)) => usize::from(*hint),
                                     _ => 0,
                                 };
@@ -4548,7 +4548,7 @@ impl Interpreter {
                         continue 'dispatch;
                     }
                     Opcode::CreateArrayLiteral => {
-                        let capacity = match instr.operands.get(2) {
+                        let capacity = match instr.operand_at(2) {
                             Some(Operand::Flag(hint)) => usize::from(*hint),
                             _ => 0,
                         };
@@ -4581,7 +4581,7 @@ impl Interpreter {
 
                     // ── Arithmetic (SMI fast path, table fallback) ──
                     Opcode::Add => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
@@ -4626,7 +4626,7 @@ impl Interpreter {
                         }
                     }
                     Opcode::Sub => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
@@ -4670,7 +4670,7 @@ impl Interpreter {
                         }
                     }
                     Opcode::Mul => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
@@ -4714,7 +4714,7 @@ impl Interpreter {
                         }
                     }
                     Opcode::AddSmi => {
-                        if let Operand::Immediate(imm) = instr.operands[0]
+                        if let Operand::Immediate(imm) = *instr.operand(0)
                             && let JsValue::Smi(n) = acc
                             && let Some(result) = n.checked_add(imm)
                         {
@@ -4754,7 +4754,7 @@ impl Interpreter {
                         }
                     }
                     Opcode::SubSmi => {
-                        if let Operand::Immediate(imm) = instr.operands[0]
+                        if let Operand::Immediate(imm) = *instr.operand(0)
                             && let JsValue::Smi(n) = acc
                             && let Some(result) = n.checked_sub(imm)
                         {
@@ -4794,7 +4794,7 @@ impl Interpreter {
                         }
                     }
                     Opcode::MulSmi => {
-                        if let Operand::Immediate(imm) = instr.operands[0]
+                        if let Operand::Immediate(imm) = *instr.operand(0)
                             && let JsValue::Smi(n) = acc
                             && let Some(result) = n.checked_mul(imm)
                         {
@@ -4915,7 +4915,7 @@ impl Interpreter {
                     }
                     // ── BitwiseOr (Smi fast path + HeapNumber→Smi coercion) ──
                     Opcode::BitwiseOr => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
                             // Fast path: Smi | Smi
                             if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
@@ -4977,7 +4977,7 @@ impl Interpreter {
                         }
                     }
                     Opcode::BitwiseOrSmi => {
-                        if let Operand::Immediate(imm) = instr.operands[0] {
+                        if let Operand::Immediate(imm) = *instr.operand(0) {
                             match acc {
                                 JsValue::Smi(n) => {
                                     acc = JsValue::Smi(n | imm);
@@ -5030,7 +5030,7 @@ impl Interpreter {
                     }
                     // ── Div (Smi fast path, exact only) ───────
                     Opcode::Div => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
                             if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs)
                                 && *b != 0
@@ -5074,7 +5074,7 @@ impl Interpreter {
                     }
                     // ── BitwiseAnd (Smi fast path) ────────────
                     Opcode::BitwiseAnd => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
                             if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
                                 acc = JsValue::Smi(*a & *b);
@@ -5115,7 +5115,7 @@ impl Interpreter {
                     }
                     // ── Mod (Smi fast path) ───────────────────
                     Opcode::Mod => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
                             if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs)
                                 && *b != 0
@@ -5158,7 +5158,7 @@ impl Interpreter {
                     }
                     // ── BitwiseAndSmi / ShiftLeftSmi / ShiftRightSmi ──
                     Opcode::BitwiseAndSmi => {
-                        if let Operand::Immediate(imm) = instr.operands[0]
+                        if let Operand::Immediate(imm) = *instr.operand(0)
                             && let JsValue::Smi(n) = acc
                         {
                             acc = JsValue::Smi(n & imm);
@@ -5197,7 +5197,7 @@ impl Interpreter {
                         }
                     }
                     Opcode::ShiftRightSmi => {
-                        if let Operand::Immediate(imm) = instr.operands[0]
+                        if let Operand::Immediate(imm) = *instr.operand(0)
                             && let JsValue::Smi(n) = acc
                         {
                             acc = JsValue::Smi(n >> (imm & 0x1f));
@@ -5236,7 +5236,7 @@ impl Interpreter {
                         }
                     }
                     Opcode::ShiftLeftSmi => {
-                        if let Operand::Immediate(imm) = instr.operands[0]
+                        if let Operand::Immediate(imm) = *instr.operand(0)
                             && let JsValue::Smi(n) = acc
                         {
                             acc = JsValue::Smi(n << (imm & 0x1f));
@@ -5277,7 +5277,7 @@ impl Interpreter {
 
                     // ── LdaGlobal (IC fast path) ────────────
                     Opcode::LdaGlobal => {
-                        if let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] {
+                        if let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) {
                             // IC fast path: known slot, generation matches.
                             if let Some(ref ic) = frame.global_ic
                                 && let Some(&(slot_idx, cached_gen)) = ic.get(&name_idx)
@@ -5479,7 +5479,7 @@ impl Interpreter {
 
                     // ── Comparisons (SMI fast path, table fallback) ──
                     Opcode::TestLessThan => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
@@ -5521,7 +5521,7 @@ impl Interpreter {
                         }
                     }
                     Opcode::TestGreaterThan => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
@@ -5563,7 +5563,7 @@ impl Interpreter {
                         }
                     }
                     Opcode::TestEqual => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
@@ -5604,7 +5604,7 @@ impl Interpreter {
                         }
                     }
                     Opcode::TestEqualStrict => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
@@ -5649,7 +5649,7 @@ impl Interpreter {
                         }
                     }
                     Opcode::TestNotEqual => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
                             let result = abstract_eq(&acc, rhs);
                             acc = JsValue::Boolean(!result);
@@ -5688,7 +5688,7 @@ impl Interpreter {
                         }
                     }
                     Opcode::TestLessThanOrEqual => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
                             if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
                                 acc = JsValue::Boolean(*a <= *b);
@@ -5728,7 +5728,7 @@ impl Interpreter {
                         }
                     }
                     Opcode::TestGreaterThanOrEqual => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
                             if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
                                 acc = JsValue::Boolean(*a >= *b);
@@ -5770,8 +5770,8 @@ impl Interpreter {
 
                     // ── LdaNamedProperty: inline mega-IC hit ─────
                     Opcode::LdaNamedProperty => {
-                        if let Operand::Register(obj_v) = instr.operands[0]
-                            && let Operand::FeedbackSlot(slot) = instr.operands[2]
+                        if let Operand::Register(obj_v) = *instr.operand(0)
+                            && let Operand::FeedbackSlot(slot) = *instr.operand(2)
                         {
                             // SAFETY: read_reg_unchecked returns a reference into
                             // frame.registers.  We use a raw pointer so we can
@@ -5783,7 +5783,7 @@ impl Interpreter {
 
                             // Fast path: arr.length on JsValue::Array — avoids
                             // prototype chain walk and string comparison.
-                            if let Operand::ConstantPoolIdx(name_idx) = instr.operands[1]
+                            if let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1)
                                 && frame.is_length_constant(name_idx)
                             {
                                 match obj {
@@ -5842,7 +5842,7 @@ impl Interpreter {
                                         }
                                     }
                                 }
-                                if let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] {
+                                if let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1) {
                                     let prop_name = frame.get_string_constant(name_idx)?;
                                     if let Some(ic) = frame
                                         .proto_load_ic
@@ -5897,7 +5897,7 @@ impl Interpreter {
 
                     // ── StaGlobal (IC fast path) ────────────
                     Opcode::StaGlobal => {
-                        if let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] {
+                        if let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) {
                             frame.pc = pc;
                             frame.accumulator = acc.cheap_clone();
                             let name = frame.get_string_constant(name_idx)?;
@@ -5946,9 +5946,9 @@ impl Interpreter {
 
                     // ── StaNamedProperty (mega-IC fast path) ──
                     Opcode::StaNamedProperty => {
-                        if let Operand::Register(obj_v) = instr.operands[0]
-                            && let Operand::ConstantPoolIdx(name_idx) = instr.operands[1]
-                            && let Operand::FeedbackSlot(slot) = instr.operands[2]
+                        if let Operand::Register(obj_v) = *instr.operand(0)
+                            && let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1)
+                            && let Operand::FeedbackSlot(slot) = *instr.operand(2)
                         {
                             let obj_ref = unsafe { frame.read_reg_unchecked(obj_v) };
                             if let JsValue::PlainObject(map) = obj_ref {
@@ -6011,7 +6011,7 @@ impl Interpreter {
 
                     // ── LdaKeyedProperty (Smi index on Array) ──
                     Opcode::LdaKeyedProperty => {
-                        if let Operand::Register(obj_v) = instr.operands[0]
+                        if let Operand::Register(obj_v) = *instr.operand(0)
                             && let JsValue::Smi(idx) = &acc
                             && *idx >= 0
                         {
@@ -6061,8 +6061,8 @@ impl Interpreter {
 
                     // ── StaKeyedProperty (Smi index on Array) ──
                     Opcode::StaKeyedProperty => {
-                        if let Operand::Register(obj_v) = instr.operands[0]
-                            && let Operand::Register(key_v) = instr.operands[1]
+                        if let Operand::Register(obj_v) = *instr.operand(0)
+                            && let Operand::Register(key_v) = *instr.operand(1)
                         {
                             let key_ref = unsafe { frame.read_reg_unchecked(key_v) };
                             if let JsValue::Smi(idx) = key_ref
@@ -6122,7 +6122,7 @@ impl Interpreter {
 
                     // ── LdaCurrentContextSlot (closure var load) ──
                     Opcode::LdaCurrentContextSlot | Opcode::LdaImmutableCurrentContextSlot => {
-                        if let Operand::ConstantPoolIdx(slot_idx) = instr.operands[0]
+                        if let Operand::ConstantPoolIdx(slot_idx) = *instr.operand(0)
                             && let Some(JsValue::Context(js_ctx)) = &frame.context
                         {
                             let borrowed = js_ctx.borrow();
@@ -6170,7 +6170,7 @@ impl Interpreter {
 
                     // ── StaCurrentContextSlot (closure var store) ──
                     Opcode::StaCurrentContextSlot => {
-                        if let Operand::ConstantPoolIdx(slot_idx) = instr.operands[0]
+                        if let Operand::ConstantPoolIdx(slot_idx) = *instr.operand(0)
                             && let Some(JsValue::Context(js_ctx)) = &frame.context
                         {
                             let mut borrowed = js_ctx.borrow_mut();
@@ -7723,7 +7723,7 @@ unsafe fn operand_reg_unchecked(
     idx: usize,
 ) -> u32 {
     // SAFETY: Caller guarantees idx < operands.len() and the variant is Register.
-    match *unsafe { instr.operands.get_unchecked(idx) } {
+    match *unsafe { instr.operand_unchecked(idx) } {
         crate::bytecode::bytecodes::Operand::Register(v) => v,
         // SAFETY: The bytecode generator guarantees the operand is Register.
         _ => unsafe { std::hint::unreachable_unchecked() },
@@ -7742,7 +7742,7 @@ unsafe fn operand_imm_unchecked(
     idx: usize,
 ) -> i32 {
     // SAFETY: Caller guarantees idx < operands.len() and the variant is Immediate.
-    match *unsafe { instr.operands.get_unchecked(idx) } {
+    match *unsafe { instr.operand_unchecked(idx) } {
         crate::bytecode::bytecodes::Operand::Immediate(v) => v,
         // SAFETY: The bytecode generator guarantees the operand is Immediate.
         _ => unsafe { std::hint::unreachable_unchecked() },
@@ -7761,7 +7761,7 @@ unsafe fn operand_constant_pool_idx_unchecked(
     idx: usize,
 ) -> u32 {
     // SAFETY: Caller guarantees idx < operands.len() and the variant is ConstantPoolIdx.
-    match *unsafe { instr.operands.get_unchecked(idx) } {
+    match *unsafe { instr.operand_unchecked(idx) } {
         crate::bytecode::bytecodes::Operand::ConstantPoolIdx(v) => v,
         // SAFETY: The bytecode generator guarantees the operand is ConstantPoolIdx.
         _ => unsafe { std::hint::unreachable_unchecked() },
@@ -7779,7 +7779,7 @@ unsafe fn operand_flag_unchecked(
     instr: &crate::bytecode::bytecodes::Instruction,
     idx: usize,
 ) -> u8 {
-    match *unsafe { instr.operands.get_unchecked(idx) } {
+    match *unsafe { instr.operand_unchecked(idx) } {
         crate::bytecode::bytecodes::Operand::Flag(v) => v,
         _ => unsafe { std::hint::unreachable_unchecked() },
     }
@@ -8424,7 +8424,7 @@ fn inline_arg_from_reg(args: &[JsValue], reg: u32) -> Option<JsValue> {
 
 #[inline(always)]
 fn checked_operand_reg(instr: &Instruction, idx: usize) -> Option<u32> {
-    match instr.operands.get(idx)? {
+    match instr.operand_at(idx)? {
         Operand::Register(reg) => Some(*reg),
         _ => None,
     }
@@ -8432,7 +8432,7 @@ fn checked_operand_reg(instr: &Instruction, idx: usize) -> Option<u32> {
 
 #[inline(always)]
 fn checked_operand_imm(instr: &Instruction, idx: usize) -> Option<i32> {
-    match instr.operands.get(idx)? {
+    match instr.operand_at(idx)? {
         Operand::Immediate(imm) => Some(*imm),
         _ => None,
     }
@@ -8440,7 +8440,7 @@ fn checked_operand_imm(instr: &Instruction, idx: usize) -> Option<i32> {
 
 #[inline(always)]
 fn checked_operand_constant_pool_idx(instr: &Instruction, idx: usize) -> Option<u32> {
-    match instr.operands.get(idx)? {
+    match instr.operand_at(idx)? {
         Operand::ConstantPoolIdx(const_idx) => Some(*const_idx),
         _ => None,
     }
