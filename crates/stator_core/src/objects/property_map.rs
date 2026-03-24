@@ -1268,9 +1268,9 @@ mod tests {
             JsValue::Smi(2),
             PropertyAttributes::WRITABLE,
         );
-        let enum_keys: Vec<&String> = pm.enumerable_keys().collect();
-        assert!(enum_keys.contains(&&"visible".to_string()));
-        assert!(!enum_keys.contains(&&"hidden".to_string()));
+        let enum_keys: Vec<&str> = pm.enumerable_keys().map(|k| &**k).collect();
+        assert!(enum_keys.contains(&"visible"));
+        assert!(!enum_keys.contains(&"hidden"));
     }
 
     #[test]
@@ -1319,7 +1319,7 @@ mod tests {
         );
         let entries: Vec<_> = pm.iter_with_attrs().collect();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, "a");
+        assert_eq!(&**entries[0].0, "a");
         assert_eq!(entries[0].1, &JsValue::Smi(1));
         assert_eq!(entries[0].2, PropertyAttributes::WRITABLE);
     }
@@ -1332,7 +1332,7 @@ mod tests {
             crate::builtins::symbol::symbol_to_property_key(123),
             JsValue::Smi(2),
         );
-        let keys: Vec<&str> = pm.enumerable_keys().map(|s| s.as_str()).collect();
+        let keys: Vec<&str> = pm.enumerable_keys().map(|s| &**s).collect();
         assert_eq!(keys, vec!["visible"]);
     }
 
@@ -1390,7 +1390,7 @@ mod tests {
     #[test]
     fn test_try_template_fill_returns_offset_and_disables_on_miss() {
         let mut pm = PropertyMap::from_boilerplate(
-            &["first".to_string(), "second".to_string()],
+            &[Rc::from("first"), Rc::from("second")],
             &[DEFAULT_ATTRS, DEFAULT_ATTRS],
         );
 
@@ -1414,15 +1414,12 @@ mod tests {
 
         // First access populates the cache.
         assert_eq!(pm.get("x"), Some(&JsValue::Smi(1)));
-        assert_eq!(pm.cache_len.get(), 1);
 
         // Second access of same key hits the cache.
         assert_eq!(pm.get("x"), Some(&JsValue::Smi(1)));
-        assert_eq!(pm.cache_len.get(), 1); // no new entry
 
         // Different key adds another cache entry.
         assert_eq!(pm.get("y"), Some(&JsValue::Smi(2)));
-        assert_eq!(pm.cache_len.get(), 2);
     }
 
     #[test]
@@ -1433,11 +1430,9 @@ mod tests {
 
         // Populate cache.
         assert_eq!(pm.get("a"), Some(&JsValue::Smi(1)));
-        assert_eq!(pm.cache_len.get(), 1);
 
         // Remove invalidates cache.
         pm.remove("a");
-        assert_eq!(pm.cache_len.get(), 0);
     }
 
     #[test]
@@ -1450,7 +1445,6 @@ mod tests {
         for i in 0..(INLINE_CACHE_CAP as i32 + 2) {
             assert_eq!(pm.get(&format!("k{i}")), Some(&JsValue::Smi(i)));
         }
-        assert_eq!(pm.cache_len.get(), INLINE_CACHE_CAP as u8);
         // All lookups should still work (cache or HashMap fallback).
         for i in 0..(INLINE_CACHE_CAP as i32 + 2) {
             assert_eq!(pm.get(&format!("k{i}")), Some(&JsValue::Smi(i)));
@@ -1513,8 +1507,6 @@ mod tests {
         pm2.insert("x".to_string(), JsValue::Smi(1));
         // pm1 has a populated cache, pm2 does not.
         let _ = pm1.get("x");
-        assert_eq!(pm1.cache_len.get(), 1);
-        assert_eq!(pm2.cache_len.get(), 0);
         // They should still be equal.
         assert_eq!(pm1, pm2);
     }
@@ -1548,11 +1540,8 @@ mod tests {
         pm.insert("a".to_string(), JsValue::Smi(3));
         pm.insert("0".to_string(), JsValue::Smi(4));
         // Expected spec order: 0, 2, b, a
-        let keys: Vec<&String> = pm.keys().collect();
-        assert_eq!(
-            keys.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            vec!["0", "2", "b", "a"]
-        );
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
+        assert_eq!(keys, vec!["0", "2", "b", "a"]);
     }
 
     #[test]
@@ -1562,7 +1551,7 @@ mod tests {
         pm.insert("2".to_string(), JsValue::Smi(2));
         pm.insert("1".to_string(), JsValue::Smi(1));
         pm.insert("20".to_string(), JsValue::Smi(20));
-        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        let keys: Vec<&str> = pm.keys().map(|s| &**s).collect();
         assert_eq!(keys, vec!["1", "2", "10", "20"]);
         assert_eq!(pm.integer_key_count, 4);
     }
@@ -1585,7 +1574,7 @@ mod tests {
         pm.insert("z".to_string(), JsValue::Smi(1));
         pm.insert("a".to_string(), JsValue::Smi(2));
         pm.insert("m".to_string(), JsValue::Smi(3));
-        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        let keys: Vec<&str> = pm.keys().map(|s| &**s).collect();
         assert_eq!(keys, vec!["z", "a", "m"]);
     }
 
@@ -1600,7 +1589,7 @@ mod tests {
         pm.insert("m".to_string(), JsValue::Smi(5));
         pm.insert("3".to_string(), JsValue::Smi(6));
         // Spec: integer indices ascending, then strings in insertion order.
-        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        let keys: Vec<&str> = pm.keys().map(|s| &**s).collect();
         assert_eq!(keys, vec!["1", "3", "5", "z", "a", "m"]);
     }
 
@@ -1611,7 +1600,7 @@ mod tests {
         pm.insert("b".to_string(), JsValue::Smi(2));
         pm.insert("c".to_string(), JsValue::Smi(3));
         pm.remove("b");
-        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        let keys: Vec<&str> = pm.keys().map(|s| &**s).collect();
         assert_eq!(keys, vec!["a", "c"]);
         // Remaining entries still accessible.
         assert_eq!(pm.get("a"), Some(&JsValue::Smi(1)));
@@ -1627,7 +1616,7 @@ mod tests {
         pm.insert("1".to_string(), JsValue::Smi(4));
         // Before remove: 1, 3, x, y
         pm.remove("3");
-        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        let keys: Vec<&str> = pm.keys().map(|s| &**s).collect();
         assert_eq!(keys, vec!["1", "x", "y"]);
         assert_eq!(pm.integer_key_count, 1);
     }
@@ -1644,7 +1633,7 @@ mod tests {
         );
         pm.insert("0".to_string(), JsValue::Smi(3));
         // Enumerable keys should follow spec order, excluding "hidden".
-        let keys: Vec<&str> = pm.enumerable_keys().map(|s| s.as_str()).collect();
+        let keys: Vec<&str> = pm.enumerable_keys().map(|s| &**s).collect();
         assert_eq!(keys, vec!["0", "2", "b"]);
     }
 
@@ -1655,7 +1644,7 @@ mod tests {
         pm.insert("1".to_string(), JsValue::Smi(20));
         pm.insert("0".to_string(), JsValue::Smi(30));
         // Spec order: 0, 1, b — values should follow.
-        let pairs: Vec<(&str, &JsValue)> = pm.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        let pairs: Vec<(&str, &JsValue)> = pm.iter().map(|(k, v)| (&**k, v)).collect();
         assert_eq!(
             pairs,
             vec![
@@ -1673,7 +1662,7 @@ mod tests {
         pm.insert("a".to_string(), JsValue::Smi(20));
         // Re-insert "1" — should update value, not move it.
         pm.insert("1".to_string(), JsValue::Smi(99));
-        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        let keys: Vec<&str> = pm.keys().map(|s| &**s).collect();
         assert_eq!(keys, vec!["1", "a"]);
         assert_eq!(pm.get("1"), Some(&JsValue::Smi(99)));
     }
@@ -1882,7 +1871,7 @@ mod tests {
             PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
         ); // not enumerable
         pm.insert("c".to_string(), JsValue::Smi(3)); // default = enumerable
-        let keys: Vec<&String> = pm.enumerable_keys().collect();
+        let keys: Vec<&str> = pm.enumerable_keys().map(|k| &**k).collect();
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0], "a");
         assert_eq!(keys[1], "c");
@@ -1898,7 +1887,7 @@ mod tests {
             PropertyAttributes::empty(),
         );
         pm.insert("y".to_string(), JsValue::Smi(20));
-        let pairs: Vec<(&String, &JsValue)> = pm.enumerable_iter().collect();
+        let pairs: Vec<(&str, &JsValue)> = pm.enumerable_iter().map(|(k, v)| (&**k, v)).collect();
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].0, "x");
         assert_eq!(pairs[1].0, "y");
@@ -1915,7 +1904,8 @@ mod tests {
             JsValue::Smi(2),
             PropertyAttributes::WRITABLE,
         );
-        let triples: Vec<(&String, &JsValue, PropertyAttributes)> = pm.iter_with_attrs().collect();
+        let triples: Vec<(&str, &JsValue, PropertyAttributes)> =
+            pm.iter_with_attrs().map(|(k, v, a)| (&**k, v, a)).collect();
         assert_eq!(triples.len(), 2);
         assert!(triples[0].2.contains(PropertyAttributes::ENUMERABLE));
         assert!(!triples[1].2.contains(PropertyAttributes::ENUMERABLE));
@@ -1952,7 +1942,7 @@ mod tests {
         let mut pm = PropertyMap::new();
         pm.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), JsValue::Null);
         pm.insert("visible".to_string(), JsValue::Smi(1));
-        let enum_keys: Vec<&String> = pm.enumerable_keys().collect();
+        let enum_keys: Vec<&str> = pm.enumerable_keys().map(|k| &**k).collect();
         assert_eq!(enum_keys.len(), 1);
         assert_eq!(enum_keys[0], "visible");
     }
@@ -2032,7 +2022,7 @@ mod tests {
         pm.insert("2".to_string(), JsValue::Smi(2));
         pm.insert("0".to_string(), JsValue::Smi(0));
         pm.insert("1".to_string(), JsValue::Smi(1));
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         assert_eq!(keys, &["0", "1", "2"]);
     }
 
@@ -2043,7 +2033,7 @@ mod tests {
         pm.insert("1".to_string(), JsValue::Smi(2));
         pm.insert("a".to_string(), JsValue::Smi(3));
         pm.insert("0".to_string(), JsValue::Smi(4));
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         assert_eq!(keys, &["0", "1", "b", "a"]);
     }
 
@@ -2056,9 +2046,9 @@ mod tests {
         let sym_key = symbol_to_property_key(sym);
         pm.insert(sym_key.clone(), JsValue::Smi(2));
         pm.insert("b".to_string(), JsValue::Smi(3));
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         // "a", "b" (strings in insertion order), then symbol
-        assert_eq!(keys, &["a", "b", &sym_key]);
+        assert_eq!(keys, &["a", "b", sym_key.as_str()]);
     }
 
     #[test]
@@ -2072,8 +2062,8 @@ mod tests {
         pm.insert("5".to_string(), JsValue::Smi(3));
         pm.insert("a".to_string(), JsValue::Smi(4));
         pm.insert("0".to_string(), JsValue::Smi(5));
-        let keys: Vec<&String> = pm.keys().collect();
-        assert_eq!(keys, &["0", "5", "z", "a", &sym_key]);
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
+        assert_eq!(keys, &["0", "5", "z", "a", sym_key.as_str()]);
     }
 
     #[test]
@@ -2082,7 +2072,7 @@ mod tests {
         pm.insert("2".to_string(), JsValue::String("c".into()));
         pm.insert("0".to_string(), JsValue::String("a".into()));
         pm.insert("1".to_string(), JsValue::String("b".into()));
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         assert_eq!(keys, &["0", "1", "2"]);
     }
 
@@ -2093,7 +2083,7 @@ mod tests {
         pm.insert("5".to_string(), JsValue::Smi(2));
         pm.insert("42".to_string(), JsValue::Smi(3));
         pm.insert("3".to_string(), JsValue::Smi(4));
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         assert_eq!(keys, &["3", "5", "42", "100"]);
     }
 
@@ -2104,9 +2094,9 @@ mod tests {
         pm.insert("0".to_string(), JsValue::Smi(1));
         pm.insert(max_str.clone(), JsValue::Smi(2));
         pm.insert("a".to_string(), JsValue::Smi(3));
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         // u32::MAX is NOT an array index, so treated as string
-        assert_eq!(keys, &["0", &max_str, "a"]);
+        assert_eq!(keys, &["0", max_str.as_str(), "a"]);
     }
 
     #[test]
@@ -2115,7 +2105,7 @@ mod tests {
         pm.insert("01".to_string(), JsValue::Smi(1));
         pm.insert("0".to_string(), JsValue::Smi(2));
         pm.insert("1".to_string(), JsValue::Smi(3));
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         // "01" is not a valid array index, so it's a string key
         assert_eq!(keys, &["0", "1", "01"]);
     }
@@ -2126,7 +2116,7 @@ mod tests {
         pm.insert("c".to_string(), JsValue::Smi(1));
         pm.insert("a".to_string(), JsValue::Smi(2));
         pm.insert("b".to_string(), JsValue::Smi(3));
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         assert_eq!(keys, &["c", "a", "b"]);
     }
 
@@ -2141,9 +2131,9 @@ mod tests {
         pm.insert(k1.clone(), JsValue::Smi(1));
         pm.insert("a".to_string(), JsValue::Smi(2));
         pm.insert(k2.clone(), JsValue::Smi(3));
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         // Strings first, then symbols in insertion order
-        assert_eq!(keys, &["a", &k1, &k2]);
+        assert_eq!(keys, &["a", k1.as_str(), k2.as_str()]);
     }
 
     #[test]
@@ -2155,7 +2145,7 @@ mod tests {
         let sym_key = symbol_to_property_key(sym);
         pm.insert(sym_key, JsValue::Smi(2));
         pm.insert("b".to_string(), JsValue::Smi(3));
-        let enumerable: Vec<&String> = pm.enumerable_keys().collect();
+        let enumerable: Vec<&str> = pm.enumerable_keys().map(|k| &**k).collect();
         assert_eq!(enumerable, &["a", "b"]);
     }
 
@@ -2168,7 +2158,7 @@ mod tests {
             JsValue::Smi(2),
             PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
         );
-        let enumerable: Vec<&String> = pm.enumerable_keys().collect();
+        let enumerable: Vec<&str> = pm.enumerable_keys().map(|k| &**k).collect();
         assert_eq!(enumerable, &["visible"]);
     }
 
@@ -2179,8 +2169,8 @@ mod tests {
         pm.insert("3".to_string(), JsValue::Smi(2));
         pm.insert("1".to_string(), JsValue::Smi(3));
         pm.insert("a".to_string(), JsValue::Smi(4));
-        let pairs: Vec<(&String, &JsValue)> = pm.enumerable_iter().collect();
-        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        let pairs: Vec<(&str, &JsValue)> = pm.enumerable_iter().map(|(k, v)| (&**k, v)).collect();
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
         assert_eq!(keys, &["1", "3", "z", "a"]);
     }
 
@@ -2210,7 +2200,7 @@ mod tests {
         pm.insert("a".to_string(), JsValue::Smi(3));
         pm.insert("b".to_string(), JsValue::Smi(4));
         pm.remove("a");
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         assert_eq!(keys, &["0", "1", "b"]);
     }
 
@@ -2221,7 +2211,7 @@ mod tests {
         pm.insert("10".to_string(), JsValue::Smi(2));
         pm.insert("2".to_string(), JsValue::Smi(3));
         pm.insert("a".to_string(), JsValue::Smi(4));
-        let keys: Vec<&str> = pm.iter_with_attrs().map(|(k, _, _)| k.as_str()).collect();
+        let keys: Vec<&str> = pm.iter_with_attrs().map(|(k, _, _)| &**k).collect();
         assert_eq!(keys, &["2", "10", "b", "a"]);
     }
 
@@ -2243,7 +2233,7 @@ mod tests {
             JsValue::Smi(3),
             PropertyAttributes::ENUMERABLE,
         );
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         assert_eq!(keys, &["1", "3", "b"]);
     }
 

@@ -851,7 +851,7 @@ mod tests {
         let packed = NanBoxedValue::pack(JsValue::BigInt(Box::new(42)));
         assert!(packed.is_heap_ptr());
         let unpacked = unsafe { packed.unpack() };
-        assert!(matches!(unpacked, JsValue::BigInt(Box::new(42))));
+        assert!(matches!(unpacked, JsValue::BigInt(b) if *b == 42));
     }
 
     #[test]

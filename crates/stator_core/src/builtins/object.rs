@@ -2185,7 +2185,7 @@ mod tests {
         pm.insert("a".to_string(), JsValue::Smi(3));
         pm.insert("2".to_string(), JsValue::Smi(4));
 
-        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        let keys: Vec<&str> = pm.keys().map(|s| &**s).collect();
         assert_eq!(keys, vec!["2", "10", "z", "a"]);
     }
 
