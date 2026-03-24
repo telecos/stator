@@ -405,7 +405,7 @@ pub struct BytecodeArray {
 #[derive(Debug, Clone)]
 pub struct ConstructBoilerplate {
     /// Property key names in insertion order.
-    pub keys: Vec<String>,
+    pub keys: Vec<Rc<str>>,
     /// Per-key attribute flags.
     pub attrs: Vec<crate::objects::map::PropertyAttributes>,
 }

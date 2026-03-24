@@ -565,7 +565,7 @@ pub fn object_define_properties(obj: &mut JsObject, props: &JsValue) -> StatorRe
         JsValue::PlainObject(map) => map
             .borrow()
             .enumerable_iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| (k.to_string(), v.clone()))
             .collect(),
         _ => {
             return Err(StatorError::TypeError(

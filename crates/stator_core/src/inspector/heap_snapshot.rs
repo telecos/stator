@@ -412,7 +412,7 @@ impl HeapSnapshotBuilder {
                 let entries: Vec<(String, JsValue)> = rc
                     .borrow()
                     .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .map(|(k, v)| (k.to_string(), v.clone()))
                     .collect();
                 for (key, val) in entries {
                     let child_offset = self.visit(&val);
