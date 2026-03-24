@@ -732,11 +732,11 @@ pub fn typed_array_get(ta: &JsTypedArray, index: usize) -> JsValue {
         }
         TypedArrayKind::BigInt64 => {
             let bytes: [u8; 8] = d[abs..abs + 8].try_into().expect("8 bytes");
-            JsValue::BigInt(i128::from(i64::from_ne_bytes(bytes)))
+            JsValue::BigInt(Box::new(i128::from(i64::from_ne_bytes(bytes))))
         }
         TypedArrayKind::BigUint64 => {
             let bytes: [u8; 8] = d[abs..abs + 8].try_into().expect("8 bytes");
-            JsValue::BigInt(i128::from(u64::from_ne_bytes(bytes)))
+            JsValue::BigInt(Box::new(i128::from(u64::from_ne_bytes(bytes))))
         }
     }
 }
@@ -1435,7 +1435,7 @@ fn clamp_u8(n: f64) -> u8 {
 /// Convert a `JsValue` to `i64` for `BigInt64Array`.
 fn value_to_bigint64(value: &JsValue) -> StatorResult<i64> {
     match value {
-        JsValue::BigInt(n) => Ok(*n as i64),
+        JsValue::BigInt(n) => Ok(**n as i64),
         JsValue::Smi(n) => Ok(i64::from(*n)),
         JsValue::HeapNumber(n) => Ok(*n as i64),
         _ => Err(StatorError::TypeError(
@@ -1447,7 +1447,7 @@ fn value_to_bigint64(value: &JsValue) -> StatorResult<i64> {
 /// Convert a `JsValue` to `u64` for `BigUint64Array`.
 fn value_to_biguint64(value: &JsValue) -> StatorResult<u64> {
     match value {
-        JsValue::BigInt(n) => Ok(*n as u64),
+        JsValue::BigInt(n) => Ok(**n as u64),
         JsValue::Smi(n) => Ok(*n as u64),
         JsValue::HeapNumber(n) => Ok(*n as u64),
         _ => Err(StatorError::TypeError(

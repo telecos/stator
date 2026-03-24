@@ -517,7 +517,7 @@ fn handle_ldar_sub_star(
     if lhs.is_bigint() || rhs.is_bigint() {
         let left = to_bigint(&lhs)?;
         let right = to_bigint(rhs)?;
-        ctx.frame.accumulator = JsValue::BigInt(left.wrapping_sub(right));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(left.wrapping_sub(right)));
     } else {
         let lhs_n = lhs.to_number()?;
         let rhs_n = rhs.to_number()?;
@@ -565,7 +565,7 @@ fn handle_ldar_mul_star(
     if lhs.is_bigint() || rhs.is_bigint() {
         let left = to_bigint(&lhs)?;
         let right = to_bigint(rhs)?;
-        ctx.frame.accumulator = JsValue::BigInt(left.wrapping_mul(right));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(left.wrapping_mul(right)));
     } else {
         let lhs_n = lhs.to_number()?;
         let rhs_n = rhs.to_number()?;
@@ -656,7 +656,7 @@ fn handle_sub(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(rhs)?;
-        ctx.frame.accumulator = JsValue::BigInt(l.wrapping_sub(r));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(l.wrapping_sub(r)));
     } else {
         let lhs_n = ctx.frame.accumulator.to_number()?;
         let rhs_n = rhs.to_number()?;
@@ -687,7 +687,7 @@ fn handle_mul(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(rhs)?;
-        ctx.frame.accumulator = JsValue::BigInt(l.wrapping_mul(r));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(l.wrapping_mul(r)));
     } else {
         let lhs_n = ctx.frame.accumulator.to_number()?;
         let rhs_n = rhs.to_number()?;
@@ -725,7 +725,7 @@ fn handle_div(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         if r == 0 {
             return Err(StatorError::RangeError("Division by zero".to_string()));
         }
-        ctx.frame.accumulator = JsValue::BigInt(l / r);
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(l / r));
     } else {
         let lhs_n = ctx.frame.accumulator.to_number()?;
         let rhs_n = rhs.to_number()?;
@@ -768,7 +768,7 @@ fn handle_mod(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
         if r == 0 {
             return Err(StatorError::RangeError("Division by zero".to_string()));
         }
-        ctx.frame.accumulator = JsValue::BigInt(l % r);
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(l % r));
     } else {
         let lhs_n = ctx.frame.accumulator.to_number()?;
         let rhs_n = rhs.to_number()?;
@@ -797,7 +797,7 @@ fn handle_exp(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<Di
                 "Exponent must be positive".to_string(),
             ));
         }
-        ctx.frame.accumulator = JsValue::BigInt(bigint_pow(l, r as u32));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(bigint_pow(l, r as u32)));
     } else {
         let lhs_n = ctx.frame.accumulator.to_number()?;
         let rhs_n = rhs.to_number()?;
@@ -825,7 +825,7 @@ fn handle_bitwise_or(
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(rhs)?;
-        ctx.frame.accumulator = JsValue::BigInt(l | r);
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(l | r));
     } else {
         let lhs = ctx.frame.accumulator.to_int32()?;
         let rhs_i = rhs.to_int32()?;
@@ -852,7 +852,7 @@ fn handle_bitwise_xor(
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(rhs)?;
-        ctx.frame.accumulator = JsValue::BigInt(l ^ r);
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(l ^ r));
     } else {
         let lhs = ctx.frame.accumulator.to_int32()?;
         let rhs_i = rhs.to_int32()?;
@@ -880,7 +880,7 @@ fn handle_bitwise_and(
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(rhs)?;
-        ctx.frame.accumulator = JsValue::BigInt(l & r);
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(l & r));
     } else {
         let lhs = ctx.frame.accumulator.to_int32()?;
         let rhs_i = rhs.to_int32()?;
@@ -908,7 +908,7 @@ fn handle_shift_left(
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(rhs)?;
-        ctx.frame.accumulator = JsValue::BigInt(l.wrapping_shl(r as u32));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(l.wrapping_shl(r as u32)));
     } else {
         let lhs = ctx.frame.accumulator.to_int32()?;
         let shift = rhs.to_uint32()? & 0x1f;
@@ -936,7 +936,7 @@ fn handle_shift_right(
     if ctx.frame.accumulator.is_bigint() || rhs.is_bigint() {
         let l = to_bigint(&ctx.frame.accumulator)?;
         let r = to_bigint(rhs)?;
-        ctx.frame.accumulator = JsValue::BigInt(l.wrapping_shr(r as u32));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(l.wrapping_shr(r as u32)));
     } else {
         let lhs = ctx.frame.accumulator.to_int32()?;
         let shift = rhs.to_uint32()? & 0x1f;
@@ -983,7 +983,7 @@ fn handle_add_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
         return Ok(DispatchAction::Continue);
     }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
-        ctx.frame.accumulator = JsValue::BigInt(n.wrapping_add(i128::from(imm)));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(n.wrapping_add(i128::from(imm))));
     } else {
         let lhs_n = ctx.frame.accumulator.to_number()?;
         ctx.frame.accumulator = number_to_jsvalue(lhs_n + imm as f64);
@@ -1016,7 +1016,7 @@ fn handle_add_smi_star(
     }
 
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
-        ctx.frame.accumulator = JsValue::BigInt(n.wrapping_add(i128::from(imm)));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(n.wrapping_add(i128::from(imm))));
     } else {
         let lhs_n = ctx.frame.accumulator.to_number()?;
         ctx.frame.accumulator = number_to_jsvalue(lhs_n + imm as f64);
@@ -1039,7 +1039,7 @@ fn handle_sub_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
         return Ok(DispatchAction::Continue);
     }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
-        ctx.frame.accumulator = JsValue::BigInt(n.wrapping_sub(i128::from(imm)));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(n.wrapping_sub(i128::from(imm))));
     } else {
         let lhs_n = ctx.frame.accumulator.to_number()?;
         ctx.frame.accumulator = number_to_jsvalue(lhs_n - imm as f64);
@@ -1059,7 +1059,7 @@ fn handle_mul_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
         return Ok(DispatchAction::Continue);
     }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
-        ctx.frame.accumulator = JsValue::BigInt(n.wrapping_mul(i128::from(imm)));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(n.wrapping_mul(i128::from(imm))));
     } else {
         let lhs_n = ctx.frame.accumulator.to_number()?;
         ctx.frame.accumulator = number_to_jsvalue(lhs_n * imm as f64);
@@ -1092,7 +1092,7 @@ fn handle_mul_smi_star(
     }
 
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
-        ctx.frame.accumulator = JsValue::BigInt(n.wrapping_mul(i128::from(imm)));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(n.wrapping_mul(i128::from(imm))));
     } else {
         let lhs_n = ctx.frame.accumulator.to_number()?;
         ctx.frame.accumulator = number_to_jsvalue(lhs_n * imm as f64);
@@ -1110,7 +1110,7 @@ fn handle_div_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
         if imm == 0 {
             return Err(StatorError::RangeError("Division by zero".to_string()));
         }
-        ctx.frame.accumulator = JsValue::BigInt(n / i128::from(imm));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(**n / i128::from(imm)));
     } else {
         let lhs_n = ctx.frame.accumulator.to_number()?;
         ctx.frame.accumulator = number_to_jsvalue(lhs_n / imm as f64);
@@ -1126,7 +1126,7 @@ fn handle_mod_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
         if imm == 0 {
             return Err(StatorError::RangeError("Division by zero".to_string()));
         }
-        ctx.frame.accumulator = JsValue::BigInt(n % i128::from(imm));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(**n % i128::from(imm)));
     } else {
         let lhs_n = ctx.frame.accumulator.to_number()?;
         ctx.frame.accumulator = number_to_jsvalue(lhs_n % imm as f64);
@@ -1144,7 +1144,7 @@ fn handle_exp_smi(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
                 "Exponent must be positive".to_string(),
             ));
         }
-        ctx.frame.accumulator = JsValue::BigInt(bigint_pow(*n, imm as u32));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(bigint_pow(**n, imm as u32)));
     } else {
         let lhs_n = ctx.frame.accumulator.to_number()?;
         ctx.frame.accumulator = number_to_jsvalue(lhs_n.powf(imm as f64));
@@ -1164,7 +1164,7 @@ fn handle_bitwise_or_smi(
         return Ok(DispatchAction::Continue);
     }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
-        ctx.frame.accumulator = JsValue::BigInt(n | i128::from(imm));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(**n | i128::from(imm)));
     } else {
         let lhs = ctx.frame.accumulator.to_int32()?;
         ctx.frame.accumulator = JsValue::Smi(lhs | imm);
@@ -1184,7 +1184,7 @@ fn handle_bitwise_xor_smi(
         return Ok(DispatchAction::Continue);
     }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
-        ctx.frame.accumulator = JsValue::BigInt(n ^ i128::from(imm));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(**n ^ i128::from(imm)));
     } else {
         let lhs = ctx.frame.accumulator.to_int32()?;
         ctx.frame.accumulator = JsValue::Smi(lhs ^ imm);
@@ -1204,7 +1204,7 @@ fn handle_bitwise_and_smi(
         return Ok(DispatchAction::Continue);
     }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
-        ctx.frame.accumulator = JsValue::BigInt(n & i128::from(imm));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(**n & i128::from(imm)));
     } else {
         let lhs = ctx.frame.accumulator.to_int32()?;
         ctx.frame.accumulator = JsValue::Smi(lhs & imm);
@@ -1225,7 +1225,7 @@ fn handle_shift_left_smi(
         return Ok(DispatchAction::Continue);
     }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
-        ctx.frame.accumulator = JsValue::BigInt(n.wrapping_shl(imm as u32));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(n.wrapping_shl(imm as u32)));
     } else {
         let lhs = ctx.frame.accumulator.to_int32()?;
         let shift = (imm as u32) & 0x1f;
@@ -1247,7 +1247,7 @@ fn handle_shift_right_smi(
         return Ok(DispatchAction::Continue);
     }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
-        ctx.frame.accumulator = JsValue::BigInt(n.wrapping_shr(imm as u32));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(n.wrapping_shr(imm as u32)));
     } else {
         let lhs = ctx.frame.accumulator.to_int32()?;
         let shift = (imm as u32) & 0x1f;
@@ -1290,7 +1290,7 @@ fn handle_inc(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<D
         return Ok(DispatchAction::Continue);
     }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
-        ctx.frame.accumulator = JsValue::BigInt(n.wrapping_add(1));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(n.wrapping_add(1)));
     } else {
         let n = ctx.frame.accumulator.to_number()?;
         ctx.frame.accumulator = number_to_jsvalue(n + 1.0);
@@ -1315,7 +1315,7 @@ fn handle_inc_star(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResu
         }
         ctx.frame.accumulator = JsValue::HeapNumber((n as f64) + 1.0);
     } else if let JsValue::BigInt(n) = &ctx.frame.accumulator {
-        ctx.frame.accumulator = JsValue::BigInt(n.wrapping_add(1));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(n.wrapping_add(1)));
     } else {
         let n = ctx.frame.accumulator.to_number()?;
         ctx.frame.accumulator = number_to_jsvalue(n + 1.0);
@@ -1338,7 +1338,7 @@ fn handle_dec(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<D
         return Ok(DispatchAction::Continue);
     }
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
-        ctx.frame.accumulator = JsValue::BigInt(n.wrapping_sub(1));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(n.wrapping_sub(1)));
     } else {
         let n = ctx.frame.accumulator.to_number()?;
         ctx.frame.accumulator = number_to_jsvalue(n - 1.0);
@@ -1712,7 +1712,7 @@ fn handle_sub_smi_star(
     }
 
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
-        ctx.frame.accumulator = JsValue::BigInt(n.wrapping_sub(i128::from(imm)));
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(n.wrapping_sub(i128::from(imm))));
     } else {
         let lhs_n = ctx.frame.accumulator.to_number()?;
         ctx.frame.accumulator = number_to_jsvalue(lhs_n - imm as f64);
@@ -5249,12 +5249,12 @@ fn handle_to_object(
         }
         // ECMAScript §7.1.18 – BigInt wrapper object.
         JsValue::BigInt(n) => {
-            let n_val = *n;
+            let n_val = **n;
             let mut map = PropertyMap::new();
-            map.insert("__wrapped__".into(), JsValue::BigInt(n_val));
+            map.insert("__wrapped__".into(), JsValue::BigInt(Box::new(n_val)));
             map.insert(
                 "valueOf".into(),
-                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::BigInt(n_val)))),
+                JsValue::NativeFunction(Rc::new(move |_| Ok(JsValue::BigInt(Box::new(n_val))))),
             );
             map.insert(
                 "toString".into(),
@@ -5293,7 +5293,7 @@ fn handle_to_name(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
 fn handle_negate(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<DispatchAction> {
     // operands[0] is a FeedbackSlot, ignored at runtime.
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
-        ctx.frame.accumulator = JsValue::BigInt(n.wrapping_neg());
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(n.wrapping_neg()));
     } else {
         let n = ctx.frame.accumulator.to_number()?;
         ctx.frame.accumulator = number_to_jsvalue(-n);
@@ -5307,7 +5307,7 @@ fn handle_bitwise_not(
 ) -> StatorResult<DispatchAction> {
     // operands[0] is a FeedbackSlot, ignored at runtime.
     if let JsValue::BigInt(n) = &ctx.frame.accumulator {
-        ctx.frame.accumulator = JsValue::BigInt(!n);
+        ctx.frame.accumulator = JsValue::BigInt(Box::new(!(**n)));
     } else {
         let n = ctx.frame.accumulator.to_int32()?;
         ctx.frame.accumulator = JsValue::Smi(!n);
