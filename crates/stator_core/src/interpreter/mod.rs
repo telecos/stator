@@ -1949,6 +1949,14 @@ impl HotRegisters {
         }
     }
 
+    /// Invalidate all hot registers, forcing subsequent reads to fall back
+    /// to the real register file.
+    #[inline(always)]
+    fn invalidate_all(&mut self) {
+        self.valid_lo = 0;
+        self.valid_hi = 0;
+    }
+
     /// Read the raw [`NanBoxedValue`] stored for register `idx`, if valid.
     #[inline(always)]
     fn read_raw(&self, idx: usize) -> Option<NanBoxedValue> {
@@ -2994,7 +3002,11 @@ impl Interpreter {
                                 smi_acc_spilled = false;
                                 hot_acc = Some(NanBoxedValue::from_smi(sa));
                                 let reg = unsafe { operand_reg_unchecked(instr, 1) };
+                                let idx = frame.reg_flat_index_unchecked(reg);
                                 unsafe { frame.write_reg_unchecked(reg, JsValue::Smi(sa)) };
+                                if let Some(ref mut hr) = frame.hot_registers {
+                                    hr.write_smi(idx, sa);
+                                }
                             }
                             Opcode::LdaZero => {
                                 sa = 0;
@@ -5709,7 +5721,13 @@ impl Interpreter {
                                 // so it can detect when execution flows past
                                 // the back-edge (e.g. loop exit).
                                 frame.loop_end_pc = loop_end;
-                                if frame.hot_registers.is_none() {
+                                // Invalidate hot_registers when re-entering
+                                // smi_mode: the outer dispatch loop may have
+                                // modified registers via table-dispatched
+                                // handlers that don't update the hot cache.
+                                if let Some(ref mut hr) = frame.hot_registers {
+                                    hr.invalidate_all();
+                                } else {
                                     frame.hot_registers =
                                         Some(HotRegisters::new(frame.registers.len()));
                                 }

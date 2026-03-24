@@ -347,15 +347,17 @@ fn fuse_superinstructions_with_origins(
         return;
     }
 
+    // Snapshot jump targets before fusion so resolve_jump_offsets can remap
+    // them after the instruction count changes.
+    let old_targets = collect_jump_target_indices(instructions, byte_offsets);
+
     let jump_target_bytes = collect_jump_target_bytes(instructions, byte_offsets);
-    let sentinel = match byte_offsets.last().copied() {
-        Some(sentinel) => sentinel,
-        None => return,
-    };
 
     let mut fused_instructions = Vec::with_capacity(instructions.len());
-    let mut fused_offsets = Vec::with_capacity(byte_offsets.len());
     let mut fused_origins = Vec::with_capacity(origins.len());
+    // Track how many pre-fusion instructions each post-fusion instruction
+    // consumed so we can build a complete pre→post index mapping later.
+    let mut consumed: Vec<usize> = Vec::with_capacity(origins.len());
     let mut index = 0usize;
 
     while index < instructions.len() {
@@ -380,8 +382,8 @@ fn fuse_superinstructions_with_origins(
                         *second.operand(1),
                         *third.operand(0),
                     ) {
-                        fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
+                        consumed.push(3);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::LdarAddStar,
                             vec![
@@ -407,8 +409,8 @@ fn fuse_superinstructions_with_origins(
                         *second.operand(1),
                         *third.operand(0),
                     ) {
-                        fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
+                        consumed.push(3);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::LdarSubStar,
                             vec![
@@ -434,8 +436,8 @@ fn fuse_superinstructions_with_origins(
                         *second.operand(1),
                         *third.operand(0),
                     ) {
-                        fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
+                        consumed.push(3);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::LdarMulStar,
                             vec![
@@ -466,8 +468,8 @@ fn fuse_superinstructions_with_origins(
                     ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
-                        fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
+                        consumed.push(2);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::TestLessThanJump,
                             vec![
@@ -489,8 +491,8 @@ fn fuse_superinstructions_with_origins(
                     ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
-                        fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
+                        consumed.push(2);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::TestGreaterThanJump,
                             vec![
@@ -512,8 +514,8 @@ fn fuse_superinstructions_with_origins(
                     ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
-                        fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
+                        consumed.push(2);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::TestEqualJump,
                             vec![
@@ -535,8 +537,8 @@ fn fuse_superinstructions_with_origins(
                     ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
-                        fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
+                        consumed.push(2);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::TestNotEqualJump,
                             vec![
@@ -558,8 +560,8 @@ fn fuse_superinstructions_with_origins(
                     ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
-                        fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
+                        consumed.push(2);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::TestEqualStrictJump,
                             vec![
@@ -581,8 +583,8 @@ fn fuse_superinstructions_with_origins(
                     ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
-                        fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
+                        consumed.push(2);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::TestLessThanOrEqualJump,
                             vec![
@@ -604,8 +606,8 @@ fn fuse_superinstructions_with_origins(
                     ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
-                        fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
+                        consumed.push(2);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::TestGreaterThanOrEqualJump,
                             vec![
@@ -626,8 +628,8 @@ fn fuse_superinstructions_with_origins(
                         Operand::Register(dst),
                     ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
-                        fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
+                        consumed.push(2);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::AddSmiStar,
                             vec![
@@ -647,8 +649,8 @@ fn fuse_superinstructions_with_origins(
                         Operand::Register(dst),
                     ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
-                        fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
+                        consumed.push(2);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::SubSmiStar,
                             vec![
@@ -668,8 +670,8 @@ fn fuse_superinstructions_with_origins(
                         Operand::Register(dst),
                     ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
-                        fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
+                        consumed.push(2);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::MulSmiStar,
                             vec![
@@ -686,8 +688,8 @@ fn fuse_superinstructions_with_origins(
                     if let (Operand::FeedbackSlot(slot), Operand::Register(dst)) =
                         (*first.operand(0), *second.operand(0))
                     {
-                        fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
+                        consumed.push(2);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::IncStar,
                             vec![Operand::FeedbackSlot(slot), Operand::Register(dst)],
@@ -700,8 +702,8 @@ fn fuse_superinstructions_with_origins(
                     if let (Operand::Immediate(imm), Operand::Register(dst)) =
                         (*first.operand(0), *second.operand(0))
                     {
-                        fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
+                        consumed.push(2);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::LdaSmiStar,
                             vec![Operand::Immediate(imm), Operand::Register(dst)],
@@ -717,8 +719,8 @@ fn fuse_superinstructions_with_origins(
                         Operand::Register(dst),
                     ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
-                        fused_offsets.push(byte_offsets[index]);
                         fused_origins.push(origins[index]);
+                        consumed.push(2);
                         fused_instructions.push(Instruction::new_unchecked(
                             Opcode::LdaGlobalStar,
                             vec![
@@ -735,16 +737,60 @@ fn fuse_superinstructions_with_origins(
             }
         }
 
-        fused_offsets.push(byte_offsets[index]);
         fused_instructions.push(instructions[index].clone());
         fused_origins.push(origins[index]);
+        consumed.push(1);
         index += 1;
     }
 
-    fused_offsets.push(sentinel);
     *instructions = fused_instructions;
-    *byte_offsets = fused_offsets;
     *origins = fused_origins;
+
+    // Build a complete pre-fusion → post-fusion index mapping.
+    // Each fused instruction consumed N pre-fusion instructions; all N
+    // indices must map to the same post-fusion instruction so that jump
+    // targets from any of the consumed instructions are resolved correctly.
+    // Include an extra sentinel entry for jumps that target past-the-end.
+    let pre_fusion_count = old_targets.len();
+    let post_fusion_count = instructions.len();
+    let mut pre_to_post = vec![None; pre_fusion_count + 1];
+    {
+        let mut old_idx = 0usize;
+        for (new_idx, &count) in consumed.iter().enumerate() {
+            for j in 0..count {
+                if old_idx + j < pre_fusion_count {
+                    pre_to_post[old_idx + j] = Some(new_idx);
+                }
+            }
+            old_idx += count;
+        }
+    }
+    // Map sentinel: past-end in pre-fusion → past-end in post-fusion.
+    pre_to_post[pre_fusion_count] = Some(post_fusion_count);
+
+    // Recalculate jump offsets.  Encoding sizes can change when deltas
+    // change (1-byte vs 4-byte operand), so iterate until stable.
+    let mut new_offsets = recompute_byte_offsets(instructions);
+    for _ in 0..20 {
+        let mut changed = false;
+        for (old_idx, target) in old_targets.iter().enumerate() {
+            let (Some(new_idx), Some(target_old)) = (pre_to_post[old_idx], *target) else {
+                continue;
+            };
+            let Some(target_new) = pre_to_post[target_old] else {
+                continue;
+            };
+            let delta = new_offsets[target_new] as i64 - new_offsets[new_idx + 1] as i64;
+            if set_jump_offset(&mut instructions[new_idx], delta as i32) {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+        new_offsets = recompute_byte_offsets(instructions);
+    }
+    *byte_offsets = new_offsets;
 }
 
 fn hoist_loop_invariants(
