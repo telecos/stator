@@ -1460,14 +1460,18 @@ mod tests {
         assert_eq!(pm.get("a"), Some(&JsValue::Smi(1)));
         assert_eq!(pm.get("b"), Some(&JsValue::Smi(2)));
 
+        // With a 16-entry direct-mapped hash cache, each key hashes to a
+        // specific slot.  Verify that both are cached at their hash slots.
         let hash_a = name_hash("a");
         let hash_b = name_hash("b");
-        assert_eq!(pm.cache_hashes[0].get(), hash_a);
-        assert_eq!(pm.cache_hashes[1].get(), hash_b);
+        let idx_a = (hash_a as usize) & (INLINE_CACHE_CAP - 1);
+        let idx_b = (hash_b as usize) & (INLINE_CACHE_CAP - 1);
+        assert_eq!(pm.cache_hashes[idx_a].get(), hash_a);
+        assert_eq!(pm.cache_hashes[idx_b].get(), hash_b);
 
+        // Re-access "b" — still at the same hash slot.
         assert_eq!(pm.get("b"), Some(&JsValue::Smi(2)));
-        assert_eq!(pm.cache_hashes[0].get(), hash_b);
-        assert_eq!(pm.cache_hashes[1].get(), hash_a);
+        assert_eq!(pm.cache_hashes[idx_b].get(), hash_b);
     }
 
     #[test]
@@ -2244,8 +2248,9 @@ mod tests {
             pm.insert(format!("k{idx}"), JsValue::Smi(idx as i32));
         }
         assert!(matches!(pm.index, PropertyIndex::Inline));
+        let last_key = format!("k{}", SMALL_PROPERTY_LINEAR_SCAN_CAP - 1);
         assert_eq!(
-            pm.get("k7"),
+            pm.get(&last_key),
             Some(&JsValue::Smi((SMALL_PROPERTY_LINEAR_SCAN_CAP - 1) as i32))
         );
 

@@ -817,7 +817,11 @@ fn find_hoist_candidates(
     let mut index = loop_info.header;
 
     while index < loop_info.back_edge {
-        if is_jump_target(byte_offsets, &jump_target_bytes, index)
+        // The loop header is always a jump target (the back-edge targets it),
+        // but instructions there execute on every iteration and are valid
+        // hoisting candidates.  Only skip non-header jump targets.
+        let at_header = index == loop_info.header;
+        if (!at_header && is_jump_target(byte_offsets, &jump_target_bytes, index))
             || is_jump_target(byte_offsets, &jump_target_bytes, index + 1)
         {
             index += 1;
@@ -1789,7 +1793,8 @@ mod tests {
 
     #[test]
     fn test_star_ldar_same_register_eliminated() {
-        // Star r0 → Ldar r0 should eliminate the Ldar.
+        // Star r0 → Ldar r0 should eliminate the Ldar, then LdaSmi+Star
+        // fuses into LdaSmiStar.
         let original = vec![
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
@@ -1802,7 +1807,7 @@ mod tests {
 
         assert_eq!(
             instructions.iter().map(|i| i.opcode).collect::<Vec<_>>(),
-            vec![Opcode::LdaSmi, Opcode::Star, Opcode::Return]
+            vec![Opcode::LdaSmiStar, Opcode::Return]
         );
         assert_eq!(byte_offsets.len(), instructions.len() + 1);
     }
@@ -1892,6 +1897,8 @@ mod tests {
     #[test]
     fn test_adjacent_star_star_eliminates_first() {
         // Star r0 → Star r1 — the first Star is dead (acc unchanged).
+        // After dead-store elimination, LdaSmi+Star(r1) fuses into
+        // LdaSmiStar(5, r1).
         let original = vec![
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
@@ -1904,10 +1911,10 @@ mod tests {
 
         assert_eq!(
             instructions.iter().map(|i| i.opcode).collect::<Vec<_>>(),
-            vec![Opcode::LdaSmi, Opcode::Star, Opcode::Return]
+            vec![Opcode::LdaSmiStar, Opcode::Return]
         );
-        // The surviving Star should target r1.
-        assert_eq!(get_register(&instructions[1], 0), Some(1));
+        // The LdaSmiStar target register is the second operand (r1).
+        assert_eq!(get_register(&instructions[0], 1), Some(1));
         assert_eq!(byte_offsets.len(), instructions.len() + 1);
     }
 

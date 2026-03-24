@@ -2863,7 +2863,7 @@ impl Interpreter {
                     // Malformed bytecode — no Return terminator.
                     frame.pc = pc;
                     frame.accumulator = acc;
-                    return Err(StatorError::RangeError(
+                    return Err(StatorError::Internal(
                         "bytecode fell off the end without Return".into(),
                     ));
                 }
