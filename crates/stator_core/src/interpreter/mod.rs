@@ -284,11 +284,11 @@ thread_local! {
     ///
     /// The cache key uses receiver pointer identity plus property-key pointer
     /// identity, which keeps hot repeated lookups O(1) for stable object shapes.
-    static PROTO_CACHE: RefCell<HashMap<(usize, usize), (JsValue, u8)>> =
+    static PROTO_CACHE: RefCell<HashMap<(usize, u64), (JsValue, u8)>> =
         RefCell::new(HashMap::with_capacity(64));
 
     /// Validation generation for entries stored in [`PROTO_CACHE`].
-    static PROTO_CACHE_GENERATIONS: RefCell<HashMap<(usize, usize), u32>> =
+    static PROTO_CACHE_GENERATIONS: RefCell<HashMap<(usize, u64), u32>> =
         RefCell::new(HashMap::with_capacity(64));
 
     /// Last observed global prototype-mutation epoch for the thread-local caches.
@@ -530,8 +530,12 @@ fn refresh_proto_resolution_caches() {
 }
 
 #[inline]
-fn proto_cache_key(map: &Rc<RefCell<PropertyMap>>, key: &str) -> (usize, usize) {
-    (Rc::as_ptr(map) as usize, key.as_ptr() as usize)
+fn proto_cache_key(map: &Rc<RefCell<PropertyMap>>, key: &str) -> (usize, u64) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    (Rc::as_ptr(map) as usize, hasher.finish())
 }
 
 #[inline]
@@ -6369,7 +6373,10 @@ impl Interpreter {
                             if let JsValue::Array(items) = obj {
                                 let borrow = items.borrow();
                                 let i = *idx as usize;
-                                let result = borrow.get(i).cloned().unwrap_or(JsValue::Undefined);
+                                let result = match borrow.get(i) {
+                                    Some(v) if !v.is_the_hole() => v.clone(),
+                                    _ => JsValue::Undefined,
+                                };
                                 drop(borrow);
                                 acc = result;
                                 continue 'dispatch;
@@ -12939,9 +12946,10 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
                 }
             } else if let Some(idx) = to_array_index(key) {
                 let mut v = arr.borrow_mut();
-                // Extend the array if needed
+                // Extend the array if needed, filling gaps with TheHole to
+                // represent sparse (unset) elements.
                 if idx >= v.len() {
-                    v.resize(idx + 1, JsValue::Undefined);
+                    v.resize(idx + 1, JsValue::TheHole);
                 }
                 v[idx] = value;
             }

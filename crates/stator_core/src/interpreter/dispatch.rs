@@ -4296,7 +4296,7 @@ fn handle_sta_keyed_property(
             } else if i == v.len() {
                 v.push(val);
             } else {
-                v.resize(i, JsValue::Undefined);
+                v.resize(i, JsValue::TheHole);
                 v.push(val);
             }
             return Ok(DispatchAction::Continue);
