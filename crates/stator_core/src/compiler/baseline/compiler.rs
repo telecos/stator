@@ -667,16 +667,16 @@ impl<'a> BaselineCompiler<'a> {
                 self.masm.xor_rr(Reg64::R12, Reg64::R12);
             }
             Opcode::LdaSmi => {
-                let Operand::Immediate(v) = instr.operands[0] else {
+                let Operand::Immediate(v) = *instr.operand(0) else {
                     return Err(bad_operand("LdaSmi", 0));
                 };
                 self.masm.mov_ri(Reg64::R12, v as i64);
             }
             Opcode::LdaSmiStar => {
-                let Operand::Immediate(v) = instr.operands[0] else {
+                let Operand::Immediate(v) = *instr.operand(0) else {
                     return Err(bad_operand("LdaSmiStar", 0));
                 };
-                let Operand::Register(dst) = instr.operands[1] else {
+                let Operand::Register(dst) = *instr.operand(1) else {
                     return Err(bad_operand("LdaSmiStar", 1));
                 };
                 self.masm.mov_ri(Reg64::R12, v as i64);
@@ -696,7 +696,7 @@ impl<'a> BaselineCompiler<'a> {
             }
             Opcode::Nop => {}
             Opcode::LdaConstant => {
-                let Operand::ConstantPoolIdx(idx_cp) = instr.operands[0] else {
+                let Operand::ConstantPoolIdx(idx_cp) = *instr.operand(0) else {
                     return Err(bad_operand("LdaConstant", 0));
                 };
                 match self.bytecode.get_constant(idx_cp) {
@@ -733,22 +733,22 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── Register moves ───────────────────────────────────────────────
             Opcode::Ldar => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("Ldar", 0));
                 };
                 self.emit_load_reg(Reg64::R12, v);
             }
             Opcode::LdarAddStar => {
-                let Operand::Register(src) = instr.operands[0] else {
+                let Operand::Register(src) = *instr.operand(0) else {
                     return Err(bad_operand("LdarAddStar", 0));
                 };
-                let Operand::Register(add_reg) = instr.operands[1] else {
+                let Operand::Register(add_reg) = *instr.operand(1) else {
                     return Err(bad_operand("LdarAddStar", 1));
                 };
-                let Operand::Register(dst) = instr.operands[2] else {
+                let Operand::Register(dst) = *instr.operand(2) else {
                     return Err(bad_operand("LdarAddStar", 2));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[3] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(3) else {
                     return Err(bad_operand("LdarAddStar", 3));
                 };
                 self.emit_load_reg(Reg64::R12, src);
@@ -757,16 +757,16 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_store_reg(dst, Reg64::R12);
             }
             Opcode::LdarSubStar => {
-                let Operand::Register(src) = instr.operands[0] else {
+                let Operand::Register(src) = *instr.operand(0) else {
                     return Err(bad_operand("LdarSubStar", 0));
                 };
-                let Operand::Register(sub_reg) = instr.operands[1] else {
+                let Operand::Register(sub_reg) = *instr.operand(1) else {
                     return Err(bad_operand("LdarSubStar", 1));
                 };
-                let Operand::Register(dst) = instr.operands[2] else {
+                let Operand::Register(dst) = *instr.operand(2) else {
                     return Err(bad_operand("LdarSubStar", 2));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[3] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(3) else {
                     return Err(bad_operand("LdarSubStar", 3));
                 };
                 self.emit_load_reg(Reg64::R12, src);
@@ -775,16 +775,16 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_store_reg(dst, Reg64::R12);
             }
             Opcode::LdarMulStar => {
-                let Operand::Register(src) = instr.operands[0] else {
+                let Operand::Register(src) = *instr.operand(0) else {
                     return Err(bad_operand("LdarMulStar", 0));
                 };
-                let Operand::Register(mul_reg) = instr.operands[1] else {
+                let Operand::Register(mul_reg) = *instr.operand(1) else {
                     return Err(bad_operand("LdarMulStar", 1));
                 };
-                let Operand::Register(dst) = instr.operands[2] else {
+                let Operand::Register(dst) = *instr.operand(2) else {
                     return Err(bad_operand("LdarMulStar", 2));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[3] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(3) else {
                     return Err(bad_operand("LdarMulStar", 3));
                 };
                 self.emit_load_reg(Reg64::R12, src);
@@ -793,16 +793,16 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_store_reg(dst, Reg64::R12);
             }
             Opcode::Star => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("Star", 0));
                 };
                 self.emit_store_reg(v, Reg64::R12);
             }
             Opcode::Mov => {
-                let Operand::Register(src) = instr.operands[0] else {
+                let Operand::Register(src) = *instr.operand(0) else {
                     return Err(bad_operand("Mov", 0));
                 };
-                let Operand::Register(dst) = instr.operands[1] else {
+                let Operand::Register(dst) = *instr.operand(1) else {
                     return Err(bad_operand("Mov", 1));
                 };
                 self.emit_load_reg(Reg64::R11, src);
@@ -811,21 +811,21 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── Arithmetic ───────────────────────────────────────────────────
             Opcode::Add => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("Add", 0));
                 };
                 self.emit_load_reg(Reg64::R11, v);
                 self.masm.add_rr(Reg64::R12, Reg64::R11);
             }
             Opcode::Sub => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("Sub", 0));
                 };
                 self.emit_load_reg(Reg64::R11, v);
                 self.masm.sub_rr(Reg64::R12, Reg64::R11);
             }
             Opcode::Mul => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("Mul", 0));
                 };
                 self.emit_load_reg(Reg64::R11, v);
@@ -838,45 +838,45 @@ impl<'a> BaselineCompiler<'a> {
                 self.masm.sub_ri(Reg64::R12, 1);
             }
             Opcode::AddSmi => {
-                let Operand::Immediate(imm) = instr.operands[0] else {
+                let Operand::Immediate(imm) = *instr.operand(0) else {
                     return Err(bad_operand("AddSmi", 0));
                 };
                 self.masm.add_ri(Reg64::R12, imm);
             }
             Opcode::AddSmiStar => {
-                let Operand::Immediate(imm) = instr.operands[0] else {
+                let Operand::Immediate(imm) = *instr.operand(0) else {
                     return Err(bad_operand("AddSmiStar", 0));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
                     return Err(bad_operand("AddSmiStar", 1));
                 };
-                let Operand::Register(dst) = instr.operands[2] else {
+                let Operand::Register(dst) = *instr.operand(2) else {
                     return Err(bad_operand("AddSmiStar", 2));
                 };
                 self.masm.add_ri(Reg64::R12, imm);
                 self.emit_store_reg(dst, Reg64::R12);
             }
             Opcode::SubSmi => {
-                let Operand::Immediate(imm) = instr.operands[0] else {
+                let Operand::Immediate(imm) = *instr.operand(0) else {
                     return Err(bad_operand("SubSmi", 0));
                 };
                 self.masm.sub_ri(Reg64::R12, imm);
             }
             Opcode::MulSmi => {
-                let Operand::Immediate(imm) = instr.operands[0] else {
+                let Operand::Immediate(imm) = *instr.operand(0) else {
                     return Err(bad_operand("MulSmi", 0));
                 };
                 self.masm.mov_ri(Reg64::R11, imm as i64);
                 self.masm.imul_rr(Reg64::R12, Reg64::R11);
             }
             Opcode::MulSmiStar => {
-                let Operand::Immediate(imm) = instr.operands[0] else {
+                let Operand::Immediate(imm) = *instr.operand(0) else {
                     return Err(bad_operand("MulSmiStar", 0));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
                     return Err(bad_operand("MulSmiStar", 1));
                 };
-                let Operand::Register(dst) = instr.operands[2] else {
+                let Operand::Register(dst) = *instr.operand(2) else {
                     return Err(bad_operand("MulSmiStar", 2));
                 };
                 self.masm.mov_ri(Reg64::R11, imm as i64);
@@ -887,10 +887,10 @@ impl<'a> BaselineCompiler<'a> {
                 self.masm.neg_r(Reg64::R12);
             }
             Opcode::IncStar => {
-                let Operand::FeedbackSlot(_slot) = instr.operands[0] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(0) else {
                     return Err(bad_operand("IncStar", 0));
                 };
-                let Operand::Register(dst) = instr.operands[1] else {
+                let Operand::Register(dst) = *instr.operand(1) else {
                     return Err(bad_operand("IncStar", 1));
                 };
                 self.masm.add_ri(Reg64::R12, 1);
@@ -899,22 +899,22 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── Comparisons ──────────────────────────────────────────────────
             Opcode::TestLessThan => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestLessThan", 0));
                 };
                 self.emit_compare_and_set(v, CondCode::Less);
             }
             Opcode::TestLessThanJump => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestLessThanJump", 0));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
                     return Err(bad_operand("TestLessThanJump", 1));
                 };
-                let Operand::JumpOffset(delta) = instr.operands[2] else {
+                let Operand::JumpOffset(delta) = *instr.operand(2) else {
                     return Err(bad_operand("TestLessThanJump", 2));
                 };
-                let Operand::Flag(is_true_flag) = instr.operands[3] else {
+                let Operand::Flag(is_true_flag) = *instr.operand(3) else {
                     return Err(bad_operand("TestLessThanJump", 3));
                 };
                 let target = Self::resolve_target(
@@ -935,16 +935,16 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::Equal, target);
             }
             Opcode::TestGreaterThanJump => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestGreaterThanJump", 0));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
                     return Err(bad_operand("TestGreaterThanJump", 1));
                 };
-                let Operand::JumpOffset(delta) = instr.operands[2] else {
+                let Operand::JumpOffset(delta) = *instr.operand(2) else {
                     return Err(bad_operand("TestGreaterThanJump", 2));
                 };
-                let Operand::Flag(is_true_flag) = instr.operands[3] else {
+                let Operand::Flag(is_true_flag) = *instr.operand(3) else {
                     return Err(bad_operand("TestGreaterThanJump", 3));
                 };
                 let target = Self::resolve_target(
@@ -965,16 +965,16 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::Equal, target);
             }
             Opcode::TestEqualJump => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestEqualJump", 0));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
                     return Err(bad_operand("TestEqualJump", 1));
                 };
-                let Operand::JumpOffset(delta) = instr.operands[2] else {
+                let Operand::JumpOffset(delta) = *instr.operand(2) else {
                     return Err(bad_operand("TestEqualJump", 2));
                 };
-                let Operand::Flag(is_true_flag) = instr.operands[3] else {
+                let Operand::Flag(is_true_flag) = *instr.operand(3) else {
                     return Err(bad_operand("TestEqualJump", 3));
                 };
                 let target = Self::resolve_target(
@@ -995,16 +995,16 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::Equal, target);
             }
             Opcode::TestNotEqualJump => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestNotEqualJump", 0));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
                     return Err(bad_operand("TestNotEqualJump", 1));
                 };
-                let Operand::JumpOffset(delta) = instr.operands[2] else {
+                let Operand::JumpOffset(delta) = *instr.operand(2) else {
                     return Err(bad_operand("TestNotEqualJump", 2));
                 };
-                let Operand::Flag(is_true_flag) = instr.operands[3] else {
+                let Operand::Flag(is_true_flag) = *instr.operand(3) else {
                     return Err(bad_operand("TestNotEqualJump", 3));
                 };
                 let target = Self::resolve_target(
@@ -1025,16 +1025,16 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::Equal, target);
             }
             Opcode::TestEqualStrictJump => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestEqualStrictJump", 0));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
                     return Err(bad_operand("TestEqualStrictJump", 1));
                 };
-                let Operand::JumpOffset(delta) = instr.operands[2] else {
+                let Operand::JumpOffset(delta) = *instr.operand(2) else {
                     return Err(bad_operand("TestEqualStrictJump", 2));
                 };
-                let Operand::Flag(is_true_flag) = instr.operands[3] else {
+                let Operand::Flag(is_true_flag) = *instr.operand(3) else {
                     return Err(bad_operand("TestEqualStrictJump", 3));
                 };
                 let target = Self::resolve_target(
@@ -1055,16 +1055,16 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::Equal, target);
             }
             Opcode::TestLessThanOrEqualJump => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestLessThanOrEqualJump", 0));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
                     return Err(bad_operand("TestLessThanOrEqualJump", 1));
                 };
-                let Operand::JumpOffset(delta) = instr.operands[2] else {
+                let Operand::JumpOffset(delta) = *instr.operand(2) else {
                     return Err(bad_operand("TestLessThanOrEqualJump", 2));
                 };
-                let Operand::Flag(is_true_flag) = instr.operands[3] else {
+                let Operand::Flag(is_true_flag) = *instr.operand(3) else {
                     return Err(bad_operand("TestLessThanOrEqualJump", 3));
                 };
                 let target = Self::resolve_target(
@@ -1085,16 +1085,16 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::Equal, target);
             }
             Opcode::TestGreaterThanOrEqualJump => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestGreaterThanOrEqualJump", 0));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
                     return Err(bad_operand("TestGreaterThanOrEqualJump", 1));
                 };
-                let Operand::JumpOffset(delta) = instr.operands[2] else {
+                let Operand::JumpOffset(delta) = *instr.operand(2) else {
                     return Err(bad_operand("TestGreaterThanOrEqualJump", 2));
                 };
-                let Operand::Flag(is_true_flag) = instr.operands[3] else {
+                let Operand::Flag(is_true_flag) = *instr.operand(3) else {
                     return Err(bad_operand("TestGreaterThanOrEqualJump", 3));
                 };
                 let target = Self::resolve_target(
@@ -1115,44 +1115,44 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::Equal, target);
             }
             Opcode::SubSmiStar => {
-                let Operand::Immediate(imm) = instr.operands[0] else {
+                let Operand::Immediate(imm) = *instr.operand(0) else {
                     return Err(bad_operand("SubSmiStar", 0));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
                     return Err(bad_operand("SubSmiStar", 1));
                 };
-                let Operand::Register(dst) = instr.operands[2] else {
+                let Operand::Register(dst) = *instr.operand(2) else {
                     return Err(bad_operand("SubSmiStar", 2));
                 };
                 self.masm.sub_ri(Reg64::R12, imm);
                 self.emit_store_reg(dst, Reg64::R12);
             }
             Opcode::TestGreaterThan => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestGreaterThan", 0));
                 };
                 self.emit_compare_and_set(v, CondCode::Greater);
             }
             Opcode::TestLessThanOrEqual => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestLessThanOrEqual", 0));
                 };
                 self.emit_compare_and_set(v, CondCode::LessEq);
             }
             Opcode::TestGreaterThanOrEqual => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestGreaterThanOrEqual", 0));
                 };
                 self.emit_compare_and_set(v, CondCode::GreaterEq);
             }
             Opcode::TestEqual | Opcode::TestEqualStrict => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestEqual", 0));
                 };
                 self.emit_compare_and_set(v, CondCode::Equal);
             }
             Opcode::TestNotEqual => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestNotEqual", 0));
                 };
                 self.emit_compare_and_set(v, CondCode::NotEqual);
@@ -1174,7 +1174,7 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── Control flow ─────────────────────────────────────────────────
             Opcode::Jump => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("Jump", 0));
                 };
                 let target = Self::resolve_target(
@@ -1185,7 +1185,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_jump(target);
             }
             Opcode::JumpLoop => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("JumpLoop", 0));
                 };
                 let target = Self::resolve_target(
@@ -1196,7 +1196,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_jump(target);
             }
             Opcode::JumpIfTrue => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("JumpIfTrue", 0));
                 };
                 let target = Self::resolve_target(
@@ -1210,7 +1210,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::Equal, target);
             }
             Opcode::JumpIfFalse => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("JumpIfFalse", 0));
                 };
                 let target = Self::resolve_target(
@@ -1223,7 +1223,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::Equal, target);
             }
             Opcode::JumpIfToBooleanTrue => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("JumpIfToBooleanTrue", 0));
                 };
                 let target = Self::resolve_target(
@@ -1237,7 +1237,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::NotEqual, target);
             }
             Opcode::JumpIfToBooleanFalse => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("JumpIfToBooleanFalse", 0));
                 };
                 let target = Self::resolve_target(
@@ -1251,7 +1251,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::Equal, target);
             }
             Opcode::JumpIfNull => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("JumpIfNull", 0));
                 };
                 let target = Self::resolve_target(
@@ -1264,7 +1264,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::Equal, target);
             }
             Opcode::JumpIfNotNull => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("JumpIfNotNull", 0));
                 };
                 let target = Self::resolve_target(
@@ -1277,7 +1277,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::NotEqual, target);
             }
             Opcode::JumpIfUndefined => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("JumpIfUndefined", 0));
                 };
                 let target = Self::resolve_target(
@@ -1290,7 +1290,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::Equal, target);
             }
             Opcode::JumpIfNotUndefined => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("JumpIfNotUndefined", 0));
                 };
                 let target = Self::resolve_target(
@@ -1303,7 +1303,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::NotEqual, target);
             }
             Opcode::JumpIfUndefinedOrNull => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("JumpIfUndefinedOrNull", 0));
                 };
                 let target = Self::resolve_target(

@@ -477,7 +477,7 @@ mod tests {
         let mut offset: u32 = 0;
         for (i, instr) in instructions.iter().enumerate() {
             // Compute byte size of each instruction.
-            let size = 1 + instr.operands.len() as u32; // opcode (1) + operands
+            let size = 1 + instr.operand_count() as u32; // opcode (1) + operands
             positions.push(SourcePosition::new(offset, (i + 1) as u32, 1));
             offset += size;
         }

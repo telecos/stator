@@ -96,13 +96,13 @@ fn operand_bytes_needed(op: Operand) -> usize {
 /// Byte size of one encoded instruction (prefix + opcode + operands).
 fn instr_byte_size(instr: &Instruction) -> usize {
     let w = instr
-        .operands
+        .operands()
         .iter()
         .map(|&op| operand_bytes_needed(op))
         .max()
         .unwrap_or(1);
     let prefix = usize::from(w > 1);
-    prefix + 1 + instr.operands.len() * w
+    prefix + 1 + instr.operand_count() * w
 }
 
 /// Compute the byte offset of every instruction in `instructions`.
@@ -6999,8 +6999,8 @@ fn resolve_jumps(instructions: &mut [Instruction], labels: &[Label]) -> StatorRe
                 let instr_end_byte = offsets[jump_instr_idx + 1];
                 let delta = target_byte as i64 - instr_end_byte as i64;
                 let new_op = Operand::JumpOffset(delta as i32);
-                if instructions[jump_instr_idx].operands[0] != new_op {
-                    instructions[jump_instr_idx].operands[0] = new_op;
+                if *instructions[jump_instr_idx].operand(0) != new_op {
+                    *instructions[jump_instr_idx].operand_mut(0) = new_op;
                     changed = true;
                 }
             }
@@ -7499,7 +7499,7 @@ mod tests {
         let arr = BytecodeGenerator::compile_program(&prog).unwrap();
         let instrs = arr.instructions().unwrap();
         assert_eq!(instrs[0].opcode, Opcode::LdaSmi);
-        assert_eq!(instrs[0].operands[0], Operand::Immediate(42));
+        assert_eq!(*instrs[0].operand(0), Operand::Immediate(42));
         assert_eq!(instrs[1].opcode, Opcode::Return);
     }
 
@@ -7661,7 +7661,7 @@ mod tests {
         // Must contain a JumpLoop back-edge.
         let has_back_jump = instrs.iter().any(|i| {
             i.opcode == Opcode::JumpLoop
-                && i.operands
+                && i.operands()
                     .first()
                     .map(|o| matches!(o, Operand::JumpOffset(v) if *v < 0))
                     .unwrap_or(false)
@@ -8349,7 +8349,7 @@ mod tests {
         // Collect all FeedbackSlot operand values used in the bytecode.
         let mut slot_indices: Vec<u32> = instructions
             .iter()
-            .flat_map(|instr| &instr.operands)
+            .flat_map(Instruction::operands)
             .filter_map(|op| {
                 if let Operand::FeedbackSlot(idx) = op {
                     Some(*idx)
@@ -8587,11 +8587,11 @@ mod tests {
         // instr 3: JumpIfToBooleanTrue → target = instr 8
         let end3 = offsets[4];
         let tgt8 = offsets[8];
-        resolved[3].operands[0] = Operand::JumpOffset(tgt8 as i32 - end3 as i32);
+        *resolved[3].operand_mut(0) = Operand::JumpOffset(tgt8 as i32 - end3 as i32);
         // instr 7: JumpLoop → target = instr 2
         let end7 = offsets[8];
         let tgt2 = offsets[2];
-        resolved[7].operands[0] = Operand::JumpOffset(tgt2 as i32 - end7 as i32);
+        *resolved[7].operand_mut(0) = Operand::JumpOffset(tgt2 as i32 - end7 as i32);
 
         let bytes = encode(&resolved);
         let ba = BytecodeArray::new(
@@ -10143,7 +10143,7 @@ mod tests {
             .find(|i| i.opcode == Opcode::CallRuntime)
             .expect("expected CallRuntime");
         assert_eq!(
-            rt_call.operands[2],
+            *rt_call.operand(2),
             Operand::RegisterCount(1),
             "dynamic import should pass exactly one argument"
         );

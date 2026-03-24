@@ -312,10 +312,10 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         Operand::FeedbackSlot(slot),
                         Operand::Register(dst),
                     ) = (
-                        first.operands[0],
-                        second.operands[0],
-                        second.operands[1],
-                        third.operands[0],
+                        *first.operand(0),
+                        *second.operand(0),
+                        *second.operand(1),
+                        *third.operand(0),
                     ) {
                         fused_offsets.push(byte_offsets[index]);
                         fused_instructions.push(Instruction::new_unchecked(
@@ -338,10 +338,10 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         Operand::FeedbackSlot(slot),
                         Operand::Register(dst),
                     ) = (
-                        first.operands[0],
-                        second.operands[0],
-                        second.operands[1],
-                        third.operands[0],
+                        *first.operand(0),
+                        *second.operand(0),
+                        *second.operand(1),
+                        *third.operand(0),
                     ) {
                         fused_offsets.push(byte_offsets[index]);
                         fused_instructions.push(Instruction::new_unchecked(
@@ -364,10 +364,10 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         Operand::FeedbackSlot(slot),
                         Operand::Register(dst),
                     ) = (
-                        first.operands[0],
-                        second.operands[0],
-                        second.operands[1],
-                        third.operands[0],
+                        *first.operand(0),
+                        *second.operand(0),
+                        *second.operand(1),
+                        *third.operand(0),
                     ) {
                         fused_offsets.push(byte_offsets[index]);
                         fused_instructions.push(Instruction::new_unchecked(
@@ -397,7 +397,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
@@ -419,7 +419,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
@@ -441,7 +441,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
@@ -463,7 +463,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
@@ -485,7 +485,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
@@ -507,7 +507,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
@@ -529,7 +529,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
                         fused_offsets.push(byte_offsets[index]);
@@ -551,7 +551,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         Operand::Immediate(imm),
                         Operand::FeedbackSlot(slot),
                         Operand::Register(dst),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         fused_offsets.push(byte_offsets[index]);
                         fused_instructions.push(Instruction::new_unchecked(
@@ -571,7 +571,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         Operand::Immediate(imm),
                         Operand::FeedbackSlot(slot),
                         Operand::Register(dst),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         fused_offsets.push(byte_offsets[index]);
                         fused_instructions.push(Instruction::new_unchecked(
@@ -591,7 +591,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         Operand::Immediate(imm),
                         Operand::FeedbackSlot(slot),
                         Operand::Register(dst),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         fused_offsets.push(byte_offsets[index]);
                         fused_instructions.push(Instruction::new_unchecked(
@@ -608,7 +608,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                 }
                 (Opcode::Inc, Opcode::Star) => {
                     if let (Operand::FeedbackSlot(slot), Operand::Register(dst)) =
-                        (first.operands[0], second.operands[0])
+                        (*first.operand(0), *second.operand(0))
                     {
                         fused_offsets.push(byte_offsets[index]);
                         fused_instructions.push(Instruction::new_unchecked(
@@ -621,7 +621,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                 }
                 (Opcode::LdaSmi, Opcode::Star) => {
                     if let (Operand::Immediate(imm), Operand::Register(dst)) =
-                        (first.operands[0], second.operands[0])
+                        (*first.operand(0), *second.operand(0))
                     {
                         fused_offsets.push(byte_offsets[index]);
                         fused_instructions.push(Instruction::new_unchecked(
@@ -637,7 +637,7 @@ fn fuse_superinstructions(instructions: &mut Vec<Instruction>, byte_offsets: &mu
                         Operand::ConstantPoolIdx(name_idx),
                         Operand::FeedbackSlot(slot),
                         Operand::Register(dst),
-                    ) = (first.operands[0], first.operands[1], second.operands[0])
+                    ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
                         fused_offsets.push(byte_offsets[index]);
                         fused_instructions.push(Instruction::new_unchecked(
@@ -809,14 +809,14 @@ fn next_non_nop_index(instructions: &[Instruction], start: usize) -> Option<usiz
 }
 
 fn get_immediate(instruction: &Instruction, operand_index: usize) -> Option<i32> {
-    match instruction.operands.get(operand_index).copied()? {
+    match instruction.operand_at(operand_index).copied()? {
         Operand::Immediate(value) => Some(value),
         _ => None,
     }
 }
 
 fn get_register(instruction: &Instruction, operand_index: usize) -> Option<u32> {
-    match instruction.operands.get(operand_index).copied()? {
+    match instruction.operand_at(operand_index).copied()? {
         Operand::Register(register) => Some(register),
         _ => None,
     }
@@ -835,7 +835,7 @@ fn is_jump_target(
 fn instruction_mentions_register(instruction: &Instruction, register: u32) -> bool {
     // Check explicit register operands.
     if instruction
-        .operands
+        .operands()
         .iter()
         .any(|operand| matches!(operand, Operand::Register(value) if *value == register))
     {
@@ -848,7 +848,7 @@ fn instruction_mentions_register(instruction: &Instruction, register: u32) -> bo
     // to a register used as a call argument.
     if uses_register_range(instruction.opcode)
         && let Some(range_start) = get_register(instruction, 1)
-        && let Some(Operand::RegisterCount(count)) = instruction.operands.get(2)
+        && let Some(Operand::RegisterCount(count)) = instruction.operand_at(2)
         && register >= range_start
         && register < range_start + count
     {
@@ -936,7 +936,7 @@ fn collect_jump_target_bytes(
 ) -> HashSet<usize> {
     let mut target_bytes = HashSet::new();
     for (index, instruction) in instructions.iter().enumerate() {
-        for operand in &instruction.operands {
+        for operand in instruction.operands() {
             let Operand::JumpOffset(delta) = operand else {
                 continue;
             };
@@ -1196,7 +1196,8 @@ mod tests {
         let mut resolved = unresolved;
         let target_byte = offsets[2];
         let jump_end_byte = offsets[1];
-        resolved[0].operands[0] = Operand::JumpOffset(target_byte as i32 - jump_end_byte as i32);
+        *resolved[0].operand_mut(0) =
+            Operand::JumpOffset(target_byte as i32 - jump_end_byte as i32);
 
         let (mut instructions, mut byte_offsets) = decode_with_offsets(&resolved);
         fuse_instructions(&mut instructions, &mut byte_offsets);
@@ -1355,7 +1356,8 @@ mod tests {
         let mut resolved = unresolved;
         let target_byte = offsets[3];
         let jump_end_byte = offsets[1];
-        resolved[0].operands[0] = Operand::JumpOffset(target_byte as i32 - jump_end_byte as i32);
+        *resolved[0].operand_mut(0) =
+            Operand::JumpOffset(target_byte as i32 - jump_end_byte as i32);
 
         let (mut instructions, mut byte_offsets) = decode_with_offsets(&resolved);
         fuse_instructions(&mut instructions, &mut byte_offsets);
