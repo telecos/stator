@@ -4348,33 +4348,54 @@ impl Interpreter {
                                         unsafe { operand_constant_pool_idx_unchecked(instr, 1) }
                                             as usize;
                                     let depth = unsafe { operand_imm_unchecked(instr, 2) };
-                                    let ctx_ref = Rc::clone(ctx_rc);
-                                    let mut current = ctx_ref;
-                                    let mut d = depth;
-                                    while d > 0 {
-                                        let next = {
-                                            let borrow = current.borrow();
-                                            if let Some(p) = &borrow.parent {
-                                                Rc::clone(p)
-                                            } else {
-                                                break;
-                                            }
+                                    // Fast path: depth-0 accesses the register
+                                    // context directly, avoiding Rc::clone and
+                                    // the chain-walk loop entirely.  We clone the
+                                    // slot value out of the borrow scope so that
+                                    // `frame` is free to mutate afterwards.
+                                    if depth == 0 {
+                                        let slot_val = {
+                                            let borrow = ctx_rc.borrow();
+                                            borrow.slots.get(slot).cloned()
                                         };
-                                        current = next;
-                                        d -= 1;
-                                    }
-                                    let borrow = current.borrow();
-                                    if let Some(val) = borrow.slots.get(slot) {
-                                        if let JsValue::Smi(v) = val {
-                                            sa = *v;
-                                            hot_acc = Some(NanBoxedValue::from_smi(*v));
+                                        if let Some(JsValue::Smi(v)) = slot_val {
+                                            sa = v;
+                                            hot_acc = Some(NanBoxedValue::from_smi(v));
                                             continue 'smi;
+                                        } else if let Some(val) = slot_val {
+                                            acc = val;
+                                            frame.smi_mode = false;
+                                            frame.loop_end_pc = 0;
+                                            break 'smi;
                                         }
-                                        // Non-Smi value — exit SMI mode.
-                                        acc = val.clone();
-                                        frame.smi_mode = false;
-                                        frame.loop_end_pc = 0;
-                                        break 'smi;
+                                    } else {
+                                        let ctx_ref = Rc::clone(ctx_rc);
+                                        let mut current = ctx_ref;
+                                        let mut d = depth;
+                                        while d > 0 {
+                                            let next = {
+                                                let borrow = current.borrow();
+                                                if let Some(p) = &borrow.parent {
+                                                    Rc::clone(p)
+                                                } else {
+                                                    break;
+                                                }
+                                            };
+                                            current = next;
+                                            d -= 1;
+                                        }
+                                        let borrow = current.borrow();
+                                        if let Some(val) = borrow.slots.get(slot) {
+                                            if let JsValue::Smi(v) = val {
+                                                sa = *v;
+                                                hot_acc = Some(NanBoxedValue::from_smi(*v));
+                                                continue 'smi;
+                                            }
+                                            acc = val.clone();
+                                            frame.smi_mode = false;
+                                            frame.loop_end_pc = 0;
+                                            break 'smi;
+                                        }
                                     }
                                 }
                                 // No context or missing slot — fall through.
@@ -4393,25 +4414,35 @@ impl Interpreter {
                                         unsafe { operand_constant_pool_idx_unchecked(instr, 1) }
                                             as usize;
                                     let depth = unsafe { operand_imm_unchecked(instr, 2) };
-                                    let ctx_ref = Rc::clone(ctx_rc);
-                                    let mut current = ctx_ref;
-                                    let mut d = depth;
-                                    while d > 0 {
-                                        let next = {
-                                            let borrow = current.borrow();
-                                            if let Some(p) = &borrow.parent {
-                                                Rc::clone(p)
-                                            } else {
-                                                break;
-                                            }
-                                        };
-                                        current = next;
-                                        d -= 1;
-                                    }
-                                    let mut borrow = current.borrow_mut();
-                                    if slot < borrow.slots.len() {
-                                        borrow.slots[slot] = materialize_acc!();
-                                        continue 'smi;
+                                    // Fast path: depth-0 stores directly into
+                                    // the register context without Rc::clone.
+                                    if depth == 0 {
+                                        let mut borrow = ctx_rc.borrow_mut();
+                                        if slot < borrow.slots.len() {
+                                            borrow.slots[slot] = materialize_acc!();
+                                            continue 'smi;
+                                        }
+                                    } else {
+                                        let ctx_ref = Rc::clone(ctx_rc);
+                                        let mut current = ctx_ref;
+                                        let mut d = depth;
+                                        while d > 0 {
+                                            let next = {
+                                                let borrow = current.borrow();
+                                                if let Some(p) = &borrow.parent {
+                                                    Rc::clone(p)
+                                                } else {
+                                                    break;
+                                                }
+                                            };
+                                            current = next;
+                                            d -= 1;
+                                        }
+                                        let mut borrow = current.borrow_mut();
+                                        if slot < borrow.slots.len() {
+                                            borrow.slots[slot] = materialize_acc!();
+                                            continue 'smi;
+                                        }
                                     }
                                 }
                                 // No context or slot out of range — fall through.
@@ -6916,6 +6947,174 @@ impl Interpreter {
                             }
                         }
                         // Fall through to table dispatch.
+                        frame.pc = pc;
+                        frame.accumulator = acc;
+                        match dispatch_via_table(
+                            frame,
+                            instructions,
+                            byte_offsets,
+                            jump_targets,
+                            handler_table.as_slice(),
+                            instr,
+                        ) {
+                            Ok(dispatch::DispatchAction::Continue) => {
+                                pc = frame.pc;
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                continue 'dispatch;
+                            }
+                            Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                            Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                            Err(e) => {
+                                if let Some(resume_pc) =
+                                    handle_dispatch_error(&e, frame, handler_table.as_slice())
+                                {
+                                    pc = resume_pc;
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
+                                    continue 'dispatch;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+
+                    // ── Inline CreateClosure (hot path for closures) ──
+                    //
+                    // Closure creation is frequent in idiomatic JS.
+                    // The common case (non-arrow, non-generator) is
+                    // handled inline to avoid the dispatch-table
+                    // indirection.  Edge cases fall through.
+                    Opcode::CreateClosure => {
+                        // SAFETY: Bytecode generator guarantees operand[0]
+                        // is ConstantPoolIdx for CreateClosure.
+                        let cp_idx = unsafe { operand_constant_pool_idx_unchecked(instr, 0) };
+                        if let Some(ConstantPoolEntry::Function(ba)) =
+                            frame.bytecode_array.get_constant(cp_idx)
+                        {
+                            let closure_ctx = match &frame.context {
+                                Some(JsValue::Context(c)) => Some(Rc::clone(c)),
+                                _ => None,
+                            };
+                            let func_rc = Rc::new(ba.clone_for_closure(closure_ctx));
+                            let is_arrow = matches!(instr.operand_at(2), Some(Operand::Flag(1)));
+                            if !is_arrow && !func_rc.is_generator() {
+                                // Common case: non-arrow, non-generator.
+                                // Prototype is created lazily on first `new`
+                                // call or `.prototype` access.
+                                acc = JsValue::Function(func_rc);
+                                continue 'dispatch;
+                            }
+                            // Arrow / generator paths need fn_props setup;
+                            // fall through to the dispatch table which
+                            // handles all edge cases.
+                        }
+                        frame.pc = pc;
+                        frame.accumulator = acc;
+                        match dispatch_via_table(
+                            frame,
+                            instructions,
+                            byte_offsets,
+                            jump_targets,
+                            handler_table.as_slice(),
+                            instr,
+                        ) {
+                            Ok(dispatch::DispatchAction::Continue) => {
+                                pc = frame.pc;
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                continue 'dispatch;
+                            }
+                            Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                            Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                            Err(e) => {
+                                if let Some(resume_pc) =
+                                    handle_dispatch_error(&e, frame, handler_table.as_slice())
+                                {
+                                    pc = resume_pc;
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
+                                    continue 'dispatch;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+
+                    // ── Inline LdaContextSlot (closure variable load) ──
+                    //
+                    // Depth-0 access (current context) is the common case
+                    // for closures and avoids Rc::clone + chain walk.
+                    Opcode::LdaContextSlot => {
+                        let ctx_reg = unsafe { operand_reg_unchecked(instr, 0) };
+                        let ctx_val = unsafe { frame.read_reg_unchecked(ctx_reg) };
+                        if let JsValue::Context(ctx_rc) = ctx_val {
+                            let slot =
+                                unsafe { operand_constant_pool_idx_unchecked(instr, 1) } as usize;
+                            let depth = unsafe { operand_imm_unchecked(instr, 2) };
+                            if depth == 0 {
+                                let borrow = ctx_rc.borrow();
+                                acc = borrow
+                                    .slots
+                                    .get(slot)
+                                    .map(|v| v.cheap_clone())
+                                    .unwrap_or(JsValue::Undefined);
+                                continue 'dispatch;
+                            }
+                        }
+                        // Non-zero depth or missing context — dispatch table.
+                        frame.pc = pc;
+                        frame.accumulator = acc;
+                        match dispatch_via_table(
+                            frame,
+                            instructions,
+                            byte_offsets,
+                            jump_targets,
+                            handler_table.as_slice(),
+                            instr,
+                        ) {
+                            Ok(dispatch::DispatchAction::Continue) => {
+                                pc = frame.pc;
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                continue 'dispatch;
+                            }
+                            Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                            Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                            Err(e) => {
+                                if let Some(resume_pc) =
+                                    handle_dispatch_error(&e, frame, handler_table.as_slice())
+                                {
+                                    pc = resume_pc;
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
+                                    continue 'dispatch;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+
+                    // ── Inline StaContextSlot (closure variable store) ──
+                    Opcode::StaContextSlot => {
+                        let ctx_reg = unsafe { operand_reg_unchecked(instr, 0) };
+                        let ctx_val = unsafe { frame.read_reg_unchecked(ctx_reg) };
+                        if let JsValue::Context(ctx_rc) = ctx_val {
+                            let slot =
+                                unsafe { operand_constant_pool_idx_unchecked(instr, 1) } as usize;
+                            let depth = unsafe { operand_imm_unchecked(instr, 2) };
+                            if depth == 0 {
+                                let mut borrow = ctx_rc.borrow_mut();
+                                if slot < borrow.slots.len() {
+                                    borrow.slots[slot] = acc.cheap_clone();
+                                    continue 'dispatch;
+                                }
+                            }
+                        }
+                        // Non-zero depth or missing context — dispatch table.
                         frame.pc = pc;
                         frame.accumulator = acc;
                         match dispatch_via_table(
