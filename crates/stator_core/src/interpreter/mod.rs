@@ -2859,6 +2859,14 @@ impl Interpreter {
                 // timeout) are handled exclusively on the `JumpLoop`
                 // back-edge, removing two branches from every forward
                 // instruction.
+                if pc >= instructions.len() {
+                    // Malformed bytecode — no Return terminator.
+                    frame.pc = pc;
+                    frame.accumulator = acc;
+                    return Err(StatorError::RangeError(
+                        "bytecode fell off the end without Return".into(),
+                    ));
+                }
                 let instr = unsafe { instructions.get_unchecked(pc) };
                 pc += 1;
 
