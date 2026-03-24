@@ -2835,18 +2835,6 @@ impl Interpreter {
             let mut acc = frame.accumulator.cheap_clone();
 
             'dispatch: loop {
-                // Inside a validated loop body we know every PC in
-                // [jump_target, loop_end_pc) was decoded successfully, so
-                // the bounds check is redundant.
-                if pc >= frame.loop_end_pc {
-                    frame.loop_end_pc = 0;
-                    if pc >= instructions.len() {
-                        frame.pc = pc;
-                        frame.accumulator = acc;
-                        return Err(bytecode_end_error());
-                    }
-                }
-
                 // ── Debug hook (pre-fetch) ─────────────────────────────────────
                 if debug_active {
                     let current_offset = byte_offsets[pc] as u32;
@@ -2862,44 +2850,17 @@ impl Interpreter {
                 }
 
                 // ── Fetch ──────────────────────────────────────────────────────
-                // SAFETY: The bounds check (or loop_end_pc guard) guarantees
-                // pc < instructions.len().
+                // SAFETY: Well-formed bytecode always terminates with a
+                // `Return` before pc reaches `instructions.len()`.  All
+                // jump targets are pre-computed and validated during decode
+                // so forward jumps cannot overshoot.  The only backward
+                // jump (`JumpLoop`) uses a pre-computed target that is
+                // always in bounds.  Periodic checks (instruction limit,
+                // timeout) are handled exclusively on the `JumpLoop`
+                // back-edge, removing two branches from every forward
+                // instruction.
                 let instr = unsafe { instructions.get_unchecked(pc) };
                 pc += 1;
-
-                // ── Approximate instruction counting & periodic checks ──────────
-                //
-                // Inside a validated loop body (loop_end_pc != 0) the
-                // periodic check is deferred to the JumpLoop back-edge,
-                // saving a branch per hot instruction.
-                if frame.loop_end_pc == 0 && pc & 0x3FF == 0 {
-                    frame.instructions_executed += 0x400;
-
-                    if frame.instruction_limit > 0
-                        && frame.instructions_executed > frame.instruction_limit
-                    {
-                        frame.pc = pc;
-                        frame.accumulator = acc;
-                        return Err(instruction_limit_error());
-                    }
-
-                    let thread_deadline = EXECUTION_DEADLINE.with(|d| d.get());
-                    if frame.deadline.is_some() || thread_deadline.is_some() {
-                        let now = Instant::now();
-                        if frame.deadline.is_some_and(|dl| now > dl)
-                            || thread_deadline.is_some_and(|dl| now > dl)
-                        {
-                            frame.pc = pc;
-                            frame.accumulator = acc;
-                            return Err(execution_timeout_error());
-                        }
-                    }
-
-                    if pc & 0xFFF == 0 {
-                        crate::inspector::profiler::maybe_record_sample();
-                        debug_active = DEBUG_ATTACHED.with(Cell::get);
-                    }
-                }
 
                 // ── Dispatch (hot-path inline + table fallback) ───────────
                 //
@@ -4511,6 +4472,13 @@ impl Interpreter {
                 }
 
                 match instr.opcode {
+                    // ════════════════════════════════════════════════════
+                    // Tier 1 — ~60% of executed instructions.
+                    // Grouped first for I-cache locality.  All handlers
+                    // are fully inlined and use `continue 'dispatch`
+                    // without touching frame.accumulator.
+                    // ════════════════════════════════════════════════════
+
                     // ── Load / Store (ultra-tight) ───────────────
                     Opcode::LdaSmi => {
                         // SAFETY: Bytecode generator guarantees operand[0]
@@ -4604,6 +4572,13 @@ impl Interpreter {
                         continue 'dispatch;
                     }
 
+                    // ════════════════════════════════════════════════════
+                    // Tier 2 — ~30% of executed instructions.
+                    // Arithmetic, comparisons, jumps, property access.
+                    // SMI fast-path inlined; non-Smi falls through to
+                    // the dispatch table.
+                    // ════════════════════════════════════════════════════
+
                     // ── Arithmetic (SMI fast path, table fallback) ──
                     Opcode::Add => {
                         if let Operand::Register(v) = instr.operands[0] {
@@ -4630,7 +4605,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4640,7 +4615,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4671,7 +4649,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4681,7 +4659,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4712,7 +4693,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4722,7 +4703,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4749,7 +4733,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4759,7 +4743,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4786,7 +4773,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4796,7 +4783,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4823,7 +4813,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4833,7 +4823,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4861,7 +4854,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4871,7 +4864,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4897,7 +4893,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4907,7 +4903,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4957,7 +4956,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4967,7 +4966,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5006,7 +5008,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5016,7 +5018,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5047,7 +5052,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5057,7 +5062,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5085,7 +5093,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5095,7 +5103,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5125,7 +5136,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5135,7 +5146,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5162,7 +5176,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5172,7 +5186,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5198,7 +5215,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5208,7 +5225,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5234,7 +5254,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5244,7 +5264,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5283,7 +5306,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5293,7 +5316,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5381,6 +5407,36 @@ impl Interpreter {
                         if frame.osr_loop_count >= TURBOFAN_OSR_LOOP_THRESHOLD {
                             maybe_compile_turbofan(&frame.bytecode_array);
                         }
+
+                        // ── Back-edge periodic checks ──────────────────
+                        // All periodic work (instruction limit, wall-clock
+                        // deadline, profiler sampling) is concentrated on
+                        // back-edges so the forward-instruction hot path
+                        // is branch-free.
+                        frame.instructions_executed += (loop_end - pc) as u64;
+                        if frame.instruction_limit > 0
+                            && frame.instructions_executed > frame.instruction_limit
+                        {
+                            frame.pc = pc;
+                            frame.accumulator = acc;
+                            return Err(instruction_limit_error());
+                        }
+                        if frame.instructions_executed & 0xFFFF == 0 {
+                            let thread_deadline = EXECUTION_DEADLINE.with(|d| d.get());
+                            if frame.deadline.is_some() || thread_deadline.is_some() {
+                                let now = Instant::now();
+                                if frame.deadline.is_some_and(|dl| now > dl)
+                                    || thread_deadline.is_some_and(|dl| now > dl)
+                                {
+                                    frame.pc = pc;
+                                    frame.accumulator = acc;
+                                    return Err(execution_timeout_error());
+                                }
+                            }
+                            crate::inspector::profiler::maybe_record_sample();
+                            debug_active = DEBUG_ATTACHED.with(Cell::get);
+                        }
+
                         // SMI-mode detection: if the accumulator is Smi
                         // (or Boolean — common for comparison-terminated
                         // loops like `for(;;i++){if(cond) ...}`) after
@@ -5444,7 +5500,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5454,7 +5510,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5483,7 +5542,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5493,7 +5552,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5521,7 +5583,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5531,7 +5593,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5563,7 +5628,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5573,7 +5638,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5599,7 +5667,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5609,7 +5677,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5636,7 +5707,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5646,7 +5717,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5673,7 +5747,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5683,7 +5757,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5797,7 +5874,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5807,7 +5884,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5825,9 +5905,7 @@ impl Interpreter {
                             if frame.bytecode_array.is_strict()
                                 && !frame.global_env.borrow().contains_key(&name)
                             {
-                                return Err(StatorError::ReferenceError(format!(
-                                    "{name} is not defined"
-                                )));
+                                return Err(sta_global_undefined_error(&name));
                             }
                             frame.store_global(name_idx, &name, val);
                             continue 'dispatch;
@@ -5845,7 +5923,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5855,7 +5933,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5907,7 +5988,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5917,7 +5998,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5954,7 +6038,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5964,7 +6048,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6012,7 +6099,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6022,7 +6109,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6057,7 +6147,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6067,7 +6157,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6101,7 +6194,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6111,7 +6204,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6223,7 +6319,10 @@ impl Interpreter {
                                         handle_dispatch_error(&e, frame, handler_table.as_slice())
                                     {
                                         pc = resume_pc;
-                                        acc = frame.accumulator.cheap_clone();
+                                        acc = std::mem::replace(
+                                            &mut frame.accumulator,
+                                            JsValue::Undefined,
+                                        );
                                         continue 'dispatch;
                                     }
                                     return Err(e);
@@ -6243,7 +6342,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6253,7 +6352,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6366,7 +6468,10 @@ impl Interpreter {
                                         handle_dispatch_error(&e, frame, handler_table.as_slice())
                                     {
                                         pc = resume_pc;
-                                        acc = frame.accumulator.cheap_clone();
+                                        acc = std::mem::replace(
+                                            &mut frame.accumulator,
+                                            JsValue::Undefined,
+                                        );
                                         continue 'dispatch;
                                     }
                                     return Err(e);
@@ -6386,7 +6491,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6396,7 +6501,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6459,7 +6567,10 @@ impl Interpreter {
                                                 ) {
                                                     Ok(dispatch::DispatchAction::Continue) => {
                                                         pc = frame.pc;
-                                                        acc = frame.accumulator.cheap_clone();
+                                                        acc = std::mem::replace(
+                                                            &mut frame.accumulator,
+                                                            JsValue::Undefined,
+                                                        );
                                                         continue 'dispatch;
                                                     }
                                                     Ok(dispatch::DispatchAction::Return(v)) => {
@@ -6477,7 +6588,10 @@ impl Interpreter {
                                                             )
                                                         {
                                                             pc = resume_pc;
-                                                            acc = frame.accumulator.cheap_clone();
+                                                            acc = std::mem::replace(
+                                                                &mut frame.accumulator,
+                                                                JsValue::Undefined,
+                                                            );
                                                             continue 'dispatch;
                                                         }
                                                         return Err(e);
@@ -6503,7 +6617,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6513,13 +6627,22 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
                             }
                         }
                     }
+
+                    // ════════════════════════════════════════════════════
+                    // Tier 3 — ~10% of executed instructions (rare).
+                    // Full dispatch via function-pointer table.  Cold
+                    // code kept out of the I-cache hot region above.
+                    // ════════════════════════════════════════════════════
 
                     // ── All other opcodes: dispatch table ────
                     _ => {
@@ -6536,7 +6659,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6546,7 +6669,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -7564,13 +7690,6 @@ pub(super) fn err_bad_operand(opcode_name: &'static str, operand_index: usize) -
     ))
 }
 
-/// Error returned when the bytecode stream ends without a `Return`.
-#[cold]
-#[inline(never)]
-fn bytecode_end_error() -> StatorError {
-    StatorError::Internal("bytecode ended without a Return instruction".into())
-}
-
 /// Error returned when the per-frame instruction limit is exceeded.
 #[cold]
 #[inline(never)]
@@ -7583,6 +7702,13 @@ fn instruction_limit_error() -> StatorError {
 #[inline(never)]
 fn execution_timeout_error() -> StatorError {
     StatorError::RangeError("execution timeout exceeded".to_string())
+}
+
+/// Error returned when a strict-mode `StaGlobal` targets an undefined binding.
+#[cold]
+#[inline(never)]
+fn sta_global_undefined_error(name: &str) -> StatorError {
+    StatorError::ReferenceError(format!("{name} is not defined"))
 }
 
 /// Extract a `Register(u32)` operand without checking the variant tag.
