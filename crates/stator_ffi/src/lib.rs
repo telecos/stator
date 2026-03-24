@@ -1896,7 +1896,7 @@ pub unsafe extern "C" fn stator_bytecode_dump(script: *const StatorScript) {
         Ok(instructions) => {
             for instr in &instructions {
                 let operand_strs: Vec<String> = instr
-                    .operands
+                    .operands()
                     .iter()
                     .map(|op| format_operand(*op))
                     .collect();
