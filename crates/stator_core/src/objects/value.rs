@@ -673,12 +673,13 @@ impl JsValue {
             | Self::Smi(_)
             | Self::HeapNumber(_)
             | Self::Symbol(_)
-            | Self::Object(_)
-            | Self::BigInt(_) => {
+            | Self::Object(_) => {
                 // SAFETY: The checked variants are stack-only scalars or raw pointers with
                 // no reference-counted ownership to update, so bitwise copy is valid.
                 unsafe { self.stack_clone() }
             }
+            // BigInt(Box<i128>) owns heap memory — must use proper Clone.
+            Self::BigInt(_) => self.clone(),
             _ => self.clone(),
         }
     }
