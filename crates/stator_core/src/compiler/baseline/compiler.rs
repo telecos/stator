@@ -116,12 +116,10 @@ pub fn jit_to_jsvalue(v: i64) -> Option<crate::objects::value::JsValue> {
     } else if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
         Some(JsValue::Smi(v as i32))
     } else {
-        // Value outside Smi range: reinterpret as f64 bit pattern.
-        // This is the inverse of `jsvalue_to_jit`'s HeapNumber encoding
-        // which uses `f64::to_bits() as i64`.  JIT code that produces
-        // floating-point results stores them as raw IEEE 754 bits in the
-        // accumulator; we recover the original f64 here.
-        Some(JsValue::HeapNumber(f64::from_bits(v as u64)))
+        // Value outside Smi range — promote to HeapNumber via lossy f64 cast.
+        // JIT arithmetic that overflows i32 produces large i64 values that
+        // must be presented to JS as floating-point numbers.
+        Some(JsValue::HeapNumber(v as f64))
     }
 }
 
@@ -697,10 +695,10 @@ impl<'a> BaselineCompiler<'a> {
         let off = self.reg_offset(v);
         self.masm.mov_store_base_disp32(Reg64::R14, off, src);
         #[cfg(all(target_arch = "x86_64", unix))]
-        if let Some(&(_, phys)) = self.cache_map.iter().find(|(vr, _)| *vr == v) {
-            if src != phys {
-                self.masm.mov_rr(phys, src);
-            }
+        if let Some(&(_, phys)) = self.cache_map.iter().find(|(vr, _)| *vr == v)
+            && src != phys
+        {
+            self.masm.mov_rr(phys, src);
         }
     }
 
@@ -946,7 +944,7 @@ impl<'a> BaselineCompiler<'a> {
             if let Ok(target_idx) = Self::resolve_target(target_byte, byte_offsets, n) {
                 // Pick the loop with the most iterations (longest body).
                 let body_len = idx - target_idx;
-                if best_loop.map_or(true, |(_, prev_len)| body_len > prev_len) {
+                if best_loop.is_none_or(|(_, prev_len)| body_len > prev_len) {
                     best_loop = Some((target_idx, body_len));
                 }
             }
@@ -959,11 +957,9 @@ impl<'a> BaselineCompiler<'a> {
 
         // Count register-file accesses within the loop body.
         let mut counts: Vec<(u32, usize)> = Vec::new();
-        for idx in entry_idx..=(entry_idx + body_len) {
-            if idx >= n {
-                break;
-            }
-            for op in instructions[idx].operands() {
+        let end = (entry_idx + body_len + 1).min(n);
+        for instr in &instructions[entry_idx..end] {
+            for op in instr.operands() {
                 if let Operand::Register(v) = op {
                     if let Some(entry) = counts.iter_mut().find(|(vr, _)| *vr == *v) {
                         entry.1 += 1;
