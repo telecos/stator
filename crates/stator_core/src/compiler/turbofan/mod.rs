@@ -203,17 +203,26 @@ impl std::fmt::Debug for TurbofanCompiledCode {
 impl TurbofanCompiledCode {
     /// Execute the compiled function with the given register-file arguments.
     ///
+    /// Uses a stack-allocated buffer ([`SmallVec`]) for the register file when
+    /// the slot count is small enough, avoiding a heap allocation on the hot
+    /// path.
+    ///
     /// # Safety
     ///
     /// The code was produced by [`compile`] from a well-formed [`MaglevGraph`].
     /// Callers must not use this value after the owning
     /// [`TurbofanCompiledCode`] is dropped.
     pub unsafe fn execute(&self, args: &[i64]) -> StatorResult<i64> {
+        use smallvec::{SmallVec, smallvec};
+
         let fn_ptr = self.module.get_finalized_function(self.func_id);
 
         // Allocate register_file_slots + 1 entries: the extra trailing slot
         // receives the deopt-site index when the JIT triggers a deopt.
-        let mut regs = vec![0i64; self.register_file_slots + 1];
+        // Use SmallVec to keep the register file on the stack for typical
+        // functions (≤ 32 slots).
+        let total = self.register_file_slots + 1;
+        let mut regs: SmallVec<[i64; 32]> = smallvec![0i64; total];
         for (i, &v) in args.iter().enumerate().take(self.register_file_slots) {
             regs[i] = v;
         }
@@ -248,6 +257,10 @@ impl TurbofanCompiledCode {
     /// [`JsValue`][crate::objects::value::JsValue] via
     /// [`jit_to_jsvalue`][crate::compiler::baseline::compiler::jit_to_jsvalue].
     ///
+    /// Uses a stack-allocated buffer ([`SmallVec`]) for the register file when
+    /// the slot count is small enough, avoiding a heap allocation on the hot
+    /// path.
+    ///
     /// # Safety
     ///
     /// The code was produced by [`compile`] from a well-formed [`MaglevGraph`].
@@ -259,10 +272,15 @@ impl TurbofanCompiledCode {
         feedback: &mut FeedbackVector,
         global_env: std::rc::Rc<std::cell::RefCell<crate::interpreter::GlobalEnv>>,
     ) -> StatorResult<crate::objects::value::JsValue> {
+        use smallvec::{SmallVec, smallvec};
+
         let fn_ptr = self.module.get_finalized_function(self.func_id);
 
         // +1 trailing slot for the deopt-site index written by the JIT.
-        let mut regs = vec![0i64; self.register_file_slots + 1];
+        // Use SmallVec to keep the register file on the stack for typical
+        // functions (≤ 32 slots).
+        let total = self.register_file_slots + 1;
+        let mut regs: SmallVec<[i64; 32]> = smallvec![0i64; total];
 
         // SAFETY: same invariants as execute().
         let result = unsafe {

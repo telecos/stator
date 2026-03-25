@@ -193,6 +193,8 @@ use crate::bytecode::bytecode_array::{
 #[cfg(all(target_arch = "x86_64", unix))]
 use crate::bytecode::bytecode_array::{MaglevJitCodeCache, TurbofanJitCodeCache};
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
+#[cfg(all(target_arch = "x86_64", unix))]
+use crate::bytecode::feedback::{FeedbackSlotKind, FeedbackVector, InlineCacheState};
 use crate::error::{StatorError, StatorResult};
 use crate::inspector::debugger::Debugger;
 use crate::objects::map::PropertyAttributes;
@@ -997,6 +999,35 @@ pub fn turbofan_stats() -> (u32, usize) {
     )
 }
 
+/// Return per-tier compilation counts as `(baseline, maglev, turbofan)`.
+pub fn jit_tier_stats() -> (u64, u64, u64) {
+    (
+        u64::from(JIT_COMPILATION_COUNT.with(|c| c.get())),
+        u64::from(MAGLEV_COMPILATION_COUNT.load(std::sync::atomic::Ordering::Relaxed)),
+        u64::from(TURBOFAN_COMPILATION_COUNT.load(std::sync::atomic::Ordering::Relaxed)),
+    )
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+fn seed_jit_feedback(ba: &BytecodeArray) -> FeedbackVector {
+    let mut feedback = ba.feedback_vector_snapshot();
+    for slot in 0..ba.feedback_metadata().slot_count() {
+        if feedback.get_state(slot) == Some(InlineCacheState::Uninitialized) {
+            match ba.feedback_metadata().kind_of(slot) {
+                Some(
+                    FeedbackSlotKind::BinaryOp
+                    | FeedbackSlotKind::Compare
+                    | FeedbackSlotKind::BinaryOpInc,
+                ) => {
+                    let _ = feedback.set_state(slot, InlineCacheState::Monomorphic);
+                }
+                _ => {}
+            }
+        }
+    }
+    feedback
+}
+
 /// Convert a [`JsValue`] to its JIT `i64` representation.
 ///
 /// Returns `None` for values that the current baseline tier cannot represent
@@ -1017,17 +1048,23 @@ fn jsvalue_to_jit(v: &JsValue) -> Option<i64> {
 /// Request baseline JIT compilation for `ba` and cache the result.
 ///
 /// On supported platforms (x86-64 Unix) this calls [`BaselineCompiler::compile`]
-/// and stores the output via [`BytecodeArray::store_jit_code`].  On other
-/// platforms this is a no-op.
+/// and stores the cached executable code via [`BytecodeArray::store_jit_code`].
+/// On other platforms this is a no-op.
 pub(super) fn maybe_compile_baseline(ba: &BytecodeArray) {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
-        use crate::compiler::baseline::compiler::BaselineCompiler;
+        use crate::compiler::baseline::compiler::{BaselineCompiler, CachedExecutableCode};
         if let Ok(cc) = BaselineCompiler::compile(ba) {
             let code_len = cc.code.len();
-            ba.store_jit_code(cc.code, cc.register_file_slots);
-            JIT_COMPILATION_COUNT.with(|c| c.set(c.get().saturating_add(1)));
-            JIT_CODE_BYTES.with(|c| c.set(c.get().saturating_add(code_len)));
+            // SAFETY: `cc.code` contains valid x86-64 machine code produced by
+            // `BaselineCompiler::compile`.
+            if let Ok(cached) =
+                unsafe { CachedExecutableCode::from_compiled(&cc.code, cc.register_file_slots) }
+            {
+                ba.store_jit_code(cached);
+                JIT_COMPILATION_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+                JIT_CODE_BYTES.with(|c| c.set(c.get().saturating_add(code_len)));
+            }
         }
     }
     #[cfg(not(all(target_arch = "x86_64", unix)))]
@@ -1099,6 +1136,7 @@ impl std::ops::Deref for SendableBytecodesArray {
 #[cfg(all(target_arch = "x86_64", unix))]
 struct MaglevCompileInput {
     ba: SendableBytecodesArray,
+    feedback: FeedbackVector,
     result_cache: MaglevJitCodeCache,
 }
 
@@ -1107,7 +1145,7 @@ struct MaglevCompileInput {
 /// On x86-64 Unix this spawns a background thread that runs the full Maglev
 /// pipeline (graph build → optimise → codegen) and writes the resulting code
 /// into `ba`'s Maglev JIT cache.  Subsequent calls will pick up the compiled
-/// code via [`BytecodeArray::try_get_maglev_jit_code`].
+/// code via [`BytecodeArray::has_maglev_jit_code`].
 ///
 /// The function is a no-op when:
 /// - compilation has already been started (atomic flag check), or
@@ -1115,7 +1153,6 @@ struct MaglevCompileInput {
 pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
-        use crate::bytecode::feedback::FeedbackVector;
         use crate::compiler::maglev::codegen as maglev_codegen;
         use crate::compiler::maglev::graph_builder::GraphBuilder;
         use crate::compiler::maglev::optimizer::optimize;
@@ -1137,6 +1174,7 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
 
         let input = MaglevCompileInput {
             ba: SendableBytecodesArray(compile_ba),
+            feedback: seed_jit_feedback(ba),
             result_cache: ba.maglev_jit_cache_arc(),
         };
 
@@ -1145,19 +1183,27 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
             // Rust 2024 precise closure capture analysis records input.ba
             // (SendableBytecodesArray: Send) not input.ba.0 (BytecodeArray:
             // !Send) as the captured variable.
-            let feedback = FeedbackVector::new(input.ba.feedback_metadata());
             let param_count = input.ba.parameter_count();
-            if let Ok(mut graph) = GraphBuilder::build(&input.ba, &feedback) {
+            if let Ok(mut graph) = GraphBuilder::build(&input.ba, &input.feedback) {
                 optimize(&mut graph);
                 if let Ok(cc) = maglev_codegen::compile(&graph, param_count) {
                     let code_len = cc.code.len();
-                    if let Ok(mut guard) = input.result_cache.lock() {
-                        *guard = Some((cc.code, cc.register_file_slots));
-                        drop(guard);
+                    // SAFETY: `cc.code` contains valid x86-64 machine code
+                    // produced by `maglev_codegen::compile`.
+                    if let Ok(cached) = unsafe {
+                        crate::compiler::baseline::compiler::CachedExecutableCode::from_compiled(
+                            &cc.code,
+                            cc.register_file_slots,
+                        )
+                    } {
+                        if let Ok(mut guard) = input.result_cache.lock() {
+                            *guard = Some(cached);
+                            drop(guard);
+                        }
+                        // Record Maglev stats atomically (readable from any thread).
+                        MAGLEV_COMPILATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        MAGLEV_CODE_BYTES.fetch_add(code_len, std::sync::atomic::Ordering::Relaxed);
                     }
-                    // Record Maglev stats atomically (readable from any thread).
-                    MAGLEV_COMPILATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    MAGLEV_CODE_BYTES.fetch_add(code_len, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         });
@@ -1180,24 +1226,15 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
     #[cfg(all(target_arch = "x86_64", unix))]
     {
         use crate::compiler::baseline::compiler::jit_to_jsvalue;
-        use crate::compiler::maglev::codegen::MaglevCompiledCode;
 
-        let (code, register_file_slots) = ba.try_get_maglev_jit_code()?;
+        let cache = ba.maglev_jit_cache_arc();
+        let guard = cache.lock().ok()?;
+        let cached = guard.as_ref()?;
         let jit_args: Option<Vec<i64>> = args.iter().map(jsvalue_to_jit).collect();
         let jit_args = jit_args?;
-        let native_code_len: usize = code.len();
-        let mc = MaglevCompiledCode {
-            code,
-            native_code_len,
-            register_file_slots,
-            safepoints: Vec::new(),
-            deopt_entries: Vec::new(),
-            source_positions: Vec::new(),
-        };
-        // SAFETY: `mc.code` was produced by `maglev_codegen::compile` and
-        // contains valid x86-64 machine code following the JIT calling
-        // convention (`extern "C" fn(*mut i64) -> i64`).
-        return match unsafe { mc.execute(&jit_args) } {
+        // SAFETY: `cached` was constructed from valid x86-64 machine code
+        // produced by `maglev_codegen::compile`.
+        return match unsafe { cached.execute(&jit_args) } {
             Ok(v) => jit_to_jsvalue(v).map(Ok),
             // JIT_DEOPT or unrecognised sentinel → fall back to baseline / interpreter.
             Err(_) => None,
@@ -1215,6 +1252,7 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
 #[cfg(all(target_arch = "x86_64", unix))]
 struct TurbofanCompileInput {
     ba: SendableBytecodesArray,
+    feedback: FeedbackVector,
     result_cache: TurbofanJitCodeCache,
 }
 
@@ -1232,7 +1270,6 @@ struct TurbofanCompileInput {
 pub(super) fn maybe_compile_turbofan(ba: &BytecodeArray) {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
-        use crate::bytecode::feedback::FeedbackVector;
         use crate::compiler::maglev::graph_builder::GraphBuilder;
         use crate::compiler::maglev::optimizer::optimize;
         use crate::compiler::turbofan;
@@ -1254,6 +1291,7 @@ pub(super) fn maybe_compile_turbofan(ba: &BytecodeArray) {
 
         let input = TurbofanCompileInput {
             ba: SendableBytecodesArray(compile_ba),
+            feedback: seed_jit_feedback(ba),
             result_cache: ba.turbofan_jit_cache_arc(),
         };
 
@@ -1262,12 +1300,11 @@ pub(super) fn maybe_compile_turbofan(ba: &BytecodeArray) {
             // Rust 2024 precise closure capture analysis records input.ba
             // (SendableBytecodesArray: Send) not input.ba.0 (BytecodeArray:
             // !Send) as the captured variable.
-            let feedback = FeedbackVector::new(input.ba.feedback_metadata());
             let param_count = input.ba.parameter_count();
-            if let Ok(mut graph) = GraphBuilder::build(&input.ba, &feedback) {
+            if let Ok(mut graph) = GraphBuilder::build(&input.ba, &input.feedback) {
                 optimize(&mut graph);
                 if let Ok(tc) =
-                    turbofan::compile_with_feedback(&graph, param_count, Some(&feedback))
+                    turbofan::compile_with_feedback(&graph, param_count, Some(&input.feedback))
                 {
                     let code_size = tc.code_size;
                     if let Ok(mut guard) = input.result_cache.lock() {
@@ -1333,28 +1370,14 @@ fn try_execute_turbofan(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorRe
 fn try_execute_jit(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
-        use crate::compiler::baseline::compiler::{
-            CompiledCode, DeoptEntry, SafepointEntry, jit_to_jsvalue,
-        };
-        let (code, register_file_slots) = ba.try_get_jit_code()?;
+        use crate::compiler::baseline::compiler::jit_to_jsvalue;
+        let guard = ba.try_get_jit_code();
+        let cached = guard.as_ref()?;
         let jit_args: Option<Vec<i64>> = args.iter().map(jsvalue_to_jit).collect();
         let jit_args = jit_args?;
-        // Capture the code length before moving `code` into the struct.
-        // `native_code_len` records the boundary between machine instructions
-        // and appended metadata tables; `execute()` does not use it directly
-        // but it is part of the `CompiledCode` API.
-        let native_code_len: usize = code.len();
-        let cc = CompiledCode {
-            code,
-            native_code_len,
-            register_file_slots,
-            safepoints: Vec::<SafepointEntry>::new(),
-            deopt_entries: Vec::<DeoptEntry>::new(),
-        };
-        // SAFETY: `cc.code` was produced by `BaselineCompiler::compile` and
-        // contains valid x86-64 machine code following the JIT calling
-        // convention (`extern "C" fn(*mut i64) -> i64`).
-        return match unsafe { cc.execute(&jit_args) } {
+        // SAFETY: `cached` was constructed from valid x86-64 machine code
+        // produced by `BaselineCompiler::compile`.
+        return match unsafe { cached.execute(&jit_args) } {
             Ok(v) => jit_to_jsvalue(v).map(Ok),
             // JIT_DEOPT or unrecognised sentinel → fall back to interpreter.
             Err(_) => None,
@@ -15908,12 +15931,12 @@ mod tests {
             // Poll for Maglev compilation to finish (background thread).
             let timeout = std::time::Duration::from_secs(5);
             let start = std::time::Instant::now();
-            while inner_ba.try_get_maglev_jit_code().is_none() && start.elapsed() < timeout {
+            while !inner_ba.has_maglev_jit_code() && start.elapsed() < timeout {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
 
             assert!(
-                inner_ba.try_get_maglev_jit_code().is_some(),
+                inner_ba.has_maglev_jit_code(),
                 "Maglev code should be cached after {} calls (threshold={})",
                 call_count,
                 MAGLEV_TIERING_THRESHOLD,

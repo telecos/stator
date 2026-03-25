@@ -44,7 +44,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::bytecode::feedback::FeedbackMetadata;
+use crate::bytecode::feedback::{FeedbackMetadata, FeedbackVector, InlineCacheState};
 use crate::bytecode::{
     bytecodes::{self, Instruction, Operand},
     peephole,
@@ -158,10 +158,20 @@ impl SourcePosition {
 
 /// Shared JIT code cache stored in a [`BytecodeArray`].
 ///
-/// Contains the raw x86-64 machine code bytes produced by the baseline
-/// compiler and the number of `i64` register-file slots required by the
-/// generated code.  The outer [`Rc`] allows all clones of a [`BytecodeArray`]
-/// to share the same cache without copying.
+/// On x86-64 Unix this stores a [`CachedExecutableCode`] that owns a
+/// persistent `mmap`'d page of executable memory, eliminating per-call
+/// `mmap`/`munmap` overhead.  On other platforms the cache stores raw bytes
+/// and the register-file slot count.
+///
+/// The outer [`Rc`] allows all clones of a [`BytecodeArray`] to share the
+/// same cache without copying.
+#[cfg(all(target_arch = "x86_64", unix))]
+type JitCodeCache = Rc<RefCell<Option<crate::compiler::baseline::compiler::CachedExecutableCode>>>;
+
+/// Shared JIT code cache stored in a [`BytecodeArray`].
+///
+/// On non-JIT platforms this is a no-op placeholder.
+#[cfg(not(all(target_arch = "x86_64", unix)))]
 type JitCodeCache = Rc<RefCell<Option<(Vec<u8>, usize)>>>;
 
 /// Shared decoded bytecode cache stored in a [`BytecodeArray`].
@@ -173,12 +183,22 @@ pub(crate) type JumpTargetMap = Vec<Option<usize>>;
 type DecodedBytecode = (Vec<Instruction>, Vec<usize>, JumpTargetMap);
 type DecodedBytecodeRef<'a> = (&'a [Instruction], &'a [usize], &'a [Option<usize>]);
 type DecodedBytecodeCache = Rc<OnceCell<Rc<DecodedBytecode>>>;
+type SharedFeedbackVector = Rc<RefCell<FeedbackVector>>;
 
 /// Shared Maglev JIT code cache stored in a [`BytecodeArray`].
 ///
-/// Uses [`Arc`] + [`Mutex`] so that the Maglev background compilation thread
-/// can write the compiled code into the cache while the interpreter runs on
-/// the main thread.
+/// On x86-64 Unix this stores a [`CachedExecutableCode`] that owns a
+/// persistent `mmap`'d page of executable memory.  Uses [`Arc`] + [`Mutex`]
+/// so that the Maglev background compilation thread can write the compiled
+/// code into the cache while the interpreter runs on the main thread.
+#[cfg(all(target_arch = "x86_64", unix))]
+pub type MaglevJitCodeCache =
+    Arc<Mutex<Option<crate::compiler::baseline::compiler::CachedExecutableCode>>>;
+
+/// Shared Maglev JIT code cache stored in a [`BytecodeArray`].
+///
+/// On non-JIT platforms this stores raw bytes and register-file slot count.
+#[cfg(not(all(target_arch = "x86_64", unix)))]
 pub type MaglevJitCodeCache = Arc<Mutex<Option<(Vec<u8>, usize)>>>;
 
 /// Shared Turbofan JIT code cache stored in a [`BytecodeArray`].
@@ -262,6 +282,11 @@ pub struct BytecodeArray {
     ///
     /// Wrapped in [`Rc`] so that closure clones share the same metadata.
     feedback_metadata: Rc<FeedbackMetadata>,
+    /// Runtime inline-cache feedback shared by all clones of this function.
+    ///
+    /// Higher JIT tiers snapshot this vector when compiling so optimisation
+    /// decisions reflect observed runtime behaviour rather than empty metadata.
+    feedback_vector: SharedFeedbackVector,
     /// Per-function exception handler table (pre-peephole instruction indices).
     handler_table: Rc<Vec<HandlerTableEntry>>,
     /// Lazily-populated remapped handler table (post-peephole instruction
@@ -482,6 +507,7 @@ impl BytecodeArray {
         feedback_metadata: FeedbackMetadata,
         handler_table: Vec<HandlerTableEntry>,
     ) -> Self {
+        let feedback_vector = FeedbackVector::new(&feedback_metadata);
         Self {
             bytecodes: bytecodes.into(),
             constant_pool: constant_pool.into(),
@@ -493,6 +519,7 @@ impl BytecodeArray {
             binding_registers: Rc::new(HashMap::new()),
             source_positions: source_positions.into(),
             feedback_metadata: Rc::new(feedback_metadata),
+            feedback_vector: Rc::new(RefCell::new(feedback_vector)),
             handler_table: Rc::new(handler_table),
             handler_table_remapped: Rc::new(OnceCell::new()),
             cached_decode: Rc::new(OnceCell::new()),
@@ -889,6 +916,28 @@ impl BytecodeArray {
         &self.feedback_metadata
     }
 
+    /// Return a snapshot of the current runtime feedback vector.
+    pub fn feedback_vector_snapshot(&self) -> FeedbackVector {
+        self.feedback_vector.borrow().clone()
+    }
+
+    /// Return the current inline-cache state for `slot`.
+    pub fn feedback_state(&self, slot: u32) -> Option<InlineCacheState> {
+        self.feedback_vector.borrow().get_state(slot)
+    }
+
+    /// Advance the feedback state for `slot` if `new_state` is hotter.
+    pub fn feedback_transition(&self, slot: u32, new_state: InlineCacheState) -> bool {
+        self.feedback_vector
+            .borrow_mut()
+            .transition(slot, new_state)
+    }
+
+    /// Overwrite the feedback state for `slot`.
+    pub fn set_feedback_state(&self, slot: u32, state: InlineCacheState) -> bool {
+        self.feedback_vector.borrow_mut().set_state(slot, state)
+    }
+
     /// The per-function exception handler table.
     ///
     /// Each entry maps a `[try_start, try_end)` instruction-index range to a
@@ -1050,32 +1099,54 @@ impl BytecodeArray {
         self.invocation_count.get()
     }
 
-    /// Store baseline-JIT machine code produced by the compiler.
+    /// Store baseline-JIT cached executable code produced by the compiler.
     ///
-    /// `code` is the raw x86-64 code buffer (including metadata tables
-    /// appended by [`BaselineCompiler`][crate::compiler::baseline::compiler::BaselineCompiler]).
-    /// `register_file_slots` is the number of `i64` slots required by the
-    /// JIT's register file (`parameter_count + frame_size`).
+    /// `cached` is a [`CachedExecutableCode`] that owns a persistent `mmap`'d
+    /// page of executable memory.
     ///
     /// All clones of this [`BytecodeArray`] share the same JIT cache.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    pub fn store_jit_code(
+        &self,
+        cached: crate::compiler::baseline::compiler::CachedExecutableCode,
+    ) {
+        *self.jit_code.borrow_mut() = Some(cached);
+    }
+
+    /// Store baseline-JIT machine code produced by the compiler (non-JIT
+    /// platform fallback).
+    #[cfg(not(all(target_arch = "x86_64", unix)))]
     pub fn store_jit_code(&self, code: Vec<u8>, register_file_slots: usize) {
         *self.jit_code.borrow_mut() = Some((code, register_file_slots));
     }
 
-    /// Returns a clone of the cached JIT machine code and register-file slot
-    /// count, or `None` if baseline compilation has not been triggered yet.
+    /// Borrows the cached JIT executable code, or returns `None` if baseline
+    /// compilation has not been triggered yet.
     ///
-    /// The caller is responsible for ensuring that the code bytes are executed
-    /// only on the platform and CPU that produced them.
+    /// The caller can call [`CachedExecutableCode::execute`] on the borrowed
+    /// reference without cloning or allocating executable memory.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    pub fn try_get_jit_code(
+        &self,
+    ) -> std::cell::Ref<'_, Option<crate::compiler::baseline::compiler::CachedExecutableCode>> {
+        self.jit_code.borrow()
+    }
+
+    /// Returns a clone of the cached JIT machine code and register-file slot
+    /// count, or `None` if baseline compilation has not been triggered yet
+    /// (non-JIT platform fallback).
+    #[cfg(not(all(target_arch = "x86_64", unix)))]
     pub fn try_get_jit_code(&self) -> Option<(Vec<u8>, usize)> {
         self.jit_code.borrow().clone()
     }
 
-    /// Returns a clone of the cached Maglev-JIT machine code and
-    /// register-file slot count, or `None` if Maglev compilation has not
-    /// finished yet.
-    pub fn try_get_maglev_jit_code(&self) -> Option<(Vec<u8>, usize)> {
-        self.maglev_jit_code.lock().ok()?.clone()
+    /// Returns `true` when Maglev JIT code has been cached for this function.
+    pub fn has_maglev_jit_code(&self) -> bool {
+        self.maglev_jit_code
+            .lock()
+            .ok()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
     }
 
     /// Returns an [`Arc`] clone of the Maglev JIT code cache.
