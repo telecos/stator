@@ -1012,15 +1012,17 @@ pub fn jit_tier_stats() -> (u64, u64, u64) {
 fn seed_jit_feedback(ba: &BytecodeArray) -> FeedbackVector {
     let mut feedback = ba.feedback_vector_snapshot();
     for slot in 0..ba.feedback_metadata().slot_count() {
-        if feedback.get_state(slot) == Some(InlineCacheState::Uninitialized) {
-            if let Some(
-                FeedbackSlotKind::BinaryOp
-                | FeedbackSlotKind::Compare
-                | FeedbackSlotKind::BinaryOpInc,
-            ) = ba.feedback_metadata().kind_of(slot)
-            {
-                let _ = feedback.set_state(slot, InlineCacheState::Monomorphic);
-            }
+        if feedback.get_state(slot) == Some(InlineCacheState::Uninitialized)
+            && matches!(
+                ba.feedback_metadata().kind_of(slot),
+                Some(
+                    FeedbackSlotKind::BinaryOp
+                        | FeedbackSlotKind::Compare
+                        | FeedbackSlotKind::BinaryOpInc
+                )
+            )
+        {
+            let _ = feedback.set_state(slot, InlineCacheState::Monomorphic);
         }
     }
     feedback
