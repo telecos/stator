@@ -396,6 +396,16 @@ unsafe impl Send for CachedExecutableCode {}
 unsafe impl Sync for CachedExecutableCode {}
 
 #[cfg(all(target_arch = "x86_64", unix))]
+impl std::fmt::Debug for CachedExecutableCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedExecutableCode")
+            .field("len", &self.len)
+            .field("register_file_slots", &self.register_file_slots)
+            .finish()
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
 impl Drop for CachedExecutableCode {
     fn drop(&mut self) {
         // SAFETY: `ptr` and `len` were set by a successful `mmap` call in
@@ -486,9 +496,7 @@ impl CachedExecutableCode {
             regs[i] = v;
         }
 
-        // SAFETY: `self.func` points to valid x86-64 machine code and
-        // `regs.as_mut_ptr()` is valid for the lifetime of the call.
-        let result = unsafe { (self.func)(regs.as_mut_ptr()) };
+        let result = (self.func)(regs.as_mut_ptr());
 
         if result == JIT_DEOPT {
             Err(StatorError::Internal("jit deopt".into()))
@@ -955,12 +963,12 @@ impl<'a> BaselineCompiler<'a> {
             if idx >= n {
                 break;
             }
-            for op in &instructions[idx].operands {
+            for op in instructions[idx].operands() {
                 if let Operand::Register(v) = op {
-                    if let Some(entry) = counts.iter_mut().find(|(vr, _)| *vr == *v) {
+                    if let Some(entry) = counts.iter_mut().find(|(vr, _)| *vr == v) {
                         entry.1 += 1;
                     } else {
-                        counts.push((*v, 1));
+                        counts.push((v, 1));
                     }
                 }
             }
@@ -1384,7 +1392,7 @@ impl<'a> BaselineCompiler<'a> {
                 )?;
                 #[cfg(all(target_arch = "x86_64", unix))]
                 {
-                    let (jump_cc, fall_val) = fused_jump_cc(CondCode::Less, is_true_flag);
+                    let (jump_cc, fall_val) = fused_jump_cc(CondCode::Less, is_true_flag.into());
                     self.emit_fused_compare_jump(v, jump_cc, target, fall_val);
                 }
                 #[cfg(not(all(target_arch = "x86_64", unix)))]
@@ -1422,7 +1430,7 @@ impl<'a> BaselineCompiler<'a> {
                 )?;
                 #[cfg(all(target_arch = "x86_64", unix))]
                 {
-                    let (jump_cc, fall_val) = fused_jump_cc(CondCode::Greater, is_true_flag);
+                    let (jump_cc, fall_val) = fused_jump_cc(CondCode::Greater, is_true_flag.into());
                     self.emit_fused_compare_jump(v, jump_cc, target, fall_val);
                 }
                 #[cfg(not(all(target_arch = "x86_64", unix)))]
@@ -1460,7 +1468,7 @@ impl<'a> BaselineCompiler<'a> {
                 )?;
                 #[cfg(all(target_arch = "x86_64", unix))]
                 {
-                    let (jump_cc, fall_val) = fused_jump_cc(CondCode::Equal, is_true_flag);
+                    let (jump_cc, fall_val) = fused_jump_cc(CondCode::Equal, is_true_flag.into());
                     self.emit_fused_compare_jump(v, jump_cc, target, fall_val);
                 }
                 #[cfg(not(all(target_arch = "x86_64", unix)))]
@@ -1498,7 +1506,8 @@ impl<'a> BaselineCompiler<'a> {
                 )?;
                 #[cfg(all(target_arch = "x86_64", unix))]
                 {
-                    let (jump_cc, fall_val) = fused_jump_cc(CondCode::NotEqual, is_true_flag);
+                    let (jump_cc, fall_val) =
+                        fused_jump_cc(CondCode::NotEqual, is_true_flag.into());
                     self.emit_fused_compare_jump(v, jump_cc, target, fall_val);
                 }
                 #[cfg(not(all(target_arch = "x86_64", unix)))]
@@ -1536,7 +1545,7 @@ impl<'a> BaselineCompiler<'a> {
                 )?;
                 #[cfg(all(target_arch = "x86_64", unix))]
                 {
-                    let (jump_cc, fall_val) = fused_jump_cc(CondCode::Equal, is_true_flag);
+                    let (jump_cc, fall_val) = fused_jump_cc(CondCode::Equal, is_true_flag.into());
                     self.emit_fused_compare_jump(v, jump_cc, target, fall_val);
                 }
                 #[cfg(not(all(target_arch = "x86_64", unix)))]
@@ -1574,7 +1583,7 @@ impl<'a> BaselineCompiler<'a> {
                 )?;
                 #[cfg(all(target_arch = "x86_64", unix))]
                 {
-                    let (jump_cc, fall_val) = fused_jump_cc(CondCode::LessEq, is_true_flag);
+                    let (jump_cc, fall_val) = fused_jump_cc(CondCode::LessEq, is_true_flag.into());
                     self.emit_fused_compare_jump(v, jump_cc, target, fall_val);
                 }
                 #[cfg(not(all(target_arch = "x86_64", unix)))]
@@ -1612,7 +1621,8 @@ impl<'a> BaselineCompiler<'a> {
                 )?;
                 #[cfg(all(target_arch = "x86_64", unix))]
                 {
-                    let (jump_cc, fall_val) = fused_jump_cc(CondCode::GreaterEq, is_true_flag);
+                    let (jump_cc, fall_val) =
+                        fused_jump_cc(CondCode::GreaterEq, is_true_flag.into());
                     self.emit_fused_compare_jump(v, jump_cc, target, fall_val);
                 }
                 #[cfg(not(all(target_arch = "x86_64", unix)))]
