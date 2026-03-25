@@ -98,8 +98,11 @@ pub const JIT_DEOPT: i64 = i64::MIN;
 
 /// Convert a JIT `i64` value back to a [`crate::objects::value::JsValue`].
 ///
-/// Returns `None` if `v` is not a recognised sentinel and does not fit in
-/// `i32` (i.e. is an out-of-range or deopt value).
+/// Returns `None` if `v` is the [`JIT_DEOPT`] sentinel (the JIT requested
+/// a fall-back to the interpreter).  All other values are mapped to a
+/// concrete `JsValue`: sentinels → booleans/undefined/null, i32-range →
+/// Smi, and everything else is reinterpreted as an IEEE 754 `f64` bit
+/// pattern (the inverse of the `jsvalue_to_jit` HeapNumber encoding).
 pub fn jit_to_jsvalue(v: i64) -> Option<crate::objects::value::JsValue> {
     use crate::objects::value::JsValue;
     if v == JIT_FALSE {
@@ -113,10 +116,12 @@ pub fn jit_to_jsvalue(v: i64) -> Option<crate::objects::value::JsValue> {
     } else if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
         Some(JsValue::Smi(v as i32))
     } else {
-        // Large integer outside Smi range: promote to HeapNumber (f64).
-        // All integers up to 2^53 are exactly representable as f64, so
-        // arithmetic results that overflow i32 can be returned faithfully.
-        Some(JsValue::HeapNumber(v as f64))
+        // Value outside Smi range: reinterpret as f64 bit pattern.
+        // This is the inverse of `jsvalue_to_jit`'s HeapNumber encoding
+        // which uses `f64::to_bits() as i64`.  JIT code that produces
+        // floating-point results stores them as raw IEEE 754 bits in the
+        // accumulator; we recover the original f64 here.
+        Some(JsValue::HeapNumber(f64::from_bits(v as u64)))
     }
 }
 
@@ -360,6 +365,140 @@ impl CompiledCode {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CachedExecutableCode
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Persistent JIT code page that caches the `mmap`'d executable memory.
+///
+/// The page is allocated once (by [`CachedExecutableCode::from_compiled`]) and
+/// reused for all subsequent calls, eliminating the per-call `mmap`/`munmap`
+/// syscall overhead.
+#[cfg(all(target_arch = "x86_64", unix))]
+pub struct CachedExecutableCode {
+    /// Pointer to the `mmap`'d executable memory.
+    ptr: *mut u8,
+    /// Size of the `mmap`'d region.
+    len: usize,
+    /// Function pointer to the JIT code (transmuted from `ptr`).
+    func: extern "C" fn(*mut i64) -> i64,
+    /// Number of `i64` slots needed in the register file.
+    pub register_file_slots: usize,
+}
+
+// SAFETY: The mmap'd code is position-independent and can be shared across
+// threads.  The memory is owned exclusively by this struct and freed on Drop.
+#[cfg(all(target_arch = "x86_64", unix))]
+unsafe impl Send for CachedExecutableCode {}
+
+// SAFETY: The mmap'd code is immutable after construction and the function
+// pointer is safe to call from any thread (the register file is caller-owned).
+#[cfg(all(target_arch = "x86_64", unix))]
+unsafe impl Sync for CachedExecutableCode {}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+impl Drop for CachedExecutableCode {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` and `len` were set by a successful `mmap` call in
+        // `from_compiled`.
+        unsafe {
+            libc::munmap(self.ptr.cast(), self.len);
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+impl CachedExecutableCode {
+    /// Allocate executable memory, copy `code` into it, and transmute to a
+    /// persistent function pointer.
+    ///
+    /// This performs the `mmap` + `copy_nonoverlapping` + `transmute` sequence
+    /// **once**.  The resulting [`CachedExecutableCode`] can then be called
+    /// many times via [`execute`](Self::execute) without further syscalls.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StatorError::Internal`] if `code` is empty or `mmap` fails.
+    ///
+    /// # Safety
+    ///
+    /// `code` must be valid x86-64 machine code emitted by the baseline or
+    /// Maglev compiler.
+    pub unsafe fn from_compiled(code: &[u8], register_file_slots: usize) -> StatorResult<Self> {
+        use std::ptr;
+
+        let code_size = code.len();
+        if code_size == 0 {
+            return Err(StatorError::Internal("compiled code is empty".into()));
+        }
+
+        // SAFETY: arguments are valid; MAP_FAILED is checked before use.
+        let mem = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                code_size,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if mem == libc::MAP_FAILED {
+            return Err(StatorError::Internal("mmap failed for JIT code".into()));
+        }
+
+        // SAFETY: `mem` is valid, page-aligned, and sized for `code_size` bytes.
+        unsafe {
+            ptr::copy_nonoverlapping(code.as_ptr(), mem.cast::<u8>(), code_size);
+        }
+
+        // SAFETY:
+        // - `mem` contains correctly-encoded x86-64 machine code.
+        // - The function signature matches the JIT calling convention:
+        //   `extern "C" fn(*mut i64) -> i64` (SysV AMD64).
+        let func: extern "C" fn(*mut i64) -> i64 = unsafe { std::mem::transmute(mem) };
+
+        Ok(Self {
+            ptr: mem.cast::<u8>(),
+            len: code_size,
+            func,
+            register_file_slots,
+        })
+    }
+
+    /// Execute the cached JIT code with the given arguments.
+    ///
+    /// Allocates only the register file (on the heap) and calls the persistent
+    /// function pointer.  No `mmap`/`munmap` syscalls are issued.
+    ///
+    /// `args` provides the initial values for the parameter slots.  Missing
+    /// arguments are filled with `0` (`Smi(0)`); extra arguments are ignored.
+    ///
+    /// Returns the accumulator value on success, or
+    /// [`StatorError::Internal`] if the JIT function returns [`JIT_DEOPT`].
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure this `CachedExecutableCode` was constructed from
+    /// valid x86-64 machine code emitted by the baseline or Maglev compiler.
+    pub unsafe fn execute(&self, args: &[i64]) -> StatorResult<i64> {
+        let mut regs = vec![0i64; self.register_file_slots];
+        for (i, &v) in args.iter().enumerate().take(regs.len()) {
+            regs[i] = v;
+        }
+
+        // SAFETY: `self.func` points to valid x86-64 machine code and
+        // `regs.as_mut_ptr()` is valid for the lifetime of the call.
+        let result = unsafe { (self.func)(regs.as_mut_ptr()) };
+
+        if result == JIT_DEOPT {
+            Err(StatorError::Internal("jit deopt".into()))
+        } else {
+            Ok(result)
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // BaselineCompiler
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -379,6 +518,11 @@ pub struct BaselineCompiler<'a> {
     labels: Vec<Label>,
     /// Label for the shared deopt epilogue.
     deopt_label: Label,
+    /// Mapping from register-file operand value to a callee-saved physical
+    /// register used as a cache.  Loads from cached slots read the physical
+    /// register directly; stores write both memory and the cached register.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    cache_map: Vec<(u32, Reg64)>,
 }
 
 impl<'a> BaselineCompiler<'a> {
@@ -397,6 +541,8 @@ impl<'a> BaselineCompiler<'a> {
             deopt_entries: Vec::new(),
             labels: Vec::new(),
             deopt_label: Label::new(),
+            #[cfg(all(target_arch = "x86_64", unix))]
+            cache_map: Vec::new(),
         };
         c.compile_function()?;
         let register_file_slots =
@@ -445,35 +591,39 @@ impl<'a> BaselineCompiler<'a> {
     /// Emit the standard function prologue.
     ///
     /// Sets up the call frame and loads the register-file pointer into R14.
-    ///
-    /// ```text
-    /// push rbp
-    /// mov  rbp, rsp
-    /// push r12        ; callee-saved accumulator
-    /// push r14        ; callee-saved register-file pointer
-    /// mov  r14, rdi   ; r14 = regs argument
-    /// xor  r12, r12   ; accumulator = 0
-    /// ```
+    /// When register caching is active, also pushes callee-saved cache
+    /// registers and pre-loads them from the register file.
     fn emit_prologue(&mut self) {
         self.masm.push(Reg64::Rbp);
         self.masm.mov_rr(Reg64::Rbp, Reg64::Rsp);
         self.masm.push(Reg64::R12);
         self.masm.push(Reg64::R14);
+        // Push callee-saved registers used for register-file caching.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        for &(_, phys_reg) in &self.cache_map {
+            self.masm.push(phys_reg);
+        }
         self.masm.mov_rr(Reg64::R14, Reg64::Rdi);
         self.masm.xor_rr(Reg64::R12, Reg64::R12);
+        // Pre-load cached registers from the register file.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        for &(virt_reg, phys_reg) in &self.cache_map {
+            let off = self.reg_offset(virt_reg);
+            self.masm.mov_load_base_disp32(phys_reg, Reg64::R14, off);
+        }
     }
 
     /// Emit the normal function epilogue.
     ///
-    /// ```text
-    /// mov rax, r12    ; return accumulator
-    /// pop r14
-    /// pop r12
-    /// pop rbp
-    /// ret
-    /// ```
+    /// Restores callee-saved registers (including any cache registers) and
+    /// returns the accumulator value in RAX.
     fn emit_normal_epilogue(&mut self) {
         self.masm.mov_rr(Reg64::Rax, Reg64::R12);
+        // Pop cache registers in reverse push order.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        for &(_, phys_reg) in self.cache_map.iter().rev() {
+            self.masm.pop(phys_reg);
+        }
         self.masm.pop(Reg64::R14);
         self.masm.pop(Reg64::R12);
         self.masm.pop(Reg64::Rbp);
@@ -515,15 +665,35 @@ impl<'a> BaselineCompiler<'a> {
     }
 
     /// Emit code to load register `v` into `dst`.
+    ///
+    /// When register caching is active and `v` is cached in a physical
+    /// register, emits a register-to-register move instead of a memory load.
     fn emit_load_reg(&mut self, dst: Reg64, v: u32) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        if let Some(&(_, phys)) = self.cache_map.iter().find(|(vr, _)| *vr == v) {
+            if dst != phys {
+                self.masm.mov_rr(dst, phys);
+            }
+            return;
+        }
         let off = self.reg_offset(v);
         self.masm.mov_load_base_disp32(dst, Reg64::R14, off);
     }
 
     /// Emit code to store `src` into register `v`.
+    ///
+    /// Always writes to memory (so the register file is up-to-date for deopt).
+    /// When register caching is active, also updates the cached physical
+    /// register.
     fn emit_store_reg(&mut self, v: u32, src: Reg64) {
         let off = self.reg_offset(v);
         self.masm.mov_store_base_disp32(Reg64::R14, off, src);
+        #[cfg(all(target_arch = "x86_64", unix))]
+        if let Some(&(_, phys)) = self.cache_map.iter().find(|(vr, _)| *vr == v) {
+            if src != phys {
+                self.masm.mov_rr(phys, src);
+            }
+        }
     }
 
     // ── Comparison helper ────────────────────────────────────────────────────
@@ -583,6 +753,230 @@ impl<'a> BaselineCompiler<'a> {
         self.masm.jcc(cc, &mut self.labels[target_idx]);
     }
 
+    // ── Codegen optimizations (x86-64 + unix only) ──────────────────────────
+
+    /// Emit an optimized load of a Smi immediate into the accumulator (R12).
+    ///
+    /// Uses shorter instruction encodings when possible:
+    /// - `xor r12d, r12d` for zero (3 bytes vs 7).
+    /// - `mov r12d, imm32` for positive values (6 bytes vs 7).
+    /// - `mov r12, imm64` (sign-extended i32) for negative values (7 bytes).
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_lda_smi_optimized(&mut self, imm: i32) {
+        if imm == 0 {
+            self.masm.xor_rr(Reg64::R12, Reg64::R12);
+        } else if imm > 0 {
+            self.masm.mov_ri32(Reg64::R12, imm as u32);
+        } else {
+            self.masm.mov_ri(Reg64::R12, imm as i64);
+        }
+    }
+
+    /// Emit a fused compare-and-jump: load register `v`, compare with the
+    /// accumulator (R12), and emit a single conditional jump.
+    ///
+    /// On the fall-through path, set the accumulator to `fall_through_bool`
+    /// so that subsequent instructions see the correct boolean result.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_fused_compare_jump(
+        &mut self,
+        v: u32,
+        jump_cc: CondCode,
+        target_idx: usize,
+        fall_through_bool: i64,
+    ) {
+        self.emit_load_reg(Reg64::R11, v);
+        self.masm.cmp_rr(Reg64::R12, Reg64::R11);
+        self.emit_cond_jump(jump_cc, target_idx);
+        self.masm.mov_ri(Reg64::R12, fall_through_bool);
+    }
+
+    /// Try to fuse a standalone comparison instruction at `idx` with a
+    /// following `JumpIfTrue`/`JumpIfFalse`/`JumpIfToBooleanTrue`/
+    /// `JumpIfToBooleanFalse` instruction.
+    ///
+    /// Returns `true` (and emits fused code) if fusion succeeded, meaning the
+    /// caller should skip the next instruction.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn try_fuse_compare_jump(
+        &mut self,
+        idx: usize,
+        instructions: &[Instruction],
+        byte_offsets: &[usize],
+        v: u32,
+        cc: CondCode,
+        n: usize,
+    ) -> bool {
+        let next_idx = idx + 1;
+        if next_idx >= n {
+            return false;
+        }
+        let next = &instructions[next_idx];
+        let (jump_offset, is_false_jump) = match next.opcode {
+            Opcode::JumpIfFalse | Opcode::JumpIfToBooleanFalse => {
+                if let Operand::JumpOffset(delta) = *next.operand(0) {
+                    (delta, true)
+                } else {
+                    return false;
+                }
+            }
+            Opcode::JumpIfTrue | Opcode::JumpIfToBooleanTrue => {
+                if let Operand::JumpOffset(delta) = *next.operand(0) {
+                    (delta, false)
+                } else {
+                    return false;
+                }
+            }
+            _ => return false,
+        };
+
+        let target = match Self::resolve_target(
+            jump_target_byte(next_idx, jump_offset, byte_offsets),
+            byte_offsets,
+            n,
+        ) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+
+        // For JumpIfFalse: jump when condition is NOT met → invert cc.
+        // For JumpIfTrue:  jump when condition IS met → use cc directly.
+        let jump_cc = if is_false_jump { cc.invert() } else { cc };
+
+        // On fall-through: the condition that did NOT cause a jump is the
+        // opposite of what the jump checked.
+        let fall_through_bool = if is_false_jump { JIT_TRUE } else { JIT_FALSE };
+
+        self.emit_fused_compare_jump(v, jump_cc, target, fall_through_bool);
+        true
+    }
+
+    /// Emit an arithmetic operation (add/sub) with i64 overflow checking.
+    ///
+    /// On overflow, jumps to a deopt stub.  On success, commits the result
+    /// from the scratch register (R11) into the accumulator (R12).
+    ///
+    /// `is_sub` selects between ADD and SUB.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_arith_with_overflow_check(&mut self, v: u32, bytecode_offset: u32, is_sub: bool) {
+        self.emit_load_reg(Reg64::Rax, v);
+        self.masm.mov_rr(Reg64::R11, Reg64::R12);
+        if is_sub {
+            self.masm.sub_rr(Reg64::R11, Reg64::Rax);
+        } else {
+            self.masm.add_rr(Reg64::R11, Reg64::Rax);
+        }
+        let mut overflow = Label::new();
+        let mut done = Label::new();
+        self.masm.jo(&mut overflow);
+        // Fast path: commit result.
+        self.masm.mov_rr(Reg64::R12, Reg64::R11);
+        self.masm.jmp(&mut done);
+        // Slow path: overflow → deopt.
+        self.masm.bind_label(&mut overflow);
+        self.emit_deopt(bytecode_offset);
+        self.masm.bind_label(&mut done);
+    }
+
+    /// Emit a multiply with i64 overflow checking.
+    ///
+    /// On overflow, jumps to a deopt stub.  On success, commits the result
+    /// from the scratch register (R11) into the accumulator (R12).
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_mul_with_overflow_check(&mut self, v: u32, bytecode_offset: u32) {
+        self.emit_load_reg(Reg64::Rax, v);
+        self.masm.mov_rr(Reg64::R11, Reg64::R12);
+        self.masm.imul_rr(Reg64::R11, Reg64::Rax);
+        let mut overflow = Label::new();
+        let mut done = Label::new();
+        self.masm.jo(&mut overflow);
+        self.masm.mov_rr(Reg64::R12, Reg64::R11);
+        self.masm.jmp(&mut done);
+        self.masm.bind_label(&mut overflow);
+        self.emit_deopt(bytecode_offset);
+        self.masm.bind_label(&mut done);
+    }
+
+    /// Analyse bytecodes to identify hot registers inside loop bodies and
+    /// build a cache mapping from virtual register-file slots to spare
+    /// callee-saved physical registers (RBX, R13, R15).
+    ///
+    /// Only the first (outermost) loop is considered.  At most 3 registers
+    /// are cached.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn analyze_register_caching(
+        instructions: &[Instruction],
+        byte_offsets: &[usize],
+        n: usize,
+    ) -> Vec<(u32, Reg64)> {
+        const AVAILABLE: [Reg64; 3] = [Reg64::Rbx, Reg64::R13, Reg64::R15];
+
+        // Find backward jumps to identify loop bodies.
+        let mut best_loop: Option<(usize, usize)> = None;
+        for (idx, instr) in instructions.iter().enumerate() {
+            let delta = match instr.opcode {
+                Opcode::JumpLoop => {
+                    if let Operand::JumpOffset(d) = *instr.operand(0) {
+                        d
+                    } else {
+                        continue;
+                    }
+                }
+                Opcode::Jump => {
+                    if let Operand::JumpOffset(d) = *instr.operand(0) {
+                        if d >= 0 {
+                            continue;
+                        }
+                        d
+                    } else {
+                        continue;
+                    }
+                }
+                _ => continue,
+            };
+            let target_byte = jump_target_byte(idx, delta, byte_offsets);
+            if let Ok(target_idx) = Self::resolve_target(target_byte, byte_offsets, n) {
+                // Pick the loop with the most iterations (longest body).
+                let body_len = idx - target_idx;
+                if best_loop.map_or(true, |(_, prev_len)| body_len > prev_len) {
+                    best_loop = Some((target_idx, body_len));
+                }
+            }
+        }
+
+        let (entry_idx, body_len) = match best_loop {
+            Some(v) => v,
+            None => return Vec::new(),
+        };
+
+        // Count register-file accesses within the loop body.
+        let mut counts: Vec<(u32, usize)> = Vec::new();
+        for idx in entry_idx..=(entry_idx + body_len) {
+            if idx >= n {
+                break;
+            }
+            for op in &instructions[idx].operands {
+                if let Operand::Register(v) = op {
+                    if let Some(entry) = counts.iter_mut().find(|(vr, _)| *vr == *v) {
+                        entry.1 += 1;
+                    } else {
+                        counts.push((*v, 1));
+                    }
+                }
+            }
+        }
+
+        // Sort by descending access count and take at most AVAILABLE.len().
+        counts.sort_by(|a, b| b.1.cmp(&a.1));
+        counts
+            .into_iter()
+            .filter(|&(_, c)| c >= 2) // only cache if accessed at least twice
+            .take(AVAILABLE.len())
+            .enumerate()
+            .map(|(i, (v, _))| (v, AVAILABLE[i]))
+            .collect()
+    }
+
     // ── Deopt helper ─────────────────────────────────────────────────────────
 
     /// Compute a conservative liveness bitmask covering all register-file
@@ -622,9 +1016,21 @@ impl<'a> BaselineCompiler<'a> {
         // Pre-create one label per instruction.
         self.labels = (0..n).map(|_| Label::new()).collect();
 
+        // Analyse register usage in loop bodies and set up the cache map
+        // before emitting the prologue (which pushes the cache registers).
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            self.cache_map = Self::analyze_register_caching(&instructions, &byte_offsets, n);
+        }
+
         self.emit_prologue();
 
-        for (idx, instr) in instructions.iter().enumerate() {
+        // Use a while loop instead of for so that compile_instruction can
+        // consume extra instructions (e.g. comparison + jump fusion).
+        let mut idx = 0;
+        while idx < n {
+            let instr = &instructions[idx];
+
             // Bind the label for this instruction to the current code position.
             self.masm.bind_label(&mut self.labels[idx]);
 
@@ -635,13 +1041,27 @@ impl<'a> BaselineCompiler<'a> {
                 gc_map: 0,
             });
 
-            self.compile_instruction(
+            let extra = self.compile_instruction(
                 idx,
                 &instructions,
                 &byte_offsets,
                 instr,
                 byte_offsets[idx] as u32,
             )?;
+
+            // Bind labels and record safepoints for any fused (skipped)
+            // instructions so that jump targets pointing at them resolve
+            // correctly.
+            for fused_idx in (idx + 1)..=(idx + extra) {
+                self.masm.bind_label(&mut self.labels[fused_idx]);
+                self.safepoints.push(SafepointEntry {
+                    code_offset: self.masm.position() as u32,
+                    bytecode_index: fused_idx as u32,
+                    gc_map: 0,
+                });
+            }
+
+            idx += 1 + extra;
         }
 
         // Emit the deopt epilogue after the normal instruction stream.
@@ -658,7 +1078,7 @@ impl<'a> BaselineCompiler<'a> {
         byte_offsets: &[usize],
         instr: &Instruction,
         bytecode_offset: u32,
-    ) -> StatorResult<()> {
+    ) -> StatorResult<usize> {
         let n = instructions.len();
 
         match instr.opcode {
@@ -670,7 +1090,14 @@ impl<'a> BaselineCompiler<'a> {
                 let Operand::Immediate(v) = *instr.operand(0) else {
                     return Err(bad_operand("LdaSmi", 0));
                 };
-                self.masm.mov_ri(Reg64::R12, v as i64);
+                #[cfg(all(target_arch = "x86_64", unix))]
+                {
+                    self.emit_lda_smi_optimized(v);
+                }
+                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                {
+                    self.masm.mov_ri(Reg64::R12, v as i64);
+                }
             }
             Opcode::LdaSmiStar => {
                 let Operand::Immediate(v) = *instr.operand(0) else {
@@ -679,7 +1106,14 @@ impl<'a> BaselineCompiler<'a> {
                 let Operand::Register(dst) = *instr.operand(1) else {
                     return Err(bad_operand("LdaSmiStar", 1));
                 };
-                self.masm.mov_ri(Reg64::R12, v as i64);
+                #[cfg(all(target_arch = "x86_64", unix))]
+                {
+                    self.emit_lda_smi_optimized(v);
+                }
+                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                {
+                    self.masm.mov_ri(Reg64::R12, v as i64);
+                }
                 self.emit_store_reg(dst, Reg64::R12);
             }
             Opcode::LdaUndefined => {
@@ -814,22 +1248,43 @@ impl<'a> BaselineCompiler<'a> {
                 let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("Add", 0));
                 };
-                self.emit_load_reg(Reg64::R11, v);
-                self.masm.add_rr(Reg64::R12, Reg64::R11);
+                #[cfg(all(target_arch = "x86_64", unix))]
+                {
+                    self.emit_arith_with_overflow_check(v, bytecode_offset, false);
+                }
+                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                {
+                    self.emit_load_reg(Reg64::R11, v);
+                    self.masm.add_rr(Reg64::R12, Reg64::R11);
+                }
             }
             Opcode::Sub => {
                 let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("Sub", 0));
                 };
-                self.emit_load_reg(Reg64::R11, v);
-                self.masm.sub_rr(Reg64::R12, Reg64::R11);
+                #[cfg(all(target_arch = "x86_64", unix))]
+                {
+                    self.emit_arith_with_overflow_check(v, bytecode_offset, true);
+                }
+                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                {
+                    self.emit_load_reg(Reg64::R11, v);
+                    self.masm.sub_rr(Reg64::R12, Reg64::R11);
+                }
             }
             Opcode::Mul => {
                 let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("Mul", 0));
                 };
-                self.emit_load_reg(Reg64::R11, v);
-                self.masm.imul_rr(Reg64::R12, Reg64::R11);
+                #[cfg(all(target_arch = "x86_64", unix))]
+                {
+                    self.emit_mul_with_overflow_check(v, bytecode_offset);
+                }
+                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                {
+                    self.emit_load_reg(Reg64::R11, v);
+                    self.masm.imul_rr(Reg64::R12, Reg64::R11);
+                }
             }
             Opcode::Inc => {
                 self.masm.add_ri(Reg64::R12, 1);
@@ -902,6 +1357,11 @@ impl<'a> BaselineCompiler<'a> {
                 let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestLessThan", 0));
                 };
+                #[cfg(all(target_arch = "x86_64", unix))]
+                if self.try_fuse_compare_jump(idx, instructions, byte_offsets, v, CondCode::Less, n)
+                {
+                    return Ok(1);
+                }
                 self.emit_compare_and_set(v, CondCode::Less);
             }
             Opcode::TestLessThanJump => {
@@ -922,17 +1382,25 @@ impl<'a> BaselineCompiler<'a> {
                     byte_offsets,
                     n,
                 )?;
-                self.emit_compare_and_set(v, CondCode::Less);
-                self.masm.mov_ri(
-                    Reg64::R11,
-                    if is_true_flag == 0 {
-                        JIT_FALSE
-                    } else {
-                        JIT_TRUE
-                    },
-                );
-                self.masm.cmp_rr(Reg64::R12, Reg64::R11);
-                self.emit_cond_jump(CondCode::Equal, target);
+                #[cfg(all(target_arch = "x86_64", unix))]
+                {
+                    let (jump_cc, fall_val) = fused_jump_cc(CondCode::Less, is_true_flag);
+                    self.emit_fused_compare_jump(v, jump_cc, target, fall_val);
+                }
+                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                {
+                    self.emit_compare_and_set(v, CondCode::Less);
+                    self.masm.mov_ri(
+                        Reg64::R11,
+                        if is_true_flag == 0 {
+                            JIT_FALSE
+                        } else {
+                            JIT_TRUE
+                        },
+                    );
+                    self.masm.cmp_rr(Reg64::R12, Reg64::R11);
+                    self.emit_cond_jump(CondCode::Equal, target);
+                }
             }
             Opcode::TestGreaterThanJump => {
                 let Operand::Register(v) = *instr.operand(0) else {
@@ -952,17 +1420,25 @@ impl<'a> BaselineCompiler<'a> {
                     byte_offsets,
                     n,
                 )?;
-                self.emit_compare_and_set(v, CondCode::Greater);
-                self.masm.mov_ri(
-                    Reg64::R11,
-                    if is_true_flag == 0 {
-                        JIT_FALSE
-                    } else {
-                        JIT_TRUE
-                    },
-                );
-                self.masm.cmp_rr(Reg64::R12, Reg64::R11);
-                self.emit_cond_jump(CondCode::Equal, target);
+                #[cfg(all(target_arch = "x86_64", unix))]
+                {
+                    let (jump_cc, fall_val) = fused_jump_cc(CondCode::Greater, is_true_flag);
+                    self.emit_fused_compare_jump(v, jump_cc, target, fall_val);
+                }
+                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                {
+                    self.emit_compare_and_set(v, CondCode::Greater);
+                    self.masm.mov_ri(
+                        Reg64::R11,
+                        if is_true_flag == 0 {
+                            JIT_FALSE
+                        } else {
+                            JIT_TRUE
+                        },
+                    );
+                    self.masm.cmp_rr(Reg64::R12, Reg64::R11);
+                    self.emit_cond_jump(CondCode::Equal, target);
+                }
             }
             Opcode::TestEqualJump => {
                 let Operand::Register(v) = *instr.operand(0) else {
@@ -982,17 +1458,25 @@ impl<'a> BaselineCompiler<'a> {
                     byte_offsets,
                     n,
                 )?;
-                self.emit_compare_and_set(v, CondCode::Equal);
-                self.masm.mov_ri(
-                    Reg64::R11,
-                    if is_true_flag == 0 {
-                        JIT_FALSE
-                    } else {
-                        JIT_TRUE
-                    },
-                );
-                self.masm.cmp_rr(Reg64::R12, Reg64::R11);
-                self.emit_cond_jump(CondCode::Equal, target);
+                #[cfg(all(target_arch = "x86_64", unix))]
+                {
+                    let (jump_cc, fall_val) = fused_jump_cc(CondCode::Equal, is_true_flag);
+                    self.emit_fused_compare_jump(v, jump_cc, target, fall_val);
+                }
+                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                {
+                    self.emit_compare_and_set(v, CondCode::Equal);
+                    self.masm.mov_ri(
+                        Reg64::R11,
+                        if is_true_flag == 0 {
+                            JIT_FALSE
+                        } else {
+                            JIT_TRUE
+                        },
+                    );
+                    self.masm.cmp_rr(Reg64::R12, Reg64::R11);
+                    self.emit_cond_jump(CondCode::Equal, target);
+                }
             }
             Opcode::TestNotEqualJump => {
                 let Operand::Register(v) = *instr.operand(0) else {
@@ -1012,17 +1496,25 @@ impl<'a> BaselineCompiler<'a> {
                     byte_offsets,
                     n,
                 )?;
-                self.emit_compare_and_set(v, CondCode::NotEqual);
-                self.masm.mov_ri(
-                    Reg64::R11,
-                    if is_true_flag == 0 {
-                        JIT_FALSE
-                    } else {
-                        JIT_TRUE
-                    },
-                );
-                self.masm.cmp_rr(Reg64::R12, Reg64::R11);
-                self.emit_cond_jump(CondCode::Equal, target);
+                #[cfg(all(target_arch = "x86_64", unix))]
+                {
+                    let (jump_cc, fall_val) = fused_jump_cc(CondCode::NotEqual, is_true_flag);
+                    self.emit_fused_compare_jump(v, jump_cc, target, fall_val);
+                }
+                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                {
+                    self.emit_compare_and_set(v, CondCode::NotEqual);
+                    self.masm.mov_ri(
+                        Reg64::R11,
+                        if is_true_flag == 0 {
+                            JIT_FALSE
+                        } else {
+                            JIT_TRUE
+                        },
+                    );
+                    self.masm.cmp_rr(Reg64::R12, Reg64::R11);
+                    self.emit_cond_jump(CondCode::Equal, target);
+                }
             }
             Opcode::TestEqualStrictJump => {
                 let Operand::Register(v) = *instr.operand(0) else {
@@ -1042,17 +1534,25 @@ impl<'a> BaselineCompiler<'a> {
                     byte_offsets,
                     n,
                 )?;
-                self.emit_compare_and_set(v, CondCode::Equal);
-                self.masm.mov_ri(
-                    Reg64::R11,
-                    if is_true_flag == 0 {
-                        JIT_FALSE
-                    } else {
-                        JIT_TRUE
-                    },
-                );
-                self.masm.cmp_rr(Reg64::R12, Reg64::R11);
-                self.emit_cond_jump(CondCode::Equal, target);
+                #[cfg(all(target_arch = "x86_64", unix))]
+                {
+                    let (jump_cc, fall_val) = fused_jump_cc(CondCode::Equal, is_true_flag);
+                    self.emit_fused_compare_jump(v, jump_cc, target, fall_val);
+                }
+                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                {
+                    self.emit_compare_and_set(v, CondCode::Equal);
+                    self.masm.mov_ri(
+                        Reg64::R11,
+                        if is_true_flag == 0 {
+                            JIT_FALSE
+                        } else {
+                            JIT_TRUE
+                        },
+                    );
+                    self.masm.cmp_rr(Reg64::R12, Reg64::R11);
+                    self.emit_cond_jump(CondCode::Equal, target);
+                }
             }
             Opcode::TestLessThanOrEqualJump => {
                 let Operand::Register(v) = *instr.operand(0) else {
@@ -1072,17 +1572,25 @@ impl<'a> BaselineCompiler<'a> {
                     byte_offsets,
                     n,
                 )?;
-                self.emit_compare_and_set(v, CondCode::LessEq);
-                self.masm.mov_ri(
-                    Reg64::R11,
-                    if is_true_flag == 0 {
-                        JIT_FALSE
-                    } else {
-                        JIT_TRUE
-                    },
-                );
-                self.masm.cmp_rr(Reg64::R12, Reg64::R11);
-                self.emit_cond_jump(CondCode::Equal, target);
+                #[cfg(all(target_arch = "x86_64", unix))]
+                {
+                    let (jump_cc, fall_val) = fused_jump_cc(CondCode::LessEq, is_true_flag);
+                    self.emit_fused_compare_jump(v, jump_cc, target, fall_val);
+                }
+                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                {
+                    self.emit_compare_and_set(v, CondCode::LessEq);
+                    self.masm.mov_ri(
+                        Reg64::R11,
+                        if is_true_flag == 0 {
+                            JIT_FALSE
+                        } else {
+                            JIT_TRUE
+                        },
+                    );
+                    self.masm.cmp_rr(Reg64::R12, Reg64::R11);
+                    self.emit_cond_jump(CondCode::Equal, target);
+                }
             }
             Opcode::TestGreaterThanOrEqualJump => {
                 let Operand::Register(v) = *instr.operand(0) else {
@@ -1102,17 +1610,25 @@ impl<'a> BaselineCompiler<'a> {
                     byte_offsets,
                     n,
                 )?;
-                self.emit_compare_and_set(v, CondCode::GreaterEq);
-                self.masm.mov_ri(
-                    Reg64::R11,
-                    if is_true_flag == 0 {
-                        JIT_FALSE
-                    } else {
-                        JIT_TRUE
-                    },
-                );
-                self.masm.cmp_rr(Reg64::R12, Reg64::R11);
-                self.emit_cond_jump(CondCode::Equal, target);
+                #[cfg(all(target_arch = "x86_64", unix))]
+                {
+                    let (jump_cc, fall_val) = fused_jump_cc(CondCode::GreaterEq, is_true_flag);
+                    self.emit_fused_compare_jump(v, jump_cc, target, fall_val);
+                }
+                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                {
+                    self.emit_compare_and_set(v, CondCode::GreaterEq);
+                    self.masm.mov_ri(
+                        Reg64::R11,
+                        if is_true_flag == 0 {
+                            JIT_FALSE
+                        } else {
+                            JIT_TRUE
+                        },
+                    );
+                    self.masm.cmp_rr(Reg64::R12, Reg64::R11);
+                    self.emit_cond_jump(CondCode::Equal, target);
+                }
             }
             Opcode::SubSmiStar => {
                 let Operand::Immediate(imm) = *instr.operand(0) else {
@@ -1131,30 +1647,85 @@ impl<'a> BaselineCompiler<'a> {
                 let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestGreaterThan", 0));
                 };
+                #[cfg(all(target_arch = "x86_64", unix))]
+                if self.try_fuse_compare_jump(
+                    idx,
+                    instructions,
+                    byte_offsets,
+                    v,
+                    CondCode::Greater,
+                    n,
+                ) {
+                    return Ok(1);
+                }
                 self.emit_compare_and_set(v, CondCode::Greater);
             }
             Opcode::TestLessThanOrEqual => {
                 let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestLessThanOrEqual", 0));
                 };
+                #[cfg(all(target_arch = "x86_64", unix))]
+                if self.try_fuse_compare_jump(
+                    idx,
+                    instructions,
+                    byte_offsets,
+                    v,
+                    CondCode::LessEq,
+                    n,
+                ) {
+                    return Ok(1);
+                }
                 self.emit_compare_and_set(v, CondCode::LessEq);
             }
             Opcode::TestGreaterThanOrEqual => {
                 let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestGreaterThanOrEqual", 0));
                 };
+                #[cfg(all(target_arch = "x86_64", unix))]
+                if self.try_fuse_compare_jump(
+                    idx,
+                    instructions,
+                    byte_offsets,
+                    v,
+                    CondCode::GreaterEq,
+                    n,
+                ) {
+                    return Ok(1);
+                }
                 self.emit_compare_and_set(v, CondCode::GreaterEq);
             }
             Opcode::TestEqual | Opcode::TestEqualStrict => {
                 let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestEqual", 0));
                 };
+                #[cfg(all(target_arch = "x86_64", unix))]
+                if self.try_fuse_compare_jump(
+                    idx,
+                    instructions,
+                    byte_offsets,
+                    v,
+                    CondCode::Equal,
+                    n,
+                ) {
+                    return Ok(1);
+                }
                 self.emit_compare_and_set(v, CondCode::Equal);
             }
             Opcode::TestNotEqual => {
                 let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestNotEqual", 0));
                 };
+                #[cfg(all(target_arch = "x86_64", unix))]
+                if self.try_fuse_compare_jump(
+                    idx,
+                    instructions,
+                    byte_offsets,
+                    v,
+                    CondCode::NotEqual,
+                    n,
+                ) {
+                    return Ok(1);
+                }
                 self.emit_compare_and_set(v, CondCode::NotEqual);
             }
             Opcode::TestNull => {
@@ -1502,7 +2073,7 @@ impl<'a> BaselineCompiler<'a> {
                 )));
             }
         }
-        Ok(())
+        Ok(0)
     }
 }
 
@@ -1525,6 +2096,30 @@ fn jump_target_byte(idx: usize, delta: i32, byte_offsets: &[usize]) -> usize {
 #[cold]
 fn bad_operand(opcode: &'static str, i: usize) -> StatorError {
     StatorError::Internal(format!("{opcode}: unexpected operand at index {i}"))
+}
+
+/// Compute the fused `Jcc` condition code and fall-through accumulator value
+/// for a `TestXxxJump` bytecode.
+///
+/// `cc` is the comparison condition (e.g. `Less` for `TestLessThanJump`).
+/// `is_true_flag` selects whether the jump is taken when the condition is
+/// true (non-zero) or false (zero).
+///
+/// Returns `(jump_cc, fall_through_bool)`:
+/// - `jump_cc`: the condition code to pass to `jcc`.
+/// - `fall_through_bool`: the value to materialise in R12 when the jump is
+///   **not** taken.
+#[cfg(all(target_arch = "x86_64", unix))]
+fn fused_jump_cc(cc: CondCode, is_true_flag: i32) -> (CondCode, i64) {
+    if is_true_flag == 0 {
+        // Jump when the condition is FALSE → invert the condition.
+        // Fall-through means the condition WAS true.
+        (cc.invert(), JIT_TRUE)
+    } else {
+        // Jump when the condition is TRUE → use the condition directly.
+        // Fall-through means the condition was false.
+        (cc, JIT_FALSE)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
