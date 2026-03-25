@@ -965,10 +965,10 @@ impl<'a> BaselineCompiler<'a> {
             }
             for op in instructions[idx].operands() {
                 if let Operand::Register(v) = op {
-                    if let Some(entry) = counts.iter_mut().find(|(vr, _)| *vr == v) {
+                    if let Some(entry) = counts.iter_mut().find(|(vr, _)| *vr == *v) {
                         entry.1 += 1;
                     } else {
-                        counts.push((v, 1));
+                        counts.push((*v, 1));
                     }
                 }
             }
