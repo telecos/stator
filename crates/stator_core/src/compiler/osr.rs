@@ -20,22 +20,22 @@
 //!
 //! | From          | To        | Trigger threshold       |
 //! |---------------|-----------|-------------------------|
-//! | Interpreter   | Baseline  | [`OSR_INTERP_TO_BASELINE`] back-edges |
-//! | Baseline      | Maglev    | [`OSR_BASELINE_TO_MAGLEV`] back-edges |
-//! | Maglev        | Turbofan  | [`OSR_MAGLEV_TO_TURBOFAN`] back-edges |
+//! | Interpreter   | Baseline  | [`OSR_INTERP_TO_BASELINE`] (10) back-edges |
+//! | Baseline      | Maglev    | [`OSR_BASELINE_TO_MAGLEV`] (100) back-edges |
+//! | Maglev        | Turbofan  | [`OSR_MAGLEV_TO_TURBOFAN`] (1 000) back-edges |
 
 use std::collections::HashMap;
 
 // ── Thresholds ──────────────────────────────────────────────────────────────
 
 /// Loop back-edge count triggering interpreter → baseline OSR.
-pub const OSR_INTERP_TO_BASELINE: u32 = 100;
+pub const OSR_INTERP_TO_BASELINE: u32 = 10;
 
 /// Loop back-edge count triggering baseline → Maglev OSR.
-pub const OSR_BASELINE_TO_MAGLEV: u32 = 1_000;
+pub const OSR_BASELINE_TO_MAGLEV: u32 = 100;
 
 /// Loop back-edge count triggering Maglev → Turbofan OSR.
-pub const OSR_MAGLEV_TO_TURBOFAN: u32 = 10_000;
+pub const OSR_MAGLEV_TO_TURBOFAN: u32 = 1_000;
 
 // ── Execution tier ──────────────────────────────────────────────────────────
 
