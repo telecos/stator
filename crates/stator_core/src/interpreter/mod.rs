@@ -3002,6 +3002,14 @@ impl Interpreter {
                                     | Opcode::CallUndefinedReceiver0
                                     | Opcode::CallUndefinedReceiver1
                                     | Opcode::CallUndefinedReceiver2
+                                    | Opcode::LdaCurrentContextSlot
+                                    | Opcode::LdaImmutableCurrentContextSlot
+                                    | Opcode::LdaContextSlot
+                                    | Opcode::LdaNamedProperty
+                                    | Opcode::LdaKeyedProperty
+                                    | Opcode::LdaGlobal
+                                    | Opcode::Jump
+                                    | Opcode::Return
                                     | Opcode::Nop
                             )
                         {
@@ -3094,9 +3102,9 @@ impl Interpreter {
                                     hot_acc = Some(NanBoxedValue::from_boolean(*b));
                                 } else {
                                     acc = val.cheap_clone();
-                                    frame.smi_mode = false;
-                                    frame.loop_end_pc = 0;
-                                    break 'smi;
+                                    smi_acc_spilled = true;
+                                    smi_acc_bool = false;
+                                    hot_acc = None;
                                 }
                             }
                             Opcode::Mov => {
@@ -3575,12 +3583,12 @@ impl Interpreter {
                                         _ => {}
                                     }
                                 }
-                                // No jump fusion — must leave SMI mode because
-                                // the accumulator becomes Boolean.
-                                acc = JsValue::Boolean(cmp);
-                                frame.smi_mode = false;
-                                frame.loop_end_pc = 0;
-                                break 'smi;
+                                // No jump fusion — keep boolean result in SMI
+                                // mode via smi_acc_bool encoding.
+                                sa = cmp as i32;
+                                smi_acc_bool = true;
+                                smi_acc_spilled = false;
+                                hot_acc = Some(NanBoxedValue::from_boolean(cmp));
                             }
                             Opcode::TestLessThanJump
                             | Opcode::TestGreaterThanJump
@@ -3660,10 +3668,10 @@ impl Interpreter {
                                         _ => {}
                                     }
                                 }
-                                acc = JsValue::Boolean(cmp);
-                                frame.smi_mode = false;
-                                frame.loop_end_pc = 0;
-                                break 'smi;
+                                sa = cmp as i32;
+                                smi_acc_bool = true;
+                                smi_acc_spilled = false;
+                                hot_acc = Some(NanBoxedValue::from_boolean(cmp));
                             }
                             Opcode::TestNotEqual => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
@@ -3694,10 +3702,10 @@ impl Interpreter {
                                         _ => {}
                                     }
                                 }
-                                acc = JsValue::Boolean(cmp);
-                                frame.smi_mode = false;
-                                frame.loop_end_pc = 0;
-                                break 'smi;
+                                sa = cmp as i32;
+                                smi_acc_bool = true;
+                                smi_acc_spilled = false;
+                                hot_acc = Some(NanBoxedValue::from_boolean(cmp));
                             }
                             Opcode::JumpIfTrue | Opcode::JumpIfToBooleanTrue => {
                                 // Accumulator is Smi — truthy iff non-zero.
@@ -3739,7 +3747,7 @@ impl Interpreter {
                                 if frame.instruction_limit > 0
                                     && frame.instructions_executed > frame.instruction_limit
                                 {
-                                    acc = smi_to_val!();
+                                    acc = materialize_acc!();
                                     frame.pc = pc;
                                     frame.accumulator = acc.cheap_clone();
                                     return Err(instruction_limit_error());
@@ -3751,7 +3759,7 @@ impl Interpreter {
                                         if frame.deadline.is_some_and(|dl| now > dl)
                                             || thread_deadline.is_some_and(|dl| now > dl)
                                         {
-                                            acc = smi_to_val!();
+                                            acc = materialize_acc!();
                                             frame.pc = pc;
                                             frame.accumulator = acc.cheap_clone();
                                             return Err(execution_timeout_error());
@@ -3763,25 +3771,27 @@ impl Interpreter {
                             }
                             Opcode::Return => {
                                 frame.pc = pc;
-                                return Ok(smi_to_val!());
+                                return Ok(materialize_acc!());
                             }
                             Opcode::LdaGlobal => {
                                 let name_idx =
                                     unsafe { operand_constant_pool_idx_unchecked(instr, 0) };
                                 // Sync state before fallible frame methods.
-                                acc = smi_to_val!();
+                                acc = materialize_acc!();
                                 frame.pc = pc;
                                 frame.accumulator = acc.cheap_clone();
                                 let name = frame.get_string_constant(name_idx)?;
                                 let value = frame.load_global(name.as_ref())?;
                                 if let JsValue::Smi(v) = value {
                                     sa = v;
+                                    smi_acc_bool = false;
+                                    smi_acc_spilled = false;
                                     hot_acc = Some(NanBoxedValue::from_smi(v));
                                 } else {
                                     acc = value;
-                                    frame.smi_mode = false;
-                                    frame.loop_end_pc = 0;
-                                    break 'smi;
+                                    smi_acc_spilled = true;
+                                    smi_acc_bool = false;
+                                    hot_acc = None;
                                 }
                             }
                             Opcode::StaGlobal => {
@@ -4190,7 +4200,8 @@ impl Interpreter {
                             }
                             Opcode::LdaNamedProperty => {
                                 // Mega-IC fast path (direct + proto): stays in
-                                // SMI mode when the loaded value is Smi.
+                                // SMI mode for both Smi (direct) and non-Smi
+                                // (spilled) values.
                                 let obj_v = unsafe { operand_reg_unchecked(instr, 0) };
                                 let slot = unsafe {
                                     match *instr.operand_unchecked(2) {
@@ -4212,6 +4223,8 @@ impl Interpreter {
                                         let len = items.borrow().len();
                                         if len <= i32::MAX as usize {
                                             sa = len as i32;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
                                             hot_acc = Some(NanBoxedValue::from_smi(sa));
                                             continue 'smi;
                                         }
@@ -4232,14 +4245,16 @@ impl Interpreter {
                                             {
                                                 if let JsValue::Smi(v) = val {
                                                     sa = *v;
+                                                    smi_acc_bool = false;
+                                                    smi_acc_spilled = false;
                                                     hot_acc = Some(NanBoxedValue::from_smi(*v));
                                                     continue 'smi;
                                                 }
                                                 acc = val.clone();
-                                                drop(pm);
-                                                frame.smi_mode = false;
-                                                frame.loop_end_pc = 0;
-                                                break 'smi;
+                                                smi_acc_spilled = true;
+                                                smi_acc_bool = false;
+                                                hot_acc = None;
+                                                continue 'smi;
                                             }
                                         } else {
                                             // Proto-IC: load from prototype.
@@ -4255,15 +4270,16 @@ impl Interpreter {
                                                 {
                                                     if let JsValue::Smi(v) = val {
                                                         sa = *v;
+                                                        smi_acc_bool = false;
+                                                        smi_acc_spilled = false;
                                                         hot_acc = Some(NanBoxedValue::from_smi(*v));
                                                         continue 'smi;
                                                     }
                                                     acc = val.clone();
-                                                    drop(proto_pm);
-                                                    drop(pm);
-                                                    frame.smi_mode = false;
-                                                    frame.loop_end_pc = 0;
-                                                    break 'smi;
+                                                    smi_acc_spilled = true;
+                                                    smi_acc_bool = false;
+                                                    hot_acc = None;
+                                                    continue 'smi;
                                                 }
                                             }
                                         }
@@ -4283,11 +4299,20 @@ impl Interpreter {
                                                 prop_name.as_ref(),
                                             )
                                         {
-                                            acc = ic.value.clone();
+                                            let val = ic.value.clone();
                                             drop(pm);
-                                            frame.smi_mode = false;
-                                            frame.loop_end_pc = 0;
-                                            break 'smi;
+                                            if let JsValue::Smi(v) = &val {
+                                                sa = *v;
+                                                smi_acc_bool = false;
+                                                smi_acc_spilled = false;
+                                                hot_acc = Some(NanBoxedValue::from_smi(*v));
+                                            } else {
+                                                acc = val;
+                                                smi_acc_spilled = true;
+                                                smi_acc_bool = false;
+                                                hot_acc = None;
+                                            }
+                                            continue 'smi;
                                         }
                                     }
                                 }
@@ -4397,7 +4422,7 @@ impl Interpreter {
                             }
                             Opcode::LdaContextSlot => {
                                 // Load from closure context — stay in SMI mode
-                                // if the loaded value is Smi.
+                                // for both Smi and non-Smi values (spilled).
                                 let ctx_reg = unsafe { operand_reg_unchecked(instr, 0) };
                                 let ctx_val = unsafe { frame.read_reg_unchecked(ctx_reg) };
                                 if let JsValue::Context(ctx_rc) = ctx_val {
@@ -4405,11 +4430,6 @@ impl Interpreter {
                                         unsafe { operand_constant_pool_idx_unchecked(instr, 1) }
                                             as usize;
                                     let depth = unsafe { operand_imm_unchecked(instr, 2) };
-                                    // Fast path: depth-0 accesses the register
-                                    // context directly, avoiding Rc::clone and
-                                    // the chain-walk loop entirely.  We clone the
-                                    // slot value out of the borrow scope so that
-                                    // `frame` is free to mutate afterwards.
                                     if depth == 0 {
                                         let slot_val = {
                                             let borrow = ctx_rc.borrow();
@@ -4417,14 +4437,23 @@ impl Interpreter {
                                         };
                                         if let Some(JsValue::Smi(v)) = slot_val {
                                             sa = v;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
                                             hot_acc = Some(NanBoxedValue::from_smi(v));
                                             continue 'smi;
                                         } else if let Some(val) = slot_val {
                                             acc = val;
-                                            frame.smi_mode = false;
-                                            frame.loop_end_pc = 0;
-                                            break 'smi;
+                                            smi_acc_spilled = true;
+                                            smi_acc_bool = false;
+                                            hot_acc = None;
+                                            continue 'smi;
                                         }
+                                        // Slot missing → Undefined
+                                        acc = JsValue::Undefined;
+                                        smi_acc_spilled = true;
+                                        smi_acc_bool = false;
+                                        hot_acc = None;
+                                        continue 'smi;
                                     } else {
                                         let ctx_ref = Rc::clone(ctx_rc);
                                         let mut current = ctx_ref;
@@ -4441,21 +4470,32 @@ impl Interpreter {
                                             current = next;
                                             d -= 1;
                                         }
-                                        let borrow = current.borrow();
-                                        if let Some(val) = borrow.slots.get(slot) {
-                                            if let JsValue::Smi(v) = val {
-                                                sa = *v;
-                                                hot_acc = Some(NanBoxedValue::from_smi(*v));
-                                                continue 'smi;
-                                            }
-                                            acc = val.clone();
-                                            frame.smi_mode = false;
-                                            frame.loop_end_pc = 0;
-                                            break 'smi;
+                                        let slot_val = {
+                                            let borrow = current.borrow();
+                                            borrow.slots.get(slot).cloned()
+                                        };
+                                        if let Some(JsValue::Smi(v)) = slot_val {
+                                            sa = v;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(v));
+                                            continue 'smi;
+                                        } else if let Some(val) = slot_val {
+                                            acc = val;
+                                            smi_acc_spilled = true;
+                                            smi_acc_bool = false;
+                                            hot_acc = None;
+                                            continue 'smi;
                                         }
+                                        // Slot missing → Undefined
+                                        acc = JsValue::Undefined;
+                                        smi_acc_spilled = true;
+                                        smi_acc_bool = false;
+                                        hot_acc = None;
+                                        continue 'smi;
                                     }
                                 }
-                                // No context or missing slot — fall through.
+                                // No context — fall through.
                                 acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
@@ -4515,19 +4555,31 @@ impl Interpreter {
                                     let slot =
                                         unsafe { operand_constant_pool_idx_unchecked(instr, 0) }
                                             as usize;
-                                    let borrow = ctx_rc.borrow();
-                                    if let Some(val) = borrow.slots.get(slot) {
-                                        if let JsValue::Smi(v) = val {
-                                            sa = *v;
-                                            hot_acc = Some(NanBoxedValue::from_smi(*v));
-                                            continue 'smi;
-                                        }
-                                        acc = val.clone();
-                                        frame.smi_mode = false;
-                                        frame.loop_end_pc = 0;
-                                        break 'smi;
+                                    let slot_val = {
+                                        let borrow = ctx_rc.borrow();
+                                        borrow.slots.get(slot).cloned()
+                                    };
+                                    if let Some(JsValue::Smi(v)) = slot_val {
+                                        sa = v;
+                                        smi_acc_bool = false;
+                                        smi_acc_spilled = false;
+                                        hot_acc = Some(NanBoxedValue::from_smi(v));
+                                        continue 'smi;
+                                    } else if let Some(val) = slot_val {
+                                        acc = val;
+                                        smi_acc_spilled = true;
+                                        smi_acc_bool = false;
+                                        hot_acc = None;
+                                        continue 'smi;
                                     }
+                                    // Slot missing → Undefined
+                                    acc = JsValue::Undefined;
+                                    smi_acc_spilled = true;
+                                    smi_acc_bool = false;
+                                    hot_acc = None;
+                                    continue 'smi;
                                 }
+                                // No context — exit SMI mode.
                                 acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
@@ -4535,16 +4587,17 @@ impl Interpreter {
                                 break 'smi;
                             }
                             Opcode::StaCurrentContextSlot => {
-                                // Store to depth-0 context.
+                                // Store to depth-0 context (with resize).
                                 if let Some(JsValue::Context(ctx_rc)) = &frame.context {
                                     let slot =
                                         unsafe { operand_constant_pool_idx_unchecked(instr, 0) }
                                             as usize;
                                     let mut borrow = ctx_rc.borrow_mut();
-                                    if slot < borrow.slots.len() {
-                                        borrow.slots[slot] = materialize_acc!();
-                                        continue 'smi;
+                                    if slot >= borrow.slots.len() {
+                                        borrow.slots.resize(slot + 1, JsValue::Undefined);
                                     }
+                                    borrow.slots[slot] = materialize_acc!();
+                                    continue 'smi;
                                 }
                                 acc = materialize_acc!();
                                 frame.smi_mode = false;
@@ -9093,6 +9146,54 @@ fn inline_smi_binary_opcode(opcode: Opcode) -> Option<Opcode> {
     }
 }
 
+#[inline(always)]
+fn is_inline_current_context_load(opcode: Opcode) -> bool {
+    matches!(
+        opcode,
+        Opcode::LdaCurrentContextSlot | Opcode::LdaImmutableCurrentContextSlot
+    )
+}
+
+#[inline(always)]
+fn inline_context_slot_update(
+    ba: &BytecodeArray,
+    slot_idx: u32,
+    update: &Instruction,
+) -> Option<JsValue> {
+    let js_ctx = ba.closure_context()?;
+    let mut borrowed = js_ctx.borrow_mut();
+    let slot = slot_idx as usize;
+    if slot >= borrowed.slots.len() {
+        borrowed.slots.resize(slot + 1, JsValue::Undefined);
+    }
+
+    let current = borrowed.slots[slot].cheap_clone();
+    let next = match update.opcode {
+        Opcode::Inc => match current {
+            JsValue::Smi(value) => match value.checked_add(1) {
+                Some(result) => JsValue::Smi(result),
+                None => JsValue::HeapNumber(value as f64 + 1.0),
+            },
+            JsValue::BigInt(value) => JsValue::BigInt(Box::new(value.wrapping_add(1))),
+            _ if is_inline_primitive(&current) => {
+                number_to_jsvalue(current.to_number().ok()? + 1.0)
+            }
+            _ => return None,
+        },
+        Opcode::AddSmi => {
+            if matches!(current, JsValue::BigInt(_)) {
+                return None;
+            }
+            number_to_jsvalue(
+                current.to_number().ok()? + f64::from(checked_operand_imm(update, 0)?),
+            )
+        }
+        _ => return None,
+    };
+    borrowed.slots[slot] = next.cheap_clone();
+    Some(next)
+}
+
 pub(super) fn try_inline_small_function(
     ba: &BytecodeArray,
     args: &[JsValue],
@@ -9129,6 +9230,32 @@ pub(super) fn try_inline_small_function(
         ),
         [lda, ret] if lda.opcode == Opcode::Ldar && ret.opcode == Opcode::Return => {
             inline_arg_from_reg(args, checked_operand_reg(lda, 0)?)
+        }
+        [load, update, store, ret]
+            if is_inline_current_context_load(load.opcode)
+                && store.opcode == Opcode::StaCurrentContextSlot
+                && ret.opcode == Opcode::Return =>
+        {
+            let load_slot = checked_operand_constant_pool_idx(load, 0)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 0)?;
+            if load_slot != store_slot {
+                return None;
+            }
+            inline_context_slot_update(ba, load_slot, update)
+        }
+        [load, update, store, reload, ret]
+            if is_inline_current_context_load(load.opcode)
+                && store.opcode == Opcode::StaCurrentContextSlot
+                && is_inline_current_context_load(reload.opcode)
+                && ret.opcode == Opcode::Return =>
+        {
+            let load_slot = checked_operand_constant_pool_idx(load, 0)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 0)?;
+            let reload_slot = checked_operand_constant_pool_idx(reload, 0)?;
+            if load_slot != store_slot || store_slot != reload_slot {
+                return None;
+            }
+            inline_context_slot_update(ba, load_slot, update)
         }
         [lda, ret] if lda.opcode == Opcode::LdaNamedProperty && ret.opcode == Opcode::Return => {
             let obj = inline_arg_from_reg(args, checked_operand_reg(lda, 0)?)?;
@@ -13160,6 +13287,71 @@ mod tests {
         let result = try_inline_small_function(&ba, &[obj], &global_env);
 
         assert_eq!(result, Some(JsValue::Smi(9)));
+    }
+
+    #[test]
+    fn test_try_inline_small_function_updates_current_context_slot_with_inc() {
+        let mut ba = make_bytecode(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::LdaCurrentContextSlot,
+                    vec![Operand::ConstantPoolIdx(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Inc, vec![Operand::FeedbackSlot(0)]),
+                Instruction::new_unchecked(
+                    Opcode::StaCurrentContextSlot,
+                    vec![Operand::ConstantPoolIdx(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+            0,
+        );
+        let closure_ctx = JsContext::new(1, None);
+        closure_ctx.borrow_mut().slots[0] = JsValue::Smi(41);
+        ba.set_closure_context(Rc::clone(&closure_ctx));
+        let global_env = Rc::new(RefCell::new(GlobalEnv::new()));
+
+        let result = try_inline_small_function(&ba, &[], &global_env);
+
+        assert_eq!(result, Some(JsValue::Smi(42)));
+        assert_eq!(closure_ctx.borrow().slots[0], JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_try_inline_small_function_updates_current_context_slot_with_add_smi() {
+        let mut ba = make_bytecode(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::LdaCurrentContextSlot,
+                    vec![Operand::ConstantPoolIdx(0)],
+                ),
+                Instruction::new_unchecked(
+                    Opcode::AddSmi,
+                    vec![Operand::Immediate(1), Operand::FeedbackSlot(0)],
+                ),
+                Instruction::new_unchecked(
+                    Opcode::StaCurrentContextSlot,
+                    vec![Operand::ConstantPoolIdx(0)],
+                ),
+                Instruction::new_unchecked(
+                    Opcode::LdaCurrentContextSlot,
+                    vec![Operand::ConstantPoolIdx(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+            0,
+        );
+        let closure_ctx = JsContext::new(1, None);
+        closure_ctx.borrow_mut().slots[0] = JsValue::Smi(7);
+        ba.set_closure_context(Rc::clone(&closure_ctx));
+        let global_env = Rc::new(RefCell::new(GlobalEnv::new()));
+
+        let result = try_inline_small_function(&ba, &[], &global_env);
+
+        assert_eq!(result, Some(JsValue::Smi(8)));
+        assert_eq!(closure_ctx.borrow().slots[0], JsValue::Smi(8));
     }
 
     // ── LdaSmi / LdaUndefined / Return ──────────────────────────────────────
