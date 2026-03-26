@@ -3845,7 +3845,7 @@ impl Interpreter {
                                     && !ba.is_async()
                                 {
                                     // Try inline BEFORE any Rc clones.
-                                    if ba.bytecode_count() <= 25
+                                    if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
                                         && !ba.has_exception_handler()
                                         && let Some(result) =
                                             try_inline_small_function(ba, &[], &frame.global_env)
@@ -3999,7 +3999,9 @@ impl Interpreter {
                                 {
                                     // Try inline BEFORE cloning Rc — saves atomic
                                     // refcount bump when function is small.
-                                    if ba.bytecode_count() <= 25 && !ba.has_exception_handler() {
+                                    if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+                                        && !ba.has_exception_handler()
+                                    {
                                         let arg1 = unsafe { frame.read_reg_unchecked(arg_reg) }
                                             .cheap_clone();
                                         let inline_args = [arg1];
@@ -6718,7 +6720,7 @@ impl Interpreter {
                             // Try inline BEFORE cloning Rc — avoids atomic
                             // refcount bump when the function is small enough
                             // to be inlined.
-                            if ba.bytecode_count() <= 25
+                            if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
                                 && !ba.has_exception_handler()
                                 && let Some(result) =
                                     try_inline_small_function(ba, &[], &frame.global_env)
@@ -6881,7 +6883,7 @@ impl Interpreter {
                             // which is not mutated during the inline check.
                             let arg_ptr =
                                 unsafe { frame.read_reg_unchecked(arg_reg) } as *const JsValue;
-                            if ba.bytecode_count() <= 25
+                            if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
                                 && !ba.has_exception_handler()
                                 && let Some(result) = try_inline_small_function(
                                     ba,
@@ -9374,7 +9376,7 @@ fn inline_chained_context_slot_binary_op(
 }
 
 /// Maximum bytecode instruction count eligible for interpreter-level inlining.
-const INLINE_BYTECODE_THRESHOLD: usize = 25;
+pub(super) const INLINE_BYTECODE_THRESHOLD: usize = 40;
 
 pub(super) fn try_inline_small_function(
     ba: &BytecodeArray,

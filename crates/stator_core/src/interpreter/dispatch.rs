@@ -18,22 +18,23 @@ use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 
 use super::{
-    ACTIVE_DEBUGGER, CallArgs, GlobalEnv, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD,
-    MegamorphicIcEntry, OSR_LOOP_THRESHOLD, ProtoLoadIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq,
-    acquire_frame, bigint_pow, clone_shared_global_env, collect_args, concat_rc_strs,
-    constant_pool_jump_delta, constant_to_value, construct_builtin_result, decode_string_constant,
-    dispatch_call_property, dispatch_call_value, dispatch_call_with_this, dispatch_getter,
-    dispatch_setter, err_bad_operand, error_message_from_value, extract_context,
-    fast_array_method_name, fast_array_method_target, find_handler, fn_props_get, fn_props_set,
-    has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
-    make_construct_this, maybe_cache_construct_boilerplate, maybe_compile_baseline,
-    maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator, number_to_jsvalue,
-    plain_object_has_own_property, plain_object_to_array_items, populate_self_name, proto_lookup,
-    proto_lookup_cached_resolution, proto_lookup_chain_depth, proto_lookup_rc,
-    resolve_construct_proto, resolve_jump, restore_closure_context, run_callee_pooled,
-    set_function_name_if_missing, set_pending_exception, settle_async_iterator_result, strict_eq,
-    to_array_index, to_bigint, to_property_key, try_execute_best_jit,
-    try_fast_named_property_lookup, try_inline_small_function, walk_context_chain,
+    ACTIVE_DEBUGGER, CallArgs, GlobalEnv, INLINE_BYTECODE_THRESHOLD, Interpreter, InterpreterFrame,
+    MAGLEV_OSR_LOOP_THRESHOLD, MegamorphicIcEntry, OSR_LOOP_THRESHOLD, ProtoLoadIc,
+    TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, acquire_frame, bigint_pow, clone_shared_global_env,
+    collect_args, concat_rc_strs, constant_pool_jump_delta, constant_to_value,
+    construct_builtin_result, decode_string_constant, dispatch_call_property, dispatch_call_value,
+    dispatch_call_with_this, dispatch_getter, dispatch_setter, err_bad_operand,
+    error_message_from_value, extract_context, fast_array_method_name, fast_array_method_target,
+    find_handler, fn_props_get, fn_props_set, has_prototype_in_chain, is_js_receiver, js_add,
+    js_less_than, keyed_load, keyed_store, make_construct_this, maybe_cache_construct_boilerplate,
+    maybe_compile_baseline, maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator,
+    number_to_jsvalue, plain_object_has_own_property, plain_object_to_array_items,
+    populate_self_name, proto_lookup, proto_lookup_cached_resolution, proto_lookup_chain_depth,
+    proto_lookup_rc, resolve_construct_proto, resolve_jump, restore_closure_context,
+    run_callee_pooled, set_function_name_if_missing, set_pending_exception,
+    settle_async_iterator_result, strict_eq, to_array_index, to_bigint, to_property_key,
+    try_execute_best_jit, try_fast_named_property_lookup, try_inline_small_function,
+    walk_context_chain,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
@@ -2277,7 +2278,7 @@ fn handle_call_undefined_receiver0(
     let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
     match callee {
         JsValue::Function(ba) => {
-            if ba.bytecode_count() <= 25
+            if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
                 && !ba.has_exception_handler()
                 && !ba.is_generator()
                 && !ba.is_async()
@@ -2421,7 +2422,7 @@ fn handle_call_undefined_receiver1(
     }
     match callee {
         JsValue::Function(ba) => {
-            if ba.bytecode_count() <= 25
+            if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
                 && !ba.has_exception_handler()
                 && !ba.is_generator()
                 && !ba.is_async()
@@ -2559,7 +2560,7 @@ fn handle_call_undefined_receiver2(
     let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
     match callee {
         JsValue::Function(ba) => {
-            if ba.bytecode_count() <= 25
+            if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
                 && !ba.has_exception_handler()
                 && !ba.is_generator()
                 && !ba.is_async()
