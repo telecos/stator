@@ -51,7 +51,7 @@ use crate::bytecode::{
 };
 use crate::compiler::turbofan::TurbofanCompiledCode;
 use crate::error::{StatorError, StatorResult};
-use crate::objects::property_map::PropertyMap;
+use crate::objects::property_map::{ObjectLiteralTemplate, PropertyMap};
 use crate::objects::value::JsContext;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -445,16 +445,15 @@ pub struct ConstructBoilerplate {
 ///    the live [`PropertyMap`] being populated by subsequent
 ///    `DefineNamedOwnProperty` instructions.
 /// 2. **[`Cached`](Self::Cached)** — promoted on the *second* execution.
-///    The first object's final key layout is captured as a template
-///    [`PropertyMap`] (values reset to `Undefined`).  All further
-///    executions clone this template via
-///    [`PropertyMap::clone_shape`].
+///    The first object's final key layout is captured as a compact
+///    [`ObjectLiteralTemplate`]. All further executions instantiate fresh
+///    [`PropertyMap`]s from that cached shape.
 #[derive(Debug)]
-pub enum ObjectLiteralCacheEntry {
+pub(crate) enum ObjectLiteralCacheEntry {
     /// First execution recorded; waiting for second to promote.
     Pending(Rc<RefCell<PropertyMap>>),
     /// Fully captured template ready for cloning.
-    Cached(Box<PropertyMap>),
+    Cached(Box<ObjectLiteralTemplate>),
 }
 
 impl PartialEq for BytecodeArray {
@@ -732,12 +731,11 @@ impl BytecodeArray {
     // ─── Object-literal template cache API ───────────────────────────────
 
     /// If a cached object-literal template exists for `slot`, returns a
-    /// fresh [`PropertyMap`] cloned from it via
-    /// [`PropertyMap::clone_shape`].
+    /// fresh [`PropertyMap`] instantiated from it.
     pub fn clone_object_literal_template(&self, slot: u32) -> Option<PropertyMap> {
         let borrow = self.object_literal_templates.borrow();
         match borrow.get(&slot) {
-            Some(ObjectLiteralCacheEntry::Cached(template)) => Some(template.clone_shape()),
+            Some(ObjectLiteralCacheEntry::Cached(template)) => Some(template.instantiate()),
             _ => None,
         }
     }
@@ -759,12 +757,9 @@ impl BytecodeArray {
         };
         let first_rc = pending_rc?;
         let first_borrow = first_rc.borrow();
-        if first_borrow.is_empty() {
-            return None;
-        }
-        let template = first_borrow.clone_shape();
+        let template = ObjectLiteralTemplate::capture(&first_borrow)?;
+        let cloned = template.instantiate();
         drop(first_borrow);
-        let cloned = template.clone_shape();
         self.object_literal_templates
             .borrow_mut()
             .insert(slot, ObjectLiteralCacheEntry::Cached(Box::new(template)));
@@ -1209,6 +1204,8 @@ mod tests {
     use super::*;
     use crate::bytecode::bytecodes::{Instruction, Opcode, Operand, encode};
     use crate::bytecode::feedback::FeedbackMetadata;
+    use crate::objects::property_map::PropertyMap;
+    use crate::objects::value::JsValue;
 
     fn make_simple_array() -> BytecodeArray {
         // load smi 7 → r0, return
@@ -1306,6 +1303,32 @@ mod tests {
         assert_eq!(array.get_constant(3), Some(&ConstantPoolEntry::Null));
         assert_eq!(array.get_constant(4), Some(&ConstantPoolEntry::Undefined));
         assert_eq!(array.get_constant(5), None);
+    }
+
+    #[test]
+    fn test_object_literal_template_cache_stores_shape_only() {
+        let array = make_simple_array();
+        let mut first = PropertyMap::with_capacity(4);
+        first.insert("x".to_string(), JsValue::Smi(1));
+        first.insert("y".to_string(), JsValue::Smi(2));
+
+        let first = Rc::new(RefCell::new(first));
+        array.set_object_literal_pending(7, Rc::clone(&first));
+
+        let promoted = array
+            .promote_object_literal_template(7)
+            .expect("template should be promoted");
+        assert_eq!(promoted.layout_id(), first.borrow().layout_id());
+        assert_eq!(promoted.get("x"), Some(&JsValue::Undefined));
+        assert_eq!(promoted.get("y"), Some(&JsValue::Undefined));
+
+        first.borrow_mut().insert("x".to_string(), JsValue::Smi(99));
+        let cached = array
+            .clone_object_literal_template(7)
+            .expect("cached template should instantiate");
+        assert_eq!(cached.layout_id(), promoted.layout_id());
+        assert_eq!(cached.get("x"), Some(&JsValue::Undefined));
+        assert_eq!(cached.get("y"), Some(&JsValue::Undefined));
     }
 
     #[test]

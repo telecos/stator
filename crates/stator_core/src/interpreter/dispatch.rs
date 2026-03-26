@@ -2286,6 +2286,14 @@ fn handle_call_undefined_receiver0(
                     Interpreter::run_async_function(Rc::clone(&ba), CallArgs::new())?;
             } else {
                 let no_args: &[JsValue] = &[];
+                if ba.bytecode_count() <= 5
+                    && !ba.has_exception_handler()
+                    && let Some(result) =
+                        try_inline_small_function(ba.as_ref(), no_args, &ctx.frame.global_env)
+                {
+                    ctx.frame.accumulator = result;
+                    return Ok(DispatchAction::Continue);
+                }
                 // ── Tiering (cold path: gated on reaching baseline threshold) ──
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD {
@@ -2302,14 +2310,6 @@ fn handle_call_undefined_receiver0(
                         ctx.frame.accumulator = jit_result?;
                         return Ok(DispatchAction::Continue);
                     }
-                }
-                if ba.bytecode_count() <= 5
-                    && !ba.has_exception_handler()
-                    && let Some(result) =
-                        try_inline_small_function(ba.as_ref(), no_args, &ctx.frame.global_env)
-                {
-                    ctx.frame.accumulator = result;
-                    return Ok(DispatchAction::Continue);
                 }
                 // Arrow functions use lexical `this` — skip override.
                 // Strict mode: `this` is undefined for free function calls.
@@ -2420,6 +2420,14 @@ fn handle_call_undefined_receiver1(
             } else {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
                 let inline_args = [arg1.clone()];
+                if ba.bytecode_count() <= 5
+                    && !ba.has_exception_handler()
+                    && let Some(result) =
+                        try_inline_small_function(ba.as_ref(), &inline_args, &ctx.frame.global_env)
+                {
+                    ctx.frame.accumulator = result;
+                    return Ok(DispatchAction::Continue);
+                }
                 // ── Tiering (cold path: gated on reaching baseline threshold) ──
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD {
@@ -2436,14 +2444,6 @@ fn handle_call_undefined_receiver1(
                         ctx.frame.accumulator = jit_result?;
                         return Ok(DispatchAction::Continue);
                     }
-                }
-                if ba.bytecode_count() <= 5
-                    && !ba.has_exception_handler()
-                    && let Some(result) =
-                        try_inline_small_function(ba.as_ref(), &inline_args, &ctx.frame.global_env)
-                {
-                    ctx.frame.accumulator = result;
-                    return Ok(DispatchAction::Continue);
                 }
                 // Arrow functions use lexical `this` — skip override.
                 let saved_this = if !ba.is_arrow() && ba.is_strict() {
@@ -3728,40 +3728,41 @@ fn handle_lda_named_property(
     // ── Megamorphic IC fast path────────────────────────────────────────
     if slot != u32::MAX
         && let JsValue::PlainObject(ref map) = obj
-        && let Some(ic) = ctx
+    {
+        let pm = map.borrow();
+        if let Some(ic) = ctx
             .frame
             .mega_load_ic
             .as_ref()
-            .and_then(|cache| cache.probe(slot, map.borrow().layout_id()))
-    {
-        if !ic.is_proto {
-            // Own-property hit: O(1) offset access on receiver.
-            let pm = map.borrow();
-            if pm.matches_key_at_offset(ic.cached_offset as usize, prop_name.as_ref())
-                && let Some(val) = pm.get_by_offset(ic.cached_offset as usize)
-            {
-                let v = val.clone();
-                drop(pm);
-                ctx.frame.accumulator = v;
-                return Ok(DispatchAction::Continue);
-            }
-        } else {
-            // Proto-property hit: verify the immediate prototype's layout
-            // matches, then read by offset from the proto.
-            let proto_layout = ic.proto_layout;
-            let offset = ic.cached_offset;
-            let pm = map.borrow();
-            if let Some(JsValue::PlainObject(proto_map)) = pm.get(INTERNAL_PROTO_PROPERTY_KEY) {
-                let proto_pm = proto_map.borrow();
-                if proto_pm.layout_id() == proto_layout
-                    && proto_pm.matches_key_at_offset(offset as usize, prop_name.as_ref())
-                    && let Some(val) = proto_pm.get_by_offset(offset as usize)
+            .and_then(|cache| cache.probe(slot, pm.layout_id()))
+        {
+            if !ic.is_proto {
+                // Own-property hit: O(1) offset access on receiver.
+                if pm.matches_key_at_offset(ic.cached_offset as usize, prop_name.as_ref())
+                    && let Some(val) = pm.get_by_offset(ic.cached_offset as usize)
                 {
                     let v = val.clone();
-                    drop(proto_pm);
                     drop(pm);
                     ctx.frame.accumulator = v;
                     return Ok(DispatchAction::Continue);
+                }
+            } else {
+                // Proto-property hit: verify the immediate prototype's layout
+                // matches, then read by offset from the proto.
+                let proto_layout = ic.proto_layout;
+                let offset = ic.cached_offset;
+                if let Some(JsValue::PlainObject(proto_map)) = pm.get(INTERNAL_PROTO_PROPERTY_KEY) {
+                    let proto_pm = proto_map.borrow();
+                    if proto_pm.layout_id() == proto_layout
+                        && proto_pm.matches_key_at_offset(offset as usize, prop_name.as_ref())
+                        && let Some(val) = proto_pm.get_by_offset(offset as usize)
+                    {
+                        let v = val.clone();
+                        drop(proto_pm);
+                        drop(pm);
+                        ctx.frame.accumulator = v;
+                        return Ok(DispatchAction::Continue);
+                    }
                 }
             }
         }

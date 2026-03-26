@@ -29,7 +29,6 @@ use std::array;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::builtins::symbol::{is_symbol_property_key, property_key_to_symbol};
 use crate::objects::map::PropertyAttributes;
@@ -40,12 +39,14 @@ pub const INTERNAL_PROTO_PROPERTY_KEY: &str = "\0stator.internal.proto";
 /// User-visible `__proto__` key used for prototype chain lookup.
 const USER_VISIBLE_PROTO_PROPERTY_KEY: &str = "__proto__";
 
-/// Global monotonically-increasing counter used to assign unique shape
-/// identifiers to each [`PropertyMap`] structural configuration.
-static NEXT_SHAPE_ID: AtomicU64 = AtomicU64::new(1);
-/// Global epoch counter incremented on every prototype-relevant mutation.
-/// Used to cheaply detect when a cached `proto_generation` may be stale.
-static GLOBAL_PROTO_MUTATION_EPOCH: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// Monotonically-increasing counter used to assign unique shape
+    /// identifiers to each [`PropertyMap`] structural configuration.
+    static NEXT_SHAPE_ID: Cell<u64> = const { Cell::new(1) };
+    /// Epoch counter incremented on every prototype-relevant mutation.
+    /// Used to cheaply detect when a cached `proto_generation` may be stale.
+    static GLOBAL_PROTO_MUTATION_EPOCH: Cell<u64> = const { Cell::new(0) };
+}
 
 /// Default attributes for properties created by ordinary JS assignment:
 /// writable, enumerable, and configurable.
@@ -94,6 +95,51 @@ enum PropertyIndex {
     #[default]
     Inline,
     Map(HashMap<Rc<str>, usize>),
+}
+
+#[derive(Debug)]
+struct InlinePropertyCache {
+    hashes: [Cell<u64>; INLINE_CACHE_CAP],
+    slots: [Cell<u32>; INLINE_CACHE_CAP],
+}
+
+impl InlinePropertyCache {
+    fn new() -> Self {
+        Self {
+            hashes: Default::default(),
+            slots: array::from_fn(|_| Cell::new(u32::MAX)),
+        }
+    }
+}
+
+impl Clone for InlinePropertyCache {
+    fn clone(&self) -> Self {
+        Self {
+            hashes: array::from_fn(|i| Cell::new(self.hashes[i].get())),
+            slots: array::from_fn(|i| Cell::new(self.slots[i].get())),
+        }
+    }
+}
+
+#[inline]
+fn next_shape_id() -> u64 {
+    NEXT_SHAPE_ID.with(|next| {
+        let shape_id = next.get();
+        next.set(shape_id.wrapping_add(1));
+        shape_id
+    })
+}
+
+#[inline]
+fn current_global_proto_mutation_epoch() -> u64 {
+    GLOBAL_PROTO_MUTATION_EPOCH.with(Cell::get)
+}
+
+#[inline]
+fn bump_global_proto_mutation_epoch() {
+    GLOBAL_PROTO_MUTATION_EPOCH.with(|epoch| {
+        epoch.set(epoch.get().wrapping_add(1));
+    });
 }
 
 fn acquire_storage_buffers(capacity: usize) -> PropertyStorageBuffers {
@@ -223,10 +269,11 @@ pub struct PropertyMap {
     /// to a hash map once the object grows beyond
     /// [`SMALL_PROPERTY_LINEAR_SCAN_CAP`] properties.
     index: PropertyIndex,
-    /// Inline cache: FNV-1a hashes of recently accessed property names.
-    cache_hashes: [Cell<u64>; INLINE_CACHE_CAP],
-    /// Inline cache: corresponding slot indices for `cache_hashes`.
-    cache_slots: [Cell<u32>; INLINE_CACHE_CAP],
+    /// Optional inline cache of recently accessed property names.
+    ///
+    /// Small objects stay cache-free because their linear scans are already
+    /// cheap and the cache state would dominate the object footprint.
+    inline_cache: Option<Box<InlinePropertyCache>>,
     /// Shape identifier — a monotonically-increasing stamp that changes on
     /// every structural mutation (property add/remove or attribute change).
     shape_id: u64,
@@ -263,6 +310,57 @@ pub struct PropertyMap {
     capacity_hint: usize,
 }
 
+/// Cached object-literal layout used to instantiate repeated literals without
+/// re-observing the first instance's values.
+#[derive(Debug, Clone)]
+pub(crate) struct ObjectLiteralTemplate {
+    keys: Box<[Rc<str>]>,
+    attrs: Box<[PropertyAttributes]>,
+    integer_key_count: usize,
+    layout_id: u64,
+    extensible: bool,
+    has_accessors: bool,
+    capacity_hint: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ShapeMetadata {
+    integer_key_count: usize,
+    layout_id: u64,
+    extensible: bool,
+    has_accessors: bool,
+    capacity_hint: usize,
+}
+
+impl ObjectLiteralTemplate {
+    pub(crate) fn capture(map: &PropertyMap) -> Option<Self> {
+        (!map.is_empty()).then(|| Self {
+            keys: map.keys.clone().into_boxed_slice(),
+            attrs: map.attrs.clone().into_boxed_slice(),
+            integer_key_count: map.integer_key_count,
+            layout_id: map.layout_id,
+            extensible: map.extensible,
+            has_accessors: map.has_accessors,
+            capacity_hint: map.capacity_hint,
+        })
+    }
+
+    pub(crate) fn instantiate(&self) -> PropertyMap {
+        PropertyMap::from_shape_parts(
+            &self.keys,
+            &self.attrs,
+            ShapeMetadata {
+                integer_key_count: self.integer_key_count,
+                layout_id: self.layout_id,
+                extensible: self.extensible,
+                has_accessors: self.has_accessors,
+                capacity_hint: self.capacity_hint,
+            },
+            0,
+        )
+    }
+}
+
 impl PartialEq for PropertyMap {
     fn eq(&self, other: &Self) -> bool {
         self.keys == other.keys
@@ -283,8 +381,10 @@ impl Clone for PropertyMap {
             attrs: self.attrs.clone(),
             integer_key_count: self.integer_key_count,
             index: self.index.clone(),
-            cache_hashes: array::from_fn(|i| Cell::new(self.cache_hashes[i].get())),
-            cache_slots: array::from_fn(|i| Cell::new(self.cache_slots[i].get())),
+            inline_cache: self
+                .inline_cache
+                .as_ref()
+                .map(|cache| Box::new((**cache).clone())),
             shape_id: self.shape_id,
             layout_id: self.layout_id,
             proto_generation: Cell::new(self.proto_generation.get()),
@@ -313,9 +413,8 @@ impl PropertyMap {
             attrs: buffers.attrs,
             integer_key_count: 0,
             index,
-            cache_hashes: Default::default(),
-            cache_slots: array::from_fn(|_| Cell::new(u32::MAX)),
-            shape_id: NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed),
+            inline_cache: None,
+            shape_id: next_shape_id(),
             layout_id: layout_hash(&[], &[]),
             proto_generation: Cell::new(0),
             proto_epoch: Cell::new(0),
@@ -341,40 +440,23 @@ impl PropertyMap {
         attrs: &[crate::objects::map::PropertyAttributes],
     ) -> Self {
         debug_assert_eq!(keys.len(), attrs.len());
-        let cap = keys.len();
-        let mut buffers = acquire_storage_buffers(cap);
-        buffers.keys.extend_from_slice(keys);
-        buffers.values.resize(cap, JsValue::Undefined);
-        buffers.attrs.extend_from_slice(attrs);
-
-        let integer_key_count = keys
-            .iter()
-            .filter(|k| parse_integer_index(k).is_some())
-            .count();
-        let has_accessors = keys
-            .iter()
-            .any(|key| key.starts_with("__get_") || key.starts_with("__set_"));
-
-        let index = Self::build_index_from_keys(keys, cap);
-
-        Self {
-            keys: buffers.keys,
-            values: buffers.values,
-            attrs: buffers.attrs,
-            integer_key_count,
-            index,
-            cache_hashes: Default::default(),
-            cache_slots: array::from_fn(|_| Cell::new(u32::MAX)),
-            shape_id: NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed),
-            layout_id: layout_hash(keys, attrs),
-            proto_generation: Cell::new(0),
-            proto_epoch: Cell::new(0),
-            proto_global_epoch: Cell::new(0),
-            extensible: true,
-            has_accessors,
-            template_next_slot: 0,
-            capacity_hint: cap,
-        }
+        Self::from_shape_parts(
+            keys,
+            attrs,
+            ShapeMetadata {
+                integer_key_count: keys
+                    .iter()
+                    .filter(|key| parse_integer_index(key).is_some())
+                    .count(),
+                layout_id: layout_hash(keys, attrs),
+                extensible: true,
+                has_accessors: keys
+                    .iter()
+                    .any(|key| key.starts_with("__get_") || key.starts_with("__set_")),
+                capacity_hint: keys.len(),
+            },
+            0,
+        )
     }
     /// Returns a snapshot of the property keys and their attribute flags,
     /// suitable for caching as a constructor boilerplate.
@@ -393,33 +475,18 @@ impl PropertyMap {
     /// to [`try_template_fill`](Self::try_template_fill) can populate
     /// values in O(1) without hash lookups.
     pub fn clone_shape(&self) -> Self {
-        let cap = self.keys.len();
-        let mut buffers = acquire_storage_buffers(cap);
-        buffers.keys.extend_from_slice(&self.keys);
-        buffers.values.resize(cap, JsValue::Undefined);
-        buffers.attrs.extend_from_slice(&self.attrs);
-
-        let capacity_hint = self.capacity_hint.max(cap);
-        let index = Self::build_index_from_keys(&buffers.keys, capacity_hint);
-
-        Self {
-            keys: buffers.keys,
-            values: buffers.values,
-            attrs: buffers.attrs,
-            integer_key_count: self.integer_key_count,
-            index,
-            cache_hashes: Default::default(),
-            cache_slots: array::from_fn(|_| Cell::new(u32::MAX)),
-            shape_id: NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed),
-            layout_id: self.layout_id,
-            proto_generation: Cell::new(0),
-            proto_epoch: Cell::new(0),
-            proto_global_epoch: Cell::new(0),
-            extensible: self.extensible,
-            has_accessors: self.has_accessors,
-            template_next_slot: 0,
-            capacity_hint,
-        }
+        Self::from_shape_parts(
+            &self.keys,
+            &self.attrs,
+            ShapeMetadata {
+                integer_key_count: self.integer_key_count,
+                layout_id: self.layout_id,
+                extensible: self.extensible,
+                has_accessors: self.has_accessors,
+                capacity_hint: self.capacity_hint,
+            },
+            0,
+        )
     }
 
     /// Backwards-compatible alias for shape-only template cloning.
@@ -471,36 +538,78 @@ impl PropertyMap {
         }
     }
 
+    fn from_shape_parts(
+        keys: &[Rc<str>],
+        attrs: &[PropertyAttributes],
+        metadata: ShapeMetadata,
+        template_next_slot: usize,
+    ) -> Self {
+        let cap = keys.len();
+        let mut buffers = acquire_storage_buffers(cap);
+        buffers.keys.extend_from_slice(keys);
+        buffers.values.resize(cap, JsValue::Undefined);
+        buffers.attrs.extend_from_slice(attrs);
+
+        let capacity_hint = metadata.capacity_hint.max(cap);
+        let index = Self::build_index_from_keys(&buffers.keys, capacity_hint);
+
+        Self {
+            keys: buffers.keys,
+            values: buffers.values,
+            attrs: buffers.attrs,
+            integer_key_count: metadata.integer_key_count,
+            index,
+            inline_cache: (cap > SMALL_PROPERTY_LINEAR_SCAN_CAP)
+                .then(|| Box::new(InlinePropertyCache::new())),
+            shape_id: next_shape_id(),
+            layout_id: metadata.layout_id,
+            proto_generation: Cell::new(0),
+            proto_epoch: Cell::new(0),
+            proto_global_epoch: Cell::new(0),
+            extensible: metadata.extensible,
+            has_accessors: metadata.has_accessors,
+            template_next_slot,
+            capacity_hint,
+        }
+    }
+
     // ── Inline cache helpers ──────────────────────────────────────────────
 
     /// Probes the inline cache for `key`, returning its slot index on hit.
     #[inline]
     fn cache_probe(&self, key: &str) -> Option<usize> {
+        let cache = self.inline_cache.as_ref()?;
         let h = name_hash(key);
         let idx = (h as usize) & (INLINE_CACHE_CAP - 1);
-        if self.cache_hashes[idx].get() != h {
+        if cache.hashes[idx].get() != h {
             return None;
         }
-        let slot = self.cache_slots[idx].get() as usize;
+        let slot = cache.slots[idx].get() as usize;
         (slot < self.keys.len() && self.keys[slot].as_ref() == key).then_some(slot)
     }
 
     /// Records a `(key, slot)` pair in the inline cache.
     #[inline]
     fn cache_record(&self, key: &str, slot: usize) {
+        let Some(cache) = self.inline_cache.as_ref() else {
+            return;
+        };
         let h = name_hash(key);
         let idx = (h as usize) & (INLINE_CACHE_CAP - 1);
-        self.cache_hashes[idx].set(h);
-        self.cache_slots[idx].set(slot as u32);
+        cache.hashes[idx].set(h);
+        cache.slots[idx].set(slot as u32);
     }
 
     /// Invalidates all inline cache entries.
     #[inline]
     fn cache_invalidate(&self) {
-        for entry in &self.cache_hashes {
+        let Some(cache) = self.inline_cache.as_ref() else {
+            return;
+        };
+        for entry in &cache.hashes {
             entry.set(0);
         }
-        for slot in &self.cache_slots {
+        for slot in &cache.slots {
             slot.set(u32::MAX);
         }
     }
@@ -509,7 +618,7 @@ impl PropertyMap {
     /// (set of property names or their attribute flags) has changed.
     #[inline]
     fn bump_shape_id(&mut self) {
-        self.shape_id = NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed);
+        self.shape_id = next_shape_id();
         self.layout_id = layout_hash(&self.keys, &self.attrs);
     }
 
@@ -518,7 +627,7 @@ impl PropertyMap {
     #[inline]
     fn touch_proto_generation(&self) {
         self.proto_epoch.set(self.proto_epoch.get().wrapping_add(1));
-        GLOBAL_PROTO_MUTATION_EPOCH.fetch_add(1, Ordering::Relaxed);
+        bump_global_proto_mutation_epoch();
         self.proto_global_epoch.set(u64::MAX);
     }
 
@@ -547,7 +656,7 @@ impl PropertyMap {
     /// recomputed only when the global prototype-mutation epoch changes.
     #[inline]
     pub fn proto_generation(&self) -> u32 {
-        let global_epoch = GLOBAL_PROTO_MUTATION_EPOCH.load(Ordering::Relaxed);
+        let global_epoch = current_global_proto_mutation_epoch();
         if self.proto_global_epoch.get() == global_epoch {
             return self.proto_generation.get();
         }
@@ -569,7 +678,7 @@ impl PropertyMap {
     /// Returns the global epoch used to invalidate prototype-dependent caches.
     #[inline]
     pub fn global_proto_mutation_epoch() -> u64 {
-        GLOBAL_PROTO_MUTATION_EPOCH.load(Ordering::Relaxed)
+        current_global_proto_mutation_epoch()
     }
 
     /// Returns the slot index (offset) for `key`, or `None` if absent.
@@ -610,11 +719,15 @@ impl PropertyMap {
             index.insert(key.clone(), slot);
         }
         self.index = PropertyIndex::Map(index);
+        if self.inline_cache.is_none() {
+            self.inline_cache = Some(Box::new(InlinePropertyCache::new()));
+        }
     }
 
     fn refresh_index_mode(&mut self) {
         if self.keys.len() <= SMALL_PROPERTY_LINEAR_SCAN_CAP {
             self.index = PropertyIndex::Inline;
+            self.inline_cache = None;
         } else {
             self.promote_index();
         }
@@ -1362,6 +1475,16 @@ mod tests {
     }
 
     #[test]
+    fn test_small_maps_skip_inline_cache() {
+        let mut pm = PropertyMap::new();
+        pm.insert("x".to_string(), JsValue::Smi(1));
+        pm.insert("y".to_string(), JsValue::Smi(2));
+
+        assert_eq!(pm.get("x"), Some(&JsValue::Smi(1)));
+        assert!(pm.inline_cache.is_none());
+    }
+
+    #[test]
     fn test_clone_shape_resets_values_and_preserves_layout() {
         let mut pm = PropertyMap::with_capacity(SMALL_PROPERTY_LINEAR_SCAN_CAP + 4);
         for idx in 0..(SMALL_PROPERTY_LINEAR_SCAN_CAP + 1) {
@@ -1409,30 +1532,33 @@ mod tests {
     #[test]
     fn test_cache_populated_on_get() {
         let mut pm = PropertyMap::new();
-        pm.insert("x".to_string(), JsValue::Smi(1));
-        pm.insert("y".to_string(), JsValue::Smi(2));
+        for i in 0..=SMALL_PROPERTY_LINEAR_SCAN_CAP {
+            pm.insert(format!("k{i}"), JsValue::Smi(i as i32));
+        }
 
         // First access populates the cache.
-        assert_eq!(pm.get("x"), Some(&JsValue::Smi(1)));
+        assert_eq!(pm.get("k0"), Some(&JsValue::Smi(0)));
 
         // Second access of same key hits the cache.
-        assert_eq!(pm.get("x"), Some(&JsValue::Smi(1)));
+        assert_eq!(pm.get("k0"), Some(&JsValue::Smi(0)));
 
         // Different key adds another cache entry.
-        assert_eq!(pm.get("y"), Some(&JsValue::Smi(2)));
+        assert_eq!(pm.get("k1"), Some(&JsValue::Smi(1)));
+        assert!(pm.inline_cache.is_some());
     }
 
     #[test]
     fn test_cache_invalidated_on_remove() {
         let mut pm = PropertyMap::new();
-        pm.insert("a".to_string(), JsValue::Smi(1));
-        pm.insert("b".to_string(), JsValue::Smi(2));
+        for i in 0..=SMALL_PROPERTY_LINEAR_SCAN_CAP {
+            pm.insert(format!("k{i}"), JsValue::Smi(i as i32));
+        }
 
         // Populate cache.
-        assert_eq!(pm.get("a"), Some(&JsValue::Smi(1)));
+        assert_eq!(pm.get("k0"), Some(&JsValue::Smi(0)));
 
         // Remove invalidates cache.
-        pm.remove("a");
+        pm.remove("k0");
     }
 
     #[test]
@@ -1454,51 +1580,65 @@ mod tests {
     #[test]
     fn test_cache_hit_moves_entry_to_front() {
         let mut pm = PropertyMap::new();
-        pm.insert("a".to_string(), JsValue::Smi(1));
-        pm.insert("b".to_string(), JsValue::Smi(2));
+        for i in 0..=SMALL_PROPERTY_LINEAR_SCAN_CAP {
+            pm.insert(format!("k{i}"), JsValue::Smi(i as i32));
+        }
 
-        assert_eq!(pm.get("a"), Some(&JsValue::Smi(1)));
-        assert_eq!(pm.get("b"), Some(&JsValue::Smi(2)));
+        assert_eq!(pm.get("k0"), Some(&JsValue::Smi(0)));
+        assert_eq!(pm.get("k1"), Some(&JsValue::Smi(1)));
 
         // With a 16-entry direct-mapped hash cache, each key hashes to a
         // specific slot.  Verify that both are cached at their hash slots.
-        let hash_a = name_hash("a");
-        let hash_b = name_hash("b");
+        let hash_a = name_hash("k0");
+        let hash_b = name_hash("k1");
         let idx_a = (hash_a as usize) & (INLINE_CACHE_CAP - 1);
         let idx_b = (hash_b as usize) & (INLINE_CACHE_CAP - 1);
-        assert_eq!(pm.cache_hashes[idx_a].get(), hash_a);
-        assert_eq!(pm.cache_hashes[idx_b].get(), hash_b);
+        let cache = pm
+            .inline_cache
+            .as_ref()
+            .expect("large map should allocate cache");
+        assert_eq!(cache.hashes[idx_a].get(), hash_a);
+        assert_eq!(cache.hashes[idx_b].get(), hash_b);
 
-        // Re-access "b" — still at the same hash slot.
-        assert_eq!(pm.get("b"), Some(&JsValue::Smi(2)));
-        assert_eq!(pm.cache_hashes[idx_b].get(), hash_b);
+        // Re-access "k1" — still at the same hash slot.
+        assert_eq!(pm.get("k1"), Some(&JsValue::Smi(1)));
+        assert_eq!(cache.hashes[idx_b].get(), hash_b);
     }
 
     #[test]
     fn test_cache_contains_key_fast_path() {
         let mut pm = PropertyMap::new();
-        pm.insert("x".to_string(), JsValue::Smi(1));
+        for i in 0..=SMALL_PROPERTY_LINEAR_SCAN_CAP {
+            pm.insert(format!("k{i}"), JsValue::Smi(i as i32));
+        }
         // Populate cache via get.
-        let _ = pm.get("x");
+        let _ = pm.get("k0");
         // contains_key should hit the cache.
-        assert!(pm.contains_key("x"));
+        assert!(pm.contains_key("k0"));
         assert!(!pm.contains_key("missing"));
     }
 
     #[test]
     fn test_cache_get_with_attrs_fast_path() {
         let mut pm = PropertyMap::new();
+        for i in 0..SMALL_PROPERTY_LINEAR_SCAN_CAP {
+            pm.insert(format!("k{i}"), JsValue::Smi(i as i32));
+        }
         pm.insert_with_attrs(
-            "p".to_string(),
+            format!("k{SMALL_PROPERTY_LINEAR_SCAN_CAP}"),
             JsValue::Smi(42),
             PropertyAttributes::WRITABLE | PropertyAttributes::ENUMERABLE,
         );
         // First call: populates cache.
-        let (val, attrs) = pm.get_with_attrs("p").unwrap();
+        let (val, attrs) = pm
+            .get_with_attrs(&format!("k{SMALL_PROPERTY_LINEAR_SCAN_CAP}"))
+            .unwrap();
         assert_eq!(val, &JsValue::Smi(42));
         assert!(attrs.contains(PropertyAttributes::WRITABLE));
         // Second call: should hit cache.
-        let (val2, attrs2) = pm.get_with_attrs("p").unwrap();
+        let (val2, attrs2) = pm
+            .get_with_attrs(&format!("k{SMALL_PROPERTY_LINEAR_SCAN_CAP}"))
+            .unwrap();
         assert_eq!(val2, &JsValue::Smi(42));
         assert_eq!(attrs, attrs2);
     }
