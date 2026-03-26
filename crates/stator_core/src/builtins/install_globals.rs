@@ -9627,6 +9627,7 @@ fn make_function() -> JsValue {
 ///
 /// The returned `PlainObject` is registered as `"GeneratorFunction"` in the
 /// global environment so that conformance tests can access it.
+#[inline(never)]
 fn make_generator_function() -> JsValue {
     use crate::interpreter::Interpreter;
     use crate::objects::value::GeneratorStep;

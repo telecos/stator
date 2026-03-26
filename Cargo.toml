@@ -36,12 +36,14 @@ num-bigint = "0.4.6"
 
 # Prevent LLVM from creating enormous stack frames in install_globals.
 # At higher opt-levels the inliner/optimizer folds dozens of temporaries
-# into gigantic frames.  opt-level 1 keeps frames manageable while the
-# main thread runs with `ulimit -s unlimited` (growable stack).
+# into gigantic frames.  The make_* helpers in install_globals.rs carry
+# #[inline(never)] so stator_core can safely use opt-level 3.
+# stator_test262 still uses opt-level 1 because it has the same issue
+# and does not need to be fast.
 [profile.release.package.stator_test262]
 opt-level = 1
 [profile.release.package.stator_core]
-opt-level = 1
+opt-level = 3
 
 # Prevent LTO from recombining the per-crate builds.
 [profile.release]

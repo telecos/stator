@@ -64,6 +64,7 @@ fn make_iter_result(value: JsValue, done: bool) -> JsValue {
 ///
 /// The returned `PlainObject` is registered as `"AsyncGeneratorFunction"` in
 /// the global environment.
+#[inline(never)]
 pub fn make_async_generator_function() -> JsValue {
     let mut props = PropertyMap::new();
 
