@@ -40,8 +40,8 @@ use crate::builtins::proxy::{
     proxy_construct, proxy_delete_property, proxy_has, proxy_set_with_receiver,
 };
 use crate::bytecode::bytecode_array::{
-    ConstantPoolEntry, HandlerTableEntry, MAGLEV_TIERING_THRESHOLD, TIERING_THRESHOLD,
-    TURBOFAN_TIERING_THRESHOLD,
+    BytecodeArray, ConstantPoolEntry, HandlerTableEntry, MAGLEV_TIERING_THRESHOLD,
+    TIERING_THRESHOLD, TURBOFAN_TIERING_THRESHOLD,
 };
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
 use crate::error::{StatorError, StatorResult};
@@ -1850,7 +1850,7 @@ fn handle_jump_loop(
     ctx.frame.pc = resolve_cached_jump(ctx, "JumpLoop")?;
     ctx.frame.osr_loop_count = ctx.frame.osr_loop_count.saturating_add(1);
     if ctx.frame.osr_loop_count >= OSR_LOOP_THRESHOLD {
-        if ctx.frame.bytecode_array.try_get_jit_code().is_none() {
+        if !ctx.frame.bytecode_array.has_any_jit_code() {
             maybe_compile_baseline(&ctx.frame.bytecode_array);
         }
         if ctx.frame.osr_loop_count >= MAGLEV_OSR_LOOP_THRESHOLD {
@@ -2076,7 +2076,7 @@ fn handle_call_any_receiver(
                 // ── Tiering (cold path: gated on reaching baseline threshold) ──
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD {
-                    if ba.try_get_jit_code().is_none() {
+                    if !ba.has_any_jit_code() {
                         maybe_compile_baseline(&ba);
                     }
                     if count >= MAGLEV_TIERING_THRESHOLD {
@@ -2176,7 +2176,7 @@ fn handle_tail_call(
                 // ── Tiering (cold path: gated on reaching baseline threshold) ──
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD {
-                    if ba.try_get_jit_code().is_none() {
+                    if !ba.has_any_jit_code() {
                         maybe_compile_baseline(&ba);
                     }
                     if count >= MAGLEV_TIERING_THRESHOLD {
@@ -2277,27 +2277,39 @@ fn handle_call_undefined_receiver0(
     let callee = ctx.frame.read_reg(callee_v)?.clone();
     match callee {
         JsValue::Function(ba) => {
-            if ba.is_generator() {
-                let state = GeneratorState::new(Rc::clone(&ba));
-                super::init_generator_state_prototype(&state, &ba);
-                ctx.frame.accumulator = JsValue::Generator(state);
-            } else if ba.is_async() {
-                ctx.frame.accumulator =
-                    Interpreter::run_async_function(Rc::clone(&ba), CallArgs::new())?;
-            } else {
+            if ba.bytecode_count() <= 25
+                && !ba.has_exception_handler()
+                && !ba.is_generator()
+                && !ba.is_async()
+            {
                 let no_args: &[JsValue] = &[];
-                if ba.bytecode_count() <= 5
-                    && !ba.has_exception_handler()
-                    && let Some(result) =
-                        try_inline_small_function(ba.as_ref(), no_args, &ctx.frame.global_env)
+                if let Some(result) =
+                    try_inline_small_function(ba.as_ref(), no_args, &ctx.frame.global_env)
                 {
                     ctx.frame.accumulator = result;
                     return Ok(DispatchAction::Continue);
                 }
+            }
+            if ba.is_generator() {
+                #[cold]
+                fn make_generator(ba: &Rc<BytecodeArray>) -> JsValue {
+                    let state = GeneratorState::new(Rc::clone(ba));
+                    super::init_generator_state_prototype(&state, ba);
+                    JsValue::Generator(state)
+                }
+                ctx.frame.accumulator = make_generator(&ba);
+            } else if ba.is_async() {
+                #[cold]
+                fn run_async(ba: &Rc<BytecodeArray>) -> StatorResult<JsValue> {
+                    Interpreter::run_async_function(Rc::clone(ba), CallArgs::new())
+                }
+                ctx.frame.accumulator = run_async(&ba)?;
+            } else {
+                let no_args: &[JsValue] = &[];
                 // ── Tiering (cold path: gated on reaching baseline threshold) ──
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD {
-                    if ba.try_get_jit_code().is_none() {
+                    if !ba.has_any_jit_code() {
                         maybe_compile_baseline(&ba);
                     }
                     if count >= MAGLEV_TIERING_THRESHOLD {
@@ -2409,29 +2421,43 @@ fn handle_call_undefined_receiver1(
     }
     match callee {
         JsValue::Function(ba) => {
-            if ba.is_generator() {
-                let state = GeneratorState::new(Rc::clone(&ba));
-                super::init_generator_state_prototype(&state, &ba);
-                ctx.frame.accumulator = JsValue::Generator(state);
-            } else if ba.is_async() {
-                let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
-                let args: CallArgs = smallvec![arg1];
-                ctx.frame.accumulator = Interpreter::run_async_function(Rc::clone(&ba), args)?;
-            } else {
+            if ba.bytecode_count() <= 25
+                && !ba.has_exception_handler()
+                && !ba.is_generator()
+                && !ba.is_async()
+            {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
                 let inline_args = [arg1.clone()];
-                if ba.bytecode_count() <= 5
-                    && !ba.has_exception_handler()
-                    && let Some(result) =
-                        try_inline_small_function(ba.as_ref(), &inline_args, &ctx.frame.global_env)
+                if let Some(result) =
+                    try_inline_small_function(ba.as_ref(), &inline_args, &ctx.frame.global_env)
                 {
                     ctx.frame.accumulator = result;
                     return Ok(DispatchAction::Continue);
                 }
+            }
+            if ba.is_generator() {
+                #[cold]
+                fn make_generator(ba: &Rc<BytecodeArray>) -> JsValue {
+                    let state = GeneratorState::new(Rc::clone(ba));
+                    super::init_generator_state_prototype(&state, ba);
+                    JsValue::Generator(state)
+                }
+                ctx.frame.accumulator = make_generator(&ba);
+            } else if ba.is_async() {
+                #[cold]
+                fn run_async(ba: &Rc<BytecodeArray>, args: CallArgs) -> StatorResult<JsValue> {
+                    Interpreter::run_async_function(Rc::clone(ba), args)
+                }
+                let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
+                let args: CallArgs = smallvec![arg1];
+                ctx.frame.accumulator = run_async(&ba, args)?;
+            } else {
+                let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
+                let inline_args = [arg1.clone()];
                 // ── Tiering (cold path: gated on reaching baseline threshold) ──
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD {
-                    if ba.try_get_jit_code().is_none() {
+                    if !ba.has_any_jit_code() {
                         maybe_compile_baseline(&ba);
                     }
                     if count >= MAGLEV_TIERING_THRESHOLD {
@@ -2533,22 +2559,45 @@ fn handle_call_undefined_receiver2(
     let callee = ctx.frame.read_reg(callee_v)?.clone();
     match callee {
         JsValue::Function(ba) => {
+            if ba.bytecode_count() <= 25
+                && !ba.has_exception_handler()
+                && !ba.is_generator()
+                && !ba.is_async()
+            {
+                let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
+                let arg2 = ctx.frame.read_reg(arg2_v)?.clone();
+                let inline_args = [arg1, arg2];
+                if let Some(result) =
+                    try_inline_small_function(ba.as_ref(), &inline_args, &ctx.frame.global_env)
+                {
+                    ctx.frame.accumulator = result;
+                    return Ok(DispatchAction::Continue);
+                }
+            }
             if ba.is_generator() {
-                let state = GeneratorState::new(Rc::clone(&ba));
-                super::init_generator_state_prototype(&state, &ba);
-                ctx.frame.accumulator = JsValue::Generator(state);
+                #[cold]
+                fn make_generator(ba: &Rc<BytecodeArray>) -> JsValue {
+                    let state = GeneratorState::new(Rc::clone(ba));
+                    super::init_generator_state_prototype(&state, ba);
+                    JsValue::Generator(state)
+                }
+                ctx.frame.accumulator = make_generator(&ba);
             } else if ba.is_async() {
+                #[cold]
+                fn run_async(ba: &Rc<BytecodeArray>, args: CallArgs) -> StatorResult<JsValue> {
+                    Interpreter::run_async_function(Rc::clone(ba), args)
+                }
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
                 let arg2 = ctx.frame.read_reg(arg2_v)?.clone();
                 let args: CallArgs = smallvec![arg1, arg2];
-                ctx.frame.accumulator = Interpreter::run_async_function(Rc::clone(&ba), args)?;
+                ctx.frame.accumulator = run_async(&ba, args)?;
             } else {
                 let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
                 let arg2 = ctx.frame.read_reg(arg2_v)?.clone();
                 let args: CallArgs = smallvec![arg1, arg2];
                 // ── Tiering ──────────────────────────────────
                 let count = ba.increment_invocation_count();
-                if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
+                if count >= TIERING_THRESHOLD && !ba.has_any_jit_code() {
                     maybe_compile_baseline(&ba);
                 }
                 if count >= MAGLEV_TIERING_THRESHOLD {
@@ -2810,7 +2859,7 @@ fn handle_call_with_spread(
         JsValue::Function(ba) => {
             // ── Tiering ──────────────────────────────────────
             let count = ba.increment_invocation_count();
-            if count >= TIERING_THRESHOLD && ba.try_get_jit_code().is_none() {
+            if count >= TIERING_THRESHOLD && !ba.has_any_jit_code() {
                 maybe_compile_baseline(&ba);
             }
             if count >= MAGLEV_TIERING_THRESHOLD {

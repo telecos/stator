@@ -193,6 +193,23 @@ struct MetadataFooter {
     deopt_table_start: u32,
 }
 
+#[cfg(all(target_arch = "x86_64", unix))]
+const STACK_REGISTER_FILE_SLOTS: usize = 32;
+
+#[cfg(all(target_arch = "x86_64", unix))]
+fn init_register_file(
+    args: &[i64],
+    register_file_slots: usize,
+) -> smallvec::SmallVec<[i64; STACK_REGISTER_FILE_SLOTS]> {
+    use smallvec::{SmallVec, smallvec};
+
+    let mut regs: SmallVec<[i64; STACK_REGISTER_FILE_SLOTS]> = smallvec![0i64; register_file_slots];
+    for (i, &value) in args.iter().enumerate().take(regs.len()) {
+        regs[i] = value;
+    }
+    regs
+}
+
 impl CompiledCode {
     /// Look up the safepoint entry whose `code_offset` equals `offset`.
     ///
@@ -330,11 +347,9 @@ impl CompiledCode {
             ptr::copy_nonoverlapping(self.code.as_ptr(), mem.cast::<u8>(), code_size);
         }
 
-        // Build the register file: fill with zeros, then overwrite with args.
-        let mut regs = vec![0i64; self.register_file_slots];
-        for (i, &v) in args.iter().enumerate().take(regs.len()) {
-            regs[i] = v;
-        }
+        // Keep small register files on the stack to avoid per-call heap churn
+        // on hot JIT entry paths.
+        let mut regs = init_register_file(args, self.register_file_slots);
 
         // Transmute and call the JIT function.
         //
@@ -475,8 +490,9 @@ impl CachedExecutableCode {
 
     /// Execute the cached JIT code with the given arguments.
     ///
-    /// Allocates only the register file (on the heap) and calls the persistent
-    /// function pointer.  No `mmap`/`munmap` syscalls are issued.
+    /// Allocates only the register file and calls the persistent function
+    /// pointer.  Small register files stay on the stack; no `mmap`/`munmap`
+    /// syscalls are issued.
     ///
     /// `args` provides the initial values for the parameter slots.  Missing
     /// arguments are filled with `0` (`Smi(0)`); extra arguments are ignored.
@@ -489,10 +505,7 @@ impl CachedExecutableCode {
     /// The caller must ensure this `CachedExecutableCode` was constructed from
     /// valid x86-64 machine code emitted by the baseline or Maglev compiler.
     pub unsafe fn execute(&self, args: &[i64]) -> StatorResult<i64> {
-        let mut regs = vec![0i64; self.register_file_slots];
-        for (i, &v) in args.iter().enumerate().take(regs.len()) {
-            regs[i] = v;
-        }
+        let mut regs = init_register_file(args, self.register_file_slots);
 
         let result = (self.func)(regs.as_mut_ptr());
 

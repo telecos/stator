@@ -808,28 +808,28 @@ pub(crate) fn set_function_name_if_missing(value: &JsValue, name: &str) {
 /// Number of loop back-edges taken before OSR baseline compilation is triggered.
 ///
 /// When a single interpreter loop accumulates this many `JumpLoop` iterations
-/// (100 back-edges) and the enclosing function has not yet been JIT-compiled,
+/// (5 back-edges) and the enclosing function has not yet been JIT-compiled,
 /// a baseline compilation is requested so the next *call* to that function
 /// executes via native code.
-pub(super) const OSR_LOOP_THRESHOLD: u32 = 100;
+pub(super) const OSR_LOOP_THRESHOLD: u32 = 5;
 
 /// Number of loop back-edges taken before a Maglev background compilation is
 /// triggered via OSR.
 ///
 /// When a loop has already caused baseline JIT compilation and the back-edge
-/// count exceeds this threshold (500 back-edges), a Maglev compilation is
+/// count exceeds this threshold (50 back-edges), a Maglev compilation is
 /// scheduled in a background thread so the next *call* can use the optimised
 /// tier.
-pub(super) const MAGLEV_OSR_LOOP_THRESHOLD: u32 = 500;
+pub(super) const MAGLEV_OSR_LOOP_THRESHOLD: u32 = 50;
 
 /// Number of loop back-edges taken before a Turbofan background compilation is
 /// triggered via OSR.
 ///
 /// When a loop has already caused Maglev JIT compilation and the back-edge
-/// count exceeds this threshold (1 000 back-edges), a Turbofan compilation
+/// count exceeds this threshold (200 back-edges), a Turbofan compilation
 /// is scheduled in a background thread so the next *call* can use the
 /// fully-optimised tier.
-pub(super) const TURBOFAN_OSR_LOOP_THRESHOLD: u32 = 1_000;
+pub(super) const TURBOFAN_OSR_LOOP_THRESHOLD: u32 = 200;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Generator return completion sentinel
@@ -2786,6 +2786,10 @@ impl Interpreter {
     }
 
     fn run_inner(frame: &mut InterpreterFrame, skip_globals: bool) -> StatorResult<JsValue> {
+        // Increment invocation count for tiering — ensures top-level code
+        // (not just function calls) participates in JIT compilation decisions.
+        let _inv_count = frame.bytecode_array.increment_invocation_count();
+
         let result = (|| {
             if skip_globals {
                 // Caller guarantees CURRENT_GLOBALS is already published.
@@ -2844,6 +2848,16 @@ impl Interpreter {
     /// `stacker::maybe_grow` closure boundary that prevents LLVM from
     /// inlining across the call.
     fn run_dispatch(frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
+        // JIT fast path: if compiled native code exists, execute it directly
+        // instead of interpreting bytecode. This avoids the interpreter overhead
+        // for functions that have been JIT-compiled via OSR or invocation tiering.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            if let Some(result) = try_execute_best_jit(&frame.bytecode_array, &[]) {
+                return result;
+            }
+        }
+
         // Outer loop: re-entered when a TailCall opcode rewrites the frame
         // with a new bytecode array (proper tail-call trampoline).
         'tail_call: loop {
@@ -9194,12 +9208,123 @@ fn inline_context_slot_update(
     Some(next)
 }
 
+/// Returns `true` for `LdaContextSlot` and `LdaImmutableContextSlot` (chain-walking variants).
+#[inline(always)]
+fn is_inline_chained_context_load(opcode: Opcode) -> bool {
+    matches!(
+        opcode,
+        Opcode::LdaContextSlot | Opcode::LdaImmutableContextSlot
+    )
+}
+
+/// Returns `true` for binary arithmetic opcodes that can be inlined.
+#[inline(always)]
+fn is_inline_arithmetic(opcode: Opcode) -> bool {
+    matches!(
+        opcode,
+        Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Div | Opcode::Mod
+    )
+}
+
+/// Perform a context-slot load-update-store through the context chain.
+///
+/// Like [`inline_context_slot_update`] but resolves the target context by
+/// walking `depth` levels from the closure context.
+#[inline(always)]
+fn inline_chained_context_slot_update(
+    ba: &BytecodeArray,
+    slot_idx: u32,
+    depth: u32,
+    update: &Instruction,
+) -> Option<JsValue> {
+    let js_ctx = ba.closure_context()?;
+    let target = walk_context_chain(js_ctx, depth, "inline_chained").ok()?;
+    let mut borrowed = target.borrow_mut();
+    let slot = slot_idx as usize;
+    if slot >= borrowed.slots.len() {
+        borrowed.slots.resize(slot + 1, JsValue::Undefined);
+    }
+
+    let current = borrowed.slots[slot].cheap_clone();
+    let next = match update.opcode {
+        Opcode::Inc => match current {
+            JsValue::Smi(value) => match value.checked_add(1) {
+                Some(result) => JsValue::Smi(result),
+                None => JsValue::HeapNumber(value as f64 + 1.0),
+            },
+            JsValue::BigInt(value) => JsValue::BigInt(Box::new(value.wrapping_add(1))),
+            _ if is_inline_primitive(&current) => {
+                number_to_jsvalue(current.to_number().ok()? + 1.0)
+            }
+            _ => return None,
+        },
+        Opcode::AddSmi => {
+            if matches!(current, JsValue::BigInt(_)) {
+                return None;
+            }
+            number_to_jsvalue(
+                current.to_number().ok()? + f64::from(checked_operand_imm(update, 0)?),
+            )
+        }
+        _ => return None,
+    };
+    borrowed.slots[slot] = next.cheap_clone();
+    Some(next)
+}
+
+/// Binary arithmetic on a current-context slot: `load slot → op(acc, arg) → store slot`.
+#[inline(always)]
+fn inline_context_slot_binary_op(
+    ba: &BytecodeArray,
+    slot_idx: u32,
+    op: &Instruction,
+    args: &[JsValue],
+) -> Option<JsValue> {
+    let js_ctx = ba.closure_context()?;
+    let mut borrowed = js_ctx.borrow_mut();
+    let slot = slot_idx as usize;
+    if slot >= borrowed.slots.len() {
+        return None;
+    }
+    let lhs = borrowed.slots[slot].cheap_clone();
+    let rhs = inline_arg_from_reg(args, checked_operand_reg(op, 0)?)?;
+    let result = inline_binary_op(op.opcode, &lhs, &rhs)?;
+    borrowed.slots[slot] = result.cheap_clone();
+    Some(result)
+}
+
+/// Binary arithmetic on a chained-context slot with depth walking.
+#[inline(always)]
+fn inline_chained_context_slot_binary_op(
+    ba: &BytecodeArray,
+    slot_idx: u32,
+    depth: u32,
+    op: &Instruction,
+    args: &[JsValue],
+) -> Option<JsValue> {
+    let js_ctx = ba.closure_context()?;
+    let target = walk_context_chain(js_ctx, depth, "inline_chained_binop").ok()?;
+    let mut borrowed = target.borrow_mut();
+    let slot = slot_idx as usize;
+    if slot >= borrowed.slots.len() {
+        return None;
+    }
+    let lhs = borrowed.slots[slot].cheap_clone();
+    let rhs = inline_arg_from_reg(args, checked_operand_reg(op, 0)?)?;
+    let result = inline_binary_op(op.opcode, &lhs, &rhs)?;
+    borrowed.slots[slot] = result.cheap_clone();
+    Some(result)
+}
+
+/// Maximum bytecode instruction count eligible for interpreter-level inlining.
+const INLINE_BYTECODE_THRESHOLD: usize = 25;
+
 pub(super) fn try_inline_small_function(
     ba: &BytecodeArray,
     args: &[JsValue],
     _global_env: &Rc<RefCell<GlobalEnv>>,
 ) -> Option<JsValue> {
-    if ba.bytecode_count() > 5 || ba.has_exception_handler() {
+    if ba.bytecode_count() > INLINE_BYTECODE_THRESHOLD || ba.has_exception_handler() {
         return None;
     }
 
@@ -9231,6 +9356,15 @@ pub(super) fn try_inline_small_function(
         [lda, ret] if lda.opcode == Opcode::Ldar && ret.opcode == Opcode::Return => {
             inline_arg_from_reg(args, checked_operand_reg(lda, 0)?)
         }
+        // ── Identity with side-effect: Ldar + Star + Return ──
+        [lda, _star, ret]
+            if lda.opcode == Opcode::Ldar
+                && _star.opcode == Opcode::Star
+                && ret.opcode == Opcode::Return =>
+        {
+            inline_arg_from_reg(args, checked_operand_reg(lda, 0)?)
+        }
+        // ── Current-context slot update (4 instrs) ──
         [load, update, store, ret]
             if is_inline_current_context_load(load.opcode)
                 && store.opcode == Opcode::StaCurrentContextSlot
@@ -9243,6 +9377,22 @@ pub(super) fn try_inline_small_function(
             }
             inline_context_slot_update(ba, load_slot, update)
         }
+        // ── Chained-context slot update: LdaContextSlot + update + StaContextSlot + Return ──
+        [load, update, store, ret]
+            if is_inline_chained_context_load(load.opcode)
+                && store.opcode == Opcode::StaContextSlot
+                && ret.opcode == Opcode::Return =>
+        {
+            let load_slot = checked_operand_constant_pool_idx(load, 1)?;
+            let load_depth = checked_operand_imm(load, 2)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 1)?;
+            let store_depth = checked_operand_imm(store, 2)?;
+            if load_slot != store_slot || load_depth != store_depth {
+                return None;
+            }
+            inline_chained_context_slot_update(ba, load_slot, load_depth as u32, update)
+        }
+        // ── Current-context slot update with reload (5 instrs) ──
         [load, update, store, reload, ret]
             if is_inline_current_context_load(load.opcode)
                 && store.opcode == Opcode::StaCurrentContextSlot
@@ -9257,6 +9407,102 @@ pub(super) fn try_inline_small_function(
             }
             inline_context_slot_update(ba, load_slot, update)
         }
+        // ── Chained-context slot update with reload (5 instrs) ──
+        [load, update, store, reload, ret]
+            if is_inline_chained_context_load(load.opcode)
+                && store.opcode == Opcode::StaContextSlot
+                && is_inline_chained_context_load(reload.opcode)
+                && ret.opcode == Opcode::Return =>
+        {
+            let load_slot = checked_operand_constant_pool_idx(load, 1)?;
+            let load_depth = checked_operand_imm(load, 2)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 1)?;
+            let store_depth = checked_operand_imm(store, 2)?;
+            let reload_slot = checked_operand_constant_pool_idx(reload, 1)?;
+            let reload_depth = checked_operand_imm(reload, 2)?;
+            if load_slot != store_slot
+                || store_slot != reload_slot
+                || load_depth != store_depth
+                || store_depth != reload_depth
+            {
+                return None;
+            }
+            inline_chained_context_slot_update(ba, load_slot, load_depth as u32, update)
+        }
+        // ── Current-context slot update through temp register (6 instrs) ──
+        // LdaCurrentContextSlot + update + Star + StaCurrentContextSlot + Ldar + Return
+        [load, update, star, store, ldar, ret]
+            if is_inline_current_context_load(load.opcode)
+                && star.opcode == Opcode::Star
+                && store.opcode == Opcode::StaCurrentContextSlot
+                && ldar.opcode == Opcode::Ldar
+                && ret.opcode == Opcode::Return =>
+        {
+            let load_slot = checked_operand_constant_pool_idx(load, 0)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 0)?;
+            let temp_reg = checked_operand_reg(star, 0)?;
+            if load_slot != store_slot || checked_operand_reg(ldar, 0)? != temp_reg {
+                return None;
+            }
+            inline_context_slot_update(ba, load_slot, update)
+        }
+        // ── Chained-context slot update through temp register (6 instrs) ──
+        // LdaContextSlot + update + Star + StaContextSlot + Ldar + Return
+        [load, update, star, store, ldar, ret]
+            if is_inline_chained_context_load(load.opcode)
+                && star.opcode == Opcode::Star
+                && store.opcode == Opcode::StaContextSlot
+                && ldar.opcode == Opcode::Ldar
+                && ret.opcode == Opcode::Return =>
+        {
+            let load_slot = checked_operand_constant_pool_idx(load, 1)?;
+            let load_depth = checked_operand_imm(load, 2)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 1)?;
+            let store_depth = checked_operand_imm(store, 2)?;
+            let temp_reg = checked_operand_reg(star, 0)?;
+            if load_slot != store_slot
+                || load_depth != store_depth
+                || checked_operand_reg(ldar, 0)? != temp_reg
+            {
+                return None;
+            }
+            inline_chained_context_slot_update(ba, load_slot, load_depth as u32, update)
+        }
+        // ── Binary arithmetic with current-context slot ──
+        // LdaCurrentContextSlot + Ldar + Add/Sub/Mul + StaCurrentContextSlot + Return
+        [load, ldar, op, store, ret]
+            if is_inline_current_context_load(load.opcode)
+                && ldar.opcode == Opcode::Ldar
+                && store.opcode == Opcode::StaCurrentContextSlot
+                && ret.opcode == Opcode::Return
+                && is_inline_arithmetic(op.opcode) =>
+        {
+            let load_slot = checked_operand_constant_pool_idx(load, 0)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 0)?;
+            if load_slot != store_slot {
+                return None;
+            }
+            inline_context_slot_binary_op(ba, load_slot, op, args)
+        }
+        // ── Binary arithmetic with chained-context slot ──
+        // LdaContextSlot + Ldar + Add/Sub/Mul + StaContextSlot + Return
+        [load, ldar, op, store, ret]
+            if is_inline_chained_context_load(load.opcode)
+                && ldar.opcode == Opcode::Ldar
+                && store.opcode == Opcode::StaContextSlot
+                && ret.opcode == Opcode::Return
+                && is_inline_arithmetic(op.opcode) =>
+        {
+            let load_slot = checked_operand_constant_pool_idx(load, 1)?;
+            let load_depth = checked_operand_imm(load, 2)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 1)?;
+            let store_depth = checked_operand_imm(store, 2)?;
+            if load_slot != store_slot || load_depth != store_depth {
+                return None;
+            }
+            inline_chained_context_slot_binary_op(ba, load_slot, load_depth as u32, op, args)
+        }
+        // ── Simple property read: LdaNamedProperty + Return ──
         [lda, ret] if lda.opcode == Opcode::LdaNamedProperty && ret.opcode == Opcode::Return => {
             let obj = inline_arg_from_reg(args, checked_operand_reg(lda, 0)?)?;
             let ConstantPoolEntry::String(key) =

@@ -210,28 +210,28 @@ pub type TurbofanJitCodeCache = Arc<Mutex<Option<TurbofanCompiledCode>>>;
 
 /// Invocation-count threshold that triggers baseline JIT compilation.
 ///
-/// When a function's `invocation_count` reaches this value (100 calls) the
+/// When a function's `invocation_count` reaches this value (10 calls) the
 /// interpreter requests a baseline-compiled version; all subsequent calls
 /// that can be represented in the current JIT tier execute via native code.
-pub const TIERING_THRESHOLD: u32 = 100;
+pub const TIERING_THRESHOLD: u32 = 10;
 
 /// Invocation-count threshold that triggers Maglev JIT compilation.
 ///
-/// When a function's `invocation_count` reaches this value (1 000 calls) and
+/// When a function's `invocation_count` reaches this value (100 calls) and
 /// baseline JIT code is already present, the interpreter schedules a
 /// background Maglev compilation.  Once compilation finishes the cached
 /// Maglev code replaces the baseline tier for future calls.
-pub const MAGLEV_TIERING_THRESHOLD: u32 = 1_000;
+pub const MAGLEV_TIERING_THRESHOLD: u32 = 100;
 
 /// Invocation-count threshold that triggers Turbofan (Cranelift optimising)
 /// JIT compilation.
 ///
-/// When a function's `invocation_count` reaches this value (10 000 calls) a
+/// When a function's `invocation_count` reaches this value (1 000 calls) a
 /// background Turbofan compilation is scheduled.  Turbofan runs the full
 /// Maglev graph builder followed by Cranelift CLIF lowering and
 /// optimisation, producing code that is expected to reach within 90 % of
 /// peak throughput.
-pub const TURBOFAN_TIERING_THRESHOLD: u32 = 10_000;
+pub const TURBOFAN_TIERING_THRESHOLD: u32 = 1_000;
 
 /// Shared, lazily-allocated megamorphic IC state persisted on a
 /// [`BytecodeArray`] across invocations.
@@ -333,6 +333,8 @@ pub struct BytecodeArray {
     /// [`BaselineCompiler`][crate::compiler::baseline::compiler::BaselineCompiler].
     /// `None` until tiering has been triggered and compilation succeeded.
     jit_code: JitCodeCache,
+    /// Fast, shared flag indicating that some baseline JIT code is cached.
+    has_jit_code: Rc<Cell<bool>>,
     /// Cached Maglev-JIT machine code and register-file slot count.
     ///
     /// Uses [`Arc`] + [`Mutex`] so the background Maglev compilation thread
@@ -459,8 +461,9 @@ pub(crate) enum ObjectLiteralCacheEntry {
 impl PartialEq for BytecodeArray {
     /// Two [`BytecodeArray`]s are equal when their static bytecode and metadata
     /// are identical.  The tiering state (`invocation_count`, `jit_code`,
-    /// `maglev_jit_code`, `turbofan_jit_code`) and runtime caches
-    /// (`template_cache`) are intentionally excluded from the comparison.
+    /// `has_jit_code`, `maglev_jit_code`, `turbofan_jit_code`) and runtime
+    /// caches (`template_cache`) are intentionally excluded from the
+    /// comparison.
     fn eq(&self, other: &Self) -> bool {
         self.bytecodes == other.bytecodes
             && self.constant_pool == other.constant_pool
@@ -530,6 +533,7 @@ impl BytecodeArray {
             is_arrow: false,
             invocation_count: Rc::new(Cell::new(0)),
             jit_code: Rc::new(RefCell::new(None)),
+            has_jit_code: Rc::new(Cell::new(false)),
             maglev_jit_code: Arc::new(Mutex::new(None)),
             maglev_compile_started: Arc::new(AtomicBool::new(false)),
             turbofan_jit_code: Arc::new(Mutex::new(None)),
@@ -1083,8 +1087,13 @@ impl BytecodeArray {
     /// [`JsValue::Function`][crate::objects::value::JsValue] or already moved
     /// into an [`crate::interpreter::InterpreterFrame`] — increments the same
     /// counter.
+    #[inline(always)]
     pub fn increment_invocation_count(&self) -> u32 {
-        let new = self.invocation_count.get().saturating_add(1);
+        let old = self.invocation_count.get();
+        if old >= TURBOFAN_TIERING_THRESHOLD {
+            return old;
+        }
+        let new = old + 1;
         self.invocation_count.set(new);
         new
     }
@@ -1106,6 +1115,7 @@ impl BytecodeArray {
         cached: crate::compiler::baseline::compiler::CachedExecutableCode,
     ) {
         *self.jit_code.borrow_mut() = Some(cached);
+        self.has_jit_code.set(true);
     }
 
     /// Store baseline-JIT machine code produced by the compiler (non-JIT
@@ -1113,6 +1123,14 @@ impl BytecodeArray {
     #[cfg(not(all(target_arch = "x86_64", unix)))]
     pub fn store_jit_code(&self, code: Vec<u8>, register_file_slots: usize) {
         *self.jit_code.borrow_mut() = Some((code, register_file_slots));
+        self.has_jit_code.set(true);
+    }
+
+    /// Fast check for whether baseline JIT code has been compiled.
+    /// Avoids the RefCell borrow of try_get_jit_code().
+    #[inline(always)]
+    pub fn has_any_jit_code(&self) -> bool {
+        self.has_jit_code.get()
     }
 
     /// Borrows the cached JIT executable code, or returns `None` if baseline

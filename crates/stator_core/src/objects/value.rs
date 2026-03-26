@@ -497,13 +497,13 @@ impl JsValue {
     /// Returns `true` if this value is a boolean.
     #[inline(always)]
     pub fn is_boolean(&self) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(&Self::Boolean(false))
+        matches!(self, Self::Boolean(_))
     }
 
     /// Returns `true` if this value is a small integer ([`Smi`][JsValue::Smi]).
     #[inline(always)]
     pub fn is_smi(&self) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(&Self::Smi(0))
+        matches!(self, Self::Smi(_))
     }
 
     /// Extract the Smi payload without re-checking the discriminant.
@@ -525,7 +525,7 @@ impl JsValue {
     /// Returns `true` if this value is a heap number ([`HeapNumber`][JsValue::HeapNumber]).
     #[inline(always)]
     pub fn is_heap_number(&self) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(&Self::HeapNumber(0.0))
+        matches!(self, Self::HeapNumber(_))
     }
 
     /// Extract the heap-number payload without re-checking the discriminant.
@@ -571,23 +571,37 @@ impl JsValue {
     /// Returns `true` if this value is any numeric type (`Smi` or `HeapNumber`).
     #[inline(always)]
     pub fn is_number(&self) -> bool {
-        self.is_smi() || self.is_heap_number()
+        matches!(self, Self::Smi(_) | Self::HeapNumber(_))
+    }
+
+    /// Convert to `f64` if this is a numeric type (`Smi` or `HeapNumber`).
+    ///
+    /// Returns `None` for non-numeric values without invoking the full
+    /// `ToNumber` abstract operation.  Use this on the interpreter fast path
+    /// where both operands are already known to be numbers.
+    #[inline(always)]
+    pub fn as_number_fast(&self) -> Option<f64> {
+        match self {
+            Self::Smi(v) => Some(*v as f64),
+            Self::HeapNumber(v) => Some(*v),
+            _ => None,
+        }
     }
 
     /// Returns `true` if this value is a string.
     #[inline(always)]
     pub fn is_string(&self) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(&Self::String(Rc::from("")))
+        matches!(self, Self::String(_))
     }
 
     /// Returns `true` if this value is a symbol.
-    #[inline]
+    #[inline(always)]
     pub fn is_symbol(&self) -> bool {
         matches!(self, Self::Symbol(_))
     }
 
     /// Returns `true` if this value is an object.
-    #[inline]
+    #[inline(always)]
     pub fn is_object(&self) -> bool {
         matches!(self, Self::Object(_))
     }
@@ -599,7 +613,7 @@ impl JsValue {
     }
 
     /// Returns `true` if this value is a callable function.
-    #[inline]
+    #[inline(always)]
     pub fn is_function(&self) -> bool {
         matches!(self, Self::Function(_) | Self::NativeFunction(_))
     }
@@ -636,7 +650,7 @@ impl JsValue {
 
     /// Returns `true` if this value is an ECMAScript primitive
     /// (Undefined, Null, Boolean, Number, String, Symbol, or BigInt).
-    #[inline]
+    #[inline(always)]
     pub fn is_primitive(&self) -> bool {
         matches!(
             self,
@@ -652,7 +666,7 @@ impl JsValue {
     }
 
     /// Returns `true` if this value is an object-like type (not a primitive).
-    #[inline]
+    #[inline(always)]
     pub fn is_object_like(&self) -> bool {
         !self.is_primitive()
     }
@@ -695,6 +709,20 @@ impl JsValue {
         // SAFETY: Caller guarantees this value is stack-only, so bitwise copy
         // preserves correctness without reference-count updates.
         unsafe { std::ptr::read(self) }
+    }
+
+    /// Fast path for Smi equality — avoids the full abstract/strict equality
+    /// machinery.
+    ///
+    /// Returns `Some(true/false)` when **both** operands are [`Smi`] values,
+    /// or `None` if either operand is not a Smi.
+    #[inline(always)]
+    pub fn smi_eq(&self, other: &Self) -> Option<bool> {
+        if let (Self::Smi(a), Self::Smi(b)) = (self, other) {
+            Some(a == b)
+        } else {
+            None
+        }
     }
 
     /// Extract the boolean payload without re-checking the discriminant.
@@ -793,7 +821,7 @@ impl JsValue {
     /// | `Symbol` | `true` |
     /// | `Object` | `true` |
     /// | `BigInt` | `false` if `0`, otherwise `true` |
-    #[inline]
+    #[inline(always)]
     pub fn to_boolean(&self) -> bool {
         match self {
             Self::Undefined | Self::Null | Self::TheHole => false,
@@ -885,7 +913,7 @@ impl JsValue {
     ///
     /// String parsing handles hex (`0x`), octal (`0o`), and binary (`0b`)
     /// integer literals as well as `"Infinity"` / `"-Infinity"`.
-    #[inline]
+    #[inline(always)]
     pub fn to_number(&self) -> StatorResult<f64> {
         match self {
             Self::Undefined | Self::TheHole => Ok(f64::NAN),
