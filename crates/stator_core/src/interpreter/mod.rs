@@ -3850,7 +3850,7 @@ impl Interpreter {
                                     let has_fn_props = is_arrow && ba.has_fn_props();
                                     let closure_ctx = ba.closure_context().map(Rc::clone);
                                     let ba = Rc::clone(ba);
-                                    if ba.bytecode_count() <= 5
+                                    if ba.bytecode_count() <= 25
                                         && !ba.has_exception_handler()
                                         && let Some(result) = try_inline_small_function(
                                             ba.as_ref(),
@@ -4006,7 +4006,7 @@ impl Interpreter {
                                     let arg1 =
                                         unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
                                     let inline_args = [arg1.cheap_clone()];
-                                    if ba.bytecode_count() <= 5
+                                    if ba.bytecode_count() <= 25
                                         && !ba.has_exception_handler()
                                         && let Some(result) = try_inline_small_function(
                                             ba.as_ref(),
@@ -6714,7 +6714,7 @@ impl Interpreter {
                             let has_fn_props = is_arrow && ba.has_fn_props();
                             let closure_ctx = ba.closure_context().map(Rc::clone);
                             let ba = Rc::clone(ba);
-                            if ba.bytecode_count() <= 5
+                            if ba.bytecode_count() <= 25
                                 && !ba.has_exception_handler()
                                 && let Some(result) =
                                     try_inline_small_function(ba.as_ref(), &[], &frame.global_env)
@@ -6872,7 +6872,7 @@ impl Interpreter {
                             let ba = Rc::clone(ba);
                             let arg1 = unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
                             let inline_args = [arg1.cheap_clone()];
-                            if ba.bytecode_count() <= 5
+                            if ba.bytecode_count() <= 25
                                 && !ba.has_exception_handler()
                                 && let Some(result) = try_inline_small_function(
                                     ba.as_ref(),
