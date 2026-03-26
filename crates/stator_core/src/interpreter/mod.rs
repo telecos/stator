@@ -1214,6 +1214,10 @@ fn try_execute_turbofan(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorRe
 ///
 /// On platforms where the JIT is not available this always returns `None`.
 fn try_execute_jit(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
+    // Skip if baseline JIT previously deopted (unsupported opcodes).
+    if ba.jit_baseline_has_deopted() {
+        return None;
+    }
     #[cfg(all(target_arch = "x86_64", unix))]
     {
         use crate::compiler::baseline::compiler::{
@@ -1248,8 +1252,12 @@ fn try_execute_jit(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<
         // Clean up: must happen regardless of success/failure.
         let ret = match result {
             Ok(v) => jit_to_jsvalue_ext(v).map(Ok),
-            // JIT_DEOPT or unrecognised sentinel → fall back to interpreter.
-            Err(_) => None,
+            // JIT_DEOPT or unrecognised sentinel → mark as deopted so we
+            // never waste time entering this code again.
+            Err(_) => {
+                ba.mark_jit_baseline_deopted();
+                None
+            }
         };
 
         jit_runtime_teardown();
@@ -4699,6 +4707,7 @@ impl Interpreter {
                         frame.osr_loop_count = frame.osr_loop_count.saturating_add(1);
                         if frame.osr_loop_count >= OSR_LOOP_THRESHOLD
                             && frame.bytecode_array.try_get_jit_code().is_none()
+                            && !frame.bytecode_array.jit_baseline_has_deopted()
                         {
                             maybe_compile_baseline(&frame.bytecode_array);
                         }
@@ -7016,7 +7025,9 @@ pub(super) fn dispatch_call(
                 // Only check tiering/JIT when the function has been called
                 // enough times — cold calls skip all JIT overhead entirely.
                 if count >= TIERING_THRESHOLD {
-                    if ba.try_get_jit_code().is_none() {
+                    // Skip baseline compilation if it previously deopted
+                    // (unsupported opcodes like LdaCurrentContextSlot).
+                    if ba.try_get_jit_code().is_none() && !ba.jit_baseline_has_deopted() {
                         maybe_compile_baseline(ba);
                     }
                     if count >= MAGLEV_TIERING_THRESHOLD {
@@ -7115,7 +7126,7 @@ pub(super) fn dispatch_call_property(
             } else {
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD {
-                    if ba.try_get_jit_code().is_none() {
+                    if ba.try_get_jit_code().is_none() && !ba.jit_baseline_has_deopted() {
                         maybe_compile_baseline(ba);
                     }
                     if count >= MAGLEV_TIERING_THRESHOLD {

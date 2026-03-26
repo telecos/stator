@@ -327,6 +327,13 @@ pub struct BytecodeArray {
     /// been scheduled so that only one background thread is spawned per
     /// function.
     turbofan_compile_started: Arc<AtomicBool>,
+    /// Set to `true` when baseline JIT code has deopted at least once.
+    ///
+    /// When `true`, the interpreter skips all baseline JIT execution attempts
+    /// for this function.  This prevents the overhead of repeatedly entering
+    /// and immediately exiting JIT code that contains unsupported opcodes
+    /// (e.g. `LdaCurrentContextSlot` in closures).
+    jit_baseline_deopted: Rc<Cell<bool>>,
     /// Captured closure context set by `CreateClosure`.
     ///
     /// When a function is created as a closure, this holds the enclosing
@@ -508,6 +515,7 @@ impl BytecodeArray {
             maglev_compile_started: Arc::new(AtomicBool::new(false)),
             turbofan_jit_code: Arc::new(Mutex::new(None)),
             turbofan_compile_started: Arc::new(AtomicBool::new(false)),
+            jit_baseline_deopted: Rc::new(Cell::new(false)),
             closure_context: None,
             writes_closure_vars: false,
             has_fn_props: Cell::new(false),
@@ -1079,6 +1087,22 @@ impl BytecodeArray {
     /// only on the platform and CPU that produced them.
     pub fn try_get_jit_code(&self) -> Option<(Vec<u8>, usize)> {
         self.jit_code.borrow().clone()
+    }
+
+    /// Returns `true` if baseline JIT code has deopted at least once,
+    /// indicating the generated code contains unsupported opcodes and
+    /// should not be re-attempted.
+    pub fn jit_baseline_has_deopted(&self) -> bool {
+        self.jit_baseline_deopted.get()
+    }
+
+    /// Mark this function's baseline JIT code as having deopted.
+    ///
+    /// Once set, the interpreter will skip all baseline JIT execution
+    /// attempts for this function to avoid the overhead of repeatedly
+    /// entering and immediately exiting always-deopting code.
+    pub fn mark_jit_baseline_deopted(&self) {
+        self.jit_baseline_deopted.set(true);
     }
 
     /// Returns a clone of the cached Maglev-JIT machine code and

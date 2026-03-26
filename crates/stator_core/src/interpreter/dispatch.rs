@@ -1604,7 +1604,9 @@ fn handle_jump_loop(
     ctx.frame.pc = resolve_cached_jump(ctx, "JumpLoop")?;
     ctx.frame.osr_loop_count = ctx.frame.osr_loop_count.saturating_add(1);
     if ctx.frame.osr_loop_count >= OSR_LOOP_THRESHOLD {
-        if ctx.frame.bytecode_array.try_get_jit_code().is_none() {
+        if ctx.frame.bytecode_array.try_get_jit_code().is_none()
+            && !ctx.frame.bytecode_array.jit_baseline_has_deopted()
+        {
             maybe_compile_baseline(&ctx.frame.bytecode_array);
         }
         if ctx.frame.osr_loop_count >= MAGLEV_OSR_LOOP_THRESHOLD {
