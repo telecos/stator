@@ -3763,13 +3763,15 @@ fn handle_lda_named_property(
         u32::MAX
     };
     let prop_name = ctx.frame.get_string_constant(name_idx)?;
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    // Fast path for array.length — avoid full clone.
     if prop_name.as_ref() == "length"
-        && let JsValue::Array(arr) = &obj
+        && let JsValue::Array(arr) = ctx.frame.read_reg(obj_v)?
     {
-        ctx.frame.accumulator = JsValue::Smi(arr.borrow().len() as i32);
+        let len = arr.borrow().len() as i32;
+        ctx.frame.accumulator = JsValue::Smi(len);
         return Ok(DispatchAction::Continue);
     }
+    let obj = ctx.frame.read_reg(obj_v)?.clone();
     if is_private_storage_key(&prop_name) {
         ctx.frame.accumulator = load_private_named_property(&obj, &prop_name)?;
         return Ok(DispatchAction::Continue);
