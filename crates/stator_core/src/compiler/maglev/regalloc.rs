@@ -512,6 +512,15 @@ fn collect_control_inputs(ctrl: &ControlNode, f: &mut impl FnMut(NodeId)) {
 /// the active interval with the farthest endpoint is spilled if it ends later
 /// than the current interval, otherwise the current interval is spilled.
 ///
+/// # Loop awareness
+///
+/// The current implementation does **not** weight spill decisions by loop
+/// depth.  Values live across a loop back-edge naturally have long intervals
+/// and are therefore *more* likely to be spilled — the opposite of what we
+/// want.  A future improvement would detect loop back-edges, compute loop
+/// nesting depth for each interval, and multiply the spill cost by the depth
+/// so that loop-live values are preferentially kept in registers.
+///
 /// # Panics
 ///
 /// Panics if `num_regs` is `0`.

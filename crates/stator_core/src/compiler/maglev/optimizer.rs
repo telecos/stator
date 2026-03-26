@@ -1,6 +1,6 @@
 //! Maglev IR optimisation passes.
 //!
-//! Six passes are implemented and composed by [`optimize`]:
+//! Eight passes are implemented and composed by [`optimize`]:
 //!
 //! 1. **Constant folding** — replaces arithmetic/comparison nodes whose *all*
 //!    inputs resolve to compile-time constant nodes with a new constant node,
@@ -12,32 +12,44 @@
 //!    - `Int32` / `Float64` unary: `Negate`, `CheckedSmiIncrement`,
 //!      `CheckedSmiDecrement`, `Int32Increment`, `Int32Decrement`.
 //!
-//! 2. **Range analysis** — tracks integer `[min, max]` intervals through
+//! 2. **Strength reduction** — replaces `Int32Multiply` nodes where one
+//!    operand is a compile-time power-of-two constant (≥ 2) with an
+//!    equivalent `Int32ShiftLeft` by the corresponding shift amount.  This
+//!    turns an expensive IMUL into a cheap SHL for common loop-index
+//!    scaling patterns like `i * 2`, `i * 4`, `i * 8`.
+//!
+//! 3. **Range analysis** — tracks integer `[min, max]` intervals through
 //!    the graph and replaces `CheckedSmi*` nodes whose output provably fits
 //!    `i32` with unchecked `Int32*` equivalents (eliminating deopt overhead).
 //!    See [`crate::compiler::maglev::range_analysis`].
 //!
-//! 3. **Loop-invariant code motion (LICM)** — detects natural loops via
+//! 4. **Loop-invariant code motion (LICM)** — detects natural loops via
 //!    back-edges and hoists pure nodes whose inputs are all defined outside
 //!    the loop into the preheader block.
 //!    See [`crate::compiler::maglev::licm`].
 //!
-//! 4. **Dead-code elimination (DCE)** — removes `ValueNode`s whose [`NodeId`]
-//!    is never referenced by any other node (value or control) in the graph.
-//!    Pure side-effect-free nodes that produce a value which nobody consumes
-//!    are safe to drop.  Nodes with observable side-effects (stores, calls,
-//!    allocations, guards/checks) are always considered *live* and are kept
-//!    even when their result value is unused.
+//! 5. **Redundant type-guard elimination** — removes `CheckSmi` guards on
+//!    values already known to be Smis.  A value is *known Smi* when it is
+//!    produced by `SmiConstant` or any `CheckedSmi*` node, or when a prior
+//!    `CheckSmi` for the same receiver already appears in the same block.
 //!
-//! 5. **Redundant `CheckMaps` removal** — within each basic block, a
+//! 6. **Redundant `CheckMaps` removal** — within each basic block, a
 //!    `CheckMaps { receiver, feedback_slot }` node is redundant if an
 //!    identical guard for the *same* (receiver, feedback_slot) pair has
 //!    already been emitted earlier in the same block.  The duplicate is
 //!    replaced by a [`ValueNode::UndefinedConstant`] placeholder and the
 //!    relevant ID is remapped so all consumers still compile correctly.
 //!
-//! 6. **Dead-code elimination (final)** — a second DCE sweep after the
-//!    CheckMaps pass cleans up any newly-dead placeholder nodes.
+//! 7. **Inlining analysis** — scans for `CallKnownFunction` nodes with
+//!    small argument counts and marks them as inlining candidates for a
+//!    future inlining pass.
+//!
+//! 8. **Dead-code elimination** — removes `ValueNode`s whose [`NodeId`]
+//!    is never referenced by any other node (value or control) in the graph.
+//!    Pure side-effect-free nodes that produce a value which nobody consumes
+//!    are safe to drop.  Nodes with observable side-effects (stores, calls,
+//!    allocations, guards/checks) are always considered *live* and are kept
+//!    even when their result value is unused.
 //!
 //! # Usage
 //!
@@ -72,14 +84,23 @@ use crate::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, NodeId, 
 
 /// Run all optimisation passes on `graph` in place.
 ///
-/// Passes are applied in the order: constant folding → range analysis →
-/// LICM → inlining analysis → redundant-CheckMaps removal → DCE.
+/// Passes are applied in the order: constant folding → strength reduction →
+/// range analysis → LICM → redundant type-guard elimination → inlining
+/// analysis → redundant-CheckMaps removal → DCE.
+///
 /// Multiple rounds are *not* performed; a single sweep of each pass is
 /// sufficient for the patterns targeted here.
 pub fn optimize(graph: &mut MaglevGraph) {
     fold_constants(graph);
+    strength_reduce(graph);
     crate::compiler::maglev::range_analysis::eliminate_overflow_checks(graph);
     crate::compiler::maglev::licm::hoist_loop_invariants(graph);
+    // TODO: implement loop peeling — execute the first iteration outside the
+    // loop to establish type information (e.g. from CheckSmi guards), then
+    // specialise the loop body based on proven types.  This requires
+    // duplicating the loop header and body, which is non-trivial with the
+    // current graph structure.
+    eliminate_redundant_type_guards(graph);
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
     eliminate_dead_code(graph);
@@ -287,7 +308,178 @@ fn fold_f64_bin(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Pass 2 — Redundant CheckMaps removal
+// Pass 1.5 — Strength reduction
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Replace `Int32Multiply` nodes where one operand is a power-of-two constant
+/// (≥ 2) with the cheaper `Int32ShiftLeft` by the corresponding shift amount.
+///
+/// For example, `x * 4` becomes `x << 2`, turning an `IMUL` into a `SHL` on
+/// x86-64.  Only positive compile-time constants that are exact powers of two
+/// are considered.
+fn strength_reduce(graph: &mut MaglevGraph) {
+    // We may need to create new constant nodes for shift amounts.  Find the
+    // maximum existing NodeId so new ones are globally unique.
+    let mut next_id = graph
+        .blocks()
+        .iter()
+        .flat_map(|b| b.nodes.iter())
+        .map(|(id, _)| id.0)
+        .max()
+        .map_or(0, |m| m + 1);
+
+    for block in graph.blocks_mut() {
+        strength_reduce_block(block, &mut next_id);
+    }
+}
+
+/// Perform strength reduction within a single [`BasicBlock`].
+fn strength_reduce_block(block: &mut BasicBlock, next_id: &mut u32) {
+    // Collect compile-time integer constants visible in this block.
+    let mut consts: HashMap<NodeId, i32> = HashMap::new();
+    for (id, node) in &block.nodes {
+        match node {
+            ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } => {
+                consts.insert(*id, *value);
+            }
+            _ => {}
+        }
+    }
+
+    // Identify multiply-by-power-of-two patterns.
+    // Each entry: (position, non-constant operand, shift amount).
+    let mut reductions: Vec<(usize, NodeId, u32)> = Vec::new();
+    for (pos, (_, node)) in block.nodes.iter().enumerate() {
+        if let ValueNode::Int32Multiply { left, right } = node
+            && let Some((operand, shift)) = find_power_of_two_operand(*left, *right, &consts)
+        {
+            reductions.push((pos, operand, shift));
+        }
+    }
+
+    if reductions.is_empty() {
+        return;
+    }
+
+    // Apply in reverse position order so earlier insertions don't shift later
+    // indices.
+    for (pos, operand, shift_amt) in reductions.into_iter().rev() {
+        let shift_const_id = NodeId(*next_id);
+        *next_id += 1;
+
+        // Replace the multiply in-place, keeping its original NodeId.
+        let (mul_id, _) = block.nodes[pos];
+        block.nodes[pos] = (
+            mul_id,
+            ValueNode::Int32ShiftLeft {
+                left: operand,
+                right: shift_const_id,
+            },
+        );
+
+        // Insert the shift-amount constant immediately before the shift node
+        // so it is defined before its use.
+        block.nodes.insert(
+            pos,
+            (
+                shift_const_id,
+                ValueNode::Int32Constant {
+                    value: shift_amt as i32,
+                },
+            ),
+        );
+    }
+}
+
+/// If exactly one operand of `left × right` is a constant positive power of
+/// two (≥ 2), return `(other_operand, trailing_zeros)`.
+fn find_power_of_two_operand(
+    left: NodeId,
+    right: NodeId,
+    consts: &HashMap<NodeId, i32>,
+) -> Option<(NodeId, u32)> {
+    // Check right first (the more common `x * 4` pattern).
+    if let Some(&val) = consts.get(&right)
+        && val >= 2
+        && val.count_ones() == 1
+    {
+        return Some((left, val.trailing_zeros()));
+    }
+    // Check left (`4 * x`).
+    if let Some(&val) = consts.get(&left)
+        && val >= 2
+        && val.count_ones() == 1
+    {
+        return Some((right, val.trailing_zeros()));
+    }
+    None
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass 4.5 — Redundant type-guard elimination
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Remove `CheckSmi` guards whose receiver is already known to be a Smi.
+///
+/// A value is *known Smi* when:
+/// - It was produced by [`ValueNode::SmiConstant`], or
+/// - It was produced by any `CheckedSmi*` node (these deopt on non-Smi and
+///   produce a Smi on the success path), or
+/// - A prior `CheckSmi` for the same receiver has already appeared in the
+///   same basic block (making subsequent guards redundant).
+///
+/// Eliminated guards are replaced with [`ValueNode::UndefinedConstant`]
+/// placeholders that will later be cleaned up by dead-code elimination.
+fn eliminate_redundant_type_guards(graph: &mut MaglevGraph) {
+    // Phase 1: collect NodeIds that are *globally* known to produce Smi values.
+    let mut known_smi: HashSet<NodeId> = HashSet::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            if is_known_smi_producer(node) {
+                known_smi.insert(*id);
+            }
+        }
+    }
+
+    // Phase 2: walk each block, eliminating redundant CheckSmi guards.
+    for block in graph.blocks_mut() {
+        // Track receivers that have already been guarded within this block.
+        let mut block_guarded: HashSet<NodeId> = HashSet::new();
+
+        for (_, node) in &mut block.nodes {
+            if let ValueNode::CheckSmi { receiver } = node {
+                if known_smi.contains(receiver) || block_guarded.contains(receiver) {
+                    // Guard is provably redundant — replace with a harmless
+                    // placeholder that DCE will clean up.
+                    *node = ValueNode::UndefinedConstant;
+                } else {
+                    // This guard is required, but from now on the receiver is
+                    // known Smi within this block.
+                    block_guarded.insert(*receiver);
+                }
+            }
+        }
+    }
+}
+
+/// Return `true` when `node` is guaranteed to produce a tagged Smi value,
+/// making any subsequent `CheckSmi` on its output redundant.
+fn is_known_smi_producer(node: &ValueNode) -> bool {
+    matches!(
+        node,
+        ValueNode::SmiConstant { .. }
+            | ValueNode::CheckedSmiAdd { .. }
+            | ValueNode::CheckedSmiSubtract { .. }
+            | ValueNode::CheckedSmiMultiply { .. }
+            | ValueNode::CheckedSmiDivide { .. }
+            | ValueNode::CheckedSmiModulus { .. }
+            | ValueNode::CheckedSmiIncrement { .. }
+            | ValueNode::CheckedSmiDecrement { .. }
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass 5 — Redundant CheckMaps removal
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Remove duplicate `CheckMaps` guards within each basic block.
@@ -1700,5 +1892,174 @@ mod tests {
         // All intermediates should be DCE'd; only one node left.
         assert_eq!(total_node_count(&graph), 1);
         assert_eq!(node_at(&graph, 0), &ValueNode::Int32Constant { value: 21 });
+    }
+
+    // ── Strength reduction ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_strength_reduce_multiply_by_2() {
+        let mut graph = MaglevGraph::new(1);
+        let mut block = BasicBlock::new(0);
+        let p = block.push_value(ValueNode::Parameter { index: 0 });
+        let c2 = block.push_value(ValueNode::Int32Constant { value: 2 });
+        let mul = block.push_value(ValueNode::Int32Multiply { left: p, right: c2 });
+        block.set_control(ControlNode::Return { value: mul });
+        graph.add_block(block);
+
+        optimize(&mut graph);
+
+        // The multiply should have been replaced with a shift-left.
+        let has_shift = graph.blocks()[0]
+            .nodes
+            .iter()
+            .any(|(_, n)| matches!(n, ValueNode::Int32ShiftLeft { .. }));
+        assert!(
+            has_shift,
+            "expected Int32ShiftLeft after strength reduction"
+        );
+    }
+
+    #[test]
+    fn test_strength_reduce_multiply_by_4() {
+        let mut graph = MaglevGraph::new(1);
+        let mut block = BasicBlock::new(0);
+        let p = block.push_value(ValueNode::Parameter { index: 0 });
+        let c4 = block.push_value(ValueNode::Int32Constant { value: 4 });
+        let mul = block.push_value(ValueNode::Int32Multiply { left: p, right: c4 });
+        block.set_control(ControlNode::Return { value: mul });
+        graph.add_block(block);
+
+        optimize(&mut graph);
+
+        // The shift amount should be 2 (since 4 == 2^2).
+        let shift_const = graph.blocks()[0].nodes.iter().find_map(|(_, n)| {
+            if let ValueNode::Int32ShiftLeft { right, .. } = n {
+                // Find the constant node that `right` refers to.
+                graph.blocks()[0].nodes.iter().find_map(|(id, cn)| {
+                    if *id == *right {
+                        if let ValueNode::Int32Constant { value } = cn {
+                            Some(*value)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            }
+        });
+        assert_eq!(shift_const, Some(2), "shift amount should be 2 for * 4");
+    }
+
+    #[test]
+    fn test_strength_reduce_not_applied_to_non_power_of_two() {
+        let mut graph = MaglevGraph::new(1);
+        let mut block = BasicBlock::new(0);
+        let p = block.push_value(ValueNode::Parameter { index: 0 });
+        let c3 = block.push_value(ValueNode::Int32Constant { value: 3 });
+        let mul = block.push_value(ValueNode::Int32Multiply { left: p, right: c3 });
+        block.set_control(ControlNode::Return { value: mul });
+        graph.add_block(block);
+
+        optimize(&mut graph);
+
+        // Multiply by 3 is not a power of two — node should stay as multiply.
+        assert!(
+            graph.blocks()[0]
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::Int32Multiply { .. }))
+        );
+    }
+
+    #[test]
+    fn test_strength_reduce_multiply_by_1_not_reduced() {
+        let mut graph = MaglevGraph::new(1);
+        let mut block = BasicBlock::new(0);
+        let p = block.push_value(ValueNode::Parameter { index: 0 });
+        let c1 = block.push_value(ValueNode::Int32Constant { value: 1 });
+        let mul = block.push_value(ValueNode::Int32Multiply { left: p, right: c1 });
+        block.set_control(ControlNode::Return { value: mul });
+        graph.add_block(block);
+
+        optimize(&mut graph);
+
+        // Multiply by 1 should NOT be strength-reduced (shift by 0 is
+        // pointless; a separate identity-elimination pass would handle this).
+        assert!(
+            graph.blocks()[0]
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::Int32Multiply { .. }))
+        );
+    }
+
+    // ── Redundant type-guard elimination ──────────────────────────────────────
+
+    #[test]
+    fn test_eliminate_check_smi_on_smi_constant() {
+        let mut graph = MaglevGraph::new(0);
+        let mut block = BasicBlock::new(0);
+        let smi = block.push_value(ValueNode::SmiConstant { value: 42 });
+        let _check = block.push_value(ValueNode::CheckSmi { receiver: smi });
+        block.set_control(ControlNode::Return { value: smi });
+        graph.add_block(block);
+
+        let before = total_node_count(&graph);
+        optimize(&mut graph);
+        // The CheckSmi on a SmiConstant should be eliminated (replaced then
+        // cleaned up by DCE).
+        assert!(total_node_count(&graph) < before);
+    }
+
+    #[test]
+    fn test_eliminate_duplicate_check_smi_same_block() {
+        let mut graph = MaglevGraph::new(1);
+        let mut block = BasicBlock::new(0);
+        let p = block.push_value(ValueNode::Parameter { index: 0 });
+        let _c1 = block.push_value(ValueNode::CheckSmi { receiver: p });
+        let _c2 = block.push_value(ValueNode::CheckSmi { receiver: p });
+        block.set_control(ControlNode::Return { value: p });
+        graph.add_block(block);
+
+        optimize(&mut graph);
+
+        // At most one CheckSmi should survive (the first one).
+        let check_count = graph.blocks()[0]
+            .nodes
+            .iter()
+            .filter(|(_, n)| matches!(n, ValueNode::CheckSmi { .. }))
+            .count();
+        assert!(
+            check_count <= 1,
+            "expected at most 1 CheckSmi, got {check_count}"
+        );
+    }
+
+    #[test]
+    fn test_eliminate_check_smi_on_checked_smi_add_result() {
+        let mut graph = MaglevGraph::new(0);
+        let mut block = BasicBlock::new(0);
+        let a = block.push_value(ValueNode::SmiConstant { value: 1 });
+        let b = block.push_value(ValueNode::SmiConstant { value: 2 });
+        let sum = block.push_value(ValueNode::CheckedSmiAdd { left: a, right: b });
+        let _check = block.push_value(ValueNode::CheckSmi { receiver: sum });
+        block.set_control(ControlNode::Return { value: sum });
+        graph.add_block(block);
+
+        optimize(&mut graph);
+
+        // The CheckSmi on the output of CheckedSmiAdd should be eliminated.
+        let check_count = graph.blocks()[0]
+            .nodes
+            .iter()
+            .filter(|(_, n)| matches!(n, ValueNode::CheckSmi { .. }))
+            .count();
+        assert_eq!(
+            check_count, 0,
+            "CheckSmi on CheckedSmiAdd output should be eliminated"
+        );
     }
 }

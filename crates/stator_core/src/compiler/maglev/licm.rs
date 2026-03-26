@@ -213,6 +213,10 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) {
         }
     }
 
+    // Collect objects mutated inside the loop so we can avoid hoisting loads
+    // that may alias those stores (soundness check).
+    let mutated_objects = collect_mutated_objects(graph, &lp.body);
+
     // Scan loop-body blocks (excluding header — hoisting from the header
     // itself is not useful).  Collect (block_idx, node_position) pairs to
     // hoist.
@@ -223,7 +227,10 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) {
             continue;
         }
         for (pos, (id, node)) in block.nodes.iter().enumerate() {
-            if is_pure(node) && all_inputs_outside(node, &outside_defs) {
+            if is_pure(node)
+                && all_inputs_outside(node, &outside_defs)
+                && !load_aliases_store(node, &mutated_objects)
+            {
                 to_hoist.push((block.id, pos, *id, node.clone()));
                 // After hoisting this node, its NodeId becomes "outside" too,
                 // so subsequent nodes that reference it may also qualify.
@@ -270,6 +277,55 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) {
         for (_, _, id, node) in to_hoist {
             preheader.push_with_id(id, node);
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Store-alias analysis
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Collect all [`NodeId`]s that appear as the target *object* of a store node
+/// anywhere in the loop body.  Used to prevent hoisting loads that may read
+/// a field written inside the loop.
+fn collect_mutated_objects(graph: &MaglevGraph, loop_body: &HashSet<u32>) -> HashSet<NodeId> {
+    let mut mutated = HashSet::new();
+    for block in graph.blocks() {
+        if !loop_body.contains(&block.id) {
+            continue;
+        }
+        for (_, node) in &block.nodes {
+            match node {
+                ValueNode::StoreField { object, .. }
+                | ValueNode::StoreNamedGeneric { object, .. }
+                | ValueNode::StoreKeyedGeneric { object, .. } => {
+                    mutated.insert(*object);
+                }
+                ValueNode::StoreFixedArrayElement { elements, .. }
+                | ValueNode::StoreFixedDoubleArrayElement { elements, .. } => {
+                    mutated.insert(*elements);
+                }
+                _ => {}
+            }
+        }
+    }
+    mutated
+}
+
+/// Return `true` when `node` is a load whose target object has been stored
+/// to inside the loop (per `mutated`).  Hoisting such a load would be
+/// unsound because the loaded value may change across iterations.
+fn load_aliases_store(node: &ValueNode, mutated: &HashSet<NodeId>) -> bool {
+    match node {
+        ValueNode::LoadField { object, .. }
+        | ValueNode::LoadTaggedField { object, .. }
+        | ValueNode::LoadDoubleField { object, .. }
+        | ValueNode::LoadNamedGeneric { object, .. } => mutated.contains(object),
+        ValueNode::LoadFixedArrayElement { elements, .. }
+        | ValueNode::LoadFixedDoubleArrayElement { elements, .. }
+        | ValueNode::LoadHoleyFixedDoubleArrayElement { elements, .. } => {
+            mutated.contains(elements)
+        }
+        _ => false,
     }
 }
 
@@ -866,5 +922,100 @@ mod tests {
                 .iter()
                 .any(|(_, n)| matches!(n, ValueNode::Int32Add { .. }))
         );
+    }
+
+    // ── LoadField hoisting (arr.length pattern) ──────────────────────────────
+
+    #[test]
+    fn test_hoist_load_field_from_loop_body() {
+        let mut graph = loop_graph();
+
+        // The parameter in block 0 (preheader) serves as the load's object.
+        let param_id = graph.blocks()[0].nodes[0].0;
+
+        // Add a LoadField in block 2 (loop body) whose object is defined
+        // outside the loop — this models reading `arr.length`.
+        graph.blocks_mut()[2].nodes.insert(
+            0,
+            (
+                NodeId(100),
+                ValueNode::LoadField {
+                    object: param_id,
+                    offset: 8,
+                },
+            ),
+        );
+
+        assert_eq!(graph.blocks()[2].nodes.len(), 1);
+
+        hoist_loop_invariants(&mut graph);
+
+        // The LoadField should have been hoisted to the preheader.
+        assert_eq!(graph.blocks()[2].nodes.len(), 0);
+        assert!(
+            graph.blocks()[0]
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::LoadField { offset: 8, .. }))
+        );
+    }
+
+    // ── LoadField NOT hoisted when object is mutated inside loop ─────────────
+
+    #[test]
+    fn test_load_field_not_hoisted_when_store_aliases() {
+        let mut graph = loop_graph();
+
+        let param_id = graph.blocks()[0].nodes[0].0;
+
+        // StoreField to the same object inside the loop body.
+        let val_id = NodeId(102);
+        graph.blocks_mut()[2]
+            .nodes
+            .push((val_id, ValueNode::Int32Constant { value: 0 }));
+        let store_id = NodeId(103);
+        graph.blocks_mut()[2].nodes.push((
+            store_id,
+            ValueNode::StoreField {
+                object: param_id,
+                offset: 8,
+                value: val_id,
+            },
+        ));
+
+        // LoadField on the same object — should NOT be hoisted because the
+        // object is mutated in the loop.
+        graph.blocks_mut()[2].nodes.insert(
+            0,
+            (
+                NodeId(100),
+                ValueNode::LoadField {
+                    object: param_id,
+                    offset: 16,
+                },
+            ),
+        );
+
+        let body_len_before = graph.blocks()[2].nodes.len();
+        hoist_loop_invariants(&mut graph);
+
+        // The constant (pure, no alias issue) may be hoisted, but the
+        // LoadField must stay because the same object is stored to.
+        assert!(
+            graph.blocks()[2]
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::LoadField { .. })),
+            "LoadField should NOT be hoisted when its object is mutated in the loop"
+        );
+        // Store is side-effecting and must also remain.
+        assert!(
+            graph.blocks()[2]
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::StoreField { .. })),
+        );
+        // At most the invariant constant was hoisted.
+        assert!(graph.blocks()[2].nodes.len() >= body_len_before - 1);
     }
 }
