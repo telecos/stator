@@ -6712,16 +6712,19 @@ impl Interpreter {
                             let is_strict = ba.is_strict();
                             let has_self_name = ba.self_name_register().is_some();
                             let has_fn_props = is_arrow && ba.has_fn_props();
-                            let closure_ctx = ba.closure_context().map(Rc::clone);
-                            let ba = Rc::clone(ba);
+                            // Try inline BEFORE cloning Rc — avoids atomic
+                            // refcount bump when the function is small enough
+                            // to be inlined.
                             if ba.bytecode_count() <= 25
                                 && !ba.has_exception_handler()
                                 && let Some(result) =
-                                    try_inline_small_function(ba.as_ref(), &[], &frame.global_env)
+                                    try_inline_small_function(ba, &[], &frame.global_env)
                             {
                                 acc = result;
                                 continue 'dispatch;
                             }
+                            let closure_ctx = ba.closure_context().map(Rc::clone);
+                            let ba = Rc::clone(ba);
                             frame.pc = pc;
 
                             let saved_this = if !is_arrow && is_strict {
@@ -6868,21 +6871,27 @@ impl Interpreter {
                             let is_strict = ba.is_strict();
                             let has_self_name = ba.self_name_register().is_some();
                             let has_fn_props = is_arrow && ba.has_fn_props();
-                            let closure_ctx = ba.closure_context().map(Rc::clone);
-                            let ba = Rc::clone(ba);
-                            let arg1 = unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
-                            let inline_args = [arg1.cheap_clone()];
+                            // Try inline BEFORE cloning Rc/arg — avoids
+                            // atomic refcount bumps + arg clone when the
+                            // function is small enough to be inlined.
+                            // SAFETY: arg_ptr points into frame.registers
+                            // which is not mutated during the inline check.
+                            let arg_ptr =
+                                unsafe { frame.read_reg_unchecked(arg_reg) } as *const JsValue;
                             if ba.bytecode_count() <= 25
                                 && !ba.has_exception_handler()
                                 && let Some(result) = try_inline_small_function(
-                                    ba.as_ref(),
-                                    &inline_args,
+                                    ba,
+                                    unsafe { std::slice::from_ref(&*arg_ptr) },
                                     &frame.global_env,
                                 )
                             {
                                 acc = result;
                                 continue 'dispatch;
                             }
+                            let closure_ctx = ba.closure_context().map(Rc::clone);
+                            let ba = Rc::clone(ba);
+                            let arg1 = unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
                             frame.pc = pc;
                             let saved_this = if !is_arrow && is_strict {
                                 let old = frame.global_env.borrow().get_this().cloned();
