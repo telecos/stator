@@ -1986,7 +1986,7 @@ fn handle_jump_if_undefined_or_null(
 
 #[inline]
 fn handle_return(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<DispatchAction> {
-    Ok(DispatchAction::Return(ctx.frame.accumulator.clone()))
+    Ok(DispatchAction::Return(ctx.frame.accumulator.cheap_clone()))
 }
 
 #[cold]
@@ -2061,7 +2061,7 @@ fn handle_call_any_receiver(
     let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
         return Err(err_bad_operand("CallAnyReceiver", 2));
     };
-    let callee = ctx.frame.read_reg(callee_v)?.clone();
+    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() {
@@ -2157,7 +2157,7 @@ fn handle_tail_call(
     let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
         return Err(err_bad_operand("TailCall", 2));
     };
-    let callee = ctx.frame.read_reg(callee_v)?.clone();
+    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
     match callee {
         JsValue::Function(ba) => {
             if ba.is_generator() || ba.is_async() {
@@ -2274,7 +2274,7 @@ fn handle_call_undefined_receiver0(
     let Operand::Register(callee_v) = *instr.operand(0) else {
         return Err(err_bad_operand("CallUndefinedReceiver0", 0));
     };
-    let callee = ctx.frame.read_reg(callee_v)?.clone();
+    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
     match callee {
         JsValue::Function(ba) => {
             if ba.bytecode_count() <= 25
@@ -2409,11 +2409,11 @@ fn handle_call_undefined_receiver1(
     let Operand::Register(arg1_v) = *instr.operand(1) else {
         return Err(err_bad_operand("CallUndefinedReceiver1", 1));
     };
-    let callee = ctx.frame.read_reg(callee_v)?.clone();
+    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
     if fast_array_method_name(&callee).as_deref() == Some("push")
         && let Some(JsValue::Array(arr)) = fast_array_method_target(&callee)
     {
-        let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
+        let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
         let mut items = arr.borrow_mut();
         items.push(arg1);
         ctx.frame.accumulator = JsValue::Smi(items.len() as i32);
@@ -2426,7 +2426,7 @@ fn handle_call_undefined_receiver1(
                 && !ba.is_generator()
                 && !ba.is_async()
             {
-                let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
+                let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
                 let inline_args = [arg1.clone()];
                 if let Some(result) =
                     try_inline_small_function(ba.as_ref(), &inline_args, &ctx.frame.global_env)
@@ -2448,11 +2448,11 @@ fn handle_call_undefined_receiver1(
                 fn run_async(ba: &Rc<BytecodeArray>, args: CallArgs) -> StatorResult<JsValue> {
                     Interpreter::run_async_function(Rc::clone(ba), args)
                 }
-                let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
+                let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
                 let args: CallArgs = smallvec![arg1];
                 ctx.frame.accumulator = run_async(&ba, args)?;
             } else {
-                let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
+                let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
                 let inline_args = [arg1.clone()];
                 // ── Tiering (cold path: gated on reaching baseline threshold) ──
                 let count = ba.increment_invocation_count();
@@ -2516,14 +2516,14 @@ fn handle_call_undefined_receiver1(
             }
         }
         JsValue::NativeFunction(f) => {
-            let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
+            let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
             let args: CallArgs = smallvec![arg1];
             ctx.frame.accumulator = f(args.into_vec())?;
             ctx.frame.global_cache_invalidate();
         }
         JsValue::PlainObject(ref map) => {
             if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
-                let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
+                let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
                 let args: CallArgs = smallvec![arg1];
                 ctx.frame.accumulator = f(args.into_vec())?;
                 ctx.frame.global_cache_invalidate();
@@ -2556,7 +2556,7 @@ fn handle_call_undefined_receiver2(
     let Operand::Register(arg2_v) = *instr.operand(2) else {
         return Err(err_bad_operand("CallUndefinedReceiver2", 2));
     };
-    let callee = ctx.frame.read_reg(callee_v)?.clone();
+    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
     match callee {
         JsValue::Function(ba) => {
             if ba.bytecode_count() <= 25
@@ -2564,8 +2564,8 @@ fn handle_call_undefined_receiver2(
                 && !ba.is_generator()
                 && !ba.is_async()
             {
-                let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
-                let arg2 = ctx.frame.read_reg(arg2_v)?.clone();
+                let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
+                let arg2 = ctx.frame.read_reg(arg2_v)?.cheap_clone();
                 let inline_args = [arg1, arg2];
                 if let Some(result) =
                     try_inline_small_function(ba.as_ref(), &inline_args, &ctx.frame.global_env)
@@ -2587,13 +2587,13 @@ fn handle_call_undefined_receiver2(
                 fn run_async(ba: &Rc<BytecodeArray>, args: CallArgs) -> StatorResult<JsValue> {
                     Interpreter::run_async_function(Rc::clone(ba), args)
                 }
-                let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
-                let arg2 = ctx.frame.read_reg(arg2_v)?.clone();
+                let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
+                let arg2 = ctx.frame.read_reg(arg2_v)?.cheap_clone();
                 let args: CallArgs = smallvec![arg1, arg2];
                 ctx.frame.accumulator = run_async(&ba, args)?;
             } else {
-                let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
-                let arg2 = ctx.frame.read_reg(arg2_v)?.clone();
+                let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
+                let arg2 = ctx.frame.read_reg(arg2_v)?.cheap_clone();
                 let args: CallArgs = smallvec![arg1, arg2];
                 // ── Tiering ──────────────────────────────────
                 let count = ba.increment_invocation_count();
@@ -2658,16 +2658,16 @@ fn handle_call_undefined_receiver2(
             }
         }
         JsValue::NativeFunction(f) => {
-            let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
-            let arg2 = ctx.frame.read_reg(arg2_v)?.clone();
+            let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
+            let arg2 = ctx.frame.read_reg(arg2_v)?.cheap_clone();
             let args: CallArgs = smallvec![arg1, arg2];
             ctx.frame.accumulator = f(args.into_vec())?;
             ctx.frame.global_cache_invalidate();
         }
         JsValue::PlainObject(ref map) => {
             if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
-                let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
-                let arg2 = ctx.frame.read_reg(arg2_v)?.clone();
+                let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
+                let arg2 = ctx.frame.read_reg(arg2_v)?.cheap_clone();
                 let args: CallArgs = smallvec![arg1, arg2];
                 ctx.frame.accumulator = f(args.into_vec())?;
                 ctx.frame.global_cache_invalidate();
@@ -2700,8 +2700,8 @@ fn handle_call_property(
     let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
         return Err(err_bad_operand("CallProperty", 2));
     };
-    let callee = ctx.frame.read_reg(callee_v)?.clone();
-    let this_val = ctx.frame.read_reg(recv_v)?.clone();
+    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
+    let this_val = ctx.frame.read_reg(recv_v)?.cheap_clone();
     // Arguments reside in the registers immediately following
     // the callee register in the flat register file.
     let callee_flat = ctx.frame.reg_index(callee_v)?;
@@ -2850,7 +2850,7 @@ fn handle_call_with_spread(
     let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
         return Err(err_bad_operand("CallWithSpread", 2));
     };
-    let callee = ctx.frame.read_reg(callee_v)?.clone();
+    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
     let raw_args = collect_args(ctx.frame, args_start_v, arg_count)?;
     // Expand any spread arrays (JsValue::Array or PlainObject with
     // __is_array__) into individual arguments.
@@ -3108,7 +3108,7 @@ fn handle_construct(
     let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
         return Err(err_bad_operand("Construct", 2));
     };
-    let ctor = ctx.frame.read_reg(ctor_v)?.clone();
+    let ctor = ctx.frame.read_reg(ctor_v)?.cheap_clone();
     match ctor {
         JsValue::Function(ba) => {
             // Arrow functions are not constructable (ES §15.3.4).
@@ -3186,7 +3186,7 @@ fn handle_construct(
         }
         JsValue::Proxy(ref p) => {
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-            let ctor_val = ctx.frame.accumulator.clone();
+            let ctor_val = ctx.frame.accumulator.cheap_clone();
             let obj = proxy_construct(&mut p.borrow_mut(), args.into_vec(), ctor_val)?;
             ctx.frame.accumulator = obj;
         }
@@ -3214,7 +3214,7 @@ fn handle_construct_with_spread(
     let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
         return Err(err_bad_operand("ConstructWithSpread", 2));
     };
-    let ctor = ctx.frame.read_reg(ctor_v)?.clone();
+    let ctor = ctx.frame.read_reg(ctor_v)?.cheap_clone();
     let raw_args = collect_args(ctx.frame, args_start_v, arg_count)?;
     // Expand any spread arrays (JsValue::Array or PlainObject with
     // __is_array__) into individual arguments.
@@ -3279,7 +3279,7 @@ fn handle_construct_with_spread(
             }
         }
         JsValue::Proxy(ref p) => {
-            let ctor_val = ctx.frame.accumulator.clone();
+            let ctor_val = ctx.frame.accumulator.cheap_clone();
             let obj = proxy_construct(&mut p.borrow_mut(), args.into_vec(), ctor_val)?;
             ctx.frame.accumulator = obj;
         }
@@ -3302,7 +3302,7 @@ fn handle_push_context(
     // Encode None as Undefined so it can be stored in a register.
     let old_ctx = ctx.frame.context.take().unwrap_or(JsValue::Undefined);
     ctx.frame.write_reg(v, old_ctx)?;
-    ctx.frame.context = Some(ctx.frame.accumulator.clone());
+    ctx.frame.context = Some(ctx.frame.accumulator.cheap_clone());
     Ok(DispatchAction::Continue)
 }
 
@@ -3313,7 +3313,7 @@ fn handle_pop_context(
     let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("PopContext", 0));
     };
-    let saved = ctx.frame.read_reg(v)?.clone();
+    let saved = ctx.frame.read_reg(v)?.cheap_clone();
     ctx.frame.context = if saved.is_undefined() {
         None
     } else {
@@ -3335,7 +3335,7 @@ fn handle_lda_context_slot(
     let Operand::Immediate(depth) = *instr.operand(2) else {
         return Err(err_bad_operand("LdaContextSlot", 2));
     };
-    let ctx_val = ctx.frame.read_reg(ctx_v)?.clone();
+    let ctx_val = ctx.frame.read_reg(ctx_v)?.cheap_clone();
     let js_ctx = extract_context(&ctx_val, "LdaContextSlot")?;
     let target = walk_context_chain(&js_ctx, depth as u32, "LdaContextSlot")?;
     let borrowed = target.borrow();
@@ -3385,7 +3385,7 @@ fn handle_sta_context_slot(
     let Operand::Immediate(depth) = *instr.operand(2) else {
         return Err(err_bad_operand("StaContextSlot", 2));
     };
-    let ctx_val = ctx.frame.read_reg(ctx_v)?.clone();
+    let ctx_val = ctx.frame.read_reg(ctx_v)?.cheap_clone();
     let js_ctx = extract_context(&ctx_val, "StaContextSlot")?;
     let target = walk_context_chain(&js_ctx, depth as u32, "StaContextSlot")?;
     let mut borrowed = target.borrow_mut();
@@ -3393,7 +3393,7 @@ fn handle_sta_context_slot(
     if slot >= borrowed.slots.len() {
         borrowed.slots.resize(slot + 1, JsValue::Undefined);
     }
-    borrowed.slots[slot] = ctx.frame.accumulator.clone();
+    borrowed.slots[slot] = ctx.frame.accumulator.cheap_clone();
     Ok(DispatchAction::Continue)
 }
 
@@ -3416,7 +3416,7 @@ fn handle_sta_current_context_slot(
     if slot >= borrowed.slots.len() {
         borrowed.slots.resize(slot + 1, JsValue::Undefined);
     }
-    borrowed.slots[slot] = ctx.frame.accumulator.clone();
+    borrowed.slots[slot] = ctx.frame.accumulator.cheap_clone();
     Ok(DispatchAction::Continue)
 }
 
@@ -3476,7 +3476,7 @@ fn handle_create_catch_context(
     let Operand::Register(exc_v) = *instr.operand(0) else {
         return Err(err_bad_operand("CreateCatchContext", 0));
     };
-    let exception = ctx.frame.read_reg(exc_v)?.clone();
+    let exception = ctx.frame.read_reg(exc_v)?.cheap_clone();
     let parent = match &ctx.frame.context {
         Some(JsValue::Context(c)) => Some(Rc::clone(c)),
         _ => None,
@@ -3495,7 +3495,7 @@ fn handle_create_with_context(
     let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("CreateWithContext", 0));
     };
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
     let parent = match &ctx.frame.context {
         Some(JsValue::Context(c)) => Some(Rc::clone(c)),
         _ => None,
@@ -3508,7 +3508,7 @@ fn handle_create_with_context(
 
 #[cold]
 fn handle_throw(ctx: &mut DispatchContext, _instr: &Instruction) -> StatorResult<DispatchAction> {
-    let thrown = ctx.frame.accumulator.clone();
+    let thrown = ctx.frame.accumulator.cheap_clone();
     let throw_idx = (ctx.frame.pc - 1) as u32;
     if let Some(handler_pc) = find_handler(throw_idx, ctx.handler_table) {
         ctx.frame.accumulator = thrown;
@@ -3729,7 +3729,7 @@ fn handle_sta_global(
         return Err(err_bad_operand("StaGlobal", 0));
     };
     let name = ctx.frame.get_string_constant(name_idx)?;
-    let val = ctx.frame.accumulator.clone();
+    let val = ctx.frame.accumulator.cheap_clone();
     // Strict mode: assigning to an undeclared variable is a ReferenceError.
     if ctx.frame.bytecode_array.is_strict() && !ctx.frame.global_env.borrow().contains_key(&name) {
         return Err(StatorError::ReferenceError(format!(
@@ -3771,7 +3771,7 @@ fn handle_lda_named_property(
         ctx.frame.accumulator = JsValue::Smi(len);
         return Ok(DispatchAction::Continue);
     }
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
     if is_private_storage_key(&prop_name) {
         ctx.frame.accumulator = load_private_named_property(&obj, &prop_name)?;
         return Ok(DispatchAction::Continue);
@@ -4029,8 +4029,8 @@ fn handle_sta_named_property(
         u32::MAX
     };
     let prop_name = ctx.frame.get_string_constant(name_idx)?;
-    let val = ctx.frame.accumulator.clone();
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let val = ctx.frame.accumulator.cheap_clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
     if is_private_storage_key(&prop_name) {
         store_private_named_property(ctx, &obj, &prop_name, val)?;
         return Ok(DispatchAction::Continue);
@@ -4286,8 +4286,8 @@ fn handle_lda_keyed_property(
         }
     }
     // ── General path ─────────────────────────────────────────────────
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
-    let key = ctx.frame.accumulator.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
+    let key = ctx.frame.accumulator.cheap_clone();
     // TypeError for property access on null or undefined (ES §13.10.3).
     if matches!(obj, JsValue::Null | JsValue::Undefined) {
         let key_str = key.to_js_string().unwrap_or_default();
@@ -4324,7 +4324,7 @@ fn handle_sta_keyed_property(
         let obj_ref = ctx.frame.read_reg(obj_v)?;
         if let JsValue::PlainObject(map) = obj_ref {
             let map_rc = Rc::clone(map);
-            let val = ctx.frame.accumulator.clone();
+            let val = ctx.frame.accumulator.cheap_clone();
             let key_str = itoa_stack(idx_val as u32);
             let mut m = map_rc.borrow_mut();
             m.insert(key_str.as_str().to_owned(), val);
@@ -4340,7 +4340,7 @@ fn handle_sta_keyed_property(
             return Ok(DispatchAction::Continue);
         } else if let JsValue::Array(items) = obj_ref {
             let items_rc = Rc::clone(items);
-            let val = ctx.frame.accumulator.clone();
+            let val = ctx.frame.accumulator.cheap_clone();
             let i = idx_val as usize;
             let mut v = items_rc.borrow_mut();
             if i < v.len() {
@@ -4355,9 +4355,9 @@ fn handle_sta_keyed_property(
         }
     }
     // ── General path ─────────────────────────────────────────────────
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
-    let key = ctx.frame.read_reg(key_v)?.clone();
-    let val = ctx.frame.accumulator.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
+    let key = ctx.frame.read_reg(key_v)?.cheap_clone();
+    let val = ctx.frame.accumulator.cheap_clone();
     // Dense array slow-mode conversion: when storing a non-index property
     // (Symbol, string like "length", etc.) on a JsValue::Array, convert the
     // array to a PlainObject so the property is preserved.  We must also
@@ -4512,7 +4512,7 @@ fn handle_get_iterator(
     let Operand::Register(iter_v) = *instr.operand(0) else {
         return Err(err_bad_operand("GetIterator", 0));
     };
-    let iterable = ctx.frame.read_reg(iter_v)?.clone();
+    let iterable = ctx.frame.read_reg(iter_v)?.cheap_clone();
     ctx.frame.accumulator = match iterable {
         JsValue::Array(items) => {
             let items_vec: Vec<JsValue> = items
@@ -4617,7 +4617,7 @@ fn handle_get_async_iterator(
     let Operand::Register(iter_v) = *instr.operand(0) else {
         return Err(err_bad_operand("GetAsyncIterator", 0));
     };
-    let iterable = ctx.frame.read_reg(iter_v)?.clone();
+    let iterable = ctx.frame.read_reg(iter_v)?.cheap_clone();
     ctx.frame.accumulator = match iterable {
         JsValue::Array(items) => {
             let items_vec: Vec<JsValue> = items.borrow().clone();
@@ -4698,7 +4698,7 @@ fn handle_iterator_next(
     let Operand::Register(value_out_v) = *instr.operand(1) else {
         return Err(err_bad_operand("IteratorNext", 1));
     };
-    let iter = ctx.frame.read_reg(iter_v)?.clone();
+    let iter = ctx.frame.read_reg(iter_v)?.cheap_clone();
     let (value, done) = match iter {
         JsValue::Iterator(ni) => match ni.borrow_mut().next_item() {
             Some(v) => (v, false),
@@ -4821,7 +4821,7 @@ fn handle_iterator_close(
     let Operand::Register(iter_v) = *instr.operand(0) else {
         return Err(err_bad_operand("IteratorClose", 0));
     };
-    let iter = ctx.frame.read_reg(iter_v)?.clone();
+    let iter = ctx.frame.read_reg(iter_v)?.cheap_clone();
     match &iter {
         JsValue::PlainObject(map) => {
             let return_fn = map.borrow().get("return").cloned();
@@ -4902,8 +4902,8 @@ fn handle_copy_data_properties(
     let Operand::Register(source_v) = *instr.operand(1) else {
         return Err(err_bad_operand("CopyDataProperties", 1));
     };
-    let target = ctx.frame.read_reg(target_v)?.clone();
-    let source = ctx.frame.read_reg(source_v)?.clone();
+    let target = ctx.frame.read_reg(target_v)?.cheap_clone();
+    let source = ctx.frame.read_reg(source_v)?.cheap_clone();
 
     if let JsValue::PlainObject(t) = &target {
         match &source {
@@ -4948,7 +4948,7 @@ fn handle_suspend_generator(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let yield_val = ctx.frame.accumulator.clone();
+    let yield_val = ctx.frame.accumulator.cheap_clone();
 
     // Save state into the attached GeneratorState (if any).
     if let Some(gs_rc) = ctx.frame.generator_state.as_ref() {
@@ -5206,7 +5206,7 @@ fn handle_to_object(
         | JsValue::Iterator(_)
         | JsValue::ArrayBuffer(_)
         | JsValue::TypedArray(_)
-        | JsValue::DataView(_) => ctx.frame.accumulator.clone(),
+        | JsValue::DataView(_) => ctx.frame.accumulator.cheap_clone(),
         // ECMAScript §7.1.18 – Boolean wrapper object.
         JsValue::Boolean(b) => {
             let b_val = *b;
@@ -5329,7 +5329,7 @@ fn handle_to_name(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
         return Err(err_bad_operand("ToName", 0));
     };
     let key = match &ctx.frame.accumulator {
-        JsValue::String(_) | JsValue::Symbol(_) => ctx.frame.accumulator.clone(),
+        JsValue::String(_) | JsValue::Symbol(_) => ctx.frame.accumulator.cheap_clone(),
         other => {
             let prim = other.to_primitive(crate::objects::value::ToPrimitiveHint::String)?;
             match prim {
@@ -5458,7 +5458,7 @@ fn handle_create_array_from_iterable(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let iterable = ctx.frame.accumulator.clone();
+    let iterable = ctx.frame.accumulator.cheap_clone();
     let items: Vec<JsValue> = match &iterable {
         JsValue::Array(arr) => arr
             .borrow()
@@ -5668,9 +5668,9 @@ fn handle_sta_in_array_literal(
         return Err(err_bad_operand("StaInArrayLiteral", 1));
     };
     // operands[2] is a FeedbackSlot, ignored at runtime.
-    let arr = ctx.frame.read_reg(arr_v)?.clone();
-    let key = ctx.frame.read_reg(idx_v)?.clone();
-    let val = ctx.frame.accumulator.clone();
+    let arr = ctx.frame.read_reg(arr_v)?.cheap_clone();
+    let key = ctx.frame.read_reg(idx_v)?.cheap_clone();
+    let val = ctx.frame.accumulator.cheap_clone();
     if let JsValue::Array(ref items) = arr {
         // Dense path: direct Vec index set, no string conversion.
         if let Some(idx) = to_array_index(&key) {
@@ -5722,8 +5722,8 @@ fn handle_define_named_own_property(
             ));
         }
     };
-    let val = ctx.frame.accumulator.clone();
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let val = ctx.frame.accumulator.cheap_clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
     if let JsValue::PlainObject(ref map) = obj {
         set_named_property_function_metadata(&val, &obj, &prop_name);
         if let Some(attrs) = private_named_property_attrs(&prop_name) {
@@ -5751,9 +5751,9 @@ fn handle_define_keyed_own_property(
         return Err(err_bad_operand("DefineKeyedOwnProperty", 1));
     };
     // operands[2] = Flag (ignored), operands[3] = FeedbackSlot (ignored).
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
-    let key = ctx.frame.read_reg(key_v)?.clone();
-    let val = ctx.frame.accumulator.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
+    let key = ctx.frame.read_reg(key_v)?.cheap_clone();
+    let val = ctx.frame.accumulator.cheap_clone();
     if let JsValue::PlainObject(ref map) = obj {
         let prop_name = to_property_key(&key)?;
         set_named_property_function_metadata(&val, &obj, &prop_name);
@@ -5774,9 +5774,9 @@ fn handle_define_keyed_own_property_in_literal(
         return Err(err_bad_operand("DefineKeyedOwnPropertyInLiteral", 1));
     };
     // operands[2] = Flag (ignored), operands[3] = FeedbackSlot (ignored).
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
-    let key = ctx.frame.read_reg(key_v)?.clone();
-    let val = ctx.frame.accumulator.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
+    let key = ctx.frame.read_reg(key_v)?.cheap_clone();
+    let val = ctx.frame.accumulator.cheap_clone();
     if let JsValue::PlainObject(ref map) = obj {
         let prop_name = to_property_key(&key)?;
         set_named_property_function_metadata(&val, &obj, &prop_name);
@@ -5793,7 +5793,7 @@ fn handle_test_instance_of(
     let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestInstanceOf", 0));
     };
-    let constructor = ctx.frame.read_reg(v)?.clone();
+    let constructor = ctx.frame.read_reg(v)?.cheap_clone();
 
     // §7.3.21 OrdinaryHasInstance — RHS must be callable, else TypeError.
     let rhs_callable = match &constructor {
@@ -5826,13 +5826,13 @@ fn handle_test_instance_of(
     if let Some(ref hi) = has_instance_fn {
         match hi {
             JsValue::NativeFunction(f) => {
-                let result = f(vec![ctx.frame.accumulator.clone()])?;
+                let result = f(vec![ctx.frame.accumulator.cheap_clone()])?;
                 ctx.frame.global_cache_invalidate();
                 ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
                 return Ok(DispatchAction::Continue);
             }
             JsValue::Function(_) | JsValue::PlainObject(_) => {
-                let result = dispatch_call_value(hi, vec![ctx.frame.accumulator.clone()])?;
+                let result = dispatch_call_value(hi, vec![ctx.frame.accumulator.cheap_clone()])?;
                 ctx.frame.accumulator = JsValue::Boolean(result.to_boolean());
                 return Ok(DispatchAction::Continue);
             }
@@ -5951,7 +5951,7 @@ fn handle_test_in(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResul
     let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestIn", 0));
     };
-    let object = ctx.frame.read_reg(v)?.clone();
+    let object = ctx.frame.read_reg(v)?.cheap_clone();
     let key = &ctx.frame.accumulator;
 
     let result = match &object {
@@ -6027,7 +6027,7 @@ fn handle_for_in_enumerate(
     let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("ForInEnumerate", 0));
     };
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
     let keys: Vec<JsValue> = match &obj {
         JsValue::PlainObject(map) => {
             let mut all_keys = Vec::new();
@@ -6154,7 +6154,7 @@ fn handle_for_in_prepare(
         return Err(err_bad_operand("ForInPrepare", 0));
     };
     // operands[1] is a FeedbackSlot, ignored at runtime.
-    let keys = ctx.frame.read_reg(keys_v)?.clone();
+    let keys = ctx.frame.read_reg(keys_v)?.cheap_clone();
     let len = match &keys {
         JsValue::Array(items) => items.borrow().len() as i32,
         _ => 0,
@@ -6181,8 +6181,8 @@ fn handle_for_in_next(
         JsValue::Smi(n) => (*n).max(0) as usize,
         _ => 0,
     };
-    let obj = ctx.frame.read_reg(_receiver_v)?.clone();
-    let keys = ctx.frame.read_reg(keys_v)?.clone();
+    let obj = ctx.frame.read_reg(_receiver_v)?.cheap_clone();
+    let keys = ctx.frame.read_reg(keys_v)?.cheap_clone();
     let key = match &keys {
         JsValue::Array(items) => items
             .borrow()
@@ -6251,7 +6251,7 @@ fn handle_delete_property_sloppy(
         return Err(err_bad_operand("DeletePropertySloppy", 0));
     };
     let key = to_property_key(&ctx.frame.accumulator)?;
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
     let removed = if let JsValue::Proxy(ref p) = obj {
         proxy_delete_property(&mut p.borrow_mut(), &key)?
     } else if let JsValue::PlainObject(ref map) = obj {
@@ -6298,7 +6298,7 @@ fn handle_delete_property_strict(
         return Err(err_bad_operand("DeletePropertyStrict", 0));
     };
     let key = to_property_key(&ctx.frame.accumulator)?;
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
     if let JsValue::Proxy(ref p) = obj {
         let deleted = proxy_delete_property(&mut p.borrow_mut(), &key)?;
         if !deleted {
@@ -6507,8 +6507,8 @@ fn handle_call_property0(
     let Operand::Register(recv_v) = *instr.operand(1) else {
         return Err(err_bad_operand("CallProperty0", 1));
     };
-    let callee = ctx.frame.read_reg(callee_v)?.clone();
-    let this_val = ctx.frame.read_reg(recv_v)?.clone();
+    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
+    let this_val = ctx.frame.read_reg(recv_v)?.cheap_clone();
     dispatch_call_property(ctx.frame, &callee, this_val, CallArgs::new())?;
     Ok(DispatchAction::Continue)
 }
@@ -6526,9 +6526,9 @@ fn handle_call_property1(
     let Operand::Register(arg0_v) = *instr.operand(2) else {
         return Err(err_bad_operand("CallProperty1", 2));
     };
-    let callee = ctx.frame.read_reg(callee_v)?.clone();
-    let this_val = ctx.frame.read_reg(recv_v)?.clone();
-    let arg0 = ctx.frame.read_reg(arg0_v)?.clone();
+    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
+    let this_val = ctx.frame.read_reg(recv_v)?.cheap_clone();
+    let arg0 = ctx.frame.read_reg(arg0_v)?.cheap_clone();
     dispatch_call_property(ctx.frame, &callee, this_val, smallvec![arg0])?;
     Ok(DispatchAction::Continue)
 }
@@ -6549,10 +6549,10 @@ fn handle_call_property2(
     let Operand::Register(arg1_v) = *instr.operand(3) else {
         return Err(err_bad_operand("CallProperty2", 3));
     };
-    let callee = ctx.frame.read_reg(callee_v)?.clone();
-    let this_val = ctx.frame.read_reg(recv_v)?.clone();
-    let arg0 = ctx.frame.read_reg(arg0_v)?.clone();
-    let arg1 = ctx.frame.read_reg(arg1_v)?.clone();
+    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
+    let this_val = ctx.frame.read_reg(recv_v)?.cheap_clone();
+    let arg0 = ctx.frame.read_reg(arg0_v)?.cheap_clone();
+    let arg1 = ctx.frame.read_reg(arg1_v)?.cheap_clone();
     dispatch_call_property(ctx.frame, &callee, this_val, smallvec![arg0, arg1])?;
     Ok(DispatchAction::Continue)
 }
@@ -6610,8 +6610,8 @@ fn handle_sta_named_own_property(
             ));
         }
     };
-    let val = ctx.frame.accumulator.clone();
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let val = ctx.frame.accumulator.cheap_clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
     if let JsValue::PlainObject(ref map) = obj {
         map.borrow_mut().insert(prop_name, val);
     }
@@ -6739,7 +6739,7 @@ fn handle_sta_lookup_slot(
         return Err(err_bad_operand("StaLookupSlot", 0));
     };
     let name = ctx.frame.get_string_constant(name_idx)?;
-    let val = ctx.frame.accumulator.clone();
+    let val = ctx.frame.accumulator.cheap_clone();
     if store_with_binding(&ctx.frame.context, &name, &val) {
         return Ok(DispatchAction::Continue);
     }
@@ -6944,7 +6944,7 @@ fn handle_lda_named_property_from_super(
     // access (HomeObject.[[Prototype]]).  The lookup must begin there,
     // NOT on `this` (the receiver), so that overridden methods on the
     // subclass prototype are skipped.
-    let lookup_start = ctx.frame.accumulator.clone();
+    let lookup_start = ctx.frame.accumulator.cheap_clone();
     ctx.frame.accumulator = if matches!(lookup_start, JsValue::Undefined | JsValue::Null) {
         JsValue::Undefined
     } else {
@@ -7006,7 +7006,7 @@ fn handle_test_reference_equal(
     let Operand::Register(v) = *instr.operand(0) else {
         return Err(err_bad_operand("TestReferenceEqual", 0));
     };
-    let rhs = ctx.frame.read_reg(v)?.clone();
+    let rhs = ctx.frame.read_reg(v)?.cheap_clone();
     let result = strict_eq(&ctx.frame.accumulator, &rhs);
     ctx.frame.accumulator = JsValue::Boolean(result);
     Ok(DispatchAction::Continue)
@@ -7301,7 +7301,7 @@ fn handle_construct_forward_all_args(
         return Err(err_bad_operand("ConstructForwardAllArgs", 0));
     };
     // operands[1] is a FeedbackSlot, ignored at runtime.
-    let ctor = ctx.frame.read_reg(ctor_v)?.clone();
+    let ctor = ctx.frame.read_reg(ctor_v)?.cheap_clone();
     let param_count = ctx.frame.bytecode_array.parameter_count() as usize;
     let args: CallArgs = ctx
         .frame
@@ -7398,7 +7398,7 @@ fn handle_create_object_from_iterable(
     ctx: &mut DispatchContext,
     _instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
-    let iterable = ctx.frame.accumulator.clone();
+    let iterable = ctx.frame.accumulator.cheap_clone();
     let map: PropertyMap = match &iterable {
         JsValue::PlainObject(obj) => obj.borrow().clone(),
         JsValue::Array(arr) => {
@@ -7447,7 +7447,7 @@ fn handle_call_direct_eval(
     let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
         return Err(err_bad_operand("CallDirectEval", 2));
     };
-    let callee = ctx.frame.read_reg(callee_v)?.clone();
+    let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
     let args = collect_args(ctx.frame, args_start_v, arg_count)?;
 
     // Check whether the callee is the original built-in eval
@@ -7489,7 +7489,7 @@ fn handle_call_direct_eval(
             eval_bindings.insert("this".to_string(), this_val);
         }
         for (name, reg) in &binding_registers {
-            eval_bindings.insert(name.clone(), ctx.frame.read_reg(*reg as u32)?.clone());
+            eval_bindings.insert(name.clone(), ctx.frame.read_reg(*reg as u32)?.cheap_clone());
         }
         let eval_env = Rc::new(RefCell::new(GlobalEnv::with_vars(eval_bindings)));
         let (result, final_env, is_strict) =
@@ -7613,7 +7613,7 @@ fn handle_create_class(
     };
 
     // 2. Read the superclass.
-    let super_val = ctx.frame.read_reg(super_v)?.clone();
+    let super_val = ctx.frame.read_reg(super_v)?.cheap_clone();
 
     // 3. Create the class constructor as a PlainObject wrapping the
     //    bytecode in __call__ so it can be invoked via both `new` and
@@ -7695,8 +7695,8 @@ fn handle_define_getter_property(
             ));
         }
     };
-    let getter = ctx.frame.accumulator.clone();
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let getter = ctx.frame.accumulator.cheap_clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
     if let JsValue::PlainObject(ref map) = obj {
         if let JsValue::Function(ba) = &getter {
             fn_props_set(ba, ".home_object".to_string(), obj.clone());
@@ -7733,8 +7733,8 @@ fn handle_define_setter_property(
             ));
         }
     };
-    let setter = ctx.frame.accumulator.clone();
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let setter = ctx.frame.accumulator.cheap_clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
     if let JsValue::PlainObject(ref map) = obj {
         if let JsValue::Function(ba) = &setter {
             fn_props_set(ba, ".home_object".to_string(), obj.clone());
@@ -7761,9 +7761,9 @@ fn handle_define_keyed_getter_property(
     let Operand::Register(key_v) = *instr.operand(1) else {
         return Err(err_bad_operand("DefineKeyedGetterProperty", 1));
     };
-    let getter = ctx.frame.accumulator.clone();
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
-    let key = ctx.frame.read_reg(key_v)?.clone();
+    let getter = ctx.frame.accumulator.cheap_clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
+    let key = ctx.frame.read_reg(key_v)?.cheap_clone();
     let key_str = to_property_key(&key)?;
     if let JsValue::PlainObject(ref map) = obj {
         if let JsValue::Function(ba) = &getter {
@@ -7787,9 +7787,9 @@ fn handle_define_keyed_setter_property(
     let Operand::Register(key_v) = *instr.operand(1) else {
         return Err(err_bad_operand("DefineKeyedSetterProperty", 1));
     };
-    let setter = ctx.frame.accumulator.clone();
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
-    let key = ctx.frame.read_reg(key_v)?.clone();
+    let setter = ctx.frame.accumulator.cheap_clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
+    let key = ctx.frame.read_reg(key_v)?.cheap_clone();
     let key_str = to_property_key(&key)?;
     if let JsValue::PlainObject(ref map) = obj {
         if let JsValue::Function(ba) = &setter {
@@ -7821,8 +7821,8 @@ fn handle_define_class_named_own_property(
             ));
         }
     };
-    let val = ctx.frame.accumulator.clone();
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let val = ctx.frame.accumulator.cheap_clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
     if let JsValue::PlainObject(ref map) = obj {
         set_named_property_function_metadata(&val, &obj, &prop_name);
         if let Some(attrs) = private_named_property_attrs(&prop_name) {
@@ -7853,8 +7853,8 @@ fn handle_define_class_getter_property(
             ));
         }
     };
-    let getter = ctx.frame.accumulator.clone();
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let getter = ctx.frame.accumulator.cheap_clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
     if let JsValue::PlainObject(ref map) = obj {
         if let JsValue::Function(ba) = &getter {
             fn_props_set(ba, ".home_object".to_string(), obj.clone());
@@ -7889,8 +7889,8 @@ fn handle_define_class_setter_property(
             ));
         }
     };
-    let setter = ctx.frame.accumulator.clone();
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
+    let setter = ctx.frame.accumulator.cheap_clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
     if let JsValue::PlainObject(ref map) = obj {
         if let JsValue::Function(ba) = &setter {
             fn_props_set(ba, ".home_object".to_string(), obj.clone());
@@ -7917,9 +7917,9 @@ fn handle_define_class_keyed_own_property(
     let Operand::Register(key_v) = *instr.operand(1) else {
         return Err(err_bad_operand("DefineClassKeyedOwnProperty", 1));
     };
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
-    let key = ctx.frame.read_reg(key_v)?.clone();
-    let val = ctx.frame.accumulator.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
+    let key = ctx.frame.read_reg(key_v)?.cheap_clone();
+    let val = ctx.frame.accumulator.cheap_clone();
     if let JsValue::PlainObject(ref map) = obj {
         let prop_name = to_property_key(&key)?;
         set_named_property_function_metadata(&val, &obj, &prop_name);
@@ -7939,9 +7939,9 @@ fn handle_define_class_keyed_getter_property(
     let Operand::Register(key_v) = *instr.operand(1) else {
         return Err(err_bad_operand("DefineClassKeyedGetterProperty", 1));
     };
-    let getter = ctx.frame.accumulator.clone();
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
-    let key = ctx.frame.read_reg(key_v)?.clone();
+    let getter = ctx.frame.accumulator.cheap_clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
+    let key = ctx.frame.read_reg(key_v)?.cheap_clone();
     let key_str = to_property_key(&key)?;
     if let JsValue::PlainObject(ref map) = obj {
         if let JsValue::Function(ba) = &getter {
@@ -7965,9 +7965,9 @@ fn handle_define_class_keyed_setter_property(
     let Operand::Register(key_v) = *instr.operand(1) else {
         return Err(err_bad_operand("DefineClassKeyedSetterProperty", 1));
     };
-    let setter = ctx.frame.accumulator.clone();
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
-    let key = ctx.frame.read_reg(key_v)?.clone();
+    let setter = ctx.frame.accumulator.cheap_clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
+    let key = ctx.frame.read_reg(key_v)?.cheap_clone();
     let key_str = to_property_key(&key)?;
     if let JsValue::PlainObject(ref map) = obj {
         if let JsValue::Function(ba) = &setter {
@@ -7993,8 +7993,8 @@ fn handle_lda_enumerated_keyed_property(
     let Operand::Register(key_v) = *instr.operand(1) else {
         return Err(err_bad_operand("LdaEnumeratedKeyedProperty", 1));
     };
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
-    let key = ctx.frame.read_reg(key_v)?.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
+    let key = ctx.frame.read_reg(key_v)?.cheap_clone();
     ctx.frame.accumulator = keyed_load(&obj, &key)?;
     Ok(DispatchAction::Continue)
 }
@@ -8016,8 +8016,8 @@ fn handle_test_private_brand(
     let Operand::Register(brand_v) = *instr.operand(1) else {
         return Err(err_bad_operand("TestPrivateBrand", 1));
     };
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
-    let brand = ctx.frame.read_reg(brand_v)?.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
+    let brand = ctx.frame.read_reg(brand_v)?.cheap_clone();
     let brand_key = to_property_key(&brand)?;
 
     if !is_js_receiver(&obj) {
@@ -8054,8 +8054,8 @@ fn handle_define_private_brand(
     let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("DefinePrivateBrand", 0));
     };
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
-    let brand = ctx.frame.accumulator.clone();
+    let obj = ctx.frame.read_reg(obj_v)?.cheap_clone();
+    let brand = ctx.frame.accumulator.cheap_clone();
     let brand_key = to_property_key(&brand)?;
 
     match &obj {
@@ -8141,7 +8141,7 @@ fn handle_sta_module_variable(
         }
     };
     let key = format!("__mod:{specifier}:{cell}");
-    let val = ctx.frame.accumulator.clone();
+    let val = ctx.frame.accumulator.cheap_clone();
     ctx.frame.global_env.borrow_mut().insert(key, val);
     Ok(DispatchAction::Continue)
 }
