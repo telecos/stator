@@ -92,6 +92,7 @@ use crate::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, NodeId, 
 /// sufficient for the patterns targeted here.
 pub fn optimize(graph: &mut MaglevGraph) {
     fold_constants(graph);
+    simplify_identities(graph);
     strength_reduce(graph);
     crate::compiler::maglev::range_analysis::eliminate_overflow_checks(graph);
     crate::compiler::maglev::licm::hoist_loop_invariants(graph);
@@ -100,6 +101,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // specialise the loop body based on proven types.  This requires
     // duplicating the loop header and body, which is non-trivial with the
     // current graph structure.
+    eliminate_common_subexpressions(graph);
     eliminate_redundant_type_guards(graph);
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
@@ -308,6 +310,120 @@ fn fold_f64_bin(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Pass 1.3 — Algebraic identity simplification
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Simplify algebraic identities: `x + 0 → x`, `x * 1 → x`, `x - 0 → x`,
+/// `x * 0 → 0`, `x | 0 → x`, `x ^ 0 → x`, `x & -1 → x`.
+///
+/// Replaced nodes are turned into [`ValueNode::UndefinedConstant`] placeholders
+/// and a substitution table redirects all downstream references to the identity
+/// operand.  DCE cleans up the dead placeholders.
+fn simplify_identities(graph: &mut MaglevGraph) {
+    for block in graph.blocks_mut() {
+        simplify_identities_in_block(block);
+    }
+}
+
+/// Perform algebraic identity simplification within a single [`BasicBlock`].
+fn simplify_identities_in_block(block: &mut BasicBlock) {
+    // Collect compile-time integer constants visible in this block.
+    let mut consts: HashMap<NodeId, i32> = HashMap::new();
+    for (id, node) in &block.nodes {
+        match node {
+            ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } => {
+                consts.insert(*id, *value);
+            }
+            _ => {}
+        }
+    }
+
+    if consts.is_empty() {
+        return;
+    }
+
+    // Build substitution map for identity patterns.
+    let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
+
+    for (id, node) in &mut block.nodes {
+        let replacement: Option<NodeId> = match node {
+            // x + 0 → x, 0 + x → x
+            ValueNode::Int32Add { left, right } | ValueNode::CheckedSmiAdd { left, right } => {
+                if consts.get(right) == Some(&0) {
+                    Some(*left)
+                } else if consts.get(left) == Some(&0) {
+                    Some(*right)
+                } else {
+                    None
+                }
+            }
+            // x - 0 → x
+            ValueNode::Int32Subtract { left, right }
+            | ValueNode::CheckedSmiSubtract { left, right } => {
+                if consts.get(right) == Some(&0) {
+                    Some(*left)
+                } else {
+                    None
+                }
+            }
+            // x * 1 → x, 1 * x → x, x * 0 → 0, 0 * x → 0
+            ValueNode::Int32Multiply { left, right }
+            | ValueNode::CheckedSmiMultiply { left, right } => {
+                if consts.get(right) == Some(&1) {
+                    Some(*left)
+                } else if consts.get(left) == Some(&1) || consts.get(right) == Some(&0) {
+                    Some(*right)
+                } else if consts.get(left) == Some(&0) {
+                    Some(*left)
+                } else {
+                    None
+                }
+            }
+            // x | 0 → x, 0 | x → x
+            ValueNode::Int32BitwiseOr { left, right } => {
+                if consts.get(right) == Some(&0) {
+                    Some(*left)
+                } else if consts.get(left) == Some(&0) {
+                    Some(*right)
+                } else {
+                    None
+                }
+            }
+            // x ^ 0 → x, 0 ^ x → x
+            ValueNode::Int32BitwiseXor { left, right } => {
+                if consts.get(right) == Some(&0) {
+                    Some(*left)
+                } else if consts.get(left) == Some(&0) {
+                    Some(*right)
+                } else {
+                    None
+                }
+            }
+            // x & -1 → x, -1 & x → x
+            ValueNode::Int32BitwiseAnd { left, right } => {
+                if consts.get(right) == Some(&-1) {
+                    Some(*left)
+                } else if consts.get(left) == Some(&-1) {
+                    Some(*right)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(canonical_id) = replacement {
+            subst.insert(*id, canonical_id);
+            *node = ValueNode::UndefinedConstant;
+        }
+    }
+
+    if !subst.is_empty() {
+        apply_subst_to_block(block, &subst);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Pass 1.5 — Strength reduction
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -413,6 +529,103 @@ fn find_power_of_two_operand(
         return Some((right, val.trailing_zeros()));
     }
     None
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass 3.5 — Common subexpression elimination (CSE)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A hashable key for common-subexpression elimination.
+///
+/// Two pure nodes with the same discriminant and identical input [`NodeId`]s
+/// compute the same value.
+#[derive(Hash, Eq, PartialEq)]
+enum CseKey {
+    /// A binary pure operation: (operation kind, left operand, right operand).
+    Binary(u16, NodeId, NodeId),
+    /// A unary pure operation: (operation kind, input operand).
+    Unary(u16, NodeId),
+}
+
+/// Extract a CSE key from a pure [`ValueNode`], or `None` if the node is not
+/// eligible for CSE (side-effecting, no inputs, or not yet covered).
+fn make_cse_key(node: &ValueNode) -> Option<CseKey> {
+    match node {
+        // Binary Int32 arithmetic
+        ValueNode::Int32Add { left, right } => Some(CseKey::Binary(1, *left, *right)),
+        ValueNode::Int32Subtract { left, right } => Some(CseKey::Binary(2, *left, *right)),
+        ValueNode::Int32Multiply { left, right } => Some(CseKey::Binary(3, *left, *right)),
+        ValueNode::Int32Divide { left, right } => Some(CseKey::Binary(4, *left, *right)),
+        ValueNode::Int32Modulus { left, right } => Some(CseKey::Binary(5, *left, *right)),
+        ValueNode::Int32BitwiseAnd { left, right } => Some(CseKey::Binary(6, *left, *right)),
+        ValueNode::Int32BitwiseOr { left, right } => Some(CseKey::Binary(7, *left, *right)),
+        ValueNode::Int32BitwiseXor { left, right } => Some(CseKey::Binary(8, *left, *right)),
+        ValueNode::Int32ShiftLeft { left, right } => Some(CseKey::Binary(9, *left, *right)),
+        ValueNode::Int32ShiftRight { left, right } => Some(CseKey::Binary(10, *left, *right)),
+        ValueNode::Int32ShiftRightLogical { left, right } => {
+            Some(CseKey::Binary(11, *left, *right))
+        }
+        // Int32 comparisons
+        ValueNode::Int32Equal { left, right } => Some(CseKey::Binary(12, *left, *right)),
+        ValueNode::Int32StrictEqual { left, right } => Some(CseKey::Binary(13, *left, *right)),
+        ValueNode::Int32LessThan { left, right } => Some(CseKey::Binary(14, *left, *right)),
+        ValueNode::Int32LessThanOrEqual { left, right } => Some(CseKey::Binary(15, *left, *right)),
+        ValueNode::Int32GreaterThan { left, right } => Some(CseKey::Binary(16, *left, *right)),
+        ValueNode::Int32GreaterThanOrEqual { left, right } => {
+            Some(CseKey::Binary(17, *left, *right))
+        }
+        // Binary Float64 arithmetic
+        ValueNode::Float64Add { left, right } => Some(CseKey::Binary(18, *left, *right)),
+        ValueNode::Float64Subtract { left, right } => Some(CseKey::Binary(19, *left, *right)),
+        ValueNode::Float64Multiply { left, right } => Some(CseKey::Binary(20, *left, *right)),
+        ValueNode::Float64Divide { left, right } => Some(CseKey::Binary(21, *left, *right)),
+        ValueNode::Float64Modulus { left, right } => Some(CseKey::Binary(22, *left, *right)),
+        // Unary operations
+        ValueNode::Int32Negate { value } => Some(CseKey::Unary(1, *value)),
+        ValueNode::Int32Increment { value } => Some(CseKey::Unary(2, *value)),
+        ValueNode::Int32Decrement { value } => Some(CseKey::Unary(3, *value)),
+        ValueNode::Float64Negate { value } => Some(CseKey::Unary(4, *value)),
+        ValueNode::ToBoolean { value } => Some(CseKey::Unary(5, *value)),
+        _ => None,
+    }
+}
+
+/// Remove duplicate pure computations within each basic block.
+///
+/// When two nodes in the same block compute the exact same operation on the
+/// same input [`NodeId`]s, the second occurrence is replaced with an
+/// [`ValueNode::UndefinedConstant`] placeholder and a substitution table
+/// redirects all downstream references to the first occurrence.  DCE cleans
+/// up the dead placeholder.
+fn eliminate_common_subexpressions(graph: &mut MaglevGraph) {
+    for block in graph.blocks_mut() {
+        cse_in_block(block);
+    }
+}
+
+/// Perform local CSE within a single [`BasicBlock`].
+fn cse_in_block(block: &mut BasicBlock) {
+    let mut seen: HashMap<CseKey, NodeId> = HashMap::new();
+    let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
+
+    for (id, node) in &mut block.nodes {
+        if has_side_effects(node) {
+            continue;
+        }
+
+        if let Some(key) = make_cse_key(node) {
+            if let Some(&first_id) = seen.get(&key) {
+                subst.insert(*id, first_id);
+                *node = ValueNode::UndefinedConstant;
+            } else {
+                seen.insert(key, *id);
+            }
+        }
+    }
+
+    if !subst.is_empty() {
+        apply_subst_to_block(block, &subst);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1975,7 +2188,7 @@ mod tests {
     }
 
     #[test]
-    fn test_strength_reduce_multiply_by_1_not_reduced() {
+    fn test_strength_reduce_multiply_by_1_simplified() {
         let mut graph = MaglevGraph::new(1);
         let mut block = BasicBlock::new(0);
         let p = block.push_value(ValueNode::Parameter { index: 0 });
@@ -1986,13 +2199,15 @@ mod tests {
 
         optimize(&mut graph);
 
-        // Multiply by 1 should NOT be strength-reduced (shift by 0 is
-        // pointless; a separate identity-elimination pass would handle this).
+        // Multiply by 1 is identity-simplified (x * 1 → x), so the multiply
+        // node should no longer be present.
+        let has_mul = graph.blocks()[0]
+            .nodes
+            .iter()
+            .any(|(_, n)| matches!(n, ValueNode::Int32Multiply { .. }));
         assert!(
-            graph.blocks()[0]
-                .nodes
-                .iter()
-                .any(|(_, n)| matches!(n, ValueNode::Int32Multiply { .. }))
+            !has_mul,
+            "expected Int32Multiply(x, 1) to be identity-simplified away"
         );
     }
 
@@ -2035,6 +2250,148 @@ mod tests {
         assert!(
             check_count <= 1,
             "expected at most 1 CheckSmi, got {check_count}"
+        );
+    }
+
+    // ── Algebraic identity simplification ─────────────────────────────────────
+
+    #[test]
+    fn test_identity_add_zero_right() {
+        let mut graph = MaglevGraph::new(1);
+        let mut block = BasicBlock::new(0);
+        let p = block.push_value(ValueNode::Parameter { index: 0 });
+        let c0 = block.push_value(ValueNode::Int32Constant { value: 0 });
+        let add = block.push_value(ValueNode::Int32Add { left: p, right: c0 });
+        block.set_control(ControlNode::Return { value: add });
+        graph.add_block(block);
+
+        optimize(&mut graph);
+
+        // x + 0 → x; the add should be eliminated and return uses the param.
+        let has_add = graph.blocks()[0]
+            .nodes
+            .iter()
+            .any(|(_, n)| matches!(n, ValueNode::Int32Add { .. }));
+        assert!(!has_add, "expected Int32Add to be simplified away");
+    }
+
+    #[test]
+    fn test_identity_multiply_by_one() {
+        let mut graph = MaglevGraph::new(1);
+        let mut block = BasicBlock::new(0);
+        let p = block.push_value(ValueNode::Parameter { index: 0 });
+        let c1 = block.push_value(ValueNode::Int32Constant { value: 1 });
+        let mul = block.push_value(ValueNode::Int32Multiply { left: p, right: c1 });
+        block.set_control(ControlNode::Return { value: mul });
+        graph.add_block(block);
+
+        optimize(&mut graph);
+
+        let has_mul = graph.blocks()[0]
+            .nodes
+            .iter()
+            .any(|(_, n)| matches!(n, ValueNode::Int32Multiply { .. }));
+        assert!(!has_mul, "expected Int32Multiply(x, 1) to be simplified");
+    }
+
+    #[test]
+    fn test_identity_multiply_by_zero() {
+        let mut graph = MaglevGraph::new(1);
+        let mut block = BasicBlock::new(0);
+        let p = block.push_value(ValueNode::Parameter { index: 0 });
+        let c0 = block.push_value(ValueNode::Int32Constant { value: 0 });
+        let mul = block.push_value(ValueNode::Int32Multiply { left: p, right: c0 });
+        block.set_control(ControlNode::Return { value: mul });
+        graph.add_block(block);
+
+        optimize(&mut graph);
+
+        let has_mul = graph.blocks()[0]
+            .nodes
+            .iter()
+            .any(|(_, n)| matches!(n, ValueNode::Int32Multiply { .. }));
+        assert!(!has_mul, "expected Int32Multiply(x, 0) to be simplified");
+    }
+
+    #[test]
+    fn test_identity_subtract_zero() {
+        let mut graph = MaglevGraph::new(1);
+        let mut block = BasicBlock::new(0);
+        let p = block.push_value(ValueNode::Parameter { index: 0 });
+        let c0 = block.push_value(ValueNode::Int32Constant { value: 0 });
+        let sub = block.push_value(ValueNode::Int32Subtract { left: p, right: c0 });
+        block.set_control(ControlNode::Return { value: sub });
+        graph.add_block(block);
+
+        optimize(&mut graph);
+
+        let has_sub = graph.blocks()[0]
+            .nodes
+            .iter()
+            .any(|(_, n)| matches!(n, ValueNode::Int32Subtract { .. }));
+        assert!(!has_sub, "expected Int32Subtract(x, 0) to be simplified");
+    }
+
+    // ── Common subexpression elimination ──────────────────────────────────────
+
+    #[test]
+    fn test_cse_duplicate_add_eliminated() {
+        let mut graph = MaglevGraph::new(2);
+        let mut block = BasicBlock::new(0);
+        let p0 = block.push_value(ValueNode::Parameter { index: 0 });
+        let p1 = block.push_value(ValueNode::Parameter { index: 1 });
+        let add1 = block.push_value(ValueNode::Int32Add {
+            left: p0,
+            right: p1,
+        });
+        let add2 = block.push_value(ValueNode::Int32Add {
+            left: p0,
+            right: p1,
+        });
+        let sum = block.push_value(ValueNode::Int32Add {
+            left: add1,
+            right: add2,
+        });
+        block.set_control(ControlNode::Return { value: sum });
+        graph.add_block(block);
+
+        let before = total_node_count(&graph);
+        optimize(&mut graph);
+        // The duplicate add should have been eliminated.
+        assert!(
+            total_node_count(&graph) < before,
+            "expected CSE to reduce node count"
+        );
+    }
+
+    #[test]
+    fn test_cse_different_ops_not_eliminated() {
+        let mut graph = MaglevGraph::new(2);
+        let mut block = BasicBlock::new(0);
+        let p0 = block.push_value(ValueNode::Parameter { index: 0 });
+        let p1 = block.push_value(ValueNode::Parameter { index: 1 });
+        let add = block.push_value(ValueNode::Int32Add {
+            left: p0,
+            right: p1,
+        });
+        let sub = block.push_value(ValueNode::Int32Subtract {
+            left: p0,
+            right: p1,
+        });
+        let result = block.push_value(ValueNode::Int32Add {
+            left: add,
+            right: sub,
+        });
+        block.set_control(ControlNode::Return { value: result });
+        graph.add_block(block);
+
+        let before = total_node_count(&graph);
+        optimize(&mut graph);
+        // Different operations on same inputs — no CSE should occur.
+        assert_eq!(
+            total_node_count(&graph),
+            before,
+            "different ops should not be CSE'd"
         );
     }
 

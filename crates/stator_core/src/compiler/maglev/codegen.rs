@@ -685,6 +685,98 @@ impl<'a> MaglevCodegen<'a> {
             // the phi's allocated location.  Emit no code here.
             ValueNode::Phi { .. } => {}
 
+            // ── Guards ───────────────────────────────────────────────────
+            //
+            // CheckSmi verifies the value fits in the Smi range (i32).
+            ValueNode::CheckSmi { receiver } | ValueNode::CheckNumber { receiver } => {
+                self.emit_load(*receiver, Reg64::R11);
+                self.emit_deopt_on_smi_overflow(0);
+                self.emit_store(id, Reg64::R11);
+            }
+            // CheckInt32IsSmi: every i32 is a valid Smi — pass-through.
+            ValueNode::CheckInt32IsSmi { input } => {
+                self.emit_load(*input, Reg64::R11);
+                self.emit_store(id, Reg64::R11);
+            }
+            // CheckUint32IsSmi: valid when the u32 fits in i32 (bit 31 clear).
+            ValueNode::CheckUint32IsSmi { input } | ValueNode::CheckHoleyFloat64IsSmi { input } => {
+                self.emit_load(*input, Reg64::R11);
+                self.emit_deopt_on_smi_overflow(0);
+                self.emit_store(id, Reg64::R11);
+            }
+
+            // ── Int32 division and modulus ────────────────────────────────
+            //
+            // x86-64 IDIV uses RAX/RDX, so we save/restore RDX (which is
+            // the allocatable register phys_reg(2)).
+            ValueNode::Int32Divide { left, right } => {
+                self.emit_load(*left, Reg64::R11);
+                self.emit_load(*right, Reg64::R10);
+                self.emit_div_zero_check(0);
+                self.masm.push(Reg64::Rdx);
+                self.emit_idiv_sequence();
+                self.masm.mov_rr(Reg64::R11, Reg64::Rax);
+                self.masm.pop(Reg64::Rdx);
+                self.emit_store(id, Reg64::R11);
+            }
+            ValueNode::Int32Modulus { left, right } => {
+                self.emit_load(*left, Reg64::R11);
+                self.emit_load(*right, Reg64::R10);
+                self.emit_div_zero_check(0);
+                self.masm.push(Reg64::Rdx);
+                self.emit_idiv_sequence();
+                self.masm.mov_rr(Reg64::R11, Reg64::Rdx);
+                self.masm.pop(Reg64::Rdx);
+                self.emit_store(id, Reg64::R11);
+            }
+
+            // ── Checked Smi division (deopt on div-by-zero or overflow) ──
+            ValueNode::CheckedSmiDivide { left, right } => {
+                self.emit_load(*left, Reg64::R11);
+                self.emit_load(*right, Reg64::R10);
+                self.emit_div_zero_check(0);
+                self.masm.push(Reg64::Rdx);
+                self.emit_idiv_sequence();
+                self.masm.mov_rr(Reg64::R11, Reg64::Rax);
+                self.masm.pop(Reg64::Rdx);
+                self.emit_deopt_on_smi_overflow(0);
+                self.emit_store(id, Reg64::R11);
+            }
+            ValueNode::CheckedSmiModulus { left, right } => {
+                self.emit_load(*left, Reg64::R11);
+                self.emit_load(*right, Reg64::R10);
+                self.emit_div_zero_check(0);
+                self.masm.push(Reg64::Rdx);
+                self.emit_idiv_sequence();
+                self.masm.mov_rr(Reg64::R11, Reg64::Rdx);
+                self.masm.pop(Reg64::Rdx);
+                self.emit_deopt_on_smi_overflow(0);
+                self.emit_store(id, Reg64::R11);
+            }
+
+            // ── Uint32 binary arithmetic ─────────────────────────────────
+            //
+            // At the i64 level, unsigned and signed add/sub/mul produce the
+            // same bit pattern; we reuse the existing instructions.
+            ValueNode::Uint32Add { left, right } => {
+                self.emit_load(*left, Reg64::R11);
+                self.emit_load(*right, Reg64::R10);
+                self.masm.add_rr(Reg64::R11, Reg64::R10);
+                self.emit_store(id, Reg64::R11);
+            }
+            ValueNode::Uint32Subtract { left, right } => {
+                self.emit_load(*left, Reg64::R11);
+                self.emit_load(*right, Reg64::R10);
+                self.masm.sub_rr(Reg64::R11, Reg64::R10);
+                self.emit_store(id, Reg64::R11);
+            }
+            ValueNode::Uint32Multiply { left, right } => {
+                self.emit_load(*left, Reg64::R11);
+                self.emit_load(*right, Reg64::R10);
+                self.masm.imul_rr(Reg64::R11, Reg64::R10);
+                self.emit_store(id, Reg64::R11);
+            }
+
             // ── Unsupported nodes → unconditional deopt ───────────────────────
             _ => {
                 self.emit_deopt_unconditional(0);
@@ -847,6 +939,51 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.emit_byte(rex);
         self.masm.emit_byte(0x0B);
         self.masm.emit_byte(modrm);
+    }
+
+    // ── Division helpers ─────────────────────────────────────────────────────
+
+    /// Emit `CQO` — sign-extend `RAX` into `RDX:RAX`.
+    fn emit_cqo(&mut self) {
+        self.masm.emit_byte(0x48); // REX.W
+        self.masm.emit_byte(0x99); // CQO
+    }
+
+    /// Emit `IDIV R10` — signed divide `RDX:RAX` by `R10`.
+    ///
+    /// After execution: quotient in `RAX`, remainder in `RDX`.
+    fn emit_idiv_r10(&mut self) {
+        // REX.WB (R10 needs REX.B): 0x49
+        self.masm.emit_byte(0x49);
+        // IDIV r/m64
+        self.masm.emit_byte(0xF7);
+        // ModRM: mod=11, /7, r/m=R10(enc=2) = 0xC0|0x38|0x02 = 0xFA
+        self.masm.emit_byte(0xFA);
+    }
+
+    /// Emit a division-by-zero guard: deopt if `R10` is zero.
+    fn emit_div_zero_check(&mut self, bytecode_offset: u32) {
+        self.masm.test_rr(Reg64::R10, Reg64::R10);
+        let code_off = self.masm.position() as u32;
+        let liveness_map = self.all_slots_live();
+        self.deopt_entries.push(DeoptEntry {
+            code_offset: code_off,
+            bytecode_offset,
+            liveness_map,
+        });
+        self.masm.jcc(CondCode::Equal, &mut self.deopt_label);
+    }
+
+    /// Emit the core 64-bit signed-divide sequence.
+    ///
+    /// Expects dividend in `R11`, divisor in `R10`.  Clobbers `RAX` and
+    /// `RDX`; the caller must save/restore `RDX` if needed.
+    ///
+    /// After return: quotient in `RAX`, remainder in `RDX`.
+    fn emit_idiv_sequence(&mut self) {
+        self.masm.mov_rr(Reg64::Rax, Reg64::R11);
+        self.emit_cqo();
+        self.emit_idiv_r10();
     }
 
     // ── Comparison helper ────────────────────────────────────────────────────
@@ -1151,6 +1288,77 @@ mod tests {
             cc.register_file_slots >= 2,
             "register file must include at least the parameters"
         );
+    }
+
+    #[test]
+    fn test_compile_check_smi_records_deopt_entry() {
+        let mut graph = MaglevGraph::new(1);
+        let mut block = BasicBlock::new(0);
+        let p0 = block.push_value(ValueNode::Parameter { index: 0 });
+        let checked = block.push_value(ValueNode::CheckSmi { receiver: p0 });
+        block.set_control(ControlNode::Return { value: checked });
+        graph.add_block(block);
+
+        let cc = do_compile(&graph, 1);
+        assert!(
+            !cc.deopt_entries.is_empty(),
+            "expected a deopt entry for CheckSmi overflow guard"
+        );
+    }
+
+    #[test]
+    fn test_compile_int32_divide_produces_code() {
+        let mut graph = MaglevGraph::new(2);
+        let mut block = BasicBlock::new(0);
+        let p0 = block.push_value(ValueNode::Parameter { index: 0 });
+        let p1 = block.push_value(ValueNode::Parameter { index: 1 });
+        let div = block.push_value(ValueNode::Int32Divide {
+            left: p0,
+            right: p1,
+        });
+        block.set_control(ControlNode::Return { value: div });
+        graph.add_block(block);
+
+        let cc = do_compile(&graph, 2);
+        assert!(cc.native_code_len > 0);
+        assert!(
+            !cc.deopt_entries.is_empty(),
+            "expected a deopt entry for div-by-zero guard"
+        );
+    }
+
+    #[test]
+    fn test_compile_int32_modulus_produces_code() {
+        let mut graph = MaglevGraph::new(2);
+        let mut block = BasicBlock::new(0);
+        let p0 = block.push_value(ValueNode::Parameter { index: 0 });
+        let p1 = block.push_value(ValueNode::Parameter { index: 1 });
+        let rem = block.push_value(ValueNode::Int32Modulus {
+            left: p0,
+            right: p1,
+        });
+        block.set_control(ControlNode::Return { value: rem });
+        graph.add_block(block);
+
+        let cc = do_compile(&graph, 2);
+        assert!(cc.native_code_len > 0);
+    }
+
+    #[test]
+    fn test_compile_uint32_add_produces_code() {
+        let mut graph = MaglevGraph::new(2);
+        let mut block = BasicBlock::new(0);
+        let p0 = block.push_value(ValueNode::Parameter { index: 0 });
+        let p1 = block.push_value(ValueNode::Parameter { index: 1 });
+        let sum = block.push_value(ValueNode::Uint32Add {
+            left: p0,
+            right: p1,
+        });
+        block.set_control(ControlNode::Return { value: sum });
+        graph.add_block(block);
+
+        let cc = do_compile(&graph, 2);
+        assert!(cc.native_code_len > 0);
     }
 
     // ── Execution tests (x86-64 / unix only) ─────────────────────────────────
