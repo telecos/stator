@@ -164,6 +164,111 @@ impl SourcePosition {
 /// to share the same cache without copying.
 type JitCodeCache = Rc<RefCell<Option<(Vec<u8>, usize)>>>;
 
+/// Persistent executable JIT code region.
+///
+/// Holds an `mmap`'d region of executable memory that persists across calls,
+/// avoiding the cost of `mmap`/`munmap` per invocation (two syscalls per call).
+/// Created lazily on first JIT execution and freed when the last
+/// [`BytecodeArray`] clone referencing it is dropped.
+#[cfg(all(target_arch = "x86_64", unix))]
+#[derive(Debug)]
+pub struct JitExecutableCode {
+    /// Pointer to `mmap`'d executable memory.
+    ptr: *mut u8,
+    /// Size of the `mmap`'d region in bytes.
+    size: usize,
+    /// Number of `i64` register-file slots the JIT code expects.
+    pub register_file_slots: usize,
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+impl JitExecutableCode {
+    /// Create a new executable code region from raw machine code bytes.
+    ///
+    /// Allocates a read-write-execute memory region via `mmap`, copies the
+    /// code into it, and returns the persistent handle.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `code` contains valid x86-64 machine code
+    /// following the JIT calling convention.
+    pub unsafe fn new(code: &[u8], register_file_slots: usize) -> Option<Self> {
+        use std::ptr;
+        if code.is_empty() {
+            return None;
+        }
+        let size = code.len();
+        // SAFETY: arguments are valid; MAP_FAILED is checked below.
+        let mem = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if mem == libc::MAP_FAILED {
+            return None;
+        }
+        // SAFETY: `mem` is valid, page-aligned, and sized for `size` bytes.
+        unsafe {
+            ptr::copy_nonoverlapping(code.as_ptr(), mem.cast::<u8>(), size);
+        }
+        Some(Self {
+            ptr: mem.cast::<u8>(),
+            size,
+            register_file_slots,
+        })
+    }
+
+    /// Execute the cached JIT code with the given register-file arguments.
+    ///
+    /// # Safety
+    ///
+    /// The stored code must still be valid x86-64 machine code that follows
+    /// the JIT calling convention (`extern "C" fn(*mut i64) -> i64`).
+    pub unsafe fn execute(&self, args: &[i64]) -> i64 {
+        let mut regs = vec![0i64; self.register_file_slots];
+        for (i, &v) in args.iter().enumerate().take(regs.len()) {
+            regs[i] = v;
+        }
+        // SAFETY: `self.ptr` contains valid x86-64 JIT code.
+        let f: extern "C" fn(*mut i64) -> i64 = unsafe { std::mem::transmute(self.ptr) };
+        f(regs.as_mut_ptr())
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+impl Drop for JitExecutableCode {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() && self.size > 0 {
+            // SAFETY: `self.ptr` is a valid `mmap`'d region of `self.size` bytes.
+            unsafe {
+                libc::munmap(self.ptr.cast(), self.size);
+            }
+        }
+    }
+}
+
+// SAFETY: JitExecutableCode is only accessed from the interpreter's single
+// thread.  The mmap'd memory is read-only after initial copy.
+#[cfg(all(target_arch = "x86_64", unix))]
+unsafe impl Send for JitExecutableCode {}
+#[cfg(all(target_arch = "x86_64", unix))]
+unsafe impl Sync for JitExecutableCode {}
+
+/// Shared persistent executable JIT code cache.
+///
+/// Created lazily on first baseline JIT execution.  All clones of a
+/// [`BytecodeArray`] share the same cache via [`Rc`].
+#[cfg(all(target_arch = "x86_64", unix))]
+pub type JitExecutableCache = Rc<RefCell<Option<JitExecutableCode>>>;
+/// Stub type for platforms without JIT support.
+#[cfg(not(all(target_arch = "x86_64", unix)))]
+pub type JitExecutableCache = Rc<RefCell<Option<()>>>;
+
 /// Shared decoded bytecode cache stored in a [`BytecodeArray`].
 ///
 /// The cache is filled on first decode and then shared by all clones of the
@@ -308,6 +413,11 @@ pub struct BytecodeArray {
     /// [`BaselineCompiler`][crate::compiler::baseline::compiler::BaselineCompiler].
     /// `None` until tiering has been triggered and compilation succeeded.
     jit_code: JitCodeCache,
+    /// Persistent executable JIT code cache.
+    ///
+    /// Created lazily on first baseline JIT execution.  Holds a persistent
+    /// `mmap`'d code region so subsequent calls avoid syscall overhead.
+    jit_executable: JitExecutableCache,
     /// Cached Maglev-JIT machine code and register-file slot count.
     ///
     /// Uses [`Arc`] + [`Mutex`] so the background Maglev compilation thread
@@ -511,6 +621,7 @@ impl BytecodeArray {
             is_arrow: false,
             invocation_count: Rc::new(Cell::new(0)),
             jit_code: Rc::new(RefCell::new(None)),
+            jit_executable: Rc::new(RefCell::new(None)),
             maglev_jit_code: Arc::new(Mutex::new(None)),
             maglev_compile_started: Arc::new(AtomicBool::new(false)),
             turbofan_jit_code: Arc::new(Mutex::new(None)),
@@ -1087,6 +1198,15 @@ impl BytecodeArray {
     /// only on the platform and CPU that produced them.
     pub fn try_get_jit_code(&self) -> Option<(Vec<u8>, usize)> {
         self.jit_code.borrow().clone()
+    }
+
+    /// Returns a shared reference to the persistent executable JIT code cache.
+    ///
+    /// On the first call after baseline JIT compilation, the cache is empty
+    /// and the caller should populate it via [`JitExecutableCode::new`].
+    /// Subsequent calls return the cached executable code directly.
+    pub fn jit_executable_cache(&self) -> &JitExecutableCache {
+        &self.jit_executable
     }
 
     /// Returns `true` if baseline JIT code has deopted at least once,

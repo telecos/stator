@@ -1220,44 +1220,46 @@ fn try_execute_jit(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<
     }
     #[cfg(all(target_arch = "x86_64", unix))]
     {
+        use crate::bytecode::bytecode_array::JitExecutableCode;
         use crate::compiler::baseline::compiler::{
-            CompiledCode, DeoptEntry, SafepointEntry, jit_runtime_setup, jit_runtime_teardown,
-            jit_to_jsvalue_ext,
+            JIT_DEOPT, jit_runtime_setup, jit_runtime_teardown, jit_to_jsvalue_ext,
         };
-        let (code, register_file_slots) = ba.try_get_jit_code()?;
+
         let jit_args: Option<Vec<i64>> = args.iter().map(jsvalue_to_jit).collect();
         let jit_args = jit_args?;
-        // Capture the code length before moving `code` into the struct.
-        // `native_code_len` records the boundary between machine instructions
-        // and appended metadata tables; `execute()` does not use it directly
-        // but it is part of the `CompiledCode` API.
-        let native_code_len: usize = code.len();
-        let cc = CompiledCode {
-            code,
-            native_code_len,
-            register_file_slots,
-            safepoints: Vec::<SafepointEntry>::new(),
-            deopt_entries: Vec::<DeoptEntry>::new(),
-        };
+
+        let exec_cache = ba.jit_executable_cache();
+
+        // Lazily populate the executable cache on first use.
+        {
+            let needs_init = exec_cache.borrow().is_none();
+            if needs_init {
+                let (code, register_file_slots) = ba.try_get_jit_code()?;
+                // SAFETY: `code` was produced by `BaselineCompiler::compile`
+                // and contains valid x86-64 machine code.
+                let exec = unsafe { JitExecutableCode::new(&code, register_file_slots) };
+                *exec_cache.borrow_mut() = exec;
+            }
+        }
+
+        let cache_ref = exec_cache.borrow();
+        let exec = cache_ref.as_ref()?;
 
         // Set up thread-local state so runtime call stubs can access the
         // constant pool and heap-object table.
         jit_runtime_setup(ba);
 
-        // SAFETY: `cc.code` was produced by `BaselineCompiler::compile` and
-        // contains valid x86-64 machine code following the JIT calling
-        // convention (`extern "C" fn(*mut i64) -> i64`).
-        let result = unsafe { cc.execute(&jit_args) };
+        // SAFETY: the cached executable code was produced by
+        // `BaselineCompiler::compile` and contains valid x86-64 machine code
+        // following the JIT calling convention.
+        let result = unsafe { exec.execute(&jit_args) };
 
-        // Clean up: must happen regardless of success/failure.
-        let ret = match result {
-            Ok(v) => jit_to_jsvalue_ext(v).map(Ok),
-            // JIT_DEOPT or unrecognised sentinel → mark as deopted so we
-            // never waste time entering this code again.
-            Err(_) => {
-                ba.mark_jit_baseline_deopted();
-                None
-            }
+        // Check for deopt sentinel.
+        let ret = if result == JIT_DEOPT {
+            ba.mark_jit_baseline_deopted();
+            None
+        } else {
+            jit_to_jsvalue_ext(result).map(Ok)
         };
 
         jit_runtime_teardown();
