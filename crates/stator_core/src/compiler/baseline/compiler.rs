@@ -164,6 +164,14 @@ mod jit_runtime {
         /// Instead, they are pushed into this table and the register file
         /// stores `JIT_HEAP_TAG + index` as a handle.
         static RT_HEAP: RefCell<Vec<JsValue>> = const { RefCell::new(Vec::new()) };
+
+        /// Simple inline cache for [`jit_runtime_lda_named_property`].
+        ///
+        /// Each entry maps a constant-pool name index to the shape at the
+        /// time of the last lookup and the slot offset within that shape.
+        /// Cleared by [`jit_runtime_setup`] to prevent cross-function
+        /// constant-pool index collisions.
+        static RT_LDA_IC: RefCell<Vec<(u32, u64, usize)>> = const { RefCell::new(Vec::new()) };
     }
 
     // ── Setup / teardown ─────────────────────────────────────────────────
@@ -175,12 +183,14 @@ mod jit_runtime {
     pub fn jit_runtime_setup(ba: &BytecodeArray) {
         RT_BYTECODE.with(|b| b.set(ba as *const BytecodeArray));
         RT_HEAP.with(|h| h.borrow_mut().clear());
+        RT_LDA_IC.with(|ic| ic.borrow_mut().clear());
     }
 
     /// Clean up thread-local state after JIT execution.
     pub fn jit_runtime_teardown() {
         RT_BYTECODE.with(|b| b.set(std::ptr::null()));
         RT_HEAP.with(|h| h.borrow_mut().clear());
+        RT_LDA_IC.with(|ic| ic.borrow_mut().clear());
     }
 
     // ── Heap-handle helpers ──────────────────────────────────────────────
@@ -524,6 +534,170 @@ mod jit_runtime {
             }
 
             _ => None,
+        }
+    }
+
+    // ── Specialized LdaNamedProperty stub ────────────────────────────────
+
+    /// Specialized runtime stub for `LdaNamedProperty`.
+    ///
+    /// Avoids the generic opcode dispatch overhead of
+    /// [`jit_runtime_trampoline`].  Maintains a simple shape-based
+    /// inline cache so that repeated accesses to the same property on
+    /// objects with an unchanged shape use O(1) offset lookups instead
+    /// of the full `PropertyMap::get` path.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_i64`) – the JIT i64 encoding of the receiver object.
+    /// * `RSI` (`name_idx`) – constant-pool index of the property name.
+    /// * `RDX` (`_feedback_slot`) – reserved for future feedback-vector use.
+    ///
+    /// Returns the property value as `i64` in `RAX`, or [`JIT_DEOPT`].
+    pub extern "C" fn jit_runtime_lda_named_property(
+        obj_i64: i64,
+        name_idx: u32,
+        _feedback_slot: u32,
+    ) -> i64 {
+        lda_named_property_inner(obj_i64, name_idx).unwrap_or(JIT_DEOPT)
+    }
+
+    /// Inner implementation for [`jit_runtime_lda_named_property`].
+    fn lda_named_property_inner(obj_i64: i64, name_idx: u32) -> Option<i64> {
+        let obj = jit_i64_to_jsvalue(obj_i64);
+
+        match &obj {
+            JsValue::PlainObject(map_rc) => {
+                let map = map_rc.borrow();
+                let shape = map.shape_id();
+
+                // ── IC fast path: check cached (name_idx, shape_id) ─────
+                let cached_offset = RT_LDA_IC.with(|ic| {
+                    let cache = ic.borrow();
+                    for &(idx, sid, off) in cache.iter() {
+                        if idx == name_idx && sid == shape {
+                            return Some(off);
+                        }
+                    }
+                    None
+                });
+
+                if let Some(offset) = cached_offset {
+                    let val = map
+                        .get_by_offset(offset)
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined);
+                    return Some(jsvalue_to_jit_i64(val));
+                }
+
+                // ── IC miss: full lookup + cache update ─────────────────
+                let prop_name = get_rt_string_constant(name_idx)?;
+
+                if let Some(offset) = map.offset_of(&prop_name) {
+                    RT_LDA_IC.with(|ic| {
+                        let mut cache = ic.borrow_mut();
+                        if let Some(entry) = cache.iter_mut().find(|(idx, _, _)| *idx == name_idx) {
+                            entry.1 = shape;
+                            entry.2 = offset;
+                        } else {
+                            if cache.len() >= 256 {
+                                cache.remove(0);
+                            }
+                            cache.push((name_idx, shape, offset));
+                        }
+                    });
+                    let val = map
+                        .get_by_offset(offset)
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined);
+                    Some(jsvalue_to_jit_i64(val))
+                } else {
+                    Some(jsvalue_to_jit_i64(JsValue::Undefined))
+                }
+            }
+            JsValue::Array(arr) => {
+                let prop_name = get_rt_string_constant(name_idx)?;
+                if prop_name == "length" {
+                    Some(jsvalue_to_jit_i64(JsValue::Smi(arr.borrow().len() as i32)))
+                } else {
+                    Some(jsvalue_to_jit_i64(JsValue::Undefined))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    // ── Specialized CallUndefinedReceiver0 stub ──────────────────────────
+
+    /// Specialized runtime stub for `CallUndefinedReceiver0`.
+    ///
+    /// Eliminates generic opcode dispatch for zero-argument function
+    /// calls.  Handles native functions directly and attempts JIT
+    /// execution for bytecode-backed `Function` values.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`callee_i64`) – the JIT i64 encoding of the callee.
+    ///
+    /// Returns the call result as `i64` in `RAX`, or [`JIT_DEOPT`].
+    pub extern "C" fn jit_runtime_call_undefined_receiver0(callee_i64: i64) -> i64 {
+        call_undefined_receiver0_inner(callee_i64).unwrap_or(JIT_DEOPT)
+    }
+
+    /// Inner implementation for [`jit_runtime_call_undefined_receiver0`].
+    fn call_undefined_receiver0_inner(callee_i64: i64) -> Option<i64> {
+        let callee = jit_i64_to_jsvalue(callee_i64);
+        let saved_ba = RT_BYTECODE.with(|b| b.get());
+
+        match &callee {
+            JsValue::NativeFunction(f) => {
+                let result = f(vec![]);
+                RT_BYTECODE.with(|b| b.set(saved_ba));
+                match result {
+                    Ok(v) => Some(jsvalue_to_jit_i64(v)),
+                    Err(_) => None,
+                }
+            }
+            JsValue::Function(ba) => {
+                let Some((code, reg_slots)) = ba.try_get_jit_code() else {
+                    RT_BYTECODE.with(|b| b.set(saved_ba));
+                    return None;
+                };
+
+                // Save outer execution state so the inner JIT call gets a
+                // clean environment and the outer state is restored after.
+                let saved_heap = RT_HEAP.with(|h| std::mem::take(&mut *h.borrow_mut()));
+                let saved_ic = RT_LDA_IC.with(|ic| std::mem::take(&mut *ic.borrow_mut()));
+                RT_BYTECODE.with(|b| b.set(&**ba as *const BytecodeArray));
+
+                let cc = CompiledCode {
+                    code,
+                    native_code_len: 0,
+                    register_file_slots: reg_slots,
+                    safepoints: Vec::new(),
+                    deopt_entries: Vec::new(),
+                };
+                // SAFETY: code was produced by the baseline compiler for
+                // this BytecodeArray and consists of valid x86-64 instructions.
+                let jit_result = unsafe { cc.execute(&[]) };
+
+                // Convert the result while the inner RT_HEAP is still alive.
+                let result_val = match jit_result {
+                    Ok(v) => jit_to_jsvalue_ext(v),
+                    Err(_) => None,
+                };
+
+                // Restore outer execution state.
+                RT_BYTECODE.with(|b| b.set(saved_ba));
+                RT_HEAP.with(|h| *h.borrow_mut() = saved_heap);
+                RT_LDA_IC.with(|ic| *ic.borrow_mut() = saved_ic);
+
+                result_val.map(jsvalue_to_jit_i64)
+            }
+            _ => {
+                RT_BYTECODE.with(|b| b.set(saved_ba));
+                None
+            }
         }
     }
 }
@@ -1140,6 +1314,96 @@ impl<'a> BaselineCompiler<'a> {
         }
 
         // Non-x86-64 fallback: deopt.
+        #[allow(unreachable_code)]
+        self.emit_deopt(bytecode_offset);
+    }
+
+    /// Emit a specialized call to
+    /// [`jit_runtime::jit_runtime_lda_named_property`] for
+    /// `LdaNamedProperty` bytecodes.
+    ///
+    /// Unlike [`emit_runtime_stub`], this loads the object value from the
+    /// register file in JIT code and calls a dedicated runtime function that
+    /// skips generic opcode dispatch and uses shape-based inline caching.
+    #[allow(unused_variables)]
+    fn emit_lda_named_property_stub(&mut self, obj_flat: i64, name_idx: u32, bytecode_offset: u32) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            // Load object value from register file: RDI = regs[obj_flat].
+            let byte_offset = (obj_flat as i32) * 8;
+            self.masm
+                .mov_load_base_disp32(Reg64::Rdi, Reg64::R14, byte_offset);
+
+            // RSI = name_idx (constant-pool index).
+            self.masm.mov_ri(Reg64::Rsi, i64::from(name_idx));
+
+            // RDX = feedback slot (reserved, zero for now).
+            self.masm.xor_rr(Reg64::Rdx, Reg64::Rdx);
+
+            let addr = jit_runtime::jit_runtime_lda_named_property as usize as i64;
+            self.masm.mov_ri(Reg64::R11, addr);
+            self.masm.call_reg(Reg64::R11);
+
+            // ── Check for deopt ─────────────────────────────────────────
+            self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+
+            let code_off = self.masm.position() as u32;
+            let liveness_map = self.all_slots_live();
+            self.deopt_entries.push(DeoptEntry {
+                code_offset: code_off,
+                bytecode_offset,
+                liveness_map,
+            });
+            self.masm.je(&mut self.deopt_label);
+
+            // ── Success: update accumulator ─────────────────────────────
+            self.masm.mov_rr(Reg64::R12, Reg64::Rax);
+            return;
+        }
+
+        #[allow(unreachable_code)]
+        self.emit_deopt(bytecode_offset);
+    }
+
+    /// Emit a specialized call to
+    /// [`jit_runtime::jit_runtime_call_undefined_receiver0`] for
+    /// `CallUndefinedReceiver0` bytecodes.
+    ///
+    /// Loads the callee from the register file in JIT code and calls a
+    /// dedicated function that handles native and JIT-compiled callees
+    /// without generic opcode dispatch.
+    #[allow(unused_variables)]
+    fn emit_call_undefined_receiver0_stub(&mut self, callee_flat: i64, bytecode_offset: u32) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            // Load callee value from register file: RDI = regs[callee_flat].
+            let byte_offset = (callee_flat as i32) * 8;
+            self.masm
+                .mov_load_base_disp32(Reg64::Rdi, Reg64::R14, byte_offset);
+
+            let addr = jit_runtime::jit_runtime_call_undefined_receiver0 as usize as i64;
+            self.masm.mov_ri(Reg64::R11, addr);
+            self.masm.call_reg(Reg64::R11);
+
+            // ── Check for deopt ─────────────────────────────────────────
+            self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+
+            let code_off = self.masm.position() as u32;
+            let liveness_map = self.all_slots_live();
+            self.deopt_entries.push(DeoptEntry {
+                code_offset: code_off,
+                bytecode_offset,
+                liveness_map,
+            });
+            self.masm.je(&mut self.deopt_label);
+
+            // ── Success: update accumulator ─────────────────────────────
+            self.masm.mov_rr(Reg64::R12, Reg64::Rax);
+            return;
+        }
+
         #[allow(unreachable_code)]
         self.emit_deopt(bytecode_offset);
     }
@@ -1860,12 +2124,7 @@ impl<'a> BaselineCompiler<'a> {
                     return Err(bad_operand("LdaNamedProperty", 1));
                 };
                 let obj_flat = self.reg_flat_index(obj_v) as i64;
-                self.emit_runtime_stub(
-                    Opcode::LdaNamedProperty,
-                    obj_flat,
-                    i64::from(name_idx),
-                    bytecode_offset,
-                );
+                self.emit_lda_named_property_stub(obj_flat, name_idx, bytecode_offset);
             }
 
             Opcode::StaNamedProperty
@@ -1938,12 +2197,7 @@ impl<'a> BaselineCompiler<'a> {
                     return Err(bad_operand("CallUndefinedReceiver0", 0));
                 };
                 let callee_flat = self.reg_flat_index(callee_v) as i64;
-                self.emit_runtime_stub(
-                    Opcode::CallUndefinedReceiver0,
-                    callee_flat,
-                    0,
-                    bytecode_offset,
-                );
+                self.emit_call_undefined_receiver0_stub(callee_flat, bytecode_offset);
             }
 
             Opcode::CallUndefinedReceiver1 => {
