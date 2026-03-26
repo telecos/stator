@@ -57,6 +57,11 @@ use crate::bytecode::bytecodes::{Instruction, Opcode, Operand, decode_with_byte_
 use crate::compiler::baseline::masm_x64::{CondCode, Label, MacroAssembler, Reg64};
 use crate::error::{StatorError, StatorResult};
 
+#[cfg(all(target_arch = "x86_64", unix))]
+use std::cell::{Cell, RefCell};
+#[cfg(all(target_arch = "x86_64", unix))]
+use std::rc::Rc;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Table serialization constants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -96,6 +101,15 @@ pub const JIT_NULL: i64 = 0x1_0000_0003_i64;
 /// bytecode and must fall back to the interpreter.
 pub const JIT_DEOPT: i64 = i64::MIN;
 
+/// Base tag for heap-object handles in the JIT `i64` register file.
+///
+/// Complex JavaScript values (objects, arrays, functions, strings) that
+/// cannot be represented as a plain `i64` are stored in a thread-local side
+/// table.  The handle `JIT_HEAP_TAG + index` is placed in the register file
+/// instead.
+#[cfg(all(target_arch = "x86_64", unix))]
+pub(crate) const JIT_HEAP_TAG: i64 = 0x2_0000_0000_i64;
+
 /// Convert a JIT `i64` value back to a [`crate::objects::value::JsValue`].
 ///
 /// Returns `None` if `v` is not a recognised sentinel and does not fit in
@@ -121,8 +135,401 @@ pub fn jit_to_jsvalue(v: i64) -> Option<crate::objects::value::JsValue> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Metadata types
+// Runtime call-stub infrastructure (x86-64 + Unix only)
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Thread-local state used by the JIT runtime trampoline to access the
+/// constant pool and to store heap-allocated JavaScript objects that cannot
+/// be encoded as plain `i64` values.
+#[cfg(all(target_arch = "x86_64", unix))]
+mod jit_runtime {
+    use super::*;
+    use crate::objects::property_map::PropertyMap;
+    use crate::objects::value::JsValue;
+
+    thread_local! {
+        /// Raw pointer to the [`BytecodeArray`] of the currently-executing
+        /// JIT function.  Set by [`jit_runtime_setup`], cleared by
+        /// [`jit_runtime_teardown`].
+        ///
+        /// # Safety
+        ///
+        /// The pointee is alive for the entire JIT execution because the
+        /// caller of `CompiledCode::execute` holds an `Rc<BytecodeArray>`.
+        static RT_BYTECODE: Cell<*const BytecodeArray> = const { Cell::new(std::ptr::null()) };
+
+        /// Side table for heap-allocated [`JsValue`]s.
+        ///
+        /// Objects, arrays, functions, and strings cannot be encoded as `i64`.
+        /// Instead, they are pushed into this table and the register file
+        /// stores `JIT_HEAP_TAG + index` as a handle.
+        static RT_HEAP: RefCell<Vec<JsValue>> = const { RefCell::new(Vec::new()) };
+    }
+
+    // ── Setup / teardown ─────────────────────────────────────────────────
+
+    /// Prepare thread-local state before JIT execution.
+    ///
+    /// Must be called before `CompiledCode::execute` so that runtime call
+    /// stubs can access the constant pool.
+    pub fn jit_runtime_setup(ba: &BytecodeArray) {
+        RT_BYTECODE.with(|b| b.set(ba as *const BytecodeArray));
+        RT_HEAP.with(|h| h.borrow_mut().clear());
+    }
+
+    /// Clean up thread-local state after JIT execution.
+    pub fn jit_runtime_teardown() {
+        RT_BYTECODE.with(|b| b.set(std::ptr::null()));
+        RT_HEAP.with(|h| h.borrow_mut().clear());
+    }
+
+    // ── Heap-handle helpers ──────────────────────────────────────────────
+
+    /// Returns `true` if `v` is a heap-object handle.
+    #[inline]
+    fn is_heap_handle(v: i64) -> bool {
+        v >= JIT_HEAP_TAG && v < JIT_HEAP_TAG + 0x1_0000_0000
+    }
+
+    /// Allocate a new heap handle for `val`, returning the `i64` handle.
+    fn alloc_heap_handle(val: JsValue) -> i64 {
+        RT_HEAP.with(|heap| {
+            let mut heap = heap.borrow_mut();
+            let idx = heap.len();
+            heap.push(val);
+            JIT_HEAP_TAG + idx as i64
+        })
+    }
+
+    /// Retrieve the [`JsValue`] stored behind `handle`.
+    fn get_heap_object(handle: i64) -> Option<JsValue> {
+        if !is_heap_handle(handle) {
+            return None;
+        }
+        let idx = (handle - JIT_HEAP_TAG) as usize;
+        RT_HEAP.with(|heap| heap.borrow().get(idx).cloned())
+    }
+
+    /// Convert a JIT `i64` (possibly a heap handle) to a [`JsValue`].
+    fn jit_i64_to_jsvalue(v: i64) -> JsValue {
+        if is_heap_handle(v) {
+            get_heap_object(v).unwrap_or(JsValue::Undefined)
+        } else {
+            super::jit_to_jsvalue(v).unwrap_or(JsValue::Undefined)
+        }
+    }
+
+    /// Convert a [`JsValue`] to a JIT `i64`, allocating a heap handle for
+    /// complex types.
+    fn jsvalue_to_jit_i64(v: JsValue) -> i64 {
+        match &v {
+            JsValue::Smi(n) => i64::from(*n),
+            JsValue::Boolean(true) => JIT_TRUE,
+            JsValue::Boolean(false) => JIT_FALSE,
+            JsValue::Undefined => JIT_UNDEFINED,
+            JsValue::Null => JIT_NULL,
+            JsValue::HeapNumber(f) => {
+                let f = *f;
+                if f.fract() == 0.0 && f >= i32::MIN as f64 && f <= i32::MAX as f64 {
+                    f as i64
+                } else {
+                    alloc_heap_handle(v)
+                }
+            }
+            _ => alloc_heap_handle(v),
+        }
+    }
+
+    /// Extended `jit_to_jsvalue` that also resolves heap handles.
+    ///
+    /// Called by the interpreter after JIT execution to convert the return
+    /// value back to a [`JsValue`].
+    pub fn jit_to_jsvalue_ext(v: i64) -> Option<JsValue> {
+        if is_heap_handle(v) {
+            get_heap_object(v)
+        } else {
+            super::jit_to_jsvalue(v)
+        }
+    }
+
+    // ── String constant helper ───────────────────────────────────────────
+
+    /// Read a string from the constant pool of the currently-executing
+    /// JIT function.
+    fn get_rt_string_constant(idx: u32) -> Option<String> {
+        RT_BYTECODE.with(|ba_ptr| {
+            let ptr = ba_ptr.get();
+            if ptr.is_null() {
+                return None;
+            }
+            // SAFETY: The pointer is valid for the duration of JIT execution
+            // (set by jit_runtime_setup, cleared by jit_runtime_teardown).
+            let ba = unsafe { &*ptr };
+            match ba.get_constant(idx) {
+                Some(ConstantPoolEntry::String(s)) => Some(s.clone()),
+                _ => None,
+            }
+        })
+    }
+
+    // ── Trampoline entry point ───────────────────────────────────────────
+
+    /// Runtime trampoline called from JIT machine code for opcodes that
+    /// cannot be compiled to native instructions.
+    ///
+    /// # Calling convention
+    ///
+    /// System V AMD64: arguments in RDI, RSI, RDX, RCX, R8; return in RAX.
+    ///
+    /// # Returns
+    ///
+    /// The new accumulator value as `i64` on success, or [`JIT_DEOPT`] if
+    /// the operation cannot be handled (causing the entire JIT function to
+    /// fall back to the interpreter).
+    ///
+    /// # Safety
+    ///
+    /// `regs` must point to a valid, adequately-sized JIT register file
+    /// (`*mut i64`) that outlives this call.
+    pub extern "C" fn jit_runtime_trampoline(
+        opcode: u32,
+        regs: *mut i64,
+        acc: i64,
+        operand1: i64,
+        operand2: i64,
+    ) -> i64 {
+        jit_runtime_dispatch(opcode, regs, acc, operand1, operand2).unwrap_or(JIT_DEOPT)
+    }
+
+    /// Inner dispatch for the trampoline.  Returns `None` to signal deopt.
+    fn jit_runtime_dispatch(
+        opcode: u32,
+        regs: *mut i64,
+        acc: i64,
+        operand1: i64,
+        operand2: i64,
+    ) -> Option<i64> {
+        let op = Opcode::try_from_u8(opcode as u8).ok()?;
+
+        match op {
+            // ── Object / array creation ──────────────────────────────────
+            Opcode::CreateEmptyObjectLiteral => {
+                let obj = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
+                Some(jsvalue_to_jit_i64(obj))
+            }
+
+            Opcode::CreateObjectLiteral => {
+                let capacity = operand2.max(4) as usize;
+                let obj = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::with_capacity(
+                    capacity,
+                ))));
+                Some(jsvalue_to_jit_i64(obj))
+            }
+
+            Opcode::CreateEmptyArrayLiteral | Opcode::CreateArrayLiteral => {
+                let arr = JsValue::Array(Rc::new(RefCell::new(Vec::new())));
+                Some(jsvalue_to_jit_i64(arr))
+            }
+
+            // ── Named property load ──────────────────────────────────────
+            Opcode::LdaNamedProperty => {
+                let obj_flat = operand1 as usize;
+                let name_idx = operand2 as u32;
+                // SAFETY: obj_flat was computed by the compiler from a valid
+                // bytecode register operand and is within bounds.
+                let obj_i64 = unsafe { *regs.add(obj_flat) };
+                let obj = jit_i64_to_jsvalue(obj_i64);
+                let prop_name = get_rt_string_constant(name_idx)?;
+
+                let result = match &obj {
+                    JsValue::PlainObject(map) => map
+                        .borrow()
+                        .get(&prop_name)
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined),
+                    JsValue::Array(arr) => {
+                        if prop_name == "length" {
+                            JsValue::Smi(arr.borrow().len() as i32)
+                        } else {
+                            JsValue::Undefined
+                        }
+                    }
+                    _ => return None,
+                };
+                Some(jsvalue_to_jit_i64(result))
+            }
+
+            // ── Named property store ─────────────────────────────────────
+            Opcode::StaNamedProperty
+            | Opcode::StaNamedOwnProperty
+            | Opcode::DefineNamedOwnProperty => {
+                let obj_flat = operand1 as usize;
+                let name_idx = operand2 as u32;
+                // SAFETY: valid index (see above).
+                let obj_i64 = unsafe { *regs.add(obj_flat) };
+                let obj = jit_i64_to_jsvalue(obj_i64);
+                let value = jit_i64_to_jsvalue(acc);
+                let prop_name = get_rt_string_constant(name_idx)?;
+
+                match &obj {
+                    JsValue::PlainObject(map) => {
+                        map.borrow_mut().insert(prop_name, value);
+                    }
+                    _ => return None,
+                }
+                Some(acc) // accumulator unchanged
+            }
+
+            // ── Keyed property load ──────────────────────────────────────
+            Opcode::LdaKeyedProperty => {
+                let obj_flat = operand1 as usize;
+                // SAFETY: valid index.
+                let obj_i64 = unsafe { *regs.add(obj_flat) };
+                let obj = jit_i64_to_jsvalue(obj_i64);
+                let key = jit_i64_to_jsvalue(acc);
+
+                let result = match (&obj, &key) {
+                    (JsValue::Array(arr), JsValue::Smi(idx)) if *idx >= 0 => {
+                        let i = *idx as usize;
+                        let borrow = arr.borrow();
+                        match borrow.get(i) {
+                            Some(v) if !matches!(v, JsValue::TheHole) => v.clone(),
+                            _ => JsValue::Undefined,
+                        }
+                    }
+                    (JsValue::PlainObject(map), JsValue::Smi(idx)) if *idx >= 0 => {
+                        let key_str = idx.to_string();
+                        map.borrow()
+                            .get(&key_str)
+                            .cloned()
+                            .unwrap_or(JsValue::Undefined)
+                    }
+                    (JsValue::PlainObject(map), JsValue::String(s)) => map
+                        .borrow()
+                        .get(&**s)
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined),
+                    _ => return None,
+                };
+                Some(jsvalue_to_jit_i64(result))
+            }
+
+            // ── Keyed property store ─────────────────────────────────────
+            Opcode::StaKeyedProperty => {
+                let obj_flat = operand1 as usize;
+                let key_flat = operand2 as usize;
+                // SAFETY: valid indices.
+                let obj_i64 = unsafe { *regs.add(obj_flat) };
+                let key_i64 = unsafe { *regs.add(key_flat) };
+                let obj = jit_i64_to_jsvalue(obj_i64);
+                let key = jit_i64_to_jsvalue(key_i64);
+                let value = jit_i64_to_jsvalue(acc);
+
+                match (&obj, &key) {
+                    (JsValue::Array(arr), JsValue::Smi(idx)) if *idx >= 0 => {
+                        let i = *idx as usize;
+                        let mut v = arr.borrow_mut();
+                        if i >= v.len() {
+                            v.resize(i + 1, JsValue::TheHole);
+                        }
+                        v[i] = value;
+                    }
+                    (JsValue::PlainObject(map), JsValue::Smi(idx)) if *idx >= 0 => {
+                        let key_str = idx.to_string();
+                        map.borrow_mut().insert(key_str, value);
+                    }
+                    (JsValue::PlainObject(map), JsValue::String(s)) => {
+                        map.borrow_mut().insert(s.to_string(), value);
+                    }
+                    _ => return None,
+                }
+                Some(acc)
+            }
+
+            // ── Array literal store ──────────────────────────────────────
+            Opcode::StaInArrayLiteral => {
+                let arr_flat = operand1 as usize;
+                let idx_flat = operand2 as usize;
+                // SAFETY: valid indices.
+                let arr_i64 = unsafe { *regs.add(arr_flat) };
+                let idx_i64 = unsafe { *regs.add(idx_flat) };
+                let arr = jit_i64_to_jsvalue(arr_i64);
+                let idx = jit_i64_to_jsvalue(idx_i64);
+                let value = jit_i64_to_jsvalue(acc);
+
+                match (&arr, &idx) {
+                    (JsValue::Array(arr), JsValue::Smi(i)) if *i >= 0 => {
+                        let i = *i as usize;
+                        let mut v = arr.borrow_mut();
+                        if i >= v.len() {
+                            v.resize(i + 1, JsValue::TheHole);
+                        }
+                        v[i] = value;
+                    }
+                    _ => return None,
+                }
+                Some(acc)
+            }
+
+            // ── Function calls (native functions only) ───────────────────
+            Opcode::CallUndefinedReceiver0 => {
+                let callee_flat = operand1 as usize;
+                // SAFETY: valid index.
+                let callee_i64 = unsafe { *regs.add(callee_flat) };
+                let callee = jit_i64_to_jsvalue(callee_i64);
+
+                // Save the bytecode pointer in case the native function
+                // triggers inner JIT execution that overwrites it.
+                let saved_ba = RT_BYTECODE.with(|b| b.get());
+
+                let result = if let JsValue::NativeFunction(f) = callee {
+                    f(vec![])
+                } else {
+                    RT_BYTECODE.with(|b| b.set(saved_ba));
+                    return None;
+                };
+
+                RT_BYTECODE.with(|b| b.set(saved_ba));
+
+                match result {
+                    Ok(v) => Some(jsvalue_to_jit_i64(v)),
+                    Err(_) => None,
+                }
+            }
+
+            Opcode::CallUndefinedReceiver1 => {
+                let callee_flat = operand1 as usize;
+                let arg1_flat = operand2 as usize;
+                // SAFETY: valid indices.
+                let callee_i64 = unsafe { *regs.add(callee_flat) };
+                let arg1_i64 = unsafe { *regs.add(arg1_flat) };
+                let callee = jit_i64_to_jsvalue(callee_i64);
+                let arg1 = jit_i64_to_jsvalue(arg1_i64);
+
+                let saved_ba = RT_BYTECODE.with(|b| b.get());
+
+                let result = if let JsValue::NativeFunction(f) = callee {
+                    f(vec![arg1])
+                } else {
+                    RT_BYTECODE.with(|b| b.set(saved_ba));
+                    return None;
+                };
+
+                RT_BYTECODE.with(|b| b.set(saved_ba));
+
+                match result {
+                    Ok(v) => Some(jsvalue_to_jit_i64(v)),
+                    Err(_) => None,
+                }
+            }
+
+            _ => None,
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+pub use jit_runtime::{jit_runtime_setup, jit_runtime_teardown, jit_to_jsvalue_ext};
 
 /// A single entry in the safepoint table.
 ///
@@ -514,6 +921,19 @@ impl<'a> BaselineCompiler<'a> {
         (flat_index * 8) as i32
     }
 
+    /// Compute the flat slot index for a bytecode register operand `v`.
+    ///
+    /// This is the element index into the `*mut i64` register file (not a
+    /// byte offset).
+    fn reg_flat_index(&self, v: u32) -> usize {
+        let signed = v as i32;
+        if signed >= 0 {
+            self.param_count + signed as usize
+        } else {
+            (-(signed + 1)) as usize
+        }
+    }
+
     /// Emit code to load register `v` into `dst`.
     fn emit_load_reg(&mut self, dst: Reg64, v: u32) {
         let off = self.reg_offset(v);
@@ -542,6 +962,51 @@ impl<'a> BaselineCompiler<'a> {
         // Convert raw 0/1 → JIT_FALSE/JIT_TRUE by adding JIT_FALSE.
         self.masm.mov_ri(Reg64::R11, JIT_FALSE);
         self.masm.add_rr(Reg64::R12, Reg64::R11);
+    }
+
+    /// Try to fuse a comparison opcode with a following conditional jump.
+    ///
+    /// If the instruction at `idx + 1` is `JumpIfFalse`, `JumpIfTrue`,
+    /// `JumpIfToBooleanFalse`, or `JumpIfToBooleanTrue`, emit a fused
+    /// `mov r11,[r14+off]; cmp r12,r11; jcc target` sequence and return
+    /// `Ok(1)` (one extra instruction consumed). Otherwise return `Ok(0)`.
+    fn try_fuse_compare_jump(
+        &mut self,
+        idx: usize,
+        instructions: &[Instruction],
+        byte_offsets: &[usize],
+        v: u32,
+        cc: CondCode,
+    ) -> StatorResult<usize> {
+        let n = instructions.len();
+        let next_idx = idx + 1;
+        if next_idx >= n {
+            return Ok(0);
+        }
+
+        let next = &instructions[next_idx];
+        let fused_cc = match next.opcode {
+            Opcode::JumpIfFalse | Opcode::JumpIfToBooleanFalse => negate_cc(cc),
+            Opcode::JumpIfTrue | Opcode::JumpIfToBooleanTrue => cc,
+            _ => return Ok(0),
+        };
+
+        let Operand::JumpOffset(delta) = next.operands[0] else {
+            return Ok(0);
+        };
+
+        let target = Self::resolve_target(
+            jump_target_byte(next_idx, delta, byte_offsets),
+            byte_offsets,
+            n,
+        )?;
+
+        // Emit fused: load RHS, compare, conditional jump.
+        self.emit_load_reg(Reg64::R11, v);
+        self.masm.cmp_rr(Reg64::R12, Reg64::R11);
+        self.emit_cond_jump(fused_cc, target);
+
+        Ok(1)
     }
 
     /// Emit code that compares R12 against `sentinel` and converts the result
@@ -613,6 +1078,72 @@ impl<'a> BaselineCompiler<'a> {
         self.masm.jmp(&mut self.deopt_label);
     }
 
+    // ── Runtime call-stub emission ───────────────────────────────────────────
+
+    /// Emit a call to the runtime trampoline for an opcode that cannot be
+    /// natively compiled.
+    ///
+    /// On x86-64 + Unix this emits the full call sequence (parameter setup,
+    /// indirect `CALL`, deopt check, accumulator update).  On all other
+    /// platforms it falls back to [`emit_deopt`](Self::emit_deopt).
+    ///
+    /// # Parameters
+    ///
+    /// * `opcode` – discriminant of the [`Opcode`] to execute at runtime.
+    /// * `operand1` / `operand2` – opcode-specific operand values (typically
+    ///   flat register-file slot indices or constant-pool indices).
+    /// * `bytecode_offset` – byte offset in the bytecode stream (for the
+    ///   deopt entry if the trampoline returns [`JIT_DEOPT`]).
+    #[allow(unused_variables)]
+    fn emit_runtime_stub(
+        &mut self,
+        opcode: Opcode,
+        operand1: i64,
+        operand2: i64,
+        bytecode_offset: u32,
+    ) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            // ── Set up SysV AMD64 arguments ─────────────────────────────
+            //   RDI = opcode (u32)
+            //   RSI = register-file base pointer (R14)
+            //   RDX = accumulator value (R12)
+            //   RCX = operand1
+            //   R8  = operand2
+            self.masm.mov_ri(Reg64::Rdi, opcode as u8 as i64);
+            self.masm.mov_rr(Reg64::Rsi, Reg64::R14);
+            self.masm.mov_rr(Reg64::Rdx, Reg64::R12);
+            self.masm.mov_ri(Reg64::Rcx, operand1);
+            self.masm.mov_ri(Reg64::R8, operand2);
+
+            // Load trampoline address into R11 and call.
+            let trampoline_addr = jit_runtime::jit_runtime_trampoline as usize as i64;
+            self.masm.mov_ri(Reg64::R11, trampoline_addr);
+            self.masm.call_reg(Reg64::R11);
+
+            // ── Check for deopt ─────────────────────────────────────────
+            self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+
+            let code_off = self.masm.position() as u32;
+            let liveness_map = self.all_slots_live();
+            self.deopt_entries.push(DeoptEntry {
+                code_offset: code_off,
+                bytecode_offset,
+                liveness_map,
+            });
+            self.masm.je(&mut self.deopt_label);
+
+            // ── Success: update accumulator ─────────────────────────────
+            self.masm.mov_rr(Reg64::R12, Reg64::Rax);
+            return;
+        }
+
+        // Non-x86-64 fallback: deopt.
+        #[allow(unreachable_code)]
+        self.emit_deopt(bytecode_offset);
+    }
+
     // ── Main compilation pass ────────────────────────────────────────────────
 
     fn compile_function(&mut self) -> StatorResult<()> {
@@ -624,7 +1155,10 @@ impl<'a> BaselineCompiler<'a> {
 
         self.emit_prologue();
 
-        for (idx, instr) in instructions.iter().enumerate() {
+        let mut idx = 0;
+        while idx < n {
+            let instr = &instructions[idx];
+
             // Bind the label for this instruction to the current code position.
             self.masm.bind_label(&mut self.labels[idx]);
 
@@ -635,13 +1169,27 @@ impl<'a> BaselineCompiler<'a> {
                 gc_map: 0,
             });
 
-            self.compile_instruction(
+            let extra = self.compile_instruction(
                 idx,
                 &instructions,
                 &byte_offsets,
                 instr,
                 byte_offsets[idx] as u32,
             )?;
+
+            // Bind labels and record safepoints for any fused (skipped)
+            // instructions so that jump targets into them still resolve.
+            for skip_i in 1..=extra {
+                let fused_idx = idx + skip_i;
+                self.masm.bind_label(&mut self.labels[fused_idx]);
+                self.safepoints.push(SafepointEntry {
+                    code_offset: self.masm.position() as u32,
+                    bytecode_index: fused_idx as u32,
+                    gc_map: 0,
+                });
+            }
+
+            idx += 1 + extra;
         }
 
         // Emit the deopt epilogue after the normal instruction stream.
@@ -658,7 +1206,7 @@ impl<'a> BaselineCompiler<'a> {
         byte_offsets: &[usize],
         instr: &Instruction,
         bytecode_offset: u32,
-    ) -> StatorResult<()> {
+    ) -> StatorResult<usize> {
         let n = instructions.len();
 
         match instr.opcode {
@@ -894,6 +1442,11 @@ impl<'a> BaselineCompiler<'a> {
                 let Operand::Register(v) = instr.operands[0] else {
                     return Err(bad_operand("TestLessThan", 0));
                 };
+                let fused =
+                    self.try_fuse_compare_jump(idx, instructions, byte_offsets, v, CondCode::Less)?;
+                if fused > 0 {
+                    return Ok(fused);
+                }
                 self.emit_compare_and_set(v, CondCode::Less);
             }
             Opcode::TestLessThanJump => {
@@ -914,17 +1467,14 @@ impl<'a> BaselineCompiler<'a> {
                     byte_offsets,
                     n,
                 )?;
-                self.emit_compare_and_set(v, CondCode::Less);
-                self.masm.mov_ri(
-                    Reg64::R11,
-                    if is_true_flag == 0 {
-                        JIT_FALSE
-                    } else {
-                        JIT_TRUE
-                    },
-                );
+                let fused_cc = if is_true_flag == 0 {
+                    negate_cc(CondCode::Less)
+                } else {
+                    CondCode::Less
+                };
+                self.emit_load_reg(Reg64::R11, v);
                 self.masm.cmp_rr(Reg64::R12, Reg64::R11);
-                self.emit_cond_jump(CondCode::Equal, target);
+                self.emit_cond_jump(fused_cc, target);
             }
             Opcode::TestGreaterThanJump => {
                 let Operand::Register(v) = instr.operands[0] else {
@@ -944,17 +1494,14 @@ impl<'a> BaselineCompiler<'a> {
                     byte_offsets,
                     n,
                 )?;
-                self.emit_compare_and_set(v, CondCode::Greater);
-                self.masm.mov_ri(
-                    Reg64::R11,
-                    if is_true_flag == 0 {
-                        JIT_FALSE
-                    } else {
-                        JIT_TRUE
-                    },
-                );
+                let fused_cc = if is_true_flag == 0 {
+                    negate_cc(CondCode::Greater)
+                } else {
+                    CondCode::Greater
+                };
+                self.emit_load_reg(Reg64::R11, v);
                 self.masm.cmp_rr(Reg64::R12, Reg64::R11);
-                self.emit_cond_jump(CondCode::Equal, target);
+                self.emit_cond_jump(fused_cc, target);
             }
             Opcode::TestEqualJump => {
                 let Operand::Register(v) = instr.operands[0] else {
@@ -974,17 +1521,14 @@ impl<'a> BaselineCompiler<'a> {
                     byte_offsets,
                     n,
                 )?;
-                self.emit_compare_and_set(v, CondCode::Equal);
-                self.masm.mov_ri(
-                    Reg64::R11,
-                    if is_true_flag == 0 {
-                        JIT_FALSE
-                    } else {
-                        JIT_TRUE
-                    },
-                );
+                let fused_cc = if is_true_flag == 0 {
+                    negate_cc(CondCode::Equal)
+                } else {
+                    CondCode::Equal
+                };
+                self.emit_load_reg(Reg64::R11, v);
                 self.masm.cmp_rr(Reg64::R12, Reg64::R11);
-                self.emit_cond_jump(CondCode::Equal, target);
+                self.emit_cond_jump(fused_cc, target);
             }
             Opcode::TestEqualStrictJump => {
                 let Operand::Register(v) = instr.operands[0] else {
@@ -1004,17 +1548,14 @@ impl<'a> BaselineCompiler<'a> {
                     byte_offsets,
                     n,
                 )?;
-                self.emit_compare_and_set(v, CondCode::Equal);
-                self.masm.mov_ri(
-                    Reg64::R11,
-                    if is_true_flag == 0 {
-                        JIT_FALSE
-                    } else {
-                        JIT_TRUE
-                    },
-                );
+                let fused_cc = if is_true_flag == 0 {
+                    negate_cc(CondCode::Equal)
+                } else {
+                    CondCode::Equal
+                };
+                self.emit_load_reg(Reg64::R11, v);
                 self.masm.cmp_rr(Reg64::R12, Reg64::R11);
-                self.emit_cond_jump(CondCode::Equal, target);
+                self.emit_cond_jump(fused_cc, target);
             }
             Opcode::SubSmiStar => {
                 let Operand::Immediate(imm) = instr.operands[0] else {
@@ -1033,30 +1574,80 @@ impl<'a> BaselineCompiler<'a> {
                 let Operand::Register(v) = instr.operands[0] else {
                     return Err(bad_operand("TestGreaterThan", 0));
                 };
+                let fused = self.try_fuse_compare_jump(
+                    idx,
+                    instructions,
+                    byte_offsets,
+                    v,
+                    CondCode::Greater,
+                )?;
+                if fused > 0 {
+                    return Ok(fused);
+                }
                 self.emit_compare_and_set(v, CondCode::Greater);
             }
             Opcode::TestLessThanOrEqual => {
                 let Operand::Register(v) = instr.operands[0] else {
                     return Err(bad_operand("TestLessThanOrEqual", 0));
                 };
+                let fused = self.try_fuse_compare_jump(
+                    idx,
+                    instructions,
+                    byte_offsets,
+                    v,
+                    CondCode::LessEq,
+                )?;
+                if fused > 0 {
+                    return Ok(fused);
+                }
                 self.emit_compare_and_set(v, CondCode::LessEq);
             }
             Opcode::TestGreaterThanOrEqual => {
                 let Operand::Register(v) = instr.operands[0] else {
                     return Err(bad_operand("TestGreaterThanOrEqual", 0));
                 };
+                let fused = self.try_fuse_compare_jump(
+                    idx,
+                    instructions,
+                    byte_offsets,
+                    v,
+                    CondCode::GreaterEq,
+                )?;
+                if fused > 0 {
+                    return Ok(fused);
+                }
                 self.emit_compare_and_set(v, CondCode::GreaterEq);
             }
             Opcode::TestEqual | Opcode::TestEqualStrict => {
                 let Operand::Register(v) = instr.operands[0] else {
                     return Err(bad_operand("TestEqual", 0));
                 };
+                let fused = self.try_fuse_compare_jump(
+                    idx,
+                    instructions,
+                    byte_offsets,
+                    v,
+                    CondCode::Equal,
+                )?;
+                if fused > 0 {
+                    return Ok(fused);
+                }
                 self.emit_compare_and_set(v, CondCode::Equal);
             }
             Opcode::TestNotEqual => {
                 let Operand::Register(v) = instr.operands[0] else {
                     return Err(bad_operand("TestNotEqual", 0));
                 };
+                let fused = self.try_fuse_compare_jump(
+                    idx,
+                    instructions,
+                    byte_offsets,
+                    v,
+                    CondCode::NotEqual,
+                )?;
+                if fused > 0 {
+                    return Ok(fused);
+                }
                 self.emit_compare_and_set(v, CondCode::NotEqual);
             }
             Opcode::TestNull => {
@@ -1236,17 +1827,146 @@ impl<'a> BaselineCompiler<'a> {
                 // These carry no runtime semantics; emit nothing.
             }
 
-            // ── IC stubs / property access / calls → deopt ────────────────────
-            Opcode::LdaNamedProperty
-            | Opcode::LdaNamedPropertyFromSuper
-            | Opcode::LdaKeyedProperty
-            | Opcode::LdaEnumeratedKeyedProperty
-            | Opcode::StaNamedProperty
+            // ── Runtime call stubs ───────────────────────────────────────────
+            //
+            // These opcodes call into the Rust runtime trampoline instead of
+            // deopting the whole function.  The loop skeleton still runs
+            // natively; only the complex operations go through Rust.
+            Opcode::CreateEmptyObjectLiteral => {
+                self.emit_runtime_stub(Opcode::CreateEmptyObjectLiteral, 0, 0, bytecode_offset);
+            }
+
+            Opcode::CreateObjectLiteral => {
+                let capacity = match instr.operands.get(2) {
+                    Some(Operand::Flag(count)) if *count > 0 => i64::from(*count),
+                    _ => 4,
+                };
+                self.emit_runtime_stub(Opcode::CreateObjectLiteral, 0, capacity, bytecode_offset);
+            }
+
+            Opcode::CreateEmptyArrayLiteral => {
+                self.emit_runtime_stub(Opcode::CreateEmptyArrayLiteral, 0, 0, bytecode_offset);
+            }
+
+            Opcode::CreateArrayLiteral => {
+                self.emit_runtime_stub(Opcode::CreateArrayLiteral, 0, 0, bytecode_offset);
+            }
+
+            Opcode::LdaNamedProperty => {
+                let Operand::Register(obj_v) = instr.operands[0] else {
+                    return Err(bad_operand("LdaNamedProperty", 0));
+                };
+                let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+                    return Err(bad_operand("LdaNamedProperty", 1));
+                };
+                let obj_flat = self.reg_flat_index(obj_v) as i64;
+                self.emit_runtime_stub(
+                    Opcode::LdaNamedProperty,
+                    obj_flat,
+                    i64::from(name_idx),
+                    bytecode_offset,
+                );
+            }
+
+            Opcode::StaNamedProperty
             | Opcode::StaNamedOwnProperty
-            | Opcode::StaKeyedProperty
-            | Opcode::DefineNamedOwnProperty
+            | Opcode::DefineNamedOwnProperty => {
+                let opname = match instr.opcode {
+                    Opcode::StaNamedProperty => "StaNamedProperty",
+                    Opcode::StaNamedOwnProperty => "StaNamedOwnProperty",
+                    _ => "DefineNamedOwnProperty",
+                };
+                let Operand::Register(obj_v) = instr.operands[0] else {
+                    return Err(bad_operand(opname, 0));
+                };
+                let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+                    return Err(bad_operand(opname, 1));
+                };
+                let obj_flat = self.reg_flat_index(obj_v) as i64;
+                self.emit_runtime_stub(
+                    instr.opcode,
+                    obj_flat,
+                    i64::from(name_idx),
+                    bytecode_offset,
+                );
+            }
+
+            Opcode::LdaKeyedProperty => {
+                let Operand::Register(obj_v) = instr.operands[0] else {
+                    return Err(bad_operand("LdaKeyedProperty", 0));
+                };
+                let obj_flat = self.reg_flat_index(obj_v) as i64;
+                self.emit_runtime_stub(Opcode::LdaKeyedProperty, obj_flat, 0, bytecode_offset);
+            }
+
+            Opcode::StaKeyedProperty => {
+                let Operand::Register(obj_v) = instr.operands[0] else {
+                    return Err(bad_operand("StaKeyedProperty", 0));
+                };
+                let Operand::Register(key_v) = instr.operands[1] else {
+                    return Err(bad_operand("StaKeyedProperty", 1));
+                };
+                let obj_flat = self.reg_flat_index(obj_v) as i64;
+                let key_flat = self.reg_flat_index(key_v) as i64;
+                self.emit_runtime_stub(
+                    Opcode::StaKeyedProperty,
+                    obj_flat,
+                    key_flat,
+                    bytecode_offset,
+                );
+            }
+
+            Opcode::StaInArrayLiteral => {
+                let Operand::Register(arr_v) = instr.operands[0] else {
+                    return Err(bad_operand("StaInArrayLiteral", 0));
+                };
+                let Operand::Register(idx_v) = instr.operands[1] else {
+                    return Err(bad_operand("StaInArrayLiteral", 1));
+                };
+                let arr_flat = self.reg_flat_index(arr_v) as i64;
+                let idx_flat = self.reg_flat_index(idx_v) as i64;
+                self.emit_runtime_stub(
+                    Opcode::StaInArrayLiteral,
+                    arr_flat,
+                    idx_flat,
+                    bytecode_offset,
+                );
+            }
+
+            Opcode::CallUndefinedReceiver0 => {
+                let Operand::Register(callee_v) = instr.operands[0] else {
+                    return Err(bad_operand("CallUndefinedReceiver0", 0));
+                };
+                let callee_flat = self.reg_flat_index(callee_v) as i64;
+                self.emit_runtime_stub(
+                    Opcode::CallUndefinedReceiver0,
+                    callee_flat,
+                    0,
+                    bytecode_offset,
+                );
+            }
+
+            Opcode::CallUndefinedReceiver1 => {
+                let Operand::Register(callee_v) = instr.operands[0] else {
+                    return Err(bad_operand("CallUndefinedReceiver1", 0));
+                };
+                let Operand::Register(arg1_v) = instr.operands[1] else {
+                    return Err(bad_operand("CallUndefinedReceiver1", 1));
+                };
+                let callee_flat = self.reg_flat_index(callee_v) as i64;
+                let arg1_flat = self.reg_flat_index(arg1_v) as i64;
+                self.emit_runtime_stub(
+                    Opcode::CallUndefinedReceiver1,
+                    callee_flat,
+                    arg1_flat,
+                    bytecode_offset,
+                );
+            }
+
+            // ── Remaining unsupported opcodes → deopt ────────────────────────
+            Opcode::LdaNamedPropertyFromSuper
+            | Opcode::LdaEnumeratedKeyedProperty
             | Opcode::DefineKeyedOwnProperty
-            | Opcode::StaInArrayLiteral
             | Opcode::DefineKeyedOwnPropertyInLiteral
             | Opcode::SetLiteralPrototype
             | Opcode::LdaGlobal
@@ -1271,8 +1991,6 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::CallProperty0
             | Opcode::CallProperty1
             | Opcode::CallProperty2
-            | Opcode::CallUndefinedReceiver0
-            | Opcode::CallUndefinedReceiver1
             | Opcode::CallUndefinedReceiver2
             | Opcode::CallWithSpread
             | Opcode::CallRuntime
@@ -1294,11 +2012,7 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::CreateUnmappedArguments
             | Opcode::CreateRestParameter
             | Opcode::CreateRegExpLiteral
-            | Opcode::CreateArrayLiteral
             | Opcode::CreateArrayFromIterable
-            | Opcode::CreateEmptyArrayLiteral
-            | Opcode::CreateObjectLiteral
-            | Opcode::CreateEmptyObjectLiteral
             | Opcode::CreateObjectFromIterable
             | Opcode::GetIterator
             | Opcode::GetAsyncIterator
@@ -1396,7 +2110,7 @@ impl<'a> BaselineCompiler<'a> {
                 )));
             }
         }
-        Ok(())
+        Ok(0)
     }
 }
 
@@ -1419,6 +2133,21 @@ fn jump_target_byte(idx: usize, delta: i32, byte_offsets: &[usize]) -> usize {
 #[cold]
 fn bad_operand(opcode: &'static str, i: usize) -> StatorError {
     StatorError::Internal(format!("{opcode}: unexpected operand at index {i}"))
+}
+
+/// Return the inverse condition code (e.g. `Less` → `GreaterEq`).
+///
+/// Used when fusing a comparison with `JumpIfFalse`: the jump fires when the
+/// comparison was *false*, so we negate the original condition.
+fn negate_cc(cc: CondCode) -> CondCode {
+    match cc {
+        CondCode::Less => CondCode::GreaterEq,
+        CondCode::Greater => CondCode::LessEq,
+        CondCode::LessEq => CondCode::Greater,
+        CondCode::GreaterEq => CondCode::Less,
+        CondCode::Equal => CondCode::NotEqual,
+        CondCode::NotEqual => CondCode::Equal,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -1217,7 +1217,8 @@ fn try_execute_jit(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<
     #[cfg(all(target_arch = "x86_64", unix))]
     {
         use crate::compiler::baseline::compiler::{
-            CompiledCode, DeoptEntry, SafepointEntry, jit_to_jsvalue,
+            CompiledCode, DeoptEntry, SafepointEntry, jit_runtime_setup, jit_runtime_teardown,
+            jit_to_jsvalue_ext,
         };
         let (code, register_file_slots) = ba.try_get_jit_code()?;
         let jit_args: Option<Vec<i64>> = args.iter().map(jsvalue_to_jit).collect();
@@ -1234,14 +1235,25 @@ fn try_execute_jit(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<
             safepoints: Vec::<SafepointEntry>::new(),
             deopt_entries: Vec::<DeoptEntry>::new(),
         };
+
+        // Set up thread-local state so runtime call stubs can access the
+        // constant pool and heap-object table.
+        jit_runtime_setup(ba);
+
         // SAFETY: `cc.code` was produced by `BaselineCompiler::compile` and
         // contains valid x86-64 machine code following the JIT calling
         // convention (`extern "C" fn(*mut i64) -> i64`).
-        return match unsafe { cc.execute(&jit_args) } {
-            Ok(v) => jit_to_jsvalue(v).map(Ok),
+        let result = unsafe { cc.execute(&jit_args) };
+
+        // Clean up: must happen regardless of success/failure.
+        let ret = match result {
+            Ok(v) => jit_to_jsvalue_ext(v).map(Ok),
             // JIT_DEOPT or unrecognised sentinel → fall back to interpreter.
             Err(_) => None,
         };
+
+        jit_runtime_teardown();
+        return ret;
     }
     #[allow(unreachable_code)]
     let _ = (ba, args);
