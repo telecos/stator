@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+      - fix/w13j
+  workflow_dispatch:
 
 concurrency:
   group: benchmarks-${{ github.ref }}
