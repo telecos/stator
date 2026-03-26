@@ -3844,19 +3844,11 @@ impl Interpreter {
                                     && !ba.is_generator()
                                     && !ba.is_async()
                                 {
-                                    let is_arrow = ba.is_arrow();
-                                    let is_strict = ba.is_strict();
-                                    let has_self_name = ba.self_name_register().is_some();
-                                    let has_fn_props = is_arrow && ba.has_fn_props();
-                                    let closure_ctx = ba.closure_context().map(Rc::clone);
-                                    let ba = Rc::clone(ba);
+                                    // Try inline BEFORE any Rc clones.
                                     if ba.bytecode_count() <= 25
                                         && !ba.has_exception_handler()
-                                        && let Some(result) = try_inline_small_function(
-                                            ba.as_ref(),
-                                            &[],
-                                            &frame.global_env,
-                                        )
+                                        && let Some(result) =
+                                            try_inline_small_function(ba, &[], &frame.global_env)
                                     {
                                         match result {
                                             JsValue::Smi(v) => {
@@ -3875,6 +3867,14 @@ impl Interpreter {
                                     // Only sync the PC for error traces — the
                                     // accumulator is dead here (overwritten by
                                     // the call result or rebuilt on Err).
+                                    // Extract all data from ba and clone it before
+                                    // mutating frame (releases the register borrow).
+                                    let is_arrow = ba.is_arrow();
+                                    let is_strict = ba.is_strict();
+                                    let has_self_name = ba.self_name_register().is_some();
+                                    let has_fn_props = is_arrow && ba.has_fn_props();
+                                    let closure_ctx = ba.closure_context().map(Rc::clone);
+                                    let ba = Rc::clone(ba);
                                     frame.pc = pc;
 
                                     let saved_this = if !is_arrow && is_strict {
@@ -3997,6 +3997,32 @@ impl Interpreter {
                                     && !ba.is_generator()
                                     && !ba.is_async()
                                 {
+                                    // Try inline BEFORE cloning Rc — saves atomic
+                                    // refcount bump when function is small.
+                                    if ba.bytecode_count() <= 25 && !ba.has_exception_handler() {
+                                        let arg1 = unsafe { frame.read_reg_unchecked(arg_reg) }
+                                            .cheap_clone();
+                                        let inline_args = [arg1];
+                                        if let Some(result) = try_inline_small_function(
+                                            ba,
+                                            &inline_args,
+                                            &frame.global_env,
+                                        ) {
+                                            match result {
+                                                JsValue::Smi(v) => {
+                                                    sa = v;
+                                                    hot_acc = Some(NanBoxedValue::from_smi(v));
+                                                    continue 'smi;
+                                                }
+                                                v => {
+                                                    acc = v;
+                                                    frame.smi_mode = false;
+                                                    frame.loop_end_pc = 0;
+                                                    break 'smi;
+                                                }
+                                            }
+                                        }
+                                    }
                                     let is_arrow = ba.is_arrow();
                                     let is_strict = ba.is_strict();
                                     let has_self_name = ba.self_name_register().is_some();
@@ -4005,29 +4031,6 @@ impl Interpreter {
                                     let ba = Rc::clone(ba);
                                     let arg1 =
                                         unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
-                                    let inline_args = [arg1.cheap_clone()];
-                                    if ba.bytecode_count() <= 25
-                                        && !ba.has_exception_handler()
-                                        && let Some(result) = try_inline_small_function(
-                                            ba.as_ref(),
-                                            &inline_args,
-                                            &frame.global_env,
-                                        )
-                                    {
-                                        match result {
-                                            JsValue::Smi(v) => {
-                                                sa = v;
-                                                hot_acc = Some(NanBoxedValue::from_smi(v));
-                                                continue 'smi;
-                                            }
-                                            v => {
-                                                acc = v;
-                                                frame.smi_mode = false;
-                                                frame.loop_end_pc = 0;
-                                                break 'smi;
-                                            }
-                                        }
-                                    }
                                     // Only sync the PC for error traces.
                                     frame.pc = pc;
                                     let args: CallArgs = smallvec::smallvec![arg1];
