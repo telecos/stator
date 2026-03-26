@@ -625,6 +625,67 @@ impl MacroAssembler {
         }
     }
 
+    /// `OR dst, src` — bitwise OR of two 64-bit registers (`dst |= src`).
+    ///
+    /// Encoding: `REX.W 0B /r` (OR r64, r/m64).
+    pub fn or_rr(&mut self, dst: Reg64, src: Reg64) {
+        self.emit_rex_wrb(dst, src);
+        self.buf.push(0x0B);
+        self.emit_modrm_rr(dst, src);
+    }
+
+    /// `OR dst, imm` — bitwise OR with a sign-extended 32-bit immediate.
+    ///
+    /// Uses the 4-byte `REX.W 83 /1 imm8` form when `imm` fits in a signed
+    /// byte, and the 7-byte `REX.W 81 /1 imm32` form otherwise.
+    pub fn or_ri(&mut self, dst: Reg64, imm: i32) {
+        self.emit_rex_wrb(Reg64::Rax, dst);
+        if (i8::MIN as i32..=i8::MAX as i32).contains(&imm) {
+            self.buf.push(0x83);
+            self.emit_modrm_digit(1, dst);
+            self.buf.push(imm as i8 as u8);
+        } else {
+            self.buf.push(0x81);
+            self.emit_modrm_digit(1, dst);
+            self.emit_i32(imm);
+        }
+    }
+
+    /// `AND dst, src` — bitwise AND of two 64-bit registers (`dst &= src`).
+    ///
+    /// Encoding: `REX.W 23 /r` (AND r64, r/m64).
+    pub fn and_rr(&mut self, dst: Reg64, src: Reg64) {
+        self.emit_rex_wrb(dst, src);
+        self.buf.push(0x23);
+        self.emit_modrm_rr(dst, src);
+    }
+
+    /// `AND dst, imm` — bitwise AND with a sign-extended 32-bit immediate.
+    ///
+    /// Uses the 4-byte `REX.W 83 /4 imm8` form when `imm` fits in a signed
+    /// byte, and the 7-byte `REX.W 81 /4 imm32` form otherwise.
+    pub fn and_ri(&mut self, dst: Reg64, imm: i32) {
+        self.emit_rex_wrb(Reg64::Rax, dst);
+        if (i8::MIN as i32..=i8::MAX as i32).contains(&imm) {
+            self.buf.push(0x83);
+            self.emit_modrm_digit(4, dst);
+            self.buf.push(imm as i8 as u8);
+        } else {
+            self.buf.push(0x81);
+            self.emit_modrm_digit(4, dst);
+            self.emit_i32(imm);
+        }
+    }
+
+    /// `NOT dst` — bitwise NOT (one's complement) of a 64-bit register.
+    ///
+    /// Encoding: `REX.W F7 /2`.
+    pub fn not_r(&mut self, dst: Reg64) {
+        self.emit_rex_wrb(Reg64::Rax, dst);
+        self.buf.push(0xF7);
+        self.emit_modrm_digit(2, dst);
+    }
+
     /// `IMUL dst, src` — signed multiply, two-operand form (`dst *= src`).
     ///
     /// Encoding: `REX.W 0F AF /r` (IMUL r64, r/m64).

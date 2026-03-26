@@ -845,6 +845,50 @@ impl<'a> BaselineCompiler<'a> {
                 self.masm.neg_r(Reg64::R12);
             }
 
+            // ── Bitwise ─────────────────────────────────────────────────────
+            Opcode::BitwiseOr => {
+                let Operand::Register(v) = instr.operands[0] else {
+                    return Err(bad_operand("BitwiseOr", 0));
+                };
+                self.emit_load_reg(Reg64::R11, v);
+                self.masm.or_rr(Reg64::R12, Reg64::R11);
+            }
+            Opcode::BitwiseAnd => {
+                let Operand::Register(v) = instr.operands[0] else {
+                    return Err(bad_operand("BitwiseAnd", 0));
+                };
+                self.emit_load_reg(Reg64::R11, v);
+                self.masm.and_rr(Reg64::R12, Reg64::R11);
+            }
+            Opcode::BitwiseXor => {
+                let Operand::Register(v) = instr.operands[0] else {
+                    return Err(bad_operand("BitwiseXor", 0));
+                };
+                self.emit_load_reg(Reg64::R11, v);
+                self.masm.xor_rr(Reg64::R12, Reg64::R11);
+            }
+            Opcode::BitwiseOrSmi => {
+                let Operand::Immediate(imm) = instr.operands[0] else {
+                    return Err(bad_operand("BitwiseOrSmi", 0));
+                };
+                self.masm.or_ri(Reg64::R12, imm);
+            }
+            Opcode::BitwiseAndSmi => {
+                let Operand::Immediate(imm) = instr.operands[0] else {
+                    return Err(bad_operand("BitwiseAndSmi", 0));
+                };
+                self.masm.and_ri(Reg64::R12, imm);
+            }
+            Opcode::BitwiseXorSmi => {
+                let Operand::Immediate(imm) = instr.operands[0] else {
+                    return Err(bad_operand("BitwiseXorSmi", 0));
+                };
+                self.masm.xor_ri(Reg64::R12, imm);
+            }
+            Opcode::BitwiseNot => {
+                self.masm.not_r(Reg64::R12);
+            }
+
             // ── Comparisons ──────────────────────────────────────────────────
             Opcode::TestLessThan => {
                 let Operand::Register(v) = instr.operands[0] else {
@@ -1311,22 +1355,15 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::Div
             | Opcode::Mod
             | Opcode::Exp
-            | Opcode::BitwiseOr
-            | Opcode::BitwiseXor
-            | Opcode::BitwiseAnd
             | Opcode::ShiftLeft
             | Opcode::ShiftRight
             | Opcode::ShiftRightLogical
             | Opcode::DivSmi
             | Opcode::ModSmi
             | Opcode::ExpSmi
-            | Opcode::BitwiseOrSmi
-            | Opcode::BitwiseXorSmi
-            | Opcode::BitwiseAndSmi
             | Opcode::ShiftLeftSmi
             | Opcode::ShiftRightSmi
             | Opcode::ShiftRightLogicalSmi
-            | Opcode::BitwiseNot
             | Opcode::DefineGetterProperty
             | Opcode::DefineSetterProperty
             | Opcode::DefineKeyedGetterProperty
