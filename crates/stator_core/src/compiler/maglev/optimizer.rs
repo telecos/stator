@@ -78,8 +78,10 @@ use crate::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, NodeId, 
 /// sufficient for the patterns targeted here.
 pub fn optimize(graph: &mut MaglevGraph) {
     fold_constants(graph);
+    strength_reduce(graph);
     crate::compiler::maglev::range_analysis::eliminate_overflow_checks(graph);
     crate::compiler::maglev::licm::hoist_loop_invariants(graph);
+    eliminate_local_cse(graph);
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
     eliminate_dead_code(graph);
@@ -284,6 +286,201 @@ fn fold_f64_bin(
         None => return None,
     };
     Some(ValueNode::Float64Constant { value: op(lv, rv) })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass 1.1 — Strength reduction
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Replace expensive operations with cheaper equivalents.
+///
+/// Currently implemented:
+/// - `Int32Multiply(x, 2^n)` → `Int32ShiftLeft(x, n)` where `n` is known at
+///   compile time from a constant input.
+fn strength_reduce(graph: &mut MaglevGraph) {
+    for block in graph.blocks_mut() {
+        strength_reduce_block(block);
+    }
+}
+
+fn strength_reduce_block(block: &mut BasicBlock) {
+    // First, collect all Int32Constant values by NodeId.
+    let constants: HashMap<NodeId, i32> = block
+        .nodes
+        .iter()
+        .filter_map(|(id, node)| {
+            if let ValueNode::Int32Constant { value } = node {
+                Some((*id, *value))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for (_id, node) in &mut block.nodes {
+        if let ValueNode::Int32Multiply { left, right } = node {
+            // Check if either operand is a constant power of 2.
+            if let Some(&c) = constants.get(right) {
+                let shift = c.trailing_zeros();
+                if c > 0 && c.count_ones() == 1 && shift > 0 && shift < 32 {
+                    *node = ValueNode::Int32ShiftLeft {
+                        left: *left,
+                        right: *right,
+                    };
+                }
+            } else if let Some(&c) = constants.get(left) {
+                let shift = c.trailing_zeros();
+                if c > 0 && c.count_ones() == 1 && shift > 0 && shift < 32 {
+                    *node = ValueNode::Int32ShiftLeft {
+                        left: *right,
+                        right: *left,
+                    };
+                }
+            }
+        }
+    }
+
+    // Patch any constant nodes that were used as shift amounts from
+    // strength-reduced multiplies.  We must change the constant value from
+    // the power-of-2 to the shift amount (trailing_zeros).
+    //
+    // Collect which constant NodeIds need patching and their new values.
+    let mut patches: Vec<(NodeId, i32)> = Vec::new();
+    for (_id, node) in &block.nodes {
+        if let ValueNode::Int32ShiftLeft { right, .. } = node
+            && let Some(&c) = constants.get(right)
+            && c > 1
+            && c.count_ones() == 1
+        {
+            patches.push((*right, c.trailing_zeros() as i32));
+        }
+    }
+    for (patch_id, new_val) in patches {
+        for (id, node) in &mut block.nodes {
+            if *id == patch_id
+                && let ValueNode::Int32Constant { value } = node
+            {
+                *value = new_val;
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass 1.5 — Local common subexpression elimination (CSE)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Key for CSE: identifies an operation by its opcode discriminant and inputs.
+///
+/// Two pure value nodes with the same `CseKey` produce identical results, so
+/// the second can be replaced by a reference to the first.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct CseKey {
+    /// Discriminant of the [`ValueNode`] variant (used as opcode tag).
+    tag: std::mem::Discriminant<ValueNode>,
+    /// Input [`NodeId`]s in a canonical order.
+    inputs: smallvec::SmallVec<[NodeId; 2]>,
+}
+
+/// Eliminate redundant pure computations within each basic block.
+///
+/// For each block, the pass scans nodes linearly.  When a pure node (no
+/// side-effects) is encountered whose (tag, inputs) pair matches an earlier
+/// node in the same block, the duplicate is replaced with
+/// `UndefinedConstant` and a substitution is recorded.  The substitution is
+/// then applied to all downstream node inputs and the block's control node.
+fn eliminate_local_cse(graph: &mut MaglevGraph) {
+    for block in graph.blocks_mut() {
+        eliminate_cse_in_block(block);
+    }
+}
+
+/// Extract the CSE key for a node, or `None` if the node has side-effects or
+/// is not eligible for CSE.
+fn cse_key(node: &ValueNode) -> Option<CseKey> {
+    use smallvec::smallvec;
+    // Only CSE pure nodes with deterministic inputs.
+    if has_side_effects(node) {
+        return None;
+    }
+    let tag = std::mem::discriminant(node);
+    let inputs: smallvec::SmallVec<[NodeId; 2]> = match node {
+        // Binary arithmetic / comparisons — two inputs.
+        ValueNode::Int32Add { left, right }
+        | ValueNode::Int32Subtract { left, right }
+        | ValueNode::Int32Multiply { left, right }
+        | ValueNode::Int32Divide { left, right }
+        | ValueNode::Int32Modulus { left, right }
+        | ValueNode::Int32BitwiseAnd { left, right }
+        | ValueNode::Int32BitwiseOr { left, right }
+        | ValueNode::Int32BitwiseXor { left, right }
+        | ValueNode::Int32ShiftLeft { left, right }
+        | ValueNode::Int32ShiftRight { left, right }
+        | ValueNode::Int32ShiftRightLogical { left, right }
+        | ValueNode::Float64Add { left, right }
+        | ValueNode::Float64Subtract { left, right }
+        | ValueNode::Float64Multiply { left, right }
+        | ValueNode::Float64Divide { left, right }
+        | ValueNode::Float64Modulus { left, right }
+        | ValueNode::Int32Equal { left, right }
+        | ValueNode::Int32StrictEqual { left, right }
+        | ValueNode::Int32LessThan { left, right }
+        | ValueNode::Int32LessThanOrEqual { left, right }
+        | ValueNode::Int32GreaterThan { left, right }
+        | ValueNode::Int32GreaterThanOrEqual { left, right }
+        | ValueNode::Float64Equal { left, right }
+        | ValueNode::Float64LessThan { left, right }
+        | ValueNode::Float64LessThanOrEqual { left, right }
+        | ValueNode::Float64GreaterThan { left, right }
+        | ValueNode::Float64GreaterThanOrEqual { left, right }
+        | ValueNode::TaggedEqual { left, right, .. }
+        | ValueNode::TaggedNotEqual { left, right, .. } => {
+            smallvec![*left, *right]
+        }
+        // Unary — single input.
+        ValueNode::Int32Negate { value }
+        | ValueNode::Int32Increment { value }
+        | ValueNode::Int32Decrement { value }
+        | ValueNode::Float64Negate { value }
+        | ValueNode::ToBoolean { value }
+        | ValueNode::TypeOf { value }
+        | ValueNode::ChangeInt32ToFloat64 { input: value }
+        | ValueNode::ChangeUint32ToFloat64 { input: value }
+        | ValueNode::ChangeFloat64ToInt32 { input: value }
+        | ValueNode::ChangeInt32ToTagged { input: value }
+        | ValueNode::ChangeUint32ToTagged { input: value }
+        | ValueNode::ChangeFloat64ToTagged { input: value }
+        | ValueNode::ChangeTaggedToInt32 { input: value }
+        | ValueNode::ChangeTaggedToUint32 { input: value }
+        | ValueNode::ChangeTaggedToFloat64 { input: value } => {
+            smallvec![*value]
+        }
+        // Everything else: not eligible for CSE.
+        _ => return None,
+    };
+    Some(CseKey { tag, inputs })
+}
+
+fn eliminate_cse_in_block(block: &mut BasicBlock) {
+    let mut seen: HashMap<CseKey, NodeId> = HashMap::new();
+    let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
+
+    for (id, node) in &mut block.nodes {
+        if let Some(key) = cse_key(node) {
+            if let Some(&first) = seen.get(&key) {
+                subst.insert(*id, first);
+                *node = ValueNode::UndefinedConstant;
+            } else {
+                seen.insert(key, *id);
+            }
+        }
+    }
+
+    if subst.is_empty() {
+        return;
+    }
+
+    apply_subst_to_block(block, &subst);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
