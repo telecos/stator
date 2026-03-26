@@ -533,6 +533,119 @@ mod jit_runtime {
                 }
             }
 
+            // ── Context slot loads/stores ────────────────────────────────
+            //
+            // The trampoline does not currently have access to the execution
+            // context chain, so these will deopt at runtime.  The stubs are
+            // wired up so future trampoline enhancements can handle them
+            // without recompilation.
+            Opcode::LdaCurrentContextSlot
+            | Opcode::LdaImmutableCurrentContextSlot
+            | Opcode::StaCurrentContextSlot
+            | Opcode::LdaContextSlot
+            | Opcode::LdaImmutableContextSlot
+            | Opcode::StaContextSlot => None,
+
+            // ── Global variable access ──────────────────────────────────
+            Opcode::LdaGlobal | Opcode::StaGlobal => None,
+
+            // ── Dynamic scope lookup ────────────────────────────────────
+            Opcode::LdaLookupSlot => None,
+
+            // ── ToString ────────────────────────────────────────────────
+            Opcode::ToString => {
+                let val = jit_i64_to_jsvalue(acc);
+                let s = match &val {
+                    JsValue::String(_) => return Some(acc),
+                    JsValue::Smi(n) => n.to_string(),
+                    JsValue::Boolean(true) => "true".to_string(),
+                    JsValue::Boolean(false) => "false".to_string(),
+                    JsValue::Undefined => "undefined".to_string(),
+                    JsValue::Null => "null".to_string(),
+                    JsValue::HeapNumber(f) => {
+                        if f.is_nan() {
+                            "NaN".to_string()
+                        } else if f.is_infinite() {
+                            if *f > 0.0 {
+                                "Infinity".to_string()
+                            } else {
+                                "-Infinity".to_string()
+                            }
+                        } else {
+                            format!("{f}")
+                        }
+                    }
+                    _ => return None,
+                };
+                Some(jsvalue_to_jit_i64(JsValue::String(Rc::from(s.as_str()))))
+            }
+
+            // ── TypeOf ──────────────────────────────────────────────────
+            Opcode::TypeOf => {
+                let val = jit_i64_to_jsvalue(acc);
+                let type_str = match &val {
+                    JsValue::Undefined => "undefined",
+                    JsValue::Null => "object",
+                    JsValue::Boolean(_) => "boolean",
+                    JsValue::Smi(_) | JsValue::HeapNumber(_) => "number",
+                    JsValue::String(_) => "string",
+                    JsValue::NativeFunction(_) | JsValue::Function(_) => "function",
+                    _ => "object",
+                };
+                Some(jsvalue_to_jit_i64(JsValue::String(Rc::from(type_str))))
+            }
+
+            // ── Bit shift operations ────────────────────────────────────
+            Opcode::ShiftLeft => {
+                let lhs_flat = operand1 as usize;
+                // SAFETY: lhs_flat was computed by the compiler from a valid
+                // bytecode register operand and is within bounds.
+                let lhs_i64 = unsafe { *regs.add(lhs_flat) };
+                let lhs = jit_i64_to_jsvalue(lhs_i64);
+                let rhs = jit_i64_to_jsvalue(acc);
+                match (&lhs, &rhs) {
+                    (JsValue::Smi(l), JsValue::Smi(r)) => {
+                        let result = l << ((*r as u32) & 0x1f);
+                        Some(i64::from(result))
+                    }
+                    _ => None,
+                }
+            }
+
+            Opcode::ShiftRight => {
+                let lhs_flat = operand1 as usize;
+                // SAFETY: valid index (see ShiftLeft above).
+                let lhs_i64 = unsafe { *regs.add(lhs_flat) };
+                let lhs = jit_i64_to_jsvalue(lhs_i64);
+                let rhs = jit_i64_to_jsvalue(acc);
+                match (&lhs, &rhs) {
+                    (JsValue::Smi(l), JsValue::Smi(r)) => {
+                        let result = l >> ((*r as u32) & 0x1f);
+                        Some(i64::from(result))
+                    }
+                    _ => None,
+                }
+            }
+
+            Opcode::ShiftRightLogical => {
+                let lhs_flat = operand1 as usize;
+                // SAFETY: valid index (see ShiftLeft above).
+                let lhs_i64 = unsafe { *regs.add(lhs_flat) };
+                let lhs = jit_i64_to_jsvalue(lhs_i64);
+                let rhs = jit_i64_to_jsvalue(acc);
+                match (&lhs, &rhs) {
+                    (JsValue::Smi(l), JsValue::Smi(r)) => {
+                        let result = (*l as u32) >> ((*r as u32) & 0x1f);
+                        if result <= i32::MAX as u32 {
+                            Some(i64::from(result as i32))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+
             _ => None,
         }
     }
@@ -2217,22 +2330,116 @@ impl<'a> BaselineCompiler<'a> {
                 );
             }
 
+            // ── Context slot runtime stubs ───────────────────────────────────
+            //
+            // The trampoline does not currently have access to the execution
+            // context chain, so these will deopt at runtime.  The stubs are
+            // wired up so future trampoline enhancements can handle them
+            // without recompilation.
+            Opcode::LdaCurrentContextSlot | Opcode::LdaImmutableCurrentContextSlot => {
+                let Operand::ConstantPoolIdx(slot) = instr.operands[0] else {
+                    return Err(bad_operand("LdaCurrentContextSlot", 0));
+                };
+                self.emit_runtime_stub(instr.opcode, i64::from(slot), 0, bytecode_offset);
+            }
+
+            Opcode::StaCurrentContextSlot => {
+                let Operand::ConstantPoolIdx(slot) = instr.operands[0] else {
+                    return Err(bad_operand("StaCurrentContextSlot", 0));
+                };
+                self.emit_runtime_stub(
+                    Opcode::StaCurrentContextSlot,
+                    i64::from(slot),
+                    0,
+                    bytecode_offset,
+                );
+            }
+
+            Opcode::LdaContextSlot | Opcode::LdaImmutableContextSlot => {
+                let Operand::Register(ctx_v) = instr.operands[0] else {
+                    return Err(bad_operand("LdaContextSlot", 0));
+                };
+                let Operand::ConstantPoolIdx(slot) = instr.operands[1] else {
+                    return Err(bad_operand("LdaContextSlot", 1));
+                };
+                let ctx_flat = self.reg_flat_index(ctx_v) as i64;
+                self.emit_runtime_stub(instr.opcode, i64::from(slot), ctx_flat, bytecode_offset);
+            }
+
+            Opcode::StaContextSlot => {
+                let Operand::Register(ctx_v) = instr.operands[0] else {
+                    return Err(bad_operand("StaContextSlot", 0));
+                };
+                let Operand::ConstantPoolIdx(slot) = instr.operands[1] else {
+                    return Err(bad_operand("StaContextSlot", 1));
+                };
+                let ctx_flat = self.reg_flat_index(ctx_v) as i64;
+                self.emit_runtime_stub(
+                    Opcode::StaContextSlot,
+                    i64::from(slot),
+                    ctx_flat,
+                    bytecode_offset,
+                );
+            }
+
+            // ── Global variable runtime stubs ────────────────────────────────
+            Opcode::LdaGlobal => {
+                let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+                    return Err(bad_operand("LdaGlobal", 0));
+                };
+                self.emit_runtime_stub(Opcode::LdaGlobal, i64::from(name_idx), 0, bytecode_offset);
+            }
+
+            Opcode::StaGlobal => {
+                let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+                    return Err(bad_operand("StaGlobal", 0));
+                };
+                self.emit_runtime_stub(Opcode::StaGlobal, i64::from(name_idx), 0, bytecode_offset);
+            }
+
+            // ── Dynamic scope lookup stub ────────────────────────────────────
+            Opcode::LdaLookupSlot => {
+                let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+                    return Err(bad_operand("LdaLookupSlot", 0));
+                };
+                self.emit_runtime_stub(
+                    Opcode::LdaLookupSlot,
+                    i64::from(name_idx),
+                    0,
+                    bytecode_offset,
+                );
+            }
+
+            // ── ToString / TypeOf runtime stubs ──────────────────────────────
+            Opcode::ToString => {
+                self.emit_runtime_stub(Opcode::ToString, 0, 0, bytecode_offset);
+            }
+
+            Opcode::TypeOf => {
+                self.emit_runtime_stub(Opcode::TypeOf, 0, 0, bytecode_offset);
+            }
+
+            // ── Bit shift runtime stubs ──────────────────────────────────────
+            Opcode::ShiftLeft | Opcode::ShiftRight | Opcode::ShiftRightLogical => {
+                let opname = match instr.opcode {
+                    Opcode::ShiftLeft => "ShiftLeft",
+                    Opcode::ShiftRight => "ShiftRight",
+                    _ => "ShiftRightLogical",
+                };
+                let Operand::Register(v) = instr.operands[0] else {
+                    return Err(bad_operand(opname, 0));
+                };
+                let lhs_flat = self.reg_flat_index(v) as i64;
+                self.emit_runtime_stub(instr.opcode, lhs_flat, 0, bytecode_offset);
+            }
+
             // ── Remaining unsupported opcodes → deopt ────────────────────────
             Opcode::LdaNamedPropertyFromSuper
             | Opcode::LdaEnumeratedKeyedProperty
             | Opcode::DefineKeyedOwnProperty
             | Opcode::DefineKeyedOwnPropertyInLiteral
             | Opcode::SetLiteralPrototype
-            | Opcode::LdaGlobal
             | Opcode::LdaGlobalInsideTypeof
-            | Opcode::StaGlobal
-            | Opcode::LdaContextSlot
-            | Opcode::LdaImmutableContextSlot
-            | Opcode::LdaCurrentContextSlot
-            | Opcode::LdaImmutableCurrentContextSlot
-            | Opcode::StaContextSlot
-            | Opcode::StaCurrentContextSlot
-            | Opcode::LdaLookupSlot
             | Opcode::LdaLookupContextSlot
             | Opcode::LdaLookupGlobalSlot
             | Opcode::LdaLookupSlotInsideTypeof
@@ -2289,9 +2496,7 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::ToNumber
             | Opcode::ToNumeric
             | Opcode::ToObject
-            | Opcode::ToString
             | Opcode::ToBoolean
-            | Opcode::TypeOf
             | Opcode::DeletePropertyStrict
             | Opcode::DeletePropertySloppy
             | Opcode::TestReferenceEqual
@@ -2323,9 +2528,6 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::Div
             | Opcode::Mod
             | Opcode::Exp
-            | Opcode::ShiftLeft
-            | Opcode::ShiftRight
-            | Opcode::ShiftRightLogical
             | Opcode::DivSmi
             | Opcode::ModSmi
             | Opcode::ExpSmi
