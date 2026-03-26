@@ -1514,7 +1514,7 @@ pub type CallArgs = SmallVec<[JsValue; 4]>;
 /// 16 slots (384 bytes) covers the vast majority of closures and small
 /// functions while keeping `InterpreterFrame` compact.  Larger register
 /// files spill to the thread-local register pool.
-pub const SMALL_REG_THRESHOLD: usize = 16;
+pub const SMALL_REG_THRESHOLD: usize = 24;
 
 /// Inline-buffered register storage for interpreter frames.
 pub type RegisterFile = SmallVec<[JsValue; SMALL_REG_THRESHOLD]>;
@@ -1558,7 +1558,7 @@ fn release_registers(regs: RegisterFile) {
 }
 
 /// Maximum number of [`InterpreterFrame`] structs kept in the thread-local pool.
-const FRAME_POOL_CAP: usize = 8;
+const FRAME_POOL_CAP: usize = 16;
 
 /// Acquire an [`InterpreterFrame`] from the thread-local pool, or allocate a
 /// new one.  When a pooled frame is available its fields are reset in-place,
@@ -9206,12 +9206,31 @@ fn inline_context_slot_update(
             }
             _ => return None,
         },
+        Opcode::Dec => match current {
+            JsValue::Smi(value) => match value.checked_sub(1) {
+                Some(result) => JsValue::Smi(result),
+                None => JsValue::HeapNumber(value as f64 - 1.0),
+            },
+            JsValue::BigInt(value) => JsValue::BigInt(Box::new(value.wrapping_sub(1))),
+            _ if is_inline_primitive(&current) => {
+                number_to_jsvalue(current.to_number().ok()? - 1.0)
+            }
+            _ => return None,
+        },
         Opcode::AddSmi => {
             if matches!(current, JsValue::BigInt(_)) {
                 return None;
             }
             number_to_jsvalue(
                 current.to_number().ok()? + f64::from(checked_operand_imm(update, 0)?),
+            )
+        }
+        Opcode::SubSmi => {
+            if matches!(current, JsValue::BigInt(_)) {
+                return None;
+            }
+            number_to_jsvalue(
+                current.to_number().ok()? - f64::from(checked_operand_imm(update, 0)?),
             )
         }
         _ => return None,
@@ -9234,7 +9253,14 @@ fn is_inline_chained_context_load(opcode: Opcode) -> bool {
 fn is_inline_arithmetic(opcode: Opcode) -> bool {
     matches!(
         opcode,
-        Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Div | Opcode::Mod
+        Opcode::Add
+            | Opcode::Sub
+            | Opcode::Mul
+            | Opcode::Div
+            | Opcode::Mod
+            | Opcode::AddSmi
+            | Opcode::SubSmi
+            | Opcode::MulSmi
     )
 }
 
@@ -9270,12 +9296,31 @@ fn inline_chained_context_slot_update(
             }
             _ => return None,
         },
+        Opcode::Dec => match current {
+            JsValue::Smi(value) => match value.checked_sub(1) {
+                Some(result) => JsValue::Smi(result),
+                None => JsValue::HeapNumber(value as f64 - 1.0),
+            },
+            JsValue::BigInt(value) => JsValue::BigInt(Box::new(value.wrapping_sub(1))),
+            _ if is_inline_primitive(&current) => {
+                number_to_jsvalue(current.to_number().ok()? - 1.0)
+            }
+            _ => return None,
+        },
         Opcode::AddSmi => {
             if matches!(current, JsValue::BigInt(_)) {
                 return None;
             }
             number_to_jsvalue(
                 current.to_number().ok()? + f64::from(checked_operand_imm(update, 0)?),
+            )
+        }
+        Opcode::SubSmi => {
+            if matches!(current, JsValue::BigInt(_)) {
+                return None;
+            }
+            number_to_jsvalue(
+                current.to_number().ok()? - f64::from(checked_operand_imm(update, 0)?),
             )
         }
         _ => return None,
