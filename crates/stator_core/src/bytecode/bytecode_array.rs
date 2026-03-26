@@ -217,21 +217,21 @@ pub const TIERING_THRESHOLD: u32 = 10;
 
 /// Invocation-count threshold that triggers Maglev JIT compilation.
 ///
-/// When a function's `invocation_count` reaches this value (100 calls) and
+/// When a function's `invocation_count` reaches this value (30 calls) and
 /// baseline JIT code is already present, the interpreter schedules a
 /// background Maglev compilation.  Once compilation finishes the cached
 /// Maglev code replaces the baseline tier for future calls.
-pub const MAGLEV_TIERING_THRESHOLD: u32 = 100;
+pub const MAGLEV_TIERING_THRESHOLD: u32 = 30;
 
 /// Invocation-count threshold that triggers Turbofan (Cranelift optimising)
 /// JIT compilation.
 ///
-/// When a function's `invocation_count` reaches this value (1 000 calls) a
+/// When a function's `invocation_count` reaches this value (200 calls) a
 /// background Turbofan compilation is scheduled.  Turbofan runs the full
 /// Maglev graph builder followed by Cranelift CLIF lowering and
 /// optimisation, producing code that is expected to reach within 90 % of
 /// peak throughput.
-pub const TURBOFAN_TIERING_THRESHOLD: u32 = 1_000;
+pub const TURBOFAN_TIERING_THRESHOLD: u32 = 200;
 
 /// Shared, lazily-allocated megamorphic IC state persisted on a
 /// [`BytecodeArray`] across invocations.
@@ -341,6 +341,12 @@ pub struct BytecodeArray {
     /// can write results while the interpreter runs on the main thread.
     /// `None` until Maglev compilation finishes successfully.
     maglev_jit_code: MaglevJitCodeCache,
+    /// Fast, shared flag indicating that Maglev JIT code has been cached.
+    ///
+    /// Set atomically by the background compilation thread after storing code
+    /// into `maglev_jit_code`, allowing the hot dispatch path to skip the
+    /// mutex lock when no Maglev code is available yet.
+    has_maglev_jit_code_flag: Arc<AtomicBool>,
     /// Set to `true` (via compare-exchange) when a Maglev compilation has been
     /// scheduled so that only one background thread is spawned per function.
     maglev_compile_started: Arc<AtomicBool>,
@@ -350,6 +356,12 @@ pub struct BytecodeArray {
     /// can write results while the interpreter runs on the main thread.
     /// `None` until Turbofan compilation finishes successfully.
     turbofan_jit_code: TurbofanJitCodeCache,
+    /// Fast, shared flag indicating that Turbofan JIT code has been cached.
+    ///
+    /// Set atomically by the background compilation thread after storing code
+    /// into `turbofan_jit_code`, allowing the hot dispatch path to skip the
+    /// mutex lock when no Turbofan code is available yet.
+    has_turbofan_jit_code_flag: Arc<AtomicBool>,
     /// Set to `true` (via compare-exchange) when a Turbofan compilation has
     /// been scheduled so that only one background thread is spawned per
     /// function.
@@ -461,7 +473,8 @@ pub(crate) enum ObjectLiteralCacheEntry {
 impl PartialEq for BytecodeArray {
     /// Two [`BytecodeArray`]s are equal when their static bytecode and metadata
     /// are identical.  The tiering state (`invocation_count`, `jit_code`,
-    /// `has_jit_code`, `maglev_jit_code`, `turbofan_jit_code`) and runtime
+    /// `has_jit_code`, `maglev_jit_code`, `has_maglev_jit_code_flag`,
+    /// `turbofan_jit_code`, `has_turbofan_jit_code_flag`) and runtime
     /// caches (`template_cache`) are intentionally excluded from the
     /// comparison.
     fn eq(&self, other: &Self) -> bool {
@@ -535,8 +548,10 @@ impl BytecodeArray {
             jit_code: Rc::new(RefCell::new(None)),
             has_jit_code: Rc::new(Cell::new(false)),
             maglev_jit_code: Arc::new(Mutex::new(None)),
+            has_maglev_jit_code_flag: Arc::new(AtomicBool::new(false)),
             maglev_compile_started: Arc::new(AtomicBool::new(false)),
             turbofan_jit_code: Arc::new(Mutex::new(None)),
+            has_turbofan_jit_code_flag: Arc::new(AtomicBool::new(false)),
             turbofan_compile_started: Arc::new(AtomicBool::new(false)),
             closure_context: None,
             writes_closure_vars: false,
@@ -1126,11 +1141,16 @@ impl BytecodeArray {
         self.has_jit_code.set(true);
     }
 
-    /// Fast check for whether baseline JIT code has been compiled.
-    /// Avoids the RefCell borrow of try_get_jit_code().
+    /// Fast check for whether any JIT tier has compiled code for this function.
+    ///
+    /// Checks the fast boolean flags for baseline, Maglev, and Turbofan tiers
+    /// using short-circuit evaluation to avoid unnecessary atomic loads when
+    /// an earlier tier is already compiled.
     #[inline(always)]
     pub fn has_any_jit_code(&self) -> bool {
         self.has_jit_code.get()
+            || self.has_maglev_jit_code_flag.load(Ordering::Relaxed)
+            || self.has_turbofan_jit_code_flag.load(Ordering::Relaxed)
     }
 
     /// Borrows the cached JIT executable code, or returns `None` if baseline
@@ -1170,6 +1190,14 @@ impl BytecodeArray {
         Arc::clone(&self.maglev_jit_code)
     }
 
+    /// Returns an [`Arc`] clone of the Maglev JIT-code-ready flag.
+    ///
+    /// The background compilation thread sets this to `true` after storing
+    /// compiled code, so the hot dispatch path can skip the mutex lock.
+    pub fn maglev_jit_code_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.has_maglev_jit_code_flag)
+    }
+
     /// Attempt to atomically mark this function as having a Maglev compilation
     /// in flight.
     ///
@@ -1198,6 +1226,14 @@ impl BytecodeArray {
     /// compiled [`TurbofanCompiledCode`] into it when compilation succeeds.
     pub fn turbofan_jit_cache_arc(&self) -> TurbofanJitCodeCache {
         Arc::clone(&self.turbofan_jit_code)
+    }
+
+    /// Returns an [`Arc`] clone of the Turbofan JIT-code-ready flag.
+    ///
+    /// The background compilation thread sets this to `true` after storing
+    /// compiled code, so the hot dispatch path can skip the mutex lock.
+    pub fn turbofan_jit_code_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.has_turbofan_jit_code_flag)
     }
 
     /// Attempt to atomically mark this function as having a Turbofan

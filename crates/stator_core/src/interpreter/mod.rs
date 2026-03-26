@@ -202,6 +202,10 @@ use crate::objects::nanbox::NanBoxedValue;
 use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 use crate::objects::string_intern::intern;
 use crate::objects::value::{JsContext, JsValue};
+#[cfg(all(target_arch = "x86_64", unix))]
+use std::sync::Arc;
+#[cfg(all(target_arch = "x86_64", unix))]
+use std::sync::atomic::AtomicBool;
 
 // Re-export generator types and bring them into scope so external code can
 // import them from `stator_core::interpreter` (backwards-compatible path).
@@ -817,19 +821,19 @@ pub(super) const OSR_LOOP_THRESHOLD: u32 = 5;
 /// triggered via OSR.
 ///
 /// When a loop has already caused baseline JIT compilation and the back-edge
-/// count exceeds this threshold (50 back-edges), a Maglev compilation is
+/// count exceeds this threshold (15 back-edges), a Maglev compilation is
 /// scheduled in a background thread so the next *call* can use the optimised
 /// tier.
-pub(super) const MAGLEV_OSR_LOOP_THRESHOLD: u32 = 50;
+pub(super) const MAGLEV_OSR_LOOP_THRESHOLD: u32 = 15;
 
 /// Number of loop back-edges taken before a Turbofan background compilation is
 /// triggered via OSR.
 ///
 /// When a loop has already caused Maglev JIT compilation and the back-edge
-/// count exceeds this threshold (200 back-edges), a Turbofan compilation
+/// count exceeds this threshold (50 back-edges), a Turbofan compilation
 /// is scheduled in a background thread so the next *call* can use the
 /// fully-optimised tier.
-pub(super) const TURBOFAN_OSR_LOOP_THRESHOLD: u32 = 200;
+pub(super) const TURBOFAN_OSR_LOOP_THRESHOLD: u32 = 50;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Generator return completion sentinel
@@ -1138,6 +1142,7 @@ struct MaglevCompileInput {
     ba: SendableBytecodesArray,
     feedback: FeedbackVector,
     result_cache: MaglevJitCodeCache,
+    ready_flag: Arc<AtomicBool>,
 }
 
 /// Schedule a Maglev background compilation for `ba`.
@@ -1176,6 +1181,7 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
             ba: SendableBytecodesArray(compile_ba),
             feedback: seed_jit_feedback(ba),
             result_cache: ba.maglev_jit_cache_arc(),
+            ready_flag: ba.maglev_jit_code_flag(),
         };
 
         std::thread::spawn(move || {
@@ -1200,6 +1206,11 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
                             *guard = Some(cached);
                             drop(guard);
                         }
+                        // Signal the fast-path flag so the dispatch loop
+                        // skips the mutex lock on subsequent entries.
+                        input
+                            .ready_flag
+                            .store(true, std::sync::atomic::Ordering::Release);
                         // Record Maglev stats atomically (readable from any thread).
                         MAGLEV_COMPILATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         MAGLEV_CODE_BYTES.fetch_add(code_len, std::sync::atomic::Ordering::Relaxed);
@@ -1254,6 +1265,7 @@ struct TurbofanCompileInput {
     ba: SendableBytecodesArray,
     feedback: FeedbackVector,
     result_cache: TurbofanJitCodeCache,
+    ready_flag: Arc<AtomicBool>,
 }
 
 /// Schedule a Turbofan background compilation for `ba`.
@@ -1293,6 +1305,7 @@ pub(super) fn maybe_compile_turbofan(ba: &BytecodeArray) {
             ba: SendableBytecodesArray(compile_ba),
             feedback: seed_jit_feedback(ba),
             result_cache: ba.turbofan_jit_cache_arc(),
+            ready_flag: ba.turbofan_jit_code_flag(),
         };
 
         std::thread::spawn(move || {
@@ -1311,6 +1324,11 @@ pub(super) fn maybe_compile_turbofan(ba: &BytecodeArray) {
                         *guard = Some(tc);
                         drop(guard);
                     }
+                    // Signal the fast-path flag so the dispatch loop
+                    // skips the mutex lock on subsequent entries.
+                    input
+                        .ready_flag
+                        .store(true, std::sync::atomic::Ordering::Release);
                     // Record Turbofan stats atomically (readable from any thread).
                     TURBOFAN_COMPILATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     TURBOFAN_CODE_BYTES.fetch_add(code_size, std::sync::atomic::Ordering::Relaxed);
@@ -2788,7 +2806,23 @@ impl Interpreter {
     fn run_inner(frame: &mut InterpreterFrame, skip_globals: bool) -> StatorResult<JsValue> {
         // Increment invocation count for tiering — ensures top-level code
         // (not just function calls) participates in JIT compilation decisions.
-        let _inv_count = frame.bytecode_array.increment_invocation_count();
+        let inv_count = frame.bytecode_array.increment_invocation_count();
+
+        // Trigger JIT compilation based on invocation count so that top-level
+        // scripts (called via Interpreter::run()) participate in tiering, not
+        // only through OSR loop back-edges.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            if inv_count == TIERING_THRESHOLD {
+                maybe_compile_baseline(&frame.bytecode_array);
+            } else if inv_count == MAGLEV_TIERING_THRESHOLD {
+                maybe_compile_maglev(&frame.bytecode_array);
+            } else if inv_count == TURBOFAN_TIERING_THRESHOLD {
+                maybe_compile_turbofan(&frame.bytecode_array);
+            }
+        }
+        #[cfg(not(all(target_arch = "x86_64", unix)))]
+        let _ = inv_count;
 
         let result = (|| {
             if skip_globals {
@@ -2853,8 +2887,10 @@ impl Interpreter {
         // for functions that have been JIT-compiled via OSR or invocation tiering.
         #[cfg(all(target_arch = "x86_64", unix))]
         {
-            if let Some(result) = try_execute_best_jit(&frame.bytecode_array, &[]) {
-                return result;
+            if frame.bytecode_array.has_any_jit_code() {
+                if let Some(result) = try_execute_best_jit(&frame.bytecode_array, &[]) {
+                    return result;
+                }
             }
         }
 
