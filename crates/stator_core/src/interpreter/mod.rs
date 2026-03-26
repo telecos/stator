@@ -2883,6 +2883,15 @@ impl Interpreter {
             let mut pc = frame.pc;
             let mut acc = frame.accumulator.cheap_clone();
 
+            // NaN-boxed shadow accumulator: tracks `acc` as a compact u64
+            // whenever the value is a primitive (Smi, Boolean, etc.).
+            // When `acc_is_nb` is true, `acc_nb` mirrors `acc` and hot
+            // consumers (JumpIfTrue/False, ToBooleanTrue/False) can
+            // branch on a single u64 compare instead of matching on the
+            // 24-byte JsValue enum.
+            let mut acc_nb: u64 = 0;
+            let mut acc_is_nb: bool = false;
+
             'dispatch: loop {
                 // ── Debug hook (pre-fetch) ─────────────────────────────────────
                 if debug_active {
@@ -4710,6 +4719,8 @@ impl Interpreter {
                         }
                         continue 'smi;
                     }
+                    // Exiting SMI mode — accumulator type is unknown.
+                    acc_is_nb = false;
                     continue 'dispatch;
                 }
 
@@ -4727,12 +4738,16 @@ impl Interpreter {
                         // is Immediate for LdaSmi.
                         let val = unsafe { operand_imm_unchecked(instr, 0) };
                         acc = JsValue::Smi(val);
+                        acc_nb = NanBoxedValue::from_smi(val).to_bits();
+                        acc_is_nb = true;
                         continue 'dispatch;
                     }
                     Opcode::LdaSmiStar => {
                         let val = unsafe { operand_imm_unchecked(instr, 0) };
                         let dst = unsafe { operand_reg_unchecked(instr, 1) };
                         acc = JsValue::Smi(val);
+                        acc_nb = NanBoxedValue::from_smi(val).to_bits();
+                        acc_is_nb = true;
                         unsafe { frame.write_reg_unchecked(dst, acc.cheap_clone()) };
                         continue 'dispatch;
                     }
@@ -4755,30 +4770,43 @@ impl Interpreter {
                         // in bounds for this frame.
                         let val = unsafe { frame.read_reg_unchecked(reg) };
                         acc = val.cheap_clone();
+                        acc_is_nb = false;
                         continue 'dispatch;
                     }
                     Opcode::LdaUndefined => {
                         acc = JsValue::Undefined;
+                        acc_nb = NanBoxedValue::undefined().to_bits();
+                        acc_is_nb = true;
                         continue 'dispatch;
                     }
                     Opcode::LdaZero => {
                         acc = JsValue::Smi(0);
+                        acc_nb = NanBoxedValue::from_smi(0).to_bits();
+                        acc_is_nb = true;
                         continue 'dispatch;
                     }
                     Opcode::LdaTrue => {
                         acc = JsValue::Boolean(true);
+                        acc_nb = NanBoxedValue::from_boolean(true).to_bits();
+                        acc_is_nb = true;
                         continue 'dispatch;
                     }
                     Opcode::LdaFalse => {
                         acc = JsValue::Boolean(false);
+                        acc_nb = NanBoxedValue::from_boolean(false).to_bits();
+                        acc_is_nb = true;
                         continue 'dispatch;
                     }
                     Opcode::LdaNull => {
                         acc = JsValue::Null;
+                        acc_nb = NanBoxedValue::null().to_bits();
+                        acc_is_nb = true;
                         continue 'dispatch;
                     }
                     Opcode::LdaTheHole => {
                         acc = JsValue::TheHole;
+                        acc_nb = NanBoxedValue::the_hole().to_bits();
+                        acc_is_nb = true;
                         continue 'dispatch;
                     }
                     Opcode::Nop => {
@@ -4787,6 +4815,7 @@ impl Interpreter {
                     // ── Array creation (inline, no table dispatch) ──
                     Opcode::CreateEmptyArrayLiteral => {
                         acc = JsValue::Array(Rc::new(RefCell::new(Vec::new())));
+                        acc_is_nb = false;
                         continue 'dispatch;
                     }
                     Opcode::CreateArrayLiteral => {
@@ -4801,6 +4830,7 @@ impl Interpreter {
                         acc = JsValue::PlainObject(Rc::new(RefCell::new(
                             PropertyMap::with_capacity(4),
                         )));
+                        acc_is_nb = false;
                         continue 'dispatch;
                     }
                     Opcode::Mov => {
@@ -4827,13 +4857,38 @@ impl Interpreter {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
+                            // NaN-box fast path: both Smi → raw i32 compare.
+                            if acc_is_nb
+                                && NanBoxedValue::from_bits(acc_nb).is_smi()
+                                && let JsValue::Smi(b) = rhs
+                            {
+                                let result = NanBoxedValue::from_bits(acc_nb).as_smi() != *b;
+                                acc = JsValue::Boolean(result);
+                                acc_nb = NanBoxedValue::from_boolean(result).to_bits();
+                                acc_is_nb = true;
+                                continue 'dispatch;
+                            }
+                            // NaN-box fast path: both Smi.
+                            if acc_is_nb
+                                && NanBoxedValue::from_bits(acc_nb).is_smi()
+                                && let JsValue::Smi(b) = rhs
+                            {
+                                let result = NanBoxedValue::from_bits(acc_nb).as_smi() == *b;
+                                acc = JsValue::Boolean(result);
+                                acc_nb = NanBoxedValue::from_boolean(result).to_bits();
+                                acc_is_nb = true;
+                                continue 'dispatch;
+                            }
                             match (&acc, rhs) {
                                 (JsValue::Smi(a), JsValue::Smi(b)) => {
-                                    acc = if let Some(result) = a.checked_add(*b) {
-                                        JsValue::Smi(result)
+                                    if let Some(result) = a.checked_add(*b) {
+                                        acc = JsValue::Smi(result);
+                                        acc_nb = NanBoxedValue::from_smi(result).to_bits();
+                                        acc_is_nb = true;
                                     } else {
-                                        JsValue::HeapNumber(*a as f64 + *b as f64)
-                                    };
+                                        acc = JsValue::HeapNumber(*a as f64 + *b as f64);
+                                        acc_is_nb = false;
+                                    }
                                     continue 'dispatch;
                                 }
                                 (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
@@ -4865,6 +4920,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4878,6 +4934,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4891,11 +4948,14 @@ impl Interpreter {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
                             match (&acc, rhs) {
                                 (JsValue::Smi(a), JsValue::Smi(b)) => {
-                                    acc = if let Some(result) = a.checked_sub(*b) {
-                                        JsValue::Smi(result)
+                                    if let Some(result) = a.checked_sub(*b) {
+                                        acc = JsValue::Smi(result);
+                                        acc_nb = NanBoxedValue::from_smi(result).to_bits();
+                                        acc_is_nb = true;
                                     } else {
-                                        JsValue::HeapNumber(*a as f64 - *b as f64)
-                                    };
+                                        acc = JsValue::HeapNumber(*a as f64 - *b as f64);
+                                        acc_is_nb = false;
+                                    }
                                     continue 'dispatch;
                                 }
                                 (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
@@ -4926,6 +4986,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4939,6 +5000,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4952,11 +5014,14 @@ impl Interpreter {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
                             match (&acc, rhs) {
                                 (JsValue::Smi(a), JsValue::Smi(b)) => {
-                                    acc = if let Some(result) = a.checked_mul(*b) {
-                                        JsValue::Smi(result)
+                                    if let Some(result) = a.checked_mul(*b) {
+                                        acc = JsValue::Smi(result);
+                                        acc_nb = NanBoxedValue::from_smi(result).to_bits();
+                                        acc_is_nb = true;
                                     } else {
-                                        JsValue::HeapNumber(*a as f64 * *b as f64)
-                                    };
+                                        acc = JsValue::HeapNumber(*a as f64 * *b as f64);
+                                        acc_is_nb = false;
+                                    }
                                     continue 'dispatch;
                                 }
                                 (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
@@ -4987,6 +5052,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5000,6 +5066,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5008,13 +5075,28 @@ impl Interpreter {
                     }
                     Opcode::AddSmi => {
                         if let Operand::Immediate(imm) = *instr.operand(0) {
+                            // NaN-box fast path for known-Smi accumulator.
+                            if acc_is_nb && NanBoxedValue::from_bits(acc_nb).is_smi() {
+                                let n = NanBoxedValue::from_bits(acc_nb).as_smi();
+                                if let Some(result) = n.checked_add(imm) {
+                                    acc_nb = NanBoxedValue::from_smi(result).to_bits();
+                                    acc = JsValue::Smi(result);
+                                    continue 'dispatch;
+                                }
+                                acc = JsValue::HeapNumber(n as f64 + imm as f64);
+                                acc_is_nb = false;
+                                continue 'dispatch;
+                            }
                             match &acc {
                                 JsValue::Smi(n) => {
-                                    acc = if let Some(result) = n.checked_add(imm) {
-                                        JsValue::Smi(result)
+                                    if let Some(result) = n.checked_add(imm) {
+                                        acc = JsValue::Smi(result);
+                                        acc_nb = NanBoxedValue::from_smi(result).to_bits();
+                                        acc_is_nb = true;
                                     } else {
-                                        JsValue::HeapNumber(*n as f64 + imm as f64)
-                                    };
+                                        acc = JsValue::HeapNumber(*n as f64 + imm as f64);
+                                        acc_is_nb = false;
+                                    }
                                     continue 'dispatch;
                                 }
                                 JsValue::HeapNumber(n) => {
@@ -5037,6 +5119,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5050,6 +5133,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5058,13 +5142,28 @@ impl Interpreter {
                     }
                     Opcode::SubSmi => {
                         if let Operand::Immediate(imm) = *instr.operand(0) {
+                            // NaN-box fast path for known-Smi accumulator.
+                            if acc_is_nb && NanBoxedValue::from_bits(acc_nb).is_smi() {
+                                let n = NanBoxedValue::from_bits(acc_nb).as_smi();
+                                if let Some(result) = n.checked_sub(imm) {
+                                    acc_nb = NanBoxedValue::from_smi(result).to_bits();
+                                    acc = JsValue::Smi(result);
+                                    continue 'dispatch;
+                                }
+                                acc = JsValue::HeapNumber(n as f64 - imm as f64);
+                                acc_is_nb = false;
+                                continue 'dispatch;
+                            }
                             match &acc {
                                 JsValue::Smi(n) => {
-                                    acc = if let Some(result) = n.checked_sub(imm) {
-                                        JsValue::Smi(result)
+                                    if let Some(result) = n.checked_sub(imm) {
+                                        acc = JsValue::Smi(result);
+                                        acc_nb = NanBoxedValue::from_smi(result).to_bits();
+                                        acc_is_nb = true;
                                     } else {
-                                        JsValue::HeapNumber(*n as f64 - imm as f64)
-                                    };
+                                        acc = JsValue::HeapNumber(*n as f64 - imm as f64);
+                                        acc_is_nb = false;
+                                    }
                                     continue 'dispatch;
                                 }
                                 JsValue::HeapNumber(n) => {
@@ -5087,6 +5186,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5100,6 +5200,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5108,13 +5209,28 @@ impl Interpreter {
                     }
                     Opcode::MulSmi => {
                         if let Operand::Immediate(imm) = *instr.operand(0) {
+                            // NaN-box fast path for known-Smi accumulator.
+                            if acc_is_nb && NanBoxedValue::from_bits(acc_nb).is_smi() {
+                                let n = NanBoxedValue::from_bits(acc_nb).as_smi();
+                                if let Some(result) = n.checked_mul(imm) {
+                                    acc_nb = NanBoxedValue::from_smi(result).to_bits();
+                                    acc = JsValue::Smi(result);
+                                    continue 'dispatch;
+                                }
+                                acc = JsValue::HeapNumber(n as f64 * imm as f64);
+                                acc_is_nb = false;
+                                continue 'dispatch;
+                            }
                             match &acc {
                                 JsValue::Smi(n) => {
-                                    acc = if let Some(result) = n.checked_mul(imm) {
-                                        JsValue::Smi(result)
+                                    if let Some(result) = n.checked_mul(imm) {
+                                        acc = JsValue::Smi(result);
+                                        acc_nb = NanBoxedValue::from_smi(result).to_bits();
+                                        acc_is_nb = true;
                                     } else {
-                                        JsValue::HeapNumber(*n as f64 * imm as f64)
-                                    };
+                                        acc = JsValue::HeapNumber(*n as f64 * imm as f64);
+                                        acc_is_nb = false;
+                                    }
                                     continue 'dispatch;
                                 }
                                 JsValue::HeapNumber(n) => {
@@ -5137,6 +5253,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5150,6 +5267,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5159,10 +5277,20 @@ impl Interpreter {
 
                     // ── Inc / Dec (Smi fast path) ────────────
                     Opcode::Inc => {
-                        if let JsValue::Smi(n) = acc
+                        // NaN-box fast path: known-Smi via shadow accumulator.
+                        if acc_is_nb && NanBoxedValue::from_bits(acc_nb).is_smi() {
+                            let n = NanBoxedValue::from_bits(acc_nb).as_smi();
+                            if let Some(result) = n.checked_add(1) {
+                                acc_nb = NanBoxedValue::from_smi(result).to_bits();
+                                acc = JsValue::Smi(result);
+                                continue 'dispatch;
+                            }
+                        } else if let JsValue::Smi(n) = acc
                             && let Some(result) = n.checked_add(1)
                         {
                             acc = JsValue::Smi(result);
+                            acc_nb = NanBoxedValue::from_smi(result).to_bits();
+                            acc_is_nb = true;
                             continue 'dispatch;
                         }
                         frame.pc = pc;
@@ -5178,6 +5306,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5191,6 +5320,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5198,10 +5328,20 @@ impl Interpreter {
                         }
                     }
                     Opcode::Dec => {
-                        if let JsValue::Smi(n) = acc
+                        // NaN-box fast path: known-Smi via shadow accumulator.
+                        if acc_is_nb && NanBoxedValue::from_bits(acc_nb).is_smi() {
+                            let n = NanBoxedValue::from_bits(acc_nb).as_smi();
+                            if let Some(result) = n.checked_sub(1) {
+                                acc_nb = NanBoxedValue::from_smi(result).to_bits();
+                                acc = JsValue::Smi(result);
+                                continue 'dispatch;
+                            }
+                        } else if let JsValue::Smi(n) = acc
                             && let Some(result) = n.checked_sub(1)
                         {
                             acc = JsValue::Smi(result);
+                            acc_nb = NanBoxedValue::from_smi(result).to_bits();
+                            acc_is_nb = true;
                             continue 'dispatch;
                         }
                         frame.pc = pc;
@@ -5217,6 +5357,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5230,6 +5371,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5280,6 +5422,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5293,6 +5436,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5307,6 +5451,7 @@ impl Interpreter {
                                     if !frame.smi_mode && !frame.loop_trip_counts.is_empty() {
                                         frame.smi_mode = true;
                                     }
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 JsValue::HeapNumber(n) => {
@@ -5332,6 +5477,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5345,6 +5491,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5392,6 +5539,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5405,6 +5553,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5417,6 +5566,7 @@ impl Interpreter {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
                             if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
                                 acc = JsValue::Smi(*a & *b);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                         }
@@ -5433,6 +5583,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5446,6 +5597,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5493,6 +5645,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5506,6 +5659,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5533,6 +5687,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5546,6 +5701,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5572,6 +5728,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5585,6 +5742,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5611,6 +5769,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5624,6 +5783,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5644,6 +5804,7 @@ impl Interpreter {
                                     drop(env);
                                     if value != JsValue::TheHole {
                                         acc = value;
+                                        acc_is_nb = false;
                                         continue 'dispatch;
                                     }
                                 }
@@ -5663,6 +5824,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5676,6 +5838,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5697,7 +5860,13 @@ impl Interpreter {
                         continue 'dispatch;
                     }
                     Opcode::JumpIfTrue => {
-                        if matches!(acc, JsValue::Boolean(true)) {
+                        // Fast path: u64 compare avoids matching 24-byte enum.
+                        let is_true = if acc_is_nb {
+                            acc_nb == NanBoxedValue::from_boolean(true).to_bits()
+                        } else {
+                            matches!(acc, JsValue::Boolean(true))
+                        };
+                        if is_true {
                             // SAFETY: Bytecode compiler guarantees all
                             // JumpIfTrue instructions have pre-computed targets.
                             pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
@@ -5705,7 +5874,12 @@ impl Interpreter {
                         continue 'dispatch;
                     }
                     Opcode::JumpIfFalse => {
-                        if matches!(acc, JsValue::Boolean(false)) {
+                        let is_false = if acc_is_nb {
+                            acc_nb == NanBoxedValue::from_boolean(false).to_bits()
+                        } else {
+                            matches!(acc, JsValue::Boolean(false))
+                        };
+                        if is_false {
                             // SAFETY: Bytecode compiler guarantees all
                             // JumpIfFalse instructions have pre-computed targets.
                             pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
@@ -5715,15 +5889,26 @@ impl Interpreter {
 
                     // ── JumpIfToBooleanTrue/False (inline to_boolean) ──
                     Opcode::JumpIfToBooleanTrue => {
-                        let truthy = match &acc {
-                            JsValue::Boolean(b) => *b,
-                            JsValue::Smi(n) => *n != 0,
-                            JsValue::Undefined | JsValue::Null | JsValue::TheHole => false,
-                            JsValue::HeapNumber(n) => !n.is_nan() && *n != 0.0,
-                            JsValue::String(s) => !s.is_empty(),
-                            JsValue::BigInt(n) => **n != 0,
-                            // Objects, functions, arrays, etc. are always truthy.
-                            _ => true,
+                        let truthy = if acc_is_nb {
+                            let nb = NanBoxedValue::from_bits(acc_nb);
+                            if nb.is_boolean() {
+                                nb.as_boolean()
+                            } else if nb.is_smi() {
+                                nb.as_smi() != 0
+                            } else {
+                                // undefined, null, the_hole are all falsy
+                                false
+                            }
+                        } else {
+                            match &acc {
+                                JsValue::Boolean(b) => *b,
+                                JsValue::Smi(n) => *n != 0,
+                                JsValue::Undefined | JsValue::Null | JsValue::TheHole => false,
+                                JsValue::HeapNumber(n) => !n.is_nan() && *n != 0.0,
+                                JsValue::String(s) => !s.is_empty(),
+                                JsValue::BigInt(n) => **n != 0,
+                                _ => true,
+                            }
                         };
                         if truthy {
                             pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
@@ -5731,14 +5916,26 @@ impl Interpreter {
                         continue 'dispatch;
                     }
                     Opcode::JumpIfToBooleanFalse => {
-                        let truthy = match &acc {
-                            JsValue::Boolean(b) => *b,
-                            JsValue::Smi(n) => *n != 0,
-                            JsValue::Undefined | JsValue::Null | JsValue::TheHole => false,
-                            JsValue::HeapNumber(n) => !n.is_nan() && *n != 0.0,
-                            JsValue::String(s) => !s.is_empty(),
-                            JsValue::BigInt(n) => **n != 0,
-                            _ => true,
+                        let truthy = if acc_is_nb {
+                            let nb = NanBoxedValue::from_bits(acc_nb);
+                            if nb.is_boolean() {
+                                nb.as_boolean()
+                            } else if nb.is_smi() {
+                                nb.as_smi() != 0
+                            } else {
+                                // undefined, null, the_hole are all falsy
+                                false
+                            }
+                        } else {
+                            match &acc {
+                                JsValue::Boolean(b) => *b,
+                                JsValue::Smi(n) => *n != 0,
+                                JsValue::Undefined | JsValue::Null | JsValue::TheHole => false,
+                                JsValue::HeapNumber(n) => !n.is_nan() && *n != 0.0,
+                                JsValue::String(s) => !s.is_empty(),
+                                JsValue::BigInt(n) => **n != 0,
+                                _ => true,
+                            }
                         };
                         if !truthy {
                             pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
@@ -5845,9 +6042,23 @@ impl Interpreter {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
+                            // NaN-box fast path: both Smi → raw i32 compare.
+                            if acc_is_nb
+                                && NanBoxedValue::from_bits(acc_nb).is_smi()
+                                && let JsValue::Smi(b) = rhs
+                            {
+                                let result = NanBoxedValue::from_bits(acc_nb).as_smi() < *b;
+                                acc = JsValue::Boolean(result);
+                                acc_nb = NanBoxedValue::from_boolean(result).to_bits();
+                                acc_is_nb = true;
+                                continue 'dispatch;
+                            }
                             match (&acc, rhs) {
                                 (JsValue::Smi(a), JsValue::Smi(b)) => {
-                                    acc = JsValue::Boolean(*a < *b);
+                                    let result = *a < *b;
+                                    acc = JsValue::Boolean(result);
+                                    acc_nb = NanBoxedValue::from_boolean(result).to_bits();
+                                    acc_is_nb = true;
                                     continue 'dispatch;
                                 }
                                 (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
@@ -5878,6 +6089,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5891,6 +6103,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5902,9 +6115,23 @@ impl Interpreter {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
+                            // NaN-box fast path: both Smi → raw i32 compare.
+                            if acc_is_nb
+                                && NanBoxedValue::from_bits(acc_nb).is_smi()
+                                && let JsValue::Smi(b) = rhs
+                            {
+                                let result = NanBoxedValue::from_bits(acc_nb).as_smi() > *b;
+                                acc = JsValue::Boolean(result);
+                                acc_nb = NanBoxedValue::from_boolean(result).to_bits();
+                                acc_is_nb = true;
+                                continue 'dispatch;
+                            }
                             match (&acc, rhs) {
                                 (JsValue::Smi(a), JsValue::Smi(b)) => {
-                                    acc = JsValue::Boolean(*a > *b);
+                                    let result = *a > *b;
+                                    acc = JsValue::Boolean(result);
+                                    acc_nb = NanBoxedValue::from_boolean(result).to_bits();
+                                    acc_is_nb = true;
                                     continue 'dispatch;
                                 }
                                 (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
@@ -5935,6 +6162,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5948,6 +6176,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5959,9 +6188,23 @@ impl Interpreter {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
+                            // NaN-box fast path: both Smi.
+                            if acc_is_nb
+                                && NanBoxedValue::from_bits(acc_nb).is_smi()
+                                && let JsValue::Smi(b) = rhs
+                            {
+                                let result = NanBoxedValue::from_bits(acc_nb).as_smi() == *b;
+                                acc = JsValue::Boolean(result);
+                                acc_nb = NanBoxedValue::from_boolean(result).to_bits();
+                                acc_is_nb = true;
+                                continue 'dispatch;
+                            }
                             match (&acc, rhs) {
                                 (JsValue::Smi(a), JsValue::Smi(b)) => {
-                                    acc = JsValue::Boolean(*a == *b);
+                                    let result = *a == *b;
+                                    acc = JsValue::Boolean(result);
+                                    acc_nb = NanBoxedValue::from_boolean(result).to_bits();
+                                    acc_is_nb = true;
                                     continue 'dispatch;
                                 }
                                 (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
@@ -5980,6 +6223,8 @@ impl Interpreter {
                             }
                             let result = abstract_eq(&acc, rhs);
                             acc = JsValue::Boolean(result);
+                            acc_nb = NanBoxedValue::from_boolean(result).to_bits();
+                            acc_is_nb = true;
                             continue 'dispatch;
                         }
                         frame.pc = pc;
@@ -5995,6 +6240,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6008,6 +6254,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6021,7 +6268,10 @@ impl Interpreter {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
                             match (&acc, rhs) {
                                 (JsValue::Smi(a), JsValue::Smi(b)) => {
-                                    acc = JsValue::Boolean(*a == *b);
+                                    let result = *a == *b;
+                                    acc = JsValue::Boolean(result);
+                                    acc_nb = NanBoxedValue::from_boolean(result).to_bits();
+                                    acc_is_nb = true;
                                     continue 'dispatch;
                                 }
                                 (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
@@ -6040,6 +6290,8 @@ impl Interpreter {
                             }
                             let result = strict_eq(&acc, rhs);
                             acc = JsValue::Boolean(result);
+                            acc_nb = NanBoxedValue::from_boolean(result).to_bits();
+                            acc_is_nb = true;
                             continue 'dispatch;
                         }
                         frame.pc = pc;
@@ -6055,6 +6307,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6068,6 +6321,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6079,7 +6333,10 @@ impl Interpreter {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
                             match (&acc, rhs) {
                                 (JsValue::Smi(a), JsValue::Smi(b)) => {
-                                    acc = JsValue::Boolean(*a != *b);
+                                    let result = *a != *b;
+                                    acc = JsValue::Boolean(result);
+                                    acc_nb = NanBoxedValue::from_boolean(result).to_bits();
+                                    acc_is_nb = true;
                                     continue 'dispatch;
                                 }
                                 (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
@@ -6098,6 +6355,8 @@ impl Interpreter {
                             }
                             let result = abstract_eq(&acc, rhs);
                             acc = JsValue::Boolean(!result);
+                            acc_nb = NanBoxedValue::from_boolean(!result).to_bits();
+                            acc_is_nb = true;
                             continue 'dispatch;
                         }
                         frame.pc = pc;
@@ -6113,6 +6372,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6126,6 +6386,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6135,9 +6396,23 @@ impl Interpreter {
                     Opcode::TestLessThanOrEqual => {
                         if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
+                            // NaN-box fast path: both Smi → raw i32 compare.
+                            if acc_is_nb
+                                && NanBoxedValue::from_bits(acc_nb).is_smi()
+                                && let JsValue::Smi(b) = rhs
+                            {
+                                let result = NanBoxedValue::from_bits(acc_nb).as_smi() <= *b;
+                                acc = JsValue::Boolean(result);
+                                acc_nb = NanBoxedValue::from_boolean(result).to_bits();
+                                acc_is_nb = true;
+                                continue 'dispatch;
+                            }
                             match (&acc, rhs) {
                                 (JsValue::Smi(a), JsValue::Smi(b)) => {
-                                    acc = JsValue::Boolean(*a <= *b);
+                                    let result = *a <= *b;
+                                    acc = JsValue::Boolean(result);
+                                    acc_nb = NanBoxedValue::from_boolean(result).to_bits();
+                                    acc_is_nb = true;
                                     continue 'dispatch;
                                 }
                                 (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
@@ -6168,6 +6443,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6181,6 +6457,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6190,9 +6467,23 @@ impl Interpreter {
                     Opcode::TestGreaterThanOrEqual => {
                         if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
+                            // NaN-box fast path: both Smi → raw i32 compare.
+                            if acc_is_nb
+                                && NanBoxedValue::from_bits(acc_nb).is_smi()
+                                && let JsValue::Smi(b) = rhs
+                            {
+                                let result = NanBoxedValue::from_bits(acc_nb).as_smi() >= *b;
+                                acc = JsValue::Boolean(result);
+                                acc_nb = NanBoxedValue::from_boolean(result).to_bits();
+                                acc_is_nb = true;
+                                continue 'dispatch;
+                            }
                             match (&acc, rhs) {
                                 (JsValue::Smi(a), JsValue::Smi(b)) => {
-                                    acc = JsValue::Boolean(*a >= *b);
+                                    let result = *a >= *b;
+                                    acc = JsValue::Boolean(result);
+                                    acc_nb = NanBoxedValue::from_boolean(result).to_bits();
+                                    acc_is_nb = true;
                                     continue 'dispatch;
                                 }
                                 (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
@@ -6223,6 +6514,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6236,6 +6528,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6350,6 +6643,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6363,6 +6657,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6399,6 +6694,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6412,6 +6708,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6464,6 +6761,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6477,6 +6775,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6517,6 +6816,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6530,6 +6830,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6578,6 +6879,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6591,6 +6893,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6626,6 +6929,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6639,6 +6943,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6673,6 +6978,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6686,6 +6992,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6824,6 +7131,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6837,6 +7145,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6979,6 +7288,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6992,6 +7302,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -7105,6 +7416,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -7118,6 +7430,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -7168,6 +7481,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -7181,6 +7495,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -7223,6 +7538,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -7236,6 +7552,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -7273,6 +7590,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -7286,6 +7604,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -7315,6 +7634,7 @@ impl Interpreter {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
                                 acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                acc_is_nb = false;
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -7328,6 +7648,7 @@ impl Interpreter {
                                         &mut frame.accumulator,
                                         JsValue::Undefined,
                                     );
+                                    acc_is_nb = false;
                                     continue 'dispatch;
                                 }
                                 return Err(e);
