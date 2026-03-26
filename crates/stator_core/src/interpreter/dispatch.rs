@@ -1613,6 +1613,14 @@ fn handle_jump_loop(
         if ctx.frame.osr_loop_count >= TURBOFAN_OSR_LOOP_THRESHOLD {
             maybe_compile_turbofan(&ctx.frame.bytecode_array);
         }
+        // OSR: if JIT code is now available, execute it instead of
+        // continuing interpretation.  The JIT re-runs the whole function
+        // with the original arguments and returns the final result.
+        if let Some(jit_result) =
+            try_execute_best_jit(&ctx.frame.bytecode_array, &ctx.frame.call_args)
+        {
+            return Ok(DispatchAction::Return(jit_result?));
+        }
     }
     Ok(DispatchAction::Continue)
 }

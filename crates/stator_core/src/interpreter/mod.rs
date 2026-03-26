@@ -2521,6 +2521,12 @@ impl Interpreter {
     /// `stacker::maybe_grow` closure boundary that prevents LLVM from
     /// inlining across the call.
     fn run_dispatch(frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
+        // Fast path: if JIT code was compiled in a previous invocation,
+        // execute it directly without entering the interpreter loop.
+        if let Some(jit_result) = try_execute_best_jit(&frame.bytecode_array, &frame.call_args) {
+            return jit_result;
+        }
+
         // Outer loop: re-entered when a TailCall opcode rewrites the frame
         // with a new bytecode array (proper tail-call trampoline).
         'tail_call: loop {
