@@ -1214,41 +1214,53 @@ mod jit_runtime {
         let idx = (obj_i64 - JIT_HEAP_TAG) as usize;
         let lda_slot = (name_idx & 63) as usize;
 
+        let ptrs = RT_PTRS.with(|p| p.get());
+
         // ── Phase 1: IC hit via borrowed heap (no input clone) ──────
         // Returns Ok(i64) for a direct/primitive result, Err(JsValue)
         // for an object result that still needs a heap handle, or None
         // on IC miss.
-        let fast: Option<Result<i64, JsValue>> = RT_HEAP.with(|heap| {
-            let heap = heap.borrow();
+        let fast: Option<Result<i64, JsValue>> = if ptrs.is_cached() {
+            // SAFETY: cached pointers set by cache_rt_ptrs; valid for thread lifetime.
+            let heap_ref = unsafe { &*ptrs.heap };
+            let ic_ref = unsafe { &*ptrs.prop_ic };
+            let heap = heap_ref.borrow();
             let obj = heap.get(idx)?;
 
             match obj {
                 JsValue::PlainObject(map_rc) => {
                     let map = map_rc.borrow();
                     let shape = map.shape_id();
+                    let cache = ic_ref.borrow();
 
-                    RT_PROP_IC.with(|ic| {
-                        let cache = ic.borrow();
+                    // Own-property IC
+                    let entry = &cache.lda[lda_slot];
+                    if entry.0 == name_idx && entry.1 == shape {
+                        return Some(
+                            match map
+                                .get_by_offset(entry.2)
+                                .map(encode_or_clone_ref)
+                                .unwrap_or(Ok(JIT_UNDEFINED))
+                            {
+                                Ok(val) => val,
+                                Err(obj_val) => {
+                                    drop(cache);
+                                    drop(map);
+                                    drop(heap);
+                                    alloc_heap_handle(obj_val)
+                                }
+                            },
+                        );
+                    }
 
-                        // Own-property IC
-                        let entry = &cache.lda[lda_slot];
-                        if entry.0 == name_idx && entry.1 == shape {
-                            return Some(
-                                map.get_by_offset(entry.2)
-                                    .map(encode_or_clone_ref)
-                                    .unwrap_or(Ok(JIT_UNDEFINED)),
-                            );
-                        }
+                    // Prototype IC (value pre-encoded as i64)
+                    let proto_slot = (name_idx & 15) as usize;
+                    let pe = &cache.proto[proto_slot];
+                    if pe.0 == name_idx && pe.1 == shape {
+                        return Some(pe.2);
+                    }
 
-                        // Prototype IC (value pre-encoded as i64)
-                        let proto_slot = (name_idx & 15) as usize;
-                        let pe = &cache.proto[proto_slot];
-                        if pe.0 == name_idx && pe.1 == shape {
-                            return Some(Ok(pe.2));
-                        }
-
-                        None // IC miss
-                    })
+                    None // IC miss
                 }
                 JsValue::Array(arr) => {
                     let prop_name = get_rt_string_constant(name_idx)?;
@@ -1260,7 +1272,49 @@ mod jit_runtime {
                 }
                 _ => None,
             }
-        });
+        } else {
+            RT_HEAP.with(|heap| {
+                let heap = heap.borrow();
+                let obj = heap.get(idx)?;
+
+                match obj {
+                    JsValue::PlainObject(map_rc) => {
+                        let map = map_rc.borrow();
+                        let shape = map.shape_id();
+
+                        RT_PROP_IC.with(|ic| {
+                            let cache = ic.borrow();
+
+                            let entry = &cache.lda[lda_slot];
+                            if entry.0 == name_idx && entry.1 == shape {
+                                return Some(
+                                    map.get_by_offset(entry.2)
+                                        .map(encode_or_clone_ref)
+                                        .unwrap_or(Ok(JIT_UNDEFINED)),
+                                );
+                            }
+
+                            let proto_slot = (name_idx & 15) as usize;
+                            let pe = &cache.proto[proto_slot];
+                            if pe.0 == name_idx && pe.1 == shape {
+                                return Some(Ok(pe.2));
+                            }
+
+                            None
+                        })
+                    }
+                    JsValue::Array(arr) => {
+                        let prop_name = get_rt_string_constant(name_idx)?;
+                        if prop_name == "length" {
+                            Some(Ok(arr.borrow().len() as i64))
+                        } else {
+                            Some(Ok(JIT_UNDEFINED))
+                        }
+                    }
+                    _ => None,
+                }
+            })
+        };
 
         if let Some(result) = fast {
             return Some(match result {
@@ -1279,9 +1333,15 @@ mod jit_runtime {
                 let prop_name = get_rt_string_constant(name_idx)?;
 
                 if let Some(offset) = map.offset_of(&prop_name) {
-                    RT_PROP_IC.with(|ic| {
-                        ic.borrow_mut().lda[lda_slot] = (name_idx, shape, offset);
-                    });
+                    if ptrs.is_cached() {
+                        // SAFETY: cached pointer valid for thread lifetime.
+                        unsafe { &*ptrs.prop_ic }.borrow_mut().lda[lda_slot] =
+                            (name_idx, shape, offset);
+                    } else {
+                        RT_PROP_IC.with(|ic| {
+                            ic.borrow_mut().lda[lda_slot] = (name_idx, shape, offset);
+                        });
+                    }
                     Some(
                         map.get_by_offset(offset)
                             .map(jsvalue_ref_to_jit_i64)
@@ -1297,9 +1357,14 @@ mod jit_runtime {
                     let result = jit_proto_chain_walk(proto.as_ref(), &prop_name);
 
                     let proto_slot = (name_idx & 15) as usize;
-                    RT_PROP_IC.with(|ic| {
-                        ic.borrow_mut().proto[proto_slot] = (name_idx, shape, result);
-                    });
+                    if ptrs.is_cached() {
+                        unsafe { &*ptrs.prop_ic }.borrow_mut().proto[proto_slot] =
+                            (name_idx, shape, result);
+                    } else {
+                        RT_PROP_IC.with(|ic| {
+                            ic.borrow_mut().proto[proto_slot] = (name_idx, shape, result);
+                        });
+                    }
 
                     Some(result)
                 }
