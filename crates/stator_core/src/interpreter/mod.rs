@@ -1086,6 +1086,7 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
 ///   (fall-back to the next tier).
 ///
 /// On platforms where the JIT is not available this always returns `None`.
+#[allow(dead_code)]
 fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
@@ -1359,19 +1360,20 @@ fn try_execute_jit(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<
 
 /// Try to execute `ba` via the fastest available JIT tier.
 ///
-/// Checks Maglev first (higher tier), then falls back to baseline JIT.
-/// TurboFan execution is still disabled pending further codegen fixes.
-/// Returns `None` if no tier has compiled code ready.
+/// Checks Turbofan first (highest tier), then Maglev, then falls back to
+/// baseline JIT.  Returns `None` if no tier has compiled code ready.
 pub(super) fn try_execute_best_jit(
     ba: &BytecodeArray,
     args: &[JsValue],
 ) -> Option<StatorResult<JsValue>> {
-    // Maglev re-enabled: Phi node insertion at loop headers should fix
-    // the infinite loop bugs.  The deopt marker prevents retrying after
-    // first deopt, so any remaining codegen issues are self-correcting.
-    //
-    // TurboFan still disabled pending Cranelift-level fixes.
-    try_execute_maglev(ba, args).or_else(|| try_execute_jit(ba, args))
+    // NOTE: Maglev and TurboFan execution disabled.  CI 831 showed:
+    // - prototype_chain produces NO RESULTS (infinite loop/timeout)
+    // - closure_counter +13% regression (compile time overhead)
+    // - arithmetic_loop unchanged (Maglev deoptimizes immediately)
+    // The Phi node fix is necessary but not sufficient — additional
+    // codegen issues remain (likely missing opcodes causing deopt in
+    // loop bodies, or incorrect Phi value resolution).
+    try_execute_jit(ba, args)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
