@@ -766,10 +766,7 @@ mod jit_runtime {
                     6 => matches!(val, JsValue::NativeFunction(_) | JsValue::Function(_)),
                     7 => matches!(
                         val,
-                        JsValue::Null
-                            | JsValue::PlainObject(_)
-                            | JsValue::Array(_)
-                            | JsValue::RegExp(_)
+                        JsValue::Null | JsValue::PlainObject(_) | JsValue::Array(_)
                     ),
                     _ => return None,
                 };
@@ -833,15 +830,200 @@ mod jit_runtime {
             }
 
             // ── CreateClosure ────────────────────────────────────────────
-            // Full closure creation requires bytecode array lookup and
-            // context capture — deopt to interpreter.
-            Opcode::CreateClosure => None,
+            Opcode::CreateClosure => {
+                let cp_idx = operand1 as u32;
+                // SAFETY: RT_BYTECODE is always set by jit_runtime_setup
+                // before any JIT code runs, and points at a live
+                // BytecodeArray for the duration of the JIT execution.
+                let ba_ptr = RT_BYTECODE.with(|b| b.get());
+                if ba_ptr.is_null() {
+                    return None;
+                }
+                let ba = unsafe { &*ba_ptr };
+                let entry = ba.get_constant(cp_idx)?;
+                let ConstantPoolEntry::Function(inner_ba) = entry else {
+                    return None;
+                };
+                // Capture the current context (if any) for the closure.
+                let closure_ctx = RT_CONTEXT.with(|ctx_cell| {
+                    let ctx_opt = ctx_cell.borrow();
+                    ctx_opt.as_ref().map(Rc::clone)
+                });
+                let func = Rc::new(inner_ba.clone_for_closure(closure_ctx));
+                let val = JsValue::Function(func);
+                Some(jsvalue_to_jit_i64(val))
+            }
+
+            // ── CreateFunctionContext ─────────────────────────────────────
+            Opcode::CreateFunctionContext => {
+                let slot_count = operand1 as usize;
+                // Parent context comes from RT_CONTEXT (the current
+                // closure's captured context chain).
+                let parent = RT_CONTEXT.with(|ctx_cell| {
+                    let ctx_opt = ctx_cell.borrow();
+                    ctx_opt.as_ref().map(Rc::clone)
+                });
+                let js_ctx = JsContext::new(slot_count, parent);
+                let val = JsValue::Context(js_ctx);
+                Some(jsvalue_to_jit_i64(val))
+            }
+
+            // ── PushContext ──────────────────────────────────────────────
+            // operand1 = flat register index to save old context into
+            Opcode::PushContext => {
+                let reg_flat = operand1 as usize;
+                // Save the current context into the specified register.
+                let old_ctx = RT_CONTEXT.with(|ctx_cell| {
+                    let ctx_opt = ctx_cell.borrow();
+                    ctx_opt
+                        .as_ref()
+                        .map(|c| JsValue::Context(Rc::clone(c)))
+                        .unwrap_or(JsValue::Undefined)
+                });
+                let old_i64 = jsvalue_to_jit_i64(old_ctx);
+                // SAFETY: reg_flat was computed by the compiler from a
+                // valid bytecode register operand.
+                unsafe { *regs.add(reg_flat) = old_i64 };
+                // Set the new context from the accumulator.
+                let new_ctx_val = jit_i64_to_jsvalue(acc);
+                if let JsValue::Context(c) = new_ctx_val {
+                    RT_CONTEXT.with(|ctx_cell| {
+                        *ctx_cell.borrow_mut() = Some(c);
+                    });
+                }
+                Some(acc)
+            }
+
+            // ── PopContext ───────────────────────────────────────────────
+            // operand1 = flat register index holding the saved context
+            Opcode::PopContext => {
+                let reg_flat = operand1 as usize;
+                // SAFETY: reg_flat was computed by the compiler.
+                let saved_i64 = unsafe { *regs.add(reg_flat) };
+                let saved = jit_i64_to_jsvalue(saved_i64);
+                match saved {
+                    JsValue::Context(c) => {
+                        RT_CONTEXT.with(|ctx_cell| {
+                            *ctx_cell.borrow_mut() = Some(c);
+                        });
+                    }
+                    _ => {
+                        RT_CONTEXT.with(|ctx_cell| {
+                            *ctx_cell.borrow_mut() = None;
+                        });
+                    }
+                }
+                Some(acc)
+            }
+
+            // ── Div / Mod ───────────────────────────────────────────────
+            Opcode::Div => {
+                let lhs_i64 = unsafe { *regs.add(operand1 as usize) };
+                let lhs = jit_i64_to_jsvalue(lhs_i64);
+                let rhs = jit_i64_to_jsvalue(acc);
+                match (&lhs, &rhs) {
+                    (JsValue::Smi(a), JsValue::Smi(b)) if *b != 0 => {
+                        if *a % *b == 0 {
+                            Some(jsvalue_to_jit_i64(JsValue::Smi(*a / *b)))
+                        } else {
+                            Some(jsvalue_to_jit_i64(JsValue::HeapNumber(
+                                *a as f64 / *b as f64,
+                            )))
+                        }
+                    }
+                    _ => None,
+                }
+            }
+
+            Opcode::Mod => {
+                let lhs_i64 = unsafe { *regs.add(operand1 as usize) };
+                let lhs = jit_i64_to_jsvalue(lhs_i64);
+                let rhs = jit_i64_to_jsvalue(acc);
+                match (&lhs, &rhs) {
+                    (JsValue::Smi(a), JsValue::Smi(b)) if *b != 0 => {
+                        Some(jsvalue_to_jit_i64(JsValue::Smi(*a % *b)))
+                    }
+                    _ => None,
+                }
+            }
+
+            // ── CallProperty0 ────────────────────────────────────────────
+            // operand1 = flat register of the callee, operand2 = flat
+            // register of the receiver.  Zero additional arguments.
+            Opcode::CallProperty0 => {
+                let callee_i64 = unsafe { *regs.add(operand1 as usize) };
+                let callee = jit_i64_to_jsvalue(callee_i64);
+                let receiver_i64 = unsafe { *regs.add(operand2 as usize) };
+                let receiver = jit_i64_to_jsvalue(receiver_i64);
+                match callee {
+                    JsValue::NativeFunction(nf) => {
+                        let result = (nf.function)(&[receiver]);
+                        match result {
+                            Ok(val) => Some(jsvalue_to_jit_i64(val)),
+                            Err(_) => None,
+                        }
+                    }
+                    _ => None,
+                }
+            }
+
+            // ── DivSmi / ModSmi ──────────────────────────────────────────
+            Opcode::DivSmi => {
+                let rhs = operand1 as i32;
+                let lhs = jit_i64_to_jsvalue(acc);
+                match lhs {
+                    JsValue::Smi(a) if rhs != 0 => {
+                        if a % (rhs as i64) == 0 {
+                            Some(jsvalue_to_jit_i64(JsValue::Smi(a / rhs as i64)))
+                        } else {
+                            Some(jsvalue_to_jit_i64(JsValue::HeapNumber(
+                                a as f64 / rhs as f64,
+                            )))
+                        }
+                    }
+                    _ => None,
+                }
+            }
+
+            Opcode::ModSmi => {
+                let rhs = operand1 as i32;
+                let lhs = jit_i64_to_jsvalue(acc);
+                match lhs {
+                    JsValue::Smi(a) if rhs != 0 => {
+                        Some(jsvalue_to_jit_i64(JsValue::Smi(a % rhs as i64)))
+                    }
+                    _ => None,
+                }
+            }
+
+            // ── CallProperty1 ────────────────────────────────────────────
+            // operand1 encodes callee_flat (low 16 bits) and receiver_flat
+            // (bits 16..31).  operand2 = flat register of arg0.
+            Opcode::CallProperty1 => {
+                let callee_flat = (operand1 & 0xFFFF) as usize;
+                let receiver_flat = ((operand1 >> 16) & 0xFFFF) as usize;
+                let arg0_flat = operand2 as usize;
+                let callee_i64 = unsafe { *regs.add(callee_flat) };
+                let callee = jit_i64_to_jsvalue(callee_i64);
+                let receiver_i64 = unsafe { *regs.add(receiver_flat) };
+                let receiver = jit_i64_to_jsvalue(receiver_i64);
+                let arg0_i64 = unsafe { *regs.add(arg0_flat) };
+                let arg0 = jit_i64_to_jsvalue(arg0_i64);
+                match callee {
+                    JsValue::NativeFunction(nf) => {
+                        let result = (nf.function)(&[receiver, arg0]);
+                        match result {
+                            Ok(val) => Some(jsvalue_to_jit_i64(val)),
+                            Err(_) => None,
+                        }
+                    }
+                    _ => None,
+                }
+            }
 
             _ => None,
         }
     }
-
-    // ── Specialized LdaNamedProperty stub ────────────────────────────────
 
     /// Specialized runtime stub for `LdaNamedProperty`.
     ///
@@ -2902,7 +3084,117 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── CreateClosure runtime stub ──────────────────────────────────
             Opcode::CreateClosure => {
-                self.emit_runtime_stub(Opcode::CreateClosure, 0, 0, bytecode_offset);
+                let Operand::ConstantPoolIdx(cp_idx) = instr.operands[0] else {
+                    return Err(bad_operand("CreateClosure", 0));
+                };
+                self.emit_runtime_stub(
+                    Opcode::CreateClosure,
+                    i64::from(cp_idx),
+                    0,
+                    bytecode_offset,
+                );
+            }
+
+            // ── CreateFunctionContext runtime stub ───────────────────────────
+            Opcode::CreateFunctionContext => {
+                let slot_count = match instr.operands.get(1) {
+                    Some(Operand::Immediate(n)) => i64::from(*n),
+                    _ => 0,
+                };
+                self.emit_runtime_stub(
+                    Opcode::CreateFunctionContext,
+                    slot_count,
+                    0,
+                    bytecode_offset,
+                );
+            }
+
+            // ── PushContext / PopContext runtime stubs ────────────────────────
+            Opcode::PushContext => {
+                let Operand::Register(v) = instr.operands[0] else {
+                    return Err(bad_operand("PushContext", 0));
+                };
+                let reg_flat = self.reg_flat_index(v) as i64;
+                self.emit_runtime_stub(Opcode::PushContext, reg_flat, 0, bytecode_offset);
+            }
+
+            Opcode::PopContext => {
+                let Operand::Register(v) = instr.operands[0] else {
+                    return Err(bad_operand("PopContext", 0));
+                };
+                let reg_flat = self.reg_flat_index(v) as i64;
+                self.emit_runtime_stub(Opcode::PopContext, reg_flat, 0, bytecode_offset);
+            }
+
+            // ── Div / Mod runtime stubs ─────────────────────────────────────
+            Opcode::Div => {
+                let Operand::Register(lhs_v) = instr.operands[0] else {
+                    return Err(bad_operand("Div", 0));
+                };
+                let lhs_flat = self.reg_flat_index(lhs_v) as i64;
+                self.emit_runtime_stub(Opcode::Div, lhs_flat, 0, bytecode_offset);
+            }
+
+            Opcode::Mod => {
+                let Operand::Register(lhs_v) = instr.operands[0] else {
+                    return Err(bad_operand("Mod", 0));
+                };
+                let lhs_flat = self.reg_flat_index(lhs_v) as i64;
+                self.emit_runtime_stub(Opcode::Mod, lhs_flat, 0, bytecode_offset);
+            }
+
+            // ── CallProperty0 runtime stub ──────────────────────────────────
+            Opcode::CallProperty0 => {
+                let Operand::Register(callee_v) = instr.operands[0] else {
+                    return Err(bad_operand("CallProperty0", 0));
+                };
+                let Operand::Register(receiver_v) = instr.operands[1] else {
+                    return Err(bad_operand("CallProperty0", 1));
+                };
+                let callee_flat = self.reg_flat_index(callee_v) as i64;
+                let receiver_flat = self.reg_flat_index(receiver_v) as i64;
+                self.emit_runtime_stub(
+                    Opcode::CallProperty0,
+                    callee_flat,
+                    receiver_flat,
+                    bytecode_offset,
+                );
+            }
+
+            // ── CallProperty1 runtime stub ──────────────────────────────────
+            // Pack callee and receiver into operand1, arg0 into operand2.
+            Opcode::CallProperty1 => {
+                let Operand::Register(callee_v) = instr.operands[0] else {
+                    return Err(bad_operand("CallProperty1", 0));
+                };
+                let Operand::Register(receiver_v) = instr.operands[1] else {
+                    return Err(bad_operand("CallProperty1", 1));
+                };
+                let Operand::Register(arg0_v) = instr.operands[2] else {
+                    return Err(bad_operand("CallProperty1", 2));
+                };
+                let callee_flat = self.reg_flat_index(callee_v) as i64;
+                let receiver_flat = self.reg_flat_index(receiver_v) as i64;
+                let arg0_flat = self.reg_flat_index(arg0_v) as i64;
+                let packed = callee_flat | (receiver_flat << 16);
+                self.emit_runtime_stub(Opcode::CallProperty1, packed, arg0_flat, bytecode_offset);
+            }
+
+            // ── DivSmi / ModSmi runtime stubs ───────────────────────────────
+            Opcode::DivSmi => {
+                let imm = match instr.operands.first() {
+                    Some(Operand::Immediate(n)) => i64::from(*n),
+                    _ => return Err(bad_operand("DivSmi", 0)),
+                };
+                self.emit_runtime_stub(Opcode::DivSmi, imm, 0, bytecode_offset);
+            }
+
+            Opcode::ModSmi => {
+                let imm = match instr.operands.first() {
+                    Some(Operand::Immediate(n)) => i64::from(*n),
+                    _ => return Err(bad_operand("ModSmi", 0)),
+                };
+                self.emit_runtime_stub(Opcode::ModSmi, imm, 0, bytecode_offset);
             }
 
             // ── Remaining unsupported opcodes → deopt ────────────────────────
@@ -2921,8 +3213,6 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::DeleteLookupSlot
             | Opcode::CallAnyReceiver
             | Opcode::CallProperty
-            | Opcode::CallProperty0
-            | Opcode::CallProperty1
             | Opcode::CallProperty2
             | Opcode::CallUndefinedReceiver2
             | Opcode::CallWithSpread
@@ -2937,7 +3227,6 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::ConstructForwardAllArgs
             | Opcode::CreateBlockContext
             | Opcode::CreateCatchContext
-            | Opcode::CreateFunctionContext
             | Opcode::CreateEvalContext
             | Opcode::CreateWithContext
             | Opcode::CreateMappedArguments
@@ -2950,8 +3239,6 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::GetAsyncIterator
             | Opcode::IteratorNext
             | Opcode::IteratorClose
-            | Opcode::PushContext
-            | Opcode::PopContext
             | Opcode::ForInEnumerate
             | Opcode::ForInPrepare
             | Opcode::ForInNext
@@ -2989,11 +3276,7 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::JumpIfUndefinedOrNullConstant
             | Opcode::JumpIfJSReceiver
             | Opcode::JumpIfJSReceiverConstant
-            | Opcode::Div
-            | Opcode::Mod
             | Opcode::Exp
-            | Opcode::DivSmi
-            | Opcode::ModSmi
             | Opcode::ExpSmi
             | Opcode::ShiftLeftSmi
             | Opcode::ShiftRightSmi
