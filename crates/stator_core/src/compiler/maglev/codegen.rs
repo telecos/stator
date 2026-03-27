@@ -1443,6 +1443,51 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_stub_call_1node(id, *value, jit_runtime::jit_runtime_typeof as usize);
             }
 
+            // ── Deep context slot access via trampoline ───────────────────────
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::LoadContextSlot { depth, slot, .. } => {
+                self.emit_trampoline_call(
+                    id,
+                    Opcode::LdaContextSlot as u8,
+                    i64::from(*slot),
+                    i64::from(*depth),
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::StoreContextSlot {
+                depth, slot, value, ..
+            } => {
+                // Store the value into the accumulator (R12) before the
+                // trampoline call, since it reads the value from `acc`.
+                self.emit_load(*value, Reg64::R12);
+                self.emit_trampoline_call(
+                    id,
+                    Opcode::StaContextSlot as u8,
+                    i64::from(*slot),
+                    i64::from(*depth),
+                );
+            }
+
+            // ── Tagged equality ───────────────────────────────────────────────
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::TaggedEqual { left, right, .. } => {
+                self.emit_stub_call_2node(
+                    id,
+                    *left,
+                    *right,
+                    jit_runtime::jit_runtime_tagged_equal as usize,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::TaggedNotEqual { left, right, .. } => {
+                self.emit_stub_call_2node(
+                    id,
+                    *left,
+                    *right,
+                    jit_runtime::jit_runtime_tagged_not_equal as usize,
+                );
+            }
+
             // ── Unsupported nodes → unconditional deopt ───────────────────────
             _ => {
                 self.emit_deopt_unconditional(0);

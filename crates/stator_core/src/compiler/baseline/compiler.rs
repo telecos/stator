@@ -3014,6 +3014,42 @@ pub(crate) mod jit_runtime {
         jsvalue_to_jit_i64(JsValue::String(Rc::from(s)))
     }
 
+    // ── Tagged equality stubs ───────────────────────────────────────────────
+
+    /// Strict equality (`===`) for tagged JIT values.
+    pub extern "C" fn jit_runtime_tagged_equal(left: i64, right: i64) -> i64 {
+        if left == right {
+            return JIT_TRUE;
+        }
+        let l = jit_i64_to_jsvalue(left);
+        let r = jit_i64_to_jsvalue(right);
+        let result = match (&l, &r) {
+            (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => *a == *b,
+            (JsValue::Smi(a), JsValue::HeapNumber(b)) => *a as f64 == *b,
+            (JsValue::HeapNumber(a), JsValue::Smi(b)) => *a == *b as f64,
+            (JsValue::String(a), JsValue::String(b)) => **a == **b,
+            _ => false,
+        };
+        if result { JIT_TRUE } else { JIT_FALSE }
+    }
+
+    /// Strict inequality (`!==`) for tagged JIT values.
+    pub extern "C" fn jit_runtime_tagged_not_equal(left: i64, right: i64) -> i64 {
+        if left == right {
+            return JIT_FALSE;
+        }
+        let l = jit_i64_to_jsvalue(left);
+        let r = jit_i64_to_jsvalue(right);
+        let result = match (&l, &r) {
+            (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => *a == *b,
+            (JsValue::Smi(a), JsValue::HeapNumber(b)) => *a as f64 == *b,
+            (JsValue::HeapNumber(a), JsValue::Smi(b)) => *a == *b as f64,
+            (JsValue::String(a), JsValue::String(b)) => **a == **b,
+            _ => false,
+        };
+        if result { JIT_FALSE } else { JIT_TRUE }
+    }
+
     // ── Construct stub for Maglev ───────────────────────────────────────────
 
     /// Simplified construct for 0 arguments — takes the constructor value
