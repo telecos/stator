@@ -683,6 +683,9 @@ pub(crate) mod jit_runtime {
                         let i = *idx as usize;
                         let mut v = arr.borrow_mut();
                         if i >= v.len() {
+                            let cur_len = v.len();
+                            let new_cap = (i + 1).next_power_of_two();
+                            v.reserve(new_cap - cur_len);
                             v.resize(i + 1, JsValue::TheHole);
                         }
                         v[i] = value;
@@ -715,6 +718,9 @@ pub(crate) mod jit_runtime {
                         let i = *i as usize;
                         let mut v = arr.borrow_mut();
                         if i >= v.len() {
+                            let cur_len = v.len();
+                            let new_cap = (i + 1).next_power_of_two();
+                            v.reserve(new_cap - cur_len);
                             v.resize(i + 1, JsValue::TheHole);
                         }
                         v[i] = value;
@@ -2344,6 +2350,9 @@ pub(crate) mod jit_runtime {
                                 let i = smi_key as usize;
                                 let mut v = arr.borrow_mut();
                                 if i >= v.len() {
+                                    let cur_len = v.len();
+                                    let new_cap = (i + 1).next_power_of_two();
+                                    v.reserve(new_cap - cur_len);
                                     v.resize(i + 1, JsValue::TheHole);
                                 }
                                 v[i] = value;
@@ -2364,6 +2373,9 @@ pub(crate) mod jit_runtime {
                                     let i = smi_key as usize;
                                     let mut v = arr.borrow_mut();
                                     if i >= v.len() {
+                                        let cur_len = v.len();
+                                        let new_cap = (i + 1).next_power_of_two();
+                                        v.reserve(new_cap - cur_len);
                                         v.resize(i + 1, JsValue::TheHole);
                                     }
                                     v[i] = value;
@@ -2395,6 +2407,9 @@ pub(crate) mod jit_runtime {
                 let i = *idx as usize;
                 let mut v = arr.borrow_mut();
                 if i >= v.len() {
+                    let cur_len = v.len();
+                    let new_cap = (i + 1).next_power_of_two();
+                    v.reserve(new_cap - cur_len);
                     v.resize(i + 1, JsValue::TheHole);
                 }
                 v[i] = value;
