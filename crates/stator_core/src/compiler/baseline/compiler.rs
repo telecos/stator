@@ -142,7 +142,7 @@ pub fn jit_to_jsvalue(v: i64) -> Option<crate::objects::value::JsValue> {
 /// constant pool and to store heap-allocated JavaScript objects that cannot
 /// be encoded as plain `i64` values.
 #[cfg(all(target_arch = "x86_64", unix))]
-mod jit_runtime {
+pub(crate) mod jit_runtime {
     use super::*;
     use crate::bytecode::bytecode_array::JitExecutableCode;
     use crate::interpreter::GlobalEnv;

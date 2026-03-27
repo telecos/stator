@@ -79,10 +79,13 @@ use crate::compiler::baseline::compiler::{
     DeoptEntry, JIT_DEOPT, JIT_FALSE, JIT_NULL, JIT_TRUE, JIT_UNDEFINED, METADATA_MAGIC,
     SafepointEntry,
 };
+#[cfg(all(target_arch = "x86_64", unix))]
+use crate::compiler::baseline::compiler::jit_runtime;
 use crate::compiler::baseline::masm_x64::{CondCode, Label, MacroAssembler, Reg64};
 use crate::compiler::maglev::ir::{ControlNode, MaglevGraph, NodeId, ValueNode};
 use crate::compiler::maglev::regalloc::{AllocationResult, Location, allocate};
 use crate::error::{StatorError, StatorResult};
+use std::collections::HashSet;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -411,6 +414,12 @@ struct MaglevCodegen<'a> {
     safepoints: Vec<SafepointEntry>,
     deopt_entries: Vec<DeoptEntry>,
     source_positions: Vec<SourcePositionEntry>,
+    /// Promoted globals: `(name_idx, slot_index)` where `slot_index` is the
+    /// byte offset from R14 divided by 8.  These slots live after the
+    /// allocator's spill area in the register file.
+    promoted_globals: Vec<(u32, usize)>,
+    /// Number of extra register-file slots allocated for promoted globals.
+    promoted_extra_slots: usize,
 }
 
 impl<'a> MaglevCodegen<'a> {
@@ -426,6 +435,8 @@ impl<'a> MaglevCodegen<'a> {
             safepoints: Vec::new(),
             deopt_entries: Vec::new(),
             source_positions: Vec::new(),
+            promoted_globals: Vec::new(),
+            promoted_extra_slots: 0,
         }
     }
 
@@ -433,9 +444,15 @@ impl<'a> MaglevCodegen<'a> {
 
     fn compile(mut self) -> StatorResult<MaglevCompiledCode> {
         let spill_count = self.alloc.spill_count();
-        let register_file_slots = (self.param_count + spill_count) as usize;
+        let base_slots = (self.param_count + spill_count) as usize;
+
+        // Scan the IR graph and promote every unique global name into an
+        // extra register-file slot beyond the allocator's spill area.
+        self.scan_and_promote_globals(base_slots);
+        let register_file_slots = base_slots + self.promoted_extra_slots;
 
         self.emit_prologue();
+        self.emit_promoted_global_loads();
 
         for block_idx in 0..self.graph.blocks().len() {
             self.emit_block(block_idx as u32);
@@ -906,6 +923,35 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_store(id, Reg64::R11);
             }
 
+            // ── Global variable access via promoted register-file slots ────
+            //
+            // Each unique global name is pre-loaded into a dedicated
+            // register-file slot during the prologue.  LoadGlobal reads from
+            // the slot; StoreGlobal writes to it.  The epilogue flushes all
+            // promoted slots back to the runtime GlobalEnv.
+            ValueNode::LoadGlobal { name, .. } => {
+                if let Some(off) = self.promoted_global_offset(*name) {
+                    self.masm.mov_load_base_disp32(Reg64::R11, Reg64::R14, off);
+                    self.emit_store(id, Reg64::R11);
+                } else {
+                    // Unknown global — deopt to interpreter.
+                    self.emit_deopt_unconditional(0);
+                    self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
+                    self.emit_store(id, Reg64::R11);
+                }
+            }
+            ValueNode::StoreGlobal { name, value, .. } => {
+                if let Some(off) = self.promoted_global_offset(*name) {
+                    self.emit_load(*value, Reg64::R11);
+                    self.masm.mov_store_base_disp32(Reg64::R14, off, Reg64::R11);
+                    self.emit_store(id, Reg64::R11);
+                } else {
+                    self.emit_deopt_unconditional(0);
+                    self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
+                    self.emit_store(id, Reg64::R11);
+                }
+            }
+
             // ── Unsupported nodes → unconditional deopt ───────────────────────
             _ => {
                 self.emit_deopt_unconditional(0);
@@ -922,6 +968,7 @@ impl<'a> MaglevCodegen<'a> {
         match ctrl {
             ControlNode::Return { value } => {
                 self.emit_load(*value, Reg64::Rax);
+                self.emit_promoted_global_stores();
                 self.emit_normal_epilogue();
             }
             ControlNode::Jump { target } => {
@@ -1043,6 +1090,92 @@ impl<'a> MaglevCodegen<'a> {
     /// Byte offset from R14 (register-file base) for spill slot `n`.
     fn slot_offset(&self, n: u32) -> i32 {
         ((self.param_count + n) * 8) as i32
+    }
+
+    // ── Promoted globals ─────────────────────────────────────────────────────
+
+    /// Scan the IR graph for every unique `LoadGlobal` / `StoreGlobal` name
+    /// and assign each one a dedicated register-file slot beyond the
+    /// allocator's spill area.
+    fn scan_and_promote_globals(&mut self, base_slots: usize) {
+        let mut seen = HashSet::new();
+        for block in self.graph.blocks() {
+            for (_, node) in &block.nodes {
+                match node {
+                    ValueNode::LoadGlobal { name, .. } | ValueNode::StoreGlobal { name, .. } => {
+                        seen.insert(*name);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut sorted: Vec<u32> = seen.into_iter().collect();
+        sorted.sort_unstable();
+        self.promoted_globals = sorted
+            .iter()
+            .enumerate()
+            .map(|(i, &name_idx)| (name_idx, base_slots + i))
+            .collect();
+        self.promoted_extra_slots = sorted.len();
+    }
+
+    /// Byte offset from R14 for the promoted global with `name_idx`.
+    fn promoted_global_offset(&self, name_idx: u32) -> Option<i32> {
+        self.promoted_globals
+            .iter()
+            .find(|(n, _)| *n == name_idx)
+            .map(|&(_, slot)| (slot * 8) as i32)
+    }
+
+    /// Emit code to load all promoted globals from `GlobalEnv` into their
+    /// register-file slots via [`jit_runtime_lda_global`].
+    ///
+    /// Called once after the prologue.  At this point no allocatable registers
+    /// hold live values, so we can freely clobber caller-saved registers.
+    #[allow(unused_variables)]
+    fn emit_promoted_global_loads(&mut self) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            let addr = jit_runtime::jit_runtime_lda_global as *const () as usize as i64;
+            for &(name_idx, slot) in &self.promoted_globals.clone() {
+                let off = (slot * 8) as i32;
+                // RDI = name_idx (SysV ABI first arg)
+                self.masm.mov_ri(Reg64::Rdi, i64::from(name_idx));
+                self.masm.mov_ri(Reg64::R11, addr);
+                self.masm.call_reg(Reg64::R11);
+                // Store result in promoted slot: [R14 + off] = RAX
+                self.masm.mov_store_base_disp32(Reg64::R14, off, Reg64::Rax);
+            }
+        }
+    }
+
+    /// Emit code to flush all promoted globals from their register-file
+    /// slots back to `GlobalEnv` via [`jit_runtime_sta_global`].
+    ///
+    /// Called before each `Return`.  We save/restore RAX around the flush
+    /// because it already holds the return value.
+    #[allow(unused_variables)]
+    fn emit_promoted_global_stores(&mut self) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            if self.promoted_globals.is_empty() {
+                return;
+            }
+            let addr = jit_runtime::jit_runtime_sta_global as *const () as usize as i64;
+            // Save the return value (already in RAX).
+            self.masm.push(Reg64::Rax);
+            for &(name_idx, slot) in &self.promoted_globals.clone() {
+                let off = (slot * 8) as i32;
+                // RDI = name_idx
+                self.masm.mov_ri(Reg64::Rdi, i64::from(name_idx));
+                // RSI = value from promoted slot
+                self.masm.mov_load_base_disp32(Reg64::Rsi, Reg64::R14, off);
+                self.masm.mov_ri(Reg64::R11, addr);
+                self.masm.call_reg(Reg64::R11);
+            }
+            // Restore the return value.
+            self.masm.pop(Reg64::Rax);
+        }
     }
 
     // ── Arithmetic helpers ───────────────────────────────────────────────────
