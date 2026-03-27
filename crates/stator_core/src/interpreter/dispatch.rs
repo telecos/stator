@@ -5313,8 +5313,8 @@ fn handle_define_named_own_property(
         return Err(err_bad_operand("DefineNamedOwnProperty", 1));
     };
     // operands[2] is a FeedbackSlot, ignored at runtime.
-    let prop_name = match ctx.frame.bytecode_array.get_constant(name_idx) {
-        Some(ConstantPoolEntry::String(s)) => s.clone(),
+    let prop_name_ref = match ctx.frame.bytecode_array.get_constant(name_idx) {
+        Some(ConstantPoolEntry::String(s)) => s,
         _ => {
             return Err(StatorError::Internal(
                 "DefineNamedOwnProperty: property name is not a string".into(),
@@ -5324,14 +5324,16 @@ fn handle_define_named_own_property(
     let val = ctx.frame.accumulator.clone();
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     if let JsValue::PlainObject(ref map) = obj {
-        set_named_property_function_metadata(&val, &obj, &prop_name);
-        if let Some(attrs) = private_named_property_attrs(&prop_name) {
-            map.borrow_mut().insert_with_attrs(prop_name, val, attrs);
+        set_named_property_function_metadata(&val, &obj, prop_name_ref);
+        if let Some(attrs) = private_named_property_attrs(prop_name_ref) {
+            map.borrow_mut()
+                .insert_with_attrs(prop_name_ref.to_string(), val, attrs);
         } else {
-            let fill_result = map.borrow_mut().try_template_fill(&prop_name, val);
+            let fill_result = map.borrow_mut().try_template_fill(prop_name_ref, val);
             if let Err(val) = fill_result {
                 // Template fill missed — fall back to normal insert.
-                map.borrow_mut().insert(prop_name, val);
+                // Only clone the property name string here (cold path).
+                map.borrow_mut().insert(prop_name_ref.to_string(), val);
             }
         }
     }
