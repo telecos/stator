@@ -700,28 +700,28 @@ pub(crate) fn set_function_name_if_missing(value: &JsValue, name: &str) {
 /// Number of loop back-edges taken before OSR baseline compilation is triggered.
 ///
 /// When a single interpreter loop accumulates this many `JumpLoop` iterations
-/// (10 back-edges) and the enclosing function has not yet been JIT-compiled,
+/// (5 back-edges) and the enclosing function has not yet been JIT-compiled,
 /// a baseline compilation is requested so the next *call* to that function
 /// executes via native code.
-pub(super) const OSR_LOOP_THRESHOLD: u32 = 10;
+pub(super) const OSR_LOOP_THRESHOLD: u32 = 5;
 
 /// Number of loop back-edges taken before a Maglev background compilation is
 /// triggered via OSR.
 ///
 /// When a loop has already caused baseline JIT compilation and the back-edge
-/// count exceeds this threshold (100 back-edges), a Maglev compilation is
+/// count exceeds this threshold (50 back-edges), a Maglev compilation is
 /// scheduled in a background thread so the next *call* can use the optimised
 /// tier.
-pub(super) const MAGLEV_OSR_LOOP_THRESHOLD: u32 = 100;
+pub(super) const MAGLEV_OSR_LOOP_THRESHOLD: u32 = 50;
 
 /// Number of loop back-edges taken before a Turbofan background compilation is
 /// triggered via OSR.
 ///
 /// When a loop has already caused Maglev JIT compilation and the back-edge
-/// count exceeds this threshold (1 000 back-edges), a Turbofan compilation
+/// count exceeds this threshold (200 back-edges), a Turbofan compilation
 /// is scheduled in a background thread so the next *call* can use the
 /// fully-optimised tier.
-pub(super) const TURBOFAN_OSR_LOOP_THRESHOLD: u32 = 1_000;
+pub(super) const TURBOFAN_OSR_LOOP_THRESHOLD: u32 = 200;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Generator return completion sentinel
