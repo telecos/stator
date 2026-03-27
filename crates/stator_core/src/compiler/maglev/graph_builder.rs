@@ -378,14 +378,14 @@ impl<'a> GraphBuilder<'a> {
             if let Some(&new_block) = self.block_at.get(&i) {
                 let cur = self.current_block;
                 if !self.block_is_complete(cur) {
-                    self.save_env_for_successor(new_block);
                     self.set_control(ControlNode::Jump { target: new_block });
-                    if let Some(block) = self.graph.block_mut(new_block) {
-                        block.add_predecessor(cur);
-                    }
                 }
                 self.current_block = new_block;
-                self.enter_block(new_block);
+                // Record predecessor.
+                self.graph
+                    .block_mut(new_block)
+                    .unwrap()
+                    .add_predecessor(cur);
             }
 
             self.translate_one(i, instr, instructions)?;
