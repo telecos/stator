@@ -458,6 +458,33 @@ pub(crate) mod jit_runtime {
         }
     }
 
+    /// Like [`get_rt_string_constant`] but returns a `&str` reference
+    /// without cloning. The reference is valid for the duration of JIT
+    /// execution (the backing `BytecodeArray` is alive on the call stack).
+    ///
+    /// # Safety
+    ///
+    /// The `RT_BYTECODE` / `RT_PTRS.bytecode` pointer must be valid.
+    fn get_rt_string_constant_ref(idx: u32) -> Option<&'static str> {
+        let ptrs = RT_PTRS.with(|p| p.get());
+        let ptr = if ptrs.is_cached() {
+            // SAFETY: cached pointer valid for thread lifetime.
+            unsafe { &*ptrs.bytecode }.get()
+        } else {
+            RT_BYTECODE.with(|ba_ptr| ba_ptr.get())
+        };
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: The pointer is valid for the duration of JIT execution
+        // (set by jit_runtime_setup, cleared by jit_runtime_teardown).
+        let ba = unsafe { &*ptr };
+        match ba.get_constant(idx) {
+            Some(ConstantPoolEntry::String(s)) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
     // ── Trampoline entry point ───────────────────────────────────────────
 
     /// Runtime trampoline called from JIT machine code for opcodes that
@@ -1293,9 +1320,10 @@ pub(crate) mod jit_runtime {
                     None // IC miss
                 }
                 JsValue::Array(arr) => {
-                    let prop_name = get_rt_string_constant(name_idx)?;
+                    let prop_name = get_rt_string_constant_ref(name_idx)?;
                     if prop_name == "length" {
-                        Some(Ok(arr.borrow().len() as i64))
+                        // SAFETY: single-threaded JIT; no concurrent borrows.
+                        Some(Ok(unsafe { &*arr.as_ptr() }.len() as i64))
                     } else {
                         Some(Ok(JIT_UNDEFINED))
                     }
@@ -1334,7 +1362,7 @@ pub(crate) mod jit_runtime {
                         })
                     }
                     JsValue::Array(arr) => {
-                        let prop_name = get_rt_string_constant(name_idx)?;
+                        let prop_name = get_rt_string_constant_ref(name_idx)?;
                         if prop_name == "length" {
                             Some(Ok(arr.borrow().len() as i64))
                         } else {
