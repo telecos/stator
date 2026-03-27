@@ -1638,6 +1638,20 @@ impl GlobalEnv {
         self.generation = self.generation.wrapping_add(1);
     }
 
+    /// Store by slot index with HashMap sync but **no generation bump**.
+    ///
+    /// Used by the JIT runtime where the IC only tracks structural validity
+    /// (name → slot-index mapping).  A value-only change does not invalidate
+    /// that mapping, so we can skip the generation bump.  This avoids
+    /// cascading IC misses for *other* variables in the same loop iteration.
+    #[inline(always)]
+    pub fn store_by_index_fast(&mut self, idx: usize, key: &str, value: JsValue) {
+        self.slots[idx] = value.clone();
+        if let Some(v) = self.vars.get_mut(key) {
+            *v = value;
+        }
+    }
+
     /// Look up the slot index for a global variable name.
     #[inline(always)]
     pub fn slot_index_for(&self, key: &str) -> Option<usize> {

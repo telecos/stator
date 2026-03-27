@@ -211,9 +211,21 @@ mod jit_runtime {
     /// rebuilt (e.g. tail-call).  Not cleared by [`jit_runtime_teardown`]
     /// so it persists across multiple JIT entries within the same
     /// `run_dispatch` invocation.
+    ///
+    /// When the environment `Rc` is the **same** as the currently stored
+    /// one (pointer-equal), the direct-mapped IC is kept warm — avoiding
+    /// cold-start IC misses on every criterion iteration.
     pub fn jit_runtime_set_global_env(env: Rc<RefCell<GlobalEnv>>) {
-        RT_GLOBAL_ENV.with(|g| *g.borrow_mut() = Some(env));
-        RT_GLOBAL_IC.with(|ic| *ic.borrow_mut() = [(u32::MAX, 0, 0); 32]);
+        RT_GLOBAL_ENV.with(|g| {
+            let mut slot = g.borrow_mut();
+            let same_env = slot.as_ref().map_or(false, |old| Rc::ptr_eq(old, &env));
+            if same_env {
+                return;
+            }
+            *slot = Some(env);
+            drop(slot);
+            RT_GLOBAL_IC.with(|ic| *ic.borrow_mut() = [(u32::MAX, 0, 0); 32]);
+        });
     }
 
     /// Clean up thread-local state after JIT execution.
@@ -1366,11 +1378,13 @@ mod jit_runtime {
             if let Some((slot_idx, cached_gen)) = ic_hit {
                 if env.generation() == cached_gen && slot_idx < env.slot_count() {
                     let name = get_rt_string_constant(name_idx)?;
-                    env.store_by_index_sync(slot_idx, &name, value);
-                    let new_gen = env.generation();
-                    RT_GLOBAL_IC.with(|ic| {
-                        ic.borrow_mut()[(name_idx & 31) as usize].2 = new_gen;
-                    });
+                    // Use store_by_index_fast: syncs HashMap but does NOT
+                    // bump generation.  The IC only tracks structural
+                    // validity (name→slot mapping), which is unchanged by
+                    // a value-only store.  Skipping the bump avoids
+                    // cascading IC misses for other variables in the same
+                    // loop iteration.
+                    env.store_by_index_fast(slot_idx, &name, value);
                     return Some(value_i64);
                 }
             }
@@ -1379,7 +1393,7 @@ mod jit_runtime {
             let name = get_rt_string_constant(name_idx)?;
             let slot_idx = env.slot_index_for(&name);
             if let Some(idx) = slot_idx {
-                env.store_by_index_sync(idx, &name, value);
+                env.store_by_index_fast(idx, &name, value);
             } else {
                 env.insert(name.clone(), value);
             }
