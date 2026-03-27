@@ -1772,6 +1772,16 @@ pub struct BaselineCompiler<'a> {
     labels: Vec<Label>,
     /// Label for the shared deopt epilogue.
     deopt_label: Label,
+    /// Promoted global variables: `(name_idx, flat_slot_index)` pairs.
+    ///
+    /// During compilation, `LdaGlobal`/`StaGlobal` for these `name_idx` values
+    /// are lowered to direct register-file loads/stores instead of runtime stub
+    /// calls.  The prologue loads each global once, and the epilogue writes back
+    /// any modifications.  Around Call/Construct opcodes the promoted slots are
+    /// flushed and reloaded to preserve correctness.
+    promoted_globals: Vec<(u32, usize)>,
+    /// Number of extra register-file slots allocated for promoted globals.
+    promoted_extra_slots: usize,
 }
 
 impl<'a> BaselineCompiler<'a> {
@@ -1790,10 +1800,13 @@ impl<'a> BaselineCompiler<'a> {
             deopt_entries: Vec::new(),
             labels: Vec::new(),
             deopt_label: Label::new(),
+            promoted_globals: Vec::new(),
+            promoted_extra_slots: 0,
         };
         c.compile_function()?;
-        let register_file_slots =
-            bytecode.parameter_count() as usize + bytecode.frame_size() as usize;
+        let register_file_slots = bytecode.parameter_count() as usize
+            + bytecode.frame_size() as usize
+            + c.promoted_extra_slots;
         let mut code = c.masm.into_code();
         let native_code_len = code.len();
 
@@ -1930,6 +1943,97 @@ impl<'a> BaselineCompiler<'a> {
     fn emit_store_reg(&mut self, v: u32, src: Reg64) {
         let off = self.reg_offset(v);
         self.masm.mov_store_base_disp32(Reg64::R14, off, src);
+    }
+
+    // ── Global register promotion helpers ────────────────────────────────────
+
+    /// Scan the decoded instruction stream and collect every unique
+    /// `ConstantPoolIdx` operand used by `LdaGlobal` / `StaGlobal`.
+    ///
+    /// Each unique `name_idx` is allocated a fresh register-file slot beyond
+    /// the original `parameter_count + frame_size` range.
+    fn scan_and_promote_globals(&mut self, instructions: &[Instruction]) {
+        let base_slots = self.param_count + self.bytecode.frame_size() as usize;
+
+        let mut seen = std::collections::HashSet::new();
+        for instr in instructions {
+            if matches!(instr.opcode, Opcode::LdaGlobal | Opcode::StaGlobal)
+                && let Operand::ConstantPoolIdx(idx) = instr.operands[0]
+            {
+                seen.insert(idx);
+            }
+        }
+
+        let mut sorted: Vec<u32> = seen.into_iter().collect();
+        sorted.sort_unstable();
+
+        self.promoted_globals = sorted
+            .iter()
+            .enumerate()
+            .map(|(i, &name_idx)| (name_idx, base_slots + i))
+            .collect();
+        self.promoted_extra_slots = sorted.len();
+    }
+
+    /// Look up the promoted register-file flat-slot index for `name_idx`.
+    fn promoted_slot_for(&self, name_idx: u32) -> Option<usize> {
+        self.promoted_globals
+            .iter()
+            .find(|(n, _)| *n == name_idx)
+            .map(|&(_, slot)| slot)
+    }
+
+    /// Byte offset into the register file for a promoted flat-slot index.
+    #[allow(dead_code)]
+    fn promoted_offset(flat: usize) -> i32 {
+        (flat * 8) as i32
+    }
+
+    /// Emit code to load **all** promoted globals from `GlobalEnv` into their
+    /// register-file slots.
+    ///
+    /// Each global is loaded via [`jit_runtime_lda_global`]; a deopt sentinel
+    /// check is omitted here because the globals are already initialised by the
+    /// time baseline JIT fires (they were created during the first interpreter
+    /// pass).  If a load does return `JIT_DEOPT` the slot will hold the deopt
+    /// sentinel and will be caught later when the value is used.
+    #[allow(unused_variables)]
+    fn emit_promoted_global_loads(&mut self) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            let addr = jit_runtime::jit_runtime_lda_global as *const () as usize as i64;
+            for &(name_idx, flat) in &self.promoted_globals.clone() {
+                // RDI = name_idx
+                self.masm.mov_ri(Reg64::Rdi, i64::from(name_idx));
+                self.masm.mov_ri(Reg64::R11, addr);
+                self.masm.call_reg(Reg64::R11);
+                // Store result into promoted slot: [r14 + flat*8] = rax
+                self.masm.mov_store_base_disp32(
+                    Reg64::R14,
+                    Self::promoted_offset(flat),
+                    Reg64::Rax,
+                );
+            }
+        }
+    }
+
+    /// Emit code to flush **all** promoted globals from their register-file
+    /// slots back to `GlobalEnv` via [`jit_runtime_sta_global`].
+    #[allow(unused_variables)]
+    fn emit_promoted_global_stores(&mut self) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            let addr = jit_runtime::jit_runtime_sta_global as *const () as usize as i64;
+            for &(name_idx, flat) in &self.promoted_globals.clone() {
+                // RDI = name_idx
+                self.masm.mov_ri(Reg64::Rdi, i64::from(name_idx));
+                // RSI = value from promoted slot
+                self.masm
+                    .mov_load_base_disp32(Reg64::Rsi, Reg64::R14, Self::promoted_offset(flat));
+                self.masm.mov_ri(Reg64::R11, addr);
+                self.masm.call_reg(Reg64::R11);
+            }
+        }
     }
 
     // ── Comparison helper ────────────────────────────────────────────────────
@@ -2306,10 +2410,19 @@ impl<'a> BaselineCompiler<'a> {
         let (instructions, byte_offsets) = decode_with_byte_offsets(self.bytecode.bytecodes())?;
         let n = instructions.len();
 
+        // ── Global register promotion analysis ───────────────────────────────
+        // Scan the bytecode for LdaGlobal/StaGlobal operands and allocate
+        // extra register-file slots so the hot loop accesses memory via [R14]
+        // instead of calling runtime stubs.
+        self.scan_and_promote_globals(&instructions);
+
         // Pre-create one label per instruction.
         self.labels = (0..n).map(|_| Label::new()).collect();
 
         self.emit_prologue();
+
+        // Load all promoted globals into their register-file slots (once).
+        self.emit_promoted_global_loads();
 
         let mut idx = 0;
         while idx < n {
@@ -2972,6 +3085,8 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── Return ───────────────────────────────────────────────────────
             Opcode::Return => {
+                // Flush promoted globals back to GlobalEnv before returning.
+                self.emit_promoted_global_stores();
                 self.emit_normal_epilogue();
             }
 
@@ -3089,7 +3204,9 @@ impl<'a> BaselineCompiler<'a> {
                     return Err(bad_operand("CallUndefinedReceiver0", 0));
                 };
                 let callee_flat = self.reg_flat_index(callee_v) as i64;
+                self.emit_promoted_global_stores();
                 self.emit_call_undefined_receiver0_stub(callee_flat, bytecode_offset);
+                self.emit_promoted_global_loads();
             }
 
             Opcode::CallUndefinedReceiver1 => {
@@ -3101,12 +3218,14 @@ impl<'a> BaselineCompiler<'a> {
                 };
                 let callee_flat = self.reg_flat_index(callee_v) as i64;
                 let arg1_flat = self.reg_flat_index(arg1_v) as i64;
+                self.emit_promoted_global_stores();
                 self.emit_runtime_stub(
                     Opcode::CallUndefinedReceiver1,
                     callee_flat,
                     arg1_flat,
                     bytecode_offset,
                 );
+                self.emit_promoted_global_loads();
             }
 
             // ── Context slot runtime stubs ───────────────────────────────────
@@ -3177,7 +3296,9 @@ impl<'a> BaselineCompiler<'a> {
                 // operand2 so they fit the two-operand stub calling
                 // convention.
                 let packed = ((args_start_flat & 0xFFFF) << 16) | (i64::from(arg_count) & 0xFFFF);
+                self.emit_promoted_global_stores();
                 self.emit_runtime_stub(Opcode::Construct, ctor_flat, packed, bytecode_offset);
+                self.emit_promoted_global_loads();
             }
 
             // ── Global variable specialized stubs ────────────────────────────
@@ -3185,14 +3306,48 @@ impl<'a> BaselineCompiler<'a> {
                 let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
                     return Err(bad_operand("LdaGlobal", 0));
                 };
-                self.emit_lda_global_stub(name_idx, bytecode_offset);
+                #[allow(unused_variables)]
+                if let Some(flat) = self.promoted_slot_for(name_idx) {
+                    // Promoted: load directly from register file.
+                    #[cfg(all(target_arch = "x86_64", unix))]
+                    {
+                        self.masm.mov_load_base_disp32(
+                            Reg64::R12,
+                            Reg64::R14,
+                            Self::promoted_offset(flat),
+                        );
+                    }
+                    #[cfg(not(all(target_arch = "x86_64", unix)))]
+                    {
+                        self.emit_deopt(bytecode_offset);
+                    }
+                } else {
+                    self.emit_lda_global_stub(name_idx, bytecode_offset);
+                }
             }
 
             Opcode::StaGlobal => {
                 let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
                     return Err(bad_operand("StaGlobal", 0));
                 };
-                self.emit_sta_global_stub(name_idx, bytecode_offset);
+                #[allow(unused_variables)]
+                if let Some(flat) = self.promoted_slot_for(name_idx) {
+                    // Promoted: store directly into register file.
+                    #[cfg(all(target_arch = "x86_64", unix))]
+                    {
+                        self.masm.mov_store_base_disp32(
+                            Reg64::R14,
+                            Self::promoted_offset(flat),
+                            Reg64::R12,
+                        );
+                    }
+                    #[cfg(not(all(target_arch = "x86_64", unix)))]
+                    {
+                        self.emit_deopt(bytecode_offset);
+                    }
+                } else {
+                    self.emit_sta_global_stub(name_idx, bytecode_offset);
+                }
             }
 
             // ── Dynamic scope lookup stub ────────────────────────────────────
@@ -3356,12 +3511,14 @@ impl<'a> BaselineCompiler<'a> {
                 };
                 let callee_flat = self.reg_flat_index(callee_v) as i64;
                 let receiver_flat = self.reg_flat_index(receiver_v) as i64;
+                self.emit_promoted_global_stores();
                 self.emit_runtime_stub(
                     Opcode::CallProperty0,
                     callee_flat,
                     receiver_flat,
                     bytecode_offset,
                 );
+                self.emit_promoted_global_loads();
             }
 
             // ── CallProperty1 runtime stub ──────────────────────────────────
@@ -3380,7 +3537,9 @@ impl<'a> BaselineCompiler<'a> {
                 let receiver_flat = self.reg_flat_index(receiver_v) as i64;
                 let arg0_flat = self.reg_flat_index(arg0_v) as i64;
                 let packed = callee_flat | (receiver_flat << 16);
+                self.emit_promoted_global_stores();
                 self.emit_runtime_stub(Opcode::CallProperty1, packed, arg0_flat, bytecode_offset);
+                self.emit_promoted_global_loads();
             }
 
             // ── DivSmi / ModSmi runtime stubs ───────────────────────────────
