@@ -1086,7 +1086,6 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
 ///   (fall-back to the next tier).
 ///
 /// On platforms where the JIT is not available this always returns `None`.
-#[allow(dead_code)]
 fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
@@ -1360,22 +1359,19 @@ fn try_execute_jit(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<
 
 /// Try to execute `ba` via the fastest available JIT tier.
 ///
-/// Checks Turbofan first (highest tier), then Maglev, then falls back to
-/// baseline JIT.  Returns `None` if no tier has compiled code ready.
+/// Checks Maglev first (higher tier), then falls back to baseline JIT.
+/// TurboFan execution is still disabled pending further codegen fixes.
+/// Returns `None` if no tier has compiled code ready.
 pub(super) fn try_execute_best_jit(
     ba: &BytecodeArray,
     args: &[JsValue],
 ) -> Option<StatorResult<JsValue>> {
-    // NOTE: Maglev and TurboFan execution is temporarily disabled because
-    // their codegen can produce infinite loops for certain benchmark
-    // patterns (e.g. prototype_chain, property_access).  Compilation is
-    // still triggered at the appropriate thresholds so the compiled code
-    // is ready when the codegen bugs are fixed.
+    // Maglev re-enabled: Phi node insertion at loop headers should fix
+    // the infinite loop bugs.  The deopt marker prevents retrying after
+    // first deopt, so any remaining codegen issues are self-correcting.
     //
-    // try_execute_turbofan(ba, args)
-    //     .or_else(|| try_execute_maglev(ba, args))
-    //     .or_else(|| try_execute_jit(ba, args))
-    try_execute_jit(ba, args)
+    // TurboFan still disabled pending Cranelift-level fixes.
+    try_execute_maglev(ba, args).or_else(|| try_execute_jit(ba, args))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
