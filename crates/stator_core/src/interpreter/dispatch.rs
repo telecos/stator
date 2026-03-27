@@ -2004,7 +2004,7 @@ fn handle_tail_call(
                 ctx.frame.mega_load_ic = None;
                 ctx.frame.proto_load_ic = None;
                 ctx.frame.mega_store_ic = None;
-                ctx.frame.global_ic = None;
+                ctx.frame.global_ic_reset();
                 ctx.frame.global_cache_invalidate();
                 return Ok(DispatchAction::TailCall);
             }
@@ -3379,7 +3379,7 @@ fn handle_sta_global(
         return Err(err_bad_operand("StaGlobal", 0));
     };
     let name = ctx.frame.get_string_constant(name_idx)?;
-    let val = ctx.frame.accumulator.clone();
+    let val = ctx.frame.accumulator.cheap_clone();
     // Strict mode: assigning to an undeclared variable is a ReferenceError.
     if ctx.frame.bytecode_array.is_strict() && !ctx.frame.global_env.borrow().contains_key(&name) {
         return Err(StatorError::ReferenceError(format!(

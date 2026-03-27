@@ -944,6 +944,141 @@ mod jit_runtime {
             }
         }
     }
+
+    // ── Specialized LdaGlobal stub ──────────────────────────────────────
+
+    /// Specialized runtime stub for `LdaGlobal`.
+    ///
+    /// Avoids the generic opcode dispatch overhead of
+    /// [`jit_runtime_trampoline`].  Uses `RT_GLOBAL_ENV` and
+    /// `RT_GLOBAL_IC` thread-locals directly for O(1) indexed access
+    /// on IC hit.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`name_idx`) – constant-pool index of the variable name.
+    ///
+    /// Returns the variable value as `i64` in `RAX`, or [`JIT_DEOPT`].
+    pub extern "C" fn jit_runtime_lda_global(name_idx: i64) -> i64 {
+        lda_global_inner(name_idx as u32).unwrap_or(JIT_DEOPT)
+    }
+
+    /// Inner implementation for [`jit_runtime_lda_global`].
+    fn lda_global_inner(name_idx: u32) -> Option<i64> {
+        RT_GLOBAL_ENV.with(|env_cell| {
+            let env_opt = env_cell.borrow();
+            let env_rc = env_opt.as_ref()?;
+            let env = env_rc.borrow();
+
+            // Fast path: IC hit with matching generation.
+            let ic_hit = RT_GLOBAL_IC.with(|ic| {
+                let ic = ic.borrow();
+                ic.iter()
+                    .find(|(idx, _, _)| *idx == name_idx)
+                    .map(|&(_, slot, cached)| (slot, cached))
+            });
+            if let Some((slot_idx, cached_gen)) = ic_hit {
+                if env.generation() == cached_gen && slot_idx < env.slot_count() {
+                    let value = env.get_by_index(slot_idx).clone();
+                    if value != JsValue::TheHole {
+                        return Some(jsvalue_to_jit_i64(value));
+                    }
+                }
+            }
+
+            // Slow path: HashMap lookup.
+            let name = get_rt_string_constant(name_idx)?;
+            let value = env.get(&name).cloned().unwrap_or(JsValue::Undefined);
+
+            // Populate IC.
+            if let Some(slot_idx) = env.slot_index_for(&name) {
+                let cur_gen = env.generation();
+                RT_GLOBAL_IC.with(|ic| {
+                    let mut ic = ic.borrow_mut();
+                    if let Some(entry) = ic.iter_mut().find(|(idx, _, _)| *idx == name_idx) {
+                        entry.1 = slot_idx;
+                        entry.2 = cur_gen;
+                    } else {
+                        ic.push((name_idx, slot_idx, cur_gen));
+                    }
+                });
+            }
+
+            Some(jsvalue_to_jit_i64(value))
+        })
+    }
+
+    // ── Specialized StaGlobal stub ──────────────────────────────────────
+
+    /// Specialized runtime stub for `StaGlobal`.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`name_idx`) – constant-pool index of the variable name.
+    /// * `RSI` (`value_i64`) – the JIT i64 encoding of the value to store.
+    ///
+    /// Returns `value_i64` in `RAX` on success, or [`JIT_DEOPT`].
+    pub extern "C" fn jit_runtime_sta_global(name_idx: i64, value_i64: i64) -> i64 {
+        sta_global_inner(name_idx as u32, value_i64).unwrap_or(JIT_DEOPT)
+    }
+
+    /// Inner implementation for [`jit_runtime_sta_global`].
+    fn sta_global_inner(name_idx: u32, value_i64: i64) -> Option<i64> {
+        let value = jit_i64_to_jsvalue(value_i64);
+
+        RT_GLOBAL_ENV.with(|env_cell| {
+            let env_opt = env_cell.borrow();
+            let env_rc = env_opt.as_ref()?;
+            let mut env = env_rc.borrow_mut();
+
+            // Fast path: IC hit — store by index.
+            let ic_hit = RT_GLOBAL_IC.with(|ic| {
+                let ic = ic.borrow();
+                ic.iter()
+                    .find(|(idx, _, _)| *idx == name_idx)
+                    .map(|&(_, slot, cached)| (slot, cached))
+            });
+            if let Some((slot_idx, cached_gen)) = ic_hit {
+                if env.generation() == cached_gen && slot_idx < env.slot_count() {
+                    let name = get_rt_string_constant(name_idx)?;
+                    env.store_by_index_sync(slot_idx, &name, value);
+                    let new_gen = env.generation();
+                    RT_GLOBAL_IC.with(|ic| {
+                        let mut ic = ic.borrow_mut();
+                        if let Some(entry) = ic.iter_mut().find(|(idx, _, _)| *idx == name_idx) {
+                            entry.2 = new_gen;
+                        }
+                    });
+                    return Some(value_i64);
+                }
+            }
+
+            // Slow path: insert via HashMap.
+            let name = get_rt_string_constant(name_idx)?;
+            let slot_idx = env.slot_index_for(&name);
+            if let Some(idx) = slot_idx {
+                env.store_by_index_sync(idx, &name, value);
+            } else {
+                env.insert(name.clone(), value);
+            }
+
+            // Populate / update IC.
+            let cur_gen = env.generation();
+            if let Some(idx) = env.slot_index_for(&name) {
+                RT_GLOBAL_IC.with(|ic| {
+                    let mut ic = ic.borrow_mut();
+                    if let Some(entry) = ic.iter_mut().find(|(i, _, _)| *i == name_idx) {
+                        entry.1 = idx;
+                        entry.2 = cur_gen;
+                    } else {
+                        ic.push((name_idx, idx, cur_gen));
+                    }
+                });
+            }
+
+            Some(value_i64)
+        })
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -1629,6 +1764,85 @@ impl<'a> BaselineCompiler<'a> {
                 .mov_load_base_disp32(Reg64::Rdi, Reg64::R14, byte_offset);
 
             let addr = jit_runtime::jit_runtime_call_undefined_receiver0 as usize as i64;
+            self.masm.mov_ri(Reg64::R11, addr);
+            self.masm.call_reg(Reg64::R11);
+
+            // ── Check for deopt ─────────────────────────────────────────
+            self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+
+            let code_off = self.masm.position() as u32;
+            let liveness_map = self.all_slots_live();
+            self.deopt_entries.push(DeoptEntry {
+                code_offset: code_off,
+                bytecode_offset,
+                liveness_map,
+            });
+            self.masm.je(&mut self.deopt_label);
+
+            // ── Success: update accumulator ─────────────────────────────
+            self.masm.mov_rr(Reg64::R12, Reg64::Rax);
+            return;
+        }
+
+        #[allow(unreachable_code)]
+        self.emit_deopt(bytecode_offset);
+    }
+
+    /// Emit a specialized call to [`jit_runtime::jit_runtime_lda_global`]
+    /// for `LdaGlobal` bytecodes.
+    ///
+    /// Unlike [`emit_runtime_stub`], this passes only the constant-pool
+    /// name index and calls a dedicated function that skips generic opcode
+    /// dispatch.
+    #[allow(unused_variables)]
+    fn emit_lda_global_stub(&mut self, name_idx: u32, bytecode_offset: u32) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            // RDI = name_idx (constant-pool index).
+            self.masm.mov_ri(Reg64::Rdi, i64::from(name_idx));
+
+            let addr = jit_runtime::jit_runtime_lda_global as usize as i64;
+            self.masm.mov_ri(Reg64::R11, addr);
+            self.masm.call_reg(Reg64::R11);
+
+            // ── Check for deopt ─────────────────────────────────────────
+            self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+
+            let code_off = self.masm.position() as u32;
+            let liveness_map = self.all_slots_live();
+            self.deopt_entries.push(DeoptEntry {
+                code_offset: code_off,
+                bytecode_offset,
+                liveness_map,
+            });
+            self.masm.je(&mut self.deopt_label);
+
+            // ── Success: update accumulator ─────────────────────────────
+            self.masm.mov_rr(Reg64::R12, Reg64::Rax);
+            return;
+        }
+
+        #[allow(unreachable_code)]
+        self.emit_deopt(bytecode_offset);
+    }
+
+    /// Emit a specialized call to [`jit_runtime::jit_runtime_sta_global`]
+    /// for `StaGlobal` bytecodes.
+    ///
+    /// Passes the constant-pool name index and the current accumulator
+    /// value to a dedicated function.
+    #[allow(unused_variables)]
+    fn emit_sta_global_stub(&mut self, name_idx: u32, bytecode_offset: u32) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            // RDI = name_idx (constant-pool index).
+            self.masm.mov_ri(Reg64::Rdi, i64::from(name_idx));
+            // RSI = accumulator value (the value to store).
+            self.masm.mov_rr(Reg64::Rsi, Reg64::R12);
+
+            let addr = jit_runtime::jit_runtime_sta_global as usize as i64;
             self.masm.mov_ri(Reg64::R11, addr);
             self.masm.call_reg(Reg64::R11);
 
@@ -2515,19 +2729,19 @@ impl<'a> BaselineCompiler<'a> {
                 );
             }
 
-            // ── Global variable runtime stubs ────────────────────────────────
+            // ── Global variable specialized stubs ────────────────────────────
             Opcode::LdaGlobal => {
                 let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
                     return Err(bad_operand("LdaGlobal", 0));
                 };
-                self.emit_runtime_stub(Opcode::LdaGlobal, i64::from(name_idx), 0, bytecode_offset);
+                self.emit_lda_global_stub(name_idx, bytecode_offset);
             }
 
             Opcode::StaGlobal => {
                 let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
                     return Err(bad_operand("StaGlobal", 0));
                 };
-                self.emit_runtime_stub(Opcode::StaGlobal, i64::from(name_idx), 0, bytecode_offset);
+                self.emit_sta_global_stub(name_idx, bytecode_offset);
             }
 
             // ── Dynamic scope lookup stub ────────────────────────────────────
