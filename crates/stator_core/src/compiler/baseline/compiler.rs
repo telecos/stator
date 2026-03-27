@@ -2529,11 +2529,13 @@ pub(crate) mod jit_runtime {
             let callee_idx = (callee_i64 - JIT_HEAP_TAG) as usize;
             // SAFETY: cached pointers set by cache_rt_ptrs; valid for thread lifetime.
             let heap_ref = unsafe { &*ptrs.heap };
-            let heap = heap_ref.borrow();
+            // SAFETY: single-threaded JIT; no concurrent mutable borrows.
+            let heap = unsafe { &*heap_ref.as_ptr() };
 
             // Check for fast array method pattern (PlainObject with marker).
             if let Some(JsValue::PlainObject(map_rc)) = heap.get(callee_idx) {
-                let map = map_rc.borrow();
+                // SAFETY: single-threaded; callee PlainObject not mutated during read.
+                let map = unsafe { &*map_rc.as_ptr() };
                 if let Some(JsValue::String(method_name)) = map.get("\0stator.fast_array_method") {
                     // Inline fast array method — currently supports "push".
                     if is_heap_handle(receiver_i64) {
@@ -2548,17 +2550,11 @@ pub(crate) mod jit_runtime {
                                         super::jit_to_jsvalue(arg0_i64)
                                             .unwrap_or(JsValue::Undefined)
                                     };
-                                    let arr = Rc::clone(arr);
-                                    drop(map);
-                                    drop(heap);
                                     let mut items = arr.borrow_mut();
                                     items.push(arg0);
                                     return Some(items.len() as i64);
                                 }
                                 "pop" => {
-                                    let arr = Rc::clone(arr);
-                                    drop(map);
-                                    drop(heap);
                                     let val = arr.borrow_mut().pop().unwrap_or(JsValue::Undefined);
                                     return Some(jsvalue_to_jit_i64(val));
                                 }
@@ -2566,8 +2562,6 @@ pub(crate) mod jit_runtime {
                             }
                         }
                     }
-                    drop(map);
-                    drop(heap);
                     // Unrecognised fast-array method or non-Array receiver — DEOPT.
                     return None;
                 }
@@ -2575,7 +2569,6 @@ pub(crate) mod jit_runtime {
                 // PlainObject with __call__ (generic callable object).
                 if let Some(JsValue::NativeFunction(nf)) = map.get("__call__") {
                     let nf = Rc::clone(nf);
-                    drop(map);
                     let receiver = heap
                         .get((receiver_i64 - JIT_HEAP_TAG) as usize)
                         .cloned()
@@ -2587,15 +2580,12 @@ pub(crate) mod jit_runtime {
                     } else {
                         super::jit_to_jsvalue(arg0_i64).unwrap_or(JsValue::Undefined)
                     };
-                    drop(heap);
                     return match nf(vec![receiver, arg0]) {
                         Ok(val) => Some(jsvalue_to_jit_i64(val)),
                         Err(_) => None,
                     };
                 }
 
-                drop(map);
-                drop(heap);
                 return None;
             }
 
@@ -2613,7 +2603,6 @@ pub(crate) mod jit_runtime {
                 } else {
                     super::jit_to_jsvalue(arg0_i64).unwrap_or(JsValue::Undefined)
                 };
-                drop(heap);
                 return match nf(vec![receiver, arg0]) {
                     Ok(val) => Some(jsvalue_to_jit_i64(val)),
                     Err(_) => None,
