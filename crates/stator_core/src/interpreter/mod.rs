@@ -215,7 +215,18 @@ type MonoLoadCache = HashMap<u32, (usize, JsValue)>;
 type PolyLoadCache = HashMap<u32, Vec<(usize, JsValue)>>;
 type ProtoLoadIcCache = HashMap<u32, ProtoLoadIc>;
 type StringCache = HashMap<u32, Rc<str>>;
-type GlobalIcCache = HashMap<u32, (usize, u64)>;
+/// Number of slots in the direct-mapped global variable inline cache.
+const GLOBAL_IC_SLOTS: usize = 32;
+/// Bitmask for mapping a constant-pool index to an IC slot.
+const GLOBAL_IC_MASK: u32 = (GLOBAL_IC_SLOTS as u32) - 1;
+/// Sentinel tag indicating an empty IC slot.
+const GLOBAL_IC_EMPTY: u32 = u32::MAX;
+/// A single IC entry: `(name_idx tag, slot_index, generation)`.
+type GlobalIcEntry = (u32, usize, u64);
+/// Fixed-size direct-mapped global variable IC array.
+type GlobalIcArray = [GlobalIcEntry; GLOBAL_IC_SLOTS];
+/// Empty IC array constant used to initialise / reset the cache.
+const GLOBAL_IC_INIT: GlobalIcArray = [(GLOBAL_IC_EMPTY, 0, 0); GLOBAL_IC_SLOTS];
 
 thread_local! {
     /// The currently-attached debugger for this thread, if any.
@@ -1249,6 +1260,13 @@ fn try_execute_jit(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<
         // constant pool and heap-object table.
         jit_runtime_setup(ba);
 
+        // Set closure context for context-slot stubs.
+        {
+            use crate::compiler::baseline::compiler::jit_runtime_set_context;
+            let ctx = ba.closure_context().cloned();
+            jit_runtime_set_context(ctx);
+        }
+
         // SAFETY: the cached executable code was produced by
         // `BaselineCompiler::compile` and contains valid x86-64 machine code
         // following the JIT calling convention.
@@ -1878,10 +1896,12 @@ pub struct InterpreterFrame {
     /// Pre-decoded string constants from the constant pool, keyed by index.
     /// Avoids repeated `String::clone()` from the constant pool.
     pub string_cache: Option<Box<StringCache>>,
-    /// Global variable inline cache: `constant_pool_idx → (slot_index, generation)`.
-    /// Maps bytecode constant-pool indices to indexed `GlobalEnv` slots for
-    /// O(1) global variable access.  Lazily allocated on first IC miss.
-    pub global_ic: Option<Box<GlobalIcCache>>,
+    /// Direct-mapped global variable IC: `[(name_idx, slot_index, generation); 32]`.
+    /// Indexed by `name_idx & 31`.  Tag `GLOBAL_IC_EMPTY` (`u32::MAX`) = vacant.
+    /// Always present — no `Option` / `Box` indirection on the hot path.
+    pub global_ic: GlobalIcArray,
+    /// `true` once the IC has been seeded from the shared `BytecodeArray` cache.
+    global_ic_seeded: bool,
     /// Cache of recently-accessed global variable values.
     /// Avoids repeated `Rc→RefCell→HashMap` lookups for hot globals.
     /// Format: `[(name_hash, name, value); 8]` — direct-mapped by hash.
@@ -1963,7 +1983,8 @@ impl InterpreterFrame {
             proto_load_ic: None,
             mega_store_ic: None,
             string_cache: None,
-            global_ic: None,
+            global_ic: GLOBAL_IC_INIT,
+            global_ic_seeded: false,
             global_cache: None,
             cache_generation: 0,
             smi_mode: false,
@@ -2055,7 +2076,8 @@ impl InterpreterFrame {
             proto_load_ic: None,
             mega_store_ic: None,
             string_cache: None,
-            global_ic: None,
+            global_ic: GLOBAL_IC_INIT,
+            global_ic_seeded: false,
             global_cache: None,
             cache_generation: 0,
             smi_mode: false,
@@ -2275,15 +2297,39 @@ impl InterpreterFrame {
         self.mega_store_ic.as_mut().unwrap()
     }
 
-    #[inline]
-    fn global_ic_mut(&mut self) -> &mut GlobalIcCache {
-        if self.global_ic.is_none() {
-            self.global_ic = self
-                .bytecode_array
-                .shared_global_ic()
-                .or_else(|| Some(Box::default()));
+    /// O(1) lookup in the direct-mapped global IC.
+    #[inline(always)]
+    pub(super) fn global_ic_get(&self, name_idx: u32) -> Option<(usize, u64)> {
+        let entry = &self.global_ic[(name_idx & GLOBAL_IC_MASK) as usize];
+        if entry.0 == name_idx {
+            Some((entry.1, entry.2))
+        } else {
+            None
         }
-        self.global_ic.as_mut().unwrap()
+    }
+
+    /// Insert / overwrite an entry in the direct-mapped global IC.
+    /// On first write, seeds from the shared `BytecodeArray` cache so that
+    /// subsequent calls to the same function start warm.
+    #[inline(always)]
+    pub(super) fn global_ic_put(&mut self, name_idx: u32, slot_idx: usize, generation_val: u64) {
+        if !self.global_ic_seeded {
+            self.global_ic_seeded = true;
+            if let Some(shared) = self.bytecode_array.shared_global_ic() {
+                for (&k, &(si, g)) in shared.iter() {
+                    self.global_ic[(k & GLOBAL_IC_MASK) as usize] = (k, si, g);
+                }
+            }
+        }
+        self.global_ic[(name_idx & GLOBAL_IC_MASK) as usize] =
+            (name_idx, slot_idx, generation_val);
+    }
+
+    /// Reset the direct-mapped global IC (e.g. on tail-call reuse).
+    #[inline(always)]
+    pub(super) fn global_ic_reset(&mut self) {
+        self.global_ic = GLOBAL_IC_INIT;
+        self.global_ic_seeded = false;
     }
 
     #[inline]
@@ -2358,15 +2404,14 @@ impl InterpreterFrame {
     #[inline]
     pub(super) fn store_global(&mut self, name_idx: u32, name: &Rc<str>, value: JsValue) {
         // IC fast path: known slot, generation matches.
-        if let Some(ref ic) = self.global_ic
-            && let Some(&(slot_idx, cached_gen)) = ic.get(&name_idx)
-        {
-            let current_gen = self.global_env.borrow().generation();
-            if current_gen == cached_gen {
+        // Single borrow_mut avoids the double RefCell overhead of
+        // borrow() for generation + borrow_mut() for store.
+        if let Some((slot_idx, cached_gen)) = self.global_ic_get(name_idx) {
+            let mut env = self.global_env.borrow_mut();
+            if env.generation() == cached_gen {
                 set_function_name_if_missing(&value, name);
-                self.global_env
-                    .borrow_mut()
-                    .store_by_index_sync(slot_idx, name, value.clone());
+                env.store_by_index_sync(slot_idx, name, value.clone());
+                drop(env);
                 self.global_cache_put(name, value);
                 return;
             }
@@ -2377,9 +2422,8 @@ impl InterpreterFrame {
         env.insert(name.to_string(), value.clone());
         let slot_gen = env.slot_index_for(name).map(|idx| (idx, env.generation()));
         drop(env);
-        if let Some((slot_idx, cached_gen)) = slot_gen {
-            self.global_ic_mut()
-                .insert(name_idx, (slot_idx, cached_gen));
+        if let Some((slot_idx, generation_val)) = slot_gen {
+            self.global_ic_put(name_idx, slot_idx, generation_val);
         }
         self.global_cache_put(name, value);
     }
@@ -2538,8 +2582,18 @@ impl Interpreter {
         if let Some(ic) = frame.proto_load_ic.take() {
             frame.bytecode_array.set_shared_proto_load_ic(ic);
         }
-        if let Some(ic) = frame.global_ic.take() {
-            frame.bytecode_array.set_shared_global_ic(ic);
+        // Write back the direct-mapped global IC to the shared HashMap cache
+        // on the BytecodeArray so subsequent invocations start warm.
+        if frame.global_ic_seeded {
+            let mut map: HashMap<u32, (usize, u64)> = HashMap::new();
+            for &(tag, slot_idx, generation_val) in &frame.global_ic {
+                if tag != GLOBAL_IC_EMPTY {
+                    map.insert(tag, (slot_idx, generation_val));
+                }
+            }
+            if !map.is_empty() {
+                frame.bytecode_array.set_shared_global_ic(Box::new(map));
+            }
         }
         release_registers(std::mem::take(&mut frame.registers));
         result
@@ -2555,6 +2609,18 @@ impl Interpreter {
         {
             use crate::compiler::baseline::compiler::jit_runtime_set_global_env;
             jit_runtime_set_global_env(frame.global_env.clone());
+        }
+
+        // Provide the closure context to JIT runtime stubs so that
+        // LdaCurrentContextSlot / StaCurrentContextSlot work.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            use crate::compiler::baseline::compiler::jit_runtime_set_context;
+            let ctx = frame.context.as_ref().and_then(|v| match v {
+                JsValue::Context(rc) => Some(Rc::clone(rc)),
+                _ => None,
+            });
+            jit_runtime_set_context(ctx);
         }
 
         // Fast path: if JIT code was compiled in a previous invocation,
@@ -3169,10 +3235,7 @@ impl Interpreter {
                                     unsafe { operand_constant_pool_idx_unchecked(instr, 0) };
                                 // IC fast path: read directly from the GlobalEnv
                                 // slot, avoiding get_string_constant + load_global.
-                                let ic_hit = frame
-                                    .global_ic
-                                    .as_ref()
-                                    .and_then(|ic| ic.get(&name_idx).copied());
+                                let ic_hit = frame.global_ic_get(name_idx);
                                 if let Some((slot_idx, cached_gen)) = ic_hit {
                                     let env = frame.global_env.borrow();
                                     if env.generation() == cached_gen {
@@ -3213,10 +3276,7 @@ impl Interpreter {
                                 let val = smi_to_val!();
                                 // IC fast path: inline the store and refresh the
                                 // IC entry so subsequent iterations stay fast.
-                                let ic_hit = frame
-                                    .global_ic
-                                    .as_ref()
-                                    .and_then(|ic| ic.get(&name_idx).copied());
+                                let ic_hit = frame.global_ic_get(name_idx);
                                 if let Some((slot_idx, cached_gen)) = ic_hit {
                                     let cur_gen = frame.global_env.borrow().generation();
                                     if cur_gen == cached_gen {
@@ -3229,7 +3289,7 @@ impl Interpreter {
                                             val.cheap_clone(),
                                         );
                                         let new_gen = frame.global_env.borrow().generation();
-                                        frame.global_ic_mut().insert(name_idx, (slot_idx, new_gen));
+                                        frame.global_ic_put(name_idx, slot_idx, new_gen);
                                         frame.global_cache_put(&name, val);
                                         continue 'smi;
                                     }
@@ -3317,7 +3377,7 @@ impl Interpreter {
                                             })
                                         }
                                     });
-                                    if (frame.global_cache.is_some() || frame.global_ic.is_some())
+                                    if (frame.global_cache.is_some() || frame.global_ic_seeded)
                                         && gen_before != frame.global_env.borrow().generation()
                                     {
                                         frame.global_cache_invalidate();
@@ -3417,7 +3477,7 @@ impl Interpreter {
                                             })
                                         }
                                     });
-                                    if (frame.global_cache.is_some() || frame.global_ic.is_some())
+                                    if (frame.global_cache.is_some() || frame.global_ic_seeded)
                                         && gen_before != frame.global_env.borrow().generation()
                                     {
                                         frame.global_cache_invalidate();
@@ -4656,12 +4716,12 @@ impl Interpreter {
                     Opcode::LdaGlobal => {
                         if let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] {
                             // IC fast path: known slot, generation matches.
-                            if let Some(ref ic) = frame.global_ic
-                                && let Some(&(slot_idx, cached_gen)) = ic.get(&name_idx)
+                            if let Some((slot_idx, cached_gen)) =
+                                frame.global_ic_get(name_idx)
                             {
                                 let env = frame.global_env.borrow();
                                 if env.generation() == cached_gen {
-                                    let value = env.get_by_index(slot_idx).clone();
+                                    let value = env.get_by_index(slot_idx).cheap_clone();
                                     drop(env);
                                     if value != JsValue::TheHole {
                                         acc = value;
@@ -5560,7 +5620,7 @@ impl Interpreter {
                                 }
                             });
                             // Only invalidate if the callee actually mutated globals.
-                            if (frame.global_cache.is_some() || frame.global_ic.is_some())
+                            if (frame.global_cache.is_some() || frame.global_ic_seeded)
                                 && gen_before != frame.global_env.borrow().generation()
                             {
                                 frame.global_cache_invalidate();
@@ -5678,7 +5738,7 @@ impl Interpreter {
                                     })
                                 }
                             });
-                            if (frame.global_cache.is_some() || frame.global_ic.is_some())
+                            if (frame.global_cache.is_some() || frame.global_ic_seeded)
                                 && gen_before != frame.global_env.borrow().generation()
                             {
                                 frame.global_cache_invalidate();
@@ -5974,7 +6034,8 @@ impl Interpreter {
             proto_load_ic: None,
             mega_store_ic: None,
             string_cache: None,
-            global_ic: None,
+            global_ic: GLOBAL_IC_INIT,
+            global_ic_seeded: false,
             global_cache: None,
             cache_generation: 0,
             smi_mode: false,
@@ -7133,7 +7194,7 @@ pub(super) fn dispatch_call(
                             })
                         }
                     });
-                    if (frame.global_cache.is_some() || frame.global_ic.is_some())
+                    if (frame.global_cache.is_some() || frame.global_ic_seeded)
                         && gen_before != frame.global_env.borrow().generation()
                     {
                         frame.global_cache_invalidate();
@@ -7233,7 +7294,7 @@ pub(super) fn dispatch_call_property(
                             })
                         }
                     });
-                    if (frame.global_cache.is_some() || frame.global_ic.is_some())
+                    if (frame.global_cache.is_some() || frame.global_ic_seeded)
                         && gen_before != frame.global_env.borrow().generation()
                     {
                         frame.global_cache_invalidate();

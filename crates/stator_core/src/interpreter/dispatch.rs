@@ -2004,7 +2004,7 @@ fn handle_tail_call(
                 ctx.frame.mega_load_ic = None;
                 ctx.frame.proto_load_ic = None;
                 ctx.frame.mega_store_ic = None;
-                ctx.frame.global_ic_reset();
+                ctx.frame.global_ic = None;
                 ctx.frame.global_cache_invalidate();
                 return Ok(DispatchAction::TailCall);
             }

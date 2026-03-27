@@ -146,7 +146,7 @@ mod jit_runtime {
     use super::*;
     use crate::interpreter::GlobalEnv;
     use crate::objects::property_map::PropertyMap;
-    use crate::objects::value::JsValue;
+    use crate::objects::value::{JsContext, JsValue};
 
     thread_local! {
         /// Raw pointer to the [`BytecodeArray`] of the currently-executing
@@ -183,6 +183,12 @@ mod jit_runtime {
         /// Inline cache for `LdaGlobal`/`StaGlobal`: maps constant-pool
         /// name index → `(slot_index, generation)` for O(1) indexed access.
         static RT_GLOBAL_IC: RefCell<Vec<(u32, usize, u64)>> = const { RefCell::new(Vec::new()) };
+
+        /// Reference to the current closure context for
+        /// `LdaCurrentContextSlot`/`StaCurrentContextSlot` stubs.
+        /// Set via [`jit_runtime_set_context`] before JIT execution of
+        /// closures.
+        static RT_CONTEXT: RefCell<Option<Rc<RefCell<JsContext>>>> = const { RefCell::new(None) };
     }
 
     // ── Setup / teardown ─────────────────────────────────────────────────
@@ -217,6 +223,14 @@ mod jit_runtime {
         RT_BYTECODE.with(|b| b.set(std::ptr::null()));
         RT_HEAP.with(|h| h.borrow_mut().clear());
         RT_LDA_IC.with(|ic| ic.borrow_mut().clear());
+    }
+
+    /// Set the current closure context for context-slot stubs.
+    ///
+    /// Called before JIT execution of closure bodies that use
+    /// `LdaCurrentContextSlot` / `StaCurrentContextSlot`.
+    pub fn jit_runtime_set_context(ctx: Option<Rc<RefCell<JsContext>>>) {
+        RT_CONTEXT.with(|c| *c.borrow_mut() = ctx);
     }
 
     // ── Heap-handle helpers ──────────────────────────────────────────────
@@ -560,17 +574,77 @@ mod jit_runtime {
             }
 
             // ── Context slot loads/stores ────────────────────────────────
-            //
-            // The trampoline does not currently have access to the execution
-            // context chain, so these will deopt at runtime.  The stubs are
-            // wired up so future trampoline enhancements can handle them
-            // without recompilation.
-            Opcode::LdaCurrentContextSlot
-            | Opcode::LdaImmutableCurrentContextSlot
-            | Opcode::StaCurrentContextSlot
-            | Opcode::LdaContextSlot
-            | Opcode::LdaImmutableContextSlot
-            | Opcode::StaContextSlot => None,
+            Opcode::LdaCurrentContextSlot | Opcode::LdaImmutableCurrentContextSlot => {
+                let slot_idx = operand1 as usize;
+                RT_CONTEXT.with(|ctx_cell| {
+                    let ctx_opt = ctx_cell.borrow();
+                    let ctx_rc = ctx_opt.as_ref()?;
+                    let ctx = ctx_rc.borrow();
+                    let value = ctx
+                        .slots
+                        .get(slot_idx)
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined);
+                    Some(jsvalue_to_jit_i64(value))
+                })
+            }
+
+            Opcode::StaCurrentContextSlot => {
+                let slot_idx = operand1 as usize;
+                let value = jit_i64_to_jsvalue(acc);
+                RT_CONTEXT.with(|ctx_cell| {
+                    let ctx_opt = ctx_cell.borrow();
+                    let ctx_rc = ctx_opt.as_ref()?;
+                    let mut ctx = ctx_rc.borrow_mut();
+                    if slot_idx >= ctx.slots.len() {
+                        ctx.slots.resize(slot_idx + 1, JsValue::Undefined);
+                    }
+                    ctx.slots[slot_idx] = value;
+                    Some(acc)
+                })
+            }
+
+            Opcode::LdaContextSlot | Opcode::LdaImmutableContextSlot => {
+                // operand1 = slot_idx, operand2 = register containing context
+                let slot_idx = operand1 as usize;
+                let ctx_flat = operand2 as usize;
+                // SAFETY: ctx_flat was computed by the compiler from a valid
+                // bytecode register operand.
+                let ctx_i64 = unsafe { *regs.add(ctx_flat) };
+                let ctx_val = jit_i64_to_jsvalue(ctx_i64);
+                match ctx_val {
+                    JsValue::Context(ctx_rc) => {
+                        let ctx = ctx_rc.borrow();
+                        let value = ctx
+                            .slots
+                            .get(slot_idx)
+                            .cloned()
+                            .unwrap_or(JsValue::Undefined);
+                        Some(jsvalue_to_jit_i64(value))
+                    }
+                    _ => None,
+                }
+            }
+
+            Opcode::StaContextSlot => {
+                let slot_idx = operand1 as usize;
+                let ctx_flat = operand2 as usize;
+                let value = jit_i64_to_jsvalue(acc);
+                // SAFETY: ctx_flat was computed by the compiler.
+                let ctx_i64 = unsafe { *regs.add(ctx_flat) };
+                let ctx_val = jit_i64_to_jsvalue(ctx_i64);
+                match ctx_val {
+                    JsValue::Context(ctx_rc) => {
+                        let mut ctx = ctx_rc.borrow_mut();
+                        if slot_idx >= ctx.slots.len() {
+                            ctx.slots.resize(slot_idx + 1, JsValue::Undefined);
+                        }
+                        ctx.slots[slot_idx] = value;
+                        Some(acc)
+                    }
+                    _ => None,
+                }
+            }
 
             // ── Global variable access ──────────────────────────────────
             Opcode::LdaGlobal => {
@@ -1083,7 +1157,8 @@ mod jit_runtime {
 
 #[cfg(all(target_arch = "x86_64", unix))]
 pub use jit_runtime::{
-    jit_runtime_set_global_env, jit_runtime_setup, jit_runtime_teardown, jit_to_jsvalue_ext,
+    jit_runtime_set_context, jit_runtime_set_global_env, jit_runtime_setup, jit_runtime_teardown,
+    jit_to_jsvalue_ext,
 };
 
 /// A single entry in the safepoint table.
@@ -2679,10 +2754,9 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── Context slot runtime stubs ───────────────────────────────────
             //
-            // The trampoline does not currently have access to the execution
-            // context chain, so these will deopt at runtime.  The stubs are
-            // wired up so future trampoline enhancements can handle them
-            // without recompilation.
+            // These use RT_CONTEXT thread-local to access the current closure
+            // context. LdaCurrentContextSlot reads from the current context;
+            // LdaContextSlot walks the chain via a register-held context.
             Opcode::LdaCurrentContextSlot | Opcode::LdaImmutableCurrentContextSlot => {
                 let Operand::ConstantPoolIdx(slot) = instr.operands[0] else {
                     return Err(bad_operand("LdaCurrentContextSlot", 0));
