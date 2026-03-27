@@ -1625,6 +1625,12 @@ impl GlobalEnv {
     pub fn slot_index_for(&self, key: &str) -> Option<usize> {
         self.name_to_index.get(key).copied()
     }
+
+    /// Number of indexed slots.
+    #[inline(always)]
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
 }
 
 impl Default for GlobalEnv {
@@ -2543,6 +2549,14 @@ impl Interpreter {
     /// `stacker::maybe_grow` closure boundary that prevents LLVM from
     /// inlining across the call.
     fn run_dispatch(frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
+        // Provide the global environment to JIT runtime stubs so that
+        // LdaGlobal / StaGlobal can access global variables.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            use crate::compiler::baseline::compiler::jit_runtime_set_global_env;
+            jit_runtime_set_global_env(frame.global_env.clone());
+        }
+
         // Fast path: if JIT code was compiled in a previous invocation,
         // execute it directly without entering the interpreter loop.
         if let Some(jit_result) = try_execute_best_jit(&frame.bytecode_array, &frame.call_args) {

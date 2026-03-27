@@ -144,6 +144,7 @@ pub fn jit_to_jsvalue(v: i64) -> Option<crate::objects::value::JsValue> {
 #[cfg(all(target_arch = "x86_64", unix))]
 mod jit_runtime {
     use super::*;
+    use crate::interpreter::GlobalEnv;
     use crate::objects::property_map::PropertyMap;
     use crate::objects::value::JsValue;
 
@@ -172,6 +173,16 @@ mod jit_runtime {
         /// Cleared by [`jit_runtime_setup`] to prevent cross-function
         /// constant-pool index collisions.
         static RT_LDA_IC: RefCell<Vec<(u32, u64, usize)>> = const { RefCell::new(Vec::new()) };
+
+        /// Reference to the global environment for `LdaGlobal`/`StaGlobal`
+        /// runtime stubs.  Set once via [`jit_runtime_set_global_env`] at
+        /// the top of `run_dispatch` and reused by all JIT calls within
+        /// that execution.
+        static RT_GLOBAL_ENV: RefCell<Option<Rc<RefCell<GlobalEnv>>>> = const { RefCell::new(None) };
+
+        /// Inline cache for `LdaGlobal`/`StaGlobal`: maps constant-pool
+        /// name index → `(slot_index, generation)` for O(1) indexed access.
+        static RT_GLOBAL_IC: RefCell<Vec<(u32, usize, u64)>> = const { RefCell::new(Vec::new()) };
     }
 
     // ── Setup / teardown ─────────────────────────────────────────────────
@@ -186,7 +197,22 @@ mod jit_runtime {
         RT_LDA_IC.with(|ic| ic.borrow_mut().clear());
     }
 
+    /// Set the global environment for `LdaGlobal`/`StaGlobal` stubs.
+    ///
+    /// Called once at the top of `run_dispatch`.  The reference is
+    /// `Rc`-cloned so it stays alive even if the interpreter frame is
+    /// rebuilt (e.g. tail-call).  Not cleared by [`jit_runtime_teardown`]
+    /// so it persists across multiple JIT entries within the same
+    /// `run_dispatch` invocation.
+    pub fn jit_runtime_set_global_env(env: Rc<RefCell<GlobalEnv>>) {
+        RT_GLOBAL_ENV.with(|g| *g.borrow_mut() = Some(env));
+        RT_GLOBAL_IC.with(|ic| ic.borrow_mut().clear());
+    }
+
     /// Clean up thread-local state after JIT execution.
+    ///
+    /// Note: does NOT clear `RT_GLOBAL_ENV` — it persists across JIT
+    /// calls within a single `run_dispatch` invocation.
     pub fn jit_runtime_teardown() {
         RT_BYTECODE.with(|b| b.set(std::ptr::null()));
         RT_HEAP.with(|h| h.borrow_mut().clear());
@@ -547,7 +573,112 @@ mod jit_runtime {
             | Opcode::StaContextSlot => None,
 
             // ── Global variable access ──────────────────────────────────
-            Opcode::LdaGlobal | Opcode::StaGlobal => None,
+            Opcode::LdaGlobal => {
+                let name_idx = operand1 as u32;
+                let name = get_rt_string_constant(name_idx)?;
+
+                RT_GLOBAL_ENV.with(|env_cell| {
+                    let env_opt = env_cell.borrow();
+                    let env_rc = env_opt.as_ref()?;
+                    let env = env_rc.borrow();
+
+                    // Fast path: IC hit with matching generation.
+                    let ic_hit = RT_GLOBAL_IC.with(|ic| {
+                        let ic = ic.borrow();
+                        ic.iter()
+                            .find(|(idx, _, _)| *idx == name_idx)
+                            .map(|&(_, slot, cached)| (slot, cached))
+                    });
+                    if let Some((slot_idx, cached_gen)) = ic_hit {
+                        if env.generation() == cached_gen && slot_idx < env.slot_count() {
+                            let value = env.get_by_index(slot_idx).clone();
+                            if value != JsValue::TheHole {
+                                return Some(jsvalue_to_jit_i64(value));
+                            }
+                        }
+                    }
+
+                    // Slow path: HashMap lookup.
+                    let value = env.get(&name).cloned().unwrap_or(JsValue::Undefined);
+
+                    // Populate IC.
+                    if let Some(slot_idx) = env.slot_index_for(&name) {
+                        let cur_gen = env.generation();
+                        RT_GLOBAL_IC.with(|ic| {
+                            let mut ic = ic.borrow_mut();
+                            if let Some(entry) = ic.iter_mut().find(|(idx, _, _)| *idx == name_idx)
+                            {
+                                entry.1 = slot_idx;
+                                entry.2 = cur_gen;
+                            } else {
+                                ic.push((name_idx, slot_idx, cur_gen));
+                            }
+                        });
+                    }
+
+                    Some(jsvalue_to_jit_i64(value))
+                })
+            }
+
+            Opcode::StaGlobal => {
+                let name_idx = operand1 as u32;
+                let name = get_rt_string_constant(name_idx)?;
+                let value = jit_i64_to_jsvalue(acc);
+
+                RT_GLOBAL_ENV.with(|env_cell| {
+                    let env_opt = env_cell.borrow();
+                    let env_rc = env_opt.as_ref()?;
+                    let mut env = env_rc.borrow_mut();
+
+                    // Fast path: IC hit — store by index.
+                    let ic_hit = RT_GLOBAL_IC.with(|ic| {
+                        let ic = ic.borrow();
+                        ic.iter()
+                            .find(|(idx, _, _)| *idx == name_idx)
+                            .map(|&(_, slot, cached)| (slot, cached))
+                    });
+                    if let Some((slot_idx, cached_gen)) = ic_hit {
+                        if env.generation() == cached_gen && slot_idx < env.slot_count() {
+                            env.store_by_index_sync(slot_idx, &name, value);
+                            // Update cached generation after mutation.
+                            let new_gen = env.generation();
+                            RT_GLOBAL_IC.with(|ic| {
+                                let mut ic = ic.borrow_mut();
+                                if let Some(entry) =
+                                    ic.iter_mut().find(|(idx, _, _)| *idx == name_idx)
+                                {
+                                    entry.2 = new_gen;
+                                }
+                            });
+                            return Some(acc);
+                        }
+                    }
+
+                    // Slow path: insert via HashMap.
+                    let slot_idx = env.slot_index_for(&name);
+                    if let Some(idx) = slot_idx {
+                        env.store_by_index_sync(idx, &name, value);
+                    } else {
+                        env.insert(name.clone(), value);
+                    }
+
+                    // Populate / update IC.
+                    let cur_gen = env.generation();
+                    if let Some(idx) = env.slot_index_for(&name) {
+                        RT_GLOBAL_IC.with(|ic| {
+                            let mut ic = ic.borrow_mut();
+                            if let Some(entry) = ic.iter_mut().find(|(i, _, _)| *i == name_idx) {
+                                entry.1 = idx;
+                                entry.2 = cur_gen;
+                            } else {
+                                ic.push((name_idx, idx, cur_gen));
+                            }
+                        });
+                    }
+
+                    Some(acc)
+                })
+            }
 
             // ── Dynamic scope lookup ────────────────────────────────────
             Opcode::LdaLookupSlot => None,
@@ -816,7 +947,9 @@ mod jit_runtime {
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]
-pub use jit_runtime::{jit_runtime_setup, jit_runtime_teardown, jit_to_jsvalue_ext};
+pub use jit_runtime::{
+    jit_runtime_set_global_env, jit_runtime_setup, jit_runtime_teardown, jit_to_jsvalue_ext,
+};
 
 /// A single entry in the safepoint table.
 ///
