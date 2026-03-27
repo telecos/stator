@@ -230,16 +230,28 @@ impl JitExecutableCode {
     /// The stored code must still be valid x86-64 machine code that follows
     /// the JIT calling convention (`extern "C" fn(*mut i64) -> i64`).
     pub unsafe fn execute(&self, args: &[i64], ctx_ptr: i64) -> i64 {
+        let n = self.register_file_slots;
+
+        // Fast path: small register files use a stack-allocated array,
+        // completely avoiding the TLS lookup + RefCell borrow.
+        if n <= 16 {
+            let mut regs = [0i64; 16];
+            for (i, &v) in args.iter().enumerate().take(n) {
+                regs[i] = v;
+            }
+            // SAFETY: `self.ptr` contains valid x86-64 JIT code.
+            let f: extern "C" fn(*mut i64, i64) -> i64 = unsafe { std::mem::transmute(self.ptr) };
+            return f(regs.as_mut_ptr(), ctx_ptr);
+        }
+
+        // Large register files: reuse pooled Vec via TLS.
         thread_local! {
-            /// Pooled register file — reused across JIT calls to avoid
-            /// per-call heap allocation.
             static REG_FILE: std::cell::RefCell<Vec<i64>> = const {
                 std::cell::RefCell::new(Vec::new())
             };
         }
         REG_FILE.with(|pool| {
             let mut regs = pool.borrow_mut();
-            let n = self.register_file_slots;
             regs.clear();
             regs.resize(n, 0);
             for (i, &v) in args.iter().enumerate().take(n) {
