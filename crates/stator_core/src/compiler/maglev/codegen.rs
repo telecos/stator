@@ -105,7 +105,7 @@ pub const NUM_PHYS_REGS: u32 = 6;
 /// R13 is initialised to this value in the prologue and decremented on every
 /// backward jump; when it reaches zero the function deopts back to the
 /// interpreter.
-const LOOP_COUNTER_MAX: i64 = 1_000;
+const LOOP_COUNTER_MAX: i64 = 100_000;
 
 /// A stub call argument that is either a Maglev IR node or an immediate i64.
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -1794,6 +1794,7 @@ impl<'a> MaglevCodegen<'a> {
     /// Call a 1-arg stub: `stub(node_arg)`.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_stub_call_1node(&mut self, id: NodeId, arg0: NodeId, stub_addr: usize) {
+        self.emit_loop_safety_check();
         self.emit_save_caller_saved();
         self.emit_load(arg0, Reg64::Rdi);
         self.masm.mov_ri(Reg64::R11, stub_addr as i64);
@@ -1807,6 +1808,7 @@ impl<'a> MaglevCodegen<'a> {
     /// Call a 2-node-arg stub: `stub(node0, node1)`.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_stub_call_2node(&mut self, id: NodeId, arg0: NodeId, arg1: NodeId, stub_addr: usize) {
+        self.emit_loop_safety_check();
         self.emit_save_caller_saved();
         self.emit_load(arg0, Reg64::Rdi);
         self.emit_load(arg1, Reg64::Rsi);
@@ -1828,6 +1830,7 @@ impl<'a> MaglevCodegen<'a> {
         arg2: NodeId,
         stub_addr: usize,
     ) {
+        self.emit_loop_safety_check();
         self.emit_save_caller_saved();
         self.emit_load(arg0, Reg64::Rdi);
         self.emit_load(arg1, Reg64::Rsi);
@@ -1851,6 +1854,7 @@ impl<'a> MaglevCodegen<'a> {
         arg2: NodeOrImm,
         stub_addr: usize,
     ) {
+        self.emit_loop_safety_check();
         self.emit_save_caller_saved();
         self.emit_load(arg0_node, Reg64::Rdi);
         self.masm.mov_ri(Reg64::Rsi, arg1_imm);
@@ -1875,6 +1879,7 @@ impl<'a> MaglevCodegen<'a> {
     /// `acc`, though most creation ops only use `operand1`/`operand2` and TLS.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_trampoline_call(&mut self, id: NodeId, opcode: u8, operand1: i64, operand2: i64) {
+        self.emit_loop_safety_check();
         self.emit_save_caller_saved();
         // RDI = opcode
         self.masm.mov_ri(Reg64::Rdi, i64::from(opcode));
