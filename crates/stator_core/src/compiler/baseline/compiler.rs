@@ -116,7 +116,12 @@ pub(crate) const JIT_HEAP_TAG: i64 = 0x2_0000_0000_i64;
 /// `i32` (i.e. is an out-of-range or deopt value).
 pub fn jit_to_jsvalue(v: i64) -> Option<crate::objects::value::JsValue> {
     use crate::objects::value::JsValue;
-    if v == JIT_FALSE {
+    // Fast path: Smi values are the overwhelmingly common case (loop
+    // counters, arithmetic results, array indices).  Check the i32
+    // range FIRST to avoid 4 wasted comparisons against magic sentinels.
+    if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
+        Some(JsValue::Smi(v as i32))
+    } else if v == JIT_FALSE {
         Some(JsValue::Boolean(false))
     } else if v == JIT_TRUE {
         Some(JsValue::Boolean(true))
@@ -124,8 +129,6 @@ pub fn jit_to_jsvalue(v: i64) -> Option<crate::objects::value::JsValue> {
         Some(JsValue::Undefined)
     } else if v == JIT_NULL {
         Some(JsValue::Null)
-    } else if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
-        Some(JsValue::Smi(v as i32))
     } else {
         // Large integer outside Smi range: promote to HeapNumber (f64).
         // All integers up to 2^53 are exactly representable as f64, so
