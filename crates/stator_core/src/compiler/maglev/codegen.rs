@@ -1025,6 +1025,39 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_store(id, Reg64::R11);
             }
 
+            // ── Context slot access via runtime stubs ─────────────────────────
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::LoadCurrentContextSlot { slot } => {
+                // jit_runtime_lda_context_slot(slot_idx: i64) -> i64
+                self.emit_save_caller_saved();
+                self.masm.mov_ri(Reg64::Rdi, i64::from(*slot));
+                self.masm.mov_ri(
+                    Reg64::R11,
+                    jit_runtime::jit_runtime_lda_context_slot as usize as i64,
+                );
+                self.masm.call_reg(Reg64::R11);
+                self.emit_restore_caller_saved();
+                self.emit_deopt_check_rax();
+                self.masm.mov_rr(Reg64::R11, Reg64::Rax);
+                self.emit_store(id, Reg64::R11);
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::StoreCurrentContextSlot { slot, value } => {
+                // jit_runtime_sta_context_slot(slot_idx: i64, value: i64) -> i64
+                self.emit_save_caller_saved();
+                self.masm.mov_ri(Reg64::Rdi, i64::from(*slot));
+                self.emit_load(*value, Reg64::Rsi);
+                self.masm.mov_ri(
+                    Reg64::R11,
+                    jit_runtime::jit_runtime_sta_context_slot as usize as i64,
+                );
+                self.masm.call_reg(Reg64::R11);
+                self.emit_restore_caller_saved();
+                self.emit_deopt_check_rax();
+                self.masm.mov_rr(Reg64::R11, Reg64::Rax);
+                self.emit_store(id, Reg64::R11);
+            }
+
             // ── Function calls via runtime stubs ──────────────────────────────
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::Call {
