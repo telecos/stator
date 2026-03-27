@@ -144,6 +144,7 @@ pub fn jit_to_jsvalue(v: i64) -> Option<crate::objects::value::JsValue> {
 #[cfg(all(target_arch = "x86_64", unix))]
 mod jit_runtime {
     use super::*;
+    use crate::bytecode::bytecode_array::JitExecutableCode;
     use crate::interpreter::GlobalEnv;
     use crate::objects::property_map::PropertyMap;
     use crate::objects::value::{JsContext, JsValue};
@@ -977,7 +978,23 @@ mod jit_runtime {
                 }
             }
             JsValue::Function(ba) => {
-                let Some((code, reg_slots)) = ba.try_get_jit_code() else {
+                // Use the persistent executable cache to avoid mmap/munmap
+                // on every call.
+                let exec_cache = ba.jit_executable_cache();
+                {
+                    let needs_init = exec_cache.borrow().is_none();
+                    if needs_init {
+                        let Some((code, reg_slots)) = ba.try_get_jit_code() else {
+                            RT_BYTECODE.with(|b| b.set(saved_ba));
+                            return None;
+                        };
+                        // SAFETY: code was produced by the baseline compiler.
+                        let exec = unsafe { JitExecutableCode::new(&code, reg_slots) };
+                        *exec_cache.borrow_mut() = exec;
+                    }
+                }
+                let cache_ref = exec_cache.borrow();
+                let Some(exec) = cache_ref.as_ref() else {
                     RT_BYTECODE.with(|b| b.set(saved_ba));
                     return None;
                 };
@@ -986,29 +1003,28 @@ mod jit_runtime {
                 // clean environment and the outer state is restored after.
                 let saved_heap = RT_HEAP.with(|h| std::mem::take(&mut *h.borrow_mut()));
                 let saved_ic = RT_LDA_IC.with(|ic| std::mem::take(&mut *ic.borrow_mut()));
+                let saved_ctx = RT_CONTEXT.with(|c| c.borrow().clone());
                 RT_BYTECODE.with(|b| b.set(&**ba as *const BytecodeArray));
 
-                let cc = CompiledCode {
-                    code,
-                    native_code_len: 0,
-                    register_file_slots: reg_slots,
-                    safepoints: Vec::new(),
-                    deopt_entries: Vec::new(),
-                };
-                // SAFETY: code was produced by the baseline compiler for
-                // this BytecodeArray and consists of valid x86-64 instructions.
-                let jit_result = unsafe { cc.execute(&[]) };
+                // Set the callee's closure context for context-slot stubs.
+                RT_CONTEXT.with(|c| *c.borrow_mut() = ba.closure_context().cloned());
+
+                // SAFETY: cached executable code was produced by the baseline
+                // compiler and contains valid x86-64 instructions.
+                let jit_result = unsafe { exec.execute(&[]) };
 
                 // Convert the result while the inner RT_HEAP is still alive.
-                let result_val = match jit_result {
-                    Ok(v) => jit_to_jsvalue_ext(v),
-                    Err(_) => None,
+                let result_val = if jit_result == JIT_DEOPT {
+                    None
+                } else {
+                    jit_to_jsvalue_ext(jit_result)
                 };
 
                 // Restore outer execution state.
                 RT_BYTECODE.with(|b| b.set(saved_ba));
                 RT_HEAP.with(|h| *h.borrow_mut() = saved_heap);
                 RT_LDA_IC.with(|ic| *ic.borrow_mut() = saved_ic);
+                RT_CONTEXT.with(|c| *c.borrow_mut() = saved_ctx);
 
                 result_val.map(jsvalue_to_jit_i64)
             }
