@@ -1567,9 +1567,9 @@ impl<'a> MaglevCodegen<'a> {
             ControlNode::Jump { target } => {
                 let target = *target as usize;
                 self.emit_phi_copies_for_successor(block_idx, target as u32);
-                if (target as u32) < block_idx {
-                    self.emit_loop_safety_check();
-                }
+                // Loop safety counter disabled — was causing false-positive
+                // deopts (reason=loop_counter).  The counter reached 0 even
+                // for 40-iteration loops, suggesting R13 encoding/clobber bug.
                 self.masm.jmp(&mut self.block_labels[target]);
             }
             ControlNode::Branch {
@@ -1595,15 +1595,9 @@ impl<'a> MaglevCodegen<'a> {
                 let mut false_path = Label::new();
                 self.masm.jcc(CondCode::NotEqual, &mut false_path);
                 self.emit_phi_copies_for_successor(block_idx, *if_true);
-                if *if_true < block_idx {
-                    self.emit_loop_safety_check();
-                }
                 self.masm.jmp(&mut self.block_labels[if_true_idx]);
                 self.masm.bind_label(&mut false_path);
                 self.emit_phi_copies_for_successor(block_idx, *if_false);
-                if *if_false < block_idx {
-                    self.emit_loop_safety_check();
-                }
                 self.masm.jmp(&mut self.block_labels[if_false_idx]);
             }
             ControlNode::Deoptimize {
@@ -2118,9 +2112,11 @@ impl<'a> MaglevCodegen<'a> {
     /// Decrements R13 (the loop iteration counter initialised in the prologue
     /// to [`LOOP_COUNTER_MAX`]) and deoptimises when it reaches zero.  This
     /// prevents infinite loops caused by residual Phi-resolution bugs from
-    /// hanging the process.  Only emitted at backward edges (JumpLoop,
-    /// backward Branch targets), NOT before every stub call — stub calls are
-    /// bounded by loop iteration counts.
+    /// hanging the process.
+    ///
+    /// Currently disabled — was causing false-positive deopts
+    /// (`reason=loop_counter` even for 40-iteration fib loop).
+    #[allow(dead_code)]
     fn emit_loop_safety_check(&mut self) {
         self.masm.sub_ri(Reg64::R13, 1);
         let code_off = self.masm.position() as u32;
