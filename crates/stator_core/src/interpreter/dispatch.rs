@@ -3951,6 +3951,9 @@ fn handle_sta_keyed_property(
             let i = idx_val as usize;
             let mut v = items_rc.borrow_mut();
             if i >= v.len() {
+                let cur_len = v.len();
+                let new_cap = (i + 1).next_power_of_two();
+                v.reserve(new_cap - cur_len);
                 v.resize(i + 1, JsValue::TheHole);
             }
             v[i] = val;

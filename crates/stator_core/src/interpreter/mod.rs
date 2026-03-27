@@ -1173,6 +1173,7 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
 ///   (fall-back to the next tier).
 ///
 /// On platforms where the JIT is not available this always returns `None`.
+#[allow(dead_code)]
 fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
@@ -1458,7 +1459,10 @@ pub(super) fn try_execute_best_jit(
     ba: &BytecodeArray,
     args: &[JsValue],
 ) -> Option<StatorResult<JsValue>> {
-    try_execute_maglev(ba, args).or_else(|| try_execute_jit(ba, args))
+    // Maglev execution disabled: stub calls (LoadNamedGeneric,
+    // StoreKeyedGeneric, etc.) cause infinite loops in 5/9 benchmarks.
+    // Only baseline JIT runs until Maglev codegen is fixed.
+    try_execute_jit(ba, args)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3897,6 +3901,9 @@ impl Interpreter {
                                     if let JsValue::Array(items) = obj_ref {
                                         let mut v = items.borrow_mut();
                                         if i >= v.len() {
+                                            let cur_len = v.len();
+                                            let new_cap = (i + 1).next_power_of_two();
+                                            v.reserve(new_cap - cur_len);
                                             v.resize(i + 1, JsValue::TheHole);
                                         }
                                         v[i] = smi_to_val!();
@@ -5644,6 +5651,9 @@ impl Interpreter {
                                     let val = acc.cheap_clone();
                                     let mut v = items_rc.borrow_mut();
                                     if i >= v.len() {
+                                        let cur_len = v.len();
+                                        let new_cap = (i + 1).next_power_of_two();
+                                        v.reserve(new_cap - cur_len);
                                         v.resize(i + 1, JsValue::TheHole);
                                     }
                                     v[i] = val;

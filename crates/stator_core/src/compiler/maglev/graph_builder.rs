@@ -1502,8 +1502,9 @@ impl<'a> GraphBuilder<'a> {
     /// vector is Uninitialized (Maglev compiles on a background thread with
     /// a fresh FeedbackVector).
     ///
-    /// Bitwise/shift ops and exponentiation still use generic stubs since
-    /// they need runtime coercion logic.
+    /// Emit a binary operation. Core arithmetic and bitwise/shift ops use
+    /// native Int32 instructions after Smi guards. Exponentiation still
+    /// requires a generic stub for runtime coercion.
     fn emit_binary_op(
         &mut self,
         left: NodeId,
@@ -1514,8 +1515,9 @@ impl<'a> GraphBuilder<'a> {
         // Guard both operands as Smis.
         self.emit(ValueNode::CheckSmi { receiver: left })?;
         self.emit(ValueNode::CheckSmi { receiver: right })?;
-        // Emit the speculative Smi operation for core arithmetic,
-        // or generic stubs for ops needing runtime coercion.
+        // Emit native Int32 instructions for arithmetic and bitwise ops.
+        // Bitwise/shift ops cannot overflow (they produce valid i32 for any
+        // two i32 inputs), so no post-operation deopt is needed.
         self.emit(match kind {
             BinaryOpKind::Add => ValueNode::CheckedSmiAdd { left, right },
             BinaryOpKind::Sub => ValueNode::CheckedSmiSubtract { left, right },
@@ -1527,36 +1529,12 @@ impl<'a> GraphBuilder<'a> {
                 right,
                 feedback_slot: slot,
             },
-            BinaryOpKind::BitwiseOr => ValueNode::GenericBitwiseOr {
-                left,
-                right,
-                feedback_slot: slot,
-            },
-            BinaryOpKind::BitwiseXor => ValueNode::GenericBitwiseXor {
-                left,
-                right,
-                feedback_slot: slot,
-            },
-            BinaryOpKind::BitwiseAnd => ValueNode::GenericBitwiseAnd {
-                left,
-                right,
-                feedback_slot: slot,
-            },
-            BinaryOpKind::ShiftLeft => ValueNode::GenericShiftLeft {
-                left,
-                right,
-                feedback_slot: slot,
-            },
-            BinaryOpKind::ShiftRight => ValueNode::GenericShiftRight {
-                left,
-                right,
-                feedback_slot: slot,
-            },
-            BinaryOpKind::ShiftRightLogical => ValueNode::GenericShiftRightLogical {
-                left,
-                right,
-                feedback_slot: slot,
-            },
+            BinaryOpKind::BitwiseOr => ValueNode::Int32BitwiseOr { left, right },
+            BinaryOpKind::BitwiseXor => ValueNode::Int32BitwiseXor { left, right },
+            BinaryOpKind::BitwiseAnd => ValueNode::Int32BitwiseAnd { left, right },
+            BinaryOpKind::ShiftLeft => ValueNode::Int32ShiftLeft { left, right },
+            BinaryOpKind::ShiftRight => ValueNode::Int32ShiftRight { left, right },
+            BinaryOpKind::ShiftRightLogical => ValueNode::Int32ShiftRightLogical { left, right },
         })
     }
 
