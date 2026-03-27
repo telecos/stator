@@ -2427,24 +2427,62 @@ pub(crate) mod jit_runtime {
 
     /// Inner implementation for [`jit_runtime_sta_keyed_property`].
     fn sta_keyed_property_inner(obj_i64: i64, key_i64: i64, value_i64: i64) -> Option<i64> {
-        // Ultra-fast path: Array[positive Smi] = non-heap-value.
-        // Avoids jit_to_jsvalue for the key; converts only the value.
+        // Ultra-fast path: Array[positive Smi] with inline value decode.
+        // Avoids jit_to_jsvalue for the key AND common value types.
         if is_heap_handle(obj_i64)
             && key_i64 >= 0
             && key_i64 <= i32::MAX as i64
             && !is_heap_handle(value_i64)
         {
-            if let Some(value) = super::jit_to_jsvalue(value_i64) {
-                let smi_key = key_i64 as usize;
-                let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
-                let ptrs = RT_PTRS.with(|p| p.get());
-                let fast = if ptrs.is_cached() {
-                    // SAFETY: cached pointers set by cache_rt_ptrs;
-                    // valid for thread lifetime.
-                    let heap_ref = unsafe { &*ptrs.heap };
-                    // SAFETY: single-threaded JIT; no concurrent
-                    // mutable borrows of RT_HEAP during keyed store.
-                    let heap = unsafe { &*heap_ref.as_ptr() };
+            // Decode value inline for common types (avoids jit_to_jsvalue).
+            let value = if value_i64 >= i32::MIN as i64 && value_i64 <= i32::MAX as i64 {
+                JsValue::Smi(value_i64 as i32)
+            } else if value_i64 == JIT_TRUE {
+                JsValue::Boolean(true)
+            } else if value_i64 == JIT_FALSE {
+                JsValue::Boolean(false)
+            } else if value_i64 == JIT_UNDEFINED {
+                JsValue::Undefined
+            } else if let Some(v) = super::jit_to_jsvalue(value_i64) {
+                v
+            } else {
+                return None;
+            };
+            let smi_key = key_i64 as usize;
+            let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+            let ptrs = RT_PTRS.with(|p| p.get());
+            let fast = if ptrs.is_cached() {
+                // SAFETY: cached pointers set by cache_rt_ptrs;
+                // valid for thread lifetime.
+                let heap_ref = unsafe { &*ptrs.heap };
+                // SAFETY: single-threaded JIT; no concurrent
+                // mutable borrows of RT_HEAP during keyed store.
+                let heap = unsafe { &*heap_ref.as_ptr() };
+                match heap.get(obj_idx)? {
+                    JsValue::Array(arr) => {
+                        // SAFETY: single-threaded JIT; no concurrent
+                        // borrows of this array during keyed store.
+                        let v = unsafe { &mut *arr.as_ptr() };
+                        if smi_key >= v.len() {
+                            let cur_len = v.len();
+                            let new_cap = (smi_key + 1).next_power_of_two();
+                            v.reserve(new_cap - cur_len);
+                            v.resize(smi_key + 1, JsValue::TheHole);
+                        }
+                        v[smi_key] = value;
+                        Some(())
+                    }
+                    JsValue::PlainObject(map_rc) => {
+                        let key_str = smi_key.to_string();
+                        // SAFETY: single-threaded JIT; no concurrent borrows.
+                        unsafe { &mut *map_rc.as_ptr() }.insert(key_str, value);
+                        Some(())
+                    }
+                    _ => None,
+                }
+            } else {
+                RT_HEAP.with(|heap| {
+                    let heap = heap.borrow();
                     match heap.get(obj_idx)? {
                         JsValue::Array(arr) => {
                             let mut v = arr.borrow_mut();
@@ -2464,33 +2502,10 @@ pub(crate) mod jit_runtime {
                         }
                         _ => None,
                     }
-                } else {
-                    RT_HEAP.with(|heap| {
-                        let heap = heap.borrow();
-                        match heap.get(obj_idx)? {
-                            JsValue::Array(arr) => {
-                                let mut v = arr.borrow_mut();
-                                if smi_key >= v.len() {
-                                    let cur_len = v.len();
-                                    let new_cap = (smi_key + 1).next_power_of_two();
-                                    v.reserve(new_cap - cur_len);
-                                    v.resize(smi_key + 1, JsValue::TheHole);
-                                }
-                                v[smi_key] = value;
-                                Some(())
-                            }
-                            JsValue::PlainObject(map_rc) => {
-                                let key_str = smi_key.to_string();
-                                map_rc.borrow_mut().insert(key_str, value);
-                                Some(())
-                            }
-                            _ => None,
-                        }
-                    })
-                };
-                if fast.is_some() {
-                    return Some(value_i64);
-                }
+                })
+            };
+            if fast.is_some() {
+                return Some(value_i64);
             }
         }
 
@@ -2724,19 +2739,29 @@ pub(crate) mod jit_runtime {
                         if let Some(JsValue::Array(arr)) = heap.get(recv_idx) {
                             match method_name.as_ref() {
                                 "push" => {
+                                    // Inline value decode for common types.
                                     let arg0 = if is_heap_handle(arg0_i64) {
                                         let a_idx = (arg0_i64 - JIT_HEAP_TAG) as usize;
                                         heap.get(a_idx).cloned().unwrap_or(JsValue::Undefined)
+                                    } else if arg0_i64 >= i32::MIN as i64
+                                        && arg0_i64 <= i32::MAX as i64
+                                    {
+                                        JsValue::Smi(arg0_i64 as i32)
                                     } else {
                                         super::jit_to_jsvalue(arg0_i64)
                                             .unwrap_or(JsValue::Undefined)
                                     };
-                                    let mut items = arr.borrow_mut();
+                                    // SAFETY: single-threaded JIT; no concurrent
+                                    // borrows of this array during push.
+                                    let items = unsafe { &mut *arr.as_ptr() };
                                     items.push(arg0);
                                     return Some(items.len() as i64);
                                 }
                                 "pop" => {
-                                    let val = arr.borrow_mut().pop().unwrap_or(JsValue::Undefined);
+                                    // SAFETY: single-threaded JIT; no concurrent borrows.
+                                    let val = unsafe { &mut *arr.as_ptr() }
+                                        .pop()
+                                        .unwrap_or(JsValue::Undefined);
                                     return Some(jsvalue_to_jit_i64(val));
                                 }
                                 _ => {}
