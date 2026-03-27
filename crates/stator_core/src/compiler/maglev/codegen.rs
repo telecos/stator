@@ -1662,7 +1662,11 @@ impl<'a> MaglevCodegen<'a> {
                 let off = self.slot_offset(n);
                 self.masm.mov_store_base_disp32(Reg64::R14, off, src);
             }
-            None => {}
+            None => {
+                // Node has no allocated location — the register allocator
+                // determined its value is unused (dead).  This is expected
+                // for side-effect-only stub calls.
+            }
         }
     }
 
@@ -1722,6 +1726,8 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.mov_ri(Reg64::Rdi, i64::from(name_idx));
                 self.masm.mov_ri(Reg64::R11, addr);
                 self.masm.call_reg(Reg64::R11);
+                // If the stub returned JIT_DEOPT, bail out immediately.
+                self.emit_deopt_check_rax();
                 // Store result in promoted slot: [R14 + off] = RAX
                 self.masm.mov_store_base_disp32(Reg64::R14, off, Reg64::Rax);
             }
@@ -1856,12 +1862,16 @@ impl<'a> MaglevCodegen<'a> {
     ) {
         self.emit_loop_safety_check();
         self.emit_save_caller_saved();
+        // Load all node arguments BEFORE setting any immediates into
+        // allocatable registers (RSI = phys_reg(3)).  The old order
+        // clobbered RSI with arg1_imm before loading arg2, which could
+        // read from RSI if the allocator placed it there.
         self.emit_load(arg0_node, Reg64::Rdi);
-        self.masm.mov_ri(Reg64::Rsi, arg1_imm);
         match arg2 {
             NodeOrImm::Node(n) => self.emit_load(n, Reg64::Rdx),
             NodeOrImm::Imm(v) => self.masm.mov_ri(Reg64::Rdx, v),
         }
+        self.masm.mov_ri(Reg64::Rsi, arg1_imm);
         self.masm.mov_ri(Reg64::R11, stub_addr as i64);
         self.masm.call_reg(Reg64::R11);
         self.emit_restore_caller_saved();

@@ -1459,10 +1459,12 @@ pub(super) fn try_execute_best_jit(
     ba: &BytecodeArray,
     args: &[JsValue],
 ) -> Option<StatorResult<JsValue>> {
-    // Try Maglev first (with low LOOP_COUNTER_MAX for diagnostics).
-    if let Some(r) = try_execute_maglev(ba, args) {
-        return Some(r);
-    }
+    // Maglev disabled — codegen crashes (SIGSEGV) on property-heavy benchmarks.
+    // Root cause: register clobbering in emit_stub_call_3arg + deopt path bugs.
+    // TODO: Fix Maglev codegen before re-enabling.
+    // if let Some(r) = try_execute_maglev(ba, args) {
+    //     return Some(r);
+    // }
     try_execute_jit(ba, args)
 }
 
