@@ -3213,6 +3213,42 @@ impl Interpreter {
                                 let loop_end = pc;
                                 pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
                                 frame.osr_loop_count = frame.osr_loop_count.saturating_add(1);
+
+                                // JIT compilation + OSR execution inside the
+                                // SMI fast loop.  Use exact-match (`==`) so
+                                // the check is free on every other back-edge.
+                                if frame.osr_loop_count == OSR_LOOP_THRESHOLD {
+                                    if frame.bytecode_array.try_get_jit_code().is_none()
+                                        && !frame.bytecode_array.jit_baseline_has_deopted()
+                                    {
+                                        maybe_compile_baseline(&frame.bytecode_array);
+                                    }
+                                    if let Some(jit_result) = try_execute_best_jit(
+                                        &frame.bytecode_array,
+                                        &frame.call_args,
+                                    ) {
+                                        return jit_result;
+                                    }
+                                }
+                                if frame.osr_loop_count == MAGLEV_OSR_LOOP_THRESHOLD {
+                                    maybe_compile_maglev(&frame.bytecode_array);
+                                    if let Some(jit_result) = try_execute_best_jit(
+                                        &frame.bytecode_array,
+                                        &frame.call_args,
+                                    ) {
+                                        return jit_result;
+                                    }
+                                }
+                                if frame.osr_loop_count == TURBOFAN_OSR_LOOP_THRESHOLD {
+                                    maybe_compile_turbofan(&frame.bytecode_array);
+                                    if let Some(jit_result) = try_execute_best_jit(
+                                        &frame.bytecode_array,
+                                        &frame.call_args,
+                                    ) {
+                                        return jit_result;
+                                    }
+                                }
+
                                 // Only EXPAND loop_end_pc — never shrink it.
                                 // Nested loops have smaller loop_end values;
                                 // shrinking would cause the outer loop to
@@ -4850,17 +4886,35 @@ impl Interpreter {
                         let loop_end = pc; // Position after this JumpLoop
                         pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
                         frame.osr_loop_count = frame.osr_loop_count.saturating_add(1);
-                        if frame.osr_loop_count >= OSR_LOOP_THRESHOLD
-                            && frame.bytecode_array.try_get_jit_code().is_none()
-                            && !frame.bytecode_array.jit_baseline_has_deopted()
-                        {
-                            maybe_compile_baseline(&frame.bytecode_array);
+                        // Use exact-match (`==`) to minimise hot-path cost.
+                        if frame.osr_loop_count == OSR_LOOP_THRESHOLD {
+                            if frame.bytecode_array.try_get_jit_code().is_none()
+                                && !frame.bytecode_array.jit_baseline_has_deopted()
+                            {
+                                maybe_compile_baseline(&frame.bytecode_array);
+                            }
+                            // OSR: switch to JIT if code is now available.
+                            if let Some(jit_result) =
+                                try_execute_best_jit(&frame.bytecode_array, &frame.call_args)
+                            {
+                                return jit_result;
+                            }
                         }
-                        if frame.osr_loop_count >= MAGLEV_OSR_LOOP_THRESHOLD {
+                        if frame.osr_loop_count == MAGLEV_OSR_LOOP_THRESHOLD {
                             maybe_compile_maglev(&frame.bytecode_array);
+                            if let Some(jit_result) =
+                                try_execute_best_jit(&frame.bytecode_array, &frame.call_args)
+                            {
+                                return jit_result;
+                            }
                         }
-                        if frame.osr_loop_count >= TURBOFAN_OSR_LOOP_THRESHOLD {
+                        if frame.osr_loop_count == TURBOFAN_OSR_LOOP_THRESHOLD {
                             maybe_compile_turbofan(&frame.bytecode_array);
+                            if let Some(jit_result) =
+                                try_execute_best_jit(&frame.bytecode_array, &frame.call_args)
+                            {
+                                return jit_result;
+                            }
                         }
                         // SMI-mode detection: if the accumulator is Smi
                         // (or Boolean — common for comparison-terminated
