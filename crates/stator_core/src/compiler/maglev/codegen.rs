@@ -1092,6 +1092,16 @@ impl<'a> MaglevCodegen<'a> {
                             jit_runtime::jit_runtime_call_undefined_receiver1 as usize,
                         );
                     }
+                    // CallUndefinedReceiver2
+                    (true, 2) => {
+                        self.emit_stub_call_3node(
+                            id,
+                            *callee,
+                            args[0],
+                            args[1],
+                            jit_runtime::jit_runtime_call_undefined_receiver2 as usize,
+                        );
+                    }
                     // CallProperty0
                     (false, 0) => {
                         self.emit_stub_call_2node(
@@ -1144,6 +1154,15 @@ impl<'a> MaglevCodegen<'a> {
                             *callee,
                             args[0],
                             jit_runtime::jit_runtime_call_undefined_receiver1 as usize,
+                        );
+                    }
+                    (true, 2) => {
+                        self.emit_stub_call_3node(
+                            id,
+                            *callee,
+                            args[0],
+                            args[1],
+                            jit_runtime::jit_runtime_call_undefined_receiver2 as usize,
                         );
                     }
                     (false, 0) => {

@@ -1872,6 +1872,93 @@ pub(crate) mod jit_runtime {
         }
     }
 
+    /// Specialized stub for calling a function with two arguments.
+    pub extern "C" fn jit_runtime_call_undefined_receiver2(
+        callee_i64: i64,
+        arg0_i64: i64,
+        arg1_i64: i64,
+    ) -> i64 {
+        call_undefined_receiver2_inner(callee_i64, arg0_i64, arg1_i64).unwrap_or(JIT_DEOPT)
+    }
+
+    fn call_undefined_receiver2_inner(
+        callee_i64: i64,
+        arg0_i64: i64,
+        arg1_i64: i64,
+    ) -> Option<i64> {
+        let ptrs = RT_PTRS.with(|p| p.get());
+
+        if ptrs.is_cached() {
+            let bc_ref = unsafe { &*ptrs.bytecode };
+            let saved_ba = bc_ref.get();
+
+            if callee_i64 >= JIT_HEAP_TAG {
+                let idx = (callee_i64 - JIT_HEAP_TAG) as usize;
+                let heap_ref = unsafe { &*ptrs.heap };
+                let heap = heap_ref.borrow();
+                match heap.get(idx) {
+                    Some(JsValue::Function(ba)) => {
+                        let ba = Rc::clone(ba);
+                        drop(heap);
+                        let arg0 = jit_i64_to_jsvalue(arg0_i64);
+                        let arg1 = jit_i64_to_jsvalue(arg1_i64);
+                        return call_js_function(
+                            &ba,
+                            vec![arg0, arg1],
+                            &[arg0_i64, arg1_i64],
+                            saved_ba,
+                        );
+                    }
+                    Some(JsValue::NativeFunction(f)) => {
+                        let f = Rc::clone(f);
+                        drop(heap);
+                        let arg0 = jit_i64_to_jsvalue(arg0_i64);
+                        let arg1 = jit_i64_to_jsvalue(arg1_i64);
+                        let result = f(vec![arg0, arg1]);
+                        bc_ref.set(saved_ba);
+                        return match result {
+                            Ok(v) => Some(jsvalue_to_jit_i64(v)),
+                            Err(_) => None,
+                        };
+                    }
+                    _ => {
+                        drop(heap);
+                        bc_ref.set(saved_ba);
+                        return None;
+                    }
+                }
+            }
+
+            bc_ref.set(saved_ba);
+            return None;
+        }
+
+        let callee = jit_i64_to_jsvalue(callee_i64);
+        let saved_ba = RT_BYTECODE.with(|b| b.get());
+
+        match &callee {
+            JsValue::NativeFunction(f) => {
+                let arg0 = jit_i64_to_jsvalue(arg0_i64);
+                let arg1 = jit_i64_to_jsvalue(arg1_i64);
+                let result = f(vec![arg0, arg1]);
+                RT_BYTECODE.with(|b| b.set(saved_ba));
+                match result {
+                    Ok(v) => Some(jsvalue_to_jit_i64(v)),
+                    Err(_) => None,
+                }
+            }
+            JsValue::Function(ba) => {
+                let arg0 = jit_i64_to_jsvalue(arg0_i64);
+                let arg1 = jit_i64_to_jsvalue(arg1_i64);
+                call_js_function(ba, vec![arg0, arg1], &[arg0_i64, arg1_i64], saved_ba)
+            }
+            _ => {
+                RT_BYTECODE.with(|b| b.set(saved_ba));
+                None
+            }
+        }
+    }
+
     /// Specialized runtime stub for `LdaGlobal`.
     ///
     /// Avoids the generic opcode dispatch overhead of
