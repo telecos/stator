@@ -544,6 +544,21 @@ impl<'a> GraphBuilder<'a> {
                 self.env.set_accumulator(id);
             }
 
+            // ── Keyed property loads ─────────────────────────────────────────
+            // LdaKeyedProperty [obj_reg, slot]
+            Opcode::LdaKeyedProperty => {
+                let obj_reg = self.operand_register(instr, 0)?;
+                let slot = self.operand_feedback_slot(instr, 1)?;
+                let obj = self.env_get_register(obj_reg)?;
+                let key = self.env_get_accumulator()?;
+                let id = self.emit(ValueNode::LoadKeyedGeneric {
+                    object: obj,
+                    key,
+                    feedback_slot: slot,
+                })?;
+                self.env.set_accumulator(id);
+            }
+
             // ── Property stores ──────────────────────────────────────────────
             // StaNamedProperty [obj_reg, name_idx, slot]
             Opcode::StaNamedProperty
@@ -557,6 +572,22 @@ impl<'a> GraphBuilder<'a> {
                 self.emit(ValueNode::StoreNamedGeneric {
                     object: obj,
                     name,
+                    value,
+                    feedback_slot: slot,
+                })?;
+            }
+
+            // StaKeyedProperty [obj_reg, key_reg, slot]
+            Opcode::StaKeyedProperty => {
+                let obj_reg = self.operand_register(instr, 0)?;
+                let key_reg = self.operand_register(instr, 1)?;
+                let slot = self.operand_feedback_slot(instr, 2)?;
+                let obj = self.env_get_register(obj_reg)?;
+                let key = self.env_get_register(key_reg)?;
+                let value = self.env_get_accumulator()?;
+                self.emit(ValueNode::StoreKeyedGeneric {
+                    object: obj,
+                    key,
                     value,
                     feedback_slot: slot,
                 })?;

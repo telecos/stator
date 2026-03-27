@@ -1585,14 +1585,33 @@ pub(crate) mod jit_runtime {
             // SAFETY: no active borrows; read length via raw pointer.
             let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
 
-            let callee_ctx = ba.closure_context().cloned();
-            let ctx_ptr = callee_ctx
+            // Compare callee context with current context — if they're
+            // the same (common for closures in tight loops), skip the
+            // expensive clone + swap + restore cycle entirely.
+            let callee_ctx_raw = ba.closure_context();
+            let callee_ctx_ptr = callee_ctx_raw
                 .as_ref()
-                .map(|rc| Rc::as_ptr(rc) as i64)
-                .unwrap_or(0);
+                .map(Rc::as_ptr)
+                .unwrap_or(std::ptr::null());
+            // SAFETY: no active borrows; read current context pointer.
+            let current_ctx_ptr = unsafe {
+                (*ctx_ref.as_ptr())
+                    .as_ref()
+                    .map(Rc::as_ptr)
+                    .unwrap_or(std::ptr::null())
+            };
+            let same_context = std::ptr::eq(callee_ctx_ptr, current_ctx_ptr);
 
-            // SAFETY: no active borrows; swap context via raw pointer.
-            let saved_ctx = unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx) };
+            let ctx_ptr = callee_ctx_ptr as i64;
+            let saved_ctx = if same_context {
+                // Same context: no clone/swap needed.
+                None
+            } else {
+                let callee_ctx = callee_ctx_raw.cloned();
+                // SAFETY: no active borrows; swap context via raw pointer.
+                Some(unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx) })
+            };
+
             bc_ref.set(&**ba as *const BytecodeArray);
 
             // SAFETY: cached executable code was produced by the
@@ -1608,7 +1627,10 @@ pub(crate) mod jit_runtime {
             bc_ref.set(saved_ba);
             // SAFETY: no active borrows; truncate/restore via raw pointer.
             unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
-            unsafe { *ctx_ref.as_ptr() = saved_ctx };
+            if let Some(ctx) = saved_ctx {
+                // SAFETY: no active borrows; restore context via raw pointer.
+                unsafe { *ctx_ref.as_ptr() = ctx };
+            }
 
             return result_val.map(jsvalue_to_jit_i64);
         }
