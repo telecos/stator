@@ -1168,50 +1168,81 @@ mod jit_runtime {
     }
 
     /// Inner implementation for [`jit_runtime_lda_named_property`].
+    ///
+    /// Uses a two-phase approach:
+    /// 1. **Fast path** – borrow the heap object without cloning it and
+    ///    check the inline cache.  On IC hit with a primitive result the
+    ///    value is returned immediately (zero Rc clones).
+    /// 2. **Slow path** – clone-based fallback for IC misses and complex
+    ///    result types that need a heap-handle allocation.
     fn lda_named_property_inner(obj_i64: i64, name_idx: u32) -> Option<i64> {
-        let obj = jit_i64_to_jsvalue(obj_i64);
+        if !is_heap_handle(obj_i64) {
+            return None;
+        }
+        let idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+        let lda_slot = (name_idx & 63) as usize;
 
+        // ── Phase 1: IC hit via borrowed heap (no input clone) ──────
+        // Returns Ok(i64) for a direct/primitive result, Err(JsValue)
+        // for an object result that still needs a heap handle, or None
+        // on IC miss.
+        let fast: Option<Result<i64, JsValue>> = RT_HEAP.with(|heap| {
+            let heap = heap.borrow();
+            let obj = heap.get(idx)?;
+
+            match obj {
+                JsValue::PlainObject(map_rc) => {
+                    let map = map_rc.borrow();
+                    let shape = map.shape_id();
+
+                    RT_PROP_IC.with(|ic| {
+                        let cache = ic.borrow();
+
+                        // Own-property IC
+                        let entry = &cache.lda[lda_slot];
+                        if entry.0 == name_idx && entry.1 == shape {
+                            return map
+                                .get_by_offset(entry.2)
+                                .map(encode_or_clone_ref)
+                                .unwrap_or(Some(Ok(JIT_UNDEFINED)));
+                        }
+
+                        // Prototype IC (value pre-encoded as i64)
+                        let proto_slot = (name_idx & 15) as usize;
+                        let pe = &cache.proto[proto_slot];
+                        if pe.0 == name_idx && pe.1 == shape {
+                            return Some(Ok(pe.2));
+                        }
+
+                        None // IC miss
+                    })
+                }
+                JsValue::Array(arr) => {
+                    let prop_name = get_rt_string_constant(name_idx)?;
+                    if prop_name == "length" {
+                        Some(Ok(arr.borrow().len() as i64))
+                    } else {
+                        Some(Ok(JIT_UNDEFINED))
+                    }
+                }
+                _ => None,
+            }
+        });
+
+        if let Some(result) = fast {
+            return Some(match result {
+                Ok(val) => val,
+                Err(obj_val) => alloc_heap_handle(obj_val),
+            });
+        }
+
+        // ── Phase 2: IC miss — clone-based slow path ────────────────
+        let obj = jit_i64_to_jsvalue(obj_i64);
         match &obj {
             JsValue::PlainObject(map_rc) => {
                 let map = map_rc.borrow();
                 let shape = map.shape_id();
 
-                // ── Single TLS access for both IC caches ────────────────
-                let lda_slot = (name_idx & 63) as usize;
-                let ic_result = RT_PROP_IC.with(|ic| {
-                    let cache = ic.borrow();
-
-                    // ── Own-property IC fast path ───────────────────────
-                    let lda_entry = &cache.lda[lda_slot];
-                    if lda_entry.0 == name_idx && lda_entry.1 == shape {
-                        return (Some(lda_entry.2), None);
-                    }
-
-                    // ── Prototype IC fast path (on own-property miss) ───
-                    let proto_slot = (name_idx & 15) as usize;
-                    let proto_entry = &cache.proto[proto_slot];
-                    if proto_entry.0 == name_idx && proto_entry.1 == shape {
-                        return (None, Some(proto_entry.2));
-                    }
-
-                    (None, None)
-                });
-
-                // Own-property IC hit → return directly.
-                if let (Some(offset), _) = ic_result {
-                    return Some(
-                        map.get_by_offset(offset)
-                            .map(jsvalue_ref_to_jit_i64)
-                            .unwrap_or(JIT_UNDEFINED),
-                    );
-                }
-
-                // Prototype IC hit → return cached value.
-                if let (_, Some(val)) = ic_result {
-                    return Some(val);
-                }
-
-                // ── IC miss: full lookup + cache update ─────────────────
                 let prop_name = get_rt_string_constant(name_idx)?;
 
                 if let Some(offset) = map.offset_of(&prop_name) {
@@ -1232,7 +1263,6 @@ mod jit_runtime {
                     drop(map);
                     let result = jit_proto_chain_walk(proto.as_ref(), &prop_name);
 
-                    // Cache the resolved prototype value.
                     let proto_slot = (name_idx & 15) as usize;
                     RT_PROP_IC.with(|ic| {
                         ic.borrow_mut().proto[proto_slot] = (name_idx, shape, result);
@@ -1250,6 +1280,29 @@ mod jit_runtime {
                 }
             }
             _ => None,
+        }
+    }
+
+    /// Encode a `&JsValue` as `i64` if it is a primitive (no heap
+    /// allocation needed), otherwise clone the value for later
+    /// [`alloc_heap_handle`].
+    #[inline]
+    fn encode_or_clone_ref(val: &JsValue) -> Result<i64, JsValue> {
+        match val {
+            JsValue::Smi(n) => Ok(i64::from(*n)),
+            JsValue::Boolean(true) => Ok(JIT_TRUE),
+            JsValue::Boolean(false) => Ok(JIT_FALSE),
+            JsValue::Undefined => Ok(JIT_UNDEFINED),
+            JsValue::Null => Ok(JIT_NULL),
+            JsValue::HeapNumber(f) => {
+                let f = *f;
+                if f.fract() == 0.0 && f >= i32::MIN as f64 && f <= i32::MAX as f64 {
+                    Ok(f as i64)
+                } else {
+                    Err(val.clone())
+                }
+            }
+            _ => Err(val.clone()),
         }
     }
 
@@ -1689,6 +1742,46 @@ mod jit_runtime {
 
     /// Inner implementation for [`jit_runtime_lda_keyed_property`].
     fn lda_keyed_property_inner(obj_i64: i64, key_i64: i64) -> Option<i64> {
+        // Fast path: Array[Smi] without cloning the input array.
+        if is_heap_handle(obj_i64) && !is_heap_handle(key_i64) {
+            if let Some(JsValue::Smi(smi_key)) = super::jit_to_jsvalue(key_i64) {
+                if smi_key >= 0 {
+                    let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+                    let fast = RT_HEAP.with(|heap| {
+                        let heap = heap.borrow();
+                        match heap.get(obj_idx)? {
+                            JsValue::Array(arr) => {
+                                let borrow = arr.borrow();
+                                match borrow.get(smi_key as usize) {
+                                    Some(v) if !matches!(v, JsValue::TheHole) => {
+                                        Some(encode_or_clone_ref(v))
+                                    }
+                                    _ => Some(Ok(JIT_UNDEFINED)),
+                                }
+                            }
+                            JsValue::PlainObject(map_rc) => {
+                                let key_str = smi_key.to_string();
+                                let val = map_rc
+                                    .borrow()
+                                    .get(&key_str)
+                                    .map(encode_or_clone_ref)
+                                    .unwrap_or(Ok(JIT_UNDEFINED));
+                                Some(val)
+                            }
+                            _ => None,
+                        }
+                    });
+                    if let Some(result) = fast {
+                        return Some(match result {
+                            Ok(val) => val,
+                            Err(obj_val) => alloc_heap_handle(obj_val),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Slow path: clone-based fallback.
         let obj = jit_i64_to_jsvalue(obj_i64);
         let key = jit_i64_to_jsvalue(key_i64);
 
@@ -1746,6 +1839,44 @@ mod jit_runtime {
 
     /// Inner implementation for [`jit_runtime_sta_keyed_property`].
     fn sta_keyed_property_inner(obj_i64: i64, key_i64: i64, value_i64: i64) -> Option<i64> {
+        // Fast path: Array[Smi] = primitive, without cloning the array.
+        // The value must NOT be a heap handle (would conflict with the
+        // immutable RT_HEAP borrow used to resolve the receiver).
+        if is_heap_handle(obj_i64) && !is_heap_handle(key_i64) && !is_heap_handle(value_i64) {
+            if let (Some(JsValue::Smi(smi_key)), Some(value)) = (
+                super::jit_to_jsvalue(key_i64),
+                super::jit_to_jsvalue(value_i64),
+            ) {
+                if smi_key >= 0 {
+                    let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+                    let fast = RT_HEAP.with(|heap| {
+                        let heap = heap.borrow();
+                        match heap.get(obj_idx)? {
+                            JsValue::Array(arr) => {
+                                let i = smi_key as usize;
+                                let mut v = arr.borrow_mut();
+                                if i >= v.len() {
+                                    v.resize(i + 1, JsValue::TheHole);
+                                }
+                                v[i] = value;
+                                Some(())
+                            }
+                            JsValue::PlainObject(map_rc) => {
+                                let key_str = smi_key.to_string();
+                                map_rc.borrow_mut().insert(key_str, value);
+                                Some(())
+                            }
+                            _ => None,
+                        }
+                    });
+                    if fast.is_some() {
+                        return Some(value_i64);
+                    }
+                }
+            }
+        }
+
+        // Slow path: clone-based fallback.
         let obj = jit_i64_to_jsvalue(obj_i64);
         let key = jit_i64_to_jsvalue(key_i64);
         let value = jit_i64_to_jsvalue(value_i64);
