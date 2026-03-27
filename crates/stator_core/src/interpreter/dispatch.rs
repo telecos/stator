@@ -18,9 +18,9 @@ use crate::objects::map::PropertyAttributes;
 use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 
 use super::{
-    ACTIVE_DEBUGGER, CallArgs, GlobalEnv, Interpreter, InterpreterFrame, MAGLEV_OSR_LOOP_THRESHOLD,
-    MegamorphicIcEntry, OSR_LOOP_THRESHOLD, ProtoLoadIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq,
-    bigint_pow, collect_args, concat_rc_strs, constant_pool_jump_delta, constant_to_value,
+    ACTIVE_DEBUGGER, CallArgs, GlobalEnv, Interpreter, InterpreterFrame, MegamorphicIcEntry,
+    OSR_LOOP_THRESHOLD, ProtoLoadIc, TURBOFAN_OSR_LOOP_THRESHOLD, abstract_eq, bigint_pow,
+    collect_args, concat_rc_strs, constant_pool_jump_delta, constant_to_value,
     construct_builtin_result, decode_string_constant, dispatch_call_property, dispatch_call_value,
     dispatch_call_with_this, dispatch_getter, dispatch_setter, err_bad_operand,
     error_message_from_value, extract_context, find_handler, fn_props_get, fn_props_set,
@@ -1609,9 +1609,9 @@ fn handle_jump_loop(
         {
             maybe_compile_baseline(&ctx.frame.bytecode_array);
         }
-        if ctx.frame.osr_loop_count >= MAGLEV_OSR_LOOP_THRESHOLD {
-            maybe_compile_maglev(&ctx.frame.bytecode_array);
-        }
+        // Kick off Maglev at the same threshold so the background
+        // thread compiles while baseline JIT runs.
+        maybe_compile_maglev(&ctx.frame.bytecode_array);
         if ctx.frame.osr_loop_count >= TURBOFAN_OSR_LOOP_THRESHOLD {
             maybe_compile_turbofan(&ctx.frame.bytecode_array);
         }

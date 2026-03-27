@@ -705,15 +705,6 @@ pub(crate) fn set_function_name_if_missing(value: &JsValue, name: &str) {
 /// executes via native code.
 pub(super) const OSR_LOOP_THRESHOLD: u32 = 5;
 
-/// Number of loop back-edges taken before a Maglev background compilation is
-/// triggered via OSR.
-///
-/// When a loop has already caused baseline JIT compilation and the back-edge
-/// count exceeds this threshold (50 back-edges), a Maglev compilation is
-/// scheduled in a background thread so the next *call* can use the optimised
-/// tier.
-pub(super) const MAGLEV_OSR_LOOP_THRESHOLD: u32 = 50;
-
 /// Number of loop back-edges taken before a Turbofan background compilation is
 /// triggered via OSR.
 ///
@@ -3385,15 +3376,17 @@ impl Interpreter {
                                     {
                                         maybe_compile_baseline(&frame.bytecode_array);
                                     }
+                                    // Kick off Maglev compilation early so
+                                    // the background thread finishes before
+                                    // baseline JIT returns — the next call
+                                    // picks up optimised Maglev code.
+                                    maybe_compile_maglev(&frame.bytecode_array);
                                     if let Some(jit_result) = try_execute_best_jit(
                                         &frame.bytecode_array,
                                         &frame.call_args,
                                     ) {
                                         return jit_result;
                                     }
-                                }
-                                if frame.osr_loop_count == MAGLEV_OSR_LOOP_THRESHOLD {
-                                    maybe_compile_maglev(&frame.bytecode_array);
                                 }
                                 if frame.osr_loop_count == TURBOFAN_OSR_LOOP_THRESHOLD {
                                     maybe_compile_turbofan(&frame.bytecode_array);
@@ -5043,15 +5036,16 @@ impl Interpreter {
                             {
                                 maybe_compile_baseline(&frame.bytecode_array);
                             }
+                            // Kick off Maglev compilation early so the
+                            // background thread finishes before the next
+                            // call to this function.
+                            maybe_compile_maglev(&frame.bytecode_array);
                             // OSR: switch to JIT if code is now available.
                             if let Some(jit_result) =
                                 try_execute_best_jit(&frame.bytecode_array, &frame.call_args)
                             {
                                 return jit_result;
                             }
-                        }
-                        if frame.osr_loop_count == MAGLEV_OSR_LOOP_THRESHOLD {
-                            maybe_compile_maglev(&frame.bytecode_array);
                         }
                         if frame.osr_loop_count == TURBOFAN_OSR_LOOP_THRESHOLD {
                             maybe_compile_turbofan(&frame.bytecode_array);
