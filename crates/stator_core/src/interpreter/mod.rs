@@ -2321,8 +2321,7 @@ impl InterpreterFrame {
                 }
             }
         }
-        self.global_ic[(name_idx & GLOBAL_IC_MASK) as usize] =
-            (name_idx, slot_idx, generation_val);
+        self.global_ic[(name_idx & GLOBAL_IC_MASK) as usize] = (name_idx, slot_idx, generation_val);
     }
 
     /// Reset the direct-mapped global IC (e.g. on tail-call reuse).
@@ -4716,9 +4715,7 @@ impl Interpreter {
                     Opcode::LdaGlobal => {
                         if let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] {
                             // IC fast path: known slot, generation matches.
-                            if let Some((slot_idx, cached_gen)) =
-                                frame.global_ic_get(name_idx)
-                            {
+                            if let Some((slot_idx, cached_gen)) = frame.global_ic_get(name_idx) {
                                 let env = frame.global_env.borrow();
                                 if env.generation() == cached_gen {
                                     let value = env.get_by_index(slot_idx).cheap_clone();

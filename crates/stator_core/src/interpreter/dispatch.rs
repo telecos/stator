@@ -2004,7 +2004,7 @@ fn handle_tail_call(
                 ctx.frame.mega_load_ic = None;
                 ctx.frame.proto_load_ic = None;
                 ctx.frame.mega_store_ic = None;
-                ctx.frame.global_ic = None;
+                ctx.frame.global_ic_reset();
                 ctx.frame.global_cache_invalidate();
                 return Ok(DispatchAction::TailCall);
             }
@@ -3266,16 +3266,11 @@ fn handle_lda_global(
         return Err(err_bad_operand("LdaGlobal", 0));
     };
 
-    // Fast path: global variable IC — O(1) Vec index.
-    let ic_hit = ctx
-        .frame
-        .global_ic
-        .as_ref()
-        .and_then(|ic| ic.get(&name_idx).copied());
-    if let Some((slot_idx, cached_gen)) = ic_hit {
+    // Fast path: direct-mapped global IC — O(1) array index.
+    if let Some((slot_idx, cached_gen)) = ctx.frame.global_ic_get(name_idx) {
         let env = ctx.frame.global_env.borrow();
         if env.generation() == cached_gen {
-            let value = env.get_by_index(slot_idx).clone();
+            let value = env.get_by_index(slot_idx).cheap_clone();
             drop(env);
             // TheHole means uninitialized `this` — fall through to slow path
             // which produces the proper ReferenceError.
@@ -3293,14 +3288,10 @@ fn handle_lda_global(
     // Populate IC on miss.
     {
         let env = ctx.frame.global_env.borrow();
-        let slot_gen = env
-            .slot_index_for(name.as_ref())
-            .map(|idx| (idx, env.generation()));
-        drop(env);
-        if let Some((slot_idx, cached_gen)) = slot_gen {
-            ctx.frame
-                .global_ic_mut()
-                .insert(name_idx, (slot_idx, cached_gen));
+        if let Some(slot_idx) = env.slot_index_for(name.as_ref()) {
+            let generation_val = env.generation();
+            drop(env);
+            ctx.frame.global_ic_put(name_idx, slot_idx, generation_val);
         }
     }
 
@@ -3321,16 +3312,11 @@ fn handle_lda_global_inside_typeof(
         return Err(err_bad_operand("LdaGlobalInsideTypeof", 0));
     };
 
-    // Fast path: global variable IC — O(1) Vec index.
-    let ic_hit = ctx
-        .frame
-        .global_ic
-        .as_ref()
-        .and_then(|ic| ic.get(&name_idx).copied());
-    if let Some((slot_idx, cached_gen)) = ic_hit {
+    // Fast path: direct-mapped global IC — O(1) array index.
+    if let Some((slot_idx, cached_gen)) = ctx.frame.global_ic_get(name_idx) {
         let env = ctx.frame.global_env.borrow();
         if env.generation() == cached_gen {
-            let value = env.get_by_index(slot_idx).clone();
+            let value = env.get_by_index(slot_idx).cheap_clone();
             drop(env);
             ctx.frame.accumulator = value;
             return Ok(DispatchAction::Continue);
@@ -3356,14 +3342,10 @@ fn handle_lda_global_inside_typeof(
     // Populate IC on miss.
     {
         let env = ctx.frame.global_env.borrow();
-        let slot_gen = env
-            .slot_index_for(name.as_ref())
-            .map(|idx| (idx, env.generation()));
-        drop(env);
-        if let Some((slot_idx, cached_gen)) = slot_gen {
-            ctx.frame
-                .global_ic_mut()
-                .insert(name_idx, (slot_idx, cached_gen));
+        if let Some(slot_idx) = env.slot_index_for(name.as_ref()) {
+            let generation_val = env.generation();
+            drop(env);
+            ctx.frame.global_ic_put(name_idx, slot_idx, generation_val);
         }
     }
 
