@@ -1251,11 +1251,22 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
 
         MAGLEV_EXECUTING.with(|f| f.set(false));
 
-        let ret = if result == JIT_DEOPT {
+        let deopt_offset = (result as u64).wrapping_sub(JIT_DEOPT as u64);
+        let ret = if deopt_offset <= 5 {
             MAGLEV_DIAG_DEOPTED.with(|c| c.set(c.get() + 1));
             let global_deopts = MAGLEV_DIAG_GLOBAL_DEOPT.with(|c| c.get());
+            let reason = match deopt_offset {
+                0 => "uncategorised",
+                1 => "smi_overflow",
+                2 => "stub_return",
+                3 => "global_load",
+                4 => "loop_counter",
+                5 => "div_by_zero",
+                _ => "unknown",
+            };
             eprintln!(
-                "MAGLEV_DEOPT: bc_len={} global_deopts={} result=0x{:x}",
+                "MAGLEV_DEOPT: reason={} bc_len={} global_deopts={} result=0x{:x}",
+                reason,
                 ba.bytecodes().len(),
                 global_deopts,
                 result as u64,

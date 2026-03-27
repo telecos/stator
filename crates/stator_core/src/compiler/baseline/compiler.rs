@@ -100,6 +100,16 @@ pub const JIT_NULL: i64 = 0x1_0000_0003_i64;
 /// Sentinel returned by the JIT function when it encounters an unsupported
 /// bytecode and must fall back to the interpreter.
 pub const JIT_DEOPT: i64 = i64::MIN;
+/// Deopt reason: CheckedSmi overflow (arithmetic result out of i32 range).
+pub const JIT_DEOPT_OVERFLOW: i64 = i64::MIN + 1;
+/// Deopt reason: a runtime stub returned JIT_DEOPT.
+pub const JIT_DEOPT_STUB: i64 = i64::MIN + 2;
+/// Deopt reason: promoted global load failed.
+pub const JIT_DEOPT_GLOBAL: i64 = i64::MIN + 3;
+/// Deopt reason: loop safety counter exhausted.
+pub const JIT_DEOPT_LOOP: i64 = i64::MIN + 4;
+/// Deopt reason: integer division by zero.
+pub const JIT_DEOPT_DIVZERO: i64 = i64::MIN + 5;
 
 /// Base tag for heap-object handles in the JIT `i64` register file.
 ///

@@ -429,8 +429,16 @@ struct MaglevCodegen<'a> {
     masm: MacroAssembler,
     /// One label per basic block, indexed by block index.
     block_labels: Vec<Label>,
-    /// Shared deopt epilogue label (forward reference during block emission).
+    /// Category-specific deopt labels (forward reference during block emission).
     deopt_label: Label,
+    /// Category-specific deopt labels for diagnostics.
+    deopt_overflow_label: Label,
+    deopt_stub_label: Label,
+    deopt_global_label: Label,
+    deopt_loop_label: Label,
+    deopt_divzero_label: Label,
+    /// Common deopt exit (pops + ret, does NOT overwrite RAX).
+    deopt_common_label: Label,
     safepoints: Vec<SafepointEntry>,
     deopt_entries: Vec<DeoptEntry>,
     source_positions: Vec<SourcePositionEntry>,
@@ -452,6 +460,12 @@ impl<'a> MaglevCodegen<'a> {
             masm: MacroAssembler::new(),
             block_labels: (0..num_blocks).map(|_| Label::new()).collect(),
             deopt_label: Label::new(),
+            deopt_overflow_label: Label::new(),
+            deopt_stub_label: Label::new(),
+            deopt_global_label: Label::new(),
+            deopt_loop_label: Label::new(),
+            deopt_divzero_label: Label::new(),
+            deopt_common_label: Label::new(),
             safepoints: Vec::new(),
             deopt_entries: Vec::new(),
             source_positions: Vec::new(),
@@ -573,20 +587,44 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.ret();
     }
 
-    /// Emit the shared deopt epilogue.
+    /// Emit the shared deopt epilogue with categorised deopt labels.
     ///
-    /// ```text
-    /// deopt_label:
-    ///   mov  rax, JIT_DEOPT
-    ///   pop  r13
-    ///   pop  r14
-    ///   pop  rbx
-    ///   pop  rbp
-    ///   ret
-    /// ```
+    /// Category labels set RAX to their specific constant and jump to
+    /// `deopt_common_label`.  The uncategorised `deopt_label` sets
+    /// `JIT_DEOPT` and falls through to common.
     fn emit_deopt_epilogue(&mut self) {
+        use crate::compiler::baseline::compiler::{
+            JIT_DEOPT_DIVZERO, JIT_DEOPT_GLOBAL, JIT_DEOPT_LOOP, JIT_DEOPT_OVERFLOW, JIT_DEOPT_STUB,
+        };
+
+        // Category-specific entry points.
+        self.masm.bind_label(&mut self.deopt_overflow_label);
+        self.masm.mov_ri(Reg64::Rax, JIT_DEOPT_OVERFLOW);
+        self.masm.jmp(&mut self.deopt_common_label);
+
+        self.masm.bind_label(&mut self.deopt_stub_label);
+        self.masm.mov_ri(Reg64::Rax, JIT_DEOPT_STUB);
+        self.masm.jmp(&mut self.deopt_common_label);
+
+        self.masm.bind_label(&mut self.deopt_global_label);
+        self.masm.mov_ri(Reg64::Rax, JIT_DEOPT_GLOBAL);
+        self.masm.jmp(&mut self.deopt_common_label);
+
+        self.masm.bind_label(&mut self.deopt_loop_label);
+        self.masm.mov_ri(Reg64::Rax, JIT_DEOPT_LOOP);
+        self.masm.jmp(&mut self.deopt_common_label);
+
+        self.masm.bind_label(&mut self.deopt_divzero_label);
+        self.masm.mov_ri(Reg64::Rax, JIT_DEOPT_DIVZERO);
+        self.masm.jmp(&mut self.deopt_common_label);
+
+        // Uncategorised fallback (existing deopt paths that still use
+        // deopt_label directly).
         self.masm.bind_label(&mut self.deopt_label);
         self.masm.mov_ri(Reg64::Rax, JIT_DEOPT);
+
+        // Common exit — RAX already set, just restore and return.
+        self.masm.bind_label(&mut self.deopt_common_label);
         self.masm.pop(Reg64::R13);
         self.masm.pop(Reg64::R14);
         self.masm.pop(Reg64::Rbx);
@@ -1737,7 +1775,9 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.mov_ri(Reg64::R11, addr);
                 self.masm.call_reg(Reg64::R11);
                 // If the stub returned JIT_DEOPT, bail out immediately.
-                self.emit_deopt_check_rax();
+                self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
+                self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+                self.masm.jcc(CondCode::Equal, &mut self.deopt_global_label);
                 // Store result in promoted slot: [R14 + off] = RAX
                 self.masm.mov_store_base_disp32(Reg64::R14, off, Reg64::Rax);
             }
@@ -1800,12 +1840,12 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.pop(Reg64::Rcx);
     }
 
-    /// Emit a deopt check: if RAX == JIT_DEOPT, jump to deopt epilogue.
+    /// Emit a deopt check: if RAX == JIT_DEOPT, jump to stub-deopt epilogue.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_deopt_check_rax(&mut self) {
         self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
         self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
-        self.masm.jcc(CondCode::Equal, &mut self.deopt_label);
+        self.masm.jcc(CondCode::Equal, &mut self.deopt_stub_label);
     }
 
     /// Call a 1-arg stub: `stub(node_arg)`.
@@ -1971,7 +2011,8 @@ impl<'a> MaglevCodegen<'a> {
             bytecode_offset,
             liveness_map,
         });
-        self.masm.jcc(CondCode::Equal, &mut self.deopt_label);
+        self.masm
+            .jcc(CondCode::Equal, &mut self.deopt_divzero_label);
     }
 
     /// Emit the core 64-bit signed-divide sequence.
@@ -2055,8 +2096,9 @@ impl<'a> MaglevCodegen<'a> {
             bytecode_offset,
             liveness_map,
         });
-        // JNE deopt_label — jump to deopt if R10 != 0 (overflow detected).
-        self.masm.jcc(CondCode::NotEqual, &mut self.deopt_label);
+        // JNE deopt_overflow_label — jump to overflow deopt if R10 != 0.
+        self.masm
+            .jcc(CondCode::NotEqual, &mut self.deopt_overflow_label);
     }
 
     /// Emit an unconditional deopt (record entry + jump to deopt epilogue).
@@ -2088,8 +2130,8 @@ impl<'a> MaglevCodegen<'a> {
             bytecode_offset: 0,
             liveness_map,
         });
-        // JE deopt_label — deopt if the counter reached zero.
-        self.masm.jcc(CondCode::Equal, &mut self.deopt_label);
+        // JE deopt_loop_label — deopt if the counter reached zero.
+        self.masm.jcc(CondCode::Equal, &mut self.deopt_loop_label);
     }
 
     /// Compute a conservative liveness bitmask covering all register-file
