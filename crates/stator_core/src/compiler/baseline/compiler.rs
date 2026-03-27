@@ -1191,7 +1191,7 @@ mod jit_runtime {
             } else {
                 // Mark as deopted so we don't re-attempt compilation on
                 // every call (each attempt costs ~20µs).
-                ba.set_jit_baseline_deopted(true);
+                ba.mark_jit_baseline_deopted();
             }
         }
 
