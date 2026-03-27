@@ -592,12 +592,12 @@ pub(crate) mod jit_runtime {
                 // bytecode register operand and is within bounds.
                 let obj_i64 = unsafe { *regs.add(obj_flat) };
                 let obj = jit_i64_to_jsvalue(obj_i64);
-                let prop_name = get_rt_string_constant(name_idx)?;
+                let prop_name = get_rt_string_constant_ref(name_idx)?;
 
                 let result = match &obj {
                     JsValue::PlainObject(map) => map
                         .borrow()
-                        .get(&prop_name)
+                        .get(prop_name)
                         .cloned()
                         .unwrap_or(JsValue::Undefined),
                     JsValue::Array(arr) => {
@@ -622,11 +622,11 @@ pub(crate) mod jit_runtime {
                 let obj_i64 = unsafe { *regs.add(obj_flat) };
                 let obj = jit_i64_to_jsvalue(obj_i64);
                 let value = jit_i64_to_jsvalue(acc);
-                let prop_name = get_rt_string_constant(name_idx)?;
+                let prop_name = get_rt_string_constant_ref(name_idx)?;
 
                 match &obj {
                     JsValue::PlainObject(map) => {
-                        map.borrow_mut().insert(prop_name, value);
+                        map.borrow_mut().insert(prop_name.to_string(), value);
                     }
                     _ => return None,
                 }
@@ -1394,9 +1394,9 @@ pub(crate) mod jit_runtime {
                 let map = map_rc.borrow();
                 let shape = map.shape_id();
 
-                let prop_name = get_rt_string_constant(name_idx)?;
+                let prop_name = get_rt_string_constant_ref(name_idx)?;
 
-                if let Some(offset) = map.offset_of(&prop_name) {
+                if let Some(offset) = map.offset_of(prop_name) {
                     if ptrs.is_cached() {
                         // SAFETY: cached pointer valid for thread lifetime.
                         unsafe { &*ptrs.prop_ic }.borrow_mut().lda[lda_slot] =
@@ -1434,7 +1434,7 @@ pub(crate) mod jit_runtime {
                 }
             }
             JsValue::Array(arr) => {
-                let prop_name = get_rt_string_constant(name_idx)?;
+                let prop_name = get_rt_string_constant_ref(name_idx)?;
                 if prop_name == "length" {
                     Some(arr.borrow().len() as i64)
                 } else {
@@ -2094,12 +2094,12 @@ pub(crate) mod jit_runtime {
         }
 
         // Slow path: HashMap lookup.
-        let name = get_rt_string_constant(name_idx)?;
-        let value = env.get(&name).unwrap_or(&JsValue::Undefined);
+        let name = get_rt_string_constant_ref(name_idx)?;
+        let value = env.get(name).unwrap_or(&JsValue::Undefined);
         let result = jsvalue_ref_to_jit_i64(value);
 
         // Populate IC — need mutable borrow; must use safe borrow here.
-        let slot_idx = env.slot_index_for(&name);
+        let slot_idx = env.slot_index_for(name);
         let cur_gen = env.generation();
         if let Some(idx) = slot_idx {
             g.borrow_mut().ic[(name_idx & 63) as usize] = (name_idx, idx, cur_gen);
@@ -2155,24 +2155,24 @@ pub(crate) mod jit_runtime {
         if entry.0 == name_idx {
             let (slot_idx, cached_gen) = (entry.1, entry.2);
             if env.generation() == cached_gen && slot_idx < env.slot_count() {
-                let name = get_rt_string_constant(name_idx)?;
-                env.store_by_index_fast(slot_idx, &name, value);
+                let name = get_rt_string_constant_ref(name_idx)?;
+                env.store_by_index_fast(slot_idx, name, value);
                 return Some(value_i64);
             }
         }
 
         // Slow path: insert via HashMap.
-        let name = get_rt_string_constant(name_idx)?;
-        let slot_idx = env.slot_index_for(&name);
+        let name = get_rt_string_constant_ref(name_idx)?;
+        let slot_idx = env.slot_index_for(name);
         if let Some(idx) = slot_idx {
-            env.store_by_index_fast(idx, &name, value);
+            env.store_by_index_fast(idx, name, value);
         } else {
-            env.insert(name.clone(), value);
+            env.insert(name.to_string(), value);
         }
 
         // Populate / update IC.
         let cur_gen = env.generation();
-        let new_slot_idx = env.slot_index_for(&name);
+        let new_slot_idx = env.slot_index_for(name);
         // SAFETY: single-threaded JIT; update IC via raw pointer.
         if let Some(idx) = new_slot_idx {
             unsafe { (*g.as_ptr()).ic[(name_idx & 63) as usize] = (name_idx, idx, cur_gen) };
@@ -2455,7 +2455,7 @@ pub(crate) mod jit_runtime {
 
         match &obj {
             JsValue::PlainObject(map_rc) => {
-                let prop_name = get_rt_string_constant(name_idx)?;
+                let prop_name = get_rt_string_constant_ref(name_idx)?;
                 map_rc.borrow_mut().insert(prop_name.to_string(), value);
                 Some(value_i64)
             }
