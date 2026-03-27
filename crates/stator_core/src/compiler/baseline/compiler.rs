@@ -439,19 +439,23 @@ pub(crate) mod jit_runtime {
     /// Read a string from the constant pool of the currently-executing
     /// JIT function.
     fn get_rt_string_constant(idx: u32) -> Option<String> {
-        RT_BYTECODE.with(|ba_ptr| {
-            let ptr = ba_ptr.get();
-            if ptr.is_null() {
-                return None;
-            }
-            // SAFETY: The pointer is valid for the duration of JIT execution
-            // (set by jit_runtime_setup, cleared by jit_runtime_teardown).
-            let ba = unsafe { &*ptr };
-            match ba.get_constant(idx) {
-                Some(ConstantPoolEntry::String(s)) => Some(s.clone()),
-                _ => None,
-            }
-        })
+        let ptrs = RT_PTRS.with(|p| p.get());
+        let ptr = if ptrs.is_cached() {
+            // SAFETY: cached pointer valid for thread lifetime.
+            unsafe { &*ptrs.bytecode }.get()
+        } else {
+            RT_BYTECODE.with(|ba_ptr| ba_ptr.get())
+        };
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: The pointer is valid for the duration of JIT execution
+        // (set by jit_runtime_setup, cleared by jit_runtime_teardown).
+        let ba = unsafe { &*ptr };
+        match ba.get_constant(idx) {
+            Some(ConstantPoolEntry::String(s)) => Some(s.clone()),
+            _ => None,
+        }
     }
 
     // ── Trampoline entry point ───────────────────────────────────────────
