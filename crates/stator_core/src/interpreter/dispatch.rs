@@ -3394,50 +3394,53 @@ fn handle_lda_named_property(
     } else {
         u32::MAX
     };
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
     // ── Megamorphic IC fast path (no string resolution needed) ──────────
-    // The (slot, receiver_layout) pair uniquely identifies the property at
-    // the cached offset, so we skip the string_cache lookup entirely.
-    if slot != u32::MAX
-        && let JsValue::PlainObject(ref map) = obj
-    {
-        let layout = map.borrow().layout_id();
-        if let Some(ic) = ctx
-            .frame
-            .mega_load_ic
-            .as_ref()
-            .and_then(|cache| cache.probe(slot, layout))
-        {
-            if !ic.is_proto {
-                // Own-property hit: O(1) offset access on receiver.
-                let pm = map.borrow();
-                if let Some(val) = pm.get_by_offset(ic.cached_offset as usize) {
-                    let v = val.cheap_clone();
-                    drop(pm);
-                    ctx.frame.accumulator = v;
-                    return Ok(DispatchAction::Continue);
-                }
-            } else {
-                // Proto-property hit: verify the immediate prototype's layout
-                // matches, then read by offset from the proto.
-                let proto_layout = ic.proto_layout;
-                let offset = ic.cached_offset;
-                let pm = map.borrow();
-                if let Some(JsValue::PlainObject(proto_map)) = pm.get(INTERNAL_PROTO_PROPERTY_KEY) {
-                    let proto_pm = proto_map.borrow();
-                    if proto_pm.layout_id() == proto_layout
-                        && let Some(val) = proto_pm.get_by_offset(offset as usize)
-                    {
+    // Try to resolve via IC *before* cloning the object value.
+    if slot != u32::MAX {
+        let obj_ref = ctx.frame.read_reg(obj_v)?;
+        if let JsValue::PlainObject(map) = obj_ref {
+            // Single borrow for both IC probe and value extraction.
+            let pm = map.borrow();
+            let layout = pm.layout_id();
+            if let Some(ic) = ctx
+                .frame
+                .mega_load_ic
+                .as_ref()
+                .and_then(|cache| cache.probe(slot, layout))
+            {
+                if !ic.is_proto {
+                    // Own-property hit: O(1) offset access on receiver.
+                    if let Some(val) = pm.get_by_offset(ic.cached_offset as usize) {
                         let v = val.cheap_clone();
-                        drop(proto_pm);
                         drop(pm);
                         ctx.frame.accumulator = v;
                         return Ok(DispatchAction::Continue);
+                    }
+                } else {
+                    // Proto-property hit: verify the immediate prototype's layout
+                    // matches, then read by offset from the proto.
+                    let proto_layout = ic.proto_layout;
+                    let offset = ic.cached_offset;
+                    if let Some(JsValue::PlainObject(proto_map)) =
+                        pm.get(INTERNAL_PROTO_PROPERTY_KEY)
+                    {
+                        let proto_pm = proto_map.borrow();
+                        if proto_pm.layout_id() == proto_layout
+                            && let Some(val) = proto_pm.get_by_offset(offset as usize)
+                        {
+                            let v = val.cheap_clone();
+                            drop(proto_pm);
+                            drop(pm);
+                            ctx.frame.accumulator = v;
+                            return Ok(DispatchAction::Continue);
+                        }
                     }
                 }
             }
         }
     }
+    // Slow path: clone the object for generic property lookup.
+    let obj = ctx.frame.read_reg(obj_v)?.clone();
     // Resolve property name (deferred past the megamorphic fast path).
     let prop_name = ctx.frame.get_string_constant(name_idx)?;
     if is_private_storage_key(&prop_name) {
