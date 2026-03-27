@@ -2072,9 +2072,10 @@ pub(crate) mod jit_runtime {
         value_i64: i64,
         value: JsValue,
     ) -> Option<i64> {
-        let state = g.borrow();
+        // SAFETY: JIT execution is single-threaded. No concurrent borrows.
+        let state = unsafe { &*g.as_ptr() };
         let env_rc = state.env.as_ref()?;
-        let mut env = env_rc.borrow_mut();
+        let env = unsafe { &mut *env_rc.as_ptr() };
 
         // Fast path: direct-mapped IC hit — store by index.
         let entry = &state.ic[(name_idx & 31) as usize];
@@ -2099,10 +2100,9 @@ pub(crate) mod jit_runtime {
         // Populate / update IC.
         let cur_gen = env.generation();
         let new_slot_idx = env.slot_index_for(&name);
-        drop(env);
-        drop(state);
+        // SAFETY: single-threaded JIT; update IC via raw pointer.
         if let Some(idx) = new_slot_idx {
-            g.borrow_mut().ic[(name_idx & 31) as usize] = (name_idx, idx, cur_gen);
+            unsafe { (*g.as_ptr()).ic[(name_idx & 31) as usize] = (name_idx, idx, cur_gen) };
         }
 
         Some(value_i64)
