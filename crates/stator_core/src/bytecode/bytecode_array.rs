@@ -229,7 +229,7 @@ impl JitExecutableCode {
     ///
     /// The stored code must still be valid x86-64 machine code that follows
     /// the JIT calling convention (`extern "C" fn(*mut i64) -> i64`).
-    pub unsafe fn execute(&self, args: &[i64]) -> i64 {
+    pub unsafe fn execute(&self, args: &[i64], ctx_ptr: i64) -> i64 {
         thread_local! {
             /// Pooled register file — reused across JIT calls to avoid
             /// per-call heap allocation.
@@ -246,8 +246,9 @@ impl JitExecutableCode {
                 regs[i] = v;
             }
             // SAFETY: `self.ptr` contains valid x86-64 JIT code.
-            let f: extern "C" fn(*mut i64) -> i64 = unsafe { std::mem::transmute(self.ptr) };
-            f(regs.as_mut_ptr())
+            // Second parameter (RSI) carries the raw context pointer.
+            let f: extern "C" fn(*mut i64, i64) -> i64 = unsafe { std::mem::transmute(self.ptr) };
+            f(regs.as_mut_ptr(), ctx_ptr)
         })
     }
 }

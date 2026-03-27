@@ -1367,16 +1367,22 @@ mod jit_runtime {
                 //
                 // We batch TLS accesses where possible to reduce overhead.
                 let saved_heap = RT_HEAP.with(|h| std::mem::take(&mut *h.borrow_mut()));
+                let callee_ctx = ba.closure_context().cloned();
+                let ctx_ptr = callee_ctx
+                    .as_ref()
+                    .map(|rc| Rc::as_ptr(rc) as i64)
+                    .unwrap_or(0);
                 let saved_ctx = RT_CONTEXT.with(|c| {
                     let prev = c.borrow().clone();
-                    *c.borrow_mut() = ba.closure_context().cloned();
+                    *c.borrow_mut() = callee_ctx;
                     prev
                 });
                 RT_BYTECODE.with(|b| b.set(&**ba as *const BytecodeArray));
 
                 // SAFETY: cached executable code was produced by the
                 // baseline compiler and contains valid x86-64 instructions.
-                let jit_result = unsafe { exec.execute(jit_args) };
+                // ctx_ptr (RSI) carries the raw closure context pointer.
+                let jit_result = unsafe { exec.execute(jit_args, ctx_ptr) };
 
                 // Convert the result while the inner RT_HEAP is still
                 // alive.
@@ -1913,6 +1919,67 @@ mod jit_runtime {
             })
             .unwrap_or(JIT_DEOPT)
     }
+
+    // ── Direct context-slot stubs (no TLS) ──────────────────────────────
+
+    /// Load a closure-context slot using a raw `RefCell<JsContext>` pointer
+    /// passed in `RDI` (RBX at the caller).  Eliminates the
+    /// `RT_CONTEXT` TLS lookup.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`ctx_raw`) – raw pointer to `RefCell<JsContext>`.
+    /// * `RSI` (`slot_idx`) – context slot index.
+    ///
+    /// Returns the slot value as `i64` in `RAX`, or [`JIT_DEOPT`].
+    ///
+    /// # Safety
+    ///
+    /// `ctx_raw` must point to a live `RefCell<JsContext>` for the
+    /// duration of this call.  The caller guarantees this because the
+    /// `Rc<RefCell<JsContext>>` is kept alive by `RT_CONTEXT`.
+    pub extern "C" fn jit_runtime_lda_context_slot_direct(ctx_raw: i64, slot_idx: i64) -> i64 {
+        if ctx_raw == 0 {
+            return JIT_DEOPT;
+        }
+        // SAFETY: ctx_raw points to a live RefCell<JsContext> kept alive
+        // by the Rc in RT_CONTEXT (set by call_js_function).
+        let ctx_ref = unsafe { &*(ctx_raw as *const RefCell<JsContext>) };
+        let ctx = ctx_ref.borrow();
+        ctx.slots
+            .get(slot_idx as usize)
+            .map(jsvalue_ref_to_jit_i64)
+            .unwrap_or(JIT_UNDEFINED)
+    }
+
+    /// Store a value into a closure-context slot using a raw pointer.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`ctx_raw`) – raw pointer to `RefCell<JsContext>`.
+    /// * `RSI` (`slot_idx`) – context slot index.
+    /// * `RDX` (`value_i64`) – JIT i64 encoding of the value.
+    ///
+    /// Returns `value_i64` in `RAX` on success, or [`JIT_DEOPT`].
+    pub extern "C" fn jit_runtime_sta_context_slot_direct(
+        ctx_raw: i64,
+        slot_idx: i64,
+        value_i64: i64,
+    ) -> i64 {
+        if ctx_raw == 0 {
+            return JIT_DEOPT;
+        }
+        let value = jit_i64_to_jsvalue(value_i64);
+        // SAFETY: see jit_runtime_lda_context_slot_direct.
+        let ctx_ref = unsafe { &*(ctx_raw as *const RefCell<JsContext>) };
+        let mut ctx = ctx_ref.borrow_mut();
+        let slot = slot_idx as usize;
+        if slot >= ctx.slots.len() {
+            ctx.slots.resize(slot + 1, JsValue::Undefined);
+        }
+        ctx.slots[slot] = value;
+        value_i64
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -2267,9 +2334,13 @@ impl<'a> BaselineCompiler<'a> {
     fn emit_prologue(&mut self) {
         self.masm.push(Reg64::Rbp);
         self.masm.mov_rr(Reg64::Rbp, Reg64::Rsp);
+        self.masm.push(Reg64::Rbx);
         self.masm.push(Reg64::R12);
         self.masm.push(Reg64::R14);
         self.masm.mov_rr(Reg64::R14, Reg64::Rdi);
+        // RSI carries the raw closure-context pointer (passed by execute).
+        // Store in RBX (callee-saved) for use by context-slot stubs.
+        self.masm.mov_rr(Reg64::Rbx, Reg64::Rsi);
         self.masm.xor_rr(Reg64::R12, Reg64::R12);
     }
 
@@ -2286,6 +2357,7 @@ impl<'a> BaselineCompiler<'a> {
         self.masm.mov_rr(Reg64::Rax, Reg64::R12);
         self.masm.pop(Reg64::R14);
         self.masm.pop(Reg64::R12);
+        self.masm.pop(Reg64::Rbx);
         self.masm.pop(Reg64::Rbp);
         self.masm.ret();
     }
@@ -2902,16 +2974,22 @@ impl<'a> BaselineCompiler<'a> {
         self.emit_deopt(bytecode_offset);
     }
 
-    /// Emit a specialized call to
-    /// [`jit_runtime::jit_runtime_lda_context_slot`] for
+    /// Emit a specialized call to the direct context-slot stub
+    /// [`jit_runtime::jit_runtime_lda_context_slot_direct`] for
     /// `LdaCurrentContextSlot` / `LdaImmutableCurrentContextSlot`.
+    ///
+    /// RBX carries the raw `RefCell<JsContext>` pointer (set in the
+    /// prologue from the RSI parameter passed by `execute`).
     #[allow(unused_variables)]
     fn emit_lda_context_slot_stub(&mut self, slot_idx: u32, bytecode_offset: u32) {
         #[cfg(all(target_arch = "x86_64", unix))]
         {
-            self.masm.mov_ri(Reg64::Rdi, i64::from(slot_idx));
+            // RDI = ctx_raw (from RBX), RSI = slot_idx.
+            self.masm.mov_rr(Reg64::Rdi, Reg64::Rbx);
+            self.masm.mov_ri(Reg64::Rsi, i64::from(slot_idx));
 
-            let addr = jit_runtime::jit_runtime_lda_context_slot as *const () as usize as i64;
+            let addr =
+                jit_runtime::jit_runtime_lda_context_slot_direct as *const () as usize as i64;
             self.masm.mov_ri(Reg64::R11, addr);
             self.masm.call_reg(Reg64::R11);
 
@@ -2936,17 +3014,22 @@ impl<'a> BaselineCompiler<'a> {
         self.emit_deopt(bytecode_offset);
     }
 
-    /// Emit a specialized call to
-    /// [`jit_runtime::jit_runtime_sta_context_slot`] for
+    /// Emit a specialized call to the direct context-slot stub
+    /// [`jit_runtime::jit_runtime_sta_context_slot_direct`] for
     /// `StaCurrentContextSlot`.
+    ///
+    /// RBX carries the raw `RefCell<JsContext>` pointer.
     #[allow(unused_variables)]
     fn emit_sta_context_slot_stub(&mut self, slot_idx: u32, bytecode_offset: u32) {
         #[cfg(all(target_arch = "x86_64", unix))]
         {
-            self.masm.mov_ri(Reg64::Rdi, i64::from(slot_idx));
-            self.masm.mov_rr(Reg64::Rsi, Reg64::R12);
+            // RDI = ctx_raw (from RBX), RSI = slot_idx, RDX = value (R12).
+            self.masm.mov_rr(Reg64::Rdi, Reg64::Rbx);
+            self.masm.mov_ri(Reg64::Rsi, i64::from(slot_idx));
+            self.masm.mov_rr(Reg64::Rdx, Reg64::R12);
 
-            let addr = jit_runtime::jit_runtime_sta_context_slot as *const () as usize as i64;
+            let addr =
+                jit_runtime::jit_runtime_sta_context_slot_direct as *const () as usize as i64;
             self.masm.mov_ri(Reg64::R11, addr);
             self.masm.call_reg(Reg64::R11);
 

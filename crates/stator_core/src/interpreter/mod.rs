@@ -1268,16 +1268,21 @@ fn try_execute_jit(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<
         jit_runtime_setup(ba);
 
         // Set closure context for context-slot stubs.
+        let ctx_ptr: i64;
         {
             use crate::compiler::baseline::compiler::jit_runtime_set_context;
             let ctx = ba.closure_context().cloned();
+            ctx_ptr = ctx
+                .as_ref()
+                .map(|rc| std::rc::Rc::as_ptr(rc) as i64)
+                .unwrap_or(0);
             jit_runtime_set_context(ctx);
         }
 
         // SAFETY: the cached executable code was produced by
         // `BaselineCompiler::compile` and contains valid x86-64 machine code
         // following the JIT calling convention.
-        let result = unsafe { exec.execute(&jit_args) };
+        let result = unsafe { exec.execute(&jit_args, ctx_ptr) };
 
         // Check for deopt sentinel.
         let ret = if result == JIT_DEOPT {
