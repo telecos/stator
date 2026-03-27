@@ -1335,19 +1335,25 @@ mod jit_runtime {
         jit_args: &[i64],
         saved_ba: *const BytecodeArray,
     ) -> Option<i64> {
-        // ── 1. Eagerly compile if no JIT code exists ────────────────
+        // ── Fast path: exec cache already populated ─────────────────
+        // On the second+ call, skip the compilation and init checks.
+        let exec_cache = ba.jit_executable_cache();
+        {
+            let cache_ref = exec_cache.borrow();
+            if let Some(exec) = cache_ref.as_ref() {
+                return exec_jit_callee(ba, exec, jit_args, saved_ba);
+            }
+        }
+
+        // ── Slow path: compile + init exec cache ────────────────────
         if ba.try_get_jit_code().is_none() && !ba.jit_baseline_has_deopted() {
             if let Ok(cc) = BaselineCompiler::compile(ba) {
                 ba.store_jit_code(cc.code, cc.register_file_slots);
             } else {
-                // Mark as deopted so we don't re-attempt compilation on
-                // every call (each attempt costs ~20µs).
                 ba.mark_jit_baseline_deopted();
             }
         }
 
-        // ── 2. Try JIT execution with the persistent exec cache ─────
-        let exec_cache = ba.jit_executable_cache();
         {
             let needs_init = exec_cache.borrow().is_none();
             if needs_init {
@@ -1362,50 +1368,54 @@ mod jit_runtime {
         {
             let cache_ref = exec_cache.borrow();
             if let Some(exec) = cache_ref.as_ref() {
-                // Save outer execution state so the inner JIT call gets a
-                // clean environment and the outer state is restored after.
-                //
-                // We batch TLS accesses where possible to reduce overhead.
-                let saved_heap = RT_HEAP.with(|h| std::mem::take(&mut *h.borrow_mut()));
-                let callee_ctx = ba.closure_context().cloned();
-                let ctx_ptr = callee_ctx
-                    .as_ref()
-                    .map(|rc| Rc::as_ptr(rc) as i64)
-                    .unwrap_or(0);
-                let saved_ctx = RT_CONTEXT.with(|c| {
-                    let prev = c.borrow().clone();
-                    *c.borrow_mut() = callee_ctx;
-                    prev
-                });
-                RT_BYTECODE.with(|b| b.set(&**ba as *const BytecodeArray));
-
-                // SAFETY: cached executable code was produced by the
-                // baseline compiler and contains valid x86-64 instructions.
-                // ctx_ptr (RSI) carries the raw closure context pointer.
-                let jit_result = unsafe { exec.execute(jit_args, ctx_ptr) };
-
-                // Convert the result while the inner RT_HEAP is still
-                // alive.
-                let result_val = if jit_result == JIT_DEOPT {
-                    None
-                } else {
-                    jit_to_jsvalue_ext(jit_result)
-                };
-
-                // Restore outer execution state.
-                RT_BYTECODE.with(|b| b.set(saved_ba));
-                RT_HEAP.with(|h| *h.borrow_mut() = saved_heap);
-                RT_CONTEXT.with(|c| *c.borrow_mut() = saved_ctx);
-
-                if let Some(val) = result_val {
-                    return Some(jsvalue_to_jit_i64(val));
-                }
-                // JIT deopted — fall through to interpreter.
+                return exec_jit_callee(ba, exec, jit_args, saved_ba);
             }
         }
 
-        // ── 3. Interpreter fallback ─────────────────────────────────
+        // ── Interpreter fallback ────────────────────────────────────
         interpreter_call_fallback(ba, args, saved_ba)
+    }
+
+    /// Execute a JIT-compiled callee with state save/restore.
+    fn exec_jit_callee(
+        ba: &Rc<BytecodeArray>,
+        exec: &JitExecutableCode,
+        jit_args: &[i64],
+        saved_ba: *const BytecodeArray,
+    ) -> Option<i64> {
+        let saved_heap = RT_HEAP.with(|h| std::mem::take(&mut *h.borrow_mut()));
+        let callee_ctx = ba.closure_context().cloned();
+        let ctx_ptr = callee_ctx
+            .as_ref()
+            .map(|rc| Rc::as_ptr(rc) as i64)
+            .unwrap_or(0);
+        let saved_ctx = RT_CONTEXT.with(|c| {
+            let prev = c.borrow().clone();
+            *c.borrow_mut() = callee_ctx;
+            prev
+        });
+        RT_BYTECODE.with(|b| b.set(&**ba as *const BytecodeArray));
+
+        // SAFETY: cached executable code was produced by the
+        // baseline compiler and contains valid x86-64 instructions.
+        let jit_result = unsafe { exec.execute(jit_args, ctx_ptr) };
+
+        // Convert the result while the inner RT_HEAP is still alive.
+        let result_val = if jit_result == JIT_DEOPT {
+            None
+        } else {
+            jit_to_jsvalue_ext(jit_result)
+        };
+
+        // Restore outer execution state.
+        RT_BYTECODE.with(|b| b.set(saved_ba));
+        RT_HEAP.with(|h| *h.borrow_mut() = saved_heap);
+        RT_CONTEXT.with(|c| *c.borrow_mut() = saved_ctx);
+
+        if let Some(val) = result_val {
+            return Some(jsvalue_to_jit_i64(val));
+        }
+        None
     }
 
     /// Execute a JS function via the interpreter.
