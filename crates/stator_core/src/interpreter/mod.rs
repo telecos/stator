@@ -893,18 +893,35 @@ pub fn turbofan_stats() -> (u32, usize) {
 
 /// Convert a [`JsValue`] to its JIT `i64` representation.
 ///
-/// Returns `None` for values that the current baseline tier cannot represent
-/// (strings, objects, arrays, etc.).  These cause a graceful fall-back to the
-/// interpreter.
+/// Primitive types (Smi, Boolean, Undefined, Null) use inline sentinels.
+/// All other types (objects, arrays, functions, strings, etc.) are stored
+/// in the thread-local heap side-table via [`alloc_jit_heap_handle`] and
+/// referenced by handle.  This makes JIT entry infallible for all types.
 #[cfg(all(target_arch = "x86_64", unix))]
-fn jsvalue_to_jit(v: &JsValue) -> Option<i64> {
-    use crate::compiler::baseline::compiler::{JIT_FALSE, JIT_NULL, JIT_TRUE, JIT_UNDEFINED};
+fn jsvalue_to_jit(v: &JsValue) -> i64 {
+    use crate::compiler::baseline::compiler::{
+        JIT_FALSE, JIT_NULL, JIT_TRUE, JIT_UNDEFINED, alloc_jit_heap_handle,
+    };
     match v {
-        JsValue::Smi(n) => Some(*n as i64),
-        JsValue::Boolean(b) => Some(if *b { JIT_TRUE } else { JIT_FALSE }),
-        JsValue::Undefined => Some(JIT_UNDEFINED),
-        JsValue::Null => Some(JIT_NULL),
-        _ => None,
+        JsValue::Smi(n) => *n as i64,
+        JsValue::Boolean(b) => {
+            if *b {
+                JIT_TRUE
+            } else {
+                JIT_FALSE
+            }
+        }
+        JsValue::Undefined => JIT_UNDEFINED,
+        JsValue::Null => JIT_NULL,
+        JsValue::HeapNumber(f) => {
+            let f = *f;
+            if f.fract() == 0.0 && f >= i32::MIN as f64 && f <= i32::MAX as f64 {
+                f as i64
+            } else {
+                alloc_jit_heap_handle(v.clone())
+            }
+        }
+        _ => alloc_jit_heap_handle(v.clone()),
     }
 }
 
@@ -1064,8 +1081,7 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
 ///
 /// Returns `Some(result)` when execution succeeds or returns an error;
 /// returns `None` when:
-/// - Maglev compilation has not finished yet,
-/// - one or more arguments cannot be represented in the JIT tier, or
+/// - Maglev compilation has not finished yet, or
 /// - the JIT returns [`JIT_DEOPT`][crate::compiler::baseline::compiler::JIT_DEOPT]
 ///   (fall-back to the next tier).
 ///
@@ -1073,7 +1089,10 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
 fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
-        use crate::compiler::baseline::compiler::{JIT_DEOPT, jit_to_jsvalue};
+        use crate::compiler::baseline::compiler::{
+            JIT_DEOPT, jit_runtime_set_context, jit_runtime_setup, jit_runtime_teardown,
+            jit_to_jsvalue_ext,
+        };
         use crate::compiler::maglev::codegen::CachedMaglevCode;
 
         let cache = ba.maglev_executable_cache();
@@ -1093,16 +1112,30 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
         let guard = cache.borrow();
         let cached = guard.as_ref()?;
 
-        let jit_args: Option<Vec<i64>> = args.iter().map(jsvalue_to_jit).collect();
-        let jit_args = jit_args?;
+        // Set up thread-local state so runtime stubs can access the
+        // constant pool, heap-object table, and property IC.
+        jit_runtime_setup(ba);
+
+        // Convert args — may allocate heap handles in RT_HEAP.
+        let jit_args: Vec<i64> = args.iter().map(|v| jsvalue_to_jit(v)).collect();
+
+        // Set closure context for context-slot stubs.
+        {
+            let ctx = ba.closure_context().cloned();
+            jit_runtime_set_context(ctx);
+        }
 
         // SAFETY: The cached code was produced by `maglev_codegen::compile`.
         let result = unsafe { cached.execute(&jit_args) };
 
-        if result == JIT_DEOPT {
-            return None;
-        }
-        return jit_to_jsvalue(result).map(Ok);
+        let ret = if result == JIT_DEOPT {
+            None
+        } else {
+            jit_to_jsvalue_ext(result).map(Ok)
+        };
+
+        jit_runtime_teardown();
+        return ret;
     }
     #[allow(unreachable_code)]
     let _ = (ba, args);
@@ -1199,22 +1232,39 @@ pub(super) fn maybe_compile_turbofan(ba: &BytecodeArray) {
 fn try_execute_turbofan(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
-        use crate::compiler::baseline::compiler::jit_to_jsvalue;
+        use crate::compiler::baseline::compiler::{
+            jit_runtime_set_context, jit_runtime_setup, jit_runtime_teardown, jit_to_jsvalue_ext,
+        };
 
         // Lock the Turbofan cache and execute if compiled code is available.
         let cache = ba.turbofan_jit_cache_arc();
         let guard = cache.lock().ok()?;
         let tc = guard.as_ref()?;
-        let jit_args: Option<Vec<i64>> = args.iter().map(jsvalue_to_jit).collect();
-        let jit_args = jit_args?;
+
+        // Set up thread-local state so runtime stubs can access the
+        // constant pool, heap-object table, and property IC.
+        jit_runtime_setup(ba);
+
+        // Convert args — may allocate heap handles in RT_HEAP.
+        let jit_args: Vec<i64> = args.iter().map(|v| jsvalue_to_jit(v)).collect();
+
+        // Set closure context for context-slot stubs.
+        {
+            let ctx = ba.closure_context().cloned();
+            jit_runtime_set_context(ctx);
+        }
+
         // SAFETY: `tc` was produced by `turbofan::compile_with_feedback` from
         // a well-formed Maglev graph.  We hold the mutex lock for the duration
         // of the call, ensuring exclusive access.
-        return match unsafe { tc.execute(&jit_args) } {
-            Ok(v) => jit_to_jsvalue(v).map(Ok),
+        let result = match unsafe { tc.execute(&jit_args) } {
+            Ok(v) => jit_to_jsvalue_ext(v).map(Ok),
             // JIT_DEOPT or unrecognised sentinel → fall back to lower tier.
             Err(_) => None,
         };
+
+        jit_runtime_teardown();
+        return result;
     }
     #[allow(unreachable_code)]
     let _ = (ba, args);
@@ -1243,9 +1293,6 @@ fn try_execute_jit(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<
             JIT_DEOPT, jit_runtime_setup, jit_runtime_teardown, jit_to_jsvalue_ext,
         };
 
-        let jit_args: Option<Vec<i64>> = args.iter().map(jsvalue_to_jit).collect();
-        let jit_args = jit_args?;
-
         let exec_cache = ba.jit_executable_cache();
 
         // Lazily populate the executable cache on first use.
@@ -1263,9 +1310,12 @@ fn try_execute_jit(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<
         let cache_ref = exec_cache.borrow();
         let exec = cache_ref.as_ref()?;
 
-        // Set up thread-local state so runtime call stubs can access the
-        // constant pool and heap-object table.
+        // Set up thread-local state BEFORE arg conversion so heap handles
+        // allocated by jsvalue_to_jit land in a freshly-cleared RT_HEAP.
         jit_runtime_setup(ba);
+
+        // Convert args — may allocate heap handles in RT_HEAP.
+        let jit_args: Vec<i64> = args.iter().map(|v| jsvalue_to_jit(v)).collect();
 
         // Set closure context for context-slot stubs.
         let ctx_ptr: i64;

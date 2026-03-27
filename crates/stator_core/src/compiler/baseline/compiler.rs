@@ -358,6 +358,15 @@ pub(crate) mod jit_runtime {
         })
     }
 
+    /// Public entry point for allocating a JIT heap handle.
+    ///
+    /// Used by the interpreter's JIT entry path to convert non-primitive
+    /// [`JsValue`] types (objects, arrays, functions, strings) into `i64`
+    /// handles that JIT code and runtime stubs can work with.
+    pub fn alloc_jit_heap_handle(val: JsValue) -> i64 {
+        alloc_heap_handle(val)
+    }
+
     /// Retrieve the [`JsValue`] stored behind `handle`.
     fn get_heap_object(handle: i64) -> Option<JsValue> {
         if !is_heap_handle(handle) {
