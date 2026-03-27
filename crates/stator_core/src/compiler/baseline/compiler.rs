@@ -219,6 +219,54 @@ mod jit_runtime {
         /// closures.
         static RT_CONTEXT: RefCell<Option<Rc<RefCell<JsContext>>>> = const { RefCell::new(None) };
 
+        /// Cached raw pointers to the three most-accessed TLS variables.
+        /// Populated once by [`cache_rt_ptrs`] and reused by
+        /// [`exec_jit_callee`] to avoid repeated `.with()` lookups in
+        /// the nested-call hot path.
+        static RT_PTRS: Cell<RtPtrs> = const { Cell::new(RtPtrs::EMPTY) };
+    }
+
+    /// Cached raw pointers to frequently-accessed TLS variables.
+    ///
+    /// # Safety
+    ///
+    /// Thread-local storage in Rust has a stable address for the
+    /// thread's lifetime.  These pointers are set once during
+    /// [`cache_rt_ptrs`] and are only dereferenced from the same
+    /// thread.
+    #[derive(Clone, Copy)]
+    struct RtPtrs {
+        heap: *const RefCell<Vec<JsValue>>,
+        context: *const RefCell<Option<Rc<RefCell<JsContext>>>>,
+        bytecode: *const Cell<*const BytecodeArray>,
+    }
+
+    impl RtPtrs {
+        const EMPTY: Self = Self {
+            heap: std::ptr::null(),
+            context: std::ptr::null(),
+            bytecode: std::ptr::null(),
+        };
+
+        fn is_cached(&self) -> bool {
+            !self.heap.is_null()
+        }
+    }
+
+    /// Populate [`RT_PTRS`] so that [`exec_jit_callee`] can bypass
+    /// per-variable `.with()` calls.
+    fn cache_rt_ptrs() {
+        RT_PTRS.with(|p| {
+            if p.get().is_cached() {
+                return;
+            }
+            let ptrs = RtPtrs {
+                heap: RT_HEAP.with(|h| h as *const RefCell<Vec<JsValue>>),
+                context: RT_CONTEXT.with(|c| c as *const RefCell<Option<Rc<RefCell<JsContext>>>>),
+                bytecode: RT_BYTECODE.with(|b| b as *const Cell<*const BytecodeArray>),
+            };
+            p.set(ptrs);
+        });
     }
 
     // ── Setup / teardown ─────────────────────────────────────────────────
@@ -228,6 +276,7 @@ mod jit_runtime {
     /// Must be called before `CompiledCode::execute` so that runtime call
     /// stubs can access the constant pool.
     pub fn jit_runtime_setup(ba: &BytecodeArray) {
+        cache_rt_ptrs();
         RT_BYTECODE.with(|b| b.set(ba as *const BytecodeArray));
         RT_HEAP.with(|h| h.borrow_mut().clear());
         RT_PROP_IC.with(|ic| {
@@ -1201,10 +1250,11 @@ mod jit_runtime {
                         // Own-property IC
                         let entry = &cache.lda[lda_slot];
                         if entry.0 == name_idx && entry.1 == shape {
-                            return map
-                                .get_by_offset(entry.2)
-                                .map(encode_or_clone_ref)
-                                .unwrap_or(Some(Ok(JIT_UNDEFINED)));
+                            return Some(
+                                map.get_by_offset(entry.2)
+                                    .map(encode_or_clone_ref)
+                                    .unwrap_or(Ok(JIT_UNDEFINED)),
+                            );
                         }
 
                         // Prototype IC (value pre-encoded as i64)
@@ -1430,13 +1480,55 @@ mod jit_runtime {
     }
 
     /// Execute a JIT-compiled callee with state save/restore.
+    ///
+    /// Uses cached TLS pointers from [`RT_PTRS`] to bypass repeated
+    /// `.with()` lookups — one TLS access instead of six.
     fn exec_jit_callee(
         ba: &Rc<BytecodeArray>,
         exec: &JitExecutableCode,
         jit_args: &[i64],
         saved_ba: *const BytecodeArray,
     ) -> Option<i64> {
-        // Record heap base for truncation (avoids moving the entire Vec).
+        let ptrs = RT_PTRS.with(|p| p.get());
+
+        if ptrs.is_cached() {
+            // SAFETY: cached pointers point to thread-local storage that
+            // outlives this function call.  Single-threaded access is
+            // guaranteed because JIT stubs only run on the interpreter
+            // thread.
+            let heap_ref = unsafe { &*ptrs.heap };
+            let ctx_ref = unsafe { &*ptrs.context };
+            let bc_ref = unsafe { &*ptrs.bytecode };
+
+            let heap_base = heap_ref.borrow().len();
+
+            let callee_ctx = ba.closure_context().cloned();
+            let ctx_ptr = callee_ctx
+                .as_ref()
+                .map(|rc| Rc::as_ptr(rc) as i64)
+                .unwrap_or(0);
+
+            let saved_ctx = std::mem::replace(&mut *ctx_ref.borrow_mut(), callee_ctx);
+            bc_ref.set(&**ba as *const BytecodeArray);
+
+            // SAFETY: cached executable code was produced by the
+            // baseline compiler and contains valid x86-64 instructions.
+            let jit_result = unsafe { exec.execute(jit_args, ctx_ptr) };
+
+            let result_val = if jit_result == JIT_DEOPT {
+                None
+            } else {
+                jit_to_jsvalue_ext(jit_result)
+            };
+
+            bc_ref.set(saved_ba);
+            heap_ref.borrow_mut().truncate(heap_base);
+            *ctx_ref.borrow_mut() = saved_ctx;
+
+            return result_val.map(jsvalue_to_jit_i64);
+        }
+
+        // Fallback: pointers not cached yet — use .with() calls.
         let heap_base = RT_HEAP.with(|h| h.borrow().len());
 
         let callee_ctx = ba.closure_context().cloned();
@@ -1445,32 +1537,22 @@ mod jit_runtime {
             .map(|rc| Rc::as_ptr(rc) as i64)
             .unwrap_or(0);
 
-        // Swap context in one borrow_mut (avoids separate borrow + borrow_mut).
         let saved_ctx = RT_CONTEXT.with(|c| std::mem::replace(&mut *c.borrow_mut(), callee_ctx));
         RT_BYTECODE.with(|b| b.set(&**ba as *const BytecodeArray));
 
-        // SAFETY: cached executable code was produced by the
-        // baseline compiler and contains valid x86-64 instructions.
         let jit_result = unsafe { exec.execute(jit_args, ctx_ptr) };
 
-        // Convert the result while the inner RT_HEAP is still alive.
         let result_val = if jit_result == JIT_DEOPT {
             None
         } else {
             jit_to_jsvalue_ext(jit_result)
         };
 
-        // Restore outer execution state.
         RT_BYTECODE.with(|b| b.set(saved_ba));
-        // Truncate heap back to the base (drops callee's entries without
-        // moving the Vec itself — much cheaper than take + restore).
         RT_HEAP.with(|h| h.borrow_mut().truncate(heap_base));
         RT_CONTEXT.with(|c| *c.borrow_mut() = saved_ctx);
 
-        if let Some(val) = result_val {
-            return Some(jsvalue_to_jit_i64(val));
-        }
-        None
+        result_val.map(jsvalue_to_jit_i64)
     }
 
     /// Execute a JS function via the interpreter.
@@ -1497,7 +1579,13 @@ mod jit_runtime {
 
         // Restore RT_BYTECODE — the interpreter may have changed it
         // through its own JIT setup/teardown.
-        RT_BYTECODE.with(|b| b.set(saved_ba));
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if ptrs.is_cached() {
+            // SAFETY: pointer set by cache_rt_ptrs; valid for thread lifetime.
+            unsafe { &*ptrs.bytecode }.set(saved_ba);
+        } else {
+            RT_BYTECODE.with(|b| b.set(saved_ba));
+        }
 
         match result {
             Ok(val) => Some(jsvalue_to_jit_i64(val)),
@@ -1586,7 +1674,52 @@ mod jit_runtime {
     }
 
     /// Inner implementation for [`jit_runtime_call_undefined_receiver0`].
+    ///
+    /// Uses cached TLS pointers for the entire call path so only one
+    /// `.with()` lookup is needed per closure invocation.
     fn call_undefined_receiver0_inner(callee_i64: i64) -> Option<i64> {
+        let ptrs = RT_PTRS.with(|p| p.get());
+
+        if ptrs.is_cached() {
+            // SAFETY: pointers set by cache_rt_ptrs; valid for thread lifetime.
+            let bc_ref = unsafe { &*ptrs.bytecode };
+            let saved_ba = bc_ref.get();
+
+            // Decode the callee without an extra jit_i64_to_jsvalue TLS access.
+            if callee_i64 >= JIT_HEAP_TAG {
+                let idx = (callee_i64 - JIT_HEAP_TAG) as usize;
+                let heap_ref = unsafe { &*ptrs.heap };
+                let heap = heap_ref.borrow();
+                match heap.get(idx) {
+                    Some(JsValue::Function(ba)) => {
+                        let ba = Rc::clone(ba);
+                        drop(heap);
+                        return call_js_function(&ba, vec![], &[], saved_ba);
+                    }
+                    Some(JsValue::NativeFunction(f)) => {
+                        let f = Rc::clone(f);
+                        drop(heap);
+                        let result = f(vec![]);
+                        bc_ref.set(saved_ba);
+                        return match result {
+                            Ok(v) => Some(jsvalue_to_jit_i64(v)),
+                            Err(_) => None,
+                        };
+                    }
+                    _ => {
+                        drop(heap);
+                        bc_ref.set(saved_ba);
+                        return None;
+                    }
+                }
+            }
+
+            // Non-heap callee (e.g. Smi / bool) — cannot be called.
+            bc_ref.set(saved_ba);
+            return None;
+        }
+
+        // Slow path: pointers not cached.
         let callee = jit_i64_to_jsvalue(callee_i64);
         let saved_ba = RT_BYTECODE.with(|b| b.get());
 
