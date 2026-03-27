@@ -70,7 +70,7 @@
 //! ));
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
@@ -183,6 +183,13 @@ pub struct GraphBuilder<'a> {
     /// Map from *instruction index* to the block that starts at that index.
     /// Populated during the first (target-collection) pass.
     block_at: HashMap<usize, u32>,
+    /// Block IDs that are loop headers (targets of `JumpLoop` opcodes).
+    loop_headers: HashSet<u32>,
+    /// Saved environments for successor blocks: `block_id → [(pred_block, env)]`.
+    saved_envs: HashMap<u32, Vec<(u32, Environment)>>,
+    /// For each loop header: `(slot_index, phi_node_id)` pairs for back-edge
+    /// patching when `JumpLoop` is encountered.
+    loop_header_phis: HashMap<u32, Vec<(usize, NodeId)>>,
 }
 
 impl<'a> GraphBuilder<'a> {
@@ -205,6 +212,9 @@ impl<'a> GraphBuilder<'a> {
             env: Environment::new(parameter_count as usize, frame_size),
             current_block: 0,
             block_at: HashMap::new(),
+            loop_headers: HashSet::new(),
+            saved_envs: HashMap::new(),
+            loop_header_phis: HashMap::new(),
         };
 
         // Pass 1: collect all jump targets → assign block indices.
@@ -378,14 +388,14 @@ impl<'a> GraphBuilder<'a> {
             if let Some(&new_block) = self.block_at.get(&i) {
                 let cur = self.current_block;
                 if !self.block_is_complete(cur) {
+                    self.save_env_for_successor(new_block);
                     self.set_control(ControlNode::Jump { target: new_block });
+                    if let Some(block) = self.graph.block_mut(new_block) {
+                        block.add_predecessor(cur);
+                    }
                 }
                 self.current_block = new_block;
-                // Record predecessor.
-                self.graph
-                    .block_mut(new_block)
-                    .unwrap()
-                    .add_predecessor(cur);
+                self.enter_block(new_block);
             }
 
             self.translate_one(i, instr, instructions)?;
@@ -841,10 +851,15 @@ impl<'a> GraphBuilder<'a> {
                     .get(&(instr_idx + 1))
                     .copied()
                     .unwrap_or(self.current_block + 1);
+                let if_true = if is_true { target } else { fall };
+                let if_false = if is_true { fall } else { target };
+                self.save_env_for_successor(if_true);
+                self.save_env_for_successor(if_false);
+                self.add_branch_predecessors(if_true, if_false);
                 self.set_control(ControlNode::Branch {
                     condition,
-                    if_true: if is_true { target } else { fall },
-                    if_false: if is_true { fall } else { target },
+                    if_true,
+                    if_false,
                 });
             }
             Opcode::TestGreaterThan => {
@@ -1246,6 +1261,11 @@ impl<'a> GraphBuilder<'a> {
                 let target = self
                     .resolve_jump_target(instr_idx, all_instructions)
                     .unwrap_or(self.current_block + 1);
+                self.save_env_for_successor(target);
+                let cur = self.current_block;
+                if let Some(block) = self.graph.block_mut(target) {
+                    block.add_predecessor(cur);
+                }
                 self.set_control(ControlNode::Jump { target });
             }
 
@@ -1263,6 +1283,9 @@ impl<'a> GraphBuilder<'a> {
                     .get(&(instr_idx + 1))
                     .copied()
                     .unwrap_or(self.current_block + 1);
+                self.save_env_for_successor(target);
+                self.save_env_for_successor(fall);
+                self.add_branch_predecessors(target, fall);
                 self.set_control(ControlNode::Branch {
                     condition: cond,
                     if_true: target,
@@ -1282,6 +1305,9 @@ impl<'a> GraphBuilder<'a> {
                     .get(&(instr_idx + 1))
                     .copied()
                     .unwrap_or(self.current_block + 1);
+                self.save_env_for_successor(target);
+                self.save_env_for_successor(fall);
+                self.add_branch_predecessors(target, fall);
                 // Invert: jump-if-false means if_true = fall, if_false = target.
                 self.set_control(ControlNode::Branch {
                     condition: cond,
@@ -1325,6 +1351,9 @@ impl<'a> GraphBuilder<'a> {
                     | Opcode::JumpIfJSReceiverConstant => (target, fall),
                     _ => (fall, target),
                 };
+                self.save_env_for_successor(if_true);
+                self.save_env_for_successor(if_false);
+                self.add_branch_predecessors(if_true, if_false);
                 self.set_control(ControlNode::Branch {
                     condition: cond,
                     if_true,
@@ -1337,6 +1366,11 @@ impl<'a> GraphBuilder<'a> {
                 let target = self
                     .resolve_jump_target(instr_idx, all_instructions)
                     .unwrap_or(0);
+                self.patch_loop_header_phis(target);
+                let cur = self.current_block;
+                if let Some(block) = self.graph.block_mut(target) {
+                    block.add_predecessor(cur);
+                }
                 self.set_control(ControlNode::Jump { target });
             }
 
@@ -1686,6 +1720,135 @@ impl<'a> GraphBuilder<'a> {
         (start..start + count)
             .map(|r| self.env_get_register(r))
             .collect()
+    }
+
+    // ── Phi / environment helpers ─────────────────────────────────────────────
+
+    /// Snapshot the current environment for a successor block.
+    fn save_env_for_successor(&mut self, target: u32) {
+        let entry = (self.current_block, self.env.clone());
+        self.saved_envs.entry(target).or_default().push(entry);
+    }
+
+    /// Add `self.current_block` as a predecessor of both branch targets.
+    fn add_branch_predecessors(&mut self, if_true: u32, if_false: u32) {
+        let cur = self.current_block;
+        if let Some(block) = self.graph.block_mut(if_true) {
+            block.add_predecessor(cur);
+        }
+        if if_false != if_true
+            && let Some(block) = self.graph.block_mut(if_false)
+        {
+            block.add_predecessor(cur);
+        }
+    }
+
+    /// Set up the SSA environment when translation enters a new block.
+    ///
+    /// For loop headers a Phi node is created for every occupied register slot
+    /// (initially with the single forward-edge input).  For non-loop merge
+    /// points, Phi nodes are created where predecessor environments disagree.
+    fn enter_block(&mut self, block_id: u32) {
+        if self.loop_headers.contains(&block_id) {
+            self.enter_loop_header(block_id);
+        } else {
+            self.enter_merge_block(block_id);
+        }
+    }
+
+    /// Enter a loop header: create single-input Phi nodes that will be
+    /// completed when the back-edge (`JumpLoop`) is processed.
+    fn enter_loop_header(&mut self, block_id: u32) {
+        let entry_env = match self.saved_envs.get(&block_id) {
+            Some(envs) if !envs.is_empty() => envs[0].1.clone(),
+            _ => return,
+        };
+
+        let mut phis = Vec::new();
+        let slot_count = entry_env.slots.len();
+        for slot_idx in 0..slot_count {
+            if let Some(val) = entry_env.slots[slot_idx] {
+                if let Some(phi_id) = self
+                    .graph
+                    .add_value_node(block_id, ValueNode::Phi { inputs: vec![val] })
+                {
+                    phis.push((slot_idx, phi_id));
+                    self.env.slots[slot_idx] = Some(phi_id);
+                }
+            } else {
+                self.env.slots[slot_idx] = None;
+            }
+        }
+        self.loop_header_phis.insert(block_id, phis);
+    }
+
+    /// Enter a non-loop block: adopt the single predecessor's environment or
+    /// merge multiple predecessors with Phi nodes where they disagree.
+    fn enter_merge_block(&mut self, block_id: u32) {
+        let envs: Vec<(u32, Environment)> = match self.saved_envs.get(&block_id) {
+            Some(e) if e.len() >= 2 => e.clone(),
+            Some(e) if e.len() == 1 => {
+                self.env = e[0].1.clone();
+                return;
+            }
+            _ => return,
+        };
+
+        let slot_count = self.env.slots.len();
+        for slot_idx in 0..slot_count {
+            let values: Vec<Option<NodeId>> = envs
+                .iter()
+                .map(|(_, e)| e.slots.get(slot_idx).copied().flatten())
+                .collect();
+
+            let all_same = values.windows(2).all(|w| w[0] == w[1]);
+            if all_same {
+                self.env.slots[slot_idx] = values[0];
+            } else {
+                let inputs: Vec<NodeId> = values.into_iter().flatten().collect();
+                if inputs.len() >= 2 {
+                    if let Some(phi_id) = self
+                        .graph
+                        .add_value_node(block_id, ValueNode::Phi { inputs })
+                    {
+                        self.env.slots[slot_idx] = Some(phi_id);
+                    }
+                } else if inputs.len() == 1 {
+                    self.env.slots[slot_idx] = Some(inputs[0]);
+                } else {
+                    self.env.slots[slot_idx] = None;
+                }
+            }
+        }
+    }
+
+    /// Add back-edge inputs to the Phi nodes at a loop header when `JumpLoop`
+    /// is processed.
+    fn patch_loop_header_phis(&mut self, target: u32) {
+        let phis: Vec<(usize, NodeId)> = match self.loop_header_phis.get(&target) {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        // Collect back-edge values from the current environment.
+        let patches: Vec<(NodeId, NodeId)> = phis
+            .iter()
+            .filter_map(|(slot_idx, phi_id)| self.env.slots[*slot_idx].map(|val| (*phi_id, val)))
+            .collect();
+
+        // Mutate the Phi nodes in the target block.
+        if let Some(block) = self.graph.block_mut(target) {
+            for (phi_id, val) in patches {
+                for (nid, node) in &mut block.nodes {
+                    if *nid == phi_id {
+                        if let ValueNode::Phi { inputs } = node {
+                            inputs.push(val);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// Set the control node for the current block.
