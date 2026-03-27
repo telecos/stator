@@ -744,9 +744,10 @@ fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(&mut frame).unwrap());
         });
     });
-    let (tried, executed, deopted, not_ready, compilations, code_bytes) = maglev_diagnostics();
+    let (tried, executed, deopted, not_ready, compilations, code_bytes, started, failed, panicked) =
+        maglev_diagnostics();
     eprintln!(
-        "MAGLEV_DIAG[arithmetic_loop_10k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes}"
+        "MAGLEV_DIAG[arithmetic_loop_10k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes} started={started} failed={failed} panicked={panicked}"
     );
 }
 
@@ -794,9 +795,10 @@ fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
-    let (tried, executed, deopted, not_ready, compilations, code_bytes) = maglev_diagnostics();
+    let (tried, executed, deopted, not_ready, compilations, code_bytes, started, failed, panicked) =
+        maglev_diagnostics();
     eprintln!(
-        "MAGLEV_DIAG[fib_40_iterative]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes}"
+        "MAGLEV_DIAG[fib_40_iterative]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes} started={started} failed={failed} panicked={panicked}"
     );
 }
 
@@ -820,9 +822,10 @@ fn bench_property_access_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
-    let (tried, executed, deopted, not_ready, compilations, code_bytes) = maglev_diagnostics();
+    let (tried, executed, deopted, not_ready, compilations, code_bytes, started, failed, panicked) =
+        maglev_diagnostics();
     eprintln!(
-        "MAGLEV_DIAG[property_access_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes}"
+        "MAGLEV_DIAG[property_access_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes} started={started} failed={failed} panicked={panicked}"
     );
 }
 
@@ -845,9 +848,10 @@ fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
-    let (tried, executed, deopted, not_ready, compilations, code_bytes) = maglev_diagnostics();
+    let (tried, executed, deopted, not_ready, compilations, code_bytes, started, failed, panicked) =
+        maglev_diagnostics();
     eprintln!(
-        "MAGLEV_DIAG[object_creation_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes}"
+        "MAGLEV_DIAG[object_creation_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes} started={started} failed={failed} panicked={panicked}"
     );
 }
 
@@ -874,9 +878,10 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
-    let (tried, executed, deopted, not_ready, compilations, code_bytes) = maglev_diagnostics();
+    let (tried, executed, deopted, not_ready, compilations, code_bytes, started, failed, panicked) =
+        maglev_diagnostics();
     eprintln!(
-        "MAGLEV_DIAG[array_push_sum_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes}"
+        "MAGLEV_DIAG[array_push_sum_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes} started={started} failed={failed} panicked={panicked}"
     );
 }
 
@@ -904,9 +909,10 @@ fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
-    let (tried, executed, deopted, not_ready, compilations, code_bytes) = maglev_diagnostics();
+    let (tried, executed, deopted, not_ready, compilations, code_bytes, started, failed, panicked) =
+        maglev_diagnostics();
     eprintln!(
-        "MAGLEV_DIAG[closure_counter_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes}"
+        "MAGLEV_DIAG[closure_counter_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes} started={started} failed={failed} panicked={panicked}"
     );
 }
 
@@ -936,9 +942,10 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
-    let (tried, executed, deopted, not_ready, compilations, code_bytes) = maglev_diagnostics();
+    let (tried, executed, deopted, not_ready, compilations, code_bytes, started, failed, panicked) =
+        maglev_diagnostics();
     eprintln!(
-        "MAGLEV_DIAG[prototype_chain_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes}"
+        "MAGLEV_DIAG[prototype_chain_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes} started={started} failed={failed} panicked={panicked}"
     );
 }
 
@@ -973,9 +980,10 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
-    let (tried, executed, deopted, not_ready, compilations, code_bytes) = maglev_diagnostics();
+    let (tried, executed, deopted, not_ready, compilations, code_bytes, started, failed, panicked) =
+        maglev_diagnostics();
     eprintln!(
-        "MAGLEV_DIAG[sieve_primes_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes}"
+        "MAGLEV_DIAG[sieve_primes_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes} started={started} failed={failed} panicked={panicked}"
     );
 }
 
@@ -999,9 +1007,10 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
-    let (tried, executed, deopted, not_ready, compilations, code_bytes) = maglev_diagnostics();
+    let (tried, executed, deopted, not_ready, compilations, code_bytes, started, failed, panicked) =
+        maglev_diagnostics();
     eprintln!(
-        "MAGLEV_DIAG[deep_object_access_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes}"
+        "MAGLEV_DIAG[deep_object_access_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes} started={started} failed={failed} panicked={panicked}"
     );
 }
 

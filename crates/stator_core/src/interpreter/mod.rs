@@ -844,6 +844,21 @@ pub fn get_execution_deadline() -> Option<Instant> {
 static MAGLEV_COMPILATION_COUNT: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
+/// Process-wide count of Maglev compilation attempts (threads spawned).
+#[cfg(all(target_arch = "x86_64", unix))]
+static MAGLEV_COMPILATION_STARTED: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Process-wide count of Maglev compilation failures (graph build or codegen).
+#[cfg(all(target_arch = "x86_64", unix))]
+static MAGLEV_COMPILATION_FAILED: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Process-wide count of Maglev compilation panics.
+#[cfg(all(target_arch = "x86_64", unix))]
+static MAGLEV_COMPILATION_PANICKED: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
 /// Process-wide total machine-code bytes produced by Maglev compilations.
 ///
 /// Uses atomics so the background compilation thread can update the counter
@@ -917,7 +932,7 @@ pub fn turbofan_stats() -> (u32, usize) {
 /// * `code_bytes` – process-wide Maglev code bytes (from [`maglev_stats`]).
 ///
 /// On platforms without Maglev JIT support all values are zero.
-pub fn maglev_diagnostics() -> (u64, u64, u64, u64, u32, usize) {
+pub fn maglev_diagnostics() -> (u64, u64, u64, u64, u32, usize, u32, u32, u32) {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
         let tried = MAGLEV_DIAG_TRIED.with(|c| c.get());
@@ -925,6 +940,9 @@ pub fn maglev_diagnostics() -> (u64, u64, u64, u64, u32, usize) {
         let deopted = MAGLEV_DIAG_DEOPTED.with(|c| c.get());
         let not_ready = MAGLEV_DIAG_NOT_READY.with(|c| c.get());
         let (compilations, code_bytes) = maglev_stats();
+        let started = MAGLEV_COMPILATION_STARTED.load(std::sync::atomic::Ordering::Relaxed);
+        let failed = MAGLEV_COMPILATION_FAILED.load(std::sync::atomic::Ordering::Relaxed);
+        let panicked = MAGLEV_COMPILATION_PANICKED.load(std::sync::atomic::Ordering::Relaxed);
         return (
             tried,
             executed,
@@ -932,10 +950,13 @@ pub fn maglev_diagnostics() -> (u64, u64, u64, u64, u32, usize) {
             not_ready,
             compilations,
             code_bytes,
+            started,
+            failed,
+            panicked,
         );
     }
     #[allow(unreachable_code)]
-    (0, 0, 0, 0, 0, 0)
+    (0, 0, 0, 0, 0, 0, 0, 0, 0)
 }
 
 /// Convert a [`JsValue`] to its JIT `i64` representation.
@@ -1083,6 +1104,8 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
             return;
         }
 
+        MAGLEV_COMPILATION_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         let compile_ba = BytecodeArray::new(
             ba.bytecodes().to_vec(),
             pool_for_compile_thread(ba.constant_pool()),
@@ -1122,16 +1145,21 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
                                     .fetch_add(code_len, std::sync::atomic::Ordering::Relaxed);
                             }
                             Err(e) => {
+                                MAGLEV_COMPILATION_FAILED
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 eprintln!("MAGLEV_COMPILE: codegen failed: {e}");
                             }
                         }
                     }
                     Err(e) => {
+                        MAGLEV_COMPILATION_FAILED
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         eprintln!("MAGLEV_COMPILE: graph build failed: {e}");
                     }
                 }
             }));
             if let Err(panic) = result {
+                MAGLEV_COMPILATION_PANICKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let msg = panic
                     .downcast_ref::<String>()
                     .map(|s| s.as_str())
