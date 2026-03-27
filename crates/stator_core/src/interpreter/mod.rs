@@ -1105,17 +1105,28 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
             // !Send) as the captured variable.
             let feedback = FeedbackVector::new(input.ba.feedback_metadata());
             let param_count = input.ba.parameter_count();
-            if let Ok(mut graph) = GraphBuilder::build(&input.ba, &feedback) {
-                optimize(&mut graph);
-                if let Ok(cc) = maglev_codegen::compile(&graph, param_count) {
-                    let code_len = cc.code.len();
-                    if let Ok(mut guard) = input.result_cache.lock() {
-                        *guard = Some((cc.code, cc.register_file_slots));
-                        drop(guard);
+            match GraphBuilder::build(&input.ba, &feedback) {
+                Ok(mut graph) => {
+                    optimize(&mut graph);
+                    match maglev_codegen::compile(&graph, param_count) {
+                        Ok(cc) => {
+                            let code_len = cc.code.len();
+                            if let Ok(mut guard) = input.result_cache.lock() {
+                                *guard = Some((cc.code, cc.register_file_slots));
+                                drop(guard);
+                            }
+                            MAGLEV_COMPILATION_COUNT
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            MAGLEV_CODE_BYTES
+                                .fetch_add(code_len, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            eprintln!("MAGLEV_COMPILE: codegen failed: {e}");
+                        }
                     }
-                    // Record Maglev stats atomically (readable from any thread).
-                    MAGLEV_COMPILATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    MAGLEV_CODE_BYTES.fetch_add(code_len, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(e) => {
+                    eprintln!("MAGLEV_COMPILE: graph build failed: {e}");
                 }
             }
         });
