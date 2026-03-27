@@ -3394,52 +3394,55 @@ fn handle_lda_named_property(
     } else {
         u32::MAX
     };
-    let prop_name = ctx.frame.get_string_constant(name_idx)?;
     let obj = ctx.frame.read_reg(obj_v)?.clone();
-    if is_private_storage_key(&prop_name) {
-        ctx.frame.accumulator = load_private_named_property(&obj, &prop_name)?;
-        return Ok(DispatchAction::Continue);
-    }
-    // ── Megamorphic IC fast path ────────────────────────────────────────
+    // ── Megamorphic IC fast path (no string resolution needed) ──────────
+    // The (slot, receiver_layout) pair uniquely identifies the property at
+    // the cached offset, so we skip the string_cache lookup entirely.
     if slot != u32::MAX
         && let JsValue::PlainObject(ref map) = obj
-        && let Some(ic) = ctx
+    {
+        let layout = map.borrow().layout_id();
+        if let Some(ic) = ctx
             .frame
             .mega_load_ic
             .as_ref()
-            .and_then(|cache| cache.probe(slot, map.borrow().layout_id()))
-    {
-        if !ic.is_proto {
-            // Own-property hit: O(1) offset access on receiver.
-            let pm = map.borrow();
-            if pm.matches_key_at_offset(ic.cached_offset as usize, prop_name.as_ref())
-                && let Some(val) = pm.get_by_offset(ic.cached_offset as usize)
-            {
-                let v = val.clone();
-                drop(pm);
-                ctx.frame.accumulator = v;
-                return Ok(DispatchAction::Continue);
-            }
-        } else {
-            // Proto-property hit: verify the immediate prototype's layout
-            // matches, then read by offset from the proto.
-            let proto_layout = ic.proto_layout;
-            let offset = ic.cached_offset;
-            let pm = map.borrow();
-            if let Some(JsValue::PlainObject(proto_map)) = pm.get(INTERNAL_PROTO_PROPERTY_KEY) {
-                let proto_pm = proto_map.borrow();
-                if proto_pm.layout_id() == proto_layout
-                    && proto_pm.matches_key_at_offset(offset as usize, prop_name.as_ref())
-                    && let Some(val) = proto_pm.get_by_offset(offset as usize)
-                {
-                    let v = val.clone();
-                    drop(proto_pm);
+            .and_then(|cache| cache.probe(slot, layout))
+        {
+            if !ic.is_proto {
+                // Own-property hit: O(1) offset access on receiver.
+                let pm = map.borrow();
+                if let Some(val) = pm.get_by_offset(ic.cached_offset as usize) {
+                    let v = val.cheap_clone();
                     drop(pm);
                     ctx.frame.accumulator = v;
                     return Ok(DispatchAction::Continue);
                 }
+            } else {
+                // Proto-property hit: verify the immediate prototype's layout
+                // matches, then read by offset from the proto.
+                let proto_layout = ic.proto_layout;
+                let offset = ic.cached_offset;
+                let pm = map.borrow();
+                if let Some(JsValue::PlainObject(proto_map)) = pm.get(INTERNAL_PROTO_PROPERTY_KEY) {
+                    let proto_pm = proto_map.borrow();
+                    if proto_pm.layout_id() == proto_layout
+                        && let Some(val) = proto_pm.get_by_offset(offset as usize)
+                    {
+                        let v = val.cheap_clone();
+                        drop(proto_pm);
+                        drop(pm);
+                        ctx.frame.accumulator = v;
+                        return Ok(DispatchAction::Continue);
+                    }
+                }
             }
         }
+    }
+    // Resolve property name (deferred past the megamorphic fast path).
+    let prop_name = ctx.frame.get_string_constant(name_idx)?;
+    if is_private_storage_key(&prop_name) {
+        ctx.frame.accumulator = load_private_named_property(&obj, &prop_name)?;
+        return Ok(DispatchAction::Continue);
     }
     // ── Prototype-chain IC fast path ────────────────────────────────────
     // Complements the megamorphic IC for deeper prototype chains (2+ levels).
@@ -3458,7 +3461,7 @@ fn handle_lda_named_property(
             && ic.proto_generation == pm.proto_generation()
             && !plain_object_has_own_property(&pm, prop_name.as_ref())
         {
-            ctx.frame.accumulator = ic.value.clone();
+            ctx.frame.accumulator = ic.value.cheap_clone();
             return Ok(DispatchAction::Continue);
         }
     }
@@ -3478,7 +3481,7 @@ fn handle_lda_named_property(
         {
             for &(cached_ptr, ref cached_val) in entries {
                 if cached_ptr == ptr {
-                    ctx.frame.accumulator = cached_val.clone();
+                    ctx.frame.accumulator = cached_val.cheap_clone();
                     return Ok(DispatchAction::Continue);
                 }
             }
@@ -3646,9 +3649,52 @@ fn handle_sta_named_property(
     } else {
         u32::MAX
     };
-    let prop_name = ctx.frame.get_string_constant(name_idx)?;
-    let val = ctx.frame.accumulator.clone();
+    let val = ctx.frame.accumulator.cheap_clone();
     let obj = ctx.frame.read_reg(obj_v)?.clone();
+    // ── Megamorphic IC fast path for PlainObject store (no string needed) ──
+    // The (slot, receiver_layout) pair uniquely identifies the property at
+    // the cached offset, so we skip the string_cache lookup entirely.
+    if slot != u32::MAX
+        && let JsValue::PlainObject(ref map) = obj
+    {
+        let layout = map.borrow().layout_id();
+        if let Some(ic) = ctx
+            .frame
+            .mega_store_ic
+            .as_ref()
+            .and_then(|cache| cache.probe(slot, layout))
+        {
+            let offset = ic.cached_offset as usize;
+            let pm = map.borrow();
+            if pm.is_writable_by_offset(offset) {
+                drop(pm);
+                map.borrow_mut().set_by_offset(offset, val);
+                // Invalidate value-based caches for this object.
+                let map_ptr = Rc::as_ptr(map) as usize;
+                if let Some(cache) = &mut ctx.frame.mono_load_cache {
+                    cache.retain(|_, (ptr, _)| *ptr != map_ptr);
+                }
+                if let Some(cache) = &mut ctx.frame.poly_load_cache {
+                    cache.retain(|_, entries| {
+                        entries.retain(|(ptr, _)| *ptr != map_ptr);
+                        !entries.is_empty()
+                    });
+                }
+                return Ok(DispatchAction::Continue);
+            }
+            drop(pm);
+            // Non-writable on IC hit: resolve name only for error reporting.
+            if ctx.frame.bytecode_array.is_strict() {
+                let prop_name = ctx.frame.get_string_constant(name_idx)?;
+                return Err(StatorError::TypeError(format!(
+                    "Cannot assign to read only property '{prop_name}'"
+                )));
+            }
+            return Ok(DispatchAction::Continue);
+        }
+    }
+    // Resolve property name (deferred past the megamorphic fast path).
+    let prop_name = ctx.frame.get_string_constant(name_idx)?;
     if is_private_storage_key(&prop_name) {
         store_private_named_property(ctx, &obj, &prop_name, val)?;
         return Ok(DispatchAction::Continue);
@@ -3674,42 +3720,6 @@ fn handle_sta_named_property(
             }
         }
         JsValue::PlainObject(ref map) => {
-            // ── Megamorphic IC fast path for store: existing writable prop ──
-            if slot != u32::MAX
-                && let Some(ic) = ctx
-                    .frame
-                    .mega_store_ic
-                    .as_ref()
-                    .and_then(|cache| cache.probe(slot, map.borrow().layout_id()))
-            {
-                let offset = ic.cached_offset as usize;
-                let pm = map.borrow();
-                if pm.matches_key_at_offset(offset, prop_name.as_ref()) {
-                    if pm.is_writable_by_offset(offset) {
-                        drop(pm);
-                        map.borrow_mut().set_by_offset(offset, val);
-                        // Invalidate value-based caches for this object.
-                        let map_ptr = Rc::as_ptr(map) as usize;
-                        if let Some(cache) = &mut ctx.frame.mono_load_cache {
-                            cache.retain(|_, (ptr, _)| *ptr != map_ptr);
-                        }
-                        if let Some(cache) = &mut ctx.frame.poly_load_cache {
-                            cache.retain(|_, entries| {
-                                entries.retain(|(ptr, _)| *ptr != map_ptr);
-                                !entries.is_empty()
-                            });
-                        }
-                        return Ok(DispatchAction::Continue);
-                    }
-                    // Non-writable: TypeError in strict mode, silently ignore in sloppy.
-                    if ctx.frame.bytecode_array.is_strict() {
-                        return Err(StatorError::TypeError(format!(
-                            "Cannot assign to read only property '{prop_name}'"
-                        )));
-                    }
-                    return Ok(DispatchAction::Continue);
-                }
-            }
             // Check for setter accessor first (own object).
             if map.borrow().has_accessors {
                 let setter = map.borrow().get_setter_for(&prop_name).cloned();
