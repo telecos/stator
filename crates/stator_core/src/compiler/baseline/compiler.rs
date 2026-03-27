@@ -2292,72 +2292,70 @@ pub(crate) mod jit_runtime {
 
     /// Inner implementation for [`jit_runtime_lda_keyed_property`].
     fn lda_keyed_property_inner(obj_i64: i64, key_i64: i64) -> Option<i64> {
-        // Fast path: Array[Smi] without cloning the input array.
-        if is_heap_handle(obj_i64) && !is_heap_handle(key_i64) {
-            if let Some(JsValue::Smi(smi_key)) = super::jit_to_jsvalue(key_i64) {
-                if smi_key >= 0 {
-                    let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
-                    let ptrs = RT_PTRS.with(|p| p.get());
-                    let fast = if ptrs.is_cached() {
-                        // SAFETY: cached pointers set by cache_rt_ptrs;
-                        // valid for thread lifetime.
-                        let heap_ref = unsafe { &*ptrs.heap };
-                        // SAFETY: single-threaded JIT; no concurrent mutable
-                        // borrows during a load-keyed fast path.
-                        let heap = unsafe { &*heap_ref.as_ptr() };
-                        match heap.get(obj_idx)? {
-                            JsValue::Array(arr) => {
-                                let borrow = unsafe { &*arr.as_ptr() };
-                                match borrow.get(smi_key as usize) {
-                                    Some(v) if !matches!(v, JsValue::TheHole) => {
-                                        Some(encode_or_clone_ref(v))
-                                    }
-                                    _ => Some(Ok(JIT_UNDEFINED)),
-                                }
+        // Ultra-fast path: positive Smi index (0..=i32::MAX).
+        // Avoids jit_to_jsvalue conversion entirely — just use the i64 as usize.
+        if is_heap_handle(obj_i64) && key_i64 >= 0 && key_i64 <= i32::MAX as i64 {
+            let smi_key = key_i64 as usize;
+            let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+            let ptrs = RT_PTRS.with(|p| p.get());
+            let fast = if ptrs.is_cached() {
+                // SAFETY: cached pointers set by cache_rt_ptrs;
+                // valid for thread lifetime.
+                let heap_ref = unsafe { &*ptrs.heap };
+                // SAFETY: single-threaded JIT; no concurrent mutable
+                // borrows during a load-keyed fast path.
+                let heap = unsafe { &*heap_ref.as_ptr() };
+                match heap.get(obj_idx)? {
+                    JsValue::Array(arr) => {
+                        let borrow = unsafe { &*arr.as_ptr() };
+                        match borrow.get(smi_key) {
+                            Some(v) if !matches!(v, JsValue::TheHole) => {
+                                Some(encode_or_clone_ref(v))
                             }
-                            JsValue::PlainObject(map_rc) => {
-                                let key_str = smi_key.to_string();
-                                let val = unsafe { &*map_rc.as_ptr() }
-                                    .get(&key_str)
-                                    .map(encode_or_clone_ref)
-                                    .unwrap_or(Ok(JIT_UNDEFINED));
-                                Some(val)
-                            }
-                            _ => None,
+                            _ => Some(Ok(JIT_UNDEFINED)),
                         }
-                    } else {
-                        RT_HEAP.with(|heap| {
-                            let heap = heap.borrow();
-                            match heap.get(obj_idx)? {
-                                JsValue::Array(arr) => {
-                                    let borrow = arr.borrow();
-                                    match borrow.get(smi_key as usize) {
-                                        Some(v) if !matches!(v, JsValue::TheHole) => {
-                                            Some(encode_or_clone_ref(v))
-                                        }
-                                        _ => Some(Ok(JIT_UNDEFINED)),
-                                    }
-                                }
-                                JsValue::PlainObject(map_rc) => {
-                                    let key_str = smi_key.to_string();
-                                    let val = map_rc
-                                        .borrow()
-                                        .get(&key_str)
-                                        .map(encode_or_clone_ref)
-                                        .unwrap_or(Ok(JIT_UNDEFINED));
-                                    Some(val)
-                                }
-                                _ => None,
-                            }
-                        })
-                    };
-                    if let Some(result) = fast {
-                        return Some(match result {
-                            Ok(val) => val,
-                            Err(obj_val) => alloc_heap_handle(obj_val),
-                        });
                     }
+                    JsValue::PlainObject(map_rc) => {
+                        let key_str = smi_key.to_string();
+                        let val = unsafe { &*map_rc.as_ptr() }
+                            .get(&key_str)
+                            .map(encode_or_clone_ref)
+                            .unwrap_or(Ok(JIT_UNDEFINED));
+                        Some(val)
+                    }
+                    _ => None,
                 }
+            } else {
+                RT_HEAP.with(|heap| {
+                    let heap = heap.borrow();
+                    match heap.get(obj_idx)? {
+                        JsValue::Array(arr) => {
+                            let borrow = arr.borrow();
+                            match borrow.get(smi_key) {
+                                Some(v) if !matches!(v, JsValue::TheHole) => {
+                                    Some(encode_or_clone_ref(v))
+                                }
+                                _ => Some(Ok(JIT_UNDEFINED)),
+                            }
+                        }
+                        JsValue::PlainObject(map_rc) => {
+                            let key_str = smi_key.to_string();
+                            let val = map_rc
+                                .borrow()
+                                .get(&key_str)
+                                .map(encode_or_clone_ref)
+                                .unwrap_or(Ok(JIT_UNDEFINED));
+                            Some(val)
+                        }
+                        _ => None,
+                    }
+                })
+            };
+            if let Some(result) = fast {
+                return Some(match result {
+                    Ok(val) => val,
+                    Err(obj_val) => alloc_heap_handle(obj_val),
+                });
             }
         }
 
@@ -2419,35 +2417,56 @@ pub(crate) mod jit_runtime {
 
     /// Inner implementation for [`jit_runtime_sta_keyed_property`].
     fn sta_keyed_property_inner(obj_i64: i64, key_i64: i64, value_i64: i64) -> Option<i64> {
-        // Fast path: Array[Smi] = primitive, without cloning the array.
-        // The value must NOT be a heap handle (would conflict with the
-        // immutable RT_HEAP borrow used to resolve the receiver).
-        if is_heap_handle(obj_i64) && !is_heap_handle(key_i64) && !is_heap_handle(value_i64) {
-            if let (Some(JsValue::Smi(smi_key)), Some(value)) = (
-                super::jit_to_jsvalue(key_i64),
-                super::jit_to_jsvalue(value_i64),
-            ) {
-                if smi_key >= 0 {
-                    let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
-                    let ptrs = RT_PTRS.with(|p| p.get());
-                    let fast = if ptrs.is_cached() {
-                        // SAFETY: cached pointers set by cache_rt_ptrs;
-                        // valid for thread lifetime.
-                        let heap_ref = unsafe { &*ptrs.heap };
-                        // SAFETY: single-threaded JIT; no concurrent
-                        // mutable borrows of RT_HEAP during keyed store.
-                        let heap = unsafe { &*heap_ref.as_ptr() };
+        // Ultra-fast path: Array[positive Smi] = non-heap-value.
+        // Avoids jit_to_jsvalue for the key; converts only the value.
+        if is_heap_handle(obj_i64)
+            && key_i64 >= 0
+            && key_i64 <= i32::MAX as i64
+            && !is_heap_handle(value_i64)
+        {
+            if let Some(value) = super::jit_to_jsvalue(value_i64) {
+                let smi_key = key_i64 as usize;
+                let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+                let ptrs = RT_PTRS.with(|p| p.get());
+                let fast = if ptrs.is_cached() {
+                    // SAFETY: cached pointers set by cache_rt_ptrs;
+                    // valid for thread lifetime.
+                    let heap_ref = unsafe { &*ptrs.heap };
+                    // SAFETY: single-threaded JIT; no concurrent
+                    // mutable borrows of RT_HEAP during keyed store.
+                    let heap = unsafe { &*heap_ref.as_ptr() };
+                    match heap.get(obj_idx)? {
+                        JsValue::Array(arr) => {
+                            let mut v = arr.borrow_mut();
+                            if smi_key >= v.len() {
+                                let cur_len = v.len();
+                                let new_cap = (smi_key + 1).next_power_of_two();
+                                v.reserve(new_cap - cur_len);
+                                v.resize(smi_key + 1, JsValue::TheHole);
+                            }
+                            v[smi_key] = value;
+                            Some(())
+                        }
+                        JsValue::PlainObject(map_rc) => {
+                            let key_str = smi_key.to_string();
+                            map_rc.borrow_mut().insert(key_str, value);
+                            Some(())
+                        }
+                        _ => None,
+                    }
+                } else {
+                    RT_HEAP.with(|heap| {
+                        let heap = heap.borrow();
                         match heap.get(obj_idx)? {
                             JsValue::Array(arr) => {
-                                let i = smi_key as usize;
                                 let mut v = arr.borrow_mut();
-                                if i >= v.len() {
+                                if smi_key >= v.len() {
                                     let cur_len = v.len();
-                                    let new_cap = (i + 1).next_power_of_two();
+                                    let new_cap = (smi_key + 1).next_power_of_two();
                                     v.reserve(new_cap - cur_len);
-                                    v.resize(i + 1, JsValue::TheHole);
+                                    v.resize(smi_key + 1, JsValue::TheHole);
                                 }
-                                v[i] = value;
+                                v[smi_key] = value;
                                 Some(())
                             }
                             JsValue::PlainObject(map_rc) => {
@@ -2457,34 +2476,10 @@ pub(crate) mod jit_runtime {
                             }
                             _ => None,
                         }
-                    } else {
-                        RT_HEAP.with(|heap| {
-                            let heap = heap.borrow();
-                            match heap.get(obj_idx)? {
-                                JsValue::Array(arr) => {
-                                    let i = smi_key as usize;
-                                    let mut v = arr.borrow_mut();
-                                    if i >= v.len() {
-                                        let cur_len = v.len();
-                                        let new_cap = (i + 1).next_power_of_two();
-                                        v.reserve(new_cap - cur_len);
-                                        v.resize(i + 1, JsValue::TheHole);
-                                    }
-                                    v[i] = value;
-                                    Some(())
-                                }
-                                JsValue::PlainObject(map_rc) => {
-                                    let key_str = smi_key.to_string();
-                                    map_rc.borrow_mut().insert(key_str, value);
-                                    Some(())
-                                }
-                                _ => None,
-                            }
-                        })
-                    };
-                    if fast.is_some() {
-                        return Some(value_i64);
-                    }
+                    })
+                };
+                if fast.is_some() {
+                    return Some(value_i64);
                 }
             }
         }
