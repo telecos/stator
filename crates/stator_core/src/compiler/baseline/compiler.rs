@@ -173,7 +173,11 @@ mod jit_runtime {
         /// time of the last lookup and the slot offset within that shape.
         /// Cleared by [`jit_runtime_setup`] to prevent cross-function
         /// constant-pool index collisions.
-        static RT_LDA_IC: RefCell<Vec<(u32, u64, usize)>> = const { RefCell::new(Vec::new()) };
+        ///
+        /// Direct-mapped by `name_idx & 63`; each entry stores
+        /// `(name_idx, shape_id, offset)`.  A sentinel `name_idx` of
+        /// `u32::MAX` marks an empty slot.
+        static RT_LDA_IC: RefCell<[(u32, u64, usize); 64]> = const { RefCell::new([(u32::MAX, 0, 0); 64]) };
 
         /// Reference to the global environment for `LdaGlobal`/`StaGlobal`
         /// runtime stubs.  Set once via [`jit_runtime_set_global_env`] at
@@ -201,7 +205,7 @@ mod jit_runtime {
     pub fn jit_runtime_setup(ba: &BytecodeArray) {
         RT_BYTECODE.with(|b| b.set(ba as *const BytecodeArray));
         RT_HEAP.with(|h| h.borrow_mut().clear());
-        RT_LDA_IC.with(|ic| ic.borrow_mut().clear());
+        RT_LDA_IC.with(|ic| *ic.borrow_mut() = [(u32::MAX, 0, 0); 64]);
     }
 
     /// Set the global environment for `LdaGlobal`/`StaGlobal` stubs.
@@ -235,7 +239,7 @@ mod jit_runtime {
     pub fn jit_runtime_teardown() {
         RT_BYTECODE.with(|b| b.set(std::ptr::null()));
         RT_HEAP.with(|h| h.borrow_mut().clear());
-        RT_LDA_IC.with(|ic| ic.borrow_mut().clear());
+        RT_LDA_IC.with(|ic| *ic.borrow_mut() = [(u32::MAX, 0, 0); 64]);
     }
 
     /// Set the current closure context for context-slot stubs.
@@ -1097,15 +1101,16 @@ mod jit_runtime {
                 let map = map_rc.borrow();
                 let shape = map.shape_id();
 
-                // ── IC fast path: check cached (name_idx, shape_id) ─────
+                // ── IC fast path: direct-mapped by name_idx ─────────────
+                let slot = (name_idx & 63) as usize;
                 let cached_offset = RT_LDA_IC.with(|ic| {
                     let cache = ic.borrow();
-                    for &(idx, sid, off) in cache.iter() {
-                        if idx == name_idx && sid == shape {
-                            return Some(off);
-                        }
+                    let entry = &cache[slot];
+                    if entry.0 == name_idx && entry.1 == shape {
+                        Some(entry.2)
+                    } else {
+                        None
                     }
-                    None
                 });
 
                 if let Some(offset) = cached_offset {
@@ -1121,16 +1126,7 @@ mod jit_runtime {
 
                 if let Some(offset) = map.offset_of(&prop_name) {
                     RT_LDA_IC.with(|ic| {
-                        let mut cache = ic.borrow_mut();
-                        if let Some(entry) = cache.iter_mut().find(|(idx, _, _)| *idx == name_idx) {
-                            entry.1 = shape;
-                            entry.2 = offset;
-                        } else {
-                            if cache.len() >= 256 {
-                                cache.remove(0);
-                            }
-                            cache.push((name_idx, shape, offset));
-                        }
+                        ic.borrow_mut()[slot] = (name_idx, shape, offset);
                     });
                     let val = map
                         .get_by_offset(offset)
@@ -1214,7 +1210,12 @@ mod jit_runtime {
                 // Save outer execution state so the inner JIT call gets a
                 // clean environment and the outer state is restored after.
                 let saved_heap = RT_HEAP.with(|h| std::mem::take(&mut *h.borrow_mut()));
-                let saved_ic = RT_LDA_IC.with(|ic| std::mem::take(&mut *ic.borrow_mut()));
+                let saved_ic = RT_LDA_IC.with(|ic| {
+                    let mut guard = ic.borrow_mut();
+                    let mut tmp = [(u32::MAX, 0u64, 0usize); 64];
+                    std::mem::swap(&mut *guard, &mut tmp);
+                    tmp
+                });
                 let saved_ctx = RT_CONTEXT.with(|c| c.borrow().clone());
                 RT_BYTECODE.with(|b| b.set(&**ba as *const BytecodeArray));
                 RT_CONTEXT.with(|c| *c.borrow_mut() = ba.closure_context().cloned());
@@ -1508,6 +1509,158 @@ mod jit_runtime {
 
             Some(value_i64)
         })
+    }
+
+    // ── Specialized LdaKeyedProperty stub ───────────────────────────────
+
+    /// Specialized runtime stub for `LdaKeyedProperty`.
+    ///
+    /// Skips generic opcode dispatch.  Handles `Array[Smi]` and
+    /// `PlainObject[Smi|String]` element access directly.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_i64`) – JIT i64 encoding of the receiver.
+    /// * `RSI` (`key_i64`) – JIT i64 encoding of the key (accumulator).
+    ///
+    /// Returns the element value as `i64` in `RAX`, or [`JIT_DEOPT`].
+    pub extern "C" fn jit_runtime_lda_keyed_property(obj_i64: i64, key_i64: i64) -> i64 {
+        lda_keyed_property_inner(obj_i64, key_i64).unwrap_or(JIT_DEOPT)
+    }
+
+    /// Inner implementation for [`jit_runtime_lda_keyed_property`].
+    fn lda_keyed_property_inner(obj_i64: i64, key_i64: i64) -> Option<i64> {
+        let obj = jit_i64_to_jsvalue(obj_i64);
+        let key = jit_i64_to_jsvalue(key_i64);
+
+        let result = match (&obj, &key) {
+            (JsValue::Array(arr), JsValue::Smi(idx)) if *idx >= 0 => {
+                let i = *idx as usize;
+                let borrow = arr.borrow();
+                match borrow.get(i) {
+                    Some(v) if !matches!(v, JsValue::TheHole) => v.clone(),
+                    _ => JsValue::Undefined,
+                }
+            }
+            (JsValue::PlainObject(map_rc), JsValue::Smi(idx)) if *idx >= 0 => {
+                let key_str = idx.to_string();
+                map_rc
+                    .borrow()
+                    .get(&key_str)
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined)
+            }
+            (JsValue::PlainObject(map_rc), JsValue::String(s)) => map_rc
+                .borrow()
+                .get(&**s)
+                .cloned()
+                .unwrap_or(JsValue::Undefined),
+            _ => return None,
+        };
+        Some(jsvalue_to_jit_i64(result))
+    }
+
+    // ── Specialized StaKeyedProperty stub ───────────────────────────────
+
+    /// Specialized runtime stub for `StaKeyedProperty`.
+    ///
+    /// Handles `Array[Smi]` and `PlainObject[Smi|String]` element
+    /// stores directly, skipping generic opcode dispatch.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_i64`) – JIT i64 encoding of the receiver.
+    /// * `RSI` (`key_i64`) – JIT i64 encoding of the key.
+    /// * `RDX` (`value_i64`) – JIT i64 encoding of the value (accumulator).
+    ///
+    /// Returns `value_i64` in `RAX` on success, or [`JIT_DEOPT`].
+    pub extern "C" fn jit_runtime_sta_keyed_property(
+        obj_i64: i64,
+        key_i64: i64,
+        value_i64: i64,
+    ) -> i64 {
+        sta_keyed_property_inner(obj_i64, key_i64, value_i64).unwrap_or(JIT_DEOPT)
+    }
+
+    /// Inner implementation for [`jit_runtime_sta_keyed_property`].
+    fn sta_keyed_property_inner(obj_i64: i64, key_i64: i64, value_i64: i64) -> Option<i64> {
+        let obj = jit_i64_to_jsvalue(obj_i64);
+        let key = jit_i64_to_jsvalue(key_i64);
+        let value = jit_i64_to_jsvalue(value_i64);
+
+        match (&obj, &key) {
+            (JsValue::Array(arr), JsValue::Smi(idx)) if *idx >= 0 => {
+                let i = *idx as usize;
+                let mut v = arr.borrow_mut();
+                if i >= v.len() {
+                    v.resize(i + 1, JsValue::TheHole);
+                }
+                v[i] = value;
+            }
+            (JsValue::PlainObject(map_rc), JsValue::Smi(idx)) if *idx >= 0 => {
+                let key_str = idx.to_string();
+                map_rc.borrow_mut().insert(key_str, value);
+            }
+            (JsValue::PlainObject(map_rc), JsValue::String(s)) => {
+                map_rc.borrow_mut().insert(s.to_string(), value);
+            }
+            _ => return None,
+        }
+        Some(value_i64)
+    }
+
+    // ── Specialized context slot stubs ──────────────────────────────────
+
+    /// Specialized runtime stub for `LdaCurrentContextSlot` and
+    /// `LdaImmutableCurrentContextSlot`.
+    ///
+    /// Eliminates generic opcode dispatch.  Accesses the closure context
+    /// stored in `RT_CONTEXT` directly.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`slot_idx`) – context slot index.
+    ///
+    /// Returns the slot value as `i64` in `RAX`, or [`JIT_DEOPT`].
+    pub extern "C" fn jit_runtime_lda_context_slot(slot_idx: i64) -> i64 {
+        RT_CONTEXT
+            .with(|ctx_cell| {
+                let ctx_opt = ctx_cell.borrow();
+                let ctx_rc = ctx_opt.as_ref()?;
+                let ctx = ctx_rc.borrow();
+                let value = ctx
+                    .slots
+                    .get(slot_idx as usize)
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined);
+                Some(jsvalue_to_jit_i64(value))
+            })
+            .unwrap_or(JIT_DEOPT)
+    }
+
+    /// Specialized runtime stub for `StaCurrentContextSlot`.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`slot_idx`) – context slot index.
+    /// * `RSI` (`value_i64`) – JIT i64 encoding of the value (accumulator).
+    ///
+    /// Returns `value_i64` in `RAX` on success, or [`JIT_DEOPT`].
+    pub extern "C" fn jit_runtime_sta_context_slot(slot_idx: i64, value_i64: i64) -> i64 {
+        let value = jit_i64_to_jsvalue(value_i64);
+        RT_CONTEXT
+            .with(|ctx_cell| {
+                let ctx_opt = ctx_cell.borrow();
+                let ctx_rc = ctx_opt.as_ref()?;
+                let mut ctx = ctx_rc.borrow_mut();
+                let slot = slot_idx as usize;
+                if slot >= ctx.slots.len() {
+                    ctx.slots.resize(slot + 1, JsValue::Undefined);
+                }
+                ctx.slots[slot] = value;
+                Some(value_i64)
+            })
+            .unwrap_or(JIT_DEOPT)
     }
 }
 
@@ -2404,6 +2557,169 @@ impl<'a> BaselineCompiler<'a> {
         self.emit_deopt(bytecode_offset);
     }
 
+    /// Emit a specialized call to
+    /// [`jit_runtime::jit_runtime_lda_keyed_property`] for
+    /// `LdaKeyedProperty` bytecodes.
+    ///
+    /// Loads the receiver from the register file and passes both the
+    /// receiver and the accumulator (key) to a dedicated function that
+    /// skips generic opcode dispatch.
+    #[allow(unused_variables)]
+    fn emit_lda_keyed_property_stub(&mut self, obj_flat: i64, bytecode_offset: u32) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            // RDI = receiver object from register file.
+            let byte_offset = (obj_flat as i32) * 8;
+            self.masm
+                .mov_load_base_disp32(Reg64::Rdi, Reg64::R14, byte_offset);
+
+            // RSI = key (current accumulator value).
+            self.masm.mov_rr(Reg64::Rsi, Reg64::R12);
+
+            let addr = jit_runtime::jit_runtime_lda_keyed_property as *const () as usize as i64;
+            self.masm.mov_ri(Reg64::R11, addr);
+            self.masm.call_reg(Reg64::R11);
+
+            // ── Check for deopt ─────────────────────────────────────────
+            self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+
+            let code_off = self.masm.position() as u32;
+            let liveness_map = self.all_slots_live();
+            self.deopt_entries.push(DeoptEntry {
+                code_offset: code_off,
+                bytecode_offset,
+                liveness_map,
+            });
+            self.masm.je(&mut self.deopt_label);
+
+            // ── Success: update accumulator ─────────────────────────────
+            self.masm.mov_rr(Reg64::R12, Reg64::Rax);
+            return;
+        }
+
+        #[allow(unreachable_code)]
+        self.emit_deopt(bytecode_offset);
+    }
+
+    /// Emit a specialized call to
+    /// [`jit_runtime::jit_runtime_sta_keyed_property`] for
+    /// `StaKeyedProperty` bytecodes.
+    ///
+    /// Passes receiver, key, and the accumulator (value) to a dedicated
+    /// function that skips generic opcode dispatch.
+    #[allow(unused_variables)]
+    fn emit_sta_keyed_property_stub(&mut self, obj_flat: i64, key_flat: i64, bytecode_offset: u32) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            // RDI = receiver object from register file.
+            let obj_byte_offset = (obj_flat as i32) * 8;
+            self.masm
+                .mov_load_base_disp32(Reg64::Rdi, Reg64::R14, obj_byte_offset);
+
+            // RSI = key from register file.
+            let key_byte_offset = (key_flat as i32) * 8;
+            self.masm
+                .mov_load_base_disp32(Reg64::Rsi, Reg64::R14, key_byte_offset);
+
+            // RDX = value (current accumulator).
+            self.masm.mov_rr(Reg64::Rdx, Reg64::R12);
+
+            let addr = jit_runtime::jit_runtime_sta_keyed_property as *const () as usize as i64;
+            self.masm.mov_ri(Reg64::R11, addr);
+            self.masm.call_reg(Reg64::R11);
+
+            // ── Check for deopt ─────────────────────────────────────────
+            self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+
+            let code_off = self.masm.position() as u32;
+            let liveness_map = self.all_slots_live();
+            self.deopt_entries.push(DeoptEntry {
+                code_offset: code_off,
+                bytecode_offset,
+                liveness_map,
+            });
+            self.masm.je(&mut self.deopt_label);
+
+            // ── Success: update accumulator ─────────────────────────────
+            self.masm.mov_rr(Reg64::R12, Reg64::Rax);
+            return;
+        }
+
+        #[allow(unreachable_code)]
+        self.emit_deopt(bytecode_offset);
+    }
+
+    /// Emit a specialized call to
+    /// [`jit_runtime::jit_runtime_lda_context_slot`] for
+    /// `LdaCurrentContextSlot` / `LdaImmutableCurrentContextSlot`.
+    #[allow(unused_variables)]
+    fn emit_lda_context_slot_stub(&mut self, slot_idx: u32, bytecode_offset: u32) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            self.masm.mov_ri(Reg64::Rdi, i64::from(slot_idx));
+
+            let addr = jit_runtime::jit_runtime_lda_context_slot as *const () as usize as i64;
+            self.masm.mov_ri(Reg64::R11, addr);
+            self.masm.call_reg(Reg64::R11);
+
+            // ── Check for deopt ─────────────────────────────────────────
+            self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+
+            let code_off = self.masm.position() as u32;
+            let liveness_map = self.all_slots_live();
+            self.deopt_entries.push(DeoptEntry {
+                code_offset: code_off,
+                bytecode_offset,
+                liveness_map,
+            });
+            self.masm.je(&mut self.deopt_label);
+
+            self.masm.mov_rr(Reg64::R12, Reg64::Rax);
+            return;
+        }
+
+        #[allow(unreachable_code)]
+        self.emit_deopt(bytecode_offset);
+    }
+
+    /// Emit a specialized call to
+    /// [`jit_runtime::jit_runtime_sta_context_slot`] for
+    /// `StaCurrentContextSlot`.
+    #[allow(unused_variables)]
+    fn emit_sta_context_slot_stub(&mut self, slot_idx: u32, bytecode_offset: u32) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            self.masm.mov_ri(Reg64::Rdi, i64::from(slot_idx));
+            self.masm.mov_rr(Reg64::Rsi, Reg64::R12);
+
+            let addr = jit_runtime::jit_runtime_sta_context_slot as *const () as usize as i64;
+            self.masm.mov_ri(Reg64::R11, addr);
+            self.masm.call_reg(Reg64::R11);
+
+            // ── Check for deopt ─────────────────────────────────────────
+            self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+
+            let code_off = self.masm.position() as u32;
+            let liveness_map = self.all_slots_live();
+            self.deopt_entries.push(DeoptEntry {
+                code_offset: code_off,
+                bytecode_offset,
+                liveness_map,
+            });
+            self.masm.je(&mut self.deopt_label);
+
+            self.masm.mov_rr(Reg64::R12, Reg64::Rax);
+            return;
+        }
+
+        #[allow(unreachable_code)]
+        self.emit_deopt(bytecode_offset);
+    }
+
     // ── Main compilation pass ────────────────────────────────────────────────
 
     fn compile_function(&mut self) -> StatorResult<()> {
@@ -3162,7 +3478,7 @@ impl<'a> BaselineCompiler<'a> {
                     return Err(bad_operand("LdaKeyedProperty", 0));
                 };
                 let obj_flat = self.reg_flat_index(obj_v) as i64;
-                self.emit_runtime_stub(Opcode::LdaKeyedProperty, obj_flat, 0, bytecode_offset);
+                self.emit_lda_keyed_property_stub(obj_flat, bytecode_offset);
             }
 
             Opcode::StaKeyedProperty => {
@@ -3174,12 +3490,7 @@ impl<'a> BaselineCompiler<'a> {
                 };
                 let obj_flat = self.reg_flat_index(obj_v) as i64;
                 let key_flat = self.reg_flat_index(key_v) as i64;
-                self.emit_runtime_stub(
-                    Opcode::StaKeyedProperty,
-                    obj_flat,
-                    key_flat,
-                    bytecode_offset,
-                );
+                self.emit_sta_keyed_property_stub(obj_flat, key_flat, bytecode_offset);
             }
 
             Opcode::StaInArrayLiteral => {
@@ -3237,19 +3548,14 @@ impl<'a> BaselineCompiler<'a> {
                 let Operand::ConstantPoolIdx(slot) = instr.operands[0] else {
                     return Err(bad_operand("LdaCurrentContextSlot", 0));
                 };
-                self.emit_runtime_stub(instr.opcode, i64::from(slot), 0, bytecode_offset);
+                self.emit_lda_context_slot_stub(slot, bytecode_offset);
             }
 
             Opcode::StaCurrentContextSlot => {
                 let Operand::ConstantPoolIdx(slot) = instr.operands[0] else {
                     return Err(bad_operand("StaCurrentContextSlot", 0));
                 };
-                self.emit_runtime_stub(
-                    Opcode::StaCurrentContextSlot,
-                    i64::from(slot),
-                    0,
-                    bytecode_offset,
-                );
+                self.emit_sta_context_slot_stub(slot, bytecode_offset);
             }
 
             Opcode::LdaContextSlot | Opcode::LdaImmutableContextSlot => {
