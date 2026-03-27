@@ -181,9 +181,9 @@ mod jit_runtime {
         /// that execution.
         static RT_GLOBAL_ENV: RefCell<Option<Rc<RefCell<GlobalEnv>>>> = const { RefCell::new(None) };
 
-        /// Inline cache for `LdaGlobal`/`StaGlobal`: maps constant-pool
-        /// name index → `(slot_index, generation)` for O(1) indexed access.
-        static RT_GLOBAL_IC: RefCell<Vec<(u32, usize, u64)>> = const { RefCell::new(Vec::new()) };
+        /// Direct-mapped inline cache for `LdaGlobal`/`StaGlobal`:
+        /// indexed by `name_idx & 31`, stores `(name_idx, slot_index, generation)`.
+        static RT_GLOBAL_IC: RefCell<[(u32, usize, u64); 32]> = const { RefCell::new([(u32::MAX, 0, 0); 32]) };
 
         /// Reference to the current closure context for
         /// `LdaCurrentContextSlot`/`StaCurrentContextSlot` stubs.
@@ -213,7 +213,7 @@ mod jit_runtime {
     /// `run_dispatch` invocation.
     pub fn jit_runtime_set_global_env(env: Rc<RefCell<GlobalEnv>>) {
         RT_GLOBAL_ENV.with(|g| *g.borrow_mut() = Some(env));
-        RT_GLOBAL_IC.with(|ic| ic.borrow_mut().clear());
+        RT_GLOBAL_IC.with(|ic| *ic.borrow_mut() = [(u32::MAX, 0, 0); 32]);
     }
 
     /// Clean up thread-local state after JIT execution.
@@ -648,112 +648,10 @@ mod jit_runtime {
             }
 
             // ── Global variable access ──────────────────────────────────
-            Opcode::LdaGlobal => {
-                let name_idx = operand1 as u32;
-                let name = get_rt_string_constant(name_idx)?;
-
-                RT_GLOBAL_ENV.with(|env_cell| {
-                    let env_opt = env_cell.borrow();
-                    let env_rc = env_opt.as_ref()?;
-                    let env = env_rc.borrow();
-
-                    // Fast path: IC hit with matching generation.
-                    let ic_hit = RT_GLOBAL_IC.with(|ic| {
-                        let ic = ic.borrow();
-                        ic.iter()
-                            .find(|(idx, _, _)| *idx == name_idx)
-                            .map(|&(_, slot, cached)| (slot, cached))
-                    });
-                    if let Some((slot_idx, cached_gen)) = ic_hit {
-                        if env.generation() == cached_gen && slot_idx < env.slot_count() {
-                            let value = env.get_by_index(slot_idx).clone();
-                            if value != JsValue::TheHole {
-                                return Some(jsvalue_to_jit_i64(value));
-                            }
-                        }
-                    }
-
-                    // Slow path: HashMap lookup.
-                    let value = env.get(&name).cloned().unwrap_or(JsValue::Undefined);
-
-                    // Populate IC.
-                    if let Some(slot_idx) = env.slot_index_for(&name) {
-                        let cur_gen = env.generation();
-                        RT_GLOBAL_IC.with(|ic| {
-                            let mut ic = ic.borrow_mut();
-                            if let Some(entry) = ic.iter_mut().find(|(idx, _, _)| *idx == name_idx)
-                            {
-                                entry.1 = slot_idx;
-                                entry.2 = cur_gen;
-                            } else {
-                                ic.push((name_idx, slot_idx, cur_gen));
-                            }
-                        });
-                    }
-
-                    Some(jsvalue_to_jit_i64(value))
-                })
-            }
-
-            Opcode::StaGlobal => {
-                let name_idx = operand1 as u32;
-                let name = get_rt_string_constant(name_idx)?;
-                let value = jit_i64_to_jsvalue(acc);
-
-                RT_GLOBAL_ENV.with(|env_cell| {
-                    let env_opt = env_cell.borrow();
-                    let env_rc = env_opt.as_ref()?;
-                    let mut env = env_rc.borrow_mut();
-
-                    // Fast path: IC hit — store by index.
-                    let ic_hit = RT_GLOBAL_IC.with(|ic| {
-                        let ic = ic.borrow();
-                        ic.iter()
-                            .find(|(idx, _, _)| *idx == name_idx)
-                            .map(|&(_, slot, cached)| (slot, cached))
-                    });
-                    if let Some((slot_idx, cached_gen)) = ic_hit {
-                        if env.generation() == cached_gen && slot_idx < env.slot_count() {
-                            env.store_by_index_sync(slot_idx, &name, value);
-                            // Update cached generation after mutation.
-                            let new_gen = env.generation();
-                            RT_GLOBAL_IC.with(|ic| {
-                                let mut ic = ic.borrow_mut();
-                                if let Some(entry) =
-                                    ic.iter_mut().find(|(idx, _, _)| *idx == name_idx)
-                                {
-                                    entry.2 = new_gen;
-                                }
-                            });
-                            return Some(acc);
-                        }
-                    }
-
-                    // Slow path: insert via HashMap.
-                    let slot_idx = env.slot_index_for(&name);
-                    if let Some(idx) = slot_idx {
-                        env.store_by_index_sync(idx, &name, value);
-                    } else {
-                        env.insert(name.clone(), value);
-                    }
-
-                    // Populate / update IC.
-                    let cur_gen = env.generation();
-                    if let Some(idx) = env.slot_index_for(&name) {
-                        RT_GLOBAL_IC.with(|ic| {
-                            let mut ic = ic.borrow_mut();
-                            if let Some(entry) = ic.iter_mut().find(|(i, _, _)| *i == name_idx) {
-                                entry.1 = idx;
-                                entry.2 = cur_gen;
-                            } else {
-                                ic.push((name_idx, idx, cur_gen));
-                            }
-                        });
-                    }
-
-                    Some(acc)
-                })
-            }
+            // NOTE: Usually reached via specialized stubs, but the generic
+            // trampoline path delegates to the shared inner functions.
+            Opcode::LdaGlobal => lda_global_inner(operand1 as u32),
+            Opcode::StaGlobal => sta_global_inner(operand1 as u32, acc),
 
             // ── Dynamic scope lookup ────────────────────────────────────
             Opcode::LdaLookupSlot => None,
@@ -851,6 +749,93 @@ mod jit_runtime {
                     _ => None,
                 }
             }
+
+            // ── TestTypeOf ────────────────────────────────────────────────
+            // Flag: 0=number, 1=string, 2=symbol, 3=boolean, 4=bigint,
+            //       5=undefined, 6=function, 7=object
+            Opcode::TestTypeOf => {
+                let val = jit_i64_to_jsvalue(acc);
+                let flag = operand1 as u8;
+                let result = match flag {
+                    0 => matches!(val, JsValue::Smi(_) | JsValue::HeapNumber(_)),
+                    1 => matches!(val, JsValue::String(_)),
+                    2 => false, // symbols not yet tracked in JIT
+                    3 => matches!(val, JsValue::Boolean(_)),
+                    4 => false, // BigInt not yet supported in JIT
+                    5 => matches!(val, JsValue::Undefined | JsValue::TheHole),
+                    6 => matches!(val, JsValue::NativeFunction(_) | JsValue::Function(_)),
+                    7 => matches!(
+                        val,
+                        JsValue::Null
+                            | JsValue::PlainObject(_)
+                            | JsValue::Array(_)
+                            | JsValue::RegExp(_)
+                    ),
+                    _ => return None,
+                };
+                Some(if result { JIT_TRUE } else { JIT_FALSE })
+            }
+
+            // ── TestInstanceOf ───────────────────────────────────────────
+            Opcode::TestInstanceOf => {
+                // operand1 = register flat index of RHS constructor
+                let rhs_i64 = unsafe { *regs.add(operand1 as usize) };
+                let _rhs = jit_i64_to_jsvalue(rhs_i64);
+                let _lhs = jit_i64_to_jsvalue(acc);
+                // Full instanceof requires @@hasInstance / prototype chain
+                // walk — deopt for now to the interpreter.
+                None
+            }
+
+            // ── TestIn ───────────────────────────────────────────────────
+            Opcode::TestIn => {
+                let obj_i64 = unsafe { *regs.add(operand1 as usize) };
+                let obj = jit_i64_to_jsvalue(obj_i64);
+                let key = jit_i64_to_jsvalue(acc);
+                match (&key, &obj) {
+                    (JsValue::String(k), JsValue::PlainObject(map)) => {
+                        let found = map.borrow().contains_key(k.as_ref());
+                        Some(if found { JIT_TRUE } else { JIT_FALSE })
+                    }
+                    (JsValue::Smi(idx), JsValue::Array(arr)) => {
+                        let found = (*idx as usize) < arr.borrow().len();
+                        Some(if found { JIT_TRUE } else { JIT_FALSE })
+                    }
+                    _ => None,
+                }
+            }
+
+            // ── ThrowReferenceErrorIfHole ────────────────────────────────
+            Opcode::ThrowReferenceErrorIfHole => {
+                let val = jit_i64_to_jsvalue(acc);
+                if matches!(val, JsValue::TheHole) {
+                    // TDZ violation — deopt to interpreter which will throw.
+                    None
+                } else {
+                    Some(acc)
+                }
+            }
+
+            // ── LdaTheHole ──────────────────────────────────────────────
+            Opcode::LdaTheHole => Some(jsvalue_to_jit_i64(JsValue::TheHole)),
+
+            // ── ToNumber / ToNumeric ─────────────────────────────────────
+            Opcode::ToNumber | Opcode::ToNumeric => {
+                let val = jit_i64_to_jsvalue(acc);
+                match &val {
+                    JsValue::Smi(_) | JsValue::HeapNumber(_) => Some(acc),
+                    JsValue::Boolean(true) => Some(1_i64),
+                    JsValue::Boolean(false) => Some(0_i64),
+                    JsValue::Undefined => Some(jsvalue_to_jit_i64(JsValue::HeapNumber(f64::NAN))),
+                    JsValue::Null => Some(0_i64),
+                    _ => None,
+                }
+            }
+
+            // ── CreateClosure ────────────────────────────────────────────
+            // Full closure creation requires bytecode array lookup and
+            // context capture — deopt to interpreter.
+            Opcode::CreateClosure => None,
 
             _ => None,
         }
@@ -1060,12 +1045,15 @@ mod jit_runtime {
             let env_rc = env_opt.as_ref()?;
             let env = env_rc.borrow();
 
-            // Fast path: IC hit with matching generation.
+            // Fast path: direct-mapped IC hit.
             let ic_hit = RT_GLOBAL_IC.with(|ic| {
                 let ic = ic.borrow();
-                ic.iter()
-                    .find(|(idx, _, _)| *idx == name_idx)
-                    .map(|&(_, slot, cached)| (slot, cached))
+                let entry = &ic[(name_idx & 31) as usize];
+                if entry.0 == name_idx {
+                    Some((entry.1, entry.2))
+                } else {
+                    None
+                }
             });
             if let Some((slot_idx, cached_gen)) = ic_hit {
                 if env.generation() == cached_gen && slot_idx < env.slot_count() {
@@ -1084,13 +1072,7 @@ mod jit_runtime {
             if let Some(slot_idx) = env.slot_index_for(&name) {
                 let cur_gen = env.generation();
                 RT_GLOBAL_IC.with(|ic| {
-                    let mut ic = ic.borrow_mut();
-                    if let Some(entry) = ic.iter_mut().find(|(idx, _, _)| *idx == name_idx) {
-                        entry.1 = slot_idx;
-                        entry.2 = cur_gen;
-                    } else {
-                        ic.push((name_idx, slot_idx, cur_gen));
-                    }
+                    ic.borrow_mut()[(name_idx & 31) as usize] = (name_idx, slot_idx, cur_gen);
                 });
             }
 
@@ -1121,12 +1103,15 @@ mod jit_runtime {
             let env_rc = env_opt.as_ref()?;
             let mut env = env_rc.borrow_mut();
 
-            // Fast path: IC hit — store by index.
+            // Fast path: direct-mapped IC hit — store by index.
             let ic_hit = RT_GLOBAL_IC.with(|ic| {
                 let ic = ic.borrow();
-                ic.iter()
-                    .find(|(idx, _, _)| *idx == name_idx)
-                    .map(|&(_, slot, cached)| (slot, cached))
+                let entry = &ic[(name_idx & 31) as usize];
+                if entry.0 == name_idx {
+                    Some((entry.1, entry.2))
+                } else {
+                    None
+                }
             });
             if let Some((slot_idx, cached_gen)) = ic_hit {
                 if env.generation() == cached_gen && slot_idx < env.slot_count() {
@@ -1134,10 +1119,7 @@ mod jit_runtime {
                     env.store_by_index_sync(slot_idx, &name, value);
                     let new_gen = env.generation();
                     RT_GLOBAL_IC.with(|ic| {
-                        let mut ic = ic.borrow_mut();
-                        if let Some(entry) = ic.iter_mut().find(|(idx, _, _)| *idx == name_idx) {
-                            entry.2 = new_gen;
-                        }
+                        ic.borrow_mut()[(name_idx & 31) as usize].2 = new_gen;
                     });
                     return Some(value_i64);
                 }
@@ -1156,13 +1138,7 @@ mod jit_runtime {
             let cur_gen = env.generation();
             if let Some(idx) = env.slot_index_for(&name) {
                 RT_GLOBAL_IC.with(|ic| {
-                    let mut ic = ic.borrow_mut();
-                    if let Some(entry) = ic.iter_mut().find(|(i, _, _)| *i == name_idx) {
-                        entry.1 = idx;
-                        entry.2 = cur_gen;
-                    } else {
-                        ic.push((name_idx, idx, cur_gen));
-                    }
+                    ic.borrow_mut()[(name_idx & 31) as usize] = (name_idx, idx, cur_gen);
                 });
             }
 
@@ -2870,6 +2846,65 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_runtime_stub(instr.opcode, lhs_flat, 0, bytecode_offset);
             }
 
+            // ── TestTypeOf runtime stub ──────────────────────────────────────
+            Opcode::TestTypeOf => {
+                let Operand::Flag(type_flag) = instr.operands[0] else {
+                    return Err(bad_operand("TestTypeOf", 0));
+                };
+                self.emit_runtime_stub(
+                    Opcode::TestTypeOf,
+                    i64::from(type_flag),
+                    0,
+                    bytecode_offset,
+                );
+            }
+
+            // ── TestInstanceOf runtime stub ──────────────────────────────────
+            Opcode::TestInstanceOf => {
+                let Operand::Register(rhs_v) = instr.operands[0] else {
+                    return Err(bad_operand("TestInstanceOf", 0));
+                };
+                let rhs_flat = self.reg_flat_index(rhs_v) as i64;
+                self.emit_runtime_stub(Opcode::TestInstanceOf, rhs_flat, 0, bytecode_offset);
+            }
+
+            // ── TestIn runtime stub ─────────────────────────────────────────
+            Opcode::TestIn => {
+                let Operand::Register(obj_v) = instr.operands[0] else {
+                    return Err(bad_operand("TestIn", 0));
+                };
+                let obj_flat = self.reg_flat_index(obj_v) as i64;
+                self.emit_runtime_stub(Opcode::TestIn, obj_flat, 0, bytecode_offset);
+            }
+
+            // ── ThrowReferenceErrorIfHole runtime stub ──────────────────────
+            Opcode::ThrowReferenceErrorIfHole => {
+                let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+                    return Err(bad_operand("ThrowReferenceErrorIfHole", 0));
+                };
+                self.emit_runtime_stub(
+                    Opcode::ThrowReferenceErrorIfHole,
+                    i64::from(name_idx),
+                    0,
+                    bytecode_offset,
+                );
+            }
+
+            // ── LdaTheHole runtime stub ─────────────────────────────────────
+            Opcode::LdaTheHole => {
+                self.emit_runtime_stub(Opcode::LdaTheHole, 0, 0, bytecode_offset);
+            }
+
+            // ── ToNumber / ToNumeric runtime stubs ──────────────────────────
+            Opcode::ToNumber | Opcode::ToNumeric => {
+                self.emit_runtime_stub(instr.opcode, 0, 0, bytecode_offset);
+            }
+
+            // ── CreateClosure runtime stub ──────────────────────────────────
+            Opcode::CreateClosure => {
+                self.emit_runtime_stub(Opcode::CreateClosure, 0, 0, bytecode_offset);
+            }
+
             // ── Remaining unsupported opcodes → deopt ────────────────────────
             Opcode::LdaNamedPropertyFromSuper
             | Opcode::LdaEnumeratedKeyedProperty
@@ -2900,7 +2935,6 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::Construct
             | Opcode::ConstructWithSpread
             | Opcode::ConstructForwardAllArgs
-            | Opcode::CreateClosure
             | Opcode::CreateBlockContext
             | Opcode::CreateCatchContext
             | Opcode::CreateFunctionContext
@@ -2930,22 +2964,15 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::GetGeneratorState
             | Opcode::SetGeneratorState
             | Opcode::ToName
-            | Opcode::ToNumber
-            | Opcode::ToNumeric
             | Opcode::ToObject
             | Opcode::ToBoolean
             | Opcode::DeletePropertyStrict
             | Opcode::DeletePropertySloppy
             | Opcode::TestReferenceEqual
-            | Opcode::TestInstanceOf
-            | Opcode::TestIn
             | Opcode::TestUndetectable
-            | Opcode::TestTypeOf
             | Opcode::Throw
             | Opcode::ReThrow
             | Opcode::SetPendingMessage
-            | Opcode::LdaTheHole
-            | Opcode::ThrowReferenceErrorIfHole
             | Opcode::ThrowSuperNotCalledIfHole
             | Opcode::ThrowSuperAlreadyCalledIfNotHole
             | Opcode::ThrowIfNullOrUndefined
