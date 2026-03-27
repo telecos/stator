@@ -1271,7 +1271,14 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
                 global_deopts,
                 result as u64,
             );
-            ba.mark_jit_maglev_deopted();
+            // Permanently mark as deopted UNLESS the reason is loop_counter,
+            // which may be a false positive (R13 clobber).  For loop_counter
+            // deopts, allow retries — functions with correct Phi resolution
+            // will succeed on future invocations once the stack-based counter
+            // is in use.
+            if deopt_offset != 4 {
+                ba.mark_jit_maglev_deopted();
+            }
             None
         } else {
             MAGLEV_DIAG_EXECUTED.with(|c| c.set(c.get() + 1));
