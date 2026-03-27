@@ -1099,35 +1099,45 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
         };
 
         std::thread::spawn(move || {
-            // Access through the SendableBytecodesArray wrapper (Deref) so the
-            // Rust 2024 precise closure capture analysis records input.ba
-            // (SendableBytecodesArray: Send) not input.ba.0 (BytecodeArray:
-            // !Send) as the captured variable.
-            let feedback = FeedbackVector::new(input.ba.feedback_metadata());
-            let param_count = input.ba.parameter_count();
-            match GraphBuilder::build(&input.ba, &feedback) {
-                Ok(mut graph) => {
-                    optimize(&mut graph);
-                    match maglev_codegen::compile(&graph, param_count) {
-                        Ok(cc) => {
-                            let code_len = cc.code.len();
-                            if let Ok(mut guard) = input.result_cache.lock() {
-                                *guard = Some((cc.code, cc.register_file_slots));
-                                drop(guard);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Access through the SendableBytecodesArray wrapper (Deref) so
+                // the Rust 2024 precise closure capture analysis records
+                // input.ba (SendableBytecodesArray: Send) not input.ba.0
+                // (BytecodeArray: !Send) as the captured variable.
+                let feedback = FeedbackVector::new(input.ba.feedback_metadata());
+                let param_count = input.ba.parameter_count();
+                match GraphBuilder::build(&input.ba, &feedback) {
+                    Ok(mut graph) => {
+                        optimize(&mut graph);
+                        match maglev_codegen::compile(&graph, param_count) {
+                            Ok(cc) => {
+                                let code_len = cc.code.len();
+                                if let Ok(mut guard) = input.result_cache.lock() {
+                                    *guard = Some((cc.code, cc.register_file_slots));
+                                    drop(guard);
+                                }
+                                MAGLEV_COMPILATION_COUNT
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                MAGLEV_CODE_BYTES
+                                    .fetch_add(code_len, std::sync::atomic::Ordering::Relaxed);
                             }
-                            MAGLEV_COMPILATION_COUNT
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            MAGLEV_CODE_BYTES
-                                .fetch_add(code_len, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            eprintln!("MAGLEV_COMPILE: codegen failed: {e}");
+                            Err(e) => {
+                                eprintln!("MAGLEV_COMPILE: codegen failed: {e}");
+                            }
                         }
                     }
+                    Err(e) => {
+                        eprintln!("MAGLEV_COMPILE: graph build failed: {e}");
+                    }
                 }
-                Err(e) => {
-                    eprintln!("MAGLEV_COMPILE: graph build failed: {e}");
-                }
+            }));
+            if let Err(panic) = result {
+                let msg = panic
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("(non-string panic)");
+                eprintln!("MAGLEV_COMPILE: thread panicked: {msg}");
             }
         });
     }
