@@ -1589,10 +1589,7 @@ pub(crate) mod jit_runtime {
             // the same (common for closures in tight loops), skip the
             // expensive clone + swap + restore cycle entirely.
             let callee_ctx_raw = ba.closure_context();
-            let callee_ctx_ptr = callee_ctx_raw
-                .as_ref()
-                .map(Rc::as_ptr)
-                .unwrap_or(std::ptr::null());
+            let callee_ctx_ptr = callee_ctx_raw.map(Rc::as_ptr).unwrap_or(std::ptr::null());
             // SAFETY: no active borrows; read current context pointer.
             let current_ctx_ptr = unsafe {
                 (*ctx_ref.as_ptr())
