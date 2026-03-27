@@ -396,7 +396,47 @@ mod jit_runtime {
             }
 
             Opcode::CreateObjectLiteral => {
+                let feedback_slot = operand1;
                 let capacity = operand2.max(4) as usize;
+
+                // Try template caching via the BytecodeArray's object
+                // literal template table (same mechanism the interpreter
+                // uses).  operand1 carries the feedback slot; -1 means no
+                // slot.
+                if feedback_slot >= 0 {
+                    let slot = feedback_slot as u32;
+
+                    // SAFETY: RT_BYTECODE is valid for the lifetime of
+                    // this JIT call.
+                    let ba = RT_BYTECODE.with(|b| b.get());
+                    if !ba.is_null() {
+                        // SAFETY: pointer is valid and points to a live
+                        // BytecodeArray.
+                        let ba_ref = unsafe { &*ba };
+
+                        // Fast path: clone a previously cached template.
+                        if let Some(map) = ba_ref.clone_object_literal_template(slot) {
+                            let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                            return Some(jsvalue_to_jit_i64(obj));
+                        }
+
+                        // Second execution: promote pending → cached.
+                        if let Some(map) = ba_ref.promote_object_literal_template(slot) {
+                            let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                            return Some(jsvalue_to_jit_i64(obj));
+                        }
+
+                        // First execution: create fresh and register as
+                        // pending for future promotion.
+                        let map = PropertyMap::with_capacity(capacity);
+                        let rc = Rc::new(RefCell::new(map));
+                        ba_ref.set_object_literal_pending(slot, Rc::clone(&rc));
+                        let obj = JsValue::PlainObject(rc);
+                        return Some(jsvalue_to_jit_i64(obj));
+                    }
+                }
+
+                // Fallback: no feedback slot or no BA pointer.
                 let obj = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::with_capacity(
                     capacity,
                 ))));
@@ -3765,11 +3805,20 @@ impl<'a> BaselineCompiler<'a> {
             }
 
             Opcode::CreateObjectLiteral => {
+                let feedback_slot = match instr.operands.get(1) {
+                    Some(Operand::FeedbackSlot(s)) => i64::from(*s),
+                    _ => -1,
+                };
                 let capacity = match instr.operands.get(2) {
                     Some(Operand::Flag(count)) if *count > 0 => i64::from(*count),
                     _ => 4,
                 };
-                self.emit_runtime_stub(Opcode::CreateObjectLiteral, 0, capacity, bytecode_offset);
+                self.emit_runtime_stub(
+                    Opcode::CreateObjectLiteral,
+                    feedback_slot,
+                    capacity,
+                    bytecode_offset,
+                );
             }
 
             Opcode::CreateEmptyArrayLiteral => {
