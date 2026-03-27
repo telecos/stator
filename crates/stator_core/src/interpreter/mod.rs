@@ -1459,9 +1459,10 @@ pub(super) fn try_execute_best_jit(
     ba: &BytecodeArray,
     args: &[JsValue],
 ) -> Option<StatorResult<JsValue>> {
-    // Maglev execution disabled: stub calls (LoadNamedGeneric,
-    // StoreKeyedGeneric, etc.) cause infinite loops in 5/9 benchmarks.
-    // Only baseline JIT runs until Maglev codegen is fixed.
+    // Try Maglev first (with low LOOP_COUNTER_MAX for diagnostics).
+    if let Some(r) = try_execute_maglev(ba, args) {
+        return Some(r);
+    }
     try_execute_jit(ba, args)
 }
 

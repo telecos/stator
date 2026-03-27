@@ -2724,6 +2724,21 @@ pub(crate) mod jit_runtime {
     ///
     /// Returns the slot value as `i64` in `RAX`, or [`JIT_DEOPT`].
     pub extern "C" fn jit_runtime_lda_context_slot(slot_idx: i64) -> i64 {
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if ptrs.is_cached() {
+            // SAFETY: cached pointers valid for thread lifetime;
+            // single-threaded JIT, no concurrent borrows.
+            let ctx_opt = unsafe { &*(*ptrs.context).as_ptr() };
+            if let Some(ctx_rc) = ctx_opt.as_ref() {
+                let ctx = unsafe { &*ctx_rc.as_ptr() };
+                return ctx
+                    .slots
+                    .get(slot_idx as usize)
+                    .map(jsvalue_ref_to_jit_i64)
+                    .unwrap_or(JIT_UNDEFINED);
+            }
+            return JIT_DEOPT;
+        }
         RT_CONTEXT
             .with(|ctx_cell| {
                 let ctx_opt = ctx_cell.borrow();
@@ -2749,6 +2764,22 @@ pub(crate) mod jit_runtime {
     /// Returns `value_i64` in `RAX` on success, or [`JIT_DEOPT`].
     pub extern "C" fn jit_runtime_sta_context_slot(slot_idx: i64, value_i64: i64) -> i64 {
         let value = jit_i64_to_jsvalue(value_i64);
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if ptrs.is_cached() {
+            // SAFETY: cached pointers valid for thread lifetime;
+            // single-threaded JIT, no concurrent borrows.
+            let ctx_opt = unsafe { &*(*ptrs.context).as_ptr() };
+            if let Some(ctx_rc) = ctx_opt.as_ref() {
+                let ctx = unsafe { &mut *ctx_rc.as_ptr() };
+                let slot = slot_idx as usize;
+                if slot >= ctx.slots.len() {
+                    ctx.slots.resize(slot + 1, JsValue::Undefined);
+                }
+                ctx.slots[slot] = value;
+                return value_i64;
+            }
+            return JIT_DEOPT;
+        }
         RT_CONTEXT
             .with(|ctx_cell| {
                 let ctx_opt = ctx_cell.borrow();
@@ -2788,8 +2819,9 @@ pub(crate) mod jit_runtime {
         }
         // SAFETY: ctx_raw points to a live RefCell<JsContext> kept alive
         // by the Rc in RT_CONTEXT (set by call_js_function).
+        // Single-threaded JIT: no concurrent borrows during slot load.
         let ctx_ref = unsafe { &*(ctx_raw as *const RefCell<JsContext>) };
-        let ctx = ctx_ref.borrow();
+        let ctx = unsafe { &*ctx_ref.as_ptr() };
         ctx.slots
             .get(slot_idx as usize)
             .map(jsvalue_ref_to_jit_i64)
@@ -2814,9 +2846,10 @@ pub(crate) mod jit_runtime {
             return JIT_DEOPT;
         }
         let value = jit_i64_to_jsvalue(value_i64);
-        // SAFETY: see jit_runtime_lda_context_slot_direct.
+        // SAFETY: single-threaded JIT; no concurrent borrows during
+        // context slot store.
         let ctx_ref = unsafe { &*(ctx_raw as *const RefCell<JsContext>) };
-        let mut ctx = ctx_ref.borrow_mut();
+        let ctx = unsafe { &mut *ctx_ref.as_ptr() };
         let slot = slot_idx as usize;
         if slot >= ctx.slots.len() {
             ctx.slots.resize(slot + 1, JsValue::Undefined);

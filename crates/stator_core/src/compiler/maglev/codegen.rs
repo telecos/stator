@@ -105,7 +105,7 @@ pub const NUM_PHYS_REGS: u32 = 6;
 /// R13 is initialised to this value in the prologue and decremented on every
 /// backward jump; when it reaches zero the function deopts back to the
 /// interpreter.
-const LOOP_COUNTER_MAX: i64 = 10_000_000;
+const LOOP_COUNTER_MAX: i64 = 1_000;
 
 /// A stub call argument that is either a Maglev IR node or an immediate i64.
 #[cfg(all(target_arch = "x86_64", unix))]
