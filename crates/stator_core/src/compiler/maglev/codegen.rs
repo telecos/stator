@@ -1719,7 +1719,14 @@ impl<'a> MaglevCodegen<'a> {
     fn emit_promoted_global_loads(&mut self) {
         #[cfg(all(target_arch = "x86_64", unix))]
         {
+            if self.promoted_globals.is_empty() {
+                return;
+            }
             let addr = jit_runtime::jit_runtime_lda_global as *const () as usize as i64;
+            // After the prologue (4 pushes + return addr = 5 items), RSP ≡ 8
+            // mod 16.  We need RSP ≡ 0 mod 16 before `call` so the callee
+            // sees RSP ≡ 8 mod 16 per SysV ABI.  A single dummy push fixes it.
+            self.masm.push(Reg64::R11);
             for &(name_idx, slot) in &self.promoted_globals.clone() {
                 let off = (slot * 8) as i32;
                 // RDI = name_idx (SysV ABI first arg)
@@ -1731,6 +1738,7 @@ impl<'a> MaglevCodegen<'a> {
                 // Store result in promoted slot: [R14 + off] = RAX
                 self.masm.mov_store_base_disp32(Reg64::R14, off, Reg64::Rax);
             }
+            self.masm.pop(Reg64::R11);
         }
     }
 
