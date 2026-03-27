@@ -2149,11 +2149,12 @@ mod tests {
         GraphBuilder::build(&arr, &vec).expect("build ok");
     }
 
-    // ── Arithmetic – generic path (uninitialized feedback) ───────────────────
+    // ── Arithmetic – always Smi-guarded (feedback state ignored) ────────────
 
     #[test]
-    fn test_add_generic() {
+    fn test_add_uninitialized_still_checked_smi() {
         // r0 = 1; acc = r0 + r0; return
+        // Even with Uninitialized feedback, we emit CheckedSmiAdd.
         let meta = FeedbackMetadata::new(vec![FeedbackSlotKind::BinaryOp]);
         let instrs = vec![
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
@@ -2167,12 +2168,11 @@ mod tests {
         let (arr, vec) = build(instrs, vec![], 1, 0, meta);
         let graph = GraphBuilder::build(&arr, &vec).unwrap();
         let block = graph.entry_block().unwrap();
-        // Uninitialized → GenericAdd
-        let has_generic_add = block
+        let has_checked_add = block
             .nodes
             .iter()
-            .any(|(_, n)| matches!(n, ValueNode::GenericAdd { .. }));
-        assert!(has_generic_add, "expected GenericAdd node");
+            .any(|(_, n)| matches!(n, ValueNode::CheckedSmiAdd { .. }));
+        assert!(has_checked_add, "expected CheckedSmiAdd node");
     }
 
     // ── Arithmetic – speculative Smi path ────────────────────────────────────
@@ -2251,7 +2251,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dec_generic() {
+    fn test_dec_uninitialized_still_checked_smi() {
         let meta = FeedbackMetadata::new(vec![FeedbackSlotKind::BinaryOpInc]);
         let instrs = vec![
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
@@ -2265,7 +2265,7 @@ mod tests {
             block
                 .nodes
                 .iter()
-                .any(|(_, n)| matches!(n, ValueNode::GenericDecrement { .. }))
+                .any(|(_, n)| matches!(n, ValueNode::CheckedSmiDecrement { .. }))
         );
     }
 
