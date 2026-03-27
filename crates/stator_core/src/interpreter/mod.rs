@@ -1271,12 +1271,17 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
                 global_deopts,
                 result as u64,
             );
-            // Permanently mark as deopted UNLESS the reason is loop_counter,
-            // which may be a false positive (R13 clobber).  For loop_counter
-            // deopts, allow retries — functions with correct Phi resolution
-            // will succeed on future invocations once the stack-based counter
-            // is in use.
-            if deopt_offset != 4 {
+            // Permanently mark as deopted UNLESS the reason is loop_counter.
+            // Loop-counter deopts allow retries (up to 3) so functions with
+            // correct Phi resolution succeed once the stack-based counter is
+            // immune to R13 clobber.  After 3 loop-counter deopts, the
+            // function is permanently marked (genuine infinite loop bug).
+            if deopt_offset == 4 {
+                // loop_counter deopt — allow retries with limit.
+                if ba.record_maglev_loop_deopt() {
+                    ba.mark_jit_maglev_deopted();
+                }
+            } else {
                 ba.mark_jit_maglev_deopted();
             }
             None
