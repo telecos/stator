@@ -2506,11 +2506,13 @@ pub(crate) mod jit_runtime {
                                     return Some(jsvalue_to_jit_i64(val));
                                 }
                                 "shift" => {
-                                    let val = if arr.borrow().is_empty() {
+                                    let mut items = arr.borrow_mut();
+                                    let val = if items.is_empty() {
                                         JsValue::Undefined
                                     } else {
-                                        arr.borrow_mut().remove(0)
+                                        items.remove(0)
                                     };
+                                    drop(items);
                                     return Some(jsvalue_to_jit_i64(val));
                                 }
                                 _ => {}
