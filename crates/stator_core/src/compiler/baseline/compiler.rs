@@ -1430,7 +1430,7 @@ pub(crate) mod jit_runtime {
                         .get(INTERNAL_PROTO_PROPERTY_KEY)
                         .or_else(|| map.get("__proto__"))
                         .cloned();
-                    drop(map);
+                    let _ = map;
                     let result = jit_proto_chain_walk(proto.as_ref(), &prop_name);
 
                     let proto_slot = (name_idx & 15) as usize;
@@ -2637,7 +2637,7 @@ pub(crate) mod jit_runtime {
                 // PlainObject with __call__.
                 if let Some(JsValue::NativeFunction(nf)) = map.get("__call__") {
                     let nf = Rc::clone(nf);
-                    drop(map);
+                    let _ = map;
                     let receiver = if is_heap_handle(receiver_i64) {
                         heap.get((receiver_i64 - JIT_HEAP_TAG) as usize)
                             .cloned()
@@ -2645,13 +2645,13 @@ pub(crate) mod jit_runtime {
                     } else {
                         super::jit_to_jsvalue(receiver_i64).unwrap_or(JsValue::Undefined)
                     };
-                    drop(heap);
+                    let _ = heap;
                     return match nf(vec![receiver]) {
                         Ok(val) => Some(jsvalue_to_jit_i64(val)),
                         Err(_) => None,
                     };
                 }
-                drop(map);
+                let _ = map;
             }
 
             if let Some(JsValue::NativeFunction(nf)) = heap.get(callee_idx) {
@@ -2663,14 +2663,14 @@ pub(crate) mod jit_runtime {
                 } else {
                     super::jit_to_jsvalue(receiver_i64).unwrap_or(JsValue::Undefined)
                 };
-                drop(heap);
+                let _ = heap;
                 return match nf(vec![receiver]) {
                     Ok(val) => Some(jsvalue_to_jit_i64(val)),
                     Err(_) => None,
                 };
             }
 
-            drop(heap);
+            let _ = heap;
             return None;
         }
 
@@ -2815,7 +2815,7 @@ pub(crate) mod jit_runtime {
                 };
             }
 
-            drop(heap);
+            let _ = heap;
             return None;
         }
 
