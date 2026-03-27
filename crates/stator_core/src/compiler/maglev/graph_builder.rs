@@ -312,6 +312,23 @@ impl<'a> GraphBuilder<'a> {
                 next_block_idx += 1;
             }
 
+            // Mark JumpLoop targets as loop headers so that `enter_block`
+            // creates Phi nodes for loop-carried variables.
+            if instr.opcode == Opcode::JumpLoop
+                && let Some(target) = maybe_target
+                && target < instr_count
+            {
+                // target == 0 maps to block 0 (the entry block).
+                let block_id = if target == 0 {
+                    0
+                } else if let Some(&bid) = self.block_at.get(&target) {
+                    bid
+                } else {
+                    continue;
+                };
+                self.loop_headers.insert(block_id);
+            }
+
             // For conditional jumps the fall-through (next instruction) is
             // also a new block boundary.
             if is_conditional_jump {
