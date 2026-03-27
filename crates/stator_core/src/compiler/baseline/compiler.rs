@@ -1921,7 +1921,7 @@ impl<'a> BaselineCompiler<'a> {
             self.masm.mov_ri(Reg64::R8, operand2);
 
             // Load trampoline address into R11 and call.
-            let trampoline_addr = jit_runtime::jit_runtime_trampoline as usize as i64;
+            let trampoline_addr = jit_runtime::jit_runtime_trampoline as *const () as usize as i64;
             self.masm.mov_ri(Reg64::R11, trampoline_addr);
             self.masm.call_reg(Reg64::R11);
 
@@ -1970,7 +1970,7 @@ impl<'a> BaselineCompiler<'a> {
             // RDX = feedback slot (reserved, zero for now).
             self.masm.xor_rr(Reg64::Rdx, Reg64::Rdx);
 
-            let addr = jit_runtime::jit_runtime_lda_named_property as usize as i64;
+            let addr = jit_runtime::jit_runtime_lda_named_property as *const () as usize as i64;
             self.masm.mov_ri(Reg64::R11, addr);
             self.masm.call_reg(Reg64::R11);
 
@@ -2012,7 +2012,8 @@ impl<'a> BaselineCompiler<'a> {
             self.masm
                 .mov_load_base_disp32(Reg64::Rdi, Reg64::R14, byte_offset);
 
-            let addr = jit_runtime::jit_runtime_call_undefined_receiver0 as usize as i64;
+            let addr =
+                jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize as i64;
             self.masm.mov_ri(Reg64::R11, addr);
             self.masm.call_reg(Reg64::R11);
 
@@ -2051,7 +2052,7 @@ impl<'a> BaselineCompiler<'a> {
             // RDI = name_idx (constant-pool index).
             self.masm.mov_ri(Reg64::Rdi, i64::from(name_idx));
 
-            let addr = jit_runtime::jit_runtime_lda_global as usize as i64;
+            let addr = jit_runtime::jit_runtime_lda_global as *const () as usize as i64;
             self.masm.mov_ri(Reg64::R11, addr);
             self.masm.call_reg(Reg64::R11);
 
@@ -2091,7 +2092,7 @@ impl<'a> BaselineCompiler<'a> {
             // RSI = accumulator value (the value to store).
             self.masm.mov_rr(Reg64::Rsi, Reg64::R12);
 
-            let addr = jit_runtime::jit_runtime_sta_global as usize as i64;
+            let addr = jit_runtime::jit_runtime_sta_global as *const () as usize as i64;
             self.masm.mov_ri(Reg64::R11, addr);
             self.masm.call_reg(Reg64::R11);
 
