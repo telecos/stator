@@ -3745,7 +3745,7 @@ impl Interpreter {
                                 pc -= 1;
                                 break 'smi;
                             }
-                            Opcode::LdaContextSlot => {
+                            Opcode::LdaContextSlot | Opcode::LdaImmutableContextSlot => {
                                 // Load from closure context — stay in SMI mode
                                 // if the loaded value is Smi.
                                 let ctx_reg = unsafe { operand_reg_unchecked(instr, 0) };
@@ -3774,6 +3774,7 @@ impl Interpreter {
                                     if let Some(val) = borrow.slots.get(slot) {
                                         if let JsValue::Smi(v) = val {
                                             sa = *v;
+                                            smi_acc_bool = false;
                                             continue 'smi;
                                         }
                                         // Non-Smi value — exit SMI mode.
@@ -3837,6 +3838,7 @@ impl Interpreter {
                                     if let Some(val) = borrow.slots.get(slot) {
                                         if let JsValue::Smi(v) = val {
                                             sa = *v;
+                                            smi_acc_bool = false;
                                             continue 'smi;
                                         }
                                         acc = val.clone();

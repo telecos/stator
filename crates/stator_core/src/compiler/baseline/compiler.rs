@@ -957,7 +957,7 @@ mod jit_runtime {
                 let receiver = jit_i64_to_jsvalue(receiver_i64);
                 match callee {
                     JsValue::NativeFunction(nf) => {
-                        let result = (nf.function)(&[receiver]);
+                        let result = nf(vec![receiver]);
                         match result {
                             Ok(val) => Some(jsvalue_to_jit_i64(val)),
                             Err(_) => None,
@@ -973,11 +973,13 @@ mod jit_runtime {
                 let lhs = jit_i64_to_jsvalue(acc);
                 match lhs {
                     JsValue::Smi(a) if rhs != 0 => {
-                        if a % (rhs as i64) == 0 {
-                            Some(jsvalue_to_jit_i64(JsValue::Smi(a / rhs as i64)))
+                        let a64 = i64::from(a);
+                        let r64 = i64::from(rhs);
+                        if a64 % r64 == 0 {
+                            Some(jsvalue_to_jit_i64(JsValue::Smi((a64 / r64) as i32)))
                         } else {
                             Some(jsvalue_to_jit_i64(JsValue::HeapNumber(
-                                a as f64 / rhs as f64,
+                                a64 as f64 / r64 as f64,
                             )))
                         }
                     }
@@ -989,9 +991,7 @@ mod jit_runtime {
                 let rhs = operand1 as i32;
                 let lhs = jit_i64_to_jsvalue(acc);
                 match lhs {
-                    JsValue::Smi(a) if rhs != 0 => {
-                        Some(jsvalue_to_jit_i64(JsValue::Smi(a % rhs as i64)))
-                    }
+                    JsValue::Smi(a) if rhs != 0 => Some(jsvalue_to_jit_i64(JsValue::Smi(a % rhs))),
                     _ => None,
                 }
             }
@@ -1011,7 +1011,7 @@ mod jit_runtime {
                 let arg0 = jit_i64_to_jsvalue(arg0_i64);
                 match callee {
                     JsValue::NativeFunction(nf) => {
-                        let result = (nf.function)(&[receiver, arg0]);
+                        let result = nf(vec![receiver, arg0]);
                         match result {
                             Ok(val) => Some(jsvalue_to_jit_i64(val)),
                             Err(_) => None,
