@@ -2506,12 +2506,12 @@ mod tests {
         let (arr, vec) = build(instrs, vec![], 0, 0, meta);
         let graph = GraphBuilder::build(&arr, &vec).unwrap();
         let block = graph.entry_block().unwrap();
-        // Uninitialized → GenericAdd
+        // Uninitialized feedback → CheckedSmiAdd (always Smi-guarded)
         assert!(
             block
                 .nodes
                 .iter()
-                .any(|(_, n)| matches!(n, ValueNode::GenericAdd { .. }))
+                .any(|(_, n)| matches!(n, ValueNode::CheckedSmiAdd { .. }))
         );
     }
 

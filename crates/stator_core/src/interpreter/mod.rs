@@ -1173,7 +1173,6 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
 ///   (fall-back to the next tier).
 ///
 /// On platforms where the JIT is not available this always returns `None`.
-#[allow(dead_code)]
 fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
@@ -1459,11 +1458,7 @@ pub(super) fn try_execute_best_jit(
     ba: &BytecodeArray,
     args: &[JsValue],
 ) -> Option<StatorResult<JsValue>> {
-    // Maglev execution disabled: 6/9 benchmarks hang due to codegen bugs
-    // (infinite loops in generated code).  Keep baseline JIT only until
-    // the Maglev codegen issues are resolved.
-    // try_execute_maglev(ba, args).or_else(|| try_execute_jit(ba, args))
-    try_execute_jit(ba, args)
+    try_execute_maglev(ba, args).or_else(|| try_execute_jit(ba, args))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

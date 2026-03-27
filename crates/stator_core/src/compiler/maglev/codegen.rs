@@ -1603,9 +1603,27 @@ impl<'a> MaglevCodegen<'a> {
             })
             .collect();
 
-        for (phi_id, src_id) in phi_ops {
-            self.emit_load(src_id, Reg64::R11);
-            self.emit_store(phi_id, Reg64::R11);
+        // Parallel-move: load ALL sources onto the stack first, then
+        // pop into destinations in reverse order.  This avoids the
+        // classic overwrite-before-read bug when a Phi destination
+        // coincides with another Phi's source location.
+        if phi_ops.len() <= 1 {
+            // Single or no Phi — no conflict possible.
+            for (phi_id, src_id) in &phi_ops {
+                self.emit_load(*src_id, Reg64::R11);
+                self.emit_store(*phi_id, Reg64::R11);
+            }
+        } else {
+            // Push all source values.
+            for (_phi_id, src_id) in &phi_ops {
+                self.emit_load(*src_id, Reg64::R11);
+                self.masm.push(Reg64::R11);
+            }
+            // Pop into destinations in reverse order.
+            for (phi_id, _src_id) in phi_ops.iter().rev() {
+                self.masm.pop(Reg64::R11);
+                self.emit_store(*phi_id, Reg64::R11);
+            }
         }
     }
 

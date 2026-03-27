@@ -681,6 +681,7 @@ fn is_known_smi_producer(node: &ValueNode) -> bool {
     matches!(
         node,
         ValueNode::SmiConstant { .. }
+            | ValueNode::Int32Constant { .. }
             | ValueNode::CheckedSmiAdd { .. }
             | ValueNode::CheckedSmiSubtract { .. }
             | ValueNode::CheckedSmiMultiply { .. }
