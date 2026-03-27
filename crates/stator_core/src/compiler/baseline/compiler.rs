@@ -169,7 +169,7 @@ pub(crate) mod jit_runtime {
     struct JitGlobalState {
         env: Option<Rc<RefCell<GlobalEnv>>>,
         /// Direct-mapped IC: `(name_idx, slot_index, generation)`.
-        ic: [(u32, usize, u64); 32],
+        ic: [(u32, usize, u64); 64],
     }
 
     thread_local! {
@@ -209,7 +209,7 @@ pub(crate) mod jit_runtime {
         static RT_GLOBAL: RefCell<JitGlobalState> = const {
             RefCell::new(JitGlobalState {
                 env: None,
-                ic: [(u32::MAX, 0, 0); 32],
+                ic: [(u32::MAX, 0, 0); 64],
             })
         };
 
@@ -314,7 +314,7 @@ pub(crate) mod jit_runtime {
                 return;
             }
             state.env = Some(env);
-            state.ic = [(u32::MAX, 0, 0); 32];
+            state.ic = [(u32::MAX, 0, 0); 64];
         });
     }
 
@@ -2048,7 +2048,7 @@ pub(crate) mod jit_runtime {
         let env = unsafe { &*env_rc.as_ptr() };
 
         // Fast path: direct-mapped IC hit.
-        let entry = &state.ic[(name_idx & 31) as usize];
+        let entry = &state.ic[(name_idx & 63) as usize];
         if entry.0 == name_idx {
             let (slot_idx, cached_gen) = (entry.1, entry.2);
             if env.generation() == cached_gen && slot_idx < env.slot_count() {
@@ -2068,7 +2068,7 @@ pub(crate) mod jit_runtime {
         let slot_idx = env.slot_index_for(&name);
         let cur_gen = env.generation();
         if let Some(idx) = slot_idx {
-            g.borrow_mut().ic[(name_idx & 31) as usize] = (name_idx, idx, cur_gen);
+            g.borrow_mut().ic[(name_idx & 63) as usize] = (name_idx, idx, cur_gen);
         }
 
         Some(result)
@@ -2117,7 +2117,7 @@ pub(crate) mod jit_runtime {
         let env = unsafe { &mut *env_rc.as_ptr() };
 
         // Fast path: direct-mapped IC hit — store by index.
-        let entry = &state.ic[(name_idx & 31) as usize];
+        let entry = &state.ic[(name_idx & 63) as usize];
         if entry.0 == name_idx {
             let (slot_idx, cached_gen) = (entry.1, entry.2);
             if env.generation() == cached_gen && slot_idx < env.slot_count() {
@@ -2141,7 +2141,7 @@ pub(crate) mod jit_runtime {
         let new_slot_idx = env.slot_index_for(&name);
         // SAFETY: single-threaded JIT; update IC via raw pointer.
         if let Some(idx) = new_slot_idx {
-            unsafe { (*g.as_ptr()).ic[(name_idx & 31) as usize] = (name_idx, idx, cur_gen) };
+            unsafe { (*g.as_ptr()).ic[(name_idx & 63) as usize] = (name_idx, idx, cur_gen) };
         }
 
         Some(value_i64)
