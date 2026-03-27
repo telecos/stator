@@ -1114,11 +1114,11 @@ mod jit_runtime {
                 });
 
                 if let Some(offset) = cached_offset {
-                    let val = map
-                        .get_by_offset(offset)
-                        .cloned()
-                        .unwrap_or(JsValue::Undefined);
-                    return Some(jsvalue_to_jit_i64(val));
+                    return Some(
+                        map.get_by_offset(offset)
+                            .map(jsvalue_ref_to_jit_i64)
+                            .unwrap_or(JIT_UNDEFINED),
+                    );
                 }
 
                 // ── IC miss: full lookup + cache update ─────────────────
@@ -1128,24 +1128,41 @@ mod jit_runtime {
                     RT_LDA_IC.with(|ic| {
                         ic.borrow_mut()[slot] = (name_idx, shape, offset);
                     });
-                    let val = map
-                        .get_by_offset(offset)
-                        .cloned()
-                        .unwrap_or(JsValue::Undefined);
-                    Some(jsvalue_to_jit_i64(val))
+                    Some(
+                        map.get_by_offset(offset)
+                            .map(jsvalue_ref_to_jit_i64)
+                            .unwrap_or(JIT_UNDEFINED),
+                    )
                 } else {
-                    Some(jsvalue_to_jit_i64(JsValue::Undefined))
+                    Some(JIT_UNDEFINED)
                 }
             }
             JsValue::Array(arr) => {
                 let prop_name = get_rt_string_constant(name_idx)?;
                 if prop_name == "length" {
-                    Some(jsvalue_to_jit_i64(JsValue::Smi(arr.borrow().len() as i32)))
+                    Some(arr.borrow().len() as i64)
                 } else {
-                    Some(jsvalue_to_jit_i64(JsValue::Undefined))
+                    Some(JIT_UNDEFINED)
                 }
             }
             _ => None,
+        }
+    }
+
+    /// Convert a `&JsValue` to JIT i64 *without* cloning when possible.
+    ///
+    /// Smi and Boolean values are encoded directly as i64 constants.
+    /// Other types fall back to [`jsvalue_to_jit_i64`] which clones and
+    /// allocates a heap handle.
+    #[inline]
+    fn jsvalue_ref_to_jit_i64(val: &JsValue) -> i64 {
+        match val {
+            JsValue::Smi(n) => i64::from(*n),
+            JsValue::Boolean(true) => JIT_TRUE,
+            JsValue::Boolean(false) => JIT_FALSE,
+            JsValue::Undefined => JIT_UNDEFINED,
+            JsValue::Null => JIT_NULL,
+            other => jsvalue_to_jit_i64(other.clone()),
         }
     }
 
@@ -1533,31 +1550,34 @@ mod jit_runtime {
         let obj = jit_i64_to_jsvalue(obj_i64);
         let key = jit_i64_to_jsvalue(key_i64);
 
-        let result = match (&obj, &key) {
+        match (&obj, &key) {
             (JsValue::Array(arr), JsValue::Smi(idx)) if *idx >= 0 => {
                 let i = *idx as usize;
                 let borrow = arr.borrow();
                 match borrow.get(i) {
-                    Some(v) if !matches!(v, JsValue::TheHole) => v.clone(),
-                    _ => JsValue::Undefined,
+                    Some(v) if !matches!(v, JsValue::TheHole) => Some(jsvalue_ref_to_jit_i64(v)),
+                    _ => Some(JIT_UNDEFINED),
                 }
             }
             (JsValue::PlainObject(map_rc), JsValue::Smi(idx)) if *idx >= 0 => {
                 let key_str = idx.to_string();
+                Some(
+                    map_rc
+                        .borrow()
+                        .get(&key_str)
+                        .map(jsvalue_ref_to_jit_i64)
+                        .unwrap_or(JIT_UNDEFINED),
+                )
+            }
+            (JsValue::PlainObject(map_rc), JsValue::String(s)) => Some(
                 map_rc
                     .borrow()
-                    .get(&key_str)
-                    .cloned()
-                    .unwrap_or(JsValue::Undefined)
-            }
-            (JsValue::PlainObject(map_rc), JsValue::String(s)) => map_rc
-                .borrow()
-                .get(&**s)
-                .cloned()
-                .unwrap_or(JsValue::Undefined),
-            _ => return None,
-        };
-        Some(jsvalue_to_jit_i64(result))
+                    .get(&**s)
+                    .map(jsvalue_ref_to_jit_i64)
+                    .unwrap_or(JIT_UNDEFINED),
+            ),
+            _ => None,
+        }
     }
 
     // ── Specialized StaKeyedProperty stub ───────────────────────────────
@@ -1628,12 +1648,12 @@ mod jit_runtime {
                 let ctx_opt = ctx_cell.borrow();
                 let ctx_rc = ctx_opt.as_ref()?;
                 let ctx = ctx_rc.borrow();
-                let value = ctx
-                    .slots
-                    .get(slot_idx as usize)
-                    .cloned()
-                    .unwrap_or(JsValue::Undefined);
-                Some(jsvalue_to_jit_i64(value))
+                Some(
+                    ctx.slots
+                        .get(slot_idx as usize)
+                        .map(jsvalue_ref_to_jit_i64)
+                        .unwrap_or(JIT_UNDEFINED),
+                )
             })
             .unwrap_or(JIT_DEOPT)
     }
