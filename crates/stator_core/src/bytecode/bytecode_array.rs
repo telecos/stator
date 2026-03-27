@@ -298,6 +298,19 @@ type DecodedBytecodeCache = Rc<OnceCell<Rc<DecodedBytecode>>>;
 /// the main thread.
 pub type MaglevJitCodeCache = Arc<Mutex<Option<(Vec<u8>, usize)>>>;
 
+/// Persistent executable Maglev code cache shared among clones of a
+/// [`BytecodeArray`].
+///
+/// On x86-64 Unix, this wraps a [`CachedMaglevCode`] that keeps a
+/// persistent `mmap`'d page.  Lazily initialised from the raw code bytes
+/// in [`MaglevJitCodeCache`] on first execution.
+#[cfg(all(target_arch = "x86_64", unix))]
+pub type MaglevExecutableCache =
+    Rc<RefCell<Option<crate::compiler::maglev::codegen::CachedMaglevCode>>>;
+/// Stub type for platforms without JIT support.
+#[cfg(not(all(target_arch = "x86_64", unix)))]
+pub type MaglevExecutableCache = Rc<RefCell<Option<()>>>;
+
 /// Shared Turbofan JIT code cache stored in a [`BytecodeArray`].
 ///
 /// Stores a fully-compiled [`TurbofanCompiledCode`] produced by the Turbofan
@@ -436,6 +449,11 @@ pub struct BytecodeArray {
     /// can write results while the interpreter runs on the main thread.
     /// `None` until Maglev compilation finishes successfully.
     maglev_jit_code: MaglevJitCodeCache,
+    /// Persistent executable Maglev code cache.
+    ///
+    /// Lazily initialised on first Maglev execution from the raw code bytes
+    /// in [`maglev_jit_code`].  Avoids `mmap`/`munmap` per call.
+    maglev_executable: MaglevExecutableCache,
     /// Set to `true` (via compare-exchange) when a Maglev compilation has been
     /// scheduled so that only one background thread is spawned per function.
     maglev_compile_started: Arc<AtomicBool>,
@@ -635,6 +653,7 @@ impl BytecodeArray {
             jit_code: Rc::new(RefCell::new(None)),
             jit_executable: Rc::new(RefCell::new(None)),
             maglev_jit_code: Arc::new(Mutex::new(None)),
+            maglev_executable: Rc::new(RefCell::new(None)),
             maglev_compile_started: Arc::new(AtomicBool::new(false)),
             turbofan_jit_code: Arc::new(Mutex::new(None)),
             turbofan_compile_started: Arc::new(AtomicBool::new(false)),
@@ -1219,6 +1238,14 @@ impl BytecodeArray {
     /// Subsequent calls return the cached executable code directly.
     pub fn jit_executable_cache(&self) -> &JitExecutableCache {
         &self.jit_executable
+    }
+
+    /// Returns a reference to the cached Maglev executable code.
+    ///
+    /// The cache is lazily initialised on first Maglev execution from the raw
+    /// compiled code bytes.
+    pub fn maglev_executable_cache(&self) -> &MaglevExecutableCache {
+        &self.maglev_executable
     }
 
     /// Returns `true` if baseline JIT code has deopted at least once,

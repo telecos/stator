@@ -1073,29 +1073,36 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
 fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
-        use crate::compiler::baseline::compiler::jit_to_jsvalue;
-        use crate::compiler::maglev::codegen::MaglevCompiledCode;
+        use crate::compiler::baseline::compiler::{JIT_DEOPT, jit_to_jsvalue};
+        use crate::compiler::maglev::codegen::CachedMaglevCode;
 
-        let (code, register_file_slots) = ba.try_get_maglev_jit_code()?;
+        let cache = ba.maglev_executable_cache();
+
+        // Lazily initialise the cached executable from raw code bytes.
+        {
+            let needs_init = cache.borrow().is_none();
+            if needs_init {
+                if let Some((code, register_file_slots)) = ba.try_get_maglev_jit_code() {
+                    // SAFETY: `code` was produced by `maglev_codegen::compile`.
+                    let exec = unsafe { CachedMaglevCode::new(&code, register_file_slots) };
+                    *cache.borrow_mut() = exec;
+                }
+            }
+        }
+
+        let guard = cache.borrow();
+        let cached = guard.as_ref()?;
+
         let jit_args: Option<Vec<i64>> = args.iter().map(jsvalue_to_jit).collect();
         let jit_args = jit_args?;
-        let native_code_len: usize = code.len();
-        let mc = MaglevCompiledCode {
-            code,
-            native_code_len,
-            register_file_slots,
-            safepoints: Vec::new(),
-            deopt_entries: Vec::new(),
-            source_positions: Vec::new(),
-        };
-        // SAFETY: `mc.code` was produced by `maglev_codegen::compile` and
-        // contains valid x86-64 machine code following the JIT calling
-        // convention (`extern "C" fn(*mut i64) -> i64`).
-        return match unsafe { mc.execute(&jit_args) } {
-            Ok(v) => jit_to_jsvalue(v).map(Ok),
-            // JIT_DEOPT or unrecognised sentinel → fall back to baseline / interpreter.
-            Err(_) => None,
-        };
+
+        // SAFETY: The cached code was produced by `maglev_codegen::compile`.
+        let result = unsafe { cached.execute(&jit_args) };
+
+        if result == JIT_DEOPT {
+            return None;
+        }
+        return jit_to_jsvalue(result).map(Ok);
     }
     #[allow(unreachable_code)]
     let _ = (ba, args);

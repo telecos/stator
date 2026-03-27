@@ -222,6 +222,112 @@ impl MaglevCompiledCode {
     }
 }
 
+/// Persistent executable Maglev code cache.
+///
+/// Unlike [`MaglevCompiledCode::execute`] which does `mmap`/`munmap` on every
+/// call, this struct keeps the executable page alive for the lifetime of the
+/// cache entry.  A thread-local register file is reused across calls to
+/// eliminate per-call heap allocation.
+#[cfg(all(target_arch = "x86_64", unix))]
+pub struct CachedMaglevCode {
+    ptr: *mut u8,
+    size: usize,
+    /// Total number of `i64` slots in the register file.
+    pub register_file_slots: usize,
+}
+
+// SAFETY: The mmap'd page is process-global memory.  We only access it
+// through an `extern "C"` function-pointer call, which is thread-safe as
+// long as the code is read-only (which it is after the initial memcpy).
+#[cfg(all(target_arch = "x86_64", unix))]
+unsafe impl Send for CachedMaglevCode {}
+#[cfg(all(target_arch = "x86_64", unix))]
+unsafe impl Sync for CachedMaglevCode {}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+impl CachedMaglevCode {
+    /// Create a new cached Maglev code entry from a compiled code buffer.
+    ///
+    /// Returns `None` if the code is empty or `mmap` fails.
+    ///
+    /// # Safety
+    ///
+    /// `code` must contain valid x86-64 machine code produced by
+    /// [`compile`].
+    pub unsafe fn new(code: &[u8], register_file_slots: usize) -> Option<Self> {
+        use std::ptr;
+
+        if code.is_empty() {
+            return None;
+        }
+
+        // SAFETY: arguments are valid; MAP_FAILED is checked before use.
+        let mem = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                code.len(),
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if mem == libc::MAP_FAILED {
+            return None;
+        }
+
+        // SAFETY: `mem` is valid for `code.len()` bytes.
+        unsafe {
+            ptr::copy_nonoverlapping(code.as_ptr(), mem.cast::<u8>(), code.len());
+        }
+
+        Some(Self {
+            ptr: mem.cast::<u8>(),
+            size: code.len(),
+            register_file_slots,
+        })
+    }
+
+    /// Execute the cached Maglev code with the given arguments.
+    ///
+    /// Uses a thread-local register file pool to avoid per-call allocation.
+    ///
+    /// # Safety
+    ///
+    /// The cached code must be valid x86-64 machine code.
+    pub unsafe fn execute(&self, args: &[i64]) -> i64 {
+        thread_local! {
+            static MAGLEV_REG_FILE: std::cell::RefCell<Vec<i64>> = const {
+                std::cell::RefCell::new(Vec::new())
+            };
+        }
+
+        MAGLEV_REG_FILE.with(|pool| {
+            let mut regs = pool.borrow_mut();
+            let n = self.register_file_slots;
+            regs.clear();
+            regs.resize(n, 0);
+            for (i, &v) in args.iter().enumerate().take(n) {
+                regs[i] = v;
+            }
+
+            // SAFETY: `self.ptr` holds valid x86-64 machine code.
+            let f: extern "C" fn(*mut i64) -> i64 = unsafe { std::mem::transmute(self.ptr) };
+            f(regs.as_mut_ptr())
+        })
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+impl Drop for CachedMaglevCode {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` is a valid mmap'd region of `self.size` bytes.
+        unsafe {
+            libc::munmap(self.ptr.cast(), self.size);
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Physical register mapping
 // ─────────────────────────────────────────────────────────────────────────────
