@@ -815,6 +815,12 @@ thread_local! {
     /// How many times the Maglev cache was empty and background compilation
     /// had not yet delivered code.
     static MAGLEV_DIAG_NOT_READY: Cell<u64> = const { Cell::new(0) };
+    /// Flag set while Maglev-generated code is executing, so stubs can
+    /// detect context.
+    static MAGLEV_EXECUTING: Cell<bool> = const { Cell::new(false) };
+    /// How many times `jit_runtime_lda_global` returned `JIT_DEOPT` during
+    /// Maglev execution.
+    static MAGLEV_DIAG_GLOBAL_DEOPT: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Set a wall-clock deadline for all interpreter execution on the current
@@ -827,6 +833,21 @@ pub fn set_execution_deadline(deadline: Option<Instant>) {
 pub fn get_execution_deadline() -> Option<Instant> {
     EXECUTION_DEADLINE.with(|d| d.get())
 }
+
+/// Increment the Maglev global-load deopt counter (called from
+/// [`jit_runtime_lda_global`] when it returns `JIT_DEOPT`).
+#[cfg(all(target_arch = "x86_64", unix))]
+pub fn maglev_track_global_deopt() {
+    MAGLEV_EXECUTING.with(|f| {
+        if f.get() {
+            MAGLEV_DIAG_GLOBAL_DEOPT.with(|c| c.set(c.get() + 1));
+        }
+    });
+}
+
+/// Stub for non-JIT platforms.
+#[cfg(not(all(target_arch = "x86_64", unix)))]
+pub fn maglev_track_global_deopt() {}
 
 /// Process-wide count of successful Maglev compilations.
 ///
@@ -1222,11 +1243,23 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
             jit_runtime_set_context(ctx);
         }
 
+        // Mark that we are executing Maglev code so stubs can track deopts.
+        MAGLEV_EXECUTING.with(|f| f.set(true));
+
         // SAFETY: The cached code was produced by `maglev_codegen::compile`.
         let result = unsafe { cached.execute(&jit_args) };
 
+        MAGLEV_EXECUTING.with(|f| f.set(false));
+
         let ret = if result == JIT_DEOPT {
             MAGLEV_DIAG_DEOPTED.with(|c| c.set(c.get() + 1));
+            let global_deopts = MAGLEV_DIAG_GLOBAL_DEOPT.with(|c| c.get());
+            eprintln!(
+                "MAGLEV_DEOPT: bc_len={} global_deopts={} result=0x{:x}",
+                ba.bytecodes().len(),
+                global_deopts,
+                result as u64,
+            );
             ba.mark_jit_maglev_deopted();
             None
         } else {

@@ -2055,7 +2055,13 @@ pub(crate) mod jit_runtime {
     ///
     /// Returns the variable value as `i64` in `RAX`, or [`JIT_DEOPT`].
     pub extern "C" fn jit_runtime_lda_global(name_idx: i64) -> i64 {
-        lda_global_inner(name_idx as u32).unwrap_or(JIT_DEOPT)
+        let result = lda_global_inner(name_idx as u32).unwrap_or(JIT_DEOPT);
+        if result == JIT_DEOPT {
+            // Track global-load failures during Maglev execution for
+            // diagnostics.
+            crate::interpreter::maglev_track_global_deopt();
+        }
+        result
     }
 
     /// Inner implementation for [`jit_runtime_lda_global`].
@@ -2847,7 +2853,14 @@ pub(crate) mod jit_runtime {
         if ctx_raw == 0 {
             return JIT_DEOPT;
         }
-        let value = jit_i64_to_jsvalue(value_i64);
+        // Fast path: decode Smi inline (most common case for counters,
+        // loop variables, etc.) to avoid the 4 magic-constant comparisons
+        // in `jit_i64_to_jsvalue`.
+        let value = if value_i64 >= i32::MIN as i64 && value_i64 <= i32::MAX as i64 {
+            JsValue::Smi(value_i64 as i32)
+        } else {
+            jit_i64_to_jsvalue(value_i64)
+        };
         // SAFETY: single-threaded JIT; no concurrent borrows during
         // context slot store.
         let ctx_ref = unsafe { &*(ctx_raw as *const RefCell<JsContext>) };
