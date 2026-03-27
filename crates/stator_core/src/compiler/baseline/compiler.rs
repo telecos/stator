@@ -1498,9 +1498,10 @@ pub(crate) mod jit_runtime {
     ) -> Option<i64> {
         // ── Fast path: exec cache already populated ─────────────────
         // On the second+ call, skip the compilation and init checks.
+        // SAFETY: single-threaded JIT; no concurrent borrows of exec cache.
         let exec_cache = ba.jit_executable_cache();
         {
-            let cache_ref = exec_cache.borrow();
+            let cache_ref = unsafe { &*exec_cache.as_ptr() };
             if let Some(exec) = cache_ref.as_ref() {
                 return exec_jit_callee(ba, exec, jit_args, saved_ba);
             }
@@ -1553,12 +1554,16 @@ pub(crate) mod jit_runtime {
             // SAFETY: cached pointers point to thread-local storage that
             // outlives this function call.  Single-threaded access is
             // guaranteed because JIT stubs only run on the interpreter
-            // thread.
+            // thread.  We bypass RefCell borrow checks here because:
+            // 1. No concurrent mutable borrows exist during JIT execution
+            // 2. The heap/context are only accessed from this thread
+            // 3. This eliminates ~4 RefCell borrows per closure call
             let heap_ref = unsafe { &*ptrs.heap };
             let ctx_ref = unsafe { &*ptrs.context };
             let bc_ref = unsafe { &*ptrs.bytecode };
 
-            let heap_base = heap_ref.borrow().len();
+            // SAFETY: no active borrows; read length via raw pointer.
+            let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
 
             let callee_ctx = ba.closure_context().cloned();
             let ctx_ptr = callee_ctx
@@ -1566,7 +1571,8 @@ pub(crate) mod jit_runtime {
                 .map(|rc| Rc::as_ptr(rc) as i64)
                 .unwrap_or(0);
 
-            let saved_ctx = std::mem::replace(&mut *ctx_ref.borrow_mut(), callee_ctx);
+            // SAFETY: no active borrows; swap context via raw pointer.
+            let saved_ctx = unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx) };
             bc_ref.set(&**ba as *const BytecodeArray);
 
             // SAFETY: cached executable code was produced by the
@@ -1580,8 +1586,9 @@ pub(crate) mod jit_runtime {
             };
 
             bc_ref.set(saved_ba);
-            heap_ref.borrow_mut().truncate(heap_base);
-            *ctx_ref.borrow_mut() = saved_ctx;
+            // SAFETY: no active borrows; truncate/restore via raw pointer.
+            unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+            unsafe { *ctx_ref.as_ptr() = saved_ctx };
 
             return result_val.map(jsvalue_to_jit_i64);
         }
@@ -1747,16 +1754,15 @@ pub(crate) mod jit_runtime {
             if callee_i64 >= JIT_HEAP_TAG {
                 let idx = (callee_i64 - JIT_HEAP_TAG) as usize;
                 let heap_ref = unsafe { &*ptrs.heap };
-                let heap = heap_ref.borrow();
+                // SAFETY: no concurrent mutable borrows; single-threaded JIT.
+                let heap = unsafe { &*heap_ref.as_ptr() };
                 match heap.get(idx) {
                     Some(JsValue::Function(ba)) => {
                         let ba = Rc::clone(ba);
-                        drop(heap);
                         return call_js_function(&ba, vec![], &[], saved_ba);
                     }
                     Some(JsValue::NativeFunction(f)) => {
                         let f = Rc::clone(f);
-                        drop(heap);
                         let result = f(vec![]);
                         bc_ref.set(saved_ba);
                         return match result {
@@ -1765,7 +1771,6 @@ pub(crate) mod jit_runtime {
                         };
                     }
                     _ => {
-                        drop(heap);
                         bc_ref.set(saved_ba);
                         return None;
                     }
@@ -1826,17 +1831,16 @@ pub(crate) mod jit_runtime {
             if callee_i64 >= JIT_HEAP_TAG {
                 let idx = (callee_i64 - JIT_HEAP_TAG) as usize;
                 let heap_ref = unsafe { &*ptrs.heap };
-                let heap = heap_ref.borrow();
+                // SAFETY: no concurrent mutable borrows; single-threaded JIT.
+                let heap = unsafe { &*heap_ref.as_ptr() };
                 match heap.get(idx) {
                     Some(JsValue::Function(ba)) => {
                         let ba = Rc::clone(ba);
-                        drop(heap);
                         let arg0 = jit_i64_to_jsvalue(arg0_i64);
                         return call_js_function(&ba, vec![arg0], &[arg0_i64], saved_ba);
                     }
                     Some(JsValue::NativeFunction(f)) => {
                         let f = Rc::clone(f);
-                        drop(heap);
                         let arg0 = jit_i64_to_jsvalue(arg0_i64);
                         let result = f(vec![arg0]);
                         bc_ref.set(saved_ba);
@@ -1846,7 +1850,6 @@ pub(crate) mod jit_runtime {
                         };
                     }
                     _ => {
-                        drop(heap);
                         bc_ref.set(saved_ba);
                         return None;
                     }
@@ -1905,11 +1908,11 @@ pub(crate) mod jit_runtime {
             if callee_i64 >= JIT_HEAP_TAG {
                 let idx = (callee_i64 - JIT_HEAP_TAG) as usize;
                 let heap_ref = unsafe { &*ptrs.heap };
-                let heap = heap_ref.borrow();
+                // SAFETY: no concurrent mutable borrows; single-threaded JIT.
+                let heap = unsafe { &*heap_ref.as_ptr() };
                 match heap.get(idx) {
                     Some(JsValue::Function(ba)) => {
                         let ba = Rc::clone(ba);
-                        drop(heap);
                         let arg0 = jit_i64_to_jsvalue(arg0_i64);
                         let arg1 = jit_i64_to_jsvalue(arg1_i64);
                         return call_js_function(
@@ -1921,7 +1924,6 @@ pub(crate) mod jit_runtime {
                     }
                     Some(JsValue::NativeFunction(f)) => {
                         let f = Rc::clone(f);
-                        drop(heap);
                         let arg0 = jit_i64_to_jsvalue(arg0_i64);
                         let arg1 = jit_i64_to_jsvalue(arg1_i64);
                         let result = f(vec![arg0, arg1]);
@@ -1932,7 +1934,6 @@ pub(crate) mod jit_runtime {
                         };
                     }
                     _ => {
-                        drop(heap);
                         bc_ref.set(saved_ba);
                         return None;
                     }

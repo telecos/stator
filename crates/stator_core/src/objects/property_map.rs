@@ -75,6 +75,11 @@ const PROPERTY_STORAGE_POOL_CAP: usize = 64;
 /// Avoid retaining very large backing allocations in the pool.
 const MAX_POOLED_PROPERTY_CAPACITY: usize = SMALL_PROPERTY_LINEAR_SCAN_CAP * 4;
 
+/// Objects with this many properties or fewer bypass the TLS pool entirely.
+/// The cost of a TLS lookup + RefCell borrow + linear scan exceeds the cost
+/// of three small Vec allocations for tiny objects.
+const POOL_BYPASS_CAP: usize = 6;
+
 thread_local! {
     static PROPERTY_STORAGE_POOL: RefCell<Vec<PropertyStorageBuffers>> =
         RefCell::new(Vec::with_capacity(PROPERTY_STORAGE_POOL_CAP));
@@ -95,6 +100,16 @@ enum PropertyIndex {
 }
 
 fn acquire_storage_buffers(capacity: usize) -> PropertyStorageBuffers {
+    // Fast path: skip TLS pool lookup for small objects — three tiny Vec
+    // allocations are cheaper than TLS + RefCell + linear pool scan.
+    if capacity <= POOL_BYPASS_CAP {
+        return PropertyStorageBuffers {
+            keys: Vec::with_capacity(capacity),
+            values: Vec::with_capacity(capacity),
+            attrs: Vec::with_capacity(capacity),
+        };
+    }
+
     PROPERTY_STORAGE_POOL
         .try_with(|pool| {
             let mut pool = pool.borrow_mut();
@@ -124,6 +139,14 @@ fn acquire_storage_buffers(capacity: usize) -> PropertyStorageBuffers {
 }
 
 fn release_storage_buffers(mut buffers: PropertyStorageBuffers) {
+    // Fast path: small buffers were allocated outside the pool — just drop them.
+    if buffers.keys.capacity() <= POOL_BYPASS_CAP
+        && buffers.values.capacity() <= POOL_BYPASS_CAP
+        && buffers.attrs.capacity() <= POOL_BYPASS_CAP
+    {
+        return;
+    }
+
     if buffers.keys.capacity() > MAX_POOLED_PROPERTY_CAPACITY
         || buffers.values.capacity() > MAX_POOLED_PROPERTY_CAPACITY
         || buffers.attrs.capacity() > MAX_POOLED_PROPERTY_CAPACITY
@@ -1135,6 +1158,15 @@ impl Default for PropertyMap {
 
 impl Drop for PropertyMap {
     fn drop(&mut self) {
+        // Fast path: small objects never entered the pool — let the Vecs
+        // drop naturally without TLS overhead.
+        if self.keys.capacity() <= POOL_BYPASS_CAP
+            && self.values.capacity() <= POOL_BYPASS_CAP
+            && self.attrs.capacity() <= POOL_BYPASS_CAP
+        {
+            return;
+        }
+
         let buffers = PropertyStorageBuffers {
             keys: std::mem::take(&mut self.keys),
             values: std::mem::take(&mut self.values),
