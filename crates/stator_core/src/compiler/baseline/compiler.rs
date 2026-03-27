@@ -3117,8 +3117,8 @@ pub(crate) mod jit_runtime {
 
 #[cfg(all(target_arch = "x86_64", unix))]
 pub use jit_runtime::{
-    jit_runtime_set_context, jit_runtime_set_global_env, jit_runtime_setup, jit_runtime_teardown,
-    jit_to_jsvalue_ext,
+    alloc_jit_heap_handle, jit_runtime_set_context, jit_runtime_set_global_env, jit_runtime_setup,
+    jit_runtime_teardown, jit_to_jsvalue_ext,
 };
 
 /// A single entry in the safepoint table.
