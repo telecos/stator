@@ -149,6 +149,29 @@ mod jit_runtime {
     use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
     use crate::objects::value::{JsContext, JsValue};
 
+    /// Combined inline caches for named-property stubs.
+    ///
+    /// Merging the LDA and prototype ICs into one TLS variable saves
+    /// one `thread_local!` lookup on the IC-miss path (where both
+    /// caches are probed sequentially).
+    struct JitPropertyIcState {
+        /// Own-property IC: `(name_idx, shape_id, offset)`.
+        /// Direct-mapped by `name_idx & 63`.
+        lda: [(u32, u64, usize); 64],
+        /// Prototype-chain IC: `(name_idx, own_shape_id, cached_value)`.
+        /// Direct-mapped by `name_idx & 15`.
+        proto: [(u32, u64, i64); 16],
+    }
+
+    /// Combined global-environment + inline-cache state for
+    /// `LdaGlobal`/`StaGlobal` stubs.  Stored in a single
+    /// `thread_local!` to save one TLS lookup per global access.
+    struct JitGlobalState {
+        env: Option<Rc<RefCell<GlobalEnv>>>,
+        /// Direct-mapped IC: `(name_idx, slot_index, generation)`.
+        ic: [(u32, usize, u64); 32],
+    }
+
     thread_local! {
         /// Raw pointer to the [`BytecodeArray`] of the currently-executing
         /// JIT function.  Set by [`jit_runtime_setup`], cleared by
@@ -167,27 +190,28 @@ mod jit_runtime {
         /// stores `JIT_HEAP_TAG + index` as a handle.
         static RT_HEAP: RefCell<Vec<JsValue>> = const { RefCell::new(Vec::new()) };
 
-        /// Simple inline cache for [`jit_runtime_lda_named_property`].
-        ///
-        /// Each entry maps a constant-pool name index to the shape at the
-        /// time of the last lookup and the slot offset within that shape.
-        /// Cleared by [`jit_runtime_setup`] to prevent cross-function
-        /// constant-pool index collisions.
-        ///
-        /// Direct-mapped by `name_idx & 63`; each entry stores
-        /// `(name_idx, shape_id, offset)`.  A sentinel `name_idx` of
-        /// `u32::MAX` marks an empty slot.
-        static RT_LDA_IC: RefCell<[(u32, u64, usize); 64]> = const { RefCell::new([(u32::MAX, 0, 0); 64]) };
+        /// Combined own-property + prototype inline caches for
+        /// `LdaNamedProperty` stubs.  Cleared by [`jit_runtime_setup`]
+        /// to prevent cross-function constant-pool index collisions.
+        static RT_PROP_IC: RefCell<JitPropertyIcState> = const {
+            RefCell::new(JitPropertyIcState {
+                lda: [(u32::MAX, 0, 0); 64],
+                proto: [(u32::MAX, 0, 0); 16],
+            })
+        };
 
-        /// Reference to the global environment for `LdaGlobal`/`StaGlobal`
+        /// Combined global environment + IC for `LdaGlobal`/`StaGlobal`
         /// runtime stubs.  Set once via [`jit_runtime_set_global_env`] at
         /// the top of `run_dispatch` and reused by all JIT calls within
-        /// that execution.
-        static RT_GLOBAL_ENV: RefCell<Option<Rc<RefCell<GlobalEnv>>>> = const { RefCell::new(None) };
-
-        /// Direct-mapped inline cache for `LdaGlobal`/`StaGlobal`:
-        /// indexed by `name_idx & 31`, stores `(name_idx, slot_index, generation)`.
-        static RT_GLOBAL_IC: RefCell<[(u32, usize, u64); 32]> = const { RefCell::new([(u32::MAX, 0, 0); 32]) };
+        /// that execution.  Merging the IC array into the same TLS
+        /// variable saves one `thread_local!` lookup per global access on
+        /// the IC-hit path.
+        static RT_GLOBAL: RefCell<JitGlobalState> = const {
+            RefCell::new(JitGlobalState {
+                env: None,
+                ic: [(u32::MAX, 0, 0); 32],
+            })
+        };
 
         /// Reference to the current closure context for
         /// `LdaCurrentContextSlot`/`StaCurrentContextSlot` stubs.
@@ -195,15 +219,6 @@ mod jit_runtime {
         /// closures.
         static RT_CONTEXT: RefCell<Option<Rc<RefCell<JsContext>>>> = const { RefCell::new(None) };
 
-        /// Direct-mapped inline cache for prototype chain lookups.
-        ///
-        /// Indexed by `name_idx & 15`; each entry stores
-        /// `(name_idx, own_shape_id, cached_jit_i64_value)`.  When a
-        /// named property is resolved through the prototype chain, the
-        /// result is cached here so subsequent accesses skip the chain
-        /// walk.  A sentinel `name_idx` of `u32::MAX` marks an empty
-        /// slot.
-        static RT_PROTO_IC: RefCell<[(u32, u64, i64); 16]> = const { RefCell::new([(u32::MAX, 0, 0); 16]) };
     }
 
     // ── Setup / teardown ─────────────────────────────────────────────────
@@ -215,7 +230,11 @@ mod jit_runtime {
     pub fn jit_runtime_setup(ba: &BytecodeArray) {
         RT_BYTECODE.with(|b| b.set(ba as *const BytecodeArray));
         RT_HEAP.with(|h| h.borrow_mut().clear());
-        RT_LDA_IC.with(|ic| *ic.borrow_mut() = [(u32::MAX, 0, 0); 64]);
+        RT_PROP_IC.with(|ic| {
+            let mut c = ic.borrow_mut();
+            c.lda = [(u32::MAX, 0, 0); 64];
+            c.proto = [(u32::MAX, 0, 0); 16];
+        });
     }
 
     /// Set the global environment for `LdaGlobal`/`StaGlobal` stubs.
@@ -230,26 +249,32 @@ mod jit_runtime {
     /// one (pointer-equal), the direct-mapped IC is kept warm — avoiding
     /// cold-start IC misses on every criterion iteration.
     pub fn jit_runtime_set_global_env(env: Rc<RefCell<GlobalEnv>>) {
-        RT_GLOBAL_ENV.with(|g| {
-            let mut slot = g.borrow_mut();
-            let same_env = slot.as_ref().map_or(false, |old| Rc::ptr_eq(old, &env));
+        RT_GLOBAL.with(|g| {
+            let mut state = g.borrow_mut();
+            let same_env = state
+                .env
+                .as_ref()
+                .map_or(false, |old| Rc::ptr_eq(old, &env));
             if same_env {
                 return;
             }
-            *slot = Some(env);
-            drop(slot);
-            RT_GLOBAL_IC.with(|ic| *ic.borrow_mut() = [(u32::MAX, 0, 0); 32]);
+            state.env = Some(env);
+            state.ic = [(u32::MAX, 0, 0); 32];
         });
     }
 
     /// Clean up thread-local state after JIT execution.
     ///
-    /// Note: does NOT clear `RT_GLOBAL_ENV` — it persists across JIT
+    /// Note: does NOT clear `RT_GLOBAL` — it persists across JIT
     /// calls within a single `run_dispatch` invocation.
     pub fn jit_runtime_teardown() {
         RT_BYTECODE.with(|b| b.set(std::ptr::null()));
         RT_HEAP.with(|h| h.borrow_mut().clear());
-        RT_LDA_IC.with(|ic| *ic.borrow_mut() = [(u32::MAX, 0, 0); 64]);
+        RT_PROP_IC.with(|ic| {
+            let mut c = ic.borrow_mut();
+            c.lda = [(u32::MAX, 0, 0); 64];
+            c.proto = [(u32::MAX, 0, 0); 16];
+        });
     }
 
     /// Set the current closure context for context-slot stubs.
@@ -1151,19 +1176,29 @@ mod jit_runtime {
                 let map = map_rc.borrow();
                 let shape = map.shape_id();
 
-                // ── IC fast path: direct-mapped by name_idx ─────────────
-                let slot = (name_idx & 63) as usize;
-                let cached_offset = RT_LDA_IC.with(|ic| {
+                // ── Single TLS access for both IC caches ────────────────
+                let lda_slot = (name_idx & 63) as usize;
+                let ic_result = RT_PROP_IC.with(|ic| {
                     let cache = ic.borrow();
-                    let entry = &cache[slot];
-                    if entry.0 == name_idx && entry.1 == shape {
-                        Some(entry.2)
-                    } else {
-                        None
+
+                    // ── Own-property IC fast path ───────────────────────
+                    let lda_entry = &cache.lda[lda_slot];
+                    if lda_entry.0 == name_idx && lda_entry.1 == shape {
+                        return (Some(lda_entry.2), None);
                     }
+
+                    // ── Prototype IC fast path (on own-property miss) ───
+                    let proto_slot = (name_idx & 15) as usize;
+                    let proto_entry = &cache.proto[proto_slot];
+                    if proto_entry.0 == name_idx && proto_entry.1 == shape {
+                        return (None, Some(proto_entry.2));
+                    }
+
+                    (None, None)
                 });
 
-                if let Some(offset) = cached_offset {
+                // Own-property IC hit → return directly.
+                if let (Some(offset), _) = ic_result {
                     return Some(
                         map.get_by_offset(offset)
                             .map(jsvalue_ref_to_jit_i64)
@@ -1171,12 +1206,17 @@ mod jit_runtime {
                     );
                 }
 
+                // Prototype IC hit → return cached value.
+                if let (_, Some(val)) = ic_result {
+                    return Some(val);
+                }
+
                 // ── IC miss: full lookup + cache update ─────────────────
                 let prop_name = get_rt_string_constant(name_idx)?;
 
                 if let Some(offset) = map.offset_of(&prop_name) {
-                    RT_LDA_IC.with(|ic| {
-                        ic.borrow_mut()[slot] = (name_idx, shape, offset);
+                    RT_PROP_IC.with(|ic| {
+                        ic.borrow_mut().lda[lda_slot] = (name_idx, shape, offset);
                     });
                     Some(
                         map.get_by_offset(offset)
@@ -1184,21 +1224,6 @@ mod jit_runtime {
                             .unwrap_or(JIT_UNDEFINED),
                     )
                 } else {
-                    // ── Prototype IC fast path ──────────────────────────
-                    let proto_slot = (name_idx & 15) as usize;
-                    let proto_cached = RT_PROTO_IC.with(|ic| {
-                        let cache = ic.borrow();
-                        let entry = &cache[proto_slot];
-                        if entry.0 == name_idx && entry.1 == shape {
-                            Some(entry.2)
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some(val) = proto_cached {
-                        return Some(val);
-                    }
-
                     // Not on own object — walk the prototype chain.
                     let proto = map
                         .get(INTERNAL_PROTO_PROPERTY_KEY)
@@ -1208,8 +1233,9 @@ mod jit_runtime {
                     let result = jit_proto_chain_walk(proto.as_ref(), &prop_name);
 
                     // Cache the resolved prototype value.
-                    RT_PROTO_IC.with(|ic| {
-                        ic.borrow_mut()[proto_slot] = (name_idx, shape, result);
+                    let proto_slot = (name_idx & 15) as usize;
+                    RT_PROP_IC.with(|ic| {
+                        ic.borrow_mut().proto[proto_slot] = (name_idx, shape, result);
                     });
 
                     Some(result)
@@ -1388,7 +1414,7 @@ mod jit_runtime {
     ) -> Option<i64> {
         use crate::interpreter::{Interpreter, InterpreterFrame};
 
-        let env_opt = RT_GLOBAL_ENV.with(|env_cell| env_cell.borrow().as_ref().cloned());
+        let env_opt = RT_GLOBAL.with(|g| g.borrow().env.as_ref().cloned());
 
         let result = if let Some(env) = env_opt {
             let mut frame = InterpreterFrame::new_with_globals(Rc::clone(ba), args, env);
@@ -1442,7 +1468,7 @@ mod jit_runtime {
                 let ctor_proto = resolve_construct_proto(&JsValue::Function(Rc::clone(ba)), ba);
                 let this_val = make_construct_this(ba, &ctor_proto);
 
-                let env_opt = RT_GLOBAL_ENV.with(|env_cell| env_cell.borrow().as_ref().cloned());
+                let env_opt = RT_GLOBAL.with(|g| g.borrow().env.as_ref().cloned());
                 let env = env_opt?;
 
                 let mut callee_frame = InterpreterFrame::new_with_globals(Rc::clone(ba), args, env);
@@ -1515,9 +1541,8 @@ mod jit_runtime {
     /// Specialized runtime stub for `LdaGlobal`.
     ///
     /// Avoids the generic opcode dispatch overhead of
-    /// [`jit_runtime_trampoline`].  Uses `RT_GLOBAL_ENV` and
-    /// `RT_GLOBAL_IC` thread-locals directly for O(1) indexed access
-    /// on IC hit.
+    /// [`jit_runtime_trampoline`].  Uses `RT_GLOBAL` thread-local
+    /// directly for O(1) indexed access on IC hit.
     ///
     /// # Calling convention (SysV AMD64)
     ///
@@ -1530,43 +1555,38 @@ mod jit_runtime {
 
     /// Inner implementation for [`jit_runtime_lda_global`].
     fn lda_global_inner(name_idx: u32) -> Option<i64> {
-        RT_GLOBAL_ENV.with(|env_cell| {
-            let env_opt = env_cell.borrow();
-            let env_rc = env_opt.as_ref()?;
+        RT_GLOBAL.with(|g| {
+            let state = g.borrow();
+            let env_rc = state.env.as_ref()?;
             let env = env_rc.borrow();
 
             // Fast path: direct-mapped IC hit.
-            let ic_hit = RT_GLOBAL_IC.with(|ic| {
-                let ic = ic.borrow();
-                let entry = &ic[(name_idx & 31) as usize];
-                if entry.0 == name_idx {
-                    Some((entry.1, entry.2))
-                } else {
-                    None
-                }
-            });
-            if let Some((slot_idx, cached_gen)) = ic_hit {
+            let entry = &state.ic[(name_idx & 31) as usize];
+            if entry.0 == name_idx {
+                let (slot_idx, cached_gen) = (entry.1, entry.2);
                 if env.generation() == cached_gen && slot_idx < env.slot_count() {
-                    let value = env.get_by_index(slot_idx).clone();
-                    if value != JsValue::TheHole {
-                        return Some(jsvalue_to_jit_i64(value));
+                    let value = env.get_by_index(slot_idx);
+                    if *value != JsValue::TheHole {
+                        return Some(jsvalue_ref_to_jit_i64(value));
                     }
                 }
             }
 
             // Slow path: HashMap lookup.
             let name = get_rt_string_constant(name_idx)?;
-            let value = env.get(&name).cloned().unwrap_or(JsValue::Undefined);
+            let value = env.get(&name).unwrap_or(&JsValue::Undefined);
+            let result = jsvalue_ref_to_jit_i64(value);
 
-            // Populate IC.
-            if let Some(slot_idx) = env.slot_index_for(&name) {
-                let cur_gen = env.generation();
-                RT_GLOBAL_IC.with(|ic| {
-                    ic.borrow_mut()[(name_idx & 31) as usize] = (name_idx, slot_idx, cur_gen);
-                });
+            // Populate IC — need mutable borrow, so drop the immutable one.
+            let slot_idx = env.slot_index_for(&name);
+            let cur_gen = env.generation();
+            drop(env);
+            drop(state);
+            if let Some(idx) = slot_idx {
+                g.borrow_mut().ic[(name_idx & 31) as usize] = (name_idx, idx, cur_gen);
             }
 
-            Some(jsvalue_to_jit_i64(value))
+            Some(result)
         })
     }
 
@@ -1588,22 +1608,15 @@ mod jit_runtime {
     fn sta_global_inner(name_idx: u32, value_i64: i64) -> Option<i64> {
         let value = jit_i64_to_jsvalue(value_i64);
 
-        RT_GLOBAL_ENV.with(|env_cell| {
-            let env_opt = env_cell.borrow();
-            let env_rc = env_opt.as_ref()?;
+        RT_GLOBAL.with(|g| {
+            let state = g.borrow();
+            let env_rc = state.env.as_ref()?;
             let mut env = env_rc.borrow_mut();
 
             // Fast path: direct-mapped IC hit — store by index.
-            let ic_hit = RT_GLOBAL_IC.with(|ic| {
-                let ic = ic.borrow();
-                let entry = &ic[(name_idx & 31) as usize];
-                if entry.0 == name_idx {
-                    Some((entry.1, entry.2))
-                } else {
-                    None
-                }
-            });
-            if let Some((slot_idx, cached_gen)) = ic_hit {
+            let entry = &state.ic[(name_idx & 31) as usize];
+            if entry.0 == name_idx {
+                let (slot_idx, cached_gen) = (entry.1, entry.2);
                 if env.generation() == cached_gen && slot_idx < env.slot_count() {
                     let name = get_rt_string_constant(name_idx)?;
                     // Use store_by_index_fast: syncs HashMap but does NOT
@@ -1628,10 +1641,11 @@ mod jit_runtime {
 
             // Populate / update IC.
             let cur_gen = env.generation();
-            if let Some(idx) = env.slot_index_for(&name) {
-                RT_GLOBAL_IC.with(|ic| {
-                    ic.borrow_mut()[(name_idx & 31) as usize] = (name_idx, idx, cur_gen);
-                });
+            let new_slot_idx = env.slot_index_for(&name);
+            drop(env);
+            drop(state);
+            if let Some(idx) = new_slot_idx {
+                g.borrow_mut().ic[(name_idx & 31) as usize] = (name_idx, idx, cur_gen);
             }
 
             Some(value_i64)
