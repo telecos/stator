@@ -84,6 +84,13 @@ const POOL_BYPASS_CAP: usize = 6;
 thread_local! {
     static PROPERTY_STORAGE_POOL: RefCell<Vec<PropertyStorageBuffers>> =
         RefCell::new(Vec::with_capacity(PROPERTY_STORAGE_POOL_CAP));
+
+    /// Single-item Cell-based cache for `Vec<JsValue>` from clone_template.
+    /// Zero borrow cost — avoids RefCell overhead of the main pool.
+    static CLONE_VALUES_CACHE: Cell<Option<Vec<JsValue>>> = const { Cell::new(None) };
+
+    /// Single-item Cell-based cache for `Vec<PropertyAttributes>` from clone_template.
+    static CLONE_ATTRS_CACHE: Cell<Option<Vec<PropertyAttributes>>> = const { Cell::new(None) };
 }
 
 #[derive(Debug)]
@@ -419,9 +426,20 @@ impl PropertyMap {
         // only when needed.
         let keys = Rc::clone(&self.keys);
 
-        let mut values = Vec::with_capacity(cap);
+        // Try to reuse cached Vecs from a previously dropped clone, avoiding
+        // two heap allocations in the hot object-creation loop.
+        let mut values = CLONE_VALUES_CACHE
+            .with(|c| c.take())
+            .filter(|v| v.capacity() >= cap)
+            .unwrap_or_else(|| Vec::with_capacity(cap));
+        values.clear();
         values.resize(cap, JsValue::Undefined);
-        let mut attrs = Vec::with_capacity(cap);
+
+        let mut attrs = CLONE_ATTRS_CACHE
+            .with(|c| c.take())
+            .filter(|a| a.capacity() >= cap)
+            .unwrap_or_else(|| Vec::with_capacity(cap));
+        attrs.clear();
         attrs.extend_from_slice(&self.attrs);
 
         let index = if cap > SMALL_PROPERTY_LINEAR_SCAN_CAP {
@@ -1174,11 +1192,25 @@ impl Default for PropertyMap {
 
 impl Drop for PropertyMap {
     fn drop(&mut self) {
-        // Keys shared with other PropertyMaps (from clone_template): skip
-        // pooling entirely.  The Rc keeps the key strings alive until the
-        // last clone is dropped, and the values/attrs Vecs are typically
-        // small enough to not warrant TLS overhead.
+        // Keys shared with other PropertyMaps (from clone_template): return
+        // the values/attrs Vecs to single-item Cell caches for reuse by the
+        // next clone_template call.  This avoids 2 heap allocations per
+        // object in tight creation loops.
         if Rc::strong_count(&self.keys) > 1 {
+            let values = std::mem::take(&mut self.values);
+            let attrs = std::mem::take(&mut self.attrs);
+            let _ = CLONE_VALUES_CACHE.try_with(|c| {
+                if c.take()
+                    .is_none_or(|old| old.capacity() < values.capacity())
+                {
+                    c.set(Some(values));
+                }
+            });
+            let _ = CLONE_ATTRS_CACHE.try_with(|c| {
+                if c.take().is_none_or(|old| old.capacity() < attrs.capacity()) {
+                    c.set(Some(attrs));
+                }
+            });
             return;
         }
 
