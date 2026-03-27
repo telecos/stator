@@ -1156,6 +1156,10 @@ mod jit_runtime {
         if ba.try_get_jit_code().is_none() && !ba.jit_baseline_has_deopted() {
             if let Ok(cc) = BaselineCompiler::compile(ba) {
                 ba.store_jit_code(cc.code, cc.register_file_slots);
+            } else {
+                // Mark as deopted so we don't re-attempt compilation on
+                // every call (each attempt costs ~20µs).
+                ba.set_jit_baseline_deopted(true);
             }
         }
 
