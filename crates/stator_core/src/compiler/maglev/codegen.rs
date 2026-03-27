@@ -105,7 +105,7 @@ pub const NUM_PHYS_REGS: u32 = 6;
 /// Stored in a stack slot at `[RBP - 32]` (below the callee-saved registers)
 /// rather than in R13, which was found to be unreliable — suspected clobber
 /// by Rust stub calls that internally use callee-saved registers.
-const LOOP_COUNTER_MAX: i64 = 10_000_000;
+const LOOP_COUNTER_MAX: i64 = 500_000;
 
 /// RBP-relative offset of the stack-based loop safety counter.
 const LOOP_COUNTER_STACK_OFFSET: i32 = -32;
