@@ -1027,32 +1027,112 @@ impl<'a> MaglevCodegen<'a> {
 
             // ── Function calls via runtime stubs ──────────────────────────────
             #[cfg(all(target_arch = "x86_64", unix))]
-            ValueNode::Call { callee, args, .. } => {
-                // Only support zero-arg calls for now (closure_counter pattern).
-                if args.is_empty() {
-                    self.emit_stub_call_1node(
-                        id,
-                        *callee,
-                        jit_runtime::jit_runtime_call_undefined_receiver0 as usize,
-                    );
-                } else {
-                    self.emit_deopt_unconditional(0);
-                    self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
-                    self.emit_store(id, Reg64::R11);
+            ValueNode::Call {
+                callee,
+                receiver,
+                args,
+                ..
+            } => {
+                // Check receiver: if it's UndefinedConstant, use the
+                // CallUndefinedReceiver stubs; otherwise use CallProperty.
+                let recv_is_undef = matches!(
+                    self.graph.node(*receiver),
+                    Some(ValueNode::UndefinedConstant)
+                );
+                match (recv_is_undef, args.len()) {
+                    // CallUndefinedReceiver0
+                    (true, 0) => {
+                        self.emit_stub_call_1node(
+                            id,
+                            *callee,
+                            jit_runtime::jit_runtime_call_undefined_receiver0 as usize,
+                        );
+                    }
+                    // CallUndefinedReceiver1
+                    (true, 1) => {
+                        self.emit_stub_call_2node(
+                            id,
+                            *callee,
+                            args[0],
+                            jit_runtime::jit_runtime_call_undefined_receiver1 as usize,
+                        );
+                    }
+                    // CallProperty0
+                    (false, 0) => {
+                        self.emit_stub_call_2node(
+                            id,
+                            *callee,
+                            *receiver,
+                            jit_runtime::jit_runtime_call_property0 as usize,
+                        );
+                    }
+                    // CallProperty1
+                    (false, 1) => {
+                        self.emit_stub_call_3node(
+                            id,
+                            *callee,
+                            *receiver,
+                            args[0],
+                            jit_runtime::jit_runtime_call_property1 as usize,
+                        );
+                    }
+                    // Unsupported arity — deopt.
+                    _ => {
+                        self.emit_deopt_unconditional(0);
+                        self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
+                        self.emit_store(id, Reg64::R11);
+                    }
                 }
             }
             #[cfg(all(target_arch = "x86_64", unix))]
-            ValueNode::CallKnownFunction { callee, args, .. } => {
-                if args.is_empty() {
-                    self.emit_stub_call_1node(
-                        id,
-                        *callee,
-                        jit_runtime::jit_runtime_call_undefined_receiver0 as usize,
-                    );
-                } else {
-                    self.emit_deopt_unconditional(0);
-                    self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
-                    self.emit_store(id, Reg64::R11);
+            ValueNode::CallKnownFunction {
+                callee,
+                receiver,
+                args,
+                ..
+            } => {
+                let recv_is_undef = matches!(
+                    self.graph.node(*receiver),
+                    Some(ValueNode::UndefinedConstant)
+                );
+                match (recv_is_undef, args.len()) {
+                    (true, 0) => {
+                        self.emit_stub_call_1node(
+                            id,
+                            *callee,
+                            jit_runtime::jit_runtime_call_undefined_receiver0 as usize,
+                        );
+                    }
+                    (true, 1) => {
+                        self.emit_stub_call_2node(
+                            id,
+                            *callee,
+                            args[0],
+                            jit_runtime::jit_runtime_call_undefined_receiver1 as usize,
+                        );
+                    }
+                    (false, 0) => {
+                        self.emit_stub_call_2node(
+                            id,
+                            *callee,
+                            *receiver,
+                            jit_runtime::jit_runtime_call_property0 as usize,
+                        );
+                    }
+                    (false, 1) => {
+                        self.emit_stub_call_3node(
+                            id,
+                            *callee,
+                            *receiver,
+                            args[0],
+                            jit_runtime::jit_runtime_call_property1 as usize,
+                        );
+                    }
+                    _ => {
+                        self.emit_deopt_unconditional(0);
+                        self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
+                        self.emit_store(id, Reg64::R11);
+                    }
                 }
             }
 

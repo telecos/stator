@@ -1398,28 +1398,16 @@ impl<'a> GraphBuilder<'a> {
         name: u32,
         slot: u32,
     ) -> StatorResult<NodeId> {
-        let state = self
-            .feedback
-            .get_state(slot)
-            .unwrap_or(InlineCacheState::Uninitialized);
-
-        if state == InlineCacheState::Monomorphic {
-            // Emit CheckMaps guard then LoadField.
-            self.emit(ValueNode::CheckMaps {
-                receiver: object,
-                feedback_slot: slot,
-            })?;
-            // Field offset 0 is a placeholder; in a full implementation the
-            // offset would be read from the IC handler stored in the feedback
-            // vector.
-            self.emit(ValueNode::LoadField { object, offset: 0 })
-        } else {
-            self.emit(ValueNode::LoadNamedGeneric {
-                object,
-                name,
-                feedback_slot: slot,
-            })
-        }
+        // Always use the generic path for now.  The monomorphic fast path
+        // (CheckMaps + LoadField) requires the real field offset from the
+        // IC handler, which is not yet populated — the offset is always 0
+        // (a placeholder).  Using LoadNamedGeneric avoids unconditional
+        // deopt in Maglev codegen for monomorphic accesses.
+        self.emit(ValueNode::LoadNamedGeneric {
+            object,
+            name,
+            feedback_slot: slot,
+        })
     }
 
     /// Emit a binary arithmetic operation, specialising on the feedback slot.
@@ -2218,16 +2206,16 @@ mod tests {
         fvec.set_state(0, InlineCacheState::Monomorphic);
         let graph = GraphBuilder::build(&arr, &fvec).unwrap();
         let block = graph.entry_block().unwrap();
-        let has_check_maps = block
+        let has_load_named_generic = block
             .nodes
             .iter()
-            .any(|(_, n)| matches!(n, ValueNode::CheckMaps { .. }));
-        let has_load_field = block
-            .nodes
-            .iter()
-            .any(|(_, n)| matches!(n, ValueNode::LoadField { .. }));
-        assert!(has_check_maps, "expected CheckMaps guard");
-        assert!(has_load_field, "expected LoadField");
+            .any(|(_, n)| matches!(n, ValueNode::LoadNamedGeneric { .. }));
+        // Monomorphic feedback now emits LoadNamedGeneric (not
+        // CheckMaps + LoadField) because LoadField offset is a placeholder.
+        assert!(
+            has_load_named_generic,
+            "expected LoadNamedGeneric for monomorphic load"
+        );
     }
 
     // ── Global loads / stores ─────────────────────────────────────────────────

@@ -1893,6 +1893,21 @@ impl MaglevGraph {
     pub fn inline_candidates(&self) -> u32 {
         self.inline_candidates
     }
+
+    /// Look up a [`ValueNode`] by its [`NodeId`].
+    ///
+    /// Performs a linear scan of all blocks; intended for compile-time
+    /// lookups, not hot-path code.
+    pub fn node(&self, id: NodeId) -> Option<&ValueNode> {
+        for block in &self.blocks {
+            for (nid, node) in &block.nodes {
+                if *nid == id {
+                    return Some(node);
+                }
+            }
+        }
+        None
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
