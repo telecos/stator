@@ -350,12 +350,21 @@ pub(crate) mod jit_runtime {
 
     /// Allocate a new heap handle for `val`, returning the `i64` handle.
     fn alloc_heap_handle(val: JsValue) -> i64 {
-        RT_HEAP.with(|heap| {
-            let mut heap = heap.borrow_mut();
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if ptrs.is_cached() {
+            // SAFETY: cached pointer valid for thread lifetime; no concurrent borrows.
+            let heap = unsafe { &mut *(&*ptrs.heap).as_ptr() };
             let idx = heap.len();
             heap.push(val);
             JIT_HEAP_TAG + idx as i64
-        })
+        } else {
+            RT_HEAP.with(|heap| {
+                let mut heap = heap.borrow_mut();
+                let idx = heap.len();
+                heap.push(val);
+                JIT_HEAP_TAG + idx as i64
+            })
+        }
     }
 
     /// Public entry point for allocating a JIT heap handle.
@@ -373,7 +382,14 @@ pub(crate) mod jit_runtime {
             return None;
         }
         let idx = (handle - JIT_HEAP_TAG) as usize;
-        RT_HEAP.with(|heap| heap.borrow().get(idx).cloned())
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if ptrs.is_cached() {
+            // SAFETY: cached pointer valid for thread lifetime; no concurrent borrows.
+            let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+            heap.get(idx).cloned()
+        } else {
+            RT_HEAP.with(|heap| heap.borrow().get(idx).cloned())
+        }
     }
 
     /// Convert a JIT `i64` (possibly a heap handle) to a [`JsValue`].
