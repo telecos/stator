@@ -3167,7 +3167,31 @@ impl Interpreter {
                             Opcode::LdaGlobal => {
                                 let name_idx =
                                     unsafe { operand_constant_pool_idx_unchecked(instr, 0) };
-                                // Sync state before fallible frame methods.
+                                // IC fast path: read directly from the GlobalEnv
+                                // slot, avoiding get_string_constant + load_global.
+                                let ic_hit = frame
+                                    .global_ic
+                                    .as_ref()
+                                    .and_then(|ic| ic.get(&name_idx).copied());
+                                if let Some((slot_idx, cached_gen)) = ic_hit {
+                                    let env = frame.global_env.borrow();
+                                    if env.generation() == cached_gen {
+                                        let value = env.get_by_index(slot_idx);
+                                        if let JsValue::Smi(v) = value {
+                                            sa = *v;
+                                            smi_acc_bool = false;
+                                            continue 'smi;
+                                        }
+                                        if *value != JsValue::TheHole {
+                                            acc = value.clone();
+                                            drop(env);
+                                            frame.smi_mode = false;
+                                            frame.loop_end_pc = 0;
+                                            break 'smi;
+                                        }
+                                    }
+                                }
+                                // IC miss / generation stale / TheHole -- slow path.
                                 acc = smi_to_val!();
                                 frame.pc = pc;
                                 frame.accumulator = acc.cheap_clone();
@@ -3175,6 +3199,7 @@ impl Interpreter {
                                 let value = frame.load_global(name.as_ref())?;
                                 if let JsValue::Smi(v) = value {
                                     sa = v;
+                                    smi_acc_bool = false;
                                 } else {
                                     acc = value;
                                     frame.smi_mode = false;
@@ -3186,6 +3211,30 @@ impl Interpreter {
                                 let name_idx =
                                     unsafe { operand_constant_pool_idx_unchecked(instr, 0) };
                                 let val = smi_to_val!();
+                                // IC fast path: inline the store and refresh the
+                                // IC entry so subsequent iterations stay fast.
+                                let ic_hit = frame
+                                    .global_ic
+                                    .as_ref()
+                                    .and_then(|ic| ic.get(&name_idx).copied());
+                                if let Some((slot_idx, cached_gen)) = ic_hit {
+                                    let cur_gen = frame.global_env.borrow().generation();
+                                    if cur_gen == cached_gen {
+                                        frame.pc = pc;
+                                        frame.accumulator = val.cheap_clone();
+                                        let name = frame.get_string_constant(name_idx)?;
+                                        frame.global_env.borrow_mut().store_by_index_sync(
+                                            slot_idx,
+                                            &name,
+                                            val.cheap_clone(),
+                                        );
+                                        let new_gen = frame.global_env.borrow().generation();
+                                        frame.global_ic_mut().insert(name_idx, (slot_idx, new_gen));
+                                        frame.global_cache_put(&name, val);
+                                        continue 'smi;
+                                    }
+                                }
+                                // IC miss -- fall back to store_global (populates IC).
                                 frame.pc = pc;
                                 frame.accumulator = val.cheap_clone();
                                 let name = frame.get_string_constant(name_idx)?;
