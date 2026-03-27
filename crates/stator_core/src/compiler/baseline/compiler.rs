@@ -1652,13 +1652,28 @@ pub(crate) mod jit_runtime {
             // baseline compiler and contains valid x86-64 instructions.
             let jit_result = unsafe { exec.execute(jit_args, ctx_ptr) };
 
+            bc_ref.set(saved_ba);
+
+            // Fast path: non-heap results (Smi, bool, undefined, null) don't
+            // reference heap handles and survive truncation unchanged.  Skip
+            // the jit_to_jsvalue_ext → jsvalue_to_jit_i64 round-trip.
+            if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
+                // SAFETY: no active borrows; truncate/restore via raw pointer.
+                unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                if let Some(ctx) = saved_ctx {
+                    unsafe { *ctx_ref.as_ptr() = ctx };
+                }
+                return Some(jit_result);
+            }
+
+            // Heap handle or deopt: resolve the handle before truncation
+            // destroys it, then re-encode after cleanup.
             let result_val = if jit_result == JIT_DEOPT {
                 None
             } else {
                 jit_to_jsvalue_ext(jit_result)
             };
 
-            bc_ref.set(saved_ba);
             // SAFETY: no active borrows; truncate/restore via raw pointer.
             unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
             if let Some(ctx) = saved_ctx {
@@ -1683,13 +1698,21 @@ pub(crate) mod jit_runtime {
 
         let jit_result = unsafe { exec.execute(jit_args, ctx_ptr) };
 
+        RT_BYTECODE.with(|b| b.set(saved_ba));
+
+        // Fast path: non-heap results survive truncation unchanged.
+        if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
+            RT_HEAP.with(|h| h.borrow_mut().truncate(heap_base));
+            RT_CONTEXT.with(|c| *c.borrow_mut() = saved_ctx);
+            return Some(jit_result);
+        }
+
         let result_val = if jit_result == JIT_DEOPT {
             None
         } else {
             jit_to_jsvalue_ext(jit_result)
         };
 
-        RT_BYTECODE.with(|b| b.set(saved_ba));
         RT_HEAP.with(|h| h.borrow_mut().truncate(heap_base));
         RT_CONTEXT.with(|c| *c.borrow_mut() = saved_ctx);
 
@@ -1834,6 +1857,66 @@ pub(crate) mod jit_runtime {
                 let heap = unsafe { &*heap_ref.as_ptr() };
                 match heap.get(idx) {
                     Some(JsValue::Function(ba)) => {
+                        // ── Inlined fast path: exec cache hit ──────────
+                        // Check the exec cache directly instead of calling
+                        // call_js_function → exec_jit_callee, which would
+                        // do a REDUNDANT RT_PTRS.with() and Rc::clone.
+                        let exec_cache = ba.jit_executable_cache();
+                        let cache_ref = unsafe { &*exec_cache.as_ptr() };
+                        if let Some(exec) = cache_ref.as_ref() {
+                            let ctx_ref = unsafe { &*ptrs.context };
+                            // SAFETY: no active borrows; read heap length.
+                            let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+
+                            let callee_ctx_raw = ba.closure_context();
+                            let callee_ctx_ptr =
+                                callee_ctx_raw.map(Rc::as_ptr).unwrap_or(std::ptr::null());
+                            let current_ctx_ptr = unsafe {
+                                (*ctx_ref.as_ptr())
+                                    .as_ref()
+                                    .map(Rc::as_ptr)
+                                    .unwrap_or(std::ptr::null())
+                            };
+                            let same_context = std::ptr::eq(callee_ctx_ptr, current_ctx_ptr);
+
+                            let ctx_ptr_i64 = callee_ctx_ptr as i64;
+                            let saved_ctx = if same_context {
+                                None
+                            } else {
+                                let callee_ctx = callee_ctx_raw.cloned();
+                                Some(unsafe {
+                                    std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx)
+                                })
+                            };
+
+                            bc_ref.set(&**ba as *const BytecodeArray);
+                            let jit_result = unsafe { exec.execute(&[], ctx_ptr_i64) };
+
+                            bc_ref.set(saved_ba);
+
+                            // Non-heap results skip the round-trip conversion.
+                            if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
+                                unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                                if let Some(ctx) = saved_ctx {
+                                    unsafe { *ctx_ref.as_ptr() = ctx };
+                                }
+                                return Some(jit_result);
+                            }
+
+                            let result_val = if jit_result == JIT_DEOPT {
+                                None
+                            } else {
+                                jit_to_jsvalue_ext(jit_result)
+                            };
+
+                            unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                            if let Some(ctx) = saved_ctx {
+                                unsafe { *ctx_ref.as_ptr() = ctx };
+                            }
+                            return result_val.map(jsvalue_to_jit_i64);
+                        }
+
+                        // Exec cache not populated: fall through to full path.
                         let ba = Rc::clone(ba);
                         return call_js_function(&ba, vec![], &[], saved_ba);
                     }
