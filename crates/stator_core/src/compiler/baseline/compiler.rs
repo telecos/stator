@@ -146,7 +146,7 @@ mod jit_runtime {
     use super::*;
     use crate::bytecode::bytecode_array::JitExecutableCode;
     use crate::interpreter::GlobalEnv;
-    use crate::objects::property_map::PropertyMap;
+    use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
     use crate::objects::value::{JsContext, JsValue};
 
     thread_local! {
@@ -1134,7 +1134,13 @@ mod jit_runtime {
                             .unwrap_or(JIT_UNDEFINED),
                     )
                 } else {
-                    Some(JIT_UNDEFINED)
+                    // Not on own object — walk the prototype chain.
+                    let proto = map
+                        .get(INTERNAL_PROTO_PROPERTY_KEY)
+                        .or_else(|| map.get("__proto__"))
+                        .cloned();
+                    drop(map);
+                    Some(jit_proto_chain_walk(proto.as_ref(), &prop_name))
                 }
             }
             JsValue::Array(arr) => {
@@ -1147,6 +1153,40 @@ mod jit_runtime {
             }
             _ => None,
         }
+    }
+
+    /// Walk a prototype chain looking for `key`, returning the JIT i64
+    /// encoding of the property value found (or [`JIT_UNDEFINED`]).
+    ///
+    /// Handles up to 64 prototype hops to guard against cycles.
+    fn jit_proto_chain_walk(start: Option<&JsValue>, key: &str) -> i64 {
+        let Some(first) = start else {
+            return JIT_UNDEFINED;
+        };
+        let mut current = first.clone();
+        for _ in 0..64 {
+            if matches!(current, JsValue::Null | JsValue::Undefined) {
+                break;
+            }
+            if let JsValue::PlainObject(ref map_rc) = current {
+                let borrow = map_rc.borrow();
+                if let Some(val) = borrow.get(key) {
+                    return jsvalue_ref_to_jit_i64(val);
+                }
+                let next = borrow
+                    .get(INTERNAL_PROTO_PROPERTY_KEY)
+                    .or_else(|| borrow.get("__proto__"))
+                    .cloned();
+                drop(borrow);
+                match next {
+                    Some(p) => current = p,
+                    None => break,
+                }
+            } else {
+                break;
+            }
+        }
+        JIT_UNDEFINED
     }
 
     /// Convert a `&JsValue` to JIT i64 *without* cloning when possible.
@@ -1226,16 +1266,15 @@ mod jit_runtime {
             if let Some(exec) = cache_ref.as_ref() {
                 // Save outer execution state so the inner JIT call gets a
                 // clean environment and the outer state is restored after.
+                //
+                // We batch TLS accesses where possible to reduce overhead.
                 let saved_heap = RT_HEAP.with(|h| std::mem::take(&mut *h.borrow_mut()));
-                let saved_ic = RT_LDA_IC.with(|ic| {
-                    let mut guard = ic.borrow_mut();
-                    let mut tmp = [(u32::MAX, 0u64, 0usize); 64];
-                    std::mem::swap(&mut *guard, &mut tmp);
-                    tmp
+                let saved_ctx = RT_CONTEXT.with(|c| {
+                    let prev = c.borrow().clone();
+                    *c.borrow_mut() = ba.closure_context().cloned();
+                    prev
                 });
-                let saved_ctx = RT_CONTEXT.with(|c| c.borrow().clone());
                 RT_BYTECODE.with(|b| b.set(&**ba as *const BytecodeArray));
-                RT_CONTEXT.with(|c| *c.borrow_mut() = ba.closure_context().cloned());
 
                 // SAFETY: cached executable code was produced by the
                 // baseline compiler and contains valid x86-64 instructions.
@@ -1252,7 +1291,6 @@ mod jit_runtime {
                 // Restore outer execution state.
                 RT_BYTECODE.with(|b| b.set(saved_ba));
                 RT_HEAP.with(|h| *h.borrow_mut() = saved_heap);
-                RT_LDA_IC.with(|ic| *ic.borrow_mut() = saved_ic);
                 RT_CONTEXT.with(|c| *c.borrow_mut() = saved_ctx);
 
                 if let Some(val) = result_val {
