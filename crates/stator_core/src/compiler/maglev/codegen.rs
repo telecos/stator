@@ -79,6 +79,8 @@
 //! ```
 
 #[cfg(all(target_arch = "x86_64", unix))]
+use crate::bytecode::bytecodes::Opcode;
+#[cfg(all(target_arch = "x86_64", unix))]
 use crate::compiler::baseline::compiler::jit_runtime;
 use crate::compiler::baseline::compiler::{
     DeoptEntry, JIT_DEOPT, JIT_FALSE, JIT_NULL, JIT_TRUE, JIT_UNDEFINED, METADATA_MAGIC,
@@ -1169,6 +1171,259 @@ impl<'a> MaglevCodegen<'a> {
                 }
             }
 
+            // ── Object / array / closure creation via trampoline ──────────────
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::CreateObjectLiteral {
+                feedback_slot,
+                flags,
+                ..
+            } => {
+                self.emit_trampoline_call(
+                    id,
+                    Opcode::CreateObjectLiteral as u8,
+                    i64::from(*feedback_slot),
+                    i64::from(*flags),
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::CreateShallowObjectLiteral {
+                feedback_slot,
+                flags,
+                ..
+            } => {
+                self.emit_trampoline_call(
+                    id,
+                    Opcode::CreateObjectLiteral as u8,
+                    i64::from(*feedback_slot),
+                    i64::from(*flags),
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::CreateEmptyObjectLiteral => {
+                self.emit_trampoline_call(id, Opcode::CreateEmptyObjectLiteral as u8, 0, 0);
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::CreateArrayLiteral { feedback_slot, .. } => {
+                self.emit_trampoline_call(
+                    id,
+                    Opcode::CreateArrayLiteral as u8,
+                    i64::from(*feedback_slot),
+                    0,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::CreateShallowArrayLiteral { feedback_slot, .. } => {
+                self.emit_trampoline_call(
+                    id,
+                    Opcode::CreateArrayLiteral as u8,
+                    i64::from(*feedback_slot),
+                    0,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::CreateClosure {
+                shared_function_info,
+                ..
+            } => {
+                self.emit_trampoline_call(
+                    id,
+                    Opcode::CreateClosure as u8,
+                    i64::from(*shared_function_info),
+                    0,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::FastCreateClosure {
+                shared_function_info,
+                ..
+            } => {
+                self.emit_trampoline_call(
+                    id,
+                    Opcode::CreateClosure as u8,
+                    i64::from(*shared_function_info),
+                    0,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::CreateFunctionContext { slot_count, .. } => {
+                self.emit_trampoline_call(
+                    id,
+                    Opcode::CreateFunctionContext as u8,
+                    i64::from(*slot_count),
+                    0,
+                );
+            }
+
+            // ── Construct via dedicated stub ──────────────────────────────────
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::Construct {
+                constructor, args, ..
+            } => {
+                // Simplified: only handle 0-arg construct.
+                if args.is_empty() {
+                    self.emit_stub_call_1node(
+                        id,
+                        *constructor,
+                        jit_runtime::jit_runtime_construct0 as usize,
+                    );
+                } else {
+                    self.emit_deopt_unconditional(0);
+                    self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
+                    self.emit_store(id, Reg64::R11);
+                }
+            }
+
+            // ── Generic arithmetic via dedicated stubs ────────────────────────
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::GenericAdd { left, right, .. } => {
+                self.emit_stub_call_2node(
+                    id,
+                    *left,
+                    *right,
+                    jit_runtime::jit_runtime_generic_add as usize,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::GenericSubtract { left, right, .. } => {
+                self.emit_stub_call_2node(
+                    id,
+                    *left,
+                    *right,
+                    jit_runtime::jit_runtime_generic_sub as usize,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::GenericMultiply { left, right, .. } => {
+                self.emit_stub_call_2node(
+                    id,
+                    *left,
+                    *right,
+                    jit_runtime::jit_runtime_generic_mul as usize,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::GenericDivide { left, right, .. } => {
+                self.emit_stub_call_2node(
+                    id,
+                    *left,
+                    *right,
+                    jit_runtime::jit_runtime_generic_div as usize,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::GenericModulus { left, right, .. } => {
+                self.emit_stub_call_2node(
+                    id,
+                    *left,
+                    *right,
+                    jit_runtime::jit_runtime_generic_mod as usize,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::GenericBitwiseAnd { left, right, .. } => {
+                self.emit_stub_call_2node(
+                    id,
+                    *left,
+                    *right,
+                    jit_runtime::jit_runtime_generic_bitwise_and as usize,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::GenericBitwiseOr { left, right, .. } => {
+                self.emit_stub_call_2node(
+                    id,
+                    *left,
+                    *right,
+                    jit_runtime::jit_runtime_generic_bitwise_or as usize,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::GenericBitwiseXor { left, right, .. } => {
+                self.emit_stub_call_2node(
+                    id,
+                    *left,
+                    *right,
+                    jit_runtime::jit_runtime_generic_bitwise_xor as usize,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::GenericShiftLeft { left, right, .. } => {
+                self.emit_stub_call_2node(
+                    id,
+                    *left,
+                    *right,
+                    jit_runtime::jit_runtime_generic_shift_left as usize,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::GenericShiftRight { left, right, .. } => {
+                self.emit_stub_call_2node(
+                    id,
+                    *left,
+                    *right,
+                    jit_runtime::jit_runtime_generic_shift_right as usize,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::GenericShiftRightLogical { left, right, .. } => {
+                self.emit_stub_call_2node(
+                    id,
+                    *left,
+                    *right,
+                    jit_runtime::jit_runtime_generic_shift_right_logical as usize,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::GenericNegate { value, .. } => {
+                self.emit_stub_call_1node(
+                    id,
+                    *value,
+                    jit_runtime::jit_runtime_generic_negate as usize,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::GenericIncrement { value, .. } => {
+                self.emit_stub_call_1node(
+                    id,
+                    *value,
+                    jit_runtime::jit_runtime_generic_increment as usize,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::GenericDecrement { value, .. } => {
+                self.emit_stub_call_1node(
+                    id,
+                    *value,
+                    jit_runtime::jit_runtime_generic_decrement as usize,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::GenericBitwiseNot { value, .. } => {
+                self.emit_stub_call_1node(
+                    id,
+                    *value,
+                    jit_runtime::jit_runtime_generic_bitwise_not as usize,
+                );
+            }
+
+            // ── Type checks and conversions via trampoline ────────────────────
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::CheckHeapObject { .. } => {
+                // Guard pass-through — no code needed.
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::ToString { value, .. } => {
+                self.emit_stub_call_1node(id, *value, jit_runtime::jit_runtime_tostring as usize);
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::ToNumber { value, .. } => {
+                self.emit_stub_call_1node(id, *value, jit_runtime::jit_runtime_tonumber as usize);
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::TypeOf { value } => {
+                self.emit_stub_call_1node(id, *value, jit_runtime::jit_runtime_typeof as usize);
+            }
+
             // ── Unsupported nodes → unconditional deopt ───────────────────────
             _ => {
                 self.emit_deopt_unconditional(0);
@@ -1497,6 +1752,35 @@ impl<'a> MaglevCodegen<'a> {
             NodeOrImm::Imm(v) => self.masm.mov_ri(Reg64::Rdx, v),
         }
         self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.emit_restore_caller_saved();
+        self.emit_deopt_check_rax();
+        self.masm.mov_rr(Reg64::R11, Reg64::Rax);
+        self.emit_store(id, Reg64::R11);
+    }
+
+    /// Call the generic trampoline for opcodes that only need immediate operands.
+    ///
+    /// The trampoline signature is:
+    /// `fn(opcode: u32, regs: *mut i64, acc: i64, operand1: i64, operand2: i64) -> i64`
+    ///
+    /// We pass R14 (register-file base) as `regs` and R12 (accumulator) as
+    /// `acc`, though most creation ops only use `operand1`/`operand2` and TLS.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_trampoline_call(&mut self, id: NodeId, opcode: u8, operand1: i64, operand2: i64) {
+        self.emit_save_caller_saved();
+        // RDI = opcode
+        self.masm.mov_ri(Reg64::Rdi, i64::from(opcode));
+        // RSI = register-file base (R14)
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R14);
+        // RDX = accumulator (R12)
+        self.masm.mov_rr(Reg64::Rdx, Reg64::R12);
+        // RCX = operand1
+        self.masm.mov_ri(Reg64::Rcx, operand1);
+        // R8 = operand2
+        self.masm.mov_ri(Reg64::R8, operand2);
+        let addr = jit_runtime::jit_runtime_trampoline as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, addr as i64);
         self.masm.call_reg(Reg64::R11);
         self.emit_restore_caller_saved();
         self.emit_deopt_check_rax();

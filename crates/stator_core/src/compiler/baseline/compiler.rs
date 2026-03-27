@@ -2657,6 +2657,330 @@ pub(crate) mod jit_runtime {
         ctx.slots[slot] = value;
         value_i64
     }
+
+    // ── Generic arithmetic stubs for Maglev ─────────────────────────────────
+
+    /// Generic Add: handles Smi + Smi (with overflow), HeapNumber, and
+    /// string concatenation.  Deopts on complex cases.
+    pub extern "C" fn jit_runtime_generic_add(left: i64, right: i64) -> i64 {
+        let l = jit_i64_to_jsvalue(left);
+        let r = jit_i64_to_jsvalue(right);
+        match (&l, &r) {
+            (JsValue::Smi(a), JsValue::Smi(b)) => match a.checked_add(*b) {
+                Some(sum) => jsvalue_to_jit_i64(JsValue::Smi(sum)),
+                None => jsvalue_to_jit_i64(JsValue::HeapNumber(*a as f64 + *b as f64)),
+            },
+            (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                jsvalue_to_jit_i64(JsValue::HeapNumber(*a + *b))
+            }
+            (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                jsvalue_to_jit_i64(JsValue::HeapNumber(*a as f64 + *b))
+            }
+            (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                jsvalue_to_jit_i64(JsValue::HeapNumber(*a + *b as f64))
+            }
+            _ => JIT_DEOPT,
+        }
+    }
+
+    /// Generic Subtract.
+    pub extern "C" fn jit_runtime_generic_sub(left: i64, right: i64) -> i64 {
+        let l = jit_i64_to_jsvalue(left);
+        let r = jit_i64_to_jsvalue(right);
+        match (&l, &r) {
+            (JsValue::Smi(a), JsValue::Smi(b)) => match a.checked_sub(*b) {
+                Some(d) => jsvalue_to_jit_i64(JsValue::Smi(d)),
+                None => jsvalue_to_jit_i64(JsValue::HeapNumber(*a as f64 - *b as f64)),
+            },
+            (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                jsvalue_to_jit_i64(JsValue::HeapNumber(*a - *b))
+            }
+            (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                jsvalue_to_jit_i64(JsValue::HeapNumber(*a as f64 - *b))
+            }
+            (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                jsvalue_to_jit_i64(JsValue::HeapNumber(*a - *b as f64))
+            }
+            _ => JIT_DEOPT,
+        }
+    }
+
+    /// Generic Multiply.
+    pub extern "C" fn jit_runtime_generic_mul(left: i64, right: i64) -> i64 {
+        let l = jit_i64_to_jsvalue(left);
+        let r = jit_i64_to_jsvalue(right);
+        match (&l, &r) {
+            (JsValue::Smi(a), JsValue::Smi(b)) => match a.checked_mul(*b) {
+                Some(p) => jsvalue_to_jit_i64(JsValue::Smi(p)),
+                None => jsvalue_to_jit_i64(JsValue::HeapNumber(*a as f64 * *b as f64)),
+            },
+            (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                jsvalue_to_jit_i64(JsValue::HeapNumber(*a * *b))
+            }
+            (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                jsvalue_to_jit_i64(JsValue::HeapNumber(*a as f64 * *b))
+            }
+            (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                jsvalue_to_jit_i64(JsValue::HeapNumber(*a * *b as f64))
+            }
+            _ => JIT_DEOPT,
+        }
+    }
+
+    /// Generic Divide.
+    pub extern "C" fn jit_runtime_generic_div(left: i64, right: i64) -> i64 {
+        let l = jit_i64_to_jsvalue(left);
+        let r = jit_i64_to_jsvalue(right);
+        let (a, b) = match (&l, &r) {
+            (JsValue::Smi(a), JsValue::Smi(b)) => (*a as f64, *b as f64),
+            (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => (*a, *b),
+            (JsValue::Smi(a), JsValue::HeapNumber(b)) => (*a as f64, *b),
+            (JsValue::HeapNumber(a), JsValue::Smi(b)) => (*a, *b as f64),
+            _ => return JIT_DEOPT,
+        };
+        let result = a / b;
+        if result.fract() == 0.0 && result >= i32::MIN as f64 && result <= i32::MAX as f64 {
+            jsvalue_to_jit_i64(JsValue::Smi(result as i32))
+        } else {
+            jsvalue_to_jit_i64(JsValue::HeapNumber(result))
+        }
+    }
+
+    /// Generic Modulus.
+    pub extern "C" fn jit_runtime_generic_mod(left: i64, right: i64) -> i64 {
+        let l = jit_i64_to_jsvalue(left);
+        let r = jit_i64_to_jsvalue(right);
+        match (&l, &r) {
+            (JsValue::Smi(a), JsValue::Smi(b)) if *b != 0 => {
+                jsvalue_to_jit_i64(JsValue::Smi(*a % *b))
+            }
+            (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) if *b != 0.0 => {
+                jsvalue_to_jit_i64(JsValue::HeapNumber(*a % *b))
+            }
+            (JsValue::Smi(a), JsValue::HeapNumber(b)) if *b != 0.0 => {
+                jsvalue_to_jit_i64(JsValue::HeapNumber(*a as f64 % *b))
+            }
+            (JsValue::HeapNumber(a), JsValue::Smi(b)) if *b != 0 => {
+                jsvalue_to_jit_i64(JsValue::HeapNumber(*a % *b as f64))
+            }
+            _ => JIT_DEOPT,
+        }
+    }
+
+    /// Generic bitwise helpers — convert to i32 first.
+    fn to_int32(v: &JsValue) -> Option<i32> {
+        match v {
+            JsValue::Smi(n) => Some(*n),
+            JsValue::HeapNumber(f) => Some(*f as i32),
+            JsValue::Boolean(true) => Some(1),
+            JsValue::Boolean(false) | JsValue::Null => Some(0),
+            JsValue::Undefined => Some(0),
+            _ => None,
+        }
+    }
+
+    pub extern "C" fn jit_runtime_generic_bitwise_and(left: i64, right: i64) -> i64 {
+        let l = jit_i64_to_jsvalue(left);
+        let r = jit_i64_to_jsvalue(right);
+        match (to_int32(&l), to_int32(&r)) {
+            (Some(a), Some(b)) => jsvalue_to_jit_i64(JsValue::Smi(a & b)),
+            _ => JIT_DEOPT,
+        }
+    }
+
+    pub extern "C" fn jit_runtime_generic_bitwise_or(left: i64, right: i64) -> i64 {
+        let l = jit_i64_to_jsvalue(left);
+        let r = jit_i64_to_jsvalue(right);
+        match (to_int32(&l), to_int32(&r)) {
+            (Some(a), Some(b)) => jsvalue_to_jit_i64(JsValue::Smi(a | b)),
+            _ => JIT_DEOPT,
+        }
+    }
+
+    pub extern "C" fn jit_runtime_generic_bitwise_xor(left: i64, right: i64) -> i64 {
+        let l = jit_i64_to_jsvalue(left);
+        let r = jit_i64_to_jsvalue(right);
+        match (to_int32(&l), to_int32(&r)) {
+            (Some(a), Some(b)) => jsvalue_to_jit_i64(JsValue::Smi(a ^ b)),
+            _ => JIT_DEOPT,
+        }
+    }
+
+    pub extern "C" fn jit_runtime_generic_shift_left(left: i64, right: i64) -> i64 {
+        let l = jit_i64_to_jsvalue(left);
+        let r = jit_i64_to_jsvalue(right);
+        match (to_int32(&l), to_int32(&r)) {
+            (Some(a), Some(b)) => jsvalue_to_jit_i64(JsValue::Smi(a << (b as u32 & 0x1f))),
+            _ => JIT_DEOPT,
+        }
+    }
+
+    pub extern "C" fn jit_runtime_generic_shift_right(left: i64, right: i64) -> i64 {
+        let l = jit_i64_to_jsvalue(left);
+        let r = jit_i64_to_jsvalue(right);
+        match (to_int32(&l), to_int32(&r)) {
+            (Some(a), Some(b)) => jsvalue_to_jit_i64(JsValue::Smi(a >> (b as u32 & 0x1f))),
+            _ => JIT_DEOPT,
+        }
+    }
+
+    pub extern "C" fn jit_runtime_generic_shift_right_logical(left: i64, right: i64) -> i64 {
+        let l = jit_i64_to_jsvalue(left);
+        let r = jit_i64_to_jsvalue(right);
+        match (to_int32(&l), to_int32(&r)) {
+            (Some(a), Some(b)) => {
+                let result = (a as u32) >> (b as u32 & 0x1f);
+                jsvalue_to_jit_i64(JsValue::Smi(result as i32))
+            }
+            _ => JIT_DEOPT,
+        }
+    }
+
+    pub extern "C" fn jit_runtime_generic_negate(value: i64) -> i64 {
+        let v = jit_i64_to_jsvalue(value);
+        match &v {
+            JsValue::Smi(n) => match n.checked_neg() {
+                Some(neg) if neg != 0 || *n == 0 => jsvalue_to_jit_i64(JsValue::Smi(neg)),
+                _ => jsvalue_to_jit_i64(JsValue::HeapNumber(-(*n as f64))),
+            },
+            JsValue::HeapNumber(f) => jsvalue_to_jit_i64(JsValue::HeapNumber(-*f)),
+            _ => JIT_DEOPT,
+        }
+    }
+
+    pub extern "C" fn jit_runtime_generic_increment(value: i64) -> i64 {
+        let v = jit_i64_to_jsvalue(value);
+        match &v {
+            JsValue::Smi(n) => match n.checked_add(1) {
+                Some(inc) => jsvalue_to_jit_i64(JsValue::Smi(inc)),
+                None => jsvalue_to_jit_i64(JsValue::HeapNumber(*n as f64 + 1.0)),
+            },
+            JsValue::HeapNumber(f) => jsvalue_to_jit_i64(JsValue::HeapNumber(*f + 1.0)),
+            _ => JIT_DEOPT,
+        }
+    }
+
+    pub extern "C" fn jit_runtime_generic_decrement(value: i64) -> i64 {
+        let v = jit_i64_to_jsvalue(value);
+        match &v {
+            JsValue::Smi(n) => match n.checked_sub(1) {
+                Some(dec) => jsvalue_to_jit_i64(JsValue::Smi(dec)),
+                None => jsvalue_to_jit_i64(JsValue::HeapNumber(*n as f64 - 1.0)),
+            },
+            JsValue::HeapNumber(f) => jsvalue_to_jit_i64(JsValue::HeapNumber(*f - 1.0)),
+            _ => JIT_DEOPT,
+        }
+    }
+
+    pub extern "C" fn jit_runtime_generic_bitwise_not(value: i64) -> i64 {
+        let v = jit_i64_to_jsvalue(value);
+        match to_int32(&v) {
+            Some(n) => jsvalue_to_jit_i64(JsValue::Smi(!n)),
+            None => JIT_DEOPT,
+        }
+    }
+
+    // ── Type conversion stubs ───────────────────────────────────────────────
+
+    /// ToString: convert a value to a string.
+    pub extern "C" fn jit_runtime_tostring(value: i64) -> i64 {
+        let v = jit_i64_to_jsvalue(value);
+        let s: Rc<str> = match &v {
+            JsValue::String(_) => return value,
+            JsValue::Smi(n) => Rc::from(n.to_string().as_str()),
+            JsValue::HeapNumber(f) => Rc::from(f.to_string().as_str()),
+            JsValue::Boolean(true) => Rc::from("true"),
+            JsValue::Boolean(false) => Rc::from("false"),
+            JsValue::Null => Rc::from("null"),
+            JsValue::Undefined => Rc::from("undefined"),
+            _ => return JIT_DEOPT,
+        };
+        jsvalue_to_jit_i64(JsValue::String(s))
+    }
+
+    /// ToNumber: convert a value to a number.
+    pub extern "C" fn jit_runtime_tonumber(value: i64) -> i64 {
+        let v = jit_i64_to_jsvalue(value);
+        match &v {
+            JsValue::Smi(_) | JsValue::HeapNumber(_) => value,
+            JsValue::Boolean(true) => jsvalue_to_jit_i64(JsValue::Smi(1)),
+            JsValue::Boolean(false) | JsValue::Null => jsvalue_to_jit_i64(JsValue::Smi(0)),
+            JsValue::Undefined => jsvalue_to_jit_i64(JsValue::HeapNumber(f64::NAN)),
+            _ => JIT_DEOPT,
+        }
+    }
+
+    /// TypeOf: return the typeof string for a value.
+    pub extern "C" fn jit_runtime_typeof(value: i64) -> i64 {
+        let v = jit_i64_to_jsvalue(value);
+        let s: &str = match &v {
+            JsValue::Smi(_) | JsValue::HeapNumber(_) => "number",
+            JsValue::Boolean(_) => "boolean",
+            JsValue::String(_) => "string",
+            JsValue::Undefined => "undefined",
+            JsValue::Null => "object",
+            JsValue::Function(_) | JsValue::NativeFunction(_) => "function",
+            JsValue::Symbol(_) => "symbol",
+            JsValue::BigInt(_) => "bigint",
+            _ => "object",
+        };
+        jsvalue_to_jit_i64(JsValue::String(Rc::from(s)))
+    }
+
+    // ── Construct stub for Maglev ───────────────────────────────────────────
+
+    /// Simplified construct for 0 arguments — takes the constructor value
+    /// directly instead of reading from the register file.
+    pub extern "C" fn jit_runtime_construct0(ctor_i64: i64) -> i64 {
+        construct0_inner(ctor_i64).unwrap_or(JIT_DEOPT)
+    }
+
+    fn construct0_inner(ctor_i64: i64) -> Option<i64> {
+        use crate::interpreter::{
+            Interpreter, InterpreterFrame, make_construct_this, maybe_cache_construct_boilerplate,
+            resolve_construct_proto, restore_closure_context,
+        };
+
+        let ctor_val = jit_i64_to_jsvalue(ctor_i64);
+        match &ctor_val {
+            JsValue::Function(ba) => {
+                if ba.is_arrow() {
+                    return None;
+                }
+
+                let ctor_proto = resolve_construct_proto(&JsValue::Function(Rc::clone(ba)), ba);
+                let this_val = make_construct_this(ba, &ctor_proto);
+
+                let saved_ba = RT_BYTECODE.with(|b| b.get());
+                let env_opt = RT_GLOBAL.with(|g| g.borrow().env.as_ref().cloned());
+                let env = env_opt?;
+
+                let mut callee_frame =
+                    InterpreterFrame::new_with_globals(Rc::clone(ba), vec![], env);
+                restore_closure_context(&mut callee_frame, ba);
+                callee_frame.new_target = JsValue::Function(Rc::clone(ba));
+                callee_frame
+                    .global_env
+                    .borrow_mut()
+                    .set_this(this_val.clone());
+
+                let result = Interpreter::run(&mut callee_frame);
+
+                RT_BYTECODE.with(|b| b.set(saved_ba));
+
+                let val = result.ok()?;
+                let constructed = match val {
+                    JsValue::PlainObject(_) | JsValue::Object(_) => val,
+                    _ => {
+                        maybe_cache_construct_boilerplate(ba, &this_val);
+                        this_val
+                    }
+                };
+                Some(jsvalue_to_jit_i64(constructed))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]
