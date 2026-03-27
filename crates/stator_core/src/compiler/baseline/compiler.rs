@@ -239,6 +239,8 @@ mod jit_runtime {
         heap: *const RefCell<Vec<JsValue>>,
         context: *const RefCell<Option<Rc<RefCell<JsContext>>>>,
         bytecode: *const Cell<*const BytecodeArray>,
+        global: *const RefCell<JitGlobalState>,
+        prop_ic: *const RefCell<JitPropertyIcState>,
     }
 
     impl RtPtrs {
@@ -246,6 +248,8 @@ mod jit_runtime {
             heap: std::ptr::null(),
             context: std::ptr::null(),
             bytecode: std::ptr::null(),
+            global: std::ptr::null(),
+            prop_ic: std::ptr::null(),
         };
 
         fn is_cached(&self) -> bool {
@@ -264,6 +268,8 @@ mod jit_runtime {
                 heap: RT_HEAP.with(|h| h as *const RefCell<Vec<JsValue>>),
                 context: RT_CONTEXT.with(|c| c as *const RefCell<Option<Rc<RefCell<JsContext>>>>),
                 bytecode: RT_BYTECODE.with(|b| b as *const Cell<*const BytecodeArray>),
+                global: RT_GLOBAL.with(|g| g as *const RefCell<JitGlobalState>),
+                prop_ic: RT_PROP_IC.with(|ic| ic as *const RefCell<JitPropertyIcState>),
             };
             p.set(ptrs);
         });
@@ -1120,19 +1126,8 @@ mod jit_runtime {
             // register of the receiver.  Zero additional arguments.
             Opcode::CallProperty0 => {
                 let callee_i64 = unsafe { *regs.add(operand1 as usize) };
-                let callee = jit_i64_to_jsvalue(callee_i64);
                 let receiver_i64 = unsafe { *regs.add(operand2 as usize) };
-                let receiver = jit_i64_to_jsvalue(receiver_i64);
-                match callee {
-                    JsValue::NativeFunction(nf) => {
-                        let result = nf(vec![receiver]);
-                        match result {
-                            Ok(val) => Some(jsvalue_to_jit_i64(val)),
-                            Err(_) => None,
-                        }
-                    }
-                    _ => None,
-                }
+                call_property0_inner(callee_i64, receiver_i64)
             }
 
             // ── DivSmi / ModSmi ──────────────────────────────────────────
@@ -1172,21 +1167,9 @@ mod jit_runtime {
                 let receiver_flat = ((operand1 >> 16) & 0xFFFF) as usize;
                 let arg0_flat = operand2 as usize;
                 let callee_i64 = unsafe { *regs.add(callee_flat) };
-                let callee = jit_i64_to_jsvalue(callee_i64);
                 let receiver_i64 = unsafe { *regs.add(receiver_flat) };
-                let receiver = jit_i64_to_jsvalue(receiver_i64);
                 let arg0_i64 = unsafe { *regs.add(arg0_flat) };
-                let arg0 = jit_i64_to_jsvalue(arg0_i64);
-                match callee {
-                    JsValue::NativeFunction(nf) => {
-                        let result = nf(vec![receiver, arg0]);
-                        match result {
-                            Ok(val) => Some(jsvalue_to_jit_i64(val)),
-                            Err(_) => None,
-                        }
-                    }
-                    _ => None,
-                }
+                call_property1_inner(callee_i64, receiver_i64, arg0_i64)
             }
 
             _ => None,
@@ -1759,39 +1742,51 @@ mod jit_runtime {
 
     /// Inner implementation for [`jit_runtime_lda_global`].
     fn lda_global_inner(name_idx: u32) -> Option<i64> {
-        RT_GLOBAL.with(|g| {
-            let state = g.borrow();
-            let env_rc = state.env.as_ref()?;
-            let env = env_rc.borrow();
+        let ptrs = RT_PTRS.with(|p| p.get());
+        // SAFETY: cached pointer set by cache_rt_ptrs; valid for thread lifetime.
+        let g_ref = if ptrs.is_cached() {
+            unsafe { &*ptrs.global }
+        } else {
+            return RT_GLOBAL.with(|g| lda_global_from_ref(g, name_idx));
+        };
 
-            // Fast path: direct-mapped IC hit.
-            let entry = &state.ic[(name_idx & 31) as usize];
-            if entry.0 == name_idx {
-                let (slot_idx, cached_gen) = (entry.1, entry.2);
-                if env.generation() == cached_gen && slot_idx < env.slot_count() {
-                    let value = env.get_by_index(slot_idx);
-                    if *value != JsValue::TheHole {
-                        return Some(jsvalue_ref_to_jit_i64(value));
-                    }
+        lda_global_from_ref(g_ref, name_idx)
+    }
+
+    /// Shared global-load logic used by both the cached-pointer and
+    /// `.with()` paths.
+    fn lda_global_from_ref(g: &RefCell<JitGlobalState>, name_idx: u32) -> Option<i64> {
+        let state = g.borrow();
+        let env_rc = state.env.as_ref()?;
+        let env = env_rc.borrow();
+
+        // Fast path: direct-mapped IC hit.
+        let entry = &state.ic[(name_idx & 31) as usize];
+        if entry.0 == name_idx {
+            let (slot_idx, cached_gen) = (entry.1, entry.2);
+            if env.generation() == cached_gen && slot_idx < env.slot_count() {
+                let value = env.get_by_index(slot_idx);
+                if *value != JsValue::TheHole {
+                    return Some(jsvalue_ref_to_jit_i64(value));
                 }
             }
+        }
 
-            // Slow path: HashMap lookup.
-            let name = get_rt_string_constant(name_idx)?;
-            let value = env.get(&name).unwrap_or(&JsValue::Undefined);
-            let result = jsvalue_ref_to_jit_i64(value);
+        // Slow path: HashMap lookup.
+        let name = get_rt_string_constant(name_idx)?;
+        let value = env.get(&name).unwrap_or(&JsValue::Undefined);
+        let result = jsvalue_ref_to_jit_i64(value);
 
-            // Populate IC — need mutable borrow, so drop the immutable one.
-            let slot_idx = env.slot_index_for(&name);
-            let cur_gen = env.generation();
-            drop(env);
-            drop(state);
-            if let Some(idx) = slot_idx {
-                g.borrow_mut().ic[(name_idx & 31) as usize] = (name_idx, idx, cur_gen);
-            }
+        // Populate IC — need mutable borrow, so drop the immutable one.
+        let slot_idx = env.slot_index_for(&name);
+        let cur_gen = env.generation();
+        drop(env);
+        drop(state);
+        if let Some(idx) = slot_idx {
+            g.borrow_mut().ic[(name_idx & 31) as usize] = (name_idx, idx, cur_gen);
+        }
 
-            Some(result)
-        })
+        Some(result)
     }
 
     // ── Specialized StaGlobal stub ──────────────────────────────────────
@@ -1812,48 +1807,59 @@ mod jit_runtime {
     fn sta_global_inner(name_idx: u32, value_i64: i64) -> Option<i64> {
         let value = jit_i64_to_jsvalue(value_i64);
 
-        RT_GLOBAL.with(|g| {
-            let state = g.borrow();
-            let env_rc = state.env.as_ref()?;
-            let mut env = env_rc.borrow_mut();
+        let ptrs = RT_PTRS.with(|p| p.get());
+        let g_ref = if ptrs.is_cached() {
+            // SAFETY: cached pointer set by cache_rt_ptrs; valid for thread lifetime.
+            unsafe { &*ptrs.global }
+        } else {
+            return RT_GLOBAL.with(|g| sta_global_from_ref(g, name_idx, value_i64, value));
+        };
 
-            // Fast path: direct-mapped IC hit — store by index.
-            let entry = &state.ic[(name_idx & 31) as usize];
-            if entry.0 == name_idx {
-                let (slot_idx, cached_gen) = (entry.1, entry.2);
-                if env.generation() == cached_gen && slot_idx < env.slot_count() {
-                    let name = get_rt_string_constant(name_idx)?;
-                    // Use store_by_index_fast: syncs HashMap but does NOT
-                    // bump generation.  The IC only tracks structural
-                    // validity (name→slot mapping), which is unchanged by
-                    // a value-only store.  Skipping the bump avoids
-                    // cascading IC misses for other variables in the same
-                    // loop iteration.
-                    env.store_by_index_fast(slot_idx, &name, value);
-                    return Some(value_i64);
-                }
+        sta_global_from_ref(g_ref, name_idx, value_i64, value)
+    }
+
+    /// Shared global-store logic used by both the cached-pointer and
+    /// `.with()` paths.
+    fn sta_global_from_ref(
+        g: &RefCell<JitGlobalState>,
+        name_idx: u32,
+        value_i64: i64,
+        value: JsValue,
+    ) -> Option<i64> {
+        let state = g.borrow();
+        let env_rc = state.env.as_ref()?;
+        let mut env = env_rc.borrow_mut();
+
+        // Fast path: direct-mapped IC hit — store by index.
+        let entry = &state.ic[(name_idx & 31) as usize];
+        if entry.0 == name_idx {
+            let (slot_idx, cached_gen) = (entry.1, entry.2);
+            if env.generation() == cached_gen && slot_idx < env.slot_count() {
+                let name = get_rt_string_constant(name_idx)?;
+                env.store_by_index_fast(slot_idx, &name, value);
+                return Some(value_i64);
             }
+        }
 
-            // Slow path: insert via HashMap.
-            let name = get_rt_string_constant(name_idx)?;
-            let slot_idx = env.slot_index_for(&name);
-            if let Some(idx) = slot_idx {
-                env.store_by_index_fast(idx, &name, value);
-            } else {
-                env.insert(name.clone(), value);
-            }
+        // Slow path: insert via HashMap.
+        let name = get_rt_string_constant(name_idx)?;
+        let slot_idx = env.slot_index_for(&name);
+        if let Some(idx) = slot_idx {
+            env.store_by_index_fast(idx, &name, value);
+        } else {
+            env.insert(name.clone(), value);
+        }
 
-            // Populate / update IC.
-            let cur_gen = env.generation();
-            let new_slot_idx = env.slot_index_for(&name);
-            drop(env);
-            drop(state);
-            if let Some(idx) = new_slot_idx {
-                g.borrow_mut().ic[(name_idx & 31) as usize] = (name_idx, idx, cur_gen);
-            }
+        // Populate / update IC.
+        let cur_gen = env.generation();
+        let new_slot_idx = env.slot_index_for(&name);
+        drop(env);
+        drop(state);
+        if let Some(idx) = new_slot_idx {
+            g.borrow_mut().ic[(name_idx & 31) as usize] = (name_idx, idx, cur_gen);
+        }
 
-            Some(value_i64)
-        })
+        Some(value_i64)
     }
 
     // ── Specialized LdaKeyedProperty stub ───────────────────────────────
@@ -2089,7 +2095,93 @@ mod jit_runtime {
     }
 
     /// Inner implementation for [`jit_runtime_call_property0`].
+    ///
+    /// Handles fast array methods (e.g. `arr.pop()`) and generic
+    /// `NativeFunction` calls.
     fn call_property0_inner(callee_i64: i64, receiver_i64: i64) -> Option<i64> {
+        // ── Fast path: use cached heap to detect fast array methods ──
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if ptrs.is_cached() && is_heap_handle(callee_i64) {
+            let callee_idx = (callee_i64 - JIT_HEAP_TAG) as usize;
+            // SAFETY: cached pointers set by cache_rt_ptrs; valid for thread lifetime.
+            let heap_ref = unsafe { &*ptrs.heap };
+            let heap = heap_ref.borrow();
+
+            if let Some(JsValue::PlainObject(map_rc)) = heap.get(callee_idx) {
+                let map = map_rc.borrow();
+                if let Some(JsValue::String(method_name)) = map.get("\0stator.fast_array_method") {
+                    if is_heap_handle(receiver_i64) {
+                        let recv_idx = (receiver_i64 - JIT_HEAP_TAG) as usize;
+                        if let Some(JsValue::Array(arr)) = heap.get(recv_idx) {
+                            match method_name.as_ref() {
+                                "pop" => {
+                                    let arr = Rc::clone(arr);
+                                    drop(map);
+                                    drop(heap);
+                                    let val = arr.borrow_mut().pop().unwrap_or(JsValue::Undefined);
+                                    return Some(jsvalue_to_jit_i64(val));
+                                }
+                                "shift" => {
+                                    let arr = Rc::clone(arr);
+                                    drop(map);
+                                    drop(heap);
+                                    let val = if arr.borrow().is_empty() {
+                                        JsValue::Undefined
+                                    } else {
+                                        arr.borrow_mut().remove(0)
+                                    };
+                                    return Some(jsvalue_to_jit_i64(val));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    drop(map);
+                    drop(heap);
+                    return None;
+                }
+
+                // PlainObject with __call__.
+                if let Some(JsValue::NativeFunction(nf)) = map.get("__call__") {
+                    let nf = Rc::clone(nf);
+                    drop(map);
+                    let receiver = if is_heap_handle(receiver_i64) {
+                        heap.get((receiver_i64 - JIT_HEAP_TAG) as usize)
+                            .cloned()
+                            .unwrap_or(JsValue::Undefined)
+                    } else {
+                        super::jit_to_jsvalue(receiver_i64).unwrap_or(JsValue::Undefined)
+                    };
+                    drop(heap);
+                    return match nf(vec![receiver]) {
+                        Ok(val) => Some(jsvalue_to_jit_i64(val)),
+                        Err(_) => None,
+                    };
+                }
+                drop(map);
+            }
+
+            if let Some(JsValue::NativeFunction(nf)) = heap.get(callee_idx) {
+                let nf = Rc::clone(nf);
+                let receiver = if is_heap_handle(receiver_i64) {
+                    heap.get((receiver_i64 - JIT_HEAP_TAG) as usize)
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined)
+                } else {
+                    super::jit_to_jsvalue(receiver_i64).unwrap_or(JsValue::Undefined)
+                };
+                drop(heap);
+                return match nf(vec![receiver]) {
+                    Ok(val) => Some(jsvalue_to_jit_i64(val)),
+                    Err(_) => None,
+                };
+            }
+
+            drop(heap);
+            return None;
+        }
+
+        // ── Slow path: pointers not cached ──────────────────────────────
         let callee = jit_i64_to_jsvalue(callee_i64);
         match callee {
             JsValue::NativeFunction(nf) => {
@@ -2127,7 +2219,115 @@ mod jit_runtime {
     }
 
     /// Inner implementation for [`jit_runtime_call_property1`].
+    ///
+    /// Handles three callee shapes:
+    /// 1. Fast array method (PlainObject with `\0stator.fast_array_method`)
+    ///    — inlines `push`, `pop`, etc. directly.
+    /// 2. `NativeFunction` — generic Rust-closure dispatch.
+    /// 3. Anything else → DEOPT.
     fn call_property1_inner(callee_i64: i64, receiver_i64: i64, arg0_i64: i64) -> Option<i64> {
+        // ── Fast path: use cached heap to avoid jit_i64_to_jsvalue clones ──
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if ptrs.is_cached() && is_heap_handle(callee_i64) {
+            let callee_idx = (callee_i64 - JIT_HEAP_TAG) as usize;
+            // SAFETY: cached pointers set by cache_rt_ptrs; valid for thread lifetime.
+            let heap_ref = unsafe { &*ptrs.heap };
+            let heap = heap_ref.borrow();
+
+            // Check for fast array method pattern (PlainObject with marker).
+            if let Some(JsValue::PlainObject(map_rc)) = heap.get(callee_idx) {
+                let map = map_rc.borrow();
+                if let Some(JsValue::String(method_name)) = map.get("\0stator.fast_array_method") {
+                    // Inline fast array method — currently supports "push".
+                    if is_heap_handle(receiver_i64) {
+                        let recv_idx = (receiver_i64 - JIT_HEAP_TAG) as usize;
+                        if let Some(JsValue::Array(arr)) = heap.get(recv_idx) {
+                            match method_name.as_ref() {
+                                "push" => {
+                                    let arg0 = if is_heap_handle(arg0_i64) {
+                                        let a_idx = (arg0_i64 - JIT_HEAP_TAG) as usize;
+                                        heap.get(a_idx).cloned().unwrap_or(JsValue::Undefined)
+                                    } else {
+                                        super::jit_to_jsvalue(arg0_i64)
+                                            .unwrap_or(JsValue::Undefined)
+                                    };
+                                    let arr = Rc::clone(arr);
+                                    drop(map);
+                                    drop(heap);
+                                    let mut items = arr.borrow_mut();
+                                    items.push(arg0);
+                                    return Some(items.len() as i64);
+                                }
+                                "pop" => {
+                                    let arr = Rc::clone(arr);
+                                    drop(map);
+                                    drop(heap);
+                                    let val = arr.borrow_mut().pop().unwrap_or(JsValue::Undefined);
+                                    return Some(jsvalue_to_jit_i64(val));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    drop(map);
+                    drop(heap);
+                    // Unrecognised fast-array method or non-Array receiver — DEOPT.
+                    return None;
+                }
+
+                // PlainObject with __call__ (generic callable object).
+                if let Some(JsValue::NativeFunction(nf)) = map.get("__call__") {
+                    let nf = Rc::clone(nf);
+                    drop(map);
+                    let receiver = heap
+                        .get((receiver_i64 - JIT_HEAP_TAG) as usize)
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined);
+                    let arg0 = if is_heap_handle(arg0_i64) {
+                        heap.get((arg0_i64 - JIT_HEAP_TAG) as usize)
+                            .cloned()
+                            .unwrap_or(JsValue::Undefined)
+                    } else {
+                        super::jit_to_jsvalue(arg0_i64).unwrap_or(JsValue::Undefined)
+                    };
+                    drop(heap);
+                    return match nf(vec![receiver, arg0]) {
+                        Ok(val) => Some(jsvalue_to_jit_i64(val)),
+                        Err(_) => None,
+                    };
+                }
+
+                drop(map);
+                drop(heap);
+                return None;
+            }
+
+            // NativeFunction path.
+            if let Some(JsValue::NativeFunction(nf)) = heap.get(callee_idx) {
+                let nf = Rc::clone(nf);
+                let receiver = heap
+                    .get((receiver_i64 - JIT_HEAP_TAG) as usize)
+                    .cloned()
+                    .unwrap_or(JsValue::Undefined);
+                let arg0 = if is_heap_handle(arg0_i64) {
+                    heap.get((arg0_i64 - JIT_HEAP_TAG) as usize)
+                        .cloned()
+                        .unwrap_or(JsValue::Undefined)
+                } else {
+                    super::jit_to_jsvalue(arg0_i64).unwrap_or(JsValue::Undefined)
+                };
+                drop(heap);
+                return match nf(vec![receiver, arg0]) {
+                    Ok(val) => Some(jsvalue_to_jit_i64(val)),
+                    Err(_) => None,
+                };
+            }
+
+            drop(heap);
+            return None;
+        }
+
+        // ── Slow path: pointers not cached ──────────────────────────────
         let callee = jit_i64_to_jsvalue(callee_i64);
         match callee {
             JsValue::NativeFunction(nf) => {
