@@ -74,7 +74,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
-use crate::bytecode::feedback::{FeedbackVector, InlineCacheState};
+use crate::bytecode::feedback::FeedbackVector;
 use crate::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, NodeId, ValueNode};
 use crate::error::{StatorError, StatorResult};
 
@@ -172,8 +172,10 @@ impl Environment {
 pub struct GraphBuilder<'a> {
     /// The bytecode being compiled.
     bytecode: &'a BytecodeArray,
-    /// Runtime feedback for speculative decisions.
-    feedback: &'a FeedbackVector,
+    /// Runtime feedback for speculative decisions (currently unused —
+    /// Maglev compiles on a background thread with a fresh FeedbackVector,
+    /// so all slots are Uninitialized; we always emit Smi-guarded code).
+    _feedback: &'a FeedbackVector,
     /// The graph under construction.
     graph: MaglevGraph,
     /// Current SSA environment (register → NodeId).
@@ -207,7 +209,7 @@ impl<'a> GraphBuilder<'a> {
 
         let mut builder = Self {
             bytecode,
-            feedback,
+            _feedback: feedback,
             graph: MaglevGraph::new(parameter_count),
             env: Environment::new(parameter_count as usize, frame_size),
             current_block: 0,
@@ -1492,10 +1494,16 @@ impl<'a> GraphBuilder<'a> {
         })
     }
 
-    /// Emit a binary arithmetic operation, specialising on the feedback slot.
+    /// Emit a binary arithmetic operation.
     ///
-    /// - **Monomorphic / Polymorphic** → Smi guards + checked Smi operation.
-    /// - Otherwise → generic fallback.
+    /// Always emits Smi-guarded checked operations for core arithmetic
+    /// (Add/Sub/Mul/Div/Mod). The `CheckSmi` guards deopt to the interpreter
+    /// if values are non-Smi. This works correctly even when the feedback
+    /// vector is Uninitialized (Maglev compiles on a background thread with
+    /// a fresh FeedbackVector).
+    ///
+    /// Bitwise/shift ops and exponentiation still use generic stubs since
+    /// they need runtime coercion logic.
     fn emit_binary_op(
         &mut self,
         left: NodeId,
@@ -1503,192 +1511,89 @@ impl<'a> GraphBuilder<'a> {
         slot: u32,
         kind: BinaryOpKind,
     ) -> StatorResult<NodeId> {
-        let state = self
-            .feedback
-            .get_state(slot)
-            .unwrap_or(InlineCacheState::Uninitialized);
-
-        if matches!(
-            state,
-            InlineCacheState::Monomorphic | InlineCacheState::Polymorphic
-        ) {
-            // Guard both operands as Smis.
-            self.emit(ValueNode::CheckSmi { receiver: left })?;
-            self.emit(ValueNode::CheckSmi { receiver: right })?;
-            // Emit the speculative Smi operation.
-            self.emit(match kind {
-                BinaryOpKind::Add => ValueNode::CheckedSmiAdd { left, right },
-                BinaryOpKind::Sub => ValueNode::CheckedSmiSubtract { left, right },
-                BinaryOpKind::Mul => ValueNode::CheckedSmiMultiply { left, right },
-                BinaryOpKind::Div => ValueNode::CheckedSmiDivide { left, right },
-                BinaryOpKind::Mod => ValueNode::CheckedSmiModulus { left, right },
-                BinaryOpKind::Exp => ValueNode::GenericExponentiate {
-                    left,
-                    right,
-                    feedback_slot: slot,
-                },
-                BinaryOpKind::BitwiseOr => ValueNode::GenericBitwiseOr {
-                    left,
-                    right,
-                    feedback_slot: slot,
-                },
-                BinaryOpKind::BitwiseXor => ValueNode::GenericBitwiseXor {
-                    left,
-                    right,
-                    feedback_slot: slot,
-                },
-                BinaryOpKind::BitwiseAnd => ValueNode::GenericBitwiseAnd {
-                    left,
-                    right,
-                    feedback_slot: slot,
-                },
-                BinaryOpKind::ShiftLeft => ValueNode::GenericShiftLeft {
-                    left,
-                    right,
-                    feedback_slot: slot,
-                },
-                BinaryOpKind::ShiftRight => ValueNode::GenericShiftRight {
-                    left,
-                    right,
-                    feedback_slot: slot,
-                },
-                BinaryOpKind::ShiftRightLogical => ValueNode::GenericShiftRightLogical {
-                    left,
-                    right,
-                    feedback_slot: slot,
-                },
-            })
-        } else {
-            // Generic slow path.
-            self.emit(match kind {
-                BinaryOpKind::Add => ValueNode::GenericAdd {
-                    left,
-                    right,
-                    feedback_slot: slot,
-                },
-                BinaryOpKind::Sub => ValueNode::GenericSubtract {
-                    left,
-                    right,
-                    feedback_slot: slot,
-                },
-                BinaryOpKind::Mul => ValueNode::GenericMultiply {
-                    left,
-                    right,
-                    feedback_slot: slot,
-                },
-                BinaryOpKind::Div => ValueNode::GenericDivide {
-                    left,
-                    right,
-                    feedback_slot: slot,
-                },
-                BinaryOpKind::Mod => ValueNode::GenericModulus {
-                    left,
-                    right,
-                    feedback_slot: slot,
-                },
-                BinaryOpKind::Exp => ValueNode::GenericExponentiate {
-                    left,
-                    right,
-                    feedback_slot: slot,
-                },
-                BinaryOpKind::BitwiseOr => ValueNode::GenericBitwiseOr {
-                    left,
-                    right,
-                    feedback_slot: slot,
-                },
-                BinaryOpKind::BitwiseXor => ValueNode::GenericBitwiseXor {
-                    left,
-                    right,
-                    feedback_slot: slot,
-                },
-                BinaryOpKind::BitwiseAnd => ValueNode::GenericBitwiseAnd {
-                    left,
-                    right,
-                    feedback_slot: slot,
-                },
-                BinaryOpKind::ShiftLeft => ValueNode::GenericShiftLeft {
-                    left,
-                    right,
-                    feedback_slot: slot,
-                },
-                BinaryOpKind::ShiftRight => ValueNode::GenericShiftRight {
-                    left,
-                    right,
-                    feedback_slot: slot,
-                },
-                BinaryOpKind::ShiftRightLogical => ValueNode::GenericShiftRightLogical {
-                    left,
-                    right,
-                    feedback_slot: slot,
-                },
-            })
-        }
+        // Guard both operands as Smis.
+        self.emit(ValueNode::CheckSmi { receiver: left })?;
+        self.emit(ValueNode::CheckSmi { receiver: right })?;
+        // Emit the speculative Smi operation for core arithmetic,
+        // or generic stubs for ops needing runtime coercion.
+        self.emit(match kind {
+            BinaryOpKind::Add => ValueNode::CheckedSmiAdd { left, right },
+            BinaryOpKind::Sub => ValueNode::CheckedSmiSubtract { left, right },
+            BinaryOpKind::Mul => ValueNode::CheckedSmiMultiply { left, right },
+            BinaryOpKind::Div => ValueNode::CheckedSmiDivide { left, right },
+            BinaryOpKind::Mod => ValueNode::CheckedSmiModulus { left, right },
+            BinaryOpKind::Exp => ValueNode::GenericExponentiate {
+                left,
+                right,
+                feedback_slot: slot,
+            },
+            BinaryOpKind::BitwiseOr => ValueNode::GenericBitwiseOr {
+                left,
+                right,
+                feedback_slot: slot,
+            },
+            BinaryOpKind::BitwiseXor => ValueNode::GenericBitwiseXor {
+                left,
+                right,
+                feedback_slot: slot,
+            },
+            BinaryOpKind::BitwiseAnd => ValueNode::GenericBitwiseAnd {
+                left,
+                right,
+                feedback_slot: slot,
+            },
+            BinaryOpKind::ShiftLeft => ValueNode::GenericShiftLeft {
+                left,
+                right,
+                feedback_slot: slot,
+            },
+            BinaryOpKind::ShiftRight => ValueNode::GenericShiftRight {
+                left,
+                right,
+                feedback_slot: slot,
+            },
+            BinaryOpKind::ShiftRightLogical => ValueNode::GenericShiftRightLogical {
+                left,
+                right,
+                feedback_slot: slot,
+            },
+        })
     }
 
     /// Emit a comparison, specialising on Smi feedback.
+    ///
+    /// When feedback is unavailable (Uninitialized) we still emit Smi-guarded
+    /// Int32 comparisons: the `CheckSmi` guards will deopt to the interpreter
+    /// if values turn out to be non-Smi, which is correct fallback behaviour.
+    /// The previous code incorrectly emitted `TaggedEqual` (===) for all
+    /// comparison kinds when feedback was Uninitialized.
     fn emit_comparison(
         &mut self,
         left: NodeId,
         right: NodeId,
-        slot: u32,
+        _slot: u32,
         kind: CompareKind,
     ) -> StatorResult<NodeId> {
-        let state = self
-            .feedback
-            .get_state(slot)
-            .unwrap_or(InlineCacheState::Uninitialized);
-
-        if matches!(
-            state,
-            InlineCacheState::Monomorphic | InlineCacheState::Polymorphic
-        ) {
-            self.emit(ValueNode::CheckSmi { receiver: left })?;
-            self.emit(ValueNode::CheckSmi { receiver: right })?;
-            self.emit(match kind {
-                CompareKind::LessThan => ValueNode::Int32LessThan { left, right },
-                CompareKind::GreaterThan => ValueNode::Int32GreaterThan { left, right },
-                CompareKind::LessThanOrEqual => ValueNode::Int32LessThanOrEqual { left, right },
-                CompareKind::GreaterThanOrEqual => {
-                    ValueNode::Int32GreaterThanOrEqual { left, right }
-                }
-            })
-        } else {
-            // Fall back to tagged equal / generic for unspecialised comparisons.
-            self.emit(ValueNode::TaggedEqual {
-                left,
-                right,
-                feedback_slot: slot,
-            })
-        }
+        self.emit(ValueNode::CheckSmi { receiver: left })?;
+        self.emit(ValueNode::CheckSmi { receiver: right })?;
+        self.emit(match kind {
+            CompareKind::LessThan => ValueNode::Int32LessThan { left, right },
+            CompareKind::GreaterThan => ValueNode::Int32GreaterThan { left, right },
+            CompareKind::LessThanOrEqual => ValueNode::Int32LessThanOrEqual { left, right },
+            CompareKind::GreaterThanOrEqual => ValueNode::Int32GreaterThanOrEqual { left, right },
+        })
     }
 
     /// Emit an increment or decrement with Smi speculation.
-    fn emit_inc_dec(&mut self, val: NodeId, slot: u32, is_inc: bool) -> StatorResult<NodeId> {
-        let state = self
-            .feedback
-            .get_state(slot)
-            .unwrap_or(InlineCacheState::Uninitialized);
-
-        if matches!(
-            state,
-            InlineCacheState::Monomorphic | InlineCacheState::Polymorphic
-        ) {
-            self.emit(ValueNode::CheckSmi { receiver: val })?;
-            if is_inc {
-                self.emit(ValueNode::CheckedSmiIncrement { value: val })
-            } else {
-                self.emit(ValueNode::CheckedSmiDecrement { value: val })
-            }
-        } else if is_inc {
-            self.emit(ValueNode::GenericIncrement {
-                value: val,
-                feedback_slot: slot,
-            })
+    ///
+    /// Always emits the Smi-guarded checked path; `CheckSmi` deopts to the
+    /// interpreter for non-Smi values.
+    fn emit_inc_dec(&mut self, val: NodeId, _slot: u32, is_inc: bool) -> StatorResult<NodeId> {
+        self.emit(ValueNode::CheckSmi { receiver: val })?;
+        if is_inc {
+            self.emit(ValueNode::CheckedSmiIncrement { value: val })
         } else {
-            self.emit(ValueNode::GenericDecrement {
-                value: val,
-                feedback_slot: slot,
-            })
+            self.emit(ValueNode::CheckedSmiDecrement { value: val })
         }
     }
 
