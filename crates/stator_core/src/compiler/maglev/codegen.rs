@@ -236,6 +236,16 @@ pub struct CachedMaglevCode {
     pub register_file_slots: usize,
 }
 
+#[cfg(all(target_arch = "x86_64", unix))]
+impl std::fmt::Debug for CachedMaglevCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedMaglevCode")
+            .field("size", &self.size)
+            .field("register_file_slots", &self.register_file_slots)
+            .finish()
+    }
+}
+
 // SAFETY: The mmap'd page is process-global memory.  We only access it
 // through an `extern "C"` function-pointer call, which is thread-safe as
 // long as the code is read-only (which it is after the initial memcpy).
