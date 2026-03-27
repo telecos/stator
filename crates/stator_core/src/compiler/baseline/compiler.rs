@@ -2332,13 +2332,18 @@ impl<'a> BaselineCompiler<'a> {
     /// Emit the standard function prologue.
     ///
     /// Sets up the call frame and loads the register-file pointer into R14.
+    /// Five callee-saved registers are pushed (odd count) so that the stack
+    /// is 16-byte aligned after the return-address push by the caller.
     ///
     /// ```text
     /// push rbp
     /// mov  rbp, rsp
+    /// push rbx        ; callee-saved context pointer
     /// push r12        ; callee-saved accumulator
     /// push r14        ; callee-saved register-file pointer
+    /// push r15        ; alignment pad (reserved for future use)
     /// mov  r14, rdi   ; r14 = regs argument
+    /// mov  rbx, rsi   ; rbx = closure context pointer
     /// xor  r12, r12   ; accumulator = 0
     /// ```
     fn emit_prologue(&mut self) {
@@ -2347,6 +2352,8 @@ impl<'a> BaselineCompiler<'a> {
         self.masm.push(Reg64::Rbx);
         self.masm.push(Reg64::R12);
         self.masm.push(Reg64::R14);
+        // Push R15 for 16-byte stack alignment (5 pushes + return addr = even).
+        self.masm.push(Reg64::R15);
         self.masm.mov_rr(Reg64::R14, Reg64::Rdi);
         // RSI carries the raw closure-context pointer (passed by execute).
         // Store in RBX (callee-saved) for use by context-slot stubs.
@@ -2358,13 +2365,16 @@ impl<'a> BaselineCompiler<'a> {
     ///
     /// ```text
     /// mov rax, r12    ; return accumulator
+    /// pop r15         ; alignment pad
     /// pop r14
     /// pop r12
+    /// pop rbx
     /// pop rbp
     /// ret
     /// ```
     fn emit_normal_epilogue(&mut self) {
         self.masm.mov_rr(Reg64::Rax, Reg64::R12);
+        self.masm.pop(Reg64::R15);
         self.masm.pop(Reg64::R14);
         self.masm.pop(Reg64::R12);
         self.masm.pop(Reg64::Rbx);
@@ -2381,8 +2391,10 @@ impl<'a> BaselineCompiler<'a> {
     /// deopt_label:
     ///   mov r12, JIT_DEOPT
     ///   mov rax, r12
+    ///   pop r15
     ///   pop r14
     ///   pop r12
+    ///   pop rbx
     ///   pop rbp
     ///   ret
     /// ```
