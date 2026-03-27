@@ -186,7 +186,8 @@ use crate::builtins::error::{
 use crate::builtins::function::{function_bound_name, function_length, function_to_string};
 use crate::builtins::proxy::{proxy_apply, proxy_get_with_receiver, proxy_set_with_receiver};
 use crate::bytecode::bytecode_array::{
-    BytecodeArray, ConstantPoolEntry, ConstructBoilerplate, HandlerTableEntry, TIERING_THRESHOLD,
+    BytecodeArray, ConstantPoolEntry, ConstructBoilerplate, HandlerTableEntry,
+    MAGLEV_TIERING_THRESHOLD, TIERING_THRESHOLD, TURBOFAN_TIERING_THRESHOLD,
 };
 #[cfg(all(target_arch = "x86_64", unix))]
 use crate::bytecode::bytecode_array::{MaglevJitCodeCache, TurbofanJitCodeCache};
@@ -1085,6 +1086,7 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
 ///   (fall-back to the next tier).
 ///
 /// On platforms where the JIT is not available this always returns `None`.
+#[allow(dead_code)]
 fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
@@ -1234,6 +1236,7 @@ pub(super) fn maybe_compile_turbofan(ba: &BytecodeArray) {
 ///   (fall-back to the next tier).
 ///
 /// On platforms where the JIT is not available this always returns `None`.
+#[allow(dead_code)]
 fn try_execute_turbofan(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
@@ -1363,9 +1366,16 @@ pub(super) fn try_execute_best_jit(
     ba: &BytecodeArray,
     args: &[JsValue],
 ) -> Option<StatorResult<JsValue>> {
-    try_execute_turbofan(ba, args)
-        .or_else(|| try_execute_maglev(ba, args))
-        .or_else(|| try_execute_jit(ba, args))
+    // NOTE: Maglev and TurboFan execution is temporarily disabled because
+    // their codegen can produce infinite loops for certain benchmark
+    // patterns (e.g. prototype_chain, property_access).  Compilation is
+    // still triggered at the appropriate thresholds so the compiled code
+    // is ready when the codegen bugs are fixed.
+    //
+    // try_execute_turbofan(ba, args)
+    //     .or_else(|| try_execute_maglev(ba, args))
+    //     .or_else(|| try_execute_jit(ba, args))
+    try_execute_jit(ba, args)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3283,12 +3293,6 @@ impl Interpreter {
                                     {
                                         maybe_compile_baseline(&frame.bytecode_array);
                                     }
-                                    // Eagerly start Maglev/TurboFan background
-                                    // compilation so optimised code is ready by
-                                    // the next invocation (baseline takes over
-                                    // for the rest of *this* call).
-                                    maybe_compile_maglev(&frame.bytecode_array);
-                                    maybe_compile_turbofan(&frame.bytecode_array);
                                     if let Some(jit_result) = try_execute_best_jit(
                                         &frame.bytecode_array,
                                         &frame.call_args,
@@ -3296,21 +3300,11 @@ impl Interpreter {
                                         return jit_result;
                                     }
                                 }
-                                if frame.osr_loop_count == MAGLEV_OSR_LOOP_THRESHOLD
-                                    && let Some(jit_result) = try_execute_best_jit(
-                                        &frame.bytecode_array,
-                                        &frame.call_args,
-                                    )
-                                {
-                                    return jit_result;
+                                if frame.osr_loop_count == MAGLEV_OSR_LOOP_THRESHOLD {
+                                    maybe_compile_maglev(&frame.bytecode_array);
                                 }
-                                if frame.osr_loop_count == TURBOFAN_OSR_LOOP_THRESHOLD
-                                    && let Some(jit_result) = try_execute_best_jit(
-                                        &frame.bytecode_array,
-                                        &frame.call_args,
-                                    )
-                                {
-                                    return jit_result;
+                                if frame.osr_loop_count == TURBOFAN_OSR_LOOP_THRESHOLD {
+                                    maybe_compile_turbofan(&frame.bytecode_array);
                                 }
 
                                 // Only EXPAND loop_end_pc — never shrink it.
@@ -4957,11 +4951,6 @@ impl Interpreter {
                             {
                                 maybe_compile_baseline(&frame.bytecode_array);
                             }
-                            // Eagerly start Maglev/TurboFan background
-                            // compilation so optimised code is ready by
-                            // the next invocation.
-                            maybe_compile_maglev(&frame.bytecode_array);
-                            maybe_compile_turbofan(&frame.bytecode_array);
                             // OSR: switch to JIT if code is now available.
                             if let Some(jit_result) =
                                 try_execute_best_jit(&frame.bytecode_array, &frame.call_args)
@@ -4969,17 +4958,11 @@ impl Interpreter {
                                 return jit_result;
                             }
                         }
-                        if frame.osr_loop_count == MAGLEV_OSR_LOOP_THRESHOLD
-                            && let Some(jit_result) =
-                                try_execute_best_jit(&frame.bytecode_array, &frame.call_args)
-                        {
-                            return jit_result;
+                        if frame.osr_loop_count == MAGLEV_OSR_LOOP_THRESHOLD {
+                            maybe_compile_maglev(&frame.bytecode_array);
                         }
-                        if frame.osr_loop_count == TURBOFAN_OSR_LOOP_THRESHOLD
-                            && let Some(jit_result) =
-                                try_execute_best_jit(&frame.bytecode_array, &frame.call_args)
-                        {
-                            return jit_result;
+                        if frame.osr_loop_count == TURBOFAN_OSR_LOOP_THRESHOLD {
+                            maybe_compile_turbofan(&frame.bytecode_array);
                         }
                         // SMI-mode detection: if the accumulator is Smi
                         // (or Boolean — common for comparison-terminated
@@ -7295,11 +7278,12 @@ pub(super) fn dispatch_call(
                     if ba.try_get_jit_code().is_none() && !ba.jit_baseline_has_deopted() {
                         maybe_compile_baseline(ba);
                     }
-                    // Eagerly start Maglev/TurboFan background compilation
-                    // at the baseline threshold so optimised code is ready
-                    // for subsequent invocations.
-                    maybe_compile_maglev(ba);
-                    maybe_compile_turbofan(ba);
+                    if count >= MAGLEV_TIERING_THRESHOLD {
+                        maybe_compile_maglev(ba);
+                    }
+                    if count >= TURBOFAN_TIERING_THRESHOLD {
+                        maybe_compile_turbofan(ba);
+                    }
                     if let Some(jit_result) = try_execute_best_jit(ba, &args) {
                         frame.accumulator = jit_result?;
                         return Ok(());
@@ -7393,8 +7377,12 @@ pub(super) fn dispatch_call_property(
                     if ba.try_get_jit_code().is_none() && !ba.jit_baseline_has_deopted() {
                         maybe_compile_baseline(ba);
                     }
-                    maybe_compile_maglev(ba);
-                    maybe_compile_turbofan(ba);
+                    if count >= MAGLEV_TIERING_THRESHOLD {
+                        maybe_compile_maglev(ba);
+                    }
+                    if count >= TURBOFAN_TIERING_THRESHOLD {
+                        maybe_compile_turbofan(ba);
+                    }
                     if let Some(jit_result) = try_execute_best_jit(ba, &args) {
                         frame.accumulator = jit_result?;
                         return Ok(());
