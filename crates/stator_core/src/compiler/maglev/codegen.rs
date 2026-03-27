@@ -15,15 +15,18 @@
 //! The generated function uses the same calling convention as the baseline JIT:
 //!
 //! ```text
-//! extern "C" fn(regs: *mut i64) -> i64
+//! extern "C" fn(regs: *mut i64, ctx: i64) -> i64
 //! ```
 //!
 //! `regs` is a caller-allocated array of `register_file_slots` × `i64` values:
 //!
 //! ```text
-//! [ param[0], param[1], …, spill[0], spill[1], … ]
-//!  ←── parameter_count ───→←──── spill_count ────→
+//! [ param[0], param[1], …, spill[0], spill[1], …, promoted_global[0], … ]
+//!  ←── parameter_count ───→←──── spill_count ────→←─ promoted_extras ──→
 //! ```
+//!
+//! `ctx` is the closure context raw pointer (0 if no context).  Stored in
+//! `R15` by the prologue for use by context-slot load/store stubs.
 //!
 //! Parameters are loaded from the array at function entry.  Spilled values use
 //! slots starting at index `parameter_count`.
@@ -75,12 +78,12 @@
 //! assert!(!compiled.code.is_empty());
 //! ```
 
+#[cfg(all(target_arch = "x86_64", unix))]
+use crate::compiler::baseline::compiler::jit_runtime;
 use crate::compiler::baseline::compiler::{
     DeoptEntry, JIT_DEOPT, JIT_FALSE, JIT_NULL, JIT_TRUE, JIT_UNDEFINED, METADATA_MAGIC,
     SafepointEntry,
 };
-#[cfg(all(target_arch = "x86_64", unix))]
-use crate::compiler::baseline::compiler::jit_runtime;
 use crate::compiler::baseline::masm_x64::{CondCode, Label, MacroAssembler, Reg64};
 use crate::compiler::maglev::ir::{ControlNode, MaglevGraph, NodeId, ValueNode};
 use crate::compiler::maglev::regalloc::{AllocationResult, Location, allocate};
@@ -88,11 +91,18 @@ use crate::error::{StatorError, StatorResult};
 use std::collections::HashSet;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Constants
+// Constants & helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Number of physical registers available to the Maglev register allocator.
 pub const NUM_PHYS_REGS: u32 = 6;
+
+/// A stub call argument that is either a Maglev IR node or an immediate i64.
+#[cfg(all(target_arch = "x86_64", unix))]
+enum NodeOrImm {
+    Node(NodeId),
+    Imm(i64),
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Output types
@@ -934,7 +944,6 @@ impl<'a> MaglevCodegen<'a> {
                     self.masm.mov_load_base_disp32(Reg64::R11, Reg64::R14, off);
                     self.emit_store(id, Reg64::R11);
                 } else {
-                    // Unknown global — deopt to interpreter.
                     self.emit_deopt_unconditional(0);
                     self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
                     self.emit_store(id, Reg64::R11);
@@ -945,6 +954,101 @@ impl<'a> MaglevCodegen<'a> {
                     self.emit_load(*value, Reg64::R11);
                     self.masm.mov_store_base_disp32(Reg64::R14, off, Reg64::R11);
                     self.emit_store(id, Reg64::R11);
+                } else {
+                    self.emit_deopt_unconditional(0);
+                    self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
+                    self.emit_store(id, Reg64::R11);
+                }
+            }
+
+            // ── Property access via runtime stubs ─────────────────────────────
+            //
+            // These delegate to the baseline JIT's runtime stubs.  We save and
+            // restore all caller-saved allocatable registers around the call.
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::LoadNamedGeneric {
+                object,
+                name,
+                feedback_slot,
+            } => {
+                self.emit_stub_call_3arg(
+                    id,
+                    *object,
+                    i64::from(*name),
+                    NodeOrImm::Imm(i64::from(*feedback_slot)),
+                    jit_runtime::jit_runtime_lda_named_property as usize,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::StoreNamedGeneric {
+                object,
+                name,
+                value,
+                feedback_slot: _,
+            } => {
+                self.emit_stub_call_3arg(
+                    id,
+                    *object,
+                    i64::from(*name),
+                    NodeOrImm::Node(*value),
+                    jit_runtime::jit_runtime_sta_named_property as usize,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::LoadKeyedGeneric { object, key, .. } => {
+                self.emit_stub_call_2node(
+                    id,
+                    *object,
+                    *key,
+                    jit_runtime::jit_runtime_lda_keyed_property as usize,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::StoreKeyedGeneric {
+                object, key, value, ..
+            } => {
+                self.emit_stub_call_3node(
+                    id,
+                    *object,
+                    *key,
+                    *value,
+                    jit_runtime::jit_runtime_sta_keyed_property as usize,
+                );
+            }
+
+            // ── Guards ── pass-through when we use generic stubs ──────────────
+            ValueNode::CheckMaps { receiver, .. }
+            | ValueNode::CheckMapsWithMigration { receiver, .. } => {
+                // The generic property stubs handle shape-checking internally.
+                // Pass the receiver through unchanged.
+                self.emit_load(*receiver, Reg64::R11);
+                self.emit_store(id, Reg64::R11);
+            }
+
+            // ── Function calls via runtime stubs ──────────────────────────────
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::Call { callee, args, .. } => {
+                // Only support zero-arg calls for now (closure_counter pattern).
+                if args.is_empty() {
+                    self.emit_stub_call_1node(
+                        id,
+                        *callee,
+                        jit_runtime::jit_runtime_call_undefined_receiver0 as usize,
+                    );
+                } else {
+                    self.emit_deopt_unconditional(0);
+                    self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
+                    self.emit_store(id, Reg64::R11);
+                }
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::CallKnownFunction { callee, args, .. } => {
+                if args.is_empty() {
+                    self.emit_stub_call_1node(
+                        id,
+                        *callee,
+                        jit_runtime::jit_runtime_call_undefined_receiver0 as usize,
+                    );
                 } else {
                     self.emit_deopt_unconditional(0);
                     self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
@@ -1176,6 +1280,115 @@ impl<'a> MaglevCodegen<'a> {
             // Restore the return value.
             self.masm.pop(Reg64::Rax);
         }
+    }
+
+    // ── Runtime stub call helpers ────────────────────────────────────────────
+    //
+    // These helpers save all caller-saved allocatable registers, set up
+    // arguments in SysV ABI order, call the extern "C" stub, check for
+    // JIT_DEOPT, and store the result.
+
+    /// Save caller-saved allocatable registers: RCX, RDX, RSI, R8, R9.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_save_caller_saved(&mut self) {
+        self.masm.push(Reg64::Rcx);
+        self.masm.push(Reg64::Rdx);
+        self.masm.push(Reg64::Rsi);
+        self.masm.push(Reg64::R8);
+        self.masm.push(Reg64::R9);
+    }
+
+    /// Restore caller-saved allocatable registers (reverse order).
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_restore_caller_saved(&mut self) {
+        self.masm.pop(Reg64::R9);
+        self.masm.pop(Reg64::R8);
+        self.masm.pop(Reg64::Rsi);
+        self.masm.pop(Reg64::Rdx);
+        self.masm.pop(Reg64::Rcx);
+    }
+
+    /// Emit a deopt check: if RAX == JIT_DEOPT, jump to deopt epilogue.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_deopt_check_rax(&mut self) {
+        self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+        self.masm.jcc(CondCode::Equal, &mut self.deopt_label);
+    }
+
+    /// Call a 1-arg stub: `stub(node_arg)`.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_stub_call_1node(&mut self, id: NodeId, arg0: NodeId, stub_addr: usize) {
+        self.emit_save_caller_saved();
+        self.emit_load(arg0, Reg64::Rdi);
+        self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.emit_restore_caller_saved();
+        self.emit_deopt_check_rax();
+        self.masm.mov_rr(Reg64::R11, Reg64::Rax);
+        self.emit_store(id, Reg64::R11);
+    }
+
+    /// Call a 2-node-arg stub: `stub(node0, node1)`.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_stub_call_2node(&mut self, id: NodeId, arg0: NodeId, arg1: NodeId, stub_addr: usize) {
+        self.emit_save_caller_saved();
+        self.emit_load(arg0, Reg64::Rdi);
+        self.emit_load(arg1, Reg64::Rsi);
+        self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.emit_restore_caller_saved();
+        self.emit_deopt_check_rax();
+        self.masm.mov_rr(Reg64::R11, Reg64::Rax);
+        self.emit_store(id, Reg64::R11);
+    }
+
+    /// Call a 3-node-arg stub: `stub(node0, node1, node2)`.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_stub_call_3node(
+        &mut self,
+        id: NodeId,
+        arg0: NodeId,
+        arg1: NodeId,
+        arg2: NodeId,
+        stub_addr: usize,
+    ) {
+        self.emit_save_caller_saved();
+        self.emit_load(arg0, Reg64::Rdi);
+        self.emit_load(arg1, Reg64::Rsi);
+        self.emit_load(arg2, Reg64::Rdx);
+        self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.emit_restore_caller_saved();
+        self.emit_deopt_check_rax();
+        self.masm.mov_rr(Reg64::R11, Reg64::Rax);
+        self.emit_store(id, Reg64::R11);
+    }
+
+    /// Call a 3-arg stub where arg0 is a node, arg1 is an immediate i64,
+    /// and arg2 is either a node or an immediate (see [`NodeOrImm`]).
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_stub_call_3arg(
+        &mut self,
+        id: NodeId,
+        arg0_node: NodeId,
+        arg1_imm: i64,
+        arg2: NodeOrImm,
+        stub_addr: usize,
+    ) {
+        self.emit_save_caller_saved();
+        self.emit_load(arg0_node, Reg64::Rdi);
+        self.masm.mov_ri(Reg64::Rsi, arg1_imm);
+        match arg2 {
+            NodeOrImm::Node(n) => self.emit_load(n, Reg64::Rdx),
+            NodeOrImm::Imm(v) => self.masm.mov_ri(Reg64::Rdx, v),
+        }
+        self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.emit_restore_caller_saved();
+        self.emit_deopt_check_rax();
+        self.masm.mov_rr(Reg64::R11, Reg64::Rax);
+        self.emit_store(id, Reg64::R11);
     }
 
     // ── Arithmetic helpers ───────────────────────────────────────────────────
