@@ -812,6 +812,20 @@ thread_local! {
     static EXECUTION_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
+// ── Maglev diagnostic counters (per-thread) ──────────────────────────────────
+#[cfg(all(target_arch = "x86_64", unix))]
+thread_local! {
+    /// How many times `try_execute_maglev` was entered (past the deopt guard).
+    static MAGLEV_DIAG_TRIED: Cell<u64> = const { Cell::new(0) };
+    /// How many times Maglev JIT code ran to completion (no deopt).
+    static MAGLEV_DIAG_EXECUTED: Cell<u64> = const { Cell::new(0) };
+    /// How many times Maglev JIT code returned `JIT_DEOPT`.
+    static MAGLEV_DIAG_DEOPTED: Cell<u64> = const { Cell::new(0) };
+    /// How many times the Maglev cache was empty and background compilation
+    /// had not yet delivered code.
+    static MAGLEV_DIAG_NOT_READY: Cell<u64> = const { Cell::new(0) };
+}
+
 /// Set a wall-clock deadline for all interpreter execution on the current
 /// thread.  Passing `None` clears any existing deadline.
 pub fn set_execution_deadline(deadline: Option<Instant>) {
@@ -889,6 +903,39 @@ pub fn turbofan_stats() -> (u32, usize) {
         TURBOFAN_COMPILATION_COUNT.load(std::sync::atomic::Ordering::Relaxed),
         TURBOFAN_CODE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
     )
+}
+
+/// Return Maglev diagnostic counters for the current thread.
+///
+/// Returns `(tried, executed, deopted, not_ready, compilations, code_bytes)`.
+///
+/// * `tried` – entries into `try_execute_maglev` past the deopt guard.
+/// * `executed` – successful JIT executions (no deopt).
+/// * `deopted` – executions that returned `JIT_DEOPT`.
+/// * `not_ready` – times the background compilation had not yet delivered code.
+/// * `compilations` – process-wide Maglev compilation count (from [`maglev_stats`]).
+/// * `code_bytes` – process-wide Maglev code bytes (from [`maglev_stats`]).
+///
+/// On platforms without Maglev JIT support all values are zero.
+pub fn maglev_diagnostics() -> (u64, u64, u64, u64, u32, usize) {
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        let tried = MAGLEV_DIAG_TRIED.with(|c| c.get());
+        let executed = MAGLEV_DIAG_EXECUTED.with(|c| c.get());
+        let deopted = MAGLEV_DIAG_DEOPTED.with(|c| c.get());
+        let not_ready = MAGLEV_DIAG_NOT_READY.with(|c| c.get());
+        let (compilations, code_bytes) = maglev_stats();
+        return (
+            tried,
+            executed,
+            deopted,
+            not_ready,
+            compilations,
+            code_bytes,
+        );
+    }
+    #[allow(unreachable_code)]
+    (0, 0, 0, 0, 0, 0)
 }
 
 /// Convert a [`JsValue`] to its JIT `i64` representation.
@@ -1094,6 +1141,8 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
             return None;
         }
 
+        MAGLEV_DIAG_TRIED.with(|c| c.set(c.get() + 1));
+
         use crate::compiler::baseline::compiler::{
             JIT_DEOPT, jit_runtime_set_context, jit_runtime_setup, jit_runtime_teardown,
             jit_to_jsvalue_ext,
@@ -1110,6 +1159,8 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
                     // SAFETY: `code` was produced by `maglev_codegen::compile`.
                     let exec = unsafe { CachedMaglevCode::new(&code, register_file_slots) };
                     *cache.borrow_mut() = exec;
+                } else {
+                    MAGLEV_DIAG_NOT_READY.with(|c| c.set(c.get() + 1));
                 }
             }
         }
@@ -1134,9 +1185,11 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
         let result = unsafe { cached.execute(&jit_args) };
 
         let ret = if result == JIT_DEOPT {
+            MAGLEV_DIAG_DEOPTED.with(|c| c.set(c.get() + 1));
             ba.mark_jit_maglev_deopted();
             None
         } else {
+            MAGLEV_DIAG_EXECUTED.with(|c| c.set(c.get() + 1));
             jit_to_jsvalue_ext(result).map(Ok)
         };
 

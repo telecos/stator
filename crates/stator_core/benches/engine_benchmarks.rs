@@ -36,7 +36,7 @@ use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_core::error::StatorResult;
 use stator_core::gc::handle::HandleScope;
 use stator_core::gc::heap::{Heap, HeapObject};
-use stator_core::interpreter::{GlobalEnv, Interpreter, InterpreterFrame};
+use stator_core::interpreter::{GlobalEnv, Interpreter, InterpreterFrame, maglev_diagnostics};
 use stator_core::objects::property_map::PropertyMap;
 use stator_core::objects::tagged::TaggedValue;
 use stator_core::objects::value::JsValue;
@@ -744,6 +744,10 @@ fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(&mut frame).unwrap());
         });
     });
+    let (tried, executed, deopted, not_ready, compilations, code_bytes) = maglev_diagnostics();
+    eprintln!(
+        "MAGLEV_DIAG[arithmetic_loop_10k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes}"
+    );
 }
 
 criterion_group! {
@@ -790,6 +794,10 @@ fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
+    let (tried, executed, deopted, not_ready, compilations, code_bytes) = maglev_diagnostics();
+    eprintln!(
+        "MAGLEV_DIAG[fib_40_iterative]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes}"
+    );
 }
 
 fn bench_property_access_1k_precompiled(c: &mut Criterion) {
@@ -812,6 +820,10 @@ fn bench_property_access_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
+    let (tried, executed, deopted, not_ready, compilations, code_bytes) = maglev_diagnostics();
+    eprintln!(
+        "MAGLEV_DIAG[property_access_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes}"
+    );
 }
 
 fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
@@ -833,6 +845,10 @@ fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
+    let (tried, executed, deopted, not_ready, compilations, code_bytes) = maglev_diagnostics();
+    eprintln!(
+        "MAGLEV_DIAG[object_creation_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes}"
+    );
 }
 
 fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
@@ -858,6 +874,10 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
+    let (tried, executed, deopted, not_ready, compilations, code_bytes) = maglev_diagnostics();
+    eprintln!(
+        "MAGLEV_DIAG[array_push_sum_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes}"
+    );
 }
 
 fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
@@ -884,6 +904,10 @@ fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
+    let (tried, executed, deopted, not_ready, compilations, code_bytes) = maglev_diagnostics();
+    eprintln!(
+        "MAGLEV_DIAG[closure_counter_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes}"
+    );
 }
 
 fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
@@ -912,6 +936,10 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
+    let (tried, executed, deopted, not_ready, compilations, code_bytes) = maglev_diagnostics();
+    eprintln!(
+        "MAGLEV_DIAG[prototype_chain_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes}"
+    );
 }
 
 fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
@@ -945,6 +973,10 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
+    let (tried, executed, deopted, not_ready, compilations, code_bytes) = maglev_diagnostics();
+    eprintln!(
+        "MAGLEV_DIAG[sieve_primes_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes}"
+    );
 }
 
 fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
@@ -967,6 +999,10 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
+    let (tried, executed, deopted, not_ready, compilations, code_bytes) = maglev_diagnostics();
+    eprintln!(
+        "MAGLEV_DIAG[deep_object_access_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes}"
+    );
 }
 
 criterion_group! {
