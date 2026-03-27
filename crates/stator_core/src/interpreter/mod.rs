@@ -1089,6 +1089,11 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
 fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
+        // Skip if Maglev previously deopted.
+        if ba.jit_maglev_has_deopted() {
+            return None;
+        }
+
         use crate::compiler::baseline::compiler::{
             JIT_DEOPT, jit_runtime_set_context, jit_runtime_setup, jit_runtime_teardown,
             jit_to_jsvalue_ext,
@@ -1129,6 +1134,7 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
         let result = unsafe { cached.execute(&jit_args) };
 
         let ret = if result == JIT_DEOPT {
+            ba.mark_jit_maglev_deopted();
             None
         } else {
             jit_to_jsvalue_ext(result).map(Ok)

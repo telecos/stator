@@ -487,6 +487,9 @@ pub struct BytecodeArray {
     /// and immediately exiting JIT code that contains unsupported opcodes
     /// (e.g. `LdaCurrentContextSlot` in closures).
     jit_baseline_deopted: Rc<Cell<bool>>,
+    /// When `true`, the interpreter skips all Maglev JIT execution attempts
+    /// for this function.
+    jit_maglev_deopted: Cell<bool>,
     /// Captured closure context set by `CreateClosure`.
     ///
     /// When a function is created as a closure, this holds the enclosing
@@ -671,6 +674,7 @@ impl BytecodeArray {
             turbofan_jit_code: Arc::new(Mutex::new(None)),
             turbofan_compile_started: Arc::new(AtomicBool::new(false)),
             jit_baseline_deopted: Rc::new(Cell::new(false)),
+            jit_maglev_deopted: Cell::new(false),
             closure_context: None,
             writes_closure_vars: false,
             has_fn_props: Cell::new(false),
@@ -1275,6 +1279,16 @@ impl BytecodeArray {
     /// entering and immediately exiting always-deopting code.
     pub fn mark_jit_baseline_deopted(&self) {
         self.jit_baseline_deopted.set(true);
+    }
+
+    /// Returns `true` if Maglev JIT code has deopted at least once.
+    pub fn jit_maglev_has_deopted(&self) -> bool {
+        self.jit_maglev_deopted.get()
+    }
+
+    /// Mark this function's Maglev JIT code as having deopted.
+    pub fn mark_jit_maglev_deopted(&self) {
+        self.jit_maglev_deopted.set(true);
     }
 
     /// Returns a clone of the cached Maglev-JIT machine code and
