@@ -1383,17 +1383,17 @@ mod jit_runtime {
         jit_args: &[i64],
         saved_ba: *const BytecodeArray,
     ) -> Option<i64> {
-        let saved_heap = RT_HEAP.with(|h| std::mem::take(&mut *h.borrow_mut()));
+        // Record heap base for truncation (avoids moving the entire Vec).
+        let heap_base = RT_HEAP.with(|h| h.borrow().len());
+
         let callee_ctx = ba.closure_context().cloned();
         let ctx_ptr = callee_ctx
             .as_ref()
             .map(|rc| Rc::as_ptr(rc) as i64)
             .unwrap_or(0);
-        let saved_ctx = RT_CONTEXT.with(|c| {
-            let prev = c.borrow().clone();
-            *c.borrow_mut() = callee_ctx;
-            prev
-        });
+
+        // Swap context in one borrow_mut (avoids separate borrow + borrow_mut).
+        let saved_ctx = RT_CONTEXT.with(|c| std::mem::replace(&mut *c.borrow_mut(), callee_ctx));
         RT_BYTECODE.with(|b| b.set(&**ba as *const BytecodeArray));
 
         // SAFETY: cached executable code was produced by the
@@ -1409,7 +1409,9 @@ mod jit_runtime {
 
         // Restore outer execution state.
         RT_BYTECODE.with(|b| b.set(saved_ba));
-        RT_HEAP.with(|h| *h.borrow_mut() = saved_heap);
+        // Truncate heap back to the base (drops callee's entries without
+        // moving the Vec itself — much cheaper than take + restore).
+        RT_HEAP.with(|h| h.borrow_mut().truncate(heap_base));
         RT_CONTEXT.with(|c| *c.borrow_mut() = saved_ctx);
 
         if let Some(val) = result_val {
