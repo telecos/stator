@@ -7587,7 +7587,7 @@ pub(super) fn walk_context_chain(
 /// If `ba` was created by `CreateClosure` with an enclosing scope, this sets
 /// the callee frame's context so that `CreateFunctionContext` chains to the
 /// captured scope and context-slot opcodes can walk up to outer variables.
-pub(super) fn restore_closure_context(
+pub(crate) fn restore_closure_context(
     frame: &mut InterpreterFrame,
     ba: &Rc<crate::bytecode::bytecode_array::BytecodeArray>,
 ) {
@@ -7788,7 +7788,7 @@ fn proto_lookup_chain_depth(current: &JsValue, key: &str) -> Option<u8> {
 ///
 /// Returns `JsValue::Undefined` if the property is not found after exhausting
 /// the chain or hitting a depth limit of 256 links.
-pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
+pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
     // Fast path: PlainObject — the most common case.
     if let JsValue::PlainObject(map) = obj {
         let borrow = map.borrow();
@@ -10981,7 +10981,7 @@ pub(super) fn wire_construct_prototype(result: JsValue, ctor_proto: &JsValue) ->
 
 /// Resolve the constructor's `.prototype` value, using the per-bytecode-array
 /// cache when available to avoid a property lookup on every `new` call.
-pub(super) fn resolve_construct_proto(ctor: &JsValue, ba: &Rc<BytecodeArray>) -> JsValue {
+pub(crate) fn resolve_construct_proto(ctor: &JsValue, ba: &Rc<BytecodeArray>) -> JsValue {
     if let Some(cached) = ba.cached_construct_proto() {
         return cached;
     }
@@ -11003,7 +11003,7 @@ pub(super) fn resolve_construct_proto(ctor: &JsValue, ba: &Rc<BytecodeArray>) ->
 
 /// Create the `this` object for a `[[Construct]]` call, optionally using
 /// the boilerplate shape cache on `ba` to pre-allocate property slots.
-pub(super) fn make_construct_this(ba: &Rc<BytecodeArray>, ctor_proto: &JsValue) -> JsValue {
+pub(crate) fn make_construct_this(ba: &Rc<BytecodeArray>, ctor_proto: &JsValue) -> JsValue {
     let this_obj: Rc<RefCell<PropertyMap>> = if let Some(bp) = ba.cached_construct_boilerplate() {
         Rc::new(RefCell::new(PropertyMap::from_boilerplate(
             &bp.keys, &bp.attrs,
@@ -11022,7 +11022,7 @@ pub(super) fn make_construct_this(ba: &Rc<BytecodeArray>, ctor_proto: &JsValue) 
 /// After a successful `[[Construct]]` where `this_val` was used (not an
 /// explicitly returned object), capture the object's shape as a
 /// boilerplate for future constructions.
-pub(super) fn maybe_cache_construct_boilerplate(ba: &Rc<BytecodeArray>, this_val: &JsValue) {
+pub(crate) fn maybe_cache_construct_boilerplate(ba: &Rc<BytecodeArray>, this_val: &JsValue) {
     // Only cache once — the first execution defines the expected shape.
     if ba.cached_construct_boilerplate().is_some() {
         return;

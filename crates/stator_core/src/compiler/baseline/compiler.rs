@@ -673,6 +673,26 @@ mod jit_runtime {
             Opcode::LdaGlobal => lda_global_inner(operand1 as u32),
             Opcode::StaGlobal => sta_global_inner(operand1 as u32, acc),
 
+            // ── Construct (new) ─────────────────────────────────────────
+            Opcode::Construct => {
+                // operand1 = ctor_flat, operand2 packs args_start (high 16)
+                // and arg_count (low 16).
+                let ctor_flat = operand1 as usize;
+                let args_start_flat = ((operand2 >> 16) & 0xFFFF) as usize;
+                let arg_count = (operand2 & 0xFFFF) as usize;
+
+                // SAFETY: ctor_flat is within the register file.
+                let ctor_i64 = unsafe { *regs.add(ctor_flat) };
+                let ctor_val = jit_i64_to_jsvalue(ctor_i64);
+
+                let saved_ba = RT_BYTECODE.with(|b| b.get());
+
+                let result = construct_inner(&ctor_val, regs, args_start_flat, arg_count, saved_ba);
+
+                RT_BYTECODE.with(|b| b.set(saved_ba));
+                result
+            }
+
             // ── Dynamic scope lookup ────────────────────────────────────
             Opcode::LdaLookupSlot => None,
 
@@ -1257,6 +1277,86 @@ mod jit_runtime {
         match result {
             Ok(val) => Some(jsvalue_to_jit_i64(val)),
             Err(_) => None,
+        }
+    }
+
+    /// Inner implementation for the `Construct` runtime stub.
+    ///
+    /// Handles `new Ctor(args...)` by creating the `this` object, running the
+    /// constructor body through the interpreter, and returning the
+    /// constructed object (or the explicitly returned one).
+    fn construct_inner(
+        ctor_val: &JsValue,
+        regs: *mut i64,
+        args_start_flat: usize,
+        arg_count: usize,
+        saved_ba: *const BytecodeArray,
+    ) -> Option<i64> {
+        use crate::interpreter::{
+            Interpreter, InterpreterFrame, make_construct_this, maybe_cache_construct_boilerplate,
+            resolve_construct_proto, restore_closure_context,
+        };
+
+        match ctor_val {
+            JsValue::Function(ba) => {
+                if ba.is_arrow() {
+                    return None;
+                }
+
+                // Collect args from the register file.
+                let mut args = Vec::with_capacity(arg_count);
+                for i in 0..arg_count {
+                    // SAFETY: args_start_flat + i is within the register file.
+                    let arg_i64 = unsafe { *regs.add(args_start_flat + i) };
+                    args.push(jit_i64_to_jsvalue(arg_i64));
+                }
+
+                let ctor_proto = resolve_construct_proto(&JsValue::Function(Rc::clone(ba)), ba);
+                let this_val = make_construct_this(ba, &ctor_proto);
+
+                let env_opt = RT_GLOBAL_ENV.with(|env_cell| env_cell.borrow().as_ref().cloned());
+                let env = env_opt?;
+
+                let mut callee_frame = InterpreterFrame::new_with_globals(Rc::clone(ba), args, env);
+                restore_closure_context(&mut callee_frame, ba);
+                callee_frame.new_target = JsValue::Function(Rc::clone(ba));
+                callee_frame
+                    .global_env
+                    .borrow_mut()
+                    .set_this(this_val.clone());
+
+                let result = Interpreter::run(&mut callee_frame);
+
+                RT_BYTECODE.with(|b| b.set(saved_ba));
+
+                let val = result.ok()?;
+                let constructed = match val {
+                    JsValue::PlainObject(_) | JsValue::Object(_) => val,
+                    _ => {
+                        maybe_cache_construct_boilerplate(ba, &this_val);
+                        this_val
+                    }
+                };
+                Some(jsvalue_to_jit_i64(constructed))
+            }
+
+            JsValue::NativeFunction(f) => {
+                let mut args = Vec::with_capacity(arg_count);
+                for i in 0..arg_count {
+                    // SAFETY: args_start_flat + i is within the register file.
+                    let arg_i64 = unsafe { *regs.add(args_start_flat + i) };
+                    args.push(jit_i64_to_jsvalue(arg_i64));
+                }
+                let result = f(args);
+                RT_BYTECODE.with(|b| b.set(saved_ba));
+                match result {
+                    Ok(val) => Some(jsvalue_to_jit_i64(val)),
+                    Err(_) => None,
+                }
+            }
+
+            // Proxy, PlainObject with __call__, etc. — fall back to deopt.
+            _ => None,
         }
     }
 
@@ -3060,6 +3160,26 @@ impl<'a> BaselineCompiler<'a> {
                 );
             }
 
+            // ── Construct (new) runtime stub ─────────────────────────────────
+            Opcode::Construct => {
+                let Operand::Register(ctor_v) = instr.operands[0] else {
+                    return Err(bad_operand("Construct", 0));
+                };
+                let Operand::Register(args_start_v) = instr.operands[1] else {
+                    return Err(bad_operand("Construct", 1));
+                };
+                let Operand::RegisterCount(arg_count) = instr.operands[2] else {
+                    return Err(bad_operand("Construct", 2));
+                };
+                let ctor_flat = self.reg_flat_index(ctor_v) as i64;
+                let args_start_flat = self.reg_flat_index(args_start_v) as i64;
+                // Pack args_start (high 16) and arg_count (low 16) into
+                // operand2 so they fit the two-operand stub calling
+                // convention.
+                let packed = ((args_start_flat & 0xFFFF) << 16) | (i64::from(arg_count) & 0xFFFF);
+                self.emit_runtime_stub(Opcode::Construct, ctor_flat, packed, bytecode_offset);
+            }
+
             // ── Global variable specialized stubs ────────────────────────────
             Opcode::LdaGlobal => {
                 let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
@@ -3305,7 +3425,6 @@ impl<'a> BaselineCompiler<'a> {
             | Opcode::InvokeIntrinsic
             | Opcode::CallDirectEval
             | Opcode::TailCall
-            | Opcode::Construct
             | Opcode::ConstructWithSpread
             | Opcode::ConstructForwardAllArgs
             | Opcode::CreateBlockContext
