@@ -1667,6 +1667,113 @@ mod jit_runtime {
         Some(value_i64)
     }
 
+    // ── Specialized StaNamedProperty stub ───────────────────────────────
+
+    /// Specialized runtime stub for `StaNamedProperty`.
+    ///
+    /// Stores the accumulator value as a named property on a
+    /// `PlainObject`, skipping the generic opcode dispatch trampoline.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_i64`) – JIT i64 encoding of the receiver object.
+    /// * `RSI` (`name_idx`) – constant-pool index of the property name.
+    /// * `RDX` (`value_i64`) – JIT i64 encoding of the value to store.
+    ///
+    /// Returns `value_i64` on success, or [`JIT_DEOPT`].
+    pub extern "C" fn jit_runtime_sta_named_property(
+        obj_i64: i64,
+        name_idx: u32,
+        value_i64: i64,
+    ) -> i64 {
+        sta_named_property_inner(obj_i64, name_idx, value_i64).unwrap_or(JIT_DEOPT)
+    }
+
+    /// Inner implementation for [`jit_runtime_sta_named_property`].
+    fn sta_named_property_inner(obj_i64: i64, name_idx: u32, value_i64: i64) -> Option<i64> {
+        let obj = jit_i64_to_jsvalue(obj_i64);
+        let value = jit_i64_to_jsvalue(value_i64);
+
+        match &obj {
+            JsValue::PlainObject(map_rc) => {
+                let prop_name = get_rt_string_constant(name_idx)?;
+                map_rc.borrow_mut().insert(prop_name.to_string(), value);
+                Some(value_i64)
+            }
+            _ => None,
+        }
+    }
+
+    // ── Specialized CallProperty0 stub ──────────────────────────────────
+
+    /// Specialized runtime stub for `CallProperty0`.
+    ///
+    /// Handles zero-argument `NativeFunction(receiver)` calls directly.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`callee_i64`) – JIT i64 encoding of the callee.
+    /// * `RSI` (`receiver_i64`) – JIT i64 encoding of the receiver.
+    ///
+    /// Returns the call result as `i64` in `RAX`, or [`JIT_DEOPT`].
+    pub extern "C" fn jit_runtime_call_property0(callee_i64: i64, receiver_i64: i64) -> i64 {
+        call_property0_inner(callee_i64, receiver_i64).unwrap_or(JIT_DEOPT)
+    }
+
+    /// Inner implementation for [`jit_runtime_call_property0`].
+    fn call_property0_inner(callee_i64: i64, receiver_i64: i64) -> Option<i64> {
+        let callee = jit_i64_to_jsvalue(callee_i64);
+        match callee {
+            JsValue::NativeFunction(nf) => {
+                let receiver = jit_i64_to_jsvalue(receiver_i64);
+                match nf(vec![receiver]) {
+                    Ok(val) => Some(jsvalue_to_jit_i64(val)),
+                    Err(_) => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    // ── Specialized CallProperty1 stub ──────────────────────────────────
+
+    /// Specialized runtime stub for `CallProperty1`.
+    ///
+    /// Handles `NativeFunction(receiver, arg0)` calls directly, avoiding
+    /// the generic trampoline dispatch.  This is the fast path for
+    /// built-in methods like `Array.prototype.push`.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`callee_i64`) – JIT i64 encoding of the callee.
+    /// * `RSI` (`receiver_i64`) – JIT i64 encoding of the receiver.
+    /// * `RDX` (`arg0_i64`) – JIT i64 encoding of the first argument.
+    ///
+    /// Returns the call result as `i64` in `RAX`, or [`JIT_DEOPT`].
+    pub extern "C" fn jit_runtime_call_property1(
+        callee_i64: i64,
+        receiver_i64: i64,
+        arg0_i64: i64,
+    ) -> i64 {
+        call_property1_inner(callee_i64, receiver_i64, arg0_i64).unwrap_or(JIT_DEOPT)
+    }
+
+    /// Inner implementation for [`jit_runtime_call_property1`].
+    fn call_property1_inner(callee_i64: i64, receiver_i64: i64, arg0_i64: i64) -> Option<i64> {
+        let callee = jit_i64_to_jsvalue(callee_i64);
+        match callee {
+            JsValue::NativeFunction(nf) => {
+                let receiver = jit_i64_to_jsvalue(receiver_i64);
+                let arg0 = jit_i64_to_jsvalue(arg0_i64);
+                match nf(vec![receiver, arg0]) {
+                    Ok(val) => Some(jsvalue_to_jit_i64(val)),
+                    Err(_) => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     // ── Specialized context slot stubs ──────────────────────────────────
 
     /// Specialized runtime stub for `LdaCurrentContextSlot` and
@@ -2778,6 +2885,150 @@ impl<'a> BaselineCompiler<'a> {
         self.emit_deopt(bytecode_offset);
     }
 
+    /// Emit a specialized call to
+    /// [`jit_runtime::jit_runtime_sta_named_property`] for
+    /// `StaNamedProperty` / `StaNamedOwnProperty` / `DefineNamedOwnProperty`.
+    #[allow(unused_variables)]
+    fn emit_sta_named_property_stub(&mut self, obj_flat: i64, name_idx: u32, bytecode_offset: u32) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            // RDI = receiver object from register file.
+            let obj_byte_offset = (obj_flat as i32) * 8;
+            self.masm
+                .mov_load_base_disp32(Reg64::Rdi, Reg64::R14, obj_byte_offset);
+
+            // RSI = name_idx (constant-pool index).
+            self.masm.mov_ri(Reg64::Rsi, i64::from(name_idx));
+
+            // RDX = value (current accumulator).
+            self.masm.mov_rr(Reg64::Rdx, Reg64::R12);
+
+            let addr = jit_runtime::jit_runtime_sta_named_property as *const () as usize as i64;
+            self.masm.mov_ri(Reg64::R11, addr);
+            self.masm.call_reg(Reg64::R11);
+
+            // ── Check for deopt ─────────────────────────────────────────
+            self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+
+            let code_off = self.masm.position() as u32;
+            let liveness_map = self.all_slots_live();
+            self.deopt_entries.push(DeoptEntry {
+                code_offset: code_off,
+                bytecode_offset,
+                liveness_map,
+            });
+            self.masm.je(&mut self.deopt_label);
+
+            // ── Success: update accumulator ──────────────────────────────
+            self.masm.mov_rr(Reg64::R12, Reg64::Rax);
+            return;
+        }
+
+        #[allow(unreachable_code)]
+        self.emit_deopt(bytecode_offset);
+    }
+
+    /// Emit a specialized call to
+    /// [`jit_runtime::jit_runtime_call_property0`] for `CallProperty0`.
+    #[allow(unused_variables)]
+    fn emit_call_property0_stub(
+        &mut self,
+        callee_flat: i64,
+        receiver_flat: i64,
+        bytecode_offset: u32,
+    ) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            // RDI = callee from register file.
+            let callee_byte_offset = (callee_flat as i32) * 8;
+            self.masm
+                .mov_load_base_disp32(Reg64::Rdi, Reg64::R14, callee_byte_offset);
+
+            // RSI = receiver from register file.
+            let receiver_byte_offset = (receiver_flat as i32) * 8;
+            self.masm
+                .mov_load_base_disp32(Reg64::Rsi, Reg64::R14, receiver_byte_offset);
+
+            let addr = jit_runtime::jit_runtime_call_property0 as *const () as usize as i64;
+            self.masm.mov_ri(Reg64::R11, addr);
+            self.masm.call_reg(Reg64::R11);
+
+            // ── Check for deopt ─────────────────────────────────────────
+            self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+
+            let code_off = self.masm.position() as u32;
+            let liveness_map = self.all_slots_live();
+            self.deopt_entries.push(DeoptEntry {
+                code_offset: code_off,
+                bytecode_offset,
+                liveness_map,
+            });
+            self.masm.je(&mut self.deopt_label);
+
+            // ── Success: update accumulator ──────────────────────────────
+            self.masm.mov_rr(Reg64::R12, Reg64::Rax);
+            return;
+        }
+
+        #[allow(unreachable_code)]
+        self.emit_deopt(bytecode_offset);
+    }
+
+    /// Emit a specialized call to
+    /// [`jit_runtime::jit_runtime_call_property1`] for `CallProperty1`.
+    #[allow(unused_variables)]
+    fn emit_call_property1_stub(
+        &mut self,
+        callee_flat: i64,
+        receiver_flat: i64,
+        arg0_flat: i64,
+        bytecode_offset: u32,
+    ) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            // RDI = callee from register file.
+            let callee_byte_offset = (callee_flat as i32) * 8;
+            self.masm
+                .mov_load_base_disp32(Reg64::Rdi, Reg64::R14, callee_byte_offset);
+
+            // RSI = receiver from register file.
+            let receiver_byte_offset = (receiver_flat as i32) * 8;
+            self.masm
+                .mov_load_base_disp32(Reg64::Rsi, Reg64::R14, receiver_byte_offset);
+
+            // RDX = arg0 from register file.
+            let arg0_byte_offset = (arg0_flat as i32) * 8;
+            self.masm
+                .mov_load_base_disp32(Reg64::Rdx, Reg64::R14, arg0_byte_offset);
+
+            let addr = jit_runtime::jit_runtime_call_property1 as *const () as usize as i64;
+            self.masm.mov_ri(Reg64::R11, addr);
+            self.masm.call_reg(Reg64::R11);
+
+            // ── Check for deopt ─────────────────────────────────────────
+            self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+
+            let code_off = self.masm.position() as u32;
+            let liveness_map = self.all_slots_live();
+            self.deopt_entries.push(DeoptEntry {
+                code_offset: code_off,
+                bytecode_offset,
+                liveness_map,
+            });
+            self.masm.je(&mut self.deopt_label);
+
+            // ── Success: update accumulator ──────────────────────────────
+            self.masm.mov_rr(Reg64::R12, Reg64::Rax);
+            return;
+        }
+
+        #[allow(unreachable_code)]
+        self.emit_deopt(bytecode_offset);
+    }
+
     // ── Main compilation pass ────────────────────────────────────────────────
 
     fn compile_function(&mut self) -> StatorResult<()> {
@@ -3523,12 +3774,7 @@ impl<'a> BaselineCompiler<'a> {
                     return Err(bad_operand(opname, 1));
                 };
                 let obj_flat = self.reg_flat_index(obj_v) as i64;
-                self.emit_runtime_stub(
-                    instr.opcode,
-                    obj_flat,
-                    i64::from(name_idx),
-                    bytecode_offset,
-                );
+                self.emit_sta_named_property_stub(obj_flat, name_idx, bytecode_offset);
             }
 
             Opcode::LdaKeyedProperty => {
@@ -3865,7 +4111,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_runtime_stub(Opcode::Mod, lhs_flat, 0, bytecode_offset);
             }
 
-            // ── CallProperty0 runtime stub ──────────────────────────────────
+            // ── CallProperty0 specialized stub ─────────────────────────────
             Opcode::CallProperty0 => {
                 let Operand::Register(callee_v) = instr.operands[0] else {
                     return Err(bad_operand("CallProperty0", 0));
@@ -3876,17 +4122,11 @@ impl<'a> BaselineCompiler<'a> {
                 let callee_flat = self.reg_flat_index(callee_v) as i64;
                 let receiver_flat = self.reg_flat_index(receiver_v) as i64;
                 self.emit_promoted_global_stores();
-                self.emit_runtime_stub(
-                    Opcode::CallProperty0,
-                    callee_flat,
-                    receiver_flat,
-                    bytecode_offset,
-                );
+                self.emit_call_property0_stub(callee_flat, receiver_flat, bytecode_offset);
                 self.emit_promoted_global_loads();
             }
 
-            // ── CallProperty1 runtime stub ──────────────────────────────────
-            // Pack callee and receiver into operand1, arg0 into operand2.
+            // ── CallProperty1 specialized stub ─────────────────────────────
             Opcode::CallProperty1 => {
                 let Operand::Register(callee_v) = instr.operands[0] else {
                     return Err(bad_operand("CallProperty1", 0));
@@ -3900,9 +4140,13 @@ impl<'a> BaselineCompiler<'a> {
                 let callee_flat = self.reg_flat_index(callee_v) as i64;
                 let receiver_flat = self.reg_flat_index(receiver_v) as i64;
                 let arg0_flat = self.reg_flat_index(arg0_v) as i64;
-                let packed = callee_flat | (receiver_flat << 16);
                 self.emit_promoted_global_stores();
-                self.emit_runtime_stub(Opcode::CallProperty1, packed, arg0_flat, bytecode_offset);
+                self.emit_call_property1_stub(
+                    callee_flat,
+                    receiver_flat,
+                    arg0_flat,
+                    bytecode_offset,
+                );
                 self.emit_promoted_global_loads();
             }
 
