@@ -27,6 +27,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::builtins::symbol::{is_symbol_property_key, property_key_to_symbol};
@@ -233,7 +234,14 @@ fn layout_hash(keys: &[String], attrs: &[PropertyAttributes]) -> u64 {
 #[derive(Debug, Clone)]
 pub struct PropertyMap {
     /// Property names in ECMAScript enumeration order.
-    keys: Vec<String>,
+    ///
+    /// Wrapped in [`Rc`] to enable copy-on-write (COW) sharing with
+    /// template clones.  [`clone_template`](Self::clone_template) produces
+    /// maps that share the key vector via `Rc::clone` (refcount increment)
+    /// instead of deep-cloning every `String`.  On structural mutation
+    /// (property add/remove), [`Rc::make_mut`] transparently clones the
+    /// vector only when other maps still reference it.
+    keys: Rc<Vec<String>>,
     /// Property values, one per key.
     values: Vec<JsValue>,
     /// Property attributes, one per key.
@@ -285,7 +293,8 @@ pub struct PropertyMap {
 
 impl PartialEq for PropertyMap {
     fn eq(&self, other: &Self) -> bool {
-        self.keys == other.keys
+        // Fast path: shared-key clones share the same Rc allocation.
+        (Rc::ptr_eq(&self.keys, &other.keys) || self.keys == other.keys)
             && self.values == other.values
             && self.attrs == other.attrs
             && self.integer_key_count == other.integer_key_count
@@ -309,7 +318,7 @@ impl PropertyMap {
         };
 
         Self {
-            keys: buffers.keys,
+            keys: Rc::new(buffers.keys),
             values: buffers.values,
             attrs: buffers.attrs,
             integer_key_count: 0,
@@ -365,7 +374,7 @@ impl PropertyMap {
         };
 
         Self {
-            keys: buffers.keys,
+            keys: Rc::new(buffers.keys),
             values: buffers.values,
             attrs: buffers.attrs,
             integer_key_count,
@@ -389,7 +398,7 @@ impl PropertyMap {
     pub fn boilerplate_snapshot(
         &self,
     ) -> (Vec<String>, Vec<crate::objects::map::PropertyAttributes>) {
-        (self.keys.clone(), self.attrs.clone())
+        ((*self.keys).clone(), self.attrs.clone())
     }
 
     /// Creates a structural clone of this property map for object-literal
@@ -403,14 +412,21 @@ impl PropertyMap {
     /// values in O(1) without hash lookups.
     pub fn clone_template(&self) -> Self {
         let cap = self.keys.len();
-        let mut buffers = acquire_storage_buffers(cap);
-        buffers.keys.extend_from_slice(&self.keys);
-        buffers.values.resize(cap, JsValue::Undefined);
-        buffers.attrs.extend_from_slice(&self.attrs);
+
+        // Share the key vector via Rc::clone instead of deep-cloning every
+        // String.  Structural mutations on the clone (property add/remove)
+        // will trigger Rc::make_mut which transparently COW-clones the Vec
+        // only when needed.
+        let keys = Rc::clone(&self.keys);
+
+        let mut values = Vec::with_capacity(cap);
+        values.resize(cap, JsValue::Undefined);
+        let mut attrs = Vec::with_capacity(cap);
+        attrs.extend_from_slice(&self.attrs);
 
         let index = if cap > SMALL_PROPERTY_LINEAR_SCAN_CAP {
             let mut map = HashMap::with_capacity(cap);
-            for (slot, key) in self.keys.iter().enumerate() {
+            for (slot, key) in keys.iter().enumerate() {
                 map.insert(key.clone(), slot);
             }
             PropertyIndex::Map(map)
@@ -419,9 +435,9 @@ impl PropertyMap {
         };
 
         Self {
-            keys: buffers.keys,
-            values: buffers.values,
-            attrs: buffers.attrs,
+            keys,
+            values,
+            attrs,
             integer_key_count: self.integer_key_count,
             index,
             cache_hashes: Default::default(),
@@ -703,7 +719,7 @@ impl PropertyMap {
         if let PropertyIndex::Map(index) = &mut self.index {
             index.insert(key.clone(), pos);
         }
-        self.keys.insert(pos, key);
+        Rc::make_mut(&mut self.keys).insert(pos, key);
         self.values.insert(pos, value);
         self.attrs.insert(pos, attrs);
         if is_integer_key {
@@ -915,7 +931,7 @@ impl PropertyMap {
                 self.integer_key_count -= 1;
             }
             let val = self.values[i].clone();
-            self.keys.remove(i);
+            Rc::make_mut(&mut self.keys).remove(i);
             self.values.remove(i);
             self.attrs.remove(i);
             // Decrement indices for every slot that shifted left.
@@ -1158,6 +1174,14 @@ impl Default for PropertyMap {
 
 impl Drop for PropertyMap {
     fn drop(&mut self) {
+        // Keys shared with other PropertyMaps (from clone_template): skip
+        // pooling entirely.  The Rc keeps the key strings alive until the
+        // last clone is dropped, and the values/attrs Vecs are typically
+        // small enough to not warrant TLS overhead.
+        if Rc::strong_count(&self.keys) > 1 {
+            return;
+        }
+
         // Fast path: small objects never entered the pool — let the Vecs
         // drop naturally without TLS overhead.
         if self.keys.capacity() <= POOL_BYPASS_CAP
@@ -1167,8 +1191,14 @@ impl Drop for PropertyMap {
             return;
         }
 
+        // We're the sole owner of the keys Rc — unwrap to reclaim the Vec
+        // for the pool.  The mem::replace leaves a cheap empty Rc behind
+        // (dropped moments later when the struct is reclaimed).
+        let keys_rc = std::mem::replace(&mut self.keys, Rc::new(Vec::new()));
+        let keys = Rc::try_unwrap(keys_rc).unwrap_or_default();
+
         let buffers = PropertyStorageBuffers {
-            keys: std::mem::take(&mut self.keys),
+            keys,
             values: std::mem::take(&mut self.values),
             attrs: std::mem::take(&mut self.attrs),
         };
