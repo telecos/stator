@@ -533,19 +533,22 @@ mod jit_runtime {
                 // triggers inner JIT execution that overwrites it.
                 let saved_ba = RT_BYTECODE.with(|b| b.get());
 
-                let result = if let JsValue::NativeFunction(f) = callee {
-                    f(vec![])
-                } else {
-                    RT_BYTECODE.with(|b| b.set(saved_ba));
-                    return None;
+                let result = match &callee {
+                    JsValue::NativeFunction(f) => {
+                        let r = f(vec![]);
+                        RT_BYTECODE.with(|b| b.set(saved_ba));
+                        match r {
+                            Ok(v) => Some(jsvalue_to_jit_i64(v)),
+                            Err(_) => None,
+                        }
+                    }
+                    JsValue::Function(ba) => call_js_function(ba, vec![], &[], saved_ba),
+                    _ => {
+                        RT_BYTECODE.with(|b| b.set(saved_ba));
+                        None
+                    }
                 };
-
-                RT_BYTECODE.with(|b| b.set(saved_ba));
-
-                match result {
-                    Ok(v) => Some(jsvalue_to_jit_i64(v)),
-                    Err(_) => None,
-                }
+                result
             }
 
             Opcode::CallUndefinedReceiver1 => {
@@ -559,19 +562,24 @@ mod jit_runtime {
 
                 let saved_ba = RT_BYTECODE.with(|b| b.get());
 
-                let result = if let JsValue::NativeFunction(f) = callee {
-                    f(vec![arg1])
-                } else {
-                    RT_BYTECODE.with(|b| b.set(saved_ba));
-                    return None;
+                let result = match &callee {
+                    JsValue::NativeFunction(f) => {
+                        let r = f(vec![arg1]);
+                        RT_BYTECODE.with(|b| b.set(saved_ba));
+                        match r {
+                            Ok(v) => Some(jsvalue_to_jit_i64(v)),
+                            Err(_) => None,
+                        }
+                    }
+                    JsValue::Function(ba) => {
+                        call_js_function(ba, vec![arg1], &[arg1_i64], saved_ba)
+                    }
+                    _ => {
+                        RT_BYTECODE.with(|b| b.set(saved_ba));
+                        None
+                    }
                 };
-
-                RT_BYTECODE.with(|b| b.set(saved_ba));
-
-                match result {
-                    Ok(v) => Some(jsvalue_to_jit_i64(v)),
-                    Err(_) => None,
-                }
+                result
             }
 
             // ── Context slot loads/stores ────────────────────────────────
@@ -1130,6 +1138,112 @@ mod jit_runtime {
         call_undefined_receiver0_inner(callee_i64).unwrap_or(JIT_DEOPT)
     }
 
+    /// Execute a JS `Function` callee via JIT (preferred) or interpreter
+    /// (fallback).
+    ///
+    /// 1. Eagerly compiles the callee via [`BaselineCompiler`] if it has no
+    ///    JIT code yet.
+    /// 2. Tries the persistent exec-cache JIT path.
+    /// 3. Falls back to the interpreter so the **caller** is never forced to
+    ///    deopt just because the callee was not yet compiled.
+    fn call_js_function(
+        ba: &Rc<BytecodeArray>,
+        args: Vec<JsValue>,
+        jit_args: &[i64],
+        saved_ba: *const BytecodeArray,
+    ) -> Option<i64> {
+        // ── 1. Eagerly compile if no JIT code exists ────────────────
+        if ba.try_get_jit_code().is_none() && !ba.jit_baseline_has_deopted() {
+            if let Ok(cc) = BaselineCompiler::compile(ba) {
+                ba.store_jit_code(cc.code, cc.register_file_slots);
+            }
+        }
+
+        // ── 2. Try JIT execution with the persistent exec cache ─────
+        let exec_cache = ba.jit_executable_cache();
+        {
+            let needs_init = exec_cache.borrow().is_none();
+            if needs_init {
+                if let Some((code, reg_slots)) = ba.try_get_jit_code() {
+                    // SAFETY: code was produced by the baseline compiler.
+                    let exec = unsafe { JitExecutableCode::new(&code, reg_slots) };
+                    *exec_cache.borrow_mut() = exec;
+                }
+            }
+        }
+
+        {
+            let cache_ref = exec_cache.borrow();
+            if let Some(exec) = cache_ref.as_ref() {
+                // Save outer execution state so the inner JIT call gets a
+                // clean environment and the outer state is restored after.
+                let saved_heap = RT_HEAP.with(|h| std::mem::take(&mut *h.borrow_mut()));
+                let saved_ic = RT_LDA_IC.with(|ic| std::mem::take(&mut *ic.borrow_mut()));
+                let saved_ctx = RT_CONTEXT.with(|c| c.borrow().clone());
+                RT_BYTECODE.with(|b| b.set(&**ba as *const BytecodeArray));
+                RT_CONTEXT.with(|c| *c.borrow_mut() = ba.closure_context().cloned());
+
+                // SAFETY: cached executable code was produced by the
+                // baseline compiler and contains valid x86-64 instructions.
+                let jit_result = unsafe { exec.execute(jit_args) };
+
+                // Convert the result while the inner RT_HEAP is still
+                // alive.
+                let result_val = if jit_result == JIT_DEOPT {
+                    None
+                } else {
+                    jit_to_jsvalue_ext(jit_result)
+                };
+
+                // Restore outer execution state.
+                RT_BYTECODE.with(|b| b.set(saved_ba));
+                RT_HEAP.with(|h| *h.borrow_mut() = saved_heap);
+                RT_LDA_IC.with(|ic| *ic.borrow_mut() = saved_ic);
+                RT_CONTEXT.with(|c| *c.borrow_mut() = saved_ctx);
+
+                if let Some(val) = result_val {
+                    return Some(jsvalue_to_jit_i64(val));
+                }
+                // JIT deopted — fall through to interpreter.
+            }
+        }
+
+        // ── 3. Interpreter fallback ─────────────────────────────────
+        interpreter_call_fallback(ba, args, saved_ba)
+    }
+
+    /// Execute a JS function via the interpreter.
+    ///
+    /// Used when the callee has no JIT code or the JIT code deopted.
+    /// This prevents the *caller* from deopting just because the callee
+    /// could not run in JIT mode.
+    fn interpreter_call_fallback(
+        ba: &Rc<BytecodeArray>,
+        args: Vec<JsValue>,
+        saved_ba: *const BytecodeArray,
+    ) -> Option<i64> {
+        use crate::interpreter::{Interpreter, InterpreterFrame};
+
+        let env_opt = RT_GLOBAL_ENV.with(|env_cell| env_cell.borrow().as_ref().cloned());
+
+        let result = if let Some(env) = env_opt {
+            let mut frame = InterpreterFrame::new_with_globals(Rc::clone(ba), args, env);
+            Interpreter::run(&mut frame)
+        } else {
+            let mut frame = InterpreterFrame::new(Rc::clone(ba), args);
+            Interpreter::run(&mut frame)
+        };
+
+        // Restore RT_BYTECODE — the interpreter may have changed it
+        // through its own JIT setup/teardown.
+        RT_BYTECODE.with(|b| b.set(saved_ba));
+
+        match result {
+            Ok(val) => Some(jsvalue_to_jit_i64(val)),
+            Err(_) => None,
+        }
+    }
+
     /// Inner implementation for [`jit_runtime_call_undefined_receiver0`].
     fn call_undefined_receiver0_inner(callee_i64: i64) -> Option<i64> {
         let callee = jit_i64_to_jsvalue(callee_i64);
@@ -1144,57 +1258,7 @@ mod jit_runtime {
                     Err(_) => None,
                 }
             }
-            JsValue::Function(ba) => {
-                // Use the persistent executable cache to avoid mmap/munmap
-                // on every call.
-                let exec_cache = ba.jit_executable_cache();
-                {
-                    let needs_init = exec_cache.borrow().is_none();
-                    if needs_init {
-                        let Some((code, reg_slots)) = ba.try_get_jit_code() else {
-                            RT_BYTECODE.with(|b| b.set(saved_ba));
-                            return None;
-                        };
-                        // SAFETY: code was produced by the baseline compiler.
-                        let exec = unsafe { JitExecutableCode::new(&code, reg_slots) };
-                        *exec_cache.borrow_mut() = exec;
-                    }
-                }
-                let cache_ref = exec_cache.borrow();
-                let Some(exec) = cache_ref.as_ref() else {
-                    RT_BYTECODE.with(|b| b.set(saved_ba));
-                    return None;
-                };
-
-                // Save outer execution state so the inner JIT call gets a
-                // clean environment and the outer state is restored after.
-                let saved_heap = RT_HEAP.with(|h| std::mem::take(&mut *h.borrow_mut()));
-                let saved_ic = RT_LDA_IC.with(|ic| std::mem::take(&mut *ic.borrow_mut()));
-                let saved_ctx = RT_CONTEXT.with(|c| c.borrow().clone());
-                RT_BYTECODE.with(|b| b.set(&**ba as *const BytecodeArray));
-
-                // Set the callee's closure context for context-slot stubs.
-                RT_CONTEXT.with(|c| *c.borrow_mut() = ba.closure_context().cloned());
-
-                // SAFETY: cached executable code was produced by the baseline
-                // compiler and contains valid x86-64 instructions.
-                let jit_result = unsafe { exec.execute(&[]) };
-
-                // Convert the result while the inner RT_HEAP is still alive.
-                let result_val = if jit_result == JIT_DEOPT {
-                    None
-                } else {
-                    jit_to_jsvalue_ext(jit_result)
-                };
-
-                // Restore outer execution state.
-                RT_BYTECODE.with(|b| b.set(saved_ba));
-                RT_HEAP.with(|h| *h.borrow_mut() = saved_heap);
-                RT_LDA_IC.with(|ic| *ic.borrow_mut() = saved_ic);
-                RT_CONTEXT.with(|c| *c.borrow_mut() = saved_ctx);
-
-                result_val.map(jsvalue_to_jit_i64)
-            }
+            JsValue::Function(ba) => call_js_function(ba, vec![], &[], saved_ba),
             _ => {
                 RT_BYTECODE.with(|b| b.set(saved_ba));
                 None
