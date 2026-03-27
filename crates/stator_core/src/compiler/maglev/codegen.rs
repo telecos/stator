@@ -99,6 +99,14 @@ use std::collections::HashSet;
 /// Number of physical registers available to the Maglev register allocator.
 pub const NUM_PHYS_REGS: u32 = 6;
 
+/// Maximum number of loop back-edge iterations before the JIT deoptimises.
+///
+/// This guards against infinite loops caused by residual Phi-resolution bugs.
+/// R13 is initialised to this value in the prologue and decremented on every
+/// backward jump; when it reaches zero the function deopts back to the
+/// interpreter.
+const LOOP_COUNTER_MAX: i64 = 10_000_000;
+
 /// A stub call argument that is either a Maglev IR node or an immediate i64.
 #[cfg(all(target_arch = "x86_64", unix))]
 enum NodeOrImm {
@@ -532,14 +540,18 @@ impl<'a> MaglevCodegen<'a> {
     /// mov   rbp, rsp
     /// push  rbx         ; callee-saved Register(0) holder
     /// push  r14         ; callee-saved reg-file pointer
+    /// push  r13         ; callee-saved loop iteration counter
     /// mov   r14, rdi    ; r14 = regs argument (SysV: first arg in RDI)
+    /// mov   r13, LOOP_COUNTER_MAX
     /// ```
     fn emit_prologue(&mut self) {
         self.masm.push(Reg64::Rbp);
         self.masm.mov_rr(Reg64::Rbp, Reg64::Rsp);
         self.masm.push(Reg64::Rbx);
         self.masm.push(Reg64::R14);
+        self.masm.push(Reg64::R13);
         self.masm.mov_rr(Reg64::R14, Reg64::Rdi);
+        self.masm.mov_ri(Reg64::R13, LOOP_COUNTER_MAX);
     }
 
     /// Emit the normal function return sequence.
@@ -547,12 +559,14 @@ impl<'a> MaglevCodegen<'a> {
     /// `rax` must already hold the return value before calling this.
     ///
     /// ```text
+    /// pop  r13
     /// pop  r14
     /// pop  rbx
     /// pop  rbp
     /// ret
     /// ```
     fn emit_normal_epilogue(&mut self) {
+        self.masm.pop(Reg64::R13);
         self.masm.pop(Reg64::R14);
         self.masm.pop(Reg64::Rbx);
         self.masm.pop(Reg64::Rbp);
@@ -564,6 +578,7 @@ impl<'a> MaglevCodegen<'a> {
     /// ```text
     /// deopt_label:
     ///   mov  rax, JIT_DEOPT
+    ///   pop  r13
     ///   pop  r14
     ///   pop  rbx
     ///   pop  rbp
@@ -572,6 +587,7 @@ impl<'a> MaglevCodegen<'a> {
     fn emit_deopt_epilogue(&mut self) {
         self.masm.bind_label(&mut self.deopt_label);
         self.masm.mov_ri(Reg64::Rax, JIT_DEOPT);
+        self.masm.pop(Reg64::R13);
         self.masm.pop(Reg64::R14);
         self.masm.pop(Reg64::Rbx);
         self.masm.pop(Reg64::Rbp);
@@ -1510,6 +1526,9 @@ impl<'a> MaglevCodegen<'a> {
             ControlNode::Jump { target } => {
                 let target = *target as usize;
                 self.emit_phi_copies_for_successor(block_idx, target as u32);
+                if (target as u32) < block_idx {
+                    self.emit_loop_safety_check();
+                }
                 self.masm.jmp(&mut self.block_labels[target]);
             }
             ControlNode::Branch {
@@ -1535,9 +1554,15 @@ impl<'a> MaglevCodegen<'a> {
                 let mut false_path = Label::new();
                 self.masm.jcc(CondCode::NotEqual, &mut false_path);
                 self.emit_phi_copies_for_successor(block_idx, *if_true);
+                if *if_true < block_idx {
+                    self.emit_loop_safety_check();
+                }
                 self.masm.jmp(&mut self.block_labels[if_true_idx]);
                 self.masm.bind_label(&mut false_path);
                 self.emit_phi_copies_for_successor(block_idx, *if_false);
+                if *if_false < block_idx {
+                    self.emit_loop_safety_check();
+                }
                 self.masm.jmp(&mut self.block_labels[if_false_idx]);
             }
             ControlNode::Deoptimize {
@@ -2005,6 +2030,25 @@ impl<'a> MaglevCodegen<'a> {
             liveness_map,
         });
         self.masm.jmp(&mut self.deopt_label);
+    }
+
+    /// Emit a loop-safety counter check for backward jumps.
+    ///
+    /// Decrements R13 (the loop iteration counter initialised in the prologue
+    /// to [`LOOP_COUNTER_MAX`]) and deoptimises when it reaches zero.  This
+    /// prevents infinite loops caused by residual Phi-resolution bugs from
+    /// hanging the process.
+    fn emit_loop_safety_check(&mut self) {
+        self.masm.sub_ri(Reg64::R13, 1);
+        let code_off = self.masm.position() as u32;
+        let liveness_map = self.all_slots_live();
+        self.deopt_entries.push(DeoptEntry {
+            code_offset: code_off,
+            bytecode_offset: 0,
+            liveness_map,
+        });
+        // JE deopt_label — deopt if the counter reached zero.
+        self.masm.jcc(CondCode::Equal, &mut self.deopt_label);
     }
 
     /// Compute a conservative liveness bitmask covering all register-file
