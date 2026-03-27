@@ -194,6 +194,16 @@ mod jit_runtime {
         /// Set via [`jit_runtime_set_context`] before JIT execution of
         /// closures.
         static RT_CONTEXT: RefCell<Option<Rc<RefCell<JsContext>>>> = const { RefCell::new(None) };
+
+        /// Direct-mapped inline cache for prototype chain lookups.
+        ///
+        /// Indexed by `name_idx & 15`; each entry stores
+        /// `(name_idx, own_shape_id, cached_jit_i64_value)`.  When a
+        /// named property is resolved through the prototype chain, the
+        /// result is cached here so subsequent accesses skip the chain
+        /// walk.  A sentinel `name_idx` of `u32::MAX` marks an empty
+        /// slot.
+        static RT_PROTO_IC: RefCell<[(u32, u64, i64); 16]> = const { RefCell::new([(u32::MAX, 0, 0); 16]) };
     }
 
     // ── Setup / teardown ─────────────────────────────────────────────────
@@ -1134,13 +1144,35 @@ mod jit_runtime {
                             .unwrap_or(JIT_UNDEFINED),
                     )
                 } else {
+                    // ── Prototype IC fast path ──────────────────────────
+                    let proto_slot = (name_idx & 15) as usize;
+                    let proto_cached = RT_PROTO_IC.with(|ic| {
+                        let cache = ic.borrow();
+                        let entry = &cache[proto_slot];
+                        if entry.0 == name_idx && entry.1 == shape {
+                            Some(entry.2)
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(val) = proto_cached {
+                        return Some(val);
+                    }
+
                     // Not on own object — walk the prototype chain.
                     let proto = map
                         .get(INTERNAL_PROTO_PROPERTY_KEY)
                         .or_else(|| map.get("__proto__"))
                         .cloned();
                     drop(map);
-                    Some(jit_proto_chain_walk(proto.as_ref(), &prop_name))
+                    let result = jit_proto_chain_walk(proto.as_ref(), &prop_name);
+
+                    // Cache the resolved prototype value.
+                    RT_PROTO_IC.with(|ic| {
+                        ic.borrow_mut()[proto_slot] = (name_idx, shape, result);
+                    });
+
+                    Some(result)
                 }
             }
             JsValue::Array(arr) => {
