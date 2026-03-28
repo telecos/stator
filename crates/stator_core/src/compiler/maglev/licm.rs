@@ -102,18 +102,16 @@ pub fn hoist_loop_invariants(graph: &mut MaglevGraph) -> usize {
 
     if loops.is_empty() && num_blocks >= 3 {
         // Diagnostic: show block structure when no loops found in a multi-block graph.
-        eprintln!("LICM: no loops in {num_blocks}-block graph; back-edges:");
+        eprintln!("LICM: no loops in {num_blocks}-block graph; edges:");
         for block in graph.blocks() {
             let targets = control_targets(block);
             for &t in &targets {
-                if t <= block.id {
-                    eprintln!(
-                        "  block {} -> {} (back-edge candidate, build_loop={})",
-                        block.id,
-                        t,
-                        build_loop(graph, t, block.id).is_some()
-                    );
-                }
+                eprintln!(
+                    "  block {} -> {} (build_loop={})",
+                    block.id,
+                    t,
+                    build_loop(graph, t, block.id).is_some()
+                );
             }
         }
     }
@@ -151,21 +149,39 @@ pub struct NaturalLoop {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Find all natural loops by locating back-edges.
+///
+/// A back-edge is any edge whose target is a loop header — a block that is
+/// reachable from itself via the edge's source.  We detect this by attempting
+/// to build a [`NaturalLoop`] for every CFG edge; [`build_loop`] validates
+/// the structure (unique preheader, etc.) and returns `None` for non-loop
+/// edges.
+///
+/// NOTE: we do **not** rely on `target <= block.id` because block IDs are
+/// assigned in jump-target discovery order, not RPO.  The loop header can
+/// have a *higher* ID than the body (e.g. when the exit block is discovered
+/// before the body's fall-through).
 pub fn detect_loops(graph: &MaglevGraph) -> Vec<NaturalLoop> {
     let mut loops = Vec::new();
+    let mut seen_headers: HashSet<u32> = HashSet::new();
 
     for block in graph.blocks() {
-        // Look at the control node for edges to earlier blocks (back-edges).
         let targets = control_targets(block);
         for &target in &targets {
-            // A back-edge exists when target <= block.id (header dominates the
-            // source in RPO layout).  The equality case covers *self-loops*
-            // where a single block branches back to itself (common for simple
-            // while-loops whose entire body fits in the header block).
-            if target <= block.id
-                && let Some(lp) = build_loop(graph, target, block.id)
-            {
-                loops.push(lp);
+            // Skip forward edges (target not yet visited can't form a loop).
+            // Only consider edges where the target block has this block as a
+            // downstream reachable node — i.e. there is a path target→…→block.
+            // The cheapest test: try to build the loop; build_loop does a
+            // predecessor walk and validates the structure.
+            if seen_headers.contains(&target) {
+                continue; // already found a loop with this header
+            }
+            if let Some(lp) = build_loop(graph, target, block.id) {
+                // Confirm the source is in the loop body (build_loop always
+                // includes it, but verify the body actually connects back).
+                if lp.body.contains(&block.id) && lp.body.contains(&target) {
+                    seen_headers.insert(target);
+                    loops.push(lp);
+                }
             }
         }
     }
@@ -185,8 +201,53 @@ pub fn control_targets(block: &BasicBlock) -> Vec<u32> {
 }
 
 /// Attempt to build a [`NaturalLoop`] from header `header` and back-edge
-/// source `back_src`.  Returns `None` if no unique preheader exists.
+/// source `back_src`.  Returns `None` if no unique preheader exists or if the
+/// edge is not a true back-edge (i.e. `back_src` is not reachable from
+/// `header` through the CFG).
 fn build_loop(graph: &MaglevGraph, header: u32, back_src: u32) -> Option<NaturalLoop> {
+    if header == back_src {
+        // Self-loop: the block jumps back to itself.
+        let block = graph.block(header)?;
+        let preheaders: Vec<u32> = block
+            .predecessors
+            .iter()
+            .copied()
+            .filter(|&p| p != header)
+            .collect();
+        if preheaders.len() != 1 {
+            return None;
+        }
+        let mut body = HashSet::new();
+        body.insert(header);
+        return Some(NaturalLoop {
+            header,
+            preheader: preheaders[0],
+            body,
+        });
+    }
+
+    // First, verify that back_src is reachable from header through forward
+    // edges.  Do a BFS/DFS from header following control-flow successors.
+    let mut reachable = HashSet::new();
+    let mut work = vec![header];
+    while let Some(b) = work.pop() {
+        if !reachable.insert(b) {
+            continue;
+        }
+        if let Some(block) = graph.block(b) {
+            for &t in &control_targets(block) {
+                if t != header {
+                    // Don't follow back to the header — we're looking for
+                    // forward reachability only.
+                    work.push(t);
+                }
+            }
+        }
+    }
+    if !reachable.contains(&back_src) {
+        return None; // Not a true back-edge.
+    }
+
     // Collect the loop body via reverse walk from back_src to header.
     let mut body = HashSet::new();
     body.insert(header);
@@ -1210,6 +1271,115 @@ mod tests {
             graph.blocks()[2].nodes.len(),
             body_len,
             "nothing should be hoisted"
+        );
+    }
+
+    // ── Loop detection with non-RPO block ordering ───────────────────────────
+
+    /// Regression test: the graph builder creates blocks in jump-target
+    /// discovery order, NOT RPO.  For a for-loop, the exit block is discovered
+    /// first (JumpIfFalse target), then the body (fall-through), and finally
+    /// the loop header (JumpLoop target).  This means the header can have a
+    /// HIGHER block ID than the body, which broke the old `target <= block.id`
+    /// back-edge heuristic.
+    #[test]
+    fn test_detect_loop_with_reversed_block_ids() {
+        let mut graph = MaglevGraph::new(1);
+
+        // block 0: init (preheader)
+        let mut b0 = BasicBlock::new(0);
+        b0.push_value(ValueNode::Parameter { index: 0 });
+        b0.set_control(ControlNode::Jump { target: 3 }); // jump to header (ID 3)
+        graph.add_block(b0);
+
+        // block 1: exit — discovered FIRST by JumpIfFalse
+        let mut b1 = BasicBlock::new(1);
+        b1.add_predecessor(3);
+        let undef = b1.push_value(ValueNode::UndefinedConstant);
+        b1.set_control(ControlNode::Return { value: undef });
+        graph.add_block(b1);
+
+        // block 2: body — discovered via fall-through
+        let mut b2 = BasicBlock::new(2);
+        b2.add_predecessor(3);
+        b2.set_control(ControlNode::Jump { target: 3 }); // back-edge to header
+        graph.add_block(b2);
+
+        // block 3: header — discovered LAST by JumpLoop (highest ID!)
+        let mut b3 = BasicBlock::new(3);
+        b3.add_predecessor(0); // from init
+        b3.add_predecessor(2); // back-edge from body
+        let cond = b3.push_value(ValueNode::TrueConstant);
+        b3.set_control(ControlNode::Branch {
+            condition: cond,
+            if_true: 2,
+            if_false: 1,
+        });
+        graph.add_block(b3);
+
+        let loops = detect_loops(&graph);
+        assert_eq!(loops.len(), 1, "must detect the loop even with non-RPO IDs");
+        assert_eq!(loops[0].header, 3, "header should be block 3");
+        assert_eq!(loops[0].preheader, 0, "preheader should be block 0");
+        assert!(loops[0].body.contains(&3), "body must contain header");
+        assert!(loops[0].body.contains(&2), "body must contain body block");
+    }
+
+    /// Regression test: LICM hoists invariant nodes from loops with non-RPO
+    /// block ordering.
+    #[test]
+    fn test_hoist_from_loop_with_reversed_block_ids() {
+        let mut graph = MaglevGraph::new(1);
+
+        // block 0: init (preheader) with a parameter
+        let mut b0 = BasicBlock::new(0);
+        let param = b0.push_value(ValueNode::Parameter { index: 0 });
+        b0.set_control(ControlNode::Jump { target: 3 });
+        graph.add_block(b0);
+
+        // block 1: exit
+        let mut b1 = BasicBlock::new(1);
+        b1.add_predecessor(3);
+        let undef = b1.push_value(ValueNode::UndefinedConstant);
+        b1.set_control(ControlNode::Return { value: undef });
+        graph.add_block(b1);
+
+        // block 2: body with an invariant constant
+        let mut b2 = BasicBlock::new(2);
+        b2.add_predecessor(3);
+        b2.nodes
+            .push((NodeId(100), ValueNode::Int32Constant { value: 42 }));
+        b2.set_control(ControlNode::Jump { target: 3 });
+        graph.add_block(b2);
+
+        // block 3: header (highest ID)
+        let mut b3 = BasicBlock::new(3);
+        b3.add_predecessor(0);
+        b3.add_predecessor(2);
+        let cond = b3.push_value(ValueNode::TrueConstant);
+        b3.set_control(ControlNode::Branch {
+            condition: cond,
+            if_true: 2,
+            if_false: 1,
+        });
+        graph.add_block(b3);
+
+        assert_eq!(graph.blocks()[2].nodes.len(), 1);
+        hoist_loop_invariants(&mut graph);
+
+        // The constant should have been hoisted from body (block 2) to
+        // preheader (block 0).
+        assert_eq!(
+            graph.blocks()[2].nodes.len(),
+            0,
+            "invariant should be hoisted from body"
+        );
+        assert!(
+            graph.blocks()[0]
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::Int32Constant { value: 42 })),
+            "invariant should appear in preheader"
         );
     }
 }
