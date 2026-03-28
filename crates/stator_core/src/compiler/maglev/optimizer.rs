@@ -973,6 +973,9 @@ fn cse_in_block(block: &mut BasicBlock) {
 /// This eliminates per-iteration memory traffic for loop-carried globals.
 fn promote_loop_globals_counted(graph: &mut MaglevGraph) -> usize {
     let loops = licm::detect_loops(graph);
+    if loops.is_empty() {
+        eprintln!("GLOBALS_PROMO: no loops detected, skipping");
+    }
     let mut count = 0;
 
     for lp in &loops {

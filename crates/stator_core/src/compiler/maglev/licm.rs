@@ -97,7 +97,26 @@ use crate::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, NodeId, 
 
 /// Detect natural loops and hoist loop-invariant pure nodes to the preheader.
 pub fn hoist_loop_invariants(graph: &mut MaglevGraph) -> usize {
+    let num_blocks = graph.blocks().len();
     let loops = detect_loops(graph);
+
+    if loops.is_empty() && num_blocks >= 3 {
+        // Diagnostic: show block structure when no loops found in a multi-block graph.
+        eprintln!("LICM: no loops in {num_blocks}-block graph; back-edges:");
+        for block in graph.blocks() {
+            let targets = control_targets(block);
+            for &t in &targets {
+                if t <= block.id {
+                    eprintln!(
+                        "  block {} -> {} (back-edge candidate, build_loop={})",
+                        block.id,
+                        t,
+                        build_loop(graph, t, block.id).is_some()
+                    );
+                }
+            }
+        }
+    }
 
     let mut total = 0;
     for lp in &loops {
@@ -233,6 +252,15 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
     // A LoadGlobal for a name that is also stored must not be hoisted.
     let mutated_globals = collect_mutated_globals(graph, &lp.body);
 
+    eprintln!(
+        "LICM_DETAIL: loop header={} preheader={} body={:?} mutated_obj={} mutated_glob={:?}",
+        lp.header,
+        lp.preheader,
+        lp.body,
+        mutated_objects.len(),
+        mutated_globals,
+    );
+
     // Scan loop blocks for hoistable nodes.  Include the loop header — in
     // single-block loops the entire body lives in the header.  Nodes whose
     // inputs are all defined outside the loop are loop-invariant regardless
@@ -248,15 +276,22 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
             if matches!(node, ValueNode::Phi { .. }) {
                 continue;
             }
-            if is_pure(node)
-                && all_inputs_outside(node, &outside_defs)
-                && !load_aliases_store(node, &mutated_objects)
-                && !global_load_aliases_store(node, &mutated_globals)
-            {
+            let pure = is_pure(node);
+            let inputs_out = all_inputs_outside(node, &outside_defs);
+            let alias_store = load_aliases_store(node, &mutated_objects);
+            let alias_glob = global_load_aliases_store(node, &mutated_globals);
+            if pure && inputs_out && !alias_store && !alias_glob {
                 to_hoist.push((block.id, pos, *id, node.clone()));
                 // After hoisting this node, its NodeId becomes "outside" too,
                 // so subsequent nodes that reference it may also qualify.
                 outside_defs.insert(*id);
+            } else {
+                eprintln!(
+                    "LICM_SKIP: blk={} {:?} pure={pure} inputs_out={inputs_out} \
+                     alias_store={alias_store} alias_glob={alias_glob}",
+                    block.id,
+                    std::mem::discriminant(node),
+                );
             }
         }
     }

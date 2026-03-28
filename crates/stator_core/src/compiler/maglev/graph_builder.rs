@@ -254,6 +254,30 @@ impl<'a> GraphBuilder<'a> {
         // Pass 2: translate instructions.
         builder.translate(&instructions)?;
 
+        // Diagnostic: dump block CFG for loop-detection debugging.
+        for block in builder.graph.blocks() {
+            let ctrl = match &block.control {
+                Some(crate::compiler::maglev::ir::ControlNode::Jump { target }) => {
+                    format!("Jump->{target}")
+                }
+                Some(crate::compiler::maglev::ir::ControlNode::Branch {
+                    if_true,
+                    if_false,
+                    ..
+                }) => format!("Branch->{if_true}/{if_false}"),
+                Some(crate::compiler::maglev::ir::ControlNode::Return { .. }) => "Return".into(),
+                Some(crate::compiler::maglev::ir::ControlNode::Deoptimize { .. }) => "Deopt".into(),
+                None => "NONE".into(),
+            };
+            eprintln!(
+                "MAGLEV_CFG: block {} preds={:?} nodes={} ctrl={}",
+                block.id,
+                block.predecessors,
+                block.nodes.len(),
+                ctrl,
+            );
+        }
+
         Ok(builder.graph)
     }
 
