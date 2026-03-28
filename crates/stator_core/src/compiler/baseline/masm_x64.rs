@@ -515,6 +515,16 @@ impl MacroAssembler {
         }
     }
 
+    /// `MOVSXD dst, src` — sign-extend the lower 32 bits of `src` into the
+    /// 64-bit `dst`.
+    ///
+    /// Encoding: `REX.W 63 /r` (MOVSXD r64, r/m32).
+    pub fn movsxd_rr(&mut self, dst: Reg64, src: Reg64) {
+        self.emit_rex_wrb(dst, src);
+        self.buf.push(0x63);
+        self.emit_modrm_rr(dst, src);
+    }
+
     // ── Control flow ─────────────────────────────────────────────────────────
 
     /// `JMP label` — unconditional near jump to a label.

@@ -672,83 +672,114 @@ impl<'a> MaglevCodegen<'a> {
     fn emit_value_node(&mut self, id: NodeId, node: &ValueNode) {
         match node {
             // ── Constants ────────────────────────────────────────────────────
-            ValueNode::SmiConstant { value } => {
-                self.masm.mov_ri(Reg64::R11, *value as i64);
-                self.emit_store(id, Reg64::R11);
-            }
-            ValueNode::Int32Constant { value } => {
-                self.masm.mov_ri(Reg64::R11, *value as i64);
-                self.emit_store(id, Reg64::R11);
-            }
-            ValueNode::Uint32Constant { value } => {
-                self.masm.mov_ri(Reg64::R11, *value as i64);
-                self.emit_store(id, Reg64::R11);
-            }
+            ValueNode::SmiConstant { value } => match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    self.masm.mov_ri(phys_reg(n), *value as i64);
+                }
+                _ => {
+                    self.masm.mov_ri(Reg64::R11, *value as i64);
+                    self.emit_store(id, Reg64::R11);
+                }
+            },
+            ValueNode::Int32Constant { value } => match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    self.masm.mov_ri(phys_reg(n), *value as i64);
+                }
+                _ => {
+                    self.masm.mov_ri(Reg64::R11, *value as i64);
+                    self.emit_store(id, Reg64::R11);
+                }
+            },
+            ValueNode::Uint32Constant { value } => match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    self.masm.mov_ri(phys_reg(n), *value as i64);
+                }
+                _ => {
+                    self.masm.mov_ri(Reg64::R11, *value as i64);
+                    self.emit_store(id, Reg64::R11);
+                }
+            },
             ValueNode::Float64Constant { value } => {
                 // Store the f64 bit pattern as an i64.
-                self.masm.mov_ri(Reg64::R11, value.to_bits() as i64);
-                self.emit_store(id, Reg64::R11);
+                match self.alloc.location(id) {
+                    Some(Location::Register(n)) => {
+                        self.masm.mov_ri(phys_reg(n), value.to_bits() as i64);
+                    }
+                    _ => {
+                        self.masm.mov_ri(Reg64::R11, value.to_bits() as i64);
+                        self.emit_store(id, Reg64::R11);
+                    }
+                }
             }
-            ValueNode::TrueConstant => {
-                self.masm.mov_ri(Reg64::R11, JIT_TRUE);
-                self.emit_store(id, Reg64::R11);
-            }
-            ValueNode::FalseConstant => {
-                self.masm.mov_ri(Reg64::R11, JIT_FALSE);
-                self.emit_store(id, Reg64::R11);
-            }
-            ValueNode::NullConstant => {
-                self.masm.mov_ri(Reg64::R11, JIT_NULL);
-                self.emit_store(id, Reg64::R11);
-            }
-            ValueNode::UndefinedConstant => {
-                self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
-                self.emit_store(id, Reg64::R11);
-            }
+            ValueNode::TrueConstant => match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    self.masm.mov_ri(phys_reg(n), JIT_TRUE);
+                }
+                _ => {
+                    self.masm.mov_ri(Reg64::R11, JIT_TRUE);
+                    self.emit_store(id, Reg64::R11);
+                }
+            },
+            ValueNode::FalseConstant => match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    self.masm.mov_ri(phys_reg(n), JIT_FALSE);
+                }
+                _ => {
+                    self.masm.mov_ri(Reg64::R11, JIT_FALSE);
+                    self.emit_store(id, Reg64::R11);
+                }
+            },
+            ValueNode::NullConstant => match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    self.masm.mov_ri(phys_reg(n), JIT_NULL);
+                }
+                _ => {
+                    self.masm.mov_ri(Reg64::R11, JIT_NULL);
+                    self.emit_store(id, Reg64::R11);
+                }
+            },
+            ValueNode::UndefinedConstant => match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    self.masm.mov_ri(phys_reg(n), JIT_UNDEFINED);
+                }
+                _ => {
+                    self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
+                    self.emit_store(id, Reg64::R11);
+                }
+            },
 
             // ── Parameters ───────────────────────────────────────────────────
             ValueNode::Parameter { index } => {
                 let off = (*index * 8) as i32;
-                self.masm.mov_load_base_disp32(Reg64::R11, Reg64::R14, off);
-                self.emit_store(id, Reg64::R11);
+                match self.alloc.location(id) {
+                    Some(Location::Register(n)) => {
+                        self.masm.mov_load_base_disp32(phys_reg(n), Reg64::R14, off);
+                    }
+                    _ => {
+                        self.masm.mov_load_base_disp32(Reg64::R11, Reg64::R14, off);
+                        self.emit_store(id, Reg64::R11);
+                    }
+                }
             }
 
             // ── Int32 binary arithmetic ──────────────────────────────────────
             ValueNode::Int32Add { left, right } => {
-                self.emit_load(*left, Reg64::R11);
-                self.emit_load(*right, Reg64::R10);
-                self.masm.add_rr(Reg64::R11, Reg64::R10);
-                self.emit_store(id, Reg64::R11);
+                self.emit_int32_binop(*left, *right, id, MacroAssembler::add_rr);
             }
             ValueNode::Int32Subtract { left, right } => {
-                self.emit_load(*left, Reg64::R11);
-                self.emit_load(*right, Reg64::R10);
-                self.masm.sub_rr(Reg64::R11, Reg64::R10);
-                self.emit_store(id, Reg64::R11);
+                self.emit_int32_binop(*left, *right, id, MacroAssembler::sub_rr);
             }
             ValueNode::Int32Multiply { left, right } => {
-                self.emit_load(*left, Reg64::R11);
-                self.emit_load(*right, Reg64::R10);
-                self.masm.imul_rr(Reg64::R11, Reg64::R10);
-                self.emit_store(id, Reg64::R11);
+                self.emit_int32_binop(*left, *right, id, MacroAssembler::imul_rr);
             }
             ValueNode::Int32BitwiseAnd { left, right } => {
-                self.emit_load(*left, Reg64::R11);
-                self.emit_load(*right, Reg64::R10);
-                self.emit_and_rr(Reg64::R11, Reg64::R10);
-                self.emit_store(id, Reg64::R11);
+                self.emit_int32_binop(*left, *right, id, MacroAssembler::and_rr);
             }
             ValueNode::Int32BitwiseOr { left, right } => {
-                self.emit_load(*left, Reg64::R11);
-                self.emit_load(*right, Reg64::R10);
-                self.emit_or_rr(Reg64::R11, Reg64::R10);
-                self.emit_store(id, Reg64::R11);
+                self.emit_int32_binop(*left, *right, id, MacroAssembler::or_rr);
             }
             ValueNode::Int32BitwiseXor { left, right } => {
-                self.emit_load(*left, Reg64::R11);
-                self.emit_load(*right, Reg64::R10);
-                self.masm.xor_rr(Reg64::R11, Reg64::R10);
-                self.emit_store(id, Reg64::R11);
+                self.emit_int32_binop(*left, *right, id, MacroAssembler::xor_rr);
             }
             ValueNode::Int32ShiftLeft { left, right } => {
                 self.emit_load(*left, Reg64::R11);
@@ -782,21 +813,42 @@ impl<'a> MaglevCodegen<'a> {
             }
 
             // ── Int32 unary arithmetic ───────────────────────────────────────
-            ValueNode::Int32Negate { value } => {
-                self.emit_load(*value, Reg64::R11);
-                self.masm.neg_r(Reg64::R11);
-                self.emit_store(id, Reg64::R11);
-            }
-            ValueNode::Int32Increment { value } => {
-                self.emit_load(*value, Reg64::R11);
-                self.masm.add_ri(Reg64::R11, 1);
-                self.emit_store(id, Reg64::R11);
-            }
-            ValueNode::Int32Decrement { value } => {
-                self.emit_load(*value, Reg64::R11);
-                self.masm.sub_ri(Reg64::R11, 1);
-                self.emit_store(id, Reg64::R11);
-            }
+            ValueNode::Int32Negate { value } => match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    let dst = phys_reg(n);
+                    self.emit_load(*value, dst);
+                    self.masm.neg_r(dst);
+                }
+                _ => {
+                    self.emit_load(*value, Reg64::R11);
+                    self.masm.neg_r(Reg64::R11);
+                    self.emit_store(id, Reg64::R11);
+                }
+            },
+            ValueNode::Int32Increment { value } => match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    let dst = phys_reg(n);
+                    self.emit_load(*value, dst);
+                    self.masm.add_ri(dst, 1);
+                }
+                _ => {
+                    self.emit_load(*value, Reg64::R11);
+                    self.masm.add_ri(Reg64::R11, 1);
+                    self.emit_store(id, Reg64::R11);
+                }
+            },
+            ValueNode::Int32Decrement { value } => match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    let dst = phys_reg(n);
+                    self.emit_load(*value, dst);
+                    self.masm.sub_ri(dst, 1);
+                }
+                _ => {
+                    self.emit_load(*value, Reg64::R11);
+                    self.masm.sub_ri(Reg64::R11, 1);
+                    self.emit_store(id, Reg64::R11);
+                }
+            },
 
             // ── Checked Smi arithmetic (deopt on signed 64-bit overflow) ─────
             //
@@ -805,38 +857,42 @@ impl<'a> MaglevCodegen<'a> {
             // compare the result's low 32 bits (sign-extended to 64) with the
             // full 64-bit result.  If they differ, the Smi range was exceeded.
             ValueNode::CheckedSmiAdd { left, right } => {
-                self.emit_load(*left, Reg64::R11);
-                self.emit_load(*right, Reg64::R10);
-                self.masm.add_rr(Reg64::R11, Reg64::R10);
-                self.emit_deopt_on_smi_overflow(0);
-                self.emit_store(id, Reg64::R11);
+                self.emit_checked_smi_binop(*left, *right, id, MacroAssembler::add_rr);
             }
             ValueNode::CheckedSmiSubtract { left, right } => {
-                self.emit_load(*left, Reg64::R11);
-                self.emit_load(*right, Reg64::R10);
-                self.masm.sub_rr(Reg64::R11, Reg64::R10);
-                self.emit_deopt_on_smi_overflow(0);
-                self.emit_store(id, Reg64::R11);
+                self.emit_checked_smi_binop(*left, *right, id, MacroAssembler::sub_rr);
             }
             ValueNode::CheckedSmiMultiply { left, right } => {
-                self.emit_load(*left, Reg64::R11);
-                self.emit_load(*right, Reg64::R10);
-                self.masm.imul_rr(Reg64::R11, Reg64::R10);
-                self.emit_deopt_on_smi_overflow(0);
-                self.emit_store(id, Reg64::R11);
+                self.emit_checked_smi_binop(*left, *right, id, MacroAssembler::imul_rr);
             }
-            ValueNode::CheckedSmiIncrement { value } => {
-                self.emit_load(*value, Reg64::R11);
-                self.masm.add_ri(Reg64::R11, 1);
-                self.emit_deopt_on_smi_overflow(0);
-                self.emit_store(id, Reg64::R11);
-            }
-            ValueNode::CheckedSmiDecrement { value } => {
-                self.emit_load(*value, Reg64::R11);
-                self.masm.sub_ri(Reg64::R11, 1);
-                self.emit_deopt_on_smi_overflow(0);
-                self.emit_store(id, Reg64::R11);
-            }
+            ValueNode::CheckedSmiIncrement { value } => match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    let dst = phys_reg(n);
+                    self.emit_load(*value, dst);
+                    self.masm.add_ri(dst, 1);
+                    self.emit_deopt_on_smi_overflow_in(dst, 0);
+                }
+                _ => {
+                    self.emit_load(*value, Reg64::R11);
+                    self.masm.add_ri(Reg64::R11, 1);
+                    self.emit_deopt_on_smi_overflow(0);
+                    self.emit_store(id, Reg64::R11);
+                }
+            },
+            ValueNode::CheckedSmiDecrement { value } => match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    let dst = phys_reg(n);
+                    self.emit_load(*value, dst);
+                    self.masm.sub_ri(dst, 1);
+                    self.emit_deopt_on_smi_overflow_in(dst, 0);
+                }
+                _ => {
+                    self.emit_load(*value, Reg64::R11);
+                    self.masm.sub_ri(Reg64::R11, 1);
+                    self.emit_deopt_on_smi_overflow(0);
+                    self.emit_store(id, Reg64::R11);
+                }
+            },
 
             // ── Int32 comparisons ────────────────────────────────────────────
             ValueNode::Int32Equal { left, right } | ValueNode::Int32StrictEqual { left, right } => {
@@ -1696,21 +1752,55 @@ impl<'a> MaglevCodegen<'a> {
         // classic overwrite-before-read bug when a Phi destination
         // coincides with another Phi's source location.
         if phi_ops.len() <= 1 {
-            // Single or no Phi — no conflict possible.
+            // Single or no Phi — no conflict possible.  Use direct
+            // register-to-register copy when both are in physical regs.
             for (phi_id, src_id) in &phi_ops {
-                self.emit_load(*src_id, Reg64::R11);
-                self.emit_store(*phi_id, Reg64::R11);
+                match (self.alloc.location(*phi_id), self.alloc.location(*src_id)) {
+                    (Some(Location::Register(dn)), Some(Location::Register(sn))) => {
+                        let dst = phys_reg(dn);
+                        let src = phys_reg(sn);
+                        if dst != src {
+                            self.masm.mov_rr(dst, src);
+                        }
+                    }
+                    _ => {
+                        self.emit_load(*src_id, Reg64::R11);
+                        self.emit_store(*phi_id, Reg64::R11);
+                    }
+                }
             }
         } else {
-            // Push all source values.
-            for (_phi_id, src_id) in &phi_ops {
-                self.emit_load(*src_id, Reg64::R11);
-                self.masm.push(Reg64::R11);
-            }
-            // Pop into destinations in reverse order.
-            for (phi_id, _src_id) in phi_ops.iter().rev() {
-                self.masm.pop(Reg64::R11);
-                self.emit_store(*phi_id, Reg64::R11);
+            // Check if any destination conflicts with another source.
+            // If no conflicts, we can do direct copies without stack.
+            let has_conflict = phi_ops.iter().any(|(phi_id, _)| {
+                let phi_loc = self.alloc.location(*phi_id);
+                phi_ops
+                    .iter()
+                    .any(|(_, other_src)| self.alloc.location(*other_src) == phi_loc)
+            });
+            if !has_conflict {
+                // No conflicts — safe to do direct copies.
+                for (phi_id, src_id) in &phi_ops {
+                    match (self.alloc.location(*phi_id), self.alloc.location(*src_id)) {
+                        (Some(Location::Register(dn)), Some(Location::Register(sn))) => {
+                            self.masm.mov_rr(phys_reg(dn), phys_reg(sn));
+                        }
+                        _ => {
+                            self.emit_load(*src_id, Reg64::R11);
+                            self.emit_store(*phi_id, Reg64::R11);
+                        }
+                    }
+                }
+            } else {
+                // Parallel-move: push/pop through stack.
+                for (_phi_id, src_id) in &phi_ops {
+                    self.emit_load(*src_id, Reg64::R11);
+                    self.masm.push(Reg64::R11);
+                }
+                for (phi_id, _src_id) in phi_ops.iter().rev() {
+                    self.masm.pop(Reg64::R11);
+                    self.emit_store(*phi_id, Reg64::R11);
+                }
             }
         }
     }
@@ -1761,6 +1851,168 @@ impl<'a> MaglevCodegen<'a> {
     /// Byte offset from R14 (register-file base) for spill slot `n`.
     fn slot_offset(&self, n: u32) -> i32 {
         ((self.param_count + n) * 8) as i32
+    }
+
+    /// If `id` refers to a `SmiConstant` or `Int32Constant` node whose value
+    /// fits in an i32, return that value.  Used to emit `CMP reg, imm` and
+    /// `ADD reg, imm` instead of loading the constant into a scratch register.
+    fn try_get_i32_constant(&self, id: NodeId) -> Option<i32> {
+        match self.graph.node(id)? {
+            ValueNode::SmiConstant { value } => {
+                let v = *value as i64;
+                if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
+                    Some(v as i32)
+                } else {
+                    None
+                }
+            }
+            ValueNode::Int32Constant { value } => Some(*value),
+            ValueNode::Uint32Constant { value } => {
+                let v = *value;
+                if v <= i32::MAX as u32 {
+                    Some(v as i32)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Emit a `CMP` between `left` and `right`, using the most efficient
+    /// encoding: `CMP reg, imm` when right is a small constant, `CMP reg, reg`
+    /// when both are in physical registers, or scratch registers as fallback.
+    fn emit_cmp(&mut self, left: NodeId, right: NodeId) {
+        // Try CMP reg, imm when right is a constant.
+        if let Some(imm) = self.try_get_i32_constant(right) {
+            match self.alloc.location(left) {
+                Some(Location::Register(ln)) => {
+                    self.masm.cmp_ri(phys_reg(ln), imm);
+                    return;
+                }
+                _ => {
+                    self.emit_load(left, Reg64::R11);
+                    self.masm.cmp_ri(Reg64::R11, imm);
+                    return;
+                }
+            }
+        }
+        // Register-to-register paths.
+        match (self.alloc.location(left), self.alloc.location(right)) {
+            (Some(Location::Register(ln)), Some(Location::Register(rn))) => {
+                self.masm.cmp_rr(phys_reg(ln), phys_reg(rn));
+            }
+            (Some(Location::Register(ln)), _) => {
+                self.emit_load(right, Reg64::R10);
+                self.masm.cmp_rr(phys_reg(ln), Reg64::R10);
+            }
+            (_, Some(Location::Register(rn))) => {
+                self.emit_load(left, Reg64::R11);
+                self.masm.cmp_rr(Reg64::R11, phys_reg(rn));
+            }
+            _ => {
+                self.emit_load(left, Reg64::R11);
+                self.emit_load(right, Reg64::R10);
+                self.masm.cmp_rr(Reg64::R11, Reg64::R10);
+            }
+        }
+    }
+
+    // ── Direct-register binary operation helpers ────────────────────────────
+
+    /// Emit an integer binary operation (`dst = left OP right`) using the
+    /// result's allocated physical register directly, avoiding scratch
+    /// register copies.
+    ///
+    /// When the result is in a physical register, this saves 1–3 MOV
+    /// instructions per operation compared to the scratch-register path.
+    fn emit_int32_binop(
+        &mut self,
+        left: NodeId,
+        right: NodeId,
+        result: NodeId,
+        op: fn(&mut MacroAssembler, Reg64, Reg64),
+    ) {
+        match self.alloc.location(result) {
+            Some(Location::Register(n)) => {
+                let dst = phys_reg(n);
+                // Check if right operand lives in the result register —
+                // if so, loading left would clobber it.
+                let right_in_dst = left != right
+                    && matches!(
+                        self.alloc.location(right),
+                        Some(Location::Register(rn)) if phys_reg(rn) == dst
+                    );
+                if right_in_dst {
+                    self.emit_load(right, Reg64::R10);
+                    self.emit_load(left, dst);
+                    op(&mut self.masm, dst, Reg64::R10);
+                } else {
+                    self.emit_load(left, dst);
+                    match self.alloc.location(right) {
+                        Some(Location::Register(rn)) if phys_reg(rn) != dst => {
+                            op(&mut self.masm, dst, phys_reg(rn));
+                        }
+                        _ => {
+                            self.emit_load(right, Reg64::R10);
+                            op(&mut self.masm, dst, Reg64::R10);
+                        }
+                    }
+                }
+            }
+            _ => {
+                self.emit_load(left, Reg64::R11);
+                self.emit_load(right, Reg64::R10);
+                op(&mut self.masm, Reg64::R11, Reg64::R10);
+                self.emit_store(result, Reg64::R11);
+            }
+        }
+    }
+
+    /// Like [`emit_int32_binop`] but emits an i32 overflow guard after the
+    /// operation.  The guard uses the result register directly when possible,
+    /// avoiding an extra copy through R11.
+    fn emit_checked_smi_binop(
+        &mut self,
+        left: NodeId,
+        right: NodeId,
+        result: NodeId,
+        op: fn(&mut MacroAssembler, Reg64, Reg64),
+    ) {
+        match self.alloc.location(result) {
+            Some(Location::Register(n)) => {
+                let dst = phys_reg(n);
+                let right_in_dst = left != right
+                    && matches!(
+                        self.alloc.location(right),
+                        Some(Location::Register(rn)) if phys_reg(rn) == dst
+                    );
+                if right_in_dst {
+                    self.emit_load(right, Reg64::R10);
+                    self.emit_load(left, dst);
+                    op(&mut self.masm, dst, Reg64::R10);
+                } else {
+                    self.emit_load(left, dst);
+                    match self.alloc.location(right) {
+                        Some(Location::Register(rn)) if phys_reg(rn) != dst => {
+                            op(&mut self.masm, dst, phys_reg(rn));
+                        }
+                        _ => {
+                            self.emit_load(right, Reg64::R10);
+                            op(&mut self.masm, dst, Reg64::R10);
+                        }
+                    }
+                }
+                self.emit_deopt_on_smi_overflow_in(dst, 0);
+            }
+            _ => {
+                self.emit_load(left, Reg64::R11);
+                self.emit_load(right, Reg64::R10);
+                op(&mut self.masm, Reg64::R11, Reg64::R10);
+                self.emit_deopt_on_smi_overflow(0);
+                self.emit_store(result, Reg64::R11);
+            }
+        }
     }
 
     // ── Promoted globals ─────────────────────────────────────────────────────
@@ -2004,31 +2256,6 @@ impl<'a> MaglevCodegen<'a> {
         self.emit_store(id, Reg64::R11);
     }
 
-    // ── Arithmetic helpers ───────────────────────────────────────────────────
-
-    /// `AND dst, src` — `REX.W 23 /r` (AND r64, r/m64).
-    fn emit_and_rr(&mut self, dst: Reg64, src: Reg64) {
-        // REX: W=1, R set if dst needs REX, B set if src needs REX.
-        let rex: u8 = 0x48
-            | (if dst.needs_rex() { 0x04 } else { 0 })
-            | (if src.needs_rex() { 0x01 } else { 0 });
-        let modrm: u8 = 0xC0 | (dst.enc() << 3) | src.enc();
-        self.masm.emit_byte(rex);
-        self.masm.emit_byte(0x23);
-        self.masm.emit_byte(modrm);
-    }
-
-    /// `OR dst, src` — `REX.W 0B /r` (OR r64, r/m64).
-    fn emit_or_rr(&mut self, dst: Reg64, src: Reg64) {
-        let rex: u8 = 0x48
-            | (if dst.needs_rex() { 0x04 } else { 0 })
-            | (if src.needs_rex() { 0x01 } else { 0 });
-        let modrm: u8 = 0xC0 | (dst.enc() << 3) | src.enc();
-        self.masm.emit_byte(rex);
-        self.masm.emit_byte(0x0B);
-        self.masm.emit_byte(modrm);
-    }
-
     // ── Division helpers ─────────────────────────────────────────────────────
 
     /// Emit `CQO` — sign-extend `RAX` into `RDX:RAX`.
@@ -2080,9 +2307,7 @@ impl<'a> MaglevCodegen<'a> {
     /// Emit a 64-bit integer comparison, writing `JIT_FALSE` or `JIT_TRUE`
     /// to `result`'s allocated location.
     fn emit_int32_compare(&mut self, left: NodeId, right: NodeId, cc: CondCode, result: NodeId) {
-        self.emit_load(left, Reg64::R11);
-        self.emit_load(right, Reg64::R10);
-        self.masm.cmp_rr(Reg64::R11, Reg64::R10);
+        self.emit_cmp(left, right);
         self.masm.setcc_al(cc);
         self.masm.movzx_r64_al(Reg64::R11);
         self.masm.mov_ri(Reg64::R10, JIT_FALSE);
@@ -2121,10 +2346,9 @@ impl<'a> MaglevCodegen<'a> {
             _ => return false,
         };
 
-        // Re-emit CMP from the comparison's operands.
-        self.emit_load(left, Reg64::R11);
-        self.emit_load(right, Reg64::R10);
-        self.masm.cmp_rr(Reg64::R11, Reg64::R10);
+        // Re-emit CMP from the comparison's operands, using physical
+        // registers directly when available and CMP-immediate for constants.
+        self.emit_cmp(left, right);
 
         // Branch directly: condition-false falls through to false phi-copies.
         let if_true_idx = if_true as usize;
@@ -2156,36 +2380,20 @@ impl<'a> MaglevCodegen<'a> {
     // ── Deopt helpers ────────────────────────────────────────────────────────
 
     /// Emit a Smi-overflow guard after an arithmetic operation whose result is
-    /// in `R11`.
-    ///
-    /// The guard verifies that the 64-bit result fits in a 32-bit signed
-    /// integer (i.e. it is a valid Smi).  If not, the function deoptimises.
-    ///
-    /// Algorithm (all operations on `R11` / `R10`):
-    /// 1. Copy `R11` → `R10`.
-    /// 2. `SAR R10, 31` — arithmetic-right-shift by 31 fills `R10` with the
-    ///    sign extension of bit 31 of the original `R10`.  After this step
-    ///    `R10` is `0` when bit 31 of the copy was 0, and `-1` (all ones) when
-    ///    bit 31 was 1.
-    /// 3. `XOR R10, R11` — if `R11` fits in i32, the upper 33 bits of `R10`
-    ///    after step 2 match the upper 33 bits of `R11`, so XOR produces 0 in
-    ///    the upper half.  If `R11` overflowed i32 the upper bits differ, so
-    ///    XOR is non-zero.
-    /// 4. `SAR R10, 32` — shift the upper-half indicator down into the low 32
-    ///    bits so that `TEST R10, R10` can detect non-zero.
-    /// 5. `TEST R10, R10` — sets ZF=0 when overflow is detected.
-    /// 6. `JNE deopt_label` — jump to the deopt epilogue on overflow.
+    /// in `R11`.  Delegates to [`emit_deopt_on_smi_overflow_in`].
     fn emit_deopt_on_smi_overflow(&mut self, bytecode_offset: u32) {
-        // Check if R11 fits in i32 using MOVSXD + CMP (3 instructions vs 6).
-        // MOVSXD R10, R11d — sign-extends the lower 32 bits of R11 into R10.
-        // If R11 was a valid i32, MOVSXD(R11[31:0]) == R11.
-        // REX.W (0x4C for R10 dst with REX.R=1, R11 src with REX.B=1)
-        self.masm.emit_byte(0x4D); // REX.W + REX.R (R10) + REX.B (R11)
-        self.masm.emit_byte(0x63); // MOVSXD
-        self.masm.emit_byte(0xD3); // ModRM: mod=11, reg=R10(enc=2), r/m=R11(enc=3)
+        self.emit_deopt_on_smi_overflow_in(Reg64::R11, bytecode_offset);
+    }
 
-        // CMP R10, R11 — if sign-extended version differs, overflow occurred.
-        self.masm.cmp_rr(Reg64::R10, Reg64::R11);
+    /// Emit an i32 overflow guard on an arbitrary register.
+    ///
+    /// Uses `MOVSXD R10, src_d` + `CMP R10, src` + `JNE deopt`.
+    /// `R10` is always the scratch for the sign-extended copy.
+    fn emit_deopt_on_smi_overflow_in(&mut self, src: Reg64, bytecode_offset: u32) {
+        // MOVSXD R10, src_d — sign-extend lower 32 bits into R10.
+        self.masm.movsxd_rr(Reg64::R10, src);
+        // CMP R10, src — if sign-extended version differs, overflow.
+        self.masm.cmp_rr(Reg64::R10, src);
 
         let code_off = self.masm.position() as u32;
         let liveness_map = self.all_slots_live();
@@ -2194,7 +2402,7 @@ impl<'a> MaglevCodegen<'a> {
             bytecode_offset,
             liveness_map,
         });
-        // JNE deopt_overflow_label — jump to overflow deopt if R10 != R11.
+        // JNE deopt_overflow_label — jump to overflow deopt if R10 != src.
         self.masm
             .jcc(CondCode::NotEqual, &mut self.deopt_overflow_label);
     }
