@@ -217,6 +217,10 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) {
     // that may alias those stores (soundness check).
     let mutated_objects = collect_mutated_objects(graph, &lp.body);
 
+    // Collect global name indices written by StoreGlobal inside the loop.
+    // A LoadGlobal for a name that is also stored must not be hoisted.
+    let mutated_globals = collect_mutated_globals(graph, &lp.body);
+
     // Scan loop blocks for hoistable nodes.  Include the loop header — in
     // single-block loops the entire body lives in the header.  Nodes whose
     // inputs are all defined outside the loop are loop-invariant regardless
@@ -235,6 +239,7 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) {
             if is_pure(node)
                 && all_inputs_outside(node, &outside_defs)
                 && !load_aliases_store(node, &mutated_objects)
+                && !global_load_aliases_store(node, &mutated_globals)
             {
                 to_hoist.push((block.id, pos, *id, node.clone()));
                 // After hoisting this node, its NodeId becomes "outside" too,
@@ -317,6 +322,24 @@ fn collect_mutated_objects(graph: &MaglevGraph, loop_body: &HashSet<u32>) -> Has
     mutated
 }
 
+/// Collect all global name-indices written by [`ValueNode::StoreGlobal`]
+/// inside the loop body.  A [`ValueNode::LoadGlobal`] for a stored name must
+/// not be hoisted because the value changes across iterations.
+fn collect_mutated_globals(graph: &MaglevGraph, loop_body: &HashSet<u32>) -> HashSet<u32> {
+    let mut mutated = HashSet::new();
+    for block in graph.blocks() {
+        if !loop_body.contains(&block.id) {
+            continue;
+        }
+        for (_, node) in &block.nodes {
+            if let ValueNode::StoreGlobal { name, .. } = node {
+                mutated.insert(*name);
+            }
+        }
+    }
+    mutated
+}
+
 /// Return `true` when `node` is a load whose target object has been stored
 /// to inside the loop (per `mutated`).  Hoisting such a load would be
 /// unsound because the loaded value may change across iterations.
@@ -332,6 +355,17 @@ fn load_aliases_store(node: &ValueNode, mutated: &HashSet<NodeId>) -> bool {
             mutated.contains(elements)
         }
         _ => false,
+    }
+}
+
+/// Return `true` when `node` is a [`ValueNode::LoadGlobal`] whose name index
+/// appears in the `mutated_globals` set (i.e. there is a [`StoreGlobal`] to
+/// the same name inside the loop).
+fn global_load_aliases_store(node: &ValueNode, mutated_globals: &HashSet<u32>) -> bool {
+    if let ValueNode::LoadGlobal { name, .. } = node {
+        mutated_globals.contains(name)
+    } else {
+        false
     }
 }
 
