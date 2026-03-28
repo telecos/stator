@@ -108,17 +108,22 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // current graph structure.
     eliminate_common_subexpressions(graph);
     let globals_promoted = promote_loop_globals_counted(graph);
+    // Re-run truncation after global promotion: promotion replaces
+    // LoadGlobal/StoreGlobal with Phi nodes, reducing use-counts on
+    // arithmetic nodes — allowing CheckedSmi→Int32 conversion.
+    let truncations2 = propagate_int32_truncation(graph);
     eliminate_redundant_type_guards(graph);
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
     eliminate_dead_code(graph);
 
+    let total_truncations = truncations + truncations2;
     let final_nodes: usize = graph.blocks().iter().map(|b| b.nodes.len()).sum();
     // Always print summary so we can confirm optimizer runs at all.
     eprintln!(
         "MAGLEV_OPT: blocks={block_count} nodes={node_count}->{final_nodes} \
          licm_hoisted={licm_hoisted} globals_promoted={globals_promoted} \
-         truncated={truncations}"
+         truncated={total_truncations}"
     );
 }
 
