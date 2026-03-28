@@ -39,11 +39,14 @@
 //! | Index | Register | ABI role           |
 //! |-------|----------|--------------------|
 //! | 0     | RBX      | callee-saved       |
-//! | 1     | RCX      | general-purpose    |
-//! | 2     | RDX      | general-purpose    |
-//! | 3     | RSI      | general-purpose    |
-//! | 4     | R8       | general-purpose    |
-//! | 5     | R9       | general-purpose    |
+//! | 1     | RCX      | caller-saved       |
+//! | 2     | RDX      | caller-saved       |
+//! | 3     | RSI      | caller-saved       |
+//! | 4     | R8       | caller-saved       |
+//! | 5     | R9       | caller-saved       |
+//! | 6     | R13      | callee-saved       |
+//! | 7     | R12      | callee-saved       |
+//! | 8     | R15      | callee-saved       |
 //!
 //! Reserved registers (not in the allocation pool):
 //! - `R10`, `R11`: scratch (clobbered by helper sequences)
@@ -97,7 +100,7 @@ use std::collections::HashSet;
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Number of physical registers available to the Maglev register allocator.
-pub const NUM_PHYS_REGS: u32 = 7;
+pub const NUM_PHYS_REGS: u32 = 9;
 
 /// A stub call argument that is either a Maglev IR node or an immediate i64.
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -385,6 +388,8 @@ fn phys_reg(n: u32) -> Reg64 {
         4 => Reg64::R8,
         5 => Reg64::R9,
         6 => Reg64::R13,
+        7 => Reg64::R12,
+        8 => Reg64::R15,
         _ => panic!("phys_reg: index {n} out of range (NUM_PHYS_REGS = {NUM_PHYS_REGS})"),
     }
 }
@@ -562,11 +567,13 @@ impl<'a> MaglevCodegen<'a> {
     /// Emit the standard function prologue.
     ///
     /// ```text
-    /// push  rbp
+    /// push  rbp         ; frame pointer
     /// mov   rbp, rsp
-    /// push  rbx         ; [RBP-8]  callee-saved Register(0) holder
-    /// push  r14         ; [RBP-16] callee-saved reg-file pointer
-    /// push  r13         ; [RBP-24] callee-saved (preserved for caller)
+    /// push  rbx         ; callee-saved allocatable Register(0)
+    /// push  r14         ; callee-saved reg-file pointer
+    /// push  r13         ; callee-saved allocatable Register(6)
+    /// push  r12         ; callee-saved allocatable Register(7)
+    /// push  r15         ; callee-saved allocatable Register(8)
     /// mov   r14, rdi    ; r14 = regs argument (SysV: first arg in RDI)
     /// ```
     fn emit_prologue(&mut self) {
@@ -575,10 +582,12 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.push(Reg64::Rbx);
         self.masm.push(Reg64::R14);
         self.masm.push(Reg64::R13);
-        // After 4 pushes (including return-address push by `call`):
-        // RSP ≡ 8 mod 16.  Stub calls use selective save (odd push
-        // count, with alignment padding when needed) to align RSP to
-        // 0 mod 16 before the inner `call`.
+        self.masm.push(Reg64::R12);
+        self.masm.push(Reg64::R15);
+        // After 6 pushes (+ return-address by `call` = 7 total):
+        // RSP ≡ 8 mod 16.  Stub calls use selective save (with
+        // alignment padding when needed) to align RSP to 0 mod 16
+        // before the inner `call`.
         self.masm.mov_rr(Reg64::R14, Reg64::Rdi);
     }
 
@@ -587,6 +596,8 @@ impl<'a> MaglevCodegen<'a> {
     /// `rax` must already hold the return value before calling this.
     ///
     /// ```text
+    /// pop  r15
+    /// pop  r12
     /// pop  r13
     /// pop  r14
     /// pop  rbx
@@ -594,6 +605,8 @@ impl<'a> MaglevCodegen<'a> {
     /// ret
     /// ```
     fn emit_normal_epilogue(&mut self) {
+        self.masm.pop(Reg64::R15);
+        self.masm.pop(Reg64::R12);
         self.masm.pop(Reg64::R13);
         self.masm.pop(Reg64::R14);
         self.masm.pop(Reg64::Rbx);
@@ -639,6 +652,8 @@ impl<'a> MaglevCodegen<'a> {
 
         // Common exit — RAX already set, just restore and return.
         self.masm.bind_label(&mut self.deopt_common_label);
+        self.masm.pop(Reg64::R15);
+        self.masm.pop(Reg64::R12);
         self.masm.pop(Reg64::R13);
         self.masm.pop(Reg64::R14);
         self.masm.pop(Reg64::Rbx);
@@ -2315,7 +2330,7 @@ impl<'a> MaglevCodegen<'a> {
                 return;
             }
             let addr = jit_runtime::jit_runtime_lda_global as *const () as usize as i64;
-            // After the prologue (4 pushes + return addr = 5 items), RSP ≡ 8
+            // After the prologue (6 pushes + return addr = 7 items), RSP ≡ 8
             // mod 16.  We need RSP ≡ 0 mod 16 before `call` so the callee
             // sees RSP ≡ 8 mod 16 per SysV ABI.  A single dummy push fixes it.
             self.masm.push(Reg64::R11);
