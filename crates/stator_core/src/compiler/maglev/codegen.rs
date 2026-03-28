@@ -1029,22 +1029,13 @@ impl<'a> MaglevCodegen<'a> {
             // At the i64 level, unsigned and signed add/sub/mul produce the
             // same bit pattern; we reuse the existing instructions.
             ValueNode::Uint32Add { left, right } => {
-                self.emit_load(*left, Reg64::R11);
-                self.emit_load(*right, Reg64::R10);
-                self.masm.add_rr(Reg64::R11, Reg64::R10);
-                self.emit_store(id, Reg64::R11);
+                self.emit_int32_binop(*left, *right, id, MacroAssembler::add_rr);
             }
             ValueNode::Uint32Subtract { left, right } => {
-                self.emit_load(*left, Reg64::R11);
-                self.emit_load(*right, Reg64::R10);
-                self.masm.sub_rr(Reg64::R11, Reg64::R10);
-                self.emit_store(id, Reg64::R11);
+                self.emit_int32_binop(*left, *right, id, MacroAssembler::sub_rr);
             }
             ValueNode::Uint32Multiply { left, right } => {
-                self.emit_load(*left, Reg64::R11);
-                self.emit_load(*right, Reg64::R10);
-                self.masm.imul_rr(Reg64::R11, Reg64::R10);
-                self.emit_store(id, Reg64::R11);
+                self.emit_int32_binop(*left, *right, id, MacroAssembler::imul_rr);
             }
 
             // ── Global variable access via promoted register-file slots ────
@@ -2140,12 +2131,16 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.pop(Reg64::Rcx);
     }
 
-    /// Emit a deopt check: if RAX == JIT_DEOPT, jump to stub-deopt epilogue.
+    /// Emit a deopt check: if RAX represents a deopt signal, jump to
+    /// stub-deopt epilogue.
+    ///
+    /// All deopt values are i64::MIN..i64::MIN+5 (< i32::MIN).  Valid
+    /// results are always ≥ i32::MIN.  A single `CMP RAX, i32::MIN; JL`
+    /// replaces the old 3-instruction `MOV R11, JIT_DEOPT; CMP; JE`.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_deopt_check_rax(&mut self) {
-        self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
-        self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
-        self.masm.jcc(CondCode::Equal, &mut self.deopt_stub_label);
+        self.masm.cmp_ri(Reg64::Rax, i32::MIN);
+        self.masm.jcc(CondCode::Less, &mut self.deopt_stub_label);
     }
 
     /// Call a 1-arg stub: `stub(node_arg)`.
@@ -2157,8 +2152,7 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.call_reg(Reg64::R11);
         self.emit_restore_caller_saved();
         self.emit_deopt_check_rax();
-        self.masm.mov_rr(Reg64::R11, Reg64::Rax);
-        self.emit_store(id, Reg64::R11);
+        self.emit_store(id, Reg64::Rax);
     }
 
     /// Call a 2-node-arg stub: `stub(node0, node1)`.
@@ -2171,8 +2165,7 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.call_reg(Reg64::R11);
         self.emit_restore_caller_saved();
         self.emit_deopt_check_rax();
-        self.masm.mov_rr(Reg64::R11, Reg64::Rax);
-        self.emit_store(id, Reg64::R11);
+        self.emit_store(id, Reg64::Rax);
     }
 
     /// Call a 3-node-arg stub: `stub(node0, node1, node2)`.
@@ -2193,8 +2186,7 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.call_reg(Reg64::R11);
         self.emit_restore_caller_saved();
         self.emit_deopt_check_rax();
-        self.masm.mov_rr(Reg64::R11, Reg64::Rax);
-        self.emit_store(id, Reg64::R11);
+        self.emit_store(id, Reg64::Rax);
     }
 
     /// Call a 3-arg stub where arg0 is a node, arg1 is an immediate i64,
@@ -2223,8 +2215,7 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.call_reg(Reg64::R11);
         self.emit_restore_caller_saved();
         self.emit_deopt_check_rax();
-        self.masm.mov_rr(Reg64::R11, Reg64::Rax);
-        self.emit_store(id, Reg64::R11);
+        self.emit_store(id, Reg64::Rax);
     }
 
     /// Call the generic trampoline for opcodes that only need immediate operands.
@@ -2252,8 +2243,7 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.call_reg(Reg64::R11);
         self.emit_restore_caller_saved();
         self.emit_deopt_check_rax();
-        self.masm.mov_rr(Reg64::R11, Reg64::Rax);
-        self.emit_store(id, Reg64::R11);
+        self.emit_store(id, Reg64::Rax);
     }
 
     // ── Division helpers ─────────────────────────────────────────────────────
