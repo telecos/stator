@@ -97,7 +97,7 @@ use std::collections::HashSet;
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Number of physical registers available to the Maglev register allocator.
-pub const NUM_PHYS_REGS: u32 = 6;
+pub const NUM_PHYS_REGS: u32 = 7;
 
 /// A stub call argument that is either a Maglev IR node or an immediate i64.
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -384,6 +384,7 @@ fn phys_reg(n: u32) -> Reg64 {
         3 => Reg64::Rsi,
         4 => Reg64::R8,
         5 => Reg64::R9,
+        6 => Reg64::R13,
         _ => panic!("phys_reg: index {n} out of range (NUM_PHYS_REGS = {NUM_PHYS_REGS})"),
     }
 }
@@ -866,8 +867,10 @@ impl<'a> MaglevCodegen<'a> {
             | ValueNode::ChangeTaggedToInt32 { input }
             | ValueNode::ChangeTaggedToUint32 { input }
             | ValueNode::ChangeTaggedToFloat64 { input } => {
-                self.emit_load(*input, Reg64::R11);
-                self.emit_store(id, Reg64::R11);
+                if self.alloc.location(id) != self.alloc.location(*input) {
+                    self.emit_load(*input, Reg64::R11);
+                    self.emit_store(id, Reg64::R11);
+                }
             }
 
             // ── Boolean conversion ───────────────────────────────────────────
@@ -903,8 +906,11 @@ impl<'a> MaglevCodegen<'a> {
             }
             // CheckInt32IsSmi: every i32 is a valid Smi — pass-through.
             ValueNode::CheckInt32IsSmi { input } => {
-                self.emit_load(*input, Reg64::R11);
-                self.emit_store(id, Reg64::R11);
+                // Skip redundant copy if input and output share a location.
+                if self.alloc.location(id) != self.alloc.location(*input) {
+                    self.emit_load(*input, Reg64::R11);
+                    self.emit_store(id, Reg64::R11);
+                }
             }
             // CheckUint32IsSmi: valid when the u32 fits in i32 (bit 31 clear).
             ValueNode::CheckUint32IsSmi { input } | ValueNode::CheckHoleyFloat64IsSmi { input } => {
@@ -998,8 +1004,18 @@ impl<'a> MaglevCodegen<'a> {
             } => {
                 let _ = feedback_slot;
                 if let Some(off) = self.promoted_global_offset(*name) {
-                    self.masm.mov_load_base_disp32(Reg64::R11, Reg64::R14, off);
-                    self.emit_store(id, Reg64::R11);
+                    // Load directly into the allocated register when possible,
+                    // avoiding an intermediate R11 copy.
+                    match self.alloc.location(id) {
+                        Some(Location::Register(n)) => {
+                            let dst = phys_reg(n);
+                            self.masm.mov_load_base_disp32(dst, Reg64::R14, off);
+                        }
+                        _ => {
+                            self.masm.mov_load_base_disp32(Reg64::R11, Reg64::R14, off);
+                            self.emit_store(id, Reg64::R11);
+                        }
+                    }
                 } else {
                     self.emit_save_caller_saved();
                     self.masm.mov_ri(Reg64::Rdi, i64::from(*name));
@@ -1019,8 +1035,17 @@ impl<'a> MaglevCodegen<'a> {
             } => {
                 let _ = feedback_slot;
                 if let Some(off) = self.promoted_global_offset(*name) {
-                    self.emit_load(*value, Reg64::R11);
-                    self.masm.mov_store_base_disp32(Reg64::R14, off, Reg64::R11);
+                    // Store directly from the allocated register when possible.
+                    match self.alloc.location(*value) {
+                        Some(Location::Register(n)) => {
+                            let src = phys_reg(n);
+                            self.masm.mov_store_base_disp32(Reg64::R14, off, src);
+                        }
+                        _ => {
+                            self.emit_load(*value, Reg64::R11);
+                            self.masm.mov_store_base_disp32(Reg64::R14, off, Reg64::R11);
+                        }
+                    }
                 } else {
                     self.emit_save_caller_saved();
                     self.masm.mov_ri(Reg64::Rdi, i64::from(*name));
@@ -1098,8 +1123,10 @@ impl<'a> MaglevCodegen<'a> {
             | ValueNode::CheckMapsWithMigration { receiver, .. } => {
                 // The generic property stubs handle shape-checking internally.
                 // Pass the receiver through unchanged.
-                self.emit_load(*receiver, Reg64::R11);
-                self.emit_store(id, Reg64::R11);
+                if self.alloc.location(id) != self.alloc.location(*receiver) {
+                    self.emit_load(*receiver, Reg64::R11);
+                    self.emit_store(id, Reg64::R11);
+                }
             }
 
             // ── Context slot access via runtime stubs ─────────────────────────
