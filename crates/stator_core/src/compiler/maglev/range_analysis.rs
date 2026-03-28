@@ -121,6 +121,20 @@ pub fn eliminate_overflow_checks(graph: &mut MaglevGraph) {
         }
     }
 
+    // Phase 0.5 — seed CheckSmi receivers with I32_FULL.
+    //
+    // A `CheckSmi` guard guarantees its receiver is a valid Smi (i32) at
+    // runtime (deoptimising otherwise).  This lets us assign the full i32
+    // range to the guarded value, unlocking downstream propagation for
+    // nodes like `LoadGlobal` that have no inherent range.
+    for block in graph.blocks() {
+        for (_id, node) in &block.nodes {
+            if let ValueNode::CheckSmi { receiver } = node {
+                ranges.entry(*receiver).or_insert(Range::I32_FULL);
+            }
+        }
+    }
+
     // Phase 1 — detect loop induction variables and rewrite step nodes.
     rewrite_loop_induction_steps(graph, &mut ranges);
 
