@@ -932,12 +932,12 @@ impl<'a> MaglevCodegen<'a> {
                     let dst = phys_reg(n);
                     self.emit_load(*value, dst);
                     self.masm.add_ri(dst, 1);
-                    self.emit_deopt_on_smi_overflow_in(dst, 0);
+                    self.emit_deopt_on_i64_overflow(0);
                 }
                 _ => {
                     self.emit_load(*value, Reg64::R11);
                     self.masm.add_ri(Reg64::R11, 1);
-                    self.emit_deopt_on_smi_overflow(0);
+                    self.emit_deopt_on_i64_overflow(0);
                     self.emit_store(id, Reg64::R11);
                 }
             },
@@ -946,12 +946,12 @@ impl<'a> MaglevCodegen<'a> {
                     let dst = phys_reg(n);
                     self.emit_load(*value, dst);
                     self.masm.sub_ri(dst, 1);
-                    self.emit_deopt_on_smi_overflow_in(dst, 0);
+                    self.emit_deopt_on_i64_overflow(0);
                 }
                 _ => {
                     self.emit_load(*value, Reg64::R11);
                     self.masm.sub_ri(Reg64::R11, 1);
-                    self.emit_deopt_on_smi_overflow(0);
+                    self.emit_deopt_on_i64_overflow(0);
                     self.emit_store(id, Reg64::R11);
                 }
             },
@@ -2178,7 +2178,6 @@ impl<'a> MaglevCodegen<'a> {
         }
     }
 
-
     /// Like [`emit_int32_binop`] but emits an i32 overflow guard after the
     /// operation.  Uses **32-bit** arithmetic + `JO` (jump on overflow) + `MOVSXD`
     /// to sign-extend the result, saving one instruction per op versus the old
@@ -2190,65 +2189,11 @@ impl<'a> MaglevCodegen<'a> {
         result: NodeId,
         op: fn(&mut MacroAssembler, Reg64, Reg64),
     ) {
-        // Select the matching 32-bit variant for each 64-bit operation.
-        let op_addr = op as *const () as usize;
-        let op32: fn(&mut MacroAssembler, Reg64, Reg64) =
-            if op_addr == MacroAssembler::add_rr as *const () as usize {
-                MacroAssembler::add32_rr
-            } else if op_addr == MacroAssembler::sub_rr as *const () as usize {
-                MacroAssembler::sub32_rr
-            } else if op_addr == MacroAssembler::imul_rr as *const () as usize {
-                MacroAssembler::imul32_rr
-            } else {
-                // Fallback: use the 64-bit op with old MOVSXD+CMP+JNE guard.
-                return self.emit_checked_smi_binop_legacy(left, right, result, op);
-            };
-
-        match self.alloc.location(result) {
-            Some(Location::Register(n)) => {
-                let dst = phys_reg(n);
-                let right_in_dst = left != right
-                    && matches!(
-                        self.alloc.location(right),
-                        Some(Location::Register(rn)) if phys_reg(rn) == dst
-                    );
-                if right_in_dst {
-                    self.emit_load(right, Reg64::R10);
-                    self.emit_load(left, dst);
-                    op32(&mut self.masm, dst, Reg64::R10);
-                } else {
-                    self.emit_load(left, dst);
-                    match self.alloc.location(right) {
-                        Some(Location::Register(rn)) if phys_reg(rn) != dst => {
-                            op32(&mut self.masm, dst, phys_reg(rn));
-                        }
-                        _ => {
-                            self.emit_load(right, Reg64::R10);
-                            op32(&mut self.masm, dst, Reg64::R10);
-                        }
-                    }
-                }
-                self.emit_deopt_on_overflow_jo(dst, 0);
-            }
-            _ => {
-                self.emit_load(left, Reg64::R11);
-                self.emit_load(right, Reg64::R10);
-                op32(&mut self.masm, Reg64::R11, Reg64::R10);
-                self.emit_deopt_on_overflow_jo(Reg64::R11, 0);
-                self.emit_store(result, Reg64::R11);
-            }
-        }
-    }
-
-    /// Legacy checked Smi binop using MOVSXD+CMP+JNE (fallback for unknown
-    /// op functions).
-    fn emit_checked_smi_binop_legacy(
-        &mut self,
-        left: NodeId,
-        right: NodeId,
-        result: NodeId,
-        op: fn(&mut MacroAssembler, Reg64, Reg64),
-    ) {
+        // CheckedSmi operations work on full-width i64 Smis.  Use the 64-bit
+        // op and then check for i64 overflow via the CPU's OF flag (JO).
+        // Stator Smis are i64, so the only overflow that matters is 64-bit
+        // overflow — NOT i32 range.  The old MOVSXD+CMP+JNE guard was wrong
+        // because it rejected values >2^31 (e.g. sum of 0..100000 ≈ 5 billion).
         match self.alloc.location(result) {
             Some(Location::Register(n)) => {
                 let dst = phys_reg(n);
@@ -2273,13 +2218,15 @@ impl<'a> MaglevCodegen<'a> {
                         }
                     }
                 }
-                self.emit_deopt_on_smi_overflow_in(dst, 0);
+                // JO deopt — 64-bit overflow from the preceding ADD/SUB/IMUL.
+                self.emit_deopt_on_i64_overflow(0);
             }
             _ => {
                 self.emit_load(left, Reg64::R11);
                 self.emit_load(right, Reg64::R10);
                 op(&mut self.masm, Reg64::R11, Reg64::R10);
-                self.emit_deopt_on_smi_overflow(0);
+                // JO deopt — 64-bit overflow from the preceding ADD/SUB/IMUL.
+                self.emit_deopt_on_i64_overflow(0);
                 self.emit_store(result, Reg64::R11);
             }
         }
@@ -2682,6 +2629,25 @@ impl<'a> MaglevCodegen<'a> {
 
     // ── Deopt helpers ────────────────────────────────────────────────────────
 
+    /// Emit a deopt on 64-bit overflow (OF flag) from a preceding ADD/SUB/IMUL.
+    ///
+    /// After a 64-bit arithmetic instruction the CPU's OF flag is set when the
+    /// signed result overflows the i64 range.  This emits a single `JO`
+    /// (2 bytes + 4-byte displacement).  For practical JS values this never
+    /// fires — it guards against pathological i64 wraparound only.
+    fn emit_deopt_on_i64_overflow(&mut self, bytecode_offset: u32) {
+        let code_off = self.masm.position() as u32;
+        let liveness_map = self.all_slots_live();
+        self.deopt_entries.push(DeoptEntry {
+            code_offset: code_off,
+            bytecode_offset,
+            liveness_map,
+        });
+        // JO deopt_overflow_label — jump if OF=1 (i64 overflow).
+        self.masm
+            .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
+    }
+
     /// Emit a Smi-overflow guard after an arithmetic operation whose result is
     /// in `R11`.  Delegates to [`emit_deopt_on_smi_overflow_in`].
     fn emit_deopt_on_smi_overflow(&mut self, bytecode_offset: u32) {
@@ -2708,27 +2674,6 @@ impl<'a> MaglevCodegen<'a> {
         // JNE deopt_overflow_label — jump to overflow deopt if R10 != src.
         self.masm
             .jcc(CondCode::NotEqual, &mut self.deopt_overflow_label);
-    }
-
-    /// Overflow guard for 32-bit arithmetic: emit `JO deopt` + `MOVSXD dst, dst`.
-    ///
-    /// After a 32-bit ADD/SUB/IMUL the CPU's OF flag indicates whether the
-    /// result overflowed the i32 range.  This emits a single `JO` (2 bytes +
-    /// 4-byte displacement) followed by a sign-extension back to 64-bit, saving
-    /// one instruction compared to the MOVSXD+CMP+JNE approach.
-    fn emit_deopt_on_overflow_jo(&mut self, dst: Reg64, bytecode_offset: u32) {
-        let code_off = self.masm.position() as u32;
-        let liveness_map = self.all_slots_live();
-        self.deopt_entries.push(DeoptEntry {
-            code_offset: code_off,
-            bytecode_offset,
-            liveness_map,
-        });
-        // JO deopt_overflow_label — jump if OF=1 (32-bit overflow).
-        self.masm
-            .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
-        // Sign-extend the 32-bit result back to 64-bit for subsequent ops.
-        self.masm.movsxd_sign_extend(dst, dst);
     }
 
     /// Emit an unconditional deopt (record entry + jump to deopt epilogue).
