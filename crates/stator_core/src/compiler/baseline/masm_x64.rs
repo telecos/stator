@@ -706,6 +706,23 @@ impl MacroAssembler {
         self.emit_modrm_rr(dst, src);
     }
 
+    /// `IMUL dst, src, imm` — three-operand signed multiply with immediate.
+    ///
+    /// Uses the short `REX.W 6B /r imm8` form when `imm` fits in a signed
+    /// byte, and the `REX.W 69 /r imm32` form otherwise.
+    pub fn imul_rri(&mut self, dst: Reg64, src: Reg64, imm: i32) {
+        self.emit_rex_wrb(dst, src);
+        if (i8::MIN as i32..=i8::MAX as i32).contains(&imm) {
+            self.buf.push(0x6B);
+            self.emit_modrm_rr(dst, src);
+            self.buf.push(imm as i8 as u8);
+        } else {
+            self.buf.push(0x69);
+            self.emit_modrm_rr(dst, src);
+            self.emit_i32(imm);
+        }
+    }
+
     /// `NEG dst` — two's-complement negation of a 64-bit register.
     ///
     /// Encoding: `REX.W F7 /3`.

@@ -784,22 +784,58 @@ impl<'a> MaglevCodegen<'a> {
 
             // ── Int32 binary arithmetic ──────────────────────────────────────
             ValueNode::Int32Add { left, right } => {
-                self.emit_int32_binop(*left, *right, id, MacroAssembler::add_rr);
+                if let Some(imm) = self.try_get_i32_constant(*right) {
+                    self.emit_int32_binop_imm(*left, imm, id, MacroAssembler::add_ri);
+                } else if let Some(imm) = self.try_get_i32_constant(*left) {
+                    // ADD is commutative
+                    self.emit_int32_binop_imm(*right, imm, id, MacroAssembler::add_ri);
+                } else {
+                    self.emit_int32_binop(*left, *right, id, MacroAssembler::add_rr);
+                }
             }
             ValueNode::Int32Subtract { left, right } => {
-                self.emit_int32_binop(*left, *right, id, MacroAssembler::sub_rr);
+                if let Some(imm) = self.try_get_i32_constant(*right) {
+                    self.emit_int32_binop_imm(*left, imm, id, MacroAssembler::sub_ri);
+                } else {
+                    self.emit_int32_binop(*left, *right, id, MacroAssembler::sub_rr);
+                }
             }
             ValueNode::Int32Multiply { left, right } => {
-                self.emit_int32_binop(*left, *right, id, MacroAssembler::imul_rr);
+                if let Some(imm) = self.try_get_i32_constant(*right) {
+                    self.emit_imul_imm(*left, imm, id);
+                } else if let Some(imm) = self.try_get_i32_constant(*left) {
+                    // MUL is commutative
+                    self.emit_imul_imm(*right, imm, id);
+                } else {
+                    self.emit_int32_binop(*left, *right, id, MacroAssembler::imul_rr);
+                }
             }
             ValueNode::Int32BitwiseAnd { left, right } => {
-                self.emit_int32_binop(*left, *right, id, MacroAssembler::and_rr);
+                if let Some(imm) = self.try_get_i32_constant(*right) {
+                    self.emit_int32_binop_imm(*left, imm, id, MacroAssembler::and_ri);
+                } else {
+                    self.emit_int32_binop(*left, *right, id, MacroAssembler::and_rr);
+                }
             }
             ValueNode::Int32BitwiseOr { left, right } => {
-                self.emit_int32_binop(*left, *right, id, MacroAssembler::or_rr);
+                if let Some(imm) = self.try_get_i32_constant(*right) {
+                    if imm == 0 {
+                        // OR x, 0 is identity — just copy left to result.
+                        self.emit_load(*left, Reg64::R11);
+                        self.emit_store(id, Reg64::R11);
+                    } else {
+                        self.emit_int32_binop_imm(*left, imm, id, MacroAssembler::or_ri);
+                    }
+                } else {
+                    self.emit_int32_binop(*left, *right, id, MacroAssembler::or_rr);
+                }
             }
             ValueNode::Int32BitwiseXor { left, right } => {
-                self.emit_int32_binop(*left, *right, id, MacroAssembler::xor_rr);
+                if let Some(imm) = self.try_get_i32_constant(*right) {
+                    self.emit_int32_binop_imm(*left, imm, id, MacroAssembler::xor_ri);
+                } else {
+                    self.emit_int32_binop(*left, *right, id, MacroAssembler::xor_rr);
+                }
             }
             ValueNode::Int32ShiftLeft { left, right } => {
                 self.emit_load(*left, Reg64::R11);
@@ -1975,6 +2011,58 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_load(left, Reg64::R11);
                 self.emit_load(right, Reg64::R10);
                 op(&mut self.masm, Reg64::R11, Reg64::R10);
+                self.emit_store(result, Reg64::R11);
+            }
+        }
+    }
+
+    /// Emit `dst = src OP imm` using a register-immediate instruction.
+    ///
+    /// Saves 1 MOV instruction per operation compared to loading the constant
+    /// into a scratch register (e.g., `ADD reg, 3` instead of `MOV R10, 3;
+    /// ADD reg, R10`).
+    fn emit_int32_binop_imm(
+        &mut self,
+        src: NodeId,
+        imm: i32,
+        result: NodeId,
+        op: fn(&mut MacroAssembler, Reg64, i32),
+    ) {
+        match self.alloc.location(result) {
+            Some(Location::Register(n)) => {
+                let dst = phys_reg(n);
+                self.emit_load(src, dst);
+                op(&mut self.masm, dst, imm);
+            }
+            _ => {
+                self.emit_load(src, Reg64::R11);
+                op(&mut self.masm, Reg64::R11, imm);
+                self.emit_store(result, Reg64::R11);
+            }
+        }
+    }
+
+    /// Emit `dst = src * imm` using the three-operand IMUL form.
+    ///
+    /// `IMUL dst, src, imm` computes the product in a single instruction
+    /// without needing to pre-load into dst.
+    fn emit_imul_imm(&mut self, src: NodeId, imm: i32, result: NodeId) {
+        match self.alloc.location(result) {
+            Some(Location::Register(n)) => {
+                let dst = phys_reg(n);
+                match self.alloc.location(src) {
+                    Some(Location::Register(sn)) => {
+                        self.masm.imul_rri(dst, phys_reg(sn), imm);
+                    }
+                    _ => {
+                        self.emit_load(src, Reg64::R10);
+                        self.masm.imul_rri(dst, Reg64::R10, imm);
+                    }
+                }
+            }
+            _ => {
+                self.emit_load(src, Reg64::R11);
+                self.masm.imul_rri(Reg64::R11, Reg64::R11, imm);
                 self.emit_store(result, Reg64::R11);
             }
         }
