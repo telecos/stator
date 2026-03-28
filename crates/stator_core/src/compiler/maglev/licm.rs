@@ -110,8 +110,8 @@ pub fn hoist_loop_invariants(graph: &mut MaglevGraph) {
 
 /// A natural loop detected from a back-edge.
 struct NaturalLoop {
-    /// Block index of the loop header.
-    header: u32,
+    /// Block index of the loop header (retained for diagnostics).
+    _header: u32,
     /// Block index of the preheader (unique non-loop predecessor of header).
     preheader: u32,
     /// Set of block indices forming the loop body (includes header).
@@ -191,7 +191,7 @@ fn build_loop(graph: &MaglevGraph, header: u32, back_src: u32) -> Option<Natural
     }
 
     Some(NaturalLoop {
-        header,
+        _header: header,
         preheader: preheaders[0],
         body,
     })
@@ -217,16 +217,21 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) {
     // that may alias those stores (soundness check).
     let mutated_objects = collect_mutated_objects(graph, &lp.body);
 
-    // Scan loop-body blocks (excluding header — hoisting from the header
-    // itself is not useful).  Collect (block_idx, node_position) pairs to
-    // hoist.
+    // Scan loop blocks for hoistable nodes.  Include the loop header — in
+    // single-block loops the entire body lives in the header.  Nodes whose
+    // inputs are all defined outside the loop are loop-invariant regardless
+    // of which block they reside in.
     let mut to_hoist: Vec<(u32, usize, NodeId, ValueNode)> = Vec::new();
 
     for block in graph.blocks() {
-        if block.id == lp.header || !lp.body.contains(&block.id) {
+        if !lp.body.contains(&block.id) {
             continue;
         }
         for (pos, (id, node)) in block.nodes.iter().enumerate() {
+            // Skip Phi nodes — they define loop-carried values.
+            if matches!(node, ValueNode::Phi { .. }) {
+                continue;
+            }
             if is_pure(node)
                 && all_inputs_outside(node, &outside_defs)
                 && !load_aliases_store(node, &mutated_objects)
