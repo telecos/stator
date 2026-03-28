@@ -2158,24 +2158,54 @@ impl<'a> MaglevCodegen<'a> {
     }
 
     /// Emit `dst = src * imm` using the three-operand 32-bit IMUL + sign-extend.
+    /// Emit a 32-bit multiply by an immediate constant, with strength reduction
+    /// for small constants.
+    ///
+    /// - `*3` → `LEA dst, [src + src*2]` + `MOVSXD`  (1c vs 3c latency)
+    /// - `*5` → `LEA dst, [src + src*4]` + `MOVSXD`
+    /// - `*9` → `LEA dst, [src + src*8]` + `MOVSXD`
+    /// - Otherwise → `IMUL32 dst, src, imm` + `MOVSXD`
     fn emit_imul32_imm(&mut self, src: NodeId, imm: i32, result: NodeId) {
+        // Strength-reduce multiply by {3, 5, 9} to LEA with SIB.
+        // LEA operates on 64-bit values; MOVSXD afterward gives wrapping
+        // 32-bit semantics identical to IMUL32.
+        let lea_scale: Option<u8> = match imm {
+            3 => Some(2),
+            5 => Some(4),
+            9 => Some(8),
+            _ => None,
+        };
+
         match self.alloc.location(result) {
             Some(Location::Register(n)) => {
                 let dst = phys_reg(n);
-                match self.alloc.location(src) {
-                    Some(Location::Register(sn)) => {
-                        self.masm.imul32_rri(dst, phys_reg(sn), imm);
-                    }
+                let src_reg = match self.alloc.location(src) {
+                    Some(Location::Register(sn)) => phys_reg(sn),
                     _ => {
                         self.emit_load(src, Reg64::R10);
-                        self.masm.imul32_rri(dst, Reg64::R10, imm);
+                        Reg64::R10
                     }
+                };
+                // RBP/R13 cannot be LEA base with mod=00 (ambiguous encoding).
+                if let Some(scale) = lea_scale {
+                    if src_reg != Reg64::Rbp && src_reg != Reg64::R13 {
+                        self.masm.lea_scaled(dst, src_reg, src_reg, scale);
+                    } else {
+                        self.masm.imul32_rri(dst, src_reg, imm);
+                    }
+                } else {
+                    self.masm.imul32_rri(dst, src_reg, imm);
                 }
                 self.masm.movsxd_sign_extend(dst, dst);
             }
             _ => {
                 self.emit_load(src, Reg64::R11);
-                self.masm.imul32_rri(Reg64::R11, Reg64::R11, imm);
+                if let Some(scale) = lea_scale {
+                    self.masm
+                        .lea_scaled(Reg64::R11, Reg64::R11, Reg64::R11, scale);
+                } else {
+                    self.masm.imul32_rri(Reg64::R11, Reg64::R11, imm);
+                }
                 self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
                 self.emit_store(result, Reg64::R11);
             }

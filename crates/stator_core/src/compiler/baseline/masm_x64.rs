@@ -366,6 +366,45 @@ impl MacroAssembler {
         self.buf.push(0xC0 | (digit << 3) | rm_field.enc());
     }
 
+    /// `LEA dst, [base + index * scale]` — compute an effective address using
+    /// a SIB (Scale-Index-Base) addressing mode, 64-bit result.
+    ///
+    /// `scale` must be one of 1, 2, 4, or 8.  This is useful for strength-
+    /// reducing multiplies by small constants:
+    ///
+    /// - `x * 3` → `lea dst, [x + x*2]`
+    /// - `x * 5` → `lea dst, [x + x*4]`
+    /// - `x * 9` → `lea dst, [x + x*8]`
+    ///
+    /// Encoding: `REX.W 8D /r` with ModRM mod=00, r/m=100 (SIB present),
+    /// SIB byte = `SS.index.base`.
+    ///
+    /// **Note**: `base` must not be RBP/R13 (encoding ambiguity with mod=00).
+    /// `index` must not be RSP (index=100 means "no index").
+    pub fn lea_scaled(&mut self, dst: Reg64, base: Reg64, index: Reg64, scale: u8) {
+        debug_assert!(
+            matches!(scale, 1 | 2 | 4 | 8),
+            "LEA scale must be 1, 2, 4, or 8"
+        );
+        let ss = match scale {
+            1 => 0b00,
+            2 => 0b01,
+            4 => 0b10,
+            8 => 0b11,
+            _ => unreachable!(),
+        };
+        // REX.W (64-bit) | REX.R (dst ext) | REX.X (index ext) | REX.B (base ext)
+        let r_bit = if dst.needs_rex() { 0x04 } else { 0 };
+        let x_bit = if index.needs_rex() { 0x02 } else { 0 };
+        let b_bit = if base.needs_rex() { 0x01 } else { 0 };
+        self.buf.push(0x48 | r_bit | x_bit | b_bit);
+        self.buf.push(0x8D); // LEA opcode
+        // ModRM: mod=00, reg=dst, r/m=100 (SIB follows)
+        self.buf.push((dst.enc() << 3) | 0x04);
+        // SIB: scale=ss, index=index, base=base
+        self.buf.push((ss << 6) | (index.enc() << 3) | base.enc());
+    }
+
     /// Emit a signed 32-bit integer in little-endian byte order.
     fn emit_i32(&mut self, v: i32) {
         self.buf.extend_from_slice(&v.to_le_bytes());
@@ -1107,6 +1146,33 @@ mod tests {
         let mut m = MacroAssembler::new();
         m.lea_rip_rel(Reg64::Rax, 0);
         assert_eq!(m.code(), &[0x48, 0x8D, 0x05, 0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_lea_scaled_times3() {
+        // lea rax, [rcx + rcx*2]  →  48 8D 04 49
+        // REX.W=0x48, LEA=0x8D, ModRM=00.000.100(SIB), SIB=01.001.001
+        let mut m = MacroAssembler::new();
+        m.lea_scaled(Reg64::Rax, Reg64::Rcx, Reg64::Rcx, 2);
+        assert_eq!(m.code(), &[0x48, 0x8D, 0x04, 0x49]);
+    }
+
+    #[test]
+    fn test_lea_scaled_times5() {
+        // lea rdx, [rsi + rsi*4]  →  48 8D 14 B6
+        // REX.W=0x48, LEA=0x8D, ModRM=00.010.100(SIB), SIB=10.110.110
+        let mut m = MacroAssembler::new();
+        m.lea_scaled(Reg64::Rdx, Reg64::Rsi, Reg64::Rsi, 4);
+        assert_eq!(m.code(), &[0x48, 0x8D, 0x14, 0xB6]);
+    }
+
+    #[test]
+    fn test_lea_scaled_with_extended_regs() {
+        // lea r8, [r9 + r9*8]  →  4F 8D 04 C9
+        // REX.W+R+X+B=0x4F, LEA=0x8D, ModRM=00.000.100(SIB), SIB=11.001.001
+        let mut m = MacroAssembler::new();
+        m.lea_scaled(Reg64::R8, Reg64::R9, Reg64::R9, 8);
+        assert_eq!(m.code(), &[0x4F, 0x8D, 0x04, 0xC9]);
     }
 
     // ── Label / branch tests ──────────────────────────────────────────────────
