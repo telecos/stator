@@ -960,6 +960,31 @@ fn eliminate_redundant_type_guards(graph: &mut MaglevGraph) {
         }
     }
 
+    // Phase 1b: iterative fixed-point for Phi nodes.
+    // A Phi is known-Smi when ALL of its inputs are known-Smi.  Because Phi
+    // inputs may reference other Phi nodes (loop-carried values), we iterate
+    // until convergence.
+    loop {
+        let mut changed = false;
+        for block in graph.blocks() {
+            for (id, node) in &block.nodes {
+                if known_smi.contains(id) {
+                    continue;
+                }
+                if let ValueNode::Phi { inputs } = node
+                    && !inputs.is_empty()
+                    && inputs.iter().all(|inp| known_smi.contains(inp))
+                    && known_smi.insert(*id)
+                {
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
     // Phase 2: walk each block, eliminating redundant CheckSmi guards.
     for block in graph.blocks_mut() {
         // Track receivers that have already been guarded within this block.
@@ -995,6 +1020,12 @@ fn is_known_smi_producer(node: &ValueNode) -> bool {
             | ValueNode::CheckedSmiModulus { .. }
             | ValueNode::CheckedSmiIncrement { .. }
             | ValueNode::CheckedSmiDecrement { .. }
+            // Bitwise ops always truncate to i32 → always Smi.
+            | ValueNode::Int32BitwiseOr { .. }
+            | ValueNode::Int32BitwiseAnd { .. }
+            | ValueNode::Int32BitwiseXor { .. }
+            | ValueNode::GenericBitwiseNot { .. }
+            | ValueNode::ChangeInt32ToTagged { .. }
     )
 }
 
