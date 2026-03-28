@@ -441,11 +441,29 @@ struct MaglevCodegen<'a> {
     promoted_globals: Vec<(u32, usize)>,
     /// Number of extra register-file slots allocated for promoted globals.
     promoted_extra_slots: usize,
+    /// Bitmask of caller-saved allocatable registers that are actually used.
+    /// Bit i means register index i is allocated somewhere.  Only the
+    /// caller-saved subset (RCX=1, RDX=2, RSI=3, R8=4, R9=5) is relevant
+    /// for save/restore around stub calls.
+    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
+    used_caller_saved: u8,
 }
 
 impl<'a> MaglevCodegen<'a> {
     fn new(graph: &'a MaglevGraph, alloc: &'a AllocationResult, param_count: u32) -> Self {
         let num_blocks = graph.blocks().len();
+        // Precompute which caller-saved registers are actually allocated.
+        let mut used_caller_saved: u8 = 0;
+        for block in graph.blocks() {
+            for (node_id, _) in &block.nodes {
+                if let Some(Location::Register(n)) = alloc.location(*node_id) {
+                    // Only track caller-saved: RCX(1), RDX(2), RSI(3), R8(4), R9(5)
+                    if (1..=5).contains(&n) {
+                        used_caller_saved |= 1 << n;
+                    }
+                }
+            }
+        }
         Self {
             graph,
             alloc,
@@ -464,6 +482,7 @@ impl<'a> MaglevCodegen<'a> {
             source_positions: Vec::new(),
             promoted_globals: Vec::new(),
             promoted_extra_slots: 0,
+            used_caller_saved,
         }
     }
 
@@ -560,8 +579,9 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.push(Reg64::R14);
         self.masm.push(Reg64::R13);
         // After 4 pushes (including return-address push by `call`):
-        // RSP ≡ 8 mod 16.  Stub calls do 5-push save which aligns
-        // RSP to 0 mod 16 before the inner `call`.
+        // RSP ≡ 8 mod 16.  Stub calls use selective save (odd push
+        // count, with alignment padding when needed) to align RSP to
+        // 0 mod 16 before the inner `call`.
         self.masm.mov_rr(Reg64::R14, Reg64::Rdi);
     }
 
@@ -2114,21 +2134,53 @@ impl<'a> MaglevCodegen<'a> {
     /// Save caller-saved allocatable registers: RCX, RDX, RSI, R8, R9.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_save_caller_saved(&mut self) {
-        self.masm.push(Reg64::Rcx);
-        self.masm.push(Reg64::Rdx);
-        self.masm.push(Reg64::Rsi);
-        self.masm.push(Reg64::R8);
-        self.masm.push(Reg64::R9);
+        let count = self.used_caller_saved.count_ones();
+        // Need an odd number of pushes for 16-byte stack alignment
+        // before the CALL instruction.  After prologue, RSP ≡ 8 mod 16,
+        // so an odd push count brings it to 0 mod 16.
+        if count % 2 == 0 {
+            self.masm.push(Reg64::R11); // alignment padding
+        }
+        if self.used_caller_saved & (1 << 1) != 0 {
+            self.masm.push(Reg64::Rcx);
+        }
+        if self.used_caller_saved & (1 << 2) != 0 {
+            self.masm.push(Reg64::Rdx);
+        }
+        if self.used_caller_saved & (1 << 3) != 0 {
+            self.masm.push(Reg64::Rsi);
+        }
+        if self.used_caller_saved & (1 << 4) != 0 {
+            self.masm.push(Reg64::R8);
+        }
+        if self.used_caller_saved & (1 << 5) != 0 {
+            self.masm.push(Reg64::R9);
+        }
     }
 
     /// Restore caller-saved allocatable registers (reverse order).
+    /// Only restores registers that were actually allocated.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_restore_caller_saved(&mut self) {
-        self.masm.pop(Reg64::R9);
-        self.masm.pop(Reg64::R8);
-        self.masm.pop(Reg64::Rsi);
-        self.masm.pop(Reg64::Rdx);
-        self.masm.pop(Reg64::Rcx);
+        if self.used_caller_saved & (1 << 5) != 0 {
+            self.masm.pop(Reg64::R9);
+        }
+        if self.used_caller_saved & (1 << 4) != 0 {
+            self.masm.pop(Reg64::R8);
+        }
+        if self.used_caller_saved & (1 << 3) != 0 {
+            self.masm.pop(Reg64::Rsi);
+        }
+        if self.used_caller_saved & (1 << 2) != 0 {
+            self.masm.pop(Reg64::Rdx);
+        }
+        if self.used_caller_saved & (1 << 1) != 0 {
+            self.masm.pop(Reg64::Rcx);
+        }
+        let count = self.used_caller_saved.count_ones();
+        if count % 2 == 0 {
+            self.masm.pop(Reg64::R11); // alignment padding
+        }
     }
 
     /// Emit a deopt check: if RAX represents a deopt signal, jump to
