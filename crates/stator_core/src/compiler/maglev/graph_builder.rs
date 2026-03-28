@@ -230,12 +230,14 @@ impl<'a> GraphBuilder<'a> {
             known_props: HashMap::new(),
         };
 
-        // Pass 1: collect all jump targets → assign block indices.
-        builder.collect_targets(&instructions);
-
-        // Always start with block 0 (the entry block).
+        // Always start with block 0 (the entry block).  It MUST be added
+        // before `collect_targets` so that its Vec index matches its block id
+        // (block(id) uses the Vec index, so id==0 must live at index 0).
         builder.graph.add_block(BasicBlock::new(0));
         builder.current_block = 0;
+
+        // Pass 1: collect all jump targets → assign block indices.
+        builder.collect_targets(&instructions);
 
         // Emit Parameter nodes into the entry block.
         // Store each parameter at the two's-complement register address the
