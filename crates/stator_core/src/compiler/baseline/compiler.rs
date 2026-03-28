@@ -5878,6 +5878,8 @@ fn negate_cc(cc: CondCode) -> CondCode {
         CondCode::GreaterEq => CondCode::Less,
         CondCode::Equal => CondCode::NotEqual,
         CondCode::NotEqual => CondCode::Equal,
+        // Overflow is never used in compare-branch fusion.
+        CondCode::Overflow => CondCode::Overflow,
     }
 }
 

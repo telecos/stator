@@ -55,6 +55,8 @@ pub enum CondCode {
     Greater,
     /// Greater-than-or-equal, signed (`SF = OF`).
     GreaterEq,
+    /// Overflow (`OF = 1`).
+    Overflow,
 }
 
 impl CondCode {
@@ -67,6 +69,7 @@ impl CondCode {
             Self::LessEq => 0x9E,
             Self::Greater => 0x9F,
             Self::GreaterEq => 0x9D,
+            Self::Overflow => 0x90,
         }
     }
 
@@ -79,6 +82,7 @@ impl CondCode {
             Self::LessEq => 0x8E,
             Self::Greater => 0x8F,
             Self::GreaterEq => 0x8D,
+            Self::Overflow => 0x80,
         }
     }
 }
@@ -327,6 +331,18 @@ impl MacroAssembler {
         self.buf.push(0x48 | r_bit | b_bit);
     }
 
+    /// Emit a REX prefix **without** the W bit (32-bit operand size).
+    ///
+    /// Only emits when at least one of `reg_field` / `rm_field` is R8–R15.
+    /// For low registers (RAX–RDI) this is a no-op.
+    fn emit_rex_rb_if_needed(&mut self, reg_field: Reg64, rm_field: Reg64) {
+        let r_bit = if reg_field.needs_rex() { 0x04 } else { 0 };
+        let b_bit = if rm_field.needs_rex() { 0x01 } else { 0 };
+        if r_bit | b_bit != 0 {
+            self.buf.push(0x40 | r_bit | b_bit);
+        }
+    }
+
     /// Emit a REX.B-only prefix for single-register short-form instructions
     /// (PUSH, POP).
     ///
@@ -483,6 +499,91 @@ impl MacroAssembler {
             self.emit_modrm_digit(5, dst);
             self.emit_i32(imm);
         }
+    }
+
+    // ── 32-bit arithmetic (for overflow-checked Smi ops) ────────────────────
+
+    /// `ADD r32, r32` — add two 32-bit registers (`dst += src`), setting OF.
+    ///
+    /// Encoding: `[REX] 03 /r` (ADD r32, r/m32) — no REX.W bit.
+    pub fn add32_rr(&mut self, dst: Reg64, src: Reg64) {
+        self.emit_rex_rb_if_needed(dst, src);
+        self.buf.push(0x03);
+        self.emit_modrm_rr(dst, src);
+    }
+
+    /// `ADD r32, imm` — add immediate to a 32-bit register, setting OF.
+    pub fn add32_ri(&mut self, dst: Reg64, imm: i32) {
+        self.emit_rex_rb_if_needed(Reg64::Rax, dst);
+        if (i8::MIN as i32..=i8::MAX as i32).contains(&imm) {
+            self.buf.push(0x83);
+            self.emit_modrm_digit(0, dst);
+            self.buf.push(imm as i8 as u8);
+        } else {
+            self.buf.push(0x81);
+            self.emit_modrm_digit(0, dst);
+            self.emit_i32(imm);
+        }
+    }
+
+    /// `SUB r32, r32` — subtract two 32-bit registers (`dst -= src`), setting
+    /// OF.
+    ///
+    /// Encoding: `[REX] 2B /r` (SUB r32, r/m32) — no REX.W bit.
+    pub fn sub32_rr(&mut self, dst: Reg64, src: Reg64) {
+        self.emit_rex_rb_if_needed(dst, src);
+        self.buf.push(0x2B);
+        self.emit_modrm_rr(dst, src);
+    }
+
+    /// `SUB r32, imm` — subtract immediate from a 32-bit register, setting
+    /// OF.
+    pub fn sub32_ri(&mut self, dst: Reg64, imm: i32) {
+        self.emit_rex_rb_if_needed(Reg64::Rax, dst);
+        if (i8::MIN as i32..=i8::MAX as i32).contains(&imm) {
+            self.buf.push(0x83);
+            self.emit_modrm_digit(5, dst);
+            self.buf.push(imm as i8 as u8);
+        } else {
+            self.buf.push(0x81);
+            self.emit_modrm_digit(5, dst);
+            self.emit_i32(imm);
+        }
+    }
+
+    /// `IMUL r32, r32` — signed 32-bit multiply (`dst *= src`), setting OF.
+    ///
+    /// Encoding: `[REX] 0F AF /r` (IMUL r32, r/m32) — no REX.W bit.
+    pub fn imul32_rr(&mut self, dst: Reg64, src: Reg64) {
+        self.emit_rex_rb_if_needed(dst, src);
+        self.buf.push(0x0F);
+        self.buf.push(0xAF);
+        self.emit_modrm_rr(dst, src);
+    }
+
+    /// `IMUL r32, r32, imm` — three-operand signed 32-bit multiply, setting
+    /// OF.
+    pub fn imul32_rri(&mut self, dst: Reg64, src: Reg64, imm: i32) {
+        self.emit_rex_rb_if_needed(dst, src);
+        if (i8::MIN as i32..=i8::MAX as i32).contains(&imm) {
+            self.buf.push(0x6B);
+            self.emit_modrm_rr(dst, src);
+            self.buf.push(imm as i8 as u8);
+        } else {
+            self.buf.push(0x69);
+            self.emit_modrm_rr(dst, src);
+            self.emit_i32(imm);
+        }
+    }
+
+    /// `MOVSXD dst, src` — sign-extend 32-bit register into 64-bit.
+    ///
+    /// Needed after 32-bit arithmetic to restore the 64-bit value for
+    /// subsequent 64-bit operations.
+    pub fn movsxd_sign_extend(&mut self, dst: Reg64, src: Reg64) {
+        self.emit_rex_wrb(dst, src);
+        self.buf.push(0x63);
+        self.emit_modrm_rr(dst, src);
     }
 
     // ── Comparison ───────────────────────────────────────────────────────────
