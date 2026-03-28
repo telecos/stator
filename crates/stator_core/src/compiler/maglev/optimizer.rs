@@ -114,12 +114,11 @@ pub fn optimize(graph: &mut MaglevGraph) {
     eliminate_dead_code(graph);
 
     let final_nodes: usize = graph.blocks().iter().map(|b| b.nodes.len()).sum();
-    if licm_hoisted > 0 || globals_promoted > 0 {
-        eprintln!(
-            "MAGLEV_OPT: blocks={block_count} nodes={node_count}->{final_nodes} \
-             licm_hoisted={licm_hoisted} globals_promoted={globals_promoted}"
-        );
-    }
+    // Always print summary so we can confirm optimizer runs at all.
+    eprintln!(
+        "MAGLEV_OPT: blocks={block_count} nodes={node_count}->{final_nodes} \
+         licm_hoisted={licm_hoisted} globals_promoted={globals_promoted}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

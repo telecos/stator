@@ -1117,6 +1117,7 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
         }
 
         MAGLEV_COMPILATION_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("MAGLEV_COMPILE: starting bc_len={}", ba.bytecodes().len());
 
         let compile_ba = BytecodeArray::new(
             ba.bytecodes().to_vec(),
@@ -1245,6 +1246,14 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
 
         // Mark that we are executing Maglev code so stubs can track deopts.
         MAGLEV_EXECUTING.with(|f| f.set(true));
+
+        let tried = MAGLEV_DIAG_TRIED.with(|c| c.get());
+        if tried <= 5 {
+            eprintln!(
+                "MAGLEV_EXEC: attempt={tried} bc_len={}",
+                ba.bytecodes().len(),
+            );
+        }
 
         // SAFETY: The cached code was produced by `maglev_codegen::compile`.
         let result = unsafe { cached.execute(&jit_args) };
