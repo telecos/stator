@@ -92,23 +92,34 @@ use crate::compiler::maglev::licm;
 /// Multiple rounds are *not* performed; a single sweep of each pass is
 /// sufficient for the patterns targeted here.
 pub fn optimize(graph: &mut MaglevGraph) {
+    let block_count = graph.blocks().len();
+    let node_count: usize = graph.blocks().iter().map(|b| b.nodes.len()).sum();
+
     fold_constants(graph);
     propagate_int32_truncation(graph);
     simplify_identities(graph);
     strength_reduce(graph);
     crate::compiler::maglev::range_analysis::eliminate_overflow_checks(graph);
-    crate::compiler::maglev::licm::hoist_loop_invariants(graph);
+    let licm_hoisted = crate::compiler::maglev::licm::hoist_loop_invariants(graph);
     // TODO: implement loop peeling — execute the first iteration outside the
     // loop to establish type information (e.g. from CheckSmi guards), then
     // specialise the loop body based on proven types.  This requires
     // duplicating the loop header and body, which is non-trivial with the
     // current graph structure.
     eliminate_common_subexpressions(graph);
-    promote_loop_globals(graph);
+    let globals_promoted = promote_loop_globals_counted(graph);
     eliminate_redundant_type_guards(graph);
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
     eliminate_dead_code(graph);
+
+    let final_nodes: usize = graph.blocks().iter().map(|b| b.nodes.len()).sum();
+    if licm_hoisted > 0 || globals_promoted > 0 {
+        eprintln!(
+            "MAGLEV_OPT: blocks={block_count} nodes={node_count}->{final_nodes} \
+             licm_hoisted={licm_hoisted} globals_promoted={globals_promoted}"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -952,12 +963,14 @@ fn cse_in_block(block: &mut BasicBlock) {
 /// 3. `StoreGlobal` nodes at every loop exit to materialise the final value.
 ///
 /// This eliminates per-iteration memory traffic for loop-carried globals.
-fn promote_loop_globals(graph: &mut MaglevGraph) {
+fn promote_loop_globals_counted(graph: &mut MaglevGraph) -> usize {
     let loops = licm::detect_loops(graph);
+    let mut count = 0;
 
     for lp in &loops {
-        promote_globals_in_loop(graph, lp);
+        count += promote_globals_in_loop(graph, lp);
     }
+    count
 }
 
 /// Return `true` if `node` is a user-visible function call that might read or
@@ -994,7 +1007,9 @@ struct PromotedGlobal {
     original_store_ids: Vec<NodeId>,
 }
 
-fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) {
+/// Promote loop-carried globals to Phi nodes.  Returns the number of globals
+/// promoted (0 if none).
+fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> usize {
     // Safety check: skip loops containing user function calls.
     for block in graph.blocks() {
         if !lp.body.contains(&block.id) {
@@ -1002,7 +1017,7 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) {
         }
         for (_, node) in &block.nodes {
             if is_user_call(node) {
-                return;
+                return 0;
             }
         }
     }
@@ -1050,7 +1065,7 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) {
     // Promotable globals: names that appear in both load and store sets.
     let promotable: Vec<u32> = load_names.intersection(&store_names).copied().collect();
     if promotable.is_empty() {
-        return;
+        return 0;
     }
 
     // Build PromotedGlobal entries: allocate preheader loads and Phi IDs.
@@ -1193,6 +1208,7 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) {
             }
         }
     }
+    promotable.len()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

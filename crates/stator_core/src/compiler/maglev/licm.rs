@@ -96,12 +96,21 @@ use crate::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, NodeId, 
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Detect natural loops and hoist loop-invariant pure nodes to the preheader.
-pub fn hoist_loop_invariants(graph: &mut MaglevGraph) {
+pub fn hoist_loop_invariants(graph: &mut MaglevGraph) -> usize {
     let loops = detect_loops(graph);
 
+    let mut total = 0;
     for lp in &loops {
-        hoist_one_loop(graph, lp);
+        total += hoist_one_loop(graph, lp);
     }
+    if !loops.is_empty() {
+        eprintln!(
+            "LICM: {} loops detected, {} nodes hoisted",
+            loops.len(),
+            total
+        );
+    }
+    total
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -204,7 +213,8 @@ fn build_loop(graph: &MaglevGraph, header: u32, back_src: u32) -> Option<Natural
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Hoist invariant nodes from a single loop to its preheader.
-fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) {
+/// Returns the number of nodes hoisted.
+fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
     // Collect all NodeIds defined outside the loop body.
     let mut outside_defs: HashSet<NodeId> = HashSet::new();
     for block in graph.blocks() {
@@ -252,7 +262,7 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) {
     }
 
     if to_hoist.is_empty() {
-        return;
+        return 0;
     }
 
     // Mark hoisted NodeIds as outside for potential future passes.
@@ -286,11 +296,13 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) {
     }
 
     // Append hoisted nodes to the preheader (before its control node).
+    let count = to_hoist.len();
     if let Some(preheader) = graph.block_mut(lp.preheader) {
         for (_, _, id, node) in to_hoist {
             preheader.push_with_id(id, node);
         }
     }
+    count
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
