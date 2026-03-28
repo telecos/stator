@@ -347,13 +347,19 @@ fn fold_f64_bin(
 /// ensuring correctness when a value is also used by non-truncating ops.
 fn propagate_int32_truncation(graph: &mut MaglevGraph) -> usize {
     // 1. Build use-count map: NodeId → number of consuming nodes.
-    //    CheckSmi guards are excluded because they are "transparent" for
-    //    truncation purposes — a value consumed only by truncation ops
-    //    + CheckSmi guards is still safe to convert to unchecked Int32.
+    //    CheckSmi guards and StoreGlobal nodes are excluded because they are
+    //    "transparent" for truncation purposes — a value consumed only by
+    //    truncation ops + CheckSmi guards + StoreGlobal exit-stores is still
+    //    safe to convert to unchecked Int32.  StoreGlobal at loop exits just
+    //    materialises the (already-truncated) value back to global storage;
+    //    it does not observe the overflow semantics.
     let mut use_counts: HashMap<NodeId, usize> = HashMap::new();
     for block in graph.blocks() {
         for (_, node) in &block.nodes {
-            if matches!(node, ValueNode::CheckSmi { .. }) {
+            if matches!(
+                node,
+                ValueNode::CheckSmi { .. } | ValueNode::StoreGlobal { .. }
+            ) {
                 continue;
             }
             visit_value_node_inputs(node, &mut |id| {

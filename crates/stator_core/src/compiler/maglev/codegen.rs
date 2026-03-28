@@ -567,10 +567,7 @@ impl<'a> MaglevCodegen<'a> {
     /// push  rbx         ; [RBP-8]  callee-saved Register(0) holder
     /// push  r14         ; [RBP-16] callee-saved reg-file pointer
     /// push  r13         ; [RBP-24] callee-saved (preserved for caller)
-    /// sub   rsp, 8      ; [RBP-32] stack-based loop safety counter
     /// mov   r14, rdi    ; r14 = regs argument (SysV: first arg in RDI)
-    /// mov   r11, LOOP_COUNTER_MAX
-    /// mov   [rbp-32], r11
     /// ```
     fn emit_prologue(&mut self) {
         self.masm.push(Reg64::Rbp);
