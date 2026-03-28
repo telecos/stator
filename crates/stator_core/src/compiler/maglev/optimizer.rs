@@ -92,6 +92,7 @@ use crate::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, NodeId, 
 /// sufficient for the patterns targeted here.
 pub fn optimize(graph: &mut MaglevGraph) {
     fold_constants(graph);
+    propagate_int32_truncation(graph);
     simplify_identities(graph);
     strength_reduce(graph);
     crate::compiler::maglev::range_analysis::eliminate_overflow_checks(graph);
@@ -311,6 +312,311 @@ fn fold_f64_bin(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pass 1.3 — Algebraic identity simplification
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass 1.3 — Int32 truncation propagation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// When a `CheckedSmi*` node's result flows exclusively into a bitwise
+/// operation (which truncates to `i32`), the overflow check is unnecessary
+/// and can be replaced with the cheaper unchecked `Int32*` variant.
+///
+/// JavaScript bitwise operators (`|`, `&`, `^`, `<<`, `>>`, `>>>`) convert
+/// their operands via `ToInt32`, which wraps to 32 bits.  A common pattern is
+/// `(a + b) | 0` to force int32 semantics.  By detecting that the consumer
+/// is a truncating op, we eliminate the deopt-on-overflow guard.
+///
+/// Only nodes whose *sole* consumer is on a truncating path are rewritten,
+/// ensuring correctness when a value is also used by non-truncating ops.
+fn propagate_int32_truncation(graph: &mut MaglevGraph) {
+    // 1. Build use-count map: NodeId → number of consuming nodes.
+    let mut use_counts: HashMap<NodeId, usize> = HashMap::new();
+    for block in graph.blocks() {
+        for (_, node) in &block.nodes {
+            visit_value_node_inputs(node, &mut |id| {
+                *use_counts.entry(id).or_insert(0) += 1;
+            });
+        }
+        if let Some(ctrl) = &block.control {
+            visit_control_inputs(ctrl, &mut |id| {
+                *use_counts.entry(id).or_insert(0) += 1;
+            });
+        }
+    }
+
+    // 2. Build NodeId → ValueNode snapshot for backward walking.
+    let mut node_map: HashMap<NodeId, ValueNode> = HashMap::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            node_map.insert(*id, node.clone());
+        }
+    }
+
+    // 3. Find truncation points (bitwise/shift ops) and walk backward.
+    let mut replacements: HashMap<NodeId, ValueNode> = HashMap::new();
+    for block in graph.blocks() {
+        for (_, node) in &block.nodes {
+            match node {
+                ValueNode::Int32BitwiseOr { left, right }
+                | ValueNode::Int32BitwiseXor { left, right }
+                | ValueNode::Int32BitwiseAnd { left, right }
+                | ValueNode::Int32ShiftLeft { left, right }
+                | ValueNode::Int32ShiftRight { left, right }
+                | ValueNode::Int32ShiftRightLogical { left, right } => {
+                    mark_truncated(*left, &use_counts, &node_map, &mut replacements);
+                    mark_truncated(*right, &use_counts, &node_map, &mut replacements);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // 4. Apply replacements in-place.
+    if !replacements.is_empty() {
+        for block in graph.blocks_mut() {
+            for (id, node) in &mut block.nodes {
+                if let Some(new_node) = replacements.remove(id) {
+                    *node = new_node;
+                }
+            }
+        }
+    }
+}
+
+/// Walk backward from a truncation point, replacing `CheckedSmi*` with
+/// unchecked `Int32*`.  Only touches nodes that have exactly one consumer
+/// (the truncating path).
+fn mark_truncated(
+    id: NodeId,
+    use_counts: &HashMap<NodeId, usize>,
+    node_map: &HashMap<NodeId, ValueNode>,
+    replacements: &mut HashMap<NodeId, ValueNode>,
+) {
+    if use_counts.get(&id) != Some(&1) {
+        return;
+    }
+    if let Some(node) = node_map.get(&id) {
+        let (new_node, inputs) = match node {
+            ValueNode::CheckedSmiAdd { left, right } => (
+                ValueNode::Int32Add {
+                    left: *left,
+                    right: *right,
+                },
+                vec![*left, *right],
+            ),
+            ValueNode::CheckedSmiSubtract { left, right } => (
+                ValueNode::Int32Subtract {
+                    left: *left,
+                    right: *right,
+                },
+                vec![*left, *right],
+            ),
+            ValueNode::CheckedSmiMultiply { left, right } => (
+                ValueNode::Int32Multiply {
+                    left: *left,
+                    right: *right,
+                },
+                vec![*left, *right],
+            ),
+            _ => return,
+        };
+
+        replacements.insert(id, new_node);
+        for input in inputs {
+            mark_truncated(input, use_counts, node_map, replacements);
+        }
+    }
+}
+
+/// Visit all [`NodeId`] inputs of a [`ValueNode`], calling `f` for each.
+///
+/// Uses a catch-all arm for zero-input nodes and any new variants that
+/// don't have NodeId inputs, which is conservative for use-counting.
+#[allow(clippy::too_many_lines)]
+fn visit_value_node_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
+    match node {
+        // ── Two-input arithmetic / comparisons ──────────────────────────
+        ValueNode::CheckedSmiAdd { left, right }
+        | ValueNode::CheckedSmiSubtract { left, right }
+        | ValueNode::CheckedSmiMultiply { left, right }
+        | ValueNode::CheckedSmiDivide { left, right }
+        | ValueNode::CheckedSmiModulus { left, right }
+        | ValueNode::Int32Add { left, right }
+        | ValueNode::Int32Subtract { left, right }
+        | ValueNode::Int32Multiply { left, right }
+        | ValueNode::Int32Divide { left, right }
+        | ValueNode::Int32Modulus { left, right }
+        | ValueNode::Uint32Add { left, right }
+        | ValueNode::Uint32Subtract { left, right }
+        | ValueNode::Uint32Multiply { left, right }
+        | ValueNode::Int32BitwiseOr { left, right }
+        | ValueNode::Int32BitwiseXor { left, right }
+        | ValueNode::Int32BitwiseAnd { left, right }
+        | ValueNode::Int32ShiftLeft { left, right }
+        | ValueNode::Int32ShiftRight { left, right }
+        | ValueNode::Int32ShiftRightLogical { left, right }
+        | ValueNode::Float64Add { left, right }
+        | ValueNode::Float64Subtract { left, right }
+        | ValueNode::Float64Multiply { left, right }
+        | ValueNode::Float64Divide { left, right }
+        | ValueNode::Float64Modulus { left, right }
+        | ValueNode::Float64Exponentiate { left, right }
+        | ValueNode::GenericAdd { left, right, .. }
+        | ValueNode::GenericSubtract { left, right, .. }
+        | ValueNode::GenericMultiply { left, right, .. }
+        | ValueNode::GenericDivide { left, right, .. }
+        | ValueNode::GenericModulus { left, right, .. }
+        | ValueNode::GenericExponentiate { left, right, .. }
+        | ValueNode::GenericBitwiseOr { left, right, .. }
+        | ValueNode::GenericBitwiseXor { left, right, .. }
+        | ValueNode::GenericBitwiseAnd { left, right, .. }
+        | ValueNode::GenericShiftLeft { left, right, .. }
+        | ValueNode::GenericShiftRight { left, right, .. }
+        | ValueNode::GenericShiftRightLogical { left, right, .. }
+        | ValueNode::Int32LessThan { left, right }
+        | ValueNode::Int32LessThanOrEqual { left, right }
+        | ValueNode::Int32GreaterThan { left, right }
+        | ValueNode::Int32GreaterThanOrEqual { left, right }
+        | ValueNode::Int32StrictEqual { left, right }
+        | ValueNode::Float64LessThan { left, right }
+        | ValueNode::Float64LessThanOrEqual { left, right }
+        | ValueNode::Float64GreaterThan { left, right }
+        | ValueNode::Float64GreaterThanOrEqual { left, right }
+        | ValueNode::TaggedEqual { left, right, .. }
+        | ValueNode::TaggedNotEqual { left, right, .. } => {
+            f(*left);
+            f(*right);
+        }
+        ValueNode::TestInstanceOf {
+            object, callable, ..
+        } => {
+            f(*object);
+            f(*callable);
+        }
+        ValueNode::TestIn { key, object, .. } => {
+            f(*key);
+            f(*object);
+        }
+
+        // ── Single-input nodes ──────────────────────────────────────────
+        ValueNode::CheckedSmiIncrement { value }
+        | ValueNode::CheckedSmiDecrement { value }
+        | ValueNode::Int32Negate { value }
+        | ValueNode::Int32Increment { value }
+        | ValueNode::Int32Decrement { value }
+        | ValueNode::Float64Negate { value }
+        | ValueNode::Float64Ieee754Unary { value, .. }
+        | ValueNode::GenericBitwiseNot { value, .. }
+        | ValueNode::GenericNegate { value, .. }
+        | ValueNode::GenericIncrement { value, .. }
+        | ValueNode::GenericDecrement { value, .. }
+        | ValueNode::ChangeInt32ToFloat64 { input: value }
+        | ValueNode::ChangeUint32ToFloat64 { input: value }
+        | ValueNode::ChangeFloat64ToInt32 { input: value }
+        | ValueNode::CheckedFloat64ToInt32 { input: value }
+        | ValueNode::ChangeInt32ToTagged { input: value }
+        | ValueNode::ChangeUint32ToTagged { input: value }
+        | ValueNode::ChangeFloat64ToTagged { input: value }
+        | ValueNode::ChangeTaggedToInt32 { input: value }
+        | ValueNode::ChangeTaggedToUint32 { input: value }
+        | ValueNode::ChangeTaggedToFloat64 { input: value }
+        | ValueNode::CheckSmi { receiver: value }
+        | ValueNode::CheckNumber { receiver: value }
+        | ValueNode::CheckString { receiver: value }
+        | ValueNode::CheckSymbol { receiver: value }
+        | ValueNode::CheckHeapObject { receiver: value }
+        | ValueNode::ToBoolean { value }
+        | ValueNode::ToNumber { value, .. }
+        | ValueNode::ToString { value, .. }
+        | ValueNode::ToObject { value, .. }
+        | ValueNode::TypeOf { value }
+        | ValueNode::TestTypeOf { value, .. }
+        | ValueNode::TestUndetectable { value } => f(*value),
+
+        // ── Multi-input special nodes ───────────────────────────────────
+        ValueNode::Phi { inputs } => {
+            for id in inputs {
+                f(*id);
+            }
+        }
+        ValueNode::CheckMaps { receiver, .. } => f(*receiver),
+        ValueNode::LoadField { object, .. } => f(*object),
+        ValueNode::LoadFixedArrayElement {
+            elements, index, ..
+        } => {
+            f(*elements);
+            f(*index);
+        }
+        ValueNode::StoreFixedArrayElement {
+            elements,
+            index,
+            value,
+            ..
+        } => {
+            f(*elements);
+            f(*index);
+            f(*value);
+        }
+        ValueNode::LoadNamedGeneric { object, .. } => f(*object),
+        ValueNode::StoreNamedGeneric { object, value, .. } => {
+            f(*object);
+            f(*value);
+        }
+        ValueNode::LoadKeyedGeneric { object, key, .. } => {
+            f(*object);
+            f(*key);
+        }
+        ValueNode::StoreKeyedGeneric {
+            object, key, value, ..
+        } => {
+            f(*object);
+            f(*key);
+            f(*value);
+        }
+        ValueNode::StoreGlobal { value, .. }
+        | ValueNode::StoreContextSlot { value, .. }
+        | ValueNode::StoreCurrentContextSlot { value, .. } => f(*value),
+        ValueNode::LoadContextSlot { context, .. } => f(*context),
+        ValueNode::GetArgument { index } => f(*index),
+        ValueNode::Call {
+            callee,
+            receiver,
+            args,
+            ..
+        } => {
+            f(*callee);
+            f(*receiver);
+            for a in args {
+                f(*a);
+            }
+        }
+        ValueNode::CallRuntime { args, .. } => {
+            for a in args {
+                f(*a);
+            }
+        }
+        ValueNode::Construct {
+            constructor, args, ..
+        } => {
+            f(*constructor);
+            for a in args {
+                f(*a);
+            }
+        }
+
+        // Catch-all for zero-input nodes and any new variants.
+        _ => {}
+    }
+}
+
+/// Visit all [`NodeId`] inputs of a [`ControlNode`], calling `f` for each.
+fn visit_control_inputs(ctrl: &ControlNode, f: &mut impl FnMut(NodeId)) {
+    match ctrl {
+        ControlNode::Return { value } => f(*value),
+        ControlNode::Branch { condition, .. } => f(*condition),
+        ControlNode::Jump { .. } | ControlNode::Deoptimize { .. } => {}
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Simplify algebraic identities: `x + 0 → x`, `x * 1 → x`, `x - 0 → x`,
