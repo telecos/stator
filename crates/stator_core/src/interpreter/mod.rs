@@ -1143,6 +1143,22 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
                 let param_count = input.ba.parameter_count();
                 match GraphBuilder::build(&input.ba, &feedback) {
                     Ok(mut graph) => {
+                        // ── Diagnostic: dump the Maglev IR graph ─────────
+                        eprintln!("MAGLEV_GRAPH_DUMP: {} blocks", graph.blocks().len());
+                        for (bi, block) in graph.blocks().iter().enumerate() {
+                            eprintln!(
+                                "  Block {} (preds: {:?}):",
+                                bi, block.predecessors
+                            );
+                            for (nid, node) in &block.nodes {
+                                eprintln!("    n{}: {:?}", nid.0, node);
+                            }
+                            if let Some(ctrl) = &block.control {
+                                eprintln!("    ctrl: {:?}", ctrl);
+                            }
+                        }
+                        eprintln!("MAGLEV_GRAPH_DUMP_END");
+                        // ── End diagnostic ────────────────────────────────
                         optimize(&mut graph);
                         match maglev_codegen::compile(&graph, param_count) {
                             Ok(cc) => {
