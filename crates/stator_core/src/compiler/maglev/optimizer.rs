@@ -384,7 +384,7 @@ fn propagate_int32_truncation(graph: &mut MaglevGraph) -> usize {
     // 3. Find truncation points (bitwise/shift ops) and walk backward.
     let mut replacements: HashMap<NodeId, ValueNode> = HashMap::new();
     for block in graph.blocks() {
-        for (_, node) in &block.nodes {
+        for (node_id, node) in &block.nodes {
             match node {
                 ValueNode::Int32BitwiseOr { left, right }
                 | ValueNode::Int32BitwiseXor { left, right }
@@ -392,6 +392,17 @@ fn propagate_int32_truncation(graph: &mut MaglevGraph) -> usize {
                 | ValueNode::Int32ShiftLeft { left, right }
                 | ValueNode::Int32ShiftRight { left, right }
                 | ValueNode::Int32ShiftRightLogical { left, right } => {
+                    eprintln!(
+                        "TRUNC_POINT: node={} left={} (use_count={:?}) right={} (use_count={:?})",
+                        node_id.0,
+                        left.0,
+                        use_counts.get(left),
+                        right.0,
+                        use_counts.get(right),
+                    );
+                    if let Some(left_node) = node_map.get(left) {
+                        eprintln!("  left_node: {:?}", std::mem::discriminant(left_node));
+                    }
                     mark_truncated(*left, &use_counts, &node_map, &mut replacements);
                     mark_truncated(*right, &use_counts, &node_map, &mut replacements);
                 }
@@ -423,7 +434,9 @@ fn mark_truncated(
     node_map: &HashMap<NodeId, ValueNode>,
     replacements: &mut HashMap<NodeId, ValueNode>,
 ) {
-    if use_counts.get(&id) != Some(&1) {
+    let uc = use_counts.get(&id);
+    if uc != Some(&1) {
+        eprintln!("  TRUNC_SKIP: node={} use_count={:?} (need 1)", id.0, uc);
         return;
     }
     if let Some(node) = node_map.get(&id) {
