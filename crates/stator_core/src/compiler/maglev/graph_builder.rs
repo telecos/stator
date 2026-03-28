@@ -392,8 +392,10 @@ impl<'a> GraphBuilder<'a> {
             let enc = encode(std::slice::from_ref(ins));
             cur_byte += enc.len();
         }
-        // Jump offset is relative to the *start* of the current instruction.
-        let target_byte = (cur_byte as i64 + offset as i64) as usize;
+        // Jump offset is relative to the *end* of the current instruction
+        // (resolve_jumps computes: target_byte - offsets[jump_idx + 1]).
+        let instr_size = encode(std::slice::from_ref(&instructions[i])).len();
+        let target_byte = (cur_byte as i64 + instr_size as i64 + offset as i64) as usize;
         byte_to_idx.get(&target_byte).copied()
     }
 

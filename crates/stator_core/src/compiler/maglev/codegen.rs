@@ -1014,24 +1014,26 @@ impl<'a> MaglevCodegen<'a> {
             // register-file slot during the prologue.  LoadGlobal reads from
             // the slot; StoreGlobal writes to it.  The epilogue flushes all
             // promoted slots back to the runtime GlobalEnv.
-            // Use runtime stubs for global access instead of promoted
-            // register-file slots.  This is slower but avoids potential
-            // correctness issues with promoted-global Phi resolution in
-            // loops.  If Maglev stops infinite-looping with this change,
-            // the bug is in promoted global codegen.
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::LoadGlobal {
                 name,
                 feedback_slot,
             } => {
-                self.emit_save_caller_saved();
-                self.masm.mov_ri(Reg64::Rdi, i64::from(*name));
-                let addr = jit_runtime::jit_runtime_lda_global as *const () as usize as i64;
-                self.masm.mov_ri(Reg64::R11, addr);
-                self.masm.call_reg(Reg64::R11);
-                self.emit_restore_caller_saved();
-                self.emit_deopt_check_rax();
-                self.emit_store(id, Reg64::Rax);
+                let _ = feedback_slot;
+                if let Some(off) = self.promoted_global_offset(*name) {
+                    self.masm.mov_load_base_disp32(Reg64::R11, Reg64::R14, off);
+                    self.emit_store(id, Reg64::R11);
+                } else {
+                    self.emit_save_caller_saved();
+                    self.masm.mov_ri(Reg64::Rdi, i64::from(*name));
+                    let addr =
+                        jit_runtime::jit_runtime_lda_global as *const () as usize as i64;
+                    self.masm.mov_ri(Reg64::R11, addr);
+                    self.masm.call_reg(Reg64::R11);
+                    self.emit_restore_caller_saved();
+                    self.emit_deopt_check_rax();
+                    self.emit_store(id, Reg64::Rax);
+                }
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::StoreGlobal {
@@ -1039,15 +1041,22 @@ impl<'a> MaglevCodegen<'a> {
                 value,
                 feedback_slot,
             } => {
-                self.emit_save_caller_saved();
-                self.masm.mov_ri(Reg64::Rdi, i64::from(*name));
-                self.emit_load(*value, Reg64::Rsi);
-                let addr = jit_runtime::jit_runtime_sta_global as *const () as usize as i64;
-                self.masm.mov_ri(Reg64::R11, addr);
-                self.masm.call_reg(Reg64::R11);
-                self.emit_restore_caller_saved();
-                self.emit_deopt_check_rax();
-                self.emit_store(id, Reg64::Rax);
+                let _ = feedback_slot;
+                if let Some(off) = self.promoted_global_offset(*name) {
+                    self.emit_load(*value, Reg64::R11);
+                    self.masm.mov_store_base_disp32(Reg64::R14, off, Reg64::R11);
+                } else {
+                    self.emit_save_caller_saved();
+                    self.masm.mov_ri(Reg64::Rdi, i64::from(*name));
+                    self.emit_load(*value, Reg64::Rsi);
+                    let addr =
+                        jit_runtime::jit_runtime_sta_global as *const () as usize as i64;
+                    self.masm.mov_ri(Reg64::R11, addr);
+                    self.masm.call_reg(Reg64::R11);
+                    self.emit_restore_caller_saved();
+                    self.emit_deopt_check_rax();
+                    self.emit_store(id, Reg64::Rax);
+                }
             }
             #[cfg(not(all(target_arch = "x86_64", unix)))]
             ValueNode::LoadGlobal { .. } | ValueNode::StoreGlobal { .. } => {
@@ -1784,7 +1793,7 @@ impl<'a> MaglevCodegen<'a> {
     }
 
     /// Byte offset from R14 for the promoted global with `name_idx`.
-    #[allow(dead_code)]
+    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
     fn promoted_global_offset(&self, name_idx: u32) -> Option<i32> {
         self.promoted_globals
             .iter()
