@@ -96,7 +96,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     let node_count: usize = graph.blocks().iter().map(|b| b.nodes.len()).sum();
 
     fold_constants(graph);
-    propagate_int32_truncation(graph);
+    let truncations = propagate_int32_truncation(graph);
     simplify_identities(graph);
     strength_reduce(graph);
     crate::compiler::maglev::range_analysis::eliminate_overflow_checks(graph);
@@ -117,7 +117,8 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // Always print summary so we can confirm optimizer runs at all.
     eprintln!(
         "MAGLEV_OPT: blocks={block_count} nodes={node_count}->{final_nodes} \
-         licm_hoisted={licm_hoisted} globals_promoted={globals_promoted}"
+         licm_hoisted={licm_hoisted} globals_promoted={globals_promoted} \
+         truncated={truncations}"
     );
 }
 
@@ -339,11 +340,17 @@ fn fold_f64_bin(
 ///
 /// Only nodes whose *sole* consumer is on a truncating path are rewritten,
 /// ensuring correctness when a value is also used by non-truncating ops.
-fn propagate_int32_truncation(graph: &mut MaglevGraph) {
+fn propagate_int32_truncation(graph: &mut MaglevGraph) -> usize {
     // 1. Build use-count map: NodeId → number of consuming nodes.
+    //    CheckSmi guards are excluded because they are "transparent" for
+    //    truncation purposes — a value consumed only by truncation ops
+    //    + CheckSmi guards is still safe to convert to unchecked Int32.
     let mut use_counts: HashMap<NodeId, usize> = HashMap::new();
     for block in graph.blocks() {
         for (_, node) in &block.nodes {
+            if matches!(node, ValueNode::CheckSmi { .. }) {
+                continue;
+            }
             visit_value_node_inputs(node, &mut |id| {
                 *use_counts.entry(id).or_insert(0) += 1;
             });
@@ -383,6 +390,7 @@ fn propagate_int32_truncation(graph: &mut MaglevGraph) {
     }
 
     // 4. Apply replacements in-place.
+    let count = replacements.len();
     if !replacements.is_empty() {
         for block in graph.blocks_mut() {
             for (id, node) in &mut block.nodes {
@@ -392,11 +400,12 @@ fn propagate_int32_truncation(graph: &mut MaglevGraph) {
             }
         }
     }
+    count
 }
 
 /// Walk backward from a truncation point, replacing `CheckedSmi*` with
-/// unchecked `Int32*`.  Only touches nodes that have exactly one consumer
-/// (the truncating path).
+/// unchecked `Int32*`.  Only touches nodes whose non-CheckSmi use count is
+/// exactly one (the truncating path).
 fn mark_truncated(
     id: NodeId,
     use_counts: &HashMap<NodeId, usize>,
@@ -1296,6 +1305,15 @@ fn is_known_smi_producer(node: &ValueNode) -> bool {
             | ValueNode::CheckedSmiModulus { .. }
             | ValueNode::CheckedSmiIncrement { .. }
             | ValueNode::CheckedSmiDecrement { .. }
+            // Unchecked Int32 ops always produce values in i32 range → always Smi.
+            | ValueNode::Int32Add { .. }
+            | ValueNode::Int32Subtract { .. }
+            | ValueNode::Int32Multiply { .. }
+            | ValueNode::Int32Divide { .. }
+            | ValueNode::Int32Modulus { .. }
+            | ValueNode::Int32Negate { .. }
+            | ValueNode::Int32Increment { .. }
+            | ValueNode::Int32Decrement { .. }
             // Bitwise ops always truncate to i32 → always Smi.
             | ValueNode::Int32BitwiseOr { .. }
             | ValueNode::Int32BitwiseAnd { .. }

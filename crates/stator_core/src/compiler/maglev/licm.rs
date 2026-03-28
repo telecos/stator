@@ -1066,4 +1066,115 @@ mod tests {
         // At most the invariant constant was hoisted.
         assert!(graph.blocks()[2].nodes.len() >= body_len_before - 1);
     }
+
+    // ── deep_object pattern: LoadGlobal + LoadNamedGeneric chain ─────────────
+
+    #[test]
+    fn test_hoist_property_chain_from_immutable_global() {
+        let mut graph = loop_graph();
+
+        // LoadGlobal("root") in the loop body — "root" is NOT stored, so it
+        // should be hoistable.
+        let root_id = NodeId(500);
+        let a_id = NodeId(501);
+        let b_id = NodeId(502);
+
+        // Insert chain: LoadGlobal("root") → LoadNamedGeneric(root, "a") →
+        // LoadNamedGeneric(a, "b") all in block 2 (body).
+        graph.blocks_mut()[2].nodes.push((
+            root_id,
+            ValueNode::LoadGlobal {
+                name: 1, // "root"
+                feedback_slot: 0,
+            },
+        ));
+        graph.blocks_mut()[2].nodes.push((
+            a_id,
+            ValueNode::LoadNamedGeneric {
+                object: root_id,
+                name: 2, // "a"
+                feedback_slot: 1,
+            },
+        ));
+        graph.blocks_mut()[2].nodes.push((
+            b_id,
+            ValueNode::LoadNamedGeneric {
+                object: a_id,
+                name: 3, // "b"
+                feedback_slot: 2,
+            },
+        ));
+
+        assert_eq!(graph.blocks()[2].nodes.len(), 3);
+
+        hoist_loop_invariants(&mut graph);
+
+        // ALL 3 should be hoisted: LoadGlobal has no inputs, each
+        // LoadNamedGeneric depends on the prior (hoisted) node.
+        assert_eq!(
+            graph.blocks()[2].nodes.len(),
+            0,
+            "all 3 invariant nodes should be hoisted from the loop body"
+        );
+        assert!(
+            graph.blocks()[0].nodes.iter().any(|(id, _)| *id == root_id),
+            "LoadGlobal should be in preheader"
+        );
+        assert!(
+            graph.blocks()[0].nodes.iter().any(|(id, _)| *id == b_id),
+            "final LoadNamedGeneric should be in preheader"
+        );
+    }
+
+    // ── LoadGlobal NOT hoisted when same name is stored in loop ──────────────
+
+    #[test]
+    fn test_load_global_not_hoisted_when_stored() {
+        let mut graph = loop_graph();
+
+        // LoadGlobal("i") + StoreGlobal("i") in the loop body.
+        let load_i = NodeId(600);
+        let inc = NodeId(601);
+        let store_i = NodeId(602);
+
+        graph.blocks_mut()[2].nodes.push((
+            load_i,
+            ValueNode::LoadGlobal {
+                name: 10, // "i"
+                feedback_slot: 0,
+            },
+        ));
+        graph.blocks_mut()[2].nodes.push((
+            inc,
+            ValueNode::Int32Add {
+                left: load_i,
+                right: load_i,
+            },
+        ));
+        graph.blocks_mut()[2].nodes.push((
+            store_i,
+            ValueNode::StoreGlobal {
+                name: 10, // "i" — same name as load
+                value: inc,
+                feedback_slot: 1,
+            },
+        ));
+
+        let body_len = graph.blocks()[2].nodes.len();
+        hoist_loop_invariants(&mut graph);
+
+        // LoadGlobal("i") must NOT be hoisted because "i" is also stored.
+        assert!(
+            graph.blocks()[2].nodes.iter().any(|(id, _)| *id == load_i),
+            "LoadGlobal for stored name must stay in loop"
+        );
+        // StoreGlobal is impure and must stay.
+        assert!(graph.blocks()[2].nodes.iter().any(|(id, _)| *id == store_i),);
+        // Int32Add depends on load_i (in loop) so it stays too.
+        assert_eq!(
+            graph.blocks()[2].nodes.len(),
+            body_len,
+            "nothing should be hoisted"
+        );
+    }
 }

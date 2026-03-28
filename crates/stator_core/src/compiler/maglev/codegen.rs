@@ -785,29 +785,29 @@ impl<'a> MaglevCodegen<'a> {
             // ── Int32 binary arithmetic ──────────────────────────────────────
             ValueNode::Int32Add { left, right } => {
                 if let Some(imm) = self.try_get_i32_constant(*right) {
-                    self.emit_int32_binop_imm(*left, imm, id, MacroAssembler::add_ri);
+                    self.emit_wrapping_int32_binop_imm(*left, imm, id, MacroAssembler::add32_ri);
                 } else if let Some(imm) = self.try_get_i32_constant(*left) {
                     // ADD is commutative
-                    self.emit_int32_binop_imm(*right, imm, id, MacroAssembler::add_ri);
+                    self.emit_wrapping_int32_binop_imm(*right, imm, id, MacroAssembler::add32_ri);
                 } else {
-                    self.emit_int32_binop(*left, *right, id, MacroAssembler::add_rr);
+                    self.emit_wrapping_int32_binop(*left, *right, id, MacroAssembler::add32_rr);
                 }
             }
             ValueNode::Int32Subtract { left, right } => {
                 if let Some(imm) = self.try_get_i32_constant(*right) {
-                    self.emit_int32_binop_imm(*left, imm, id, MacroAssembler::sub_ri);
+                    self.emit_wrapping_int32_binop_imm(*left, imm, id, MacroAssembler::sub32_ri);
                 } else {
-                    self.emit_int32_binop(*left, *right, id, MacroAssembler::sub_rr);
+                    self.emit_wrapping_int32_binop(*left, *right, id, MacroAssembler::sub32_rr);
                 }
             }
             ValueNode::Int32Multiply { left, right } => {
                 if let Some(imm) = self.try_get_i32_constant(*right) {
-                    self.emit_imul_imm(*left, imm, id);
+                    self.emit_imul32_imm(*left, imm, id);
                 } else if let Some(imm) = self.try_get_i32_constant(*left) {
                     // MUL is commutative
-                    self.emit_imul_imm(*right, imm, id);
+                    self.emit_imul32_imm(*right, imm, id);
                 } else {
-                    self.emit_int32_binop(*left, *right, id, MacroAssembler::imul_rr);
+                    self.emit_wrapping_int32_binop(*left, *right, id, MacroAssembler::imul32_rr);
                 }
             }
             ValueNode::Int32BitwiseAnd { left, right } => {
@@ -874,10 +874,12 @@ impl<'a> MaglevCodegen<'a> {
                     let dst = phys_reg(n);
                     self.emit_load(*value, dst);
                     self.masm.neg_r(dst);
+                    self.masm.movsxd_sign_extend(dst, dst);
                 }
                 _ => {
                     self.emit_load(*value, Reg64::R11);
                     self.masm.neg_r(Reg64::R11);
+                    self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
                     self.emit_store(id, Reg64::R11);
                 }
             },
@@ -885,11 +887,13 @@ impl<'a> MaglevCodegen<'a> {
                 Some(Location::Register(n)) => {
                     let dst = phys_reg(n);
                     self.emit_load(*value, dst);
-                    self.masm.add_ri(dst, 1);
+                    self.masm.add32_ri(dst, 1);
+                    self.masm.movsxd_sign_extend(dst, dst);
                 }
                 _ => {
                     self.emit_load(*value, Reg64::R11);
-                    self.masm.add_ri(Reg64::R11, 1);
+                    self.masm.add32_ri(Reg64::R11, 1);
+                    self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
                     self.emit_store(id, Reg64::R11);
                 }
             },
@@ -897,11 +901,13 @@ impl<'a> MaglevCodegen<'a> {
                 Some(Location::Register(n)) => {
                     let dst = phys_reg(n);
                     self.emit_load(*value, dst);
-                    self.masm.sub_ri(dst, 1);
+                    self.masm.sub32_ri(dst, 1);
+                    self.masm.movsxd_sign_extend(dst, dst);
                 }
                 _ => {
                     self.emit_load(*value, Reg64::R11);
-                    self.masm.sub_ri(Reg64::R11, 1);
+                    self.masm.sub32_ri(Reg64::R11, 1);
+                    self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
                     self.emit_store(id, Reg64::R11);
                 }
             },
@@ -2074,31 +2080,104 @@ impl<'a> MaglevCodegen<'a> {
         }
     }
 
-    /// Emit `dst = src * imm` using the three-operand IMUL form.
+    /// Emit a wrapping 32-bit binary operation: `dst = left OP32 right; movsxd dst, dst`.
     ///
-    /// `IMUL dst, src, imm` computes the product in a single instruction
-    /// without needing to pre-load into dst.
-    fn emit_imul_imm(&mut self, src: NodeId, imm: i32, result: NodeId) {
+    /// Uses a true 32-bit instruction (no REX.W) so the CPU wraps on overflow,
+    /// then sign-extends the 32-bit result back to i64 for the Smi register file.
+    /// Used for `Int32Add`/`Int32Subtract`/`Int32Multiply` generated by the
+    /// truncation analysis pass (the `(expr) | 0` pattern).
+    fn emit_wrapping_int32_binop(
+        &mut self,
+        left: NodeId,
+        right: NodeId,
+        result: NodeId,
+        op: fn(&mut MacroAssembler, Reg64, Reg64),
+    ) {
+        match self.alloc.location(result) {
+            Some(Location::Register(n)) => {
+                let dst = phys_reg(n);
+                let right_in_dst = left != right
+                    && matches!(
+                        self.alloc.location(right),
+                        Some(Location::Register(rn)) if phys_reg(rn) == dst
+                    );
+                if right_in_dst {
+                    self.emit_load(right, Reg64::R10);
+                    self.emit_load(left, dst);
+                    op(&mut self.masm, dst, Reg64::R10);
+                } else {
+                    self.emit_load(left, dst);
+                    match self.alloc.location(right) {
+                        Some(Location::Register(rn)) if phys_reg(rn) != dst => {
+                            op(&mut self.masm, dst, phys_reg(rn));
+                        }
+                        _ => {
+                            self.emit_load(right, Reg64::R10);
+                            op(&mut self.masm, dst, Reg64::R10);
+                        }
+                    }
+                }
+                self.masm.movsxd_sign_extend(dst, dst);
+            }
+            _ => {
+                self.emit_load(left, Reg64::R11);
+                self.emit_load(right, Reg64::R10);
+                op(&mut self.masm, Reg64::R11, Reg64::R10);
+                self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
+                self.emit_store(result, Reg64::R11);
+            }
+        }
+    }
+
+    /// Emit a wrapping 32-bit register-immediate operation + sign-extend.
+    fn emit_wrapping_int32_binop_imm(
+        &mut self,
+        src: NodeId,
+        imm: i32,
+        result: NodeId,
+        op: fn(&mut MacroAssembler, Reg64, i32),
+    ) {
+        match self.alloc.location(result) {
+            Some(Location::Register(n)) => {
+                let dst = phys_reg(n);
+                self.emit_load(src, dst);
+                op(&mut self.masm, dst, imm);
+                self.masm.movsxd_sign_extend(dst, dst);
+            }
+            _ => {
+                self.emit_load(src, Reg64::R11);
+                op(&mut self.masm, Reg64::R11, imm);
+                self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
+                self.emit_store(result, Reg64::R11);
+            }
+        }
+    }
+
+    /// Emit `dst = src * imm` using the three-operand 32-bit IMUL + sign-extend.
+    fn emit_imul32_imm(&mut self, src: NodeId, imm: i32, result: NodeId) {
         match self.alloc.location(result) {
             Some(Location::Register(n)) => {
                 let dst = phys_reg(n);
                 match self.alloc.location(src) {
                     Some(Location::Register(sn)) => {
-                        self.masm.imul_rri(dst, phys_reg(sn), imm);
+                        self.masm.imul32_rri(dst, phys_reg(sn), imm);
                     }
                     _ => {
                         self.emit_load(src, Reg64::R10);
-                        self.masm.imul_rri(dst, Reg64::R10, imm);
+                        self.masm.imul32_rri(dst, Reg64::R10, imm);
                     }
                 }
+                self.masm.movsxd_sign_extend(dst, dst);
             }
             _ => {
                 self.emit_load(src, Reg64::R11);
-                self.masm.imul_rri(Reg64::R11, Reg64::R11, imm);
+                self.masm.imul32_rri(Reg64::R11, Reg64::R11, imm);
+                self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
                 self.emit_store(result, Reg64::R11);
             }
         }
     }
+
 
     /// Like [`emit_int32_binop`] but emits an i32 overflow guard after the
     /// operation.  Uses **32-bit** arithmetic + `JO` (jump on overflow) + `MOVSXD`
