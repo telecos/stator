@@ -1221,6 +1221,38 @@ impl<'a> MaglevCodegen<'a> {
                 );
             }
 
+            // ── FixedArray element access (routed through keyed-property stubs) ──
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::LoadFixedArrayElement { elements, index }
+            | ValueNode::LoadFixedDoubleArrayElement { elements, index }
+            | ValueNode::LoadHoleyFixedDoubleArrayElement { elements, index } => {
+                self.emit_stub_call_2node(
+                    id,
+                    *elements,
+                    *index,
+                    jit_runtime::jit_runtime_lda_keyed_property as usize,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::StoreFixedArrayElement {
+                elements,
+                index,
+                value,
+            }
+            | ValueNode::StoreFixedDoubleArrayElement {
+                elements,
+                index,
+                value,
+            } => {
+                self.emit_stub_call_3node(
+                    id,
+                    *elements,
+                    *index,
+                    *value,
+                    jit_runtime::jit_runtime_sta_keyed_property as usize,
+                );
+            }
+
             // ── Guards ── pass-through when we use generic stubs ──────────────
             ValueNode::CheckMaps { receiver, .. }
             | ValueNode::CheckMapsWithMigration { receiver, .. } => {
