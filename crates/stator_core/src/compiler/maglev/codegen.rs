@@ -99,17 +99,6 @@ use std::collections::HashSet;
 /// Number of physical registers available to the Maglev register allocator.
 pub const NUM_PHYS_REGS: u32 = 6;
 
-/// Maximum number of loop back-edge iterations before the JIT deoptimises.
-///
-/// This guards against infinite loops caused by residual Phi-resolution bugs.
-/// Stored in a stack slot at `[RBP - 32]` (below the callee-saved registers)
-/// rather than in R13, which was found to be unreliable — suspected clobber
-/// by Rust stub calls that internally use callee-saved registers.
-const LOOP_COUNTER_MAX: i64 = 500_000;
-
-/// RBP-relative offset of the stack-based loop safety counter.
-const LOOP_COUNTER_STACK_OFFSET: i32 = -32;
-
 /// A stub call argument that is either a Maglev IR node or an immediate i64.
 #[cfg(all(target_arch = "x86_64", unix))]
 enum NodeOrImm {
@@ -569,19 +558,10 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.push(Reg64::Rbx);
         self.masm.push(Reg64::R14);
         self.masm.push(Reg64::R13);
-        // Allocate two stack slots (16 bytes) so total frame adjustment is
-        // an even number of 8-byte items, preserving the RSP ≡ 8 mod 16
-        // alignment established by the 4 pushes above.  This keeps the
-        // existing stub-call alignment pushes (emit_save_caller_saved with
-        // 5 registers, R11 push in emit_promoted_global_loads) correct.
-        //
-        // Layout: [RBP-32] = loop counter, [RBP-40] = padding.
-        self.masm.sub_ri(Reg64::Rsp, 16);
+        // After 4 pushes (including return-address push by `call`):
+        // RSP ≡ 8 mod 16.  Stub calls do 5-push save which aligns
+        // RSP to 0 mod 16 before the inner `call`.
         self.masm.mov_rr(Reg64::R14, Reg64::Rdi);
-        // Initialise counter via R11 scratch (mov_store requires a register).
-        self.masm.mov_ri(Reg64::R11, LOOP_COUNTER_MAX);
-        self.masm
-            .mov_store_base_disp32(Reg64::Rbp, LOOP_COUNTER_STACK_OFFSET, Reg64::R11);
     }
 
     /// Emit the normal function return sequence.
@@ -589,7 +569,6 @@ impl<'a> MaglevCodegen<'a> {
     /// `rax` must already hold the return value before calling this.
     ///
     /// ```text
-    /// add  rsp, 8   ; skip loop counter slot
     /// pop  r13
     /// pop  r14
     /// pop  rbx
@@ -597,7 +576,6 @@ impl<'a> MaglevCodegen<'a> {
     /// ret
     /// ```
     fn emit_normal_epilogue(&mut self) {
-        self.masm.add_ri(Reg64::Rsp, 16); // skip loop counter + padding slots
         self.masm.pop(Reg64::R13);
         self.masm.pop(Reg64::R14);
         self.masm.pop(Reg64::Rbx);
@@ -643,7 +621,6 @@ impl<'a> MaglevCodegen<'a> {
 
         // Common exit — RAX already set, just restore and return.
         self.masm.bind_label(&mut self.deopt_common_label);
-        self.masm.add_ri(Reg64::Rsp, 16); // skip loop counter + padding slots
         self.masm.pop(Reg64::R13);
         self.masm.pop(Reg64::R14);
         self.masm.pop(Reg64::Rbx);
@@ -1026,8 +1003,7 @@ impl<'a> MaglevCodegen<'a> {
                 } else {
                     self.emit_save_caller_saved();
                     self.masm.mov_ri(Reg64::Rdi, i64::from(*name));
-                    let addr =
-                        jit_runtime::jit_runtime_lda_global as *const () as usize as i64;
+                    let addr = jit_runtime::jit_runtime_lda_global as *const () as usize as i64;
                     self.masm.mov_ri(Reg64::R11, addr);
                     self.masm.call_reg(Reg64::R11);
                     self.emit_restore_caller_saved();
@@ -1049,8 +1025,7 @@ impl<'a> MaglevCodegen<'a> {
                     self.emit_save_caller_saved();
                     self.masm.mov_ri(Reg64::Rdi, i64::from(*name));
                     self.emit_load(*value, Reg64::Rsi);
-                    let addr =
-                        jit_runtime::jit_runtime_sta_global as *const () as usize as i64;
+                    let addr = jit_runtime::jit_runtime_sta_global as *const () as usize as i64;
                     self.masm.mov_ri(Reg64::R11, addr);
                     self.masm.call_reg(Reg64::R11);
                     self.emit_restore_caller_saved();
@@ -1613,10 +1588,6 @@ impl<'a> MaglevCodegen<'a> {
             ControlNode::Jump { target } => {
                 let target = *target as usize;
                 self.emit_phi_copies_for_successor(block_idx, target as u32);
-                // Stack-based loop safety counter on backward jumps.
-                if (target as u32) <= block_idx {
-                    self.emit_loop_safety_check();
-                }
                 self.masm.jmp(&mut self.block_labels[target]);
             }
             ControlNode::Branch {
@@ -1635,24 +1606,16 @@ impl<'a> MaglevCodegen<'a> {
                 // Layout:
                 //   jne  false_path
                 //   <true phi-copies>
-                //   [loop safety check if backward]
                 //   jmp  if_true_block
                 //   false_path:
                 //   <false phi-copies>
-                //   [loop safety check if backward]
                 //   jmp  if_false_block
                 let mut false_path = Label::new();
                 self.masm.jcc(CondCode::NotEqual, &mut false_path);
                 self.emit_phi_copies_for_successor(block_idx, *if_true);
-                if *if_true <= block_idx {
-                    self.emit_loop_safety_check();
-                }
                 self.masm.jmp(&mut self.block_labels[if_true_idx]);
                 self.masm.bind_label(&mut false_path);
                 self.emit_phi_copies_for_successor(block_idx, *if_false);
-                if *if_false <= block_idx {
-                    self.emit_loop_safety_check();
-                }
                 self.masm.jmp(&mut self.block_labels[if_false_idx]);
             }
             ControlNode::Deoptimize {
@@ -1690,6 +1653,14 @@ impl<'a> MaglevCodegen<'a> {
                 } else {
                     None
                 }
+            })
+            // Skip self-referential Phis (src == phi) and same-location copies.
+            .filter(|(phi_id, src_id)| {
+                if phi_id == src_id {
+                    return false;
+                }
+                // Also skip when source and destination occupy the same location.
+                self.alloc.location(*phi_id) != self.alloc.location(*src_id)
             })
             .collect();
 
@@ -2161,32 +2132,6 @@ impl<'a> MaglevCodegen<'a> {
             liveness_map,
         });
         self.masm.jmp(&mut self.deopt_label);
-    }
-
-    /// Emit a loop-safety counter check for backward jumps.
-    ///
-    /// Loads the stack-based counter from `[RBP + LOOP_COUNTER_STACK_OFFSET]`,
-    /// decrements it, stores back, and deoptimises when it reaches zero.
-    /// Uses R11 as scratch (caller-saved, safe to clobber).
-    ///
-    /// This guards against infinite loops caused by Phi-resolution bugs.
-    fn emit_loop_safety_check(&mut self) {
-        // Load counter from stack slot into R11 (scratch).
-        self.masm
-            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, LOOP_COUNTER_STACK_OFFSET);
-        // Decrement and store back.  SUB sets ZF when result is zero.
-        self.masm.sub_ri(Reg64::R11, 1);
-        self.masm
-            .mov_store_base_disp32(Reg64::Rbp, LOOP_COUNTER_STACK_OFFSET, Reg64::R11);
-        let code_off = self.masm.position() as u32;
-        let liveness_map = self.all_slots_live();
-        self.deopt_entries.push(DeoptEntry {
-            code_offset: code_off,
-            bytecode_offset: 0,
-            liveness_map,
-        });
-        // JE deopt_loop_label — deopt if the counter reached zero.
-        self.masm.jcc(CondCode::Equal, &mut self.deopt_loop_label);
     }
 
     /// Compute a conservative liveness bitmask covering all register-file

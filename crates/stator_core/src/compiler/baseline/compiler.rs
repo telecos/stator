@@ -2268,16 +2268,17 @@ pub(crate) mod jit_runtime {
         let slot_idx = env.slot_index_for(name);
         if let Some(idx) = slot_idx {
             env.store_by_index_fast(idx, name, value);
+            // Populate / update IC with the slot index we already found.
+            let cur_gen = env.generation();
+            // SAFETY: single-threaded JIT; update IC via raw pointer.
+            unsafe { (*g.as_ptr()).ic[(name_idx & 63) as usize] = (name_idx, idx, cur_gen) };
         } else {
             env.insert(name.to_string(), value);
-        }
-
-        // Populate / update IC.
-        let cur_gen = env.generation();
-        let new_slot_idx = env.slot_index_for(name);
-        // SAFETY: single-threaded JIT; update IC via raw pointer.
-        if let Some(idx) = new_slot_idx {
-            unsafe { (*g.as_ptr()).ic[(name_idx & 63) as usize] = (name_idx, idx, cur_gen) };
+            // After insert, populate IC with the new slot index.
+            let cur_gen = env.generation();
+            if let Some(idx) = env.slot_index_for(name) {
+                unsafe { (*g.as_ptr()).ic[(name_idx & 63) as usize] = (name_idx, idx, cur_gen) };
+            }
         }
 
         Some(value_i64)
