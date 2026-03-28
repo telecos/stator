@@ -1598,25 +1598,25 @@ impl<'a> MaglevCodegen<'a> {
                 let if_true_idx = *if_true as usize;
                 let if_false_idx = *if_false as usize;
 
-                // Load condition and compare against JIT_TRUE.
-                self.emit_load(*condition, Reg64::R11);
-                self.masm.mov_ri(Reg64::R10, JIT_TRUE);
-                self.masm.cmp_rr(Reg64::R11, Reg64::R10);
+                // Try compare-branch fusion: if the condition is an Int32
+                // comparison, re-emit CMP and branch directly instead of
+                // materializing a JIT_TRUE/JIT_FALSE boolean.
+                let fused =
+                    self.try_fuse_compare_branch(*condition, block_idx, *if_true, *if_false);
+                if !fused {
+                    // Fallback: load materialised boolean, compare with JIT_TRUE.
+                    self.emit_load(*condition, Reg64::R11);
+                    self.masm.mov_ri(Reg64::R10, JIT_TRUE);
+                    self.masm.cmp_rr(Reg64::R11, Reg64::R10);
 
-                // Layout:
-                //   jne  false_path
-                //   <true phi-copies>
-                //   jmp  if_true_block
-                //   false_path:
-                //   <false phi-copies>
-                //   jmp  if_false_block
-                let mut false_path = Label::new();
-                self.masm.jcc(CondCode::NotEqual, &mut false_path);
-                self.emit_phi_copies_for_successor(block_idx, *if_true);
-                self.masm.jmp(&mut self.block_labels[if_true_idx]);
-                self.masm.bind_label(&mut false_path);
-                self.emit_phi_copies_for_successor(block_idx, *if_false);
-                self.masm.jmp(&mut self.block_labels[if_false_idx]);
+                    let mut false_path = Label::new();
+                    self.masm.jcc(CondCode::NotEqual, &mut false_path);
+                    self.emit_phi_copies_for_successor(block_idx, *if_true);
+                    self.masm.jmp(&mut self.block_labels[if_true_idx]);
+                    self.masm.bind_label(&mut false_path);
+                    self.emit_phi_copies_for_successor(block_idx, *if_false);
+                    self.masm.jmp(&mut self.block_labels[if_false_idx]);
+                }
             }
             ControlNode::Deoptimize {
                 bytecode_offset,
@@ -2063,6 +2063,69 @@ impl<'a> MaglevCodegen<'a> {
         self.emit_store(result, Reg64::R11);
     }
 
+    /// Try to fuse a Branch's condition with a comparison node.
+    ///
+    /// If `condition` is an `Int32LessThan` (or similar), re-emit `CMP` from
+    /// the original operands and branch directly, saving ~10 instructions per
+    /// compare-and-branch versus materialising a JIT_TRUE/JIT_FALSE boolean.
+    ///
+    /// Returns `true` if the fusion was emitted.
+    fn try_fuse_compare_branch(
+        &mut self,
+        condition: NodeId,
+        block_idx: u32,
+        if_true: u32,
+        if_false: u32,
+    ) -> bool {
+        let cond_node = match self.graph.node(condition) {
+            Some(n) => n.clone(),
+            None => return false,
+        };
+        let (left, right, cc) = match &cond_node {
+            ValueNode::Int32LessThan { left, right } => (*left, *right, CondCode::Less),
+            ValueNode::Int32LessThanOrEqual { left, right } => (*left, *right, CondCode::LessEq),
+            ValueNode::Int32GreaterThan { left, right } => (*left, *right, CondCode::Greater),
+            ValueNode::Int32GreaterThanOrEqual { left, right } => {
+                (*left, *right, CondCode::GreaterEq)
+            }
+            ValueNode::Int32Equal { left, right } | ValueNode::Int32StrictEqual { left, right } => {
+                (*left, *right, CondCode::Equal)
+            }
+            _ => return false,
+        };
+
+        // Re-emit CMP from the comparison's operands.
+        self.emit_load(left, Reg64::R11);
+        self.emit_load(right, Reg64::R10);
+        self.masm.cmp_rr(Reg64::R11, Reg64::R10);
+
+        // Branch directly: condition-false falls through to false phi-copies.
+        let if_true_idx = if_true as usize;
+        let if_false_idx = if_false as usize;
+        let negated = Self::negate_cc(cc);
+        let mut false_path = Label::new();
+        self.masm.jcc(negated, &mut false_path);
+        self.emit_phi_copies_for_successor(block_idx, if_true);
+        self.masm.jmp(&mut self.block_labels[if_true_idx]);
+        self.masm.bind_label(&mut false_path);
+        self.emit_phi_copies_for_successor(block_idx, if_false);
+        self.masm.jmp(&mut self.block_labels[if_false_idx]);
+        true
+    }
+
+    /// Negate a condition code (for compare-branch fusion: jump on the
+    /// *opposite* condition to skip the true path).
+    const fn negate_cc(cc: CondCode) -> CondCode {
+        match cc {
+            CondCode::Equal => CondCode::NotEqual,
+            CondCode::NotEqual => CondCode::Equal,
+            CondCode::Less => CondCode::GreaterEq,
+            CondCode::GreaterEq => CondCode::Less,
+            CondCode::LessEq => CondCode::Greater,
+            CondCode::Greater => CondCode::LessEq,
+        }
+    }
+
     // ── Deopt helpers ────────────────────────────────────────────────────────
 
     /// Emit a Smi-overflow guard after an arithmetic operation whose result is
@@ -2086,29 +2149,16 @@ impl<'a> MaglevCodegen<'a> {
     /// 5. `TEST R10, R10` — sets ZF=0 when overflow is detected.
     /// 6. `JNE deopt_label` — jump to the deopt epilogue on overflow.
     fn emit_deopt_on_smi_overflow(&mut self, bytecode_offset: u32) {
-        // Copy result to R10.
-        self.masm.mov_rr(Reg64::R10, Reg64::R11);
-        // SAR R10, 31 — fills bits [63..32] with the sign of bit 31.
-        // REX.B (R10 needs REX.B=1): 0x49; opcode D3; /7=0xF8; r/m=R10.enc()=2 → 0xFA
-        self.masm.emit_byte(0x49); // REX.B
-        self.masm.emit_byte(0xC1); // SAR r/m64, imm8
-        self.masm.emit_byte(0xFA); // ModRM: mod=11, /7, r/m=R10(enc=2) = 0xC0|0x38|2
-        self.masm.emit_byte(31); // shift count
+        // Check if R11 fits in i32 using MOVSXD + CMP (3 instructions vs 6).
+        // MOVSXD R10, R11d — sign-extends the lower 32 bits of R11 into R10.
+        // If R11 was a valid i32, MOVSXD(R11[31:0]) == R11.
+        // REX.W (0x4C for R10 dst with REX.R=1, R11 src with REX.B=1)
+        self.masm.emit_byte(0x4D); // REX.W + REX.R (R10) + REX.B (R11)
+        self.masm.emit_byte(0x63); // MOVSXD
+        self.masm.emit_byte(0xD3); // ModRM: mod=11, reg=R10(enc=2), r/m=R11(enc=3)
 
-        // XOR R10, R11: if R11 fits in i32, the upper 32 bits of R10 after SAR
-        // equal the upper 32 bits of R11.  After XOR, the upper 32 bits are 0.
-        // Then check if the upper 32 bits of the XOR result are non-zero.
-        self.masm.xor_rr(Reg64::R10, Reg64::R11);
-        // Test if R10 (the XOR result) has any set bits in bits [63..32].
-        // We use: SAR R10, 32 to shift the upper half down, then TEST R10, R10.
-        self.masm.emit_byte(0x49);
-        self.masm.emit_byte(0xC1);
-        self.masm.emit_byte(0xFA);
-        self.masm.emit_byte(32); // shift count
-
-        // If R10 is non-zero, the upper 32 bits of the XOR were non-zero →
-        // the result does not fit in i32 → deopt.
-        self.masm.test_rr(Reg64::R10, Reg64::R10);
+        // CMP R10, R11 — if sign-extended version differs, overflow occurred.
+        self.masm.cmp_rr(Reg64::R10, Reg64::R11);
 
         let code_off = self.masm.position() as u32;
         let liveness_map = self.all_slots_live();
@@ -2117,7 +2167,7 @@ impl<'a> MaglevCodegen<'a> {
             bytecode_offset,
             liveness_map,
         });
-        // JNE deopt_overflow_label — jump to overflow deopt if R10 != 0.
+        // JNE deopt_overflow_label — jump to overflow deopt if R10 != R11.
         self.masm
             .jcc(CondCode::NotEqual, &mut self.deopt_overflow_label);
     }
