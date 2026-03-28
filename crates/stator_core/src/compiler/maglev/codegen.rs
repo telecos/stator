@@ -1016,11 +1016,18 @@ impl<'a> MaglevCodegen<'a> {
 
             // ── Guards ───────────────────────────────────────────────────
             //
-            // CheckSmi verifies the value fits in the Smi range (i32).
+            // CheckSmi / CheckNumber: pass-through for i64 Smis.
+            //
+            // Stator Smis are full i64 values — there is no i32 constraint.
+            // Stubs already return JIT_DEOPT for non-integer values (caught
+            // by emit_deopt_check_rax), so CheckSmi is redundant and was
+            // previously causing spurious deopts for values > i32 max
+            // (e.g. loop accumulators exceeding ~2.1 billion).
             ValueNode::CheckSmi { receiver } | ValueNode::CheckNumber { receiver } => {
-                self.emit_load(*receiver, Reg64::R11);
-                self.emit_deopt_on_smi_overflow(0);
-                self.emit_store(id, Reg64::R11);
+                if self.alloc.location(id) != self.alloc.location(*receiver) {
+                    self.emit_load(*receiver, Reg64::R11);
+                    self.emit_store(id, Reg64::R11);
+                }
             }
             // CheckInt32IsSmi: every i32 is a valid Smi — pass-through.
             ValueNode::CheckInt32IsSmi { input } => {
@@ -2908,7 +2915,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_check_smi_records_deopt_entry() {
+    fn test_compile_check_smi_is_passthrough() {
         let mut graph = MaglevGraph::new(1);
         let mut block = BasicBlock::new(0);
         let p0 = block.push_value(ValueNode::Parameter { index: 0 });
@@ -2917,9 +2924,10 @@ mod tests {
         graph.add_block(block);
 
         let cc = do_compile(&graph, 1);
+        // CheckSmi is now a pass-through for i64 Smis — no deopt guard.
         assert!(
-            !cc.deopt_entries.is_empty(),
-            "expected a deopt entry for CheckSmi overflow guard"
+            cc.deopt_entries.is_empty(),
+            "CheckSmi should not emit a deopt entry (i64 Smis have no i32 constraint)"
         );
     }
 
