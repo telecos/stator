@@ -79,6 +79,42 @@ use std::collections::{HashMap, HashSet};
 use crate::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, NodeId, ValueNode};
 use crate::compiler::maglev::licm;
 
+/// Short variant name for diagnostic dumps.
+fn node_variant_name(n: &ValueNode) -> &'static str {
+    match n {
+        ValueNode::SmiConstant { .. } => "SmiConst",
+        ValueNode::Int32Constant { .. } => "I32Const",
+        ValueNode::Float64Constant { .. } => "F64Const",
+        ValueNode::CheckSmi { .. } => "CheckSmi",
+        ValueNode::CheckNumber { .. } => "CheckNum",
+        ValueNode::CheckedSmiAdd { .. } => "ChkAdd",
+        ValueNode::CheckedSmiSubtract { .. } => "ChkSub",
+        ValueNode::CheckedSmiMultiply { .. } => "ChkMul",
+        ValueNode::CheckedSmiDivide { .. } => "ChkDiv",
+        ValueNode::CheckedSmiModulus { .. } => "ChkMod",
+        ValueNode::CheckedSmiIncrement { .. } => "ChkInc",
+        ValueNode::CheckedSmiDecrement { .. } => "ChkDec",
+        ValueNode::Int32Add { .. } => "I32Add",
+        ValueNode::Int32Subtract { .. } => "I32Sub",
+        ValueNode::Int32Multiply { .. } => "I32Mul",
+        ValueNode::Int32BitwiseOr { .. } => "I32Or",
+        ValueNode::Int32BitwiseXor { .. } => "I32Xor",
+        ValueNode::Int32BitwiseAnd { .. } => "I32And",
+        ValueNode::Int32ShiftLeft { .. } => "I32Shl",
+        ValueNode::Int32ShiftRight { .. } => "I32Shr",
+        ValueNode::Int32ShiftRightLogical { .. } => "I32Ushr",
+        ValueNode::Int32LessThan { .. } => "I32Lt",
+        ValueNode::Int32GreaterThan { .. } => "I32Gt",
+        ValueNode::Int32LessThanOrEqual { .. } => "I32Le",
+        ValueNode::Int32GreaterThanOrEqual { .. } => "I32Ge",
+        ValueNode::LoadGlobal { .. } => "LdGlob",
+        ValueNode::StoreGlobal { .. } => "StGlob",
+        ValueNode::LoadNamedGeneric { .. } => "LdNamed",
+        ValueNode::Phi { .. } => "Phi",
+        _ => "Other",
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry-point
 // ─────────────────────────────────────────────────────────────────────────────
@@ -96,6 +132,21 @@ pub fn optimize(graph: &mut MaglevGraph) {
     let node_count: usize = graph.blocks().iter().map(|b| b.nodes.len()).sum();
 
     fold_constants(graph);
+
+    // Diagnostic: dump all node types per block before truncation runs.
+    for block in graph.blocks() {
+        let names: Vec<String> = block
+            .nodes
+            .iter()
+            .map(|(id, n)| format!("{}:{}", id.0, node_variant_name(n)))
+            .collect();
+        eprintln!(
+            "GRAPH_DUMP: block={} nodes=[{}]",
+            block.id,
+            names.join(", ")
+        );
+    }
+
     let truncations = propagate_int32_truncation(graph);
     simplify_identities(graph);
     strength_reduce(graph);
