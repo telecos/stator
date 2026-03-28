@@ -1223,6 +1223,12 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
                     let exec = unsafe { CachedMaglevCode::new(&code, register_file_slots) };
                     *cache.borrow_mut() = exec;
                 } else {
+                    // Maglev code not ready yet — trigger compilation if it
+                    // hasn't been started.  This is the primary trigger for
+                    // top-level scripts whose loops were already captured by
+                    // the baseline JIT (so the interpreter's JumpLoop handler
+                    // never fires again).
+                    maybe_compile_maglev(ba);
                     MAGLEV_DIAG_NOT_READY.with(|c| c.set(c.get() + 1));
                 }
             }
