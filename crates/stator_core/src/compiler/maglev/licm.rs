@@ -234,6 +234,7 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) {
                 to_hoist.push((block.id, pos, *id, node.clone()));
                 // After hoisting this node, its NodeId becomes "outside" too,
                 // so subsequent nodes that reference it may also qualify.
+                outside_defs.insert(*id);
             }
         }
     }
@@ -850,27 +851,21 @@ mod tests {
             .push((user_id, ValueNode::Int32Negate { value: inner_id }));
 
         // The negate depends on a loop-local node, so only the constant (which
-        // is loop-invariant) should be hoisted, but the negate should stay
-        // (its input inner_id is loop-local before hoisting).
-        // After hoisting the constant, inner_id becomes "outside" but we only
-        // do one pass, so negate also gets hoisted since its input was added
-        // to outside_defs.  But because our single-pass collects candidates
-        // before mutating, the negate does reference a loop-local definition
-        // at scan time.
-        //
-        // Actually: our impl adds hoisted ids to outside_defs *after* the
-        // scan, not during. So the negate won't be hoisted.
+        // is loop-invariant) should be hoisted at first glance.  But since the
+        // constant itself is hoistable, and we now eagerly add hoisted IDs to
+        // outside_defs during the scan, the negate also qualifies for hoisting
+        // because its sole input became an outside def once the constant was
+        // scheduled for hoisting.  This is correct: both nodes are genuinely
+        // loop-invariant.
         let body_before = graph.blocks()[2].nodes.len();
         hoist_loop_invariants(&mut graph);
-        // The constant was hoisted (1 removed), the negate stays because
-        // its input was loop-local at scan time. However, in our implementation
-        // the constant IS loop-invariant (no inputs), so it gets hoisted.
-        // The negate references inner_id which was IN the loop body, so it
-        // should NOT be hoisted.
+        // Both the constant AND the negate should be hoisted — the constant
+        // has no loop-local inputs, and the negate's input (the constant) was
+        // added to outside_defs eagerly when it was hoisted.
         assert_eq!(
             graph.blocks()[2].nodes.len(),
-            body_before - 1,
-            "only the constant should have been hoisted"
+            body_before - 2,
+            "both the constant and the negate should have been hoisted"
         );
     }
 
