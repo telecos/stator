@@ -109,13 +109,13 @@ pub fn hoist_loop_invariants(graph: &mut MaglevGraph) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A natural loop detected from a back-edge.
-struct NaturalLoop {
-    /// Block index of the loop header (retained for diagnostics).
-    _header: u32,
+pub struct NaturalLoop {
+    /// Block index of the loop header.
+    pub header: u32,
     /// Block index of the preheader (unique non-loop predecessor of header).
-    preheader: u32,
+    pub preheader: u32,
     /// Set of block indices forming the loop body (includes header).
-    body: HashSet<u32>,
+    pub body: HashSet<u32>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -123,7 +123,7 @@ struct NaturalLoop {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Find all natural loops by locating back-edges.
-fn detect_loops(graph: &MaglevGraph) -> Vec<NaturalLoop> {
+pub fn detect_loops(graph: &MaglevGraph) -> Vec<NaturalLoop> {
     let mut loops = Vec::new();
 
     for block in graph.blocks() {
@@ -131,8 +131,10 @@ fn detect_loops(graph: &MaglevGraph) -> Vec<NaturalLoop> {
         let targets = control_targets(block);
         for &target in &targets {
             // A back-edge exists when target <= block.id (header dominates the
-            // source in RPO layout).
-            if target < block.id
+            // source in RPO layout).  The equality case covers *self-loops*
+            // where a single block branches back to itself (common for simple
+            // while-loops whose entire body fits in the header block).
+            if target <= block.id
                 && let Some(lp) = build_loop(graph, target, block.id)
             {
                 loops.push(lp);
@@ -144,7 +146,7 @@ fn detect_loops(graph: &MaglevGraph) -> Vec<NaturalLoop> {
 }
 
 /// Return the block indices that a block's control node branches to.
-fn control_targets(block: &BasicBlock) -> Vec<u32> {
+pub fn control_targets(block: &BasicBlock) -> Vec<u32> {
     match &block.control {
         Some(ControlNode::Jump { target }) => vec![*target],
         Some(ControlNode::Branch {
@@ -191,7 +193,7 @@ fn build_loop(graph: &MaglevGraph, header: u32, back_src: u32) -> Option<Natural
     }
 
     Some(NaturalLoop {
-        _header: header,
+        header,
         preheader: preheaders[0],
         body,
     })

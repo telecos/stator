@@ -77,6 +77,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, NodeId, ValueNode};
+use crate::compiler::maglev::licm;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry-point
@@ -103,6 +104,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // duplicating the loop header and body, which is non-trivial with the
     // current graph structure.
     eliminate_common_subexpressions(graph);
+    promote_loop_globals(graph);
     eliminate_redundant_type_guards(graph);
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
@@ -931,6 +933,265 @@ fn cse_in_block(block: &mut BasicBlock) {
 
     if !subst.is_empty() {
         apply_subst_to_block(block, &subst);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass 4.4 — Loop-global promotion
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Promote `LoadGlobal`/`StoreGlobal` pairs inside loops into Phi nodes.
+///
+/// For each natural loop that contains no user function calls (which could
+/// observe or modify global state), every global name that is both loaded and
+/// stored is replaced with:
+///
+/// 1. A single `LoadGlobal` in the preheader.
+/// 2. A `Phi` at the front of the loop header merging the preheader value
+///    and the loop-body computed value.
+/// 3. `StoreGlobal` nodes at every loop exit to materialise the final value.
+///
+/// This eliminates per-iteration memory traffic for loop-carried globals.
+fn promote_loop_globals(graph: &mut MaglevGraph) {
+    let loops = licm::detect_loops(graph);
+
+    for lp in &loops {
+        promote_globals_in_loop(graph, lp);
+    }
+}
+
+/// Return `true` if `node` is a user-visible function call that might read or
+/// write global variables.  Stub calls (generic property loads/stores) are
+/// considered safe because they don't access globals.
+fn is_user_call(node: &ValueNode) -> bool {
+    matches!(
+        node,
+        ValueNode::Call { .. }
+            | ValueNode::CallKnownFunction { .. }
+            | ValueNode::CallBuiltin { .. }
+            | ValueNode::CallRuntime { .. }
+            | ValueNode::CallWithSpread { .. }
+            | ValueNode::Construct { .. }
+            | ValueNode::ConstructWithSpread { .. }
+    )
+}
+
+/// Information about one promoted global inside a loop.
+struct PromotedGlobal {
+    /// The constant-pool name index of the global.
+    name: u32,
+    /// Feedback slot reused from the original `LoadGlobal`.
+    feedback_slot: u32,
+    /// `NodeId` of the `LoadGlobal` inserted in the preheader.
+    preheader_load_id: NodeId,
+    /// `NodeId` of the `Phi` inserted at the loop header.
+    phi_id: NodeId,
+    /// `NodeId` of the value the loop body would have stored (back-edge input).
+    store_value_id: NodeId,
+    /// `NodeId`s of the original `LoadGlobal` nodes inside the loop body.
+    original_load_ids: Vec<NodeId>,
+    /// `NodeId`s of the original `StoreGlobal` nodes inside the loop body.
+    original_store_ids: Vec<NodeId>,
+}
+
+fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) {
+    // Safety check: skip loops containing user function calls.
+    for block in graph.blocks() {
+        if !lp.body.contains(&block.id) {
+            continue;
+        }
+        for (_, node) in &block.nodes {
+            if is_user_call(node) {
+                return;
+            }
+        }
+    }
+
+    // Collect LoadGlobal and StoreGlobal occurrences inside the loop.
+    let mut load_names: HashSet<u32> = HashSet::new();
+    let mut store_names: HashSet<u32> = HashSet::new();
+
+    // Details keyed by name index.
+    let mut load_info: HashMap<u32, (u32, Vec<NodeId>)> = HashMap::new(); // name -> (feedback_slot, [NodeId])
+    let mut store_info: HashMap<u32, (NodeId, Vec<NodeId>)> = HashMap::new(); // name -> (last value, [NodeId])
+
+    for block in graph.blocks() {
+        if !lp.body.contains(&block.id) {
+            continue;
+        }
+        for (id, node) in &block.nodes {
+            match node {
+                ValueNode::LoadGlobal {
+                    name,
+                    feedback_slot,
+                } => {
+                    load_names.insert(*name);
+                    let entry = load_info
+                        .entry(*name)
+                        .or_insert((*feedback_slot, Vec::new()));
+                    entry.1.push(*id);
+                }
+                ValueNode::StoreGlobal {
+                    name,
+                    value,
+                    feedback_slot: _,
+                } => {
+                    store_names.insert(*name);
+                    let entry = store_info.entry(*name).or_insert((*value, Vec::new()));
+                    // Update the value to the latest store (last writer wins).
+                    entry.0 = *value;
+                    entry.1.push(*id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Promotable globals: names that appear in both load and store sets.
+    let promotable: Vec<u32> = load_names.intersection(&store_names).copied().collect();
+    if promotable.is_empty() {
+        return;
+    }
+
+    // Build PromotedGlobal entries: allocate preheader loads and Phi IDs.
+    let mut promoted: Vec<PromotedGlobal> = Vec::new();
+    for &name in &promotable {
+        let (feedback_slot, ref load_ids) = load_info[&name];
+        let (store_value, ref store_ids) = store_info[&name];
+
+        // Insert LoadGlobal into the preheader block.
+        let preheader_load_id = graph
+            .add_value_node(
+                lp.preheader,
+                ValueNode::LoadGlobal {
+                    name,
+                    feedback_slot,
+                },
+            )
+            .expect("preheader block must exist");
+
+        // Allocate a NodeId for the Phi (we'll insert it manually at the front).
+        let phi_id = graph.alloc_node_id();
+
+        promoted.push(PromotedGlobal {
+            name,
+            feedback_slot,
+            preheader_load_id,
+            phi_id,
+            store_value_id: store_value,
+            original_load_ids: load_ids.clone(),
+            original_store_ids: store_ids.clone(),
+        });
+    }
+
+    // Build the substitution map: old LoadGlobal id → Phi id.
+    let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
+    for pg in &promoted {
+        for &load_id in &pg.original_load_ids {
+            subst.insert(load_id, pg.phi_id);
+        }
+    }
+
+    // Insert Phi nodes at the front of the loop header block.
+    // Each Phi starts with a single input (the preheader load); the back-edge
+    // input is added after substitution has been applied to store_value_ids.
+    if let Some(header_block) = graph.block_mut(lp.header) {
+        // Insert in reverse order so the first promoted global ends up first.
+        for pg in promoted.iter().rev() {
+            header_block.nodes.insert(
+                0,
+                (
+                    pg.phi_id,
+                    ValueNode::Phi {
+                        inputs: vec![pg.preheader_load_id],
+                    },
+                ),
+            );
+        }
+    }
+
+    // Replace original LoadGlobal and StoreGlobal nodes inside the loop body
+    // with UndefinedConstant (DCE will remove them).
+    for block in graph.blocks_mut() {
+        if !lp.body.contains(&block.id) {
+            continue;
+        }
+        for (id, node) in &mut block.nodes {
+            for pg in &promoted {
+                if pg.original_load_ids.contains(id) || pg.original_store_ids.contains(id) {
+                    *node = ValueNode::UndefinedConstant;
+                }
+            }
+        }
+    }
+
+    // Apply substitution to all blocks in the loop body.
+    for block in graph.blocks_mut() {
+        if !lp.body.contains(&block.id) {
+            continue;
+        }
+        apply_subst_to_block(block, &subst);
+    }
+
+    // Resolve back-edge store_value_ids through the substitution map and add
+    // them as the second Phi input.
+    for pg in &mut promoted {
+        pg.store_value_id = subst
+            .get(&pg.store_value_id)
+            .copied()
+            .unwrap_or(pg.store_value_id);
+    }
+
+    if let Some(header_block) = graph.block_mut(lp.header) {
+        for pg in &promoted {
+            for (_, node) in &mut header_block.nodes {
+                if let ValueNode::Phi { inputs } = node {
+                    // Find the Phi we inserted by checking the first input.
+                    if inputs.len() == 1 && inputs[0] == pg.preheader_load_id {
+                        inputs.push(pg.store_value_id);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Find loop exits and insert StoreGlobal nodes at each exit.
+    // A loop exit is a successor block that is NOT in the loop body.
+    let mut exit_blocks: HashSet<u32> = HashSet::new();
+    for block in graph.blocks() {
+        if !lp.body.contains(&block.id) {
+            continue;
+        }
+        let targets = licm::control_targets(block);
+        for &target in &targets {
+            if !lp.body.contains(&target) {
+                exit_blocks.insert(target);
+            }
+        }
+    }
+
+    // At each exit, prepend StoreGlobal nodes for each promoted global.
+    // The value to store is the StoreGlobal's original value input (the
+    // computed value from the loop body), which has been substituted through
+    // the Phi chain.
+    for &exit_id in &exit_blocks {
+        for pg in promoted.iter().rev() {
+            let store_id = graph.alloc_node_id();
+            if let Some(exit_block) = graph.block_mut(exit_id) {
+                exit_block.nodes.insert(
+                    0,
+                    (
+                        store_id,
+                        ValueNode::StoreGlobal {
+                            name: pg.name,
+                            value: pg.store_value_id,
+                            feedback_slot: pg.feedback_slot,
+                        },
+                    ),
+                );
+            }
+        }
     }
 }
 

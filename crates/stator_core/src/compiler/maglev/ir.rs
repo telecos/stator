@@ -1851,6 +1851,17 @@ impl MaglevGraph {
         Some(id)
     }
 
+    /// Allocate a fresh graph-global [`NodeId`] without inserting a node.
+    ///
+    /// The caller is responsible for inserting a node with this ID into the
+    /// appropriate block (e.g. via [`BasicBlock::push_with_id`] or
+    /// `nodes.insert`).
+    pub fn alloc_node_id(&mut self) -> NodeId {
+        let id = NodeId(self.next_node_id);
+        self.next_node_id += 1;
+        id
+    }
+
     /// Return an immutable slice of all blocks.
     pub fn blocks(&self) -> &[BasicBlock] {
         &self.blocks
