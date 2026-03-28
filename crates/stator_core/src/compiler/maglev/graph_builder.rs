@@ -197,6 +197,10 @@ pub struct GraphBuilder<'a> {
     /// boundaries and after any opcode that may have side-effects on globals
     /// (function calls, etc.).
     known_globals: HashMap<u32, NodeId>,
+    /// Within-block CSE for named property loads: maps `(object, name_idx)` →
+    /// the last known result [`NodeId`].  Cleared at block boundaries and
+    /// after any store/call that may mutate object properties.
+    known_props: HashMap<(NodeId, u32), NodeId>,
 }
 
 impl<'a> GraphBuilder<'a> {
@@ -223,6 +227,7 @@ impl<'a> GraphBuilder<'a> {
             saved_envs: HashMap::new(),
             loop_header_phis: HashMap::new(),
             known_globals: HashMap::new(),
+            known_props: HashMap::new(),
         };
 
         // Pass 1: collect all jump targets → assign block indices.
@@ -595,6 +600,8 @@ impl<'a> GraphBuilder<'a> {
                     value,
                     feedback_slot: slot,
                 })?;
+                // Invalidate property CSE — the store may affect cached loads.
+                self.known_props.clear();
             }
 
             // StaKeyedProperty [obj_reg, key_reg, slot]
@@ -611,6 +618,8 @@ impl<'a> GraphBuilder<'a> {
                     value,
                     feedback_slot: slot,
                 })?;
+                // Invalidate property CSE — keyed store may affect named lookups.
+                self.known_props.clear();
             }
 
             // ── Arithmetic ───────────────────────────────────────────────────
@@ -1046,6 +1055,7 @@ impl<'a> GraphBuilder<'a> {
                 })?;
                 self.env.set_accumulator(id);
                 self.known_globals.clear();
+                self.known_props.clear();
             }
             Opcode::CallProperty0 => {
                 let callable_reg = self.operand_register(instr, 0)?;
@@ -1061,6 +1071,7 @@ impl<'a> GraphBuilder<'a> {
                 })?;
                 self.env.set_accumulator(id);
                 self.known_globals.clear();
+                self.known_props.clear();
             }
             Opcode::CallProperty1 => {
                 let callable_reg = self.operand_register(instr, 0)?;
@@ -1078,6 +1089,7 @@ impl<'a> GraphBuilder<'a> {
                 })?;
                 self.env.set_accumulator(id);
                 self.known_globals.clear();
+                self.known_props.clear();
             }
             Opcode::CallProperty2 => {
                 let callable_reg = self.operand_register(instr, 0)?;
@@ -1097,6 +1109,7 @@ impl<'a> GraphBuilder<'a> {
                 })?;
                 self.env.set_accumulator(id);
                 self.known_globals.clear();
+                self.known_props.clear();
             }
             Opcode::CallUndefinedReceiver0 => {
                 let callable_reg = self.operand_register(instr, 0)?;
@@ -1111,6 +1124,7 @@ impl<'a> GraphBuilder<'a> {
                 })?;
                 self.env.set_accumulator(id);
                 self.known_globals.clear();
+                self.known_props.clear();
             }
             Opcode::CallUndefinedReceiver1 => {
                 let callable_reg = self.operand_register(instr, 0)?;
@@ -1127,6 +1141,7 @@ impl<'a> GraphBuilder<'a> {
                 })?;
                 self.env.set_accumulator(id);
                 self.known_globals.clear();
+                self.known_props.clear();
             }
             Opcode::CallUndefinedReceiver2 => {
                 let callable_reg = self.operand_register(instr, 0)?;
@@ -1145,6 +1160,7 @@ impl<'a> GraphBuilder<'a> {
                 })?;
                 self.env.set_accumulator(id);
                 self.known_globals.clear();
+                self.known_props.clear();
             }
             Opcode::CallRuntime => {
                 let function_id = self.operand_runtime_id(instr, 0)?;
@@ -1154,6 +1170,7 @@ impl<'a> GraphBuilder<'a> {
                 let id = self.emit(ValueNode::CallRuntime { function_id, args })?;
                 self.env.set_accumulator(id);
                 self.known_globals.clear();
+                self.known_props.clear();
             }
 
             // ── Construct ─────────────────────────────────────────────────────
@@ -1171,6 +1188,7 @@ impl<'a> GraphBuilder<'a> {
                 })?;
                 self.env.set_accumulator(id);
                 self.known_globals.clear();
+                self.known_props.clear();
             }
 
             // ── Type conversions ─────────────────────────────────────────────
@@ -1509,16 +1527,27 @@ impl<'a> GraphBuilder<'a> {
         name: u32,
         slot: u32,
     ) -> StatorResult<NodeId> {
+        // Within-block CSE: if we've already loaded this property from the
+        // same object in this block, reuse the previous result.
+        let cse_key = (object, name);
+        if let Some(&cached) = self.known_props.get(&cse_key) {
+            return Ok(cached);
+        }
+
         // Always use the generic path for now.  The monomorphic fast path
         // (CheckMaps + LoadField) requires the real field offset from the
         // IC handler, which is not yet populated — the offset is always 0
         // (a placeholder).  Using LoadNamedGeneric avoids unconditional
         // deopt in Maglev codegen for monomorphic accesses.
-        self.emit(ValueNode::LoadNamedGeneric {
+        let id = self.emit(ValueNode::LoadNamedGeneric {
             object,
             name,
             feedback_slot: slot,
-        })
+        })?;
+
+        // Cache the result for subsequent loads of the same property.
+        self.known_props.insert(cse_key, id);
+        Ok(id)
     }
 
     /// Emit a binary arithmetic operation.
@@ -1707,8 +1736,9 @@ impl<'a> GraphBuilder<'a> {
     /// (initially with the single forward-edge input).  For non-loop merge
     /// points, Phi nodes are created where predecessor environments disagree.
     fn enter_block(&mut self, block_id: u32) {
-        // Invalidate within-block global CSE at control-flow boundaries.
+        // Invalidate within-block CSE at control-flow boundaries.
         self.known_globals.clear();
+        self.known_props.clear();
         if self.loop_headers.contains(&block_id) {
             self.enter_loop_header(block_id);
         } else {
