@@ -335,6 +335,13 @@ impl<'a> GraphBuilder<'a> {
                     | Opcode::JumpIfUndefinedOrNullConstant
                     | Opcode::JumpIfJSReceiverConstant
                     | Opcode::JumpLoop
+                    | Opcode::TestLessThanJump
+                    | Opcode::TestGreaterThanJump
+                    | Opcode::TestLessThanOrEqualJump
+                    | Opcode::TestGreaterThanOrEqualJump
+                    | Opcode::TestEqualJump
+                    | Opcode::TestNotEqualJump
+                    | Opcode::TestEqualStrictJump
             );
 
             // Record the jump target as a new block boundary.  `target == 0`
@@ -406,6 +413,20 @@ impl<'a> GraphBuilder<'a> {
             | Opcode::JumpIfJSReceiver
             | Opcode::JumpLoop => {
                 if let Operand::JumpOffset(off) = *instr.operand(0) {
+                    off
+                } else {
+                    return None;
+                }
+            }
+            // Fused test+jump superinstructions: JumpOffset is operand 2.
+            Opcode::TestLessThanJump
+            | Opcode::TestGreaterThanJump
+            | Opcode::TestLessThanOrEqualJump
+            | Opcode::TestGreaterThanOrEqualJump
+            | Opcode::TestEqualJump
+            | Opcode::TestNotEqualJump
+            | Opcode::TestEqualStrictJump => {
+                if let Operand::JumpOffset(off) = *instr.operand(2) {
                     off
                 } else {
                     return None;
@@ -487,6 +508,14 @@ impl<'a> GraphBuilder<'a> {
                 let imm = self.operand_immediate(instr, 0)?;
                 let id = self.emit(ValueNode::SmiConstant { value: imm })?;
                 self.env.set_accumulator(id);
+            }
+            // ── Superinstruction: LdaSmi + Star ─────────────────────────────
+            Opcode::LdaSmiStar => {
+                let imm = self.operand_immediate(instr, 0)?;
+                let dst = self.operand_register(instr, 1)?;
+                let id = self.emit(ValueNode::SmiConstant { value: imm })?;
+                self.env.set_accumulator(id);
+                self.env.set(dst, id);
             }
             Opcode::LdaUndefined => {
                 let id = self.emit(ValueNode::UndefinedConstant)?;
@@ -581,6 +610,24 @@ impl<'a> GraphBuilder<'a> {
                 // The stored value is now the known state for this global.
                 self.known_globals.insert(name, value);
             }
+            // ── Superinstruction: LdaGlobal + Star ──────────────────────────
+            Opcode::LdaGlobalStar => {
+                let name = self.operand_constant_pool_idx(instr, 0)?;
+                let slot = self.operand_feedback_slot(instr, 1)?;
+                let dst = self.operand_register(instr, 2)?;
+                let id = if let Some(&known) = self.known_globals.get(&name) {
+                    known
+                } else {
+                    let id = self.emit(ValueNode::LoadGlobal {
+                        name,
+                        feedback_slot: slot,
+                    })?;
+                    self.known_globals.insert(name, id);
+                    id
+                };
+                self.env.set_accumulator(id);
+                self.env.set(dst, id);
+            }
 
             // ── Property loads ───────────────────────────────────────────────
             // LdaNamedProperty [obj_reg, name_idx, slot]
@@ -674,6 +721,19 @@ impl<'a> GraphBuilder<'a> {
                 let id = self.emit_binary_op(left, right, slot, BinaryOpKind::Mul)?;
                 self.env.set_accumulator(id);
             }
+            // ── Superinstruction: Ldar + Mul + Star ─────────────────────────
+            Opcode::LdarMulStar => {
+                let src = self.operand_register(instr, 0)?;
+                let mul_reg = self.operand_register(instr, 1)?;
+                let dst = self.operand_register(instr, 2)?;
+                let slot = self.operand_feedback_slot(instr, 3)?;
+                let left = self.env_get_register(src)?;
+                self.env.set_accumulator(left);
+                let right = self.env_get_register(mul_reg)?;
+                let id = self.emit_binary_op(left, right, slot, BinaryOpKind::Mul)?;
+                self.env.set_accumulator(id);
+                self.env.set(dst, id);
+            }
             Opcode::Div => {
                 let reg = self.operand_register(instr, 0)?;
                 let slot = self.operand_feedback_slot(instr, 1)?;
@@ -726,6 +786,17 @@ impl<'a> GraphBuilder<'a> {
                 let id = self.emit_binary_op(left, right, slot, BinaryOpKind::Sub)?;
                 self.env.set_accumulator(id);
             }
+            // ── Superinstruction: SubSmi + Star ─────────────────────────────
+            Opcode::SubSmiStar => {
+                let imm = self.operand_immediate(instr, 0)?;
+                let slot = self.operand_feedback_slot(instr, 1)?;
+                let dst = self.operand_register(instr, 2)?;
+                let left = self.env_get_accumulator()?;
+                let right = self.emit(ValueNode::SmiConstant { value: imm })?;
+                let id = self.emit_binary_op(left, right, slot, BinaryOpKind::Sub)?;
+                self.env.set_accumulator(id);
+                self.env.set(dst, id);
+            }
             Opcode::MulSmi => {
                 let imm = self.operand_immediate(instr, 0)?;
                 let slot = self.operand_feedback_slot(instr, 1)?;
@@ -733,6 +804,17 @@ impl<'a> GraphBuilder<'a> {
                 let right = self.emit(ValueNode::SmiConstant { value: imm })?;
                 let id = self.emit_binary_op(left, right, slot, BinaryOpKind::Mul)?;
                 self.env.set_accumulator(id);
+            }
+            // ── Superinstruction: MulSmi + Star ─────────────────────────────
+            Opcode::MulSmiStar => {
+                let imm = self.operand_immediate(instr, 0)?;
+                let slot = self.operand_feedback_slot(instr, 1)?;
+                let dst = self.operand_register(instr, 2)?;
+                let left = self.env_get_accumulator()?;
+                let right = self.emit(ValueNode::SmiConstant { value: imm })?;
+                let id = self.emit_binary_op(left, right, slot, BinaryOpKind::Mul)?;
+                self.env.set_accumulator(id);
+                self.env.set(dst, id);
             }
             Opcode::DivSmi => {
                 let imm = self.operand_immediate(instr, 0)?;
@@ -866,6 +948,15 @@ impl<'a> GraphBuilder<'a> {
                 let id = self.emit_inc_dec(val, slot, true)?;
                 self.env.set_accumulator(id);
             }
+            // ── Superinstruction: Inc + Star ────────────────────────────────
+            Opcode::IncStar => {
+                let slot = self.operand_feedback_slot(instr, 0)?;
+                let dst = self.operand_register(instr, 1)?;
+                let val = self.env_get_accumulator()?;
+                let id = self.emit_inc_dec(val, slot, true)?;
+                self.env.set_accumulator(id);
+                self.env.set(dst, id);
+            }
             Opcode::Dec => {
                 let slot = self.operand_feedback_slot(instr, 0)?;
                 let val = self.env_get_accumulator()?;
@@ -906,6 +997,21 @@ impl<'a> GraphBuilder<'a> {
                 })?;
                 self.env.set_accumulator(id);
             }
+            // ── Superinstruction: TestEqual + Jump ──────────────────────────
+            Opcode::TestEqualJump => {
+                let reg = self.operand_register(instr, 0)?;
+                let slot = self.operand_feedback_slot(instr, 1)?;
+                let is_true = self.operand_flag(instr, 3)? != 0;
+                let left = self.env_get_accumulator()?;
+                let right = self.env_get_register(reg)?;
+                let condition = self.emit(ValueNode::TaggedEqual {
+                    left,
+                    right,
+                    feedback_slot: slot,
+                })?;
+                self.env.set_accumulator(condition);
+                self.emit_fused_branch(instr_idx, all_instructions, condition, is_true);
+            }
             Opcode::TestNotEqual => {
                 let reg = self.operand_register(instr, 0)?;
                 let slot = self.operand_feedback_slot(instr, 1)?;
@@ -918,6 +1024,21 @@ impl<'a> GraphBuilder<'a> {
                 })?;
                 self.env.set_accumulator(id);
             }
+            // ── Superinstruction: TestNotEqual + Jump ───────────────────────
+            Opcode::TestNotEqualJump => {
+                let reg = self.operand_register(instr, 0)?;
+                let slot = self.operand_feedback_slot(instr, 1)?;
+                let is_true = self.operand_flag(instr, 3)? != 0;
+                let left = self.env_get_accumulator()?;
+                let right = self.env_get_register(reg)?;
+                let condition = self.emit(ValueNode::TaggedNotEqual {
+                    left,
+                    right,
+                    feedback_slot: slot,
+                })?;
+                self.env.set_accumulator(condition);
+                self.emit_fused_branch(instr_idx, all_instructions, condition, is_true);
+            }
             Opcode::TestEqualStrict => {
                 let reg = self.operand_register(instr, 0)?;
                 let slot = self.operand_feedback_slot(instr, 1)?;
@@ -929,6 +1050,21 @@ impl<'a> GraphBuilder<'a> {
                     feedback_slot: slot,
                 })?;
                 self.env.set_accumulator(id);
+            }
+            // ── Superinstruction: TestEqualStrict + Jump ────────────────────
+            Opcode::TestEqualStrictJump => {
+                let reg = self.operand_register(instr, 0)?;
+                let slot = self.operand_feedback_slot(instr, 1)?;
+                let is_true = self.operand_flag(instr, 3)? != 0;
+                let left = self.env_get_accumulator()?;
+                let right = self.env_get_register(reg)?;
+                let condition = self.emit(ValueNode::TaggedEqual {
+                    left,
+                    right,
+                    feedback_slot: slot,
+                })?;
+                self.env.set_accumulator(condition);
+                self.emit_fused_branch(instr_idx, all_instructions, condition, is_true);
             }
             Opcode::TestLessThan => {
                 let reg = self.operand_register(instr, 0)?;
@@ -946,24 +1082,7 @@ impl<'a> GraphBuilder<'a> {
                 let right = self.env_get_register(reg)?;
                 let condition = self.emit_comparison(left, right, slot, CompareKind::LessThan)?;
                 self.env.set_accumulator(condition);
-                let target = self
-                    .resolve_jump_target(instr_idx, all_instructions)
-                    .unwrap_or(self.current_block + 1);
-                let fall = self
-                    .block_at
-                    .get(&(instr_idx + 1))
-                    .copied()
-                    .unwrap_or(self.current_block + 1);
-                let if_true = if is_true { target } else { fall };
-                let if_false = if is_true { fall } else { target };
-                self.save_env_for_successor(if_true);
-                self.save_env_for_successor(if_false);
-                self.add_branch_predecessors(if_true, if_false);
-                self.set_control(ControlNode::Branch {
-                    condition,
-                    if_true,
-                    if_false,
-                });
+                self.emit_fused_branch(instr_idx, all_instructions, condition, is_true);
             }
             Opcode::TestGreaterThan => {
                 let reg = self.operand_register(instr, 0)?;
@@ -973,6 +1092,18 @@ impl<'a> GraphBuilder<'a> {
                 let id = self.emit_comparison(left, right, slot, CompareKind::GreaterThan)?;
                 self.env.set_accumulator(id);
             }
+            // ── Superinstruction: TestGreaterThan + Jump ────────────────────
+            Opcode::TestGreaterThanJump => {
+                let reg = self.operand_register(instr, 0)?;
+                let slot = self.operand_feedback_slot(instr, 1)?;
+                let is_true = self.operand_flag(instr, 3)? != 0;
+                let left = self.env_get_accumulator()?;
+                let right = self.env_get_register(reg)?;
+                let condition =
+                    self.emit_comparison(left, right, slot, CompareKind::GreaterThan)?;
+                self.env.set_accumulator(condition);
+                self.emit_fused_branch(instr_idx, all_instructions, condition, is_true);
+            }
             Opcode::TestLessThanOrEqual => {
                 let reg = self.operand_register(instr, 0)?;
                 let slot = self.operand_feedback_slot(instr, 1)?;
@@ -980,6 +1111,18 @@ impl<'a> GraphBuilder<'a> {
                 let right = self.env_get_register(reg)?;
                 let id = self.emit_comparison(left, right, slot, CompareKind::LessThanOrEqual)?;
                 self.env.set_accumulator(id);
+            }
+            // ── Superinstruction: TestLessThanOrEqual + Jump ────────────────
+            Opcode::TestLessThanOrEqualJump => {
+                let reg = self.operand_register(instr, 0)?;
+                let slot = self.operand_feedback_slot(instr, 1)?;
+                let is_true = self.operand_flag(instr, 3)? != 0;
+                let left = self.env_get_accumulator()?;
+                let right = self.env_get_register(reg)?;
+                let condition =
+                    self.emit_comparison(left, right, slot, CompareKind::LessThanOrEqual)?;
+                self.env.set_accumulator(condition);
+                self.emit_fused_branch(instr_idx, all_instructions, condition, is_true);
             }
             Opcode::TestGreaterThanOrEqual => {
                 let reg = self.operand_register(instr, 0)?;
@@ -989,6 +1132,18 @@ impl<'a> GraphBuilder<'a> {
                 let id =
                     self.emit_comparison(left, right, slot, CompareKind::GreaterThanOrEqual)?;
                 self.env.set_accumulator(id);
+            }
+            // ── Superinstruction: TestGreaterThanOrEqual + Jump ─────────────
+            Opcode::TestGreaterThanOrEqualJump => {
+                let reg = self.operand_register(instr, 0)?;
+                let slot = self.operand_feedback_slot(instr, 1)?;
+                let is_true = self.operand_flag(instr, 3)? != 0;
+                let left = self.env_get_accumulator()?;
+                let right = self.env_get_register(reg)?;
+                let condition =
+                    self.emit_comparison(left, right, slot, CompareKind::GreaterThanOrEqual)?;
+                self.env.set_accumulator(condition);
+                self.emit_fused_branch(instr_idx, all_instructions, condition, is_true);
             }
             Opcode::TestInstanceOf => {
                 let reg = self.operand_register(instr, 0)?;
@@ -1655,6 +1810,38 @@ impl<'a> GraphBuilder<'a> {
         } else {
             self.emit(ValueNode::CheckedSmiDecrement { value: val })
         }
+    }
+
+    /// Emit the branch portion of a fused test+jump superinstruction.
+    ///
+    /// Resolves the jump target and fall-through block, saves environments
+    /// for both successors, and terminates the current block with a
+    /// [`ControlNode::Branch`].
+    fn emit_fused_branch(
+        &mut self,
+        instr_idx: usize,
+        all_instructions: &[Instruction],
+        condition: NodeId,
+        is_true: bool,
+    ) {
+        let target = self
+            .resolve_jump_target(instr_idx, all_instructions)
+            .unwrap_or(self.current_block + 1);
+        let fall = self
+            .block_at
+            .get(&(instr_idx + 1))
+            .copied()
+            .unwrap_or(self.current_block + 1);
+        let if_true = if is_true { target } else { fall };
+        let if_false = if is_true { fall } else { target };
+        self.save_env_for_successor(if_true);
+        self.save_env_for_successor(if_false);
+        self.add_branch_predecessors(if_true, if_false);
+        self.set_control(ControlNode::Branch {
+            condition,
+            if_true,
+            if_false,
+        });
     }
 
     // ── Environment helpers ──────────────────────────────────────────────────
