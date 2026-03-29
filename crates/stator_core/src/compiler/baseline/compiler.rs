@@ -1580,7 +1580,14 @@ pub(crate) mod jit_runtime {
         // ── Slow path: compile + init exec cache ────────────────────
         if ba.try_get_jit_code().is_none() && !ba.jit_baseline_has_deopted() {
             if let Ok(cc) = BaselineCompiler::compile(ba) {
-                ba.store_jit_code(cc.code, cc.register_file_slots);
+                // SAFETY: `cc.code` is valid x86-64 machine code from the
+                // baseline compiler.
+                match unsafe {
+                    CachedExecutableCode::from_compiled(&cc.code, cc.register_file_slots)
+                } {
+                    Ok(cached) => ba.store_jit_code(cached),
+                    Err(_) => ba.mark_jit_baseline_deopted(),
+                }
             } else {
                 ba.mark_jit_baseline_deopted();
             }
@@ -1589,9 +1596,12 @@ pub(crate) mod jit_runtime {
         {
             let needs_init = exec_cache.borrow().is_none();
             if needs_init {
-                if let Some((code, reg_slots)) = ba.try_get_jit_code() {
+                let jit_ref = ba.try_get_jit_code();
+                if let Some(cached) = jit_ref.as_ref() {
                     // SAFETY: code was produced by the baseline compiler.
-                    let exec = unsafe { JitExecutableCode::new(&code, reg_slots) };
+                    let exec = unsafe {
+                        JitExecutableCode::new(cached.code_bytes(), cached.register_file_slots)
+                    };
                     *exec_cache.borrow_mut() = exec;
                 }
             }
@@ -2261,7 +2271,7 @@ pub(crate) mod jit_runtime {
             let (slot_idx, cached_gen) = (entry.1, entry.2);
             if env.generation() == cached_gen && slot_idx < env.slot_count() {
                 let name = get_rt_string_constant_ref(name_idx)?;
-                env.store_by_index_fast(slot_idx, name, value);
+                env.store_by_index_sync(slot_idx, name, value);
                 return Some(value_i64);
             }
         }
@@ -2270,7 +2280,7 @@ pub(crate) mod jit_runtime {
         let name = get_rt_string_constant_ref(name_idx)?;
         let slot_idx = env.slot_index_for(name);
         if let Some(idx) = slot_idx {
-            env.store_by_index_fast(idx, name, value);
+            env.store_by_index_sync(idx, name, value);
             // Populate / update IC with the slot index we already found.
             let cur_gen = env.generation();
             // SAFETY: single-threaded JIT; update IC via raw pointer.
@@ -3721,6 +3731,18 @@ impl CachedExecutableCode {
         })
     }
 
+    /// Returns the mmap'd executable code as a byte slice.
+    ///
+    /// Used by the interpreter to lazily initialise a
+    /// [`JitExecutableCode`](crate::bytecode::bytecode_array::JitExecutableCode)
+    /// or [`CachedMaglevCode`](crate::compiler::maglev::codegen::CachedMaglevCode)
+    /// from a previously-cached compilation result.
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `self.ptr` and `self.len` were set by a successful `mmap`
+        // call in `from_compiled`.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
     /// Execute the cached JIT code with the given arguments.
     ///
     /// Allocates only the register file and calls the persistent function
@@ -3747,6 +3769,16 @@ impl CachedExecutableCode {
         } else {
             Ok(result)
         }
+    }
+
+    /// Returns the raw machine-code bytes stored in the `mmap`'d region.
+    ///
+    /// Used to seed a [`JitExecutableCode`](crate::bytecode::bytecode_array::JitExecutableCode)
+    /// from the persistent cache without re-compiling.
+    pub fn code_bytes(&self) -> &[u8] {
+        // SAFETY: `ptr` and `len` were set by a successful `mmap` in
+        // `from_compiled`; the region remains valid until `Drop`.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 

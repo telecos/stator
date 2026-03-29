@@ -202,10 +202,6 @@ use crate::objects::nanbox::NanBoxedValue;
 use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 use crate::objects::string_intern::intern;
 use crate::objects::value::{JsContext, JsValue};
-#[cfg(all(target_arch = "x86_64", unix))]
-use std::sync::Arc;
-#[cfg(all(target_arch = "x86_64", unix))]
-use std::sync::atomic::AtomicBool;
 
 // Re-export generator types and bring them into scope so external code can
 // import them from `stator_core::interpreter` (backwards-compatible path).
@@ -1158,12 +1154,17 @@ fn jsvalue_to_jit(v: &JsValue) -> i64 {
 pub(super) fn maybe_compile_baseline(ba: &BytecodeArray) {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
-        use crate::compiler::baseline::compiler::BaselineCompiler;
+        use crate::compiler::baseline::compiler::{BaselineCompiler, CachedExecutableCode};
         if let Ok(cc) = BaselineCompiler::compile(ba) {
             let code_len = cc.code.len();
-            ba.store_jit_code(cc.code, cc.register_file_slots);
-            JIT_COMPILATION_COUNT.with(|c| c.set(c.get().saturating_add(1)));
-            JIT_CODE_BYTES.with(|c| c.set(c.get().saturating_add(code_len)));
+            // SAFETY: `cc.code` was produced by `BaselineCompiler::compile`.
+            if let Ok(cached) =
+                (unsafe { CachedExecutableCode::from_compiled(&cc.code, cc.register_file_slots) })
+            {
+                ba.store_jit_code(cached);
+                JIT_COMPILATION_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+                JIT_CODE_BYTES.with(|c| c.set(c.get().saturating_add(code_len)));
+            }
         }
     }
     #[cfg(not(all(target_arch = "x86_64", unix)))]
@@ -1293,7 +1294,15 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
                             Ok(cc) => {
                                 let code_len = cc.code.len();
                                 if let Ok(mut guard) = input.result_cache.lock() {
-                                    *guard = Some((cc.code, cc.register_file_slots));
+                                    // SAFETY: `cc.code` was produced by `maglev_codegen::compile`.
+                                    if let Ok(cached) = (unsafe {
+                                        crate::compiler::baseline::compiler::CachedExecutableCode::from_compiled(
+                                            &cc.code,
+                                            cc.register_file_slots,
+                                        )
+                                    }) {
+                                        *guard = Some(cached);
+                                    }
                                     drop(guard);
                                 }
                                 MAGLEV_COMPILATION_COUNT
@@ -1362,7 +1371,17 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
         {
             let needs_init = cache.borrow().is_none();
             if needs_init {
-                if let Some((code, register_file_slots)) = ba.try_get_maglev_jit_code() {
+                // Lock the shared Maglev JIT cache (written by the background
+                // thread) and copy the code bytes + slot count while the lock
+                // is held.  The mmap for `CachedMaglevCode` happens outside
+                // the lock.
+                let jit_cache = ba.maglev_jit_cache_arc();
+                let cached_data = jit_cache.lock().ok().and_then(|guard| {
+                    guard
+                        .as_ref()
+                        .map(|c| (c.as_bytes().to_vec(), c.register_file_slots))
+                });
+                if let Some((code, register_file_slots)) = cached_data {
                     // SAFETY: `code` was produced by `maglev_codegen::compile`.
                     let exec = unsafe { CachedMaglevCode::new(&code, register_file_slots) };
                     *cache.borrow_mut() = exec;
@@ -1580,10 +1599,13 @@ fn try_execute_jit(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<
         {
             let needs_init = exec_cache.borrow().is_none();
             if needs_init {
-                let (code, register_file_slots) = ba.try_get_jit_code()?;
-                // SAFETY: `code` was produced by `BaselineCompiler::compile`
-                // and contains valid x86-64 machine code.
-                let exec = unsafe { JitExecutableCode::new(&code, register_file_slots) };
+                let jit_ref = ba.try_get_jit_code();
+                let exec = (*jit_ref).as_ref().and_then(|cached| {
+                    // SAFETY: `cached` contains valid x86-64 machine code
+                    // produced by `BaselineCompiler::compile`.
+                    unsafe { JitExecutableCode::new(cached.as_bytes(), cached.register_file_slots) }
+                });
+                drop(jit_ref);
                 *exec_cache.borrow_mut() = exec;
             }
         }
