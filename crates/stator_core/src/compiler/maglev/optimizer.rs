@@ -618,6 +618,7 @@ fn visit_value_node_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
         | ValueNode::StoreContextSlot { value, .. }
         | ValueNode::StoreCurrentContextSlot { value, .. } => f(*value),
         ValueNode::LoadContextSlot { context, .. } => f(*context),
+        ValueNode::PushContext { context } | ValueNode::PopContext { context } => f(*context),
         ValueNode::GetArgument { index } => f(*index),
         ValueNode::Call {
             callee,
@@ -1633,6 +1634,10 @@ fn collect_value_node_inputs(node: &ValueNode, live: &mut HashSet<NodeId>) {
             live.insert(*value);
         }
 
+        ValueNode::PushContext { context } | ValueNode::PopContext { context } => {
+            live.insert(*context);
+        }
+
         ValueNode::LoadFixedArrayElement { elements, index }
         | ValueNode::LoadFixedDoubleArrayElement { elements, index }
         | ValueNode::LoadHoleyFixedDoubleArrayElement { elements, index } => {
@@ -1873,6 +1878,8 @@ fn has_side_effects(node: &ValueNode) -> bool {
             | ValueNode::CreateBlockContext { .. }
             | ValueNode::CreateCatchContext { .. }
             | ValueNode::CreateWithContext { .. }
+            | ValueNode::PushContext { .. }
+            | ValueNode::PopContext { .. }
             | ValueNode::CreateClosure { .. }
             | ValueNode::FastCreateClosure { .. }
             | ValueNode::CreateEmptyObjectLiteral
@@ -2062,6 +2069,9 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
         ValueNode::StoreContextSlot { context, value, .. } => {
             *context = resolve(*context);
             *value = resolve(*value);
+        }
+        ValueNode::PushContext { context } | ValueNode::PopContext { context } => {
+            *context = resolve(*context);
         }
 
         ValueNode::LoadFixedArrayElement { elements, index }

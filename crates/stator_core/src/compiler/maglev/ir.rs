@@ -220,6 +220,8 @@ pub struct NodeId(pub u32);
 /// [`CreateShallowObjectLiteral`](ValueNode::CreateShallowObjectLiteral),
 /// [`CreateShallowArrayLiteral`](ValueNode::CreateShallowArrayLiteral),
 /// [`CreateFunctionContext`](ValueNode::CreateFunctionContext),
+/// [`PushContext`](ValueNode::PushContext),
+/// [`PopContext`](ValueNode::PopContext),
 /// [`CreateBlockContext`](ValueNode::CreateBlockContext),
 /// [`CreateCatchContext`](ValueNode::CreateCatchContext),
 /// [`CreateWithContext`](ValueNode::CreateWithContext),
@@ -1436,6 +1438,23 @@ pub enum ValueNode {
         scope_info: u32,
         /// Number of context slots.
         slot_count: u32,
+    },
+
+    /// Push a new context as the active closure context.
+    ///
+    /// Takes the new context from [`CreateFunctionContext`] or
+    /// [`CreateBlockContext`] and installs it as `RT_CONTEXT`, returning
+    /// the previous context so the caller can save it in a register.
+    PushContext {
+        /// The new context to push.
+        context: NodeId,
+    },
+
+    /// Pop (restore) a previously saved context as the active closure
+    /// context.
+    PopContext {
+        /// The saved context to restore.
+        context: NodeId,
     },
 
     /// Allocate a new block scope context.

@@ -504,6 +504,8 @@ fn is_pure(node: &ValueNode) -> bool {
             | ValueNode::CreateBlockContext { .. }
             | ValueNode::CreateCatchContext { .. }
             | ValueNode::CreateWithContext { .. }
+            | ValueNode::PushContext { .. }
+            | ValueNode::PopContext { .. }
             | ValueNode::CreateClosure { .. }
             | ValueNode::FastCreateClosure { .. }
             | ValueNode::CreateEmptyObjectLiteral
@@ -687,6 +689,7 @@ fn visit_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
             f(*context);
             f(*value);
         }
+        ValueNode::PushContext { context } | ValueNode::PopContext { context } => f(*context),
 
         ValueNode::LoadFixedArrayElement { elements, index }
         | ValueNode::LoadFixedDoubleArrayElement { elements, index }

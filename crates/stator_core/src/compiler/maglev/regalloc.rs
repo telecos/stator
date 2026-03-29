@@ -301,6 +301,8 @@ fn collect_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
             f(*value);
         }
 
+        ValueNode::PushContext { context } | ValueNode::PopContext { context } => f(*context),
+
         ValueNode::LoadFixedArrayElement { elements, index }
         | ValueNode::LoadFixedDoubleArrayElement { elements, index }
         | ValueNode::LoadHoleyFixedDoubleArrayElement { elements, index } => {

@@ -3092,6 +3092,58 @@ pub(crate) mod jit_runtime {
         value_i64
     }
 
+    // ── Context push/pop stubs for Maglev ──────────────────────────────────
+
+    /// Push a new context as the active closure context, returning the old
+    /// context.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`new_ctx_i64`) – JIT i64 encoding of the new context value.
+    ///
+    /// Returns the **old** context as JIT `i64` in `RAX`.
+    pub extern "C" fn jit_runtime_push_context(new_ctx_i64: i64) -> i64 {
+        let old = RT_CONTEXT.with(|ctx_cell| {
+            let ctx_opt = ctx_cell.borrow();
+            ctx_opt
+                .as_ref()
+                .map(|c| JsValue::Context(Rc::clone(c)))
+                .unwrap_or(JsValue::Undefined)
+        });
+        let old_i64 = jsvalue_to_jit_i64(old);
+        let new_ctx_val = jit_i64_to_jsvalue(new_ctx_i64);
+        if let JsValue::Context(c) = new_ctx_val {
+            RT_CONTEXT.with(|ctx_cell| {
+                *ctx_cell.borrow_mut() = Some(c);
+            });
+        }
+        old_i64
+    }
+
+    /// Restore a previously saved context as the active closure context.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`saved_ctx_i64`) – JIT i64 encoding of the saved context.
+    ///
+    /// Returns `JIT_UNDEFINED` in `RAX`.
+    pub extern "C" fn jit_runtime_pop_context(saved_ctx_i64: i64) -> i64 {
+        let saved = jit_i64_to_jsvalue(saved_ctx_i64);
+        match saved {
+            JsValue::Context(c) => {
+                RT_CONTEXT.with(|ctx_cell| {
+                    *ctx_cell.borrow_mut() = Some(c);
+                });
+            }
+            _ => {
+                RT_CONTEXT.with(|ctx_cell| {
+                    *ctx_cell.borrow_mut() = None;
+                });
+            }
+        }
+        JIT_UNDEFINED
+    }
+
     // ── Generic arithmetic stubs for Maglev ─────────────────────────────────
 
     /// Generic Add: handles Smi + Smi (with overflow), HeapNumber, and

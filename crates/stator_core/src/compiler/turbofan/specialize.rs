@@ -1076,6 +1076,9 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
             *context = resolve(*context);
             *value = resolve(*value);
         }
+        PushContext { context } | PopContext { context } => {
+            *context = resolve(*context);
+        }
 
         LoadFixedArrayElement { elements, index }
         | LoadFixedDoubleArrayElement { elements, index }

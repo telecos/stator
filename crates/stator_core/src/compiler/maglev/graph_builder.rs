@@ -1475,6 +1475,27 @@ impl<'a> GraphBuilder<'a> {
             }
 
             // ── Closures ──────────────────────────────────────────────────────
+            Opcode::CreateFunctionContext => {
+                let scope_info = self.operand_constant_pool_idx(instr, 0)?;
+                let slot_count = self.operand_immediate(instr, 1)? as u32;
+                let id = self.emit(ValueNode::CreateFunctionContext {
+                    scope_info,
+                    slot_count,
+                })?;
+                self.env.set_accumulator(id);
+            }
+            Opcode::PushContext => {
+                let reg = self.operand_register(instr, 0)?;
+                let new_ctx = self.env_get_accumulator()?;
+                let id = self.emit(ValueNode::PushContext { context: new_ctx })?;
+                // The old context is saved into the register.
+                self.env.set(reg, id);
+            }
+            Opcode::PopContext => {
+                let reg = self.operand_register(instr, 0)?;
+                let saved = self.env_get_register(reg)?;
+                self.emit(ValueNode::PopContext { context: saved })?;
+            }
             Opcode::CreateClosure => {
                 let func_idx = self.operand_constant_pool_idx(instr, 0)?;
                 let slot = self.operand_feedback_slot(instr, 1)?;
@@ -2785,6 +2806,54 @@ mod tests {
                 .nodes
                 .iter()
                 .any(|(_, n)| matches!(n, ValueNode::CheckedSmiAdd { .. }))
+        );
+    }
+
+    /// Compile the object_creation_1k benchmark from source and verify that
+    /// the Maglev graph builder handles every bytecode without inserting
+    /// spurious `Deoptimize` control nodes.
+    #[test]
+    fn test_object_creation_benchmark_no_deopt() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::recursive_descent;
+
+        let source = r#"
+            var last;
+            for (var i = 0; i < 1000; i++) {
+                last = { x: i, y: i + 1, z: i * 2 };
+            }
+            last.x + last.y + last.z;
+        "#;
+
+        let program = recursive_descent::parse(source).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+
+        // Decode and print each instruction for diagnostics.
+        let instructions = ba.instructions().unwrap();
+        eprintln!(
+            "object_creation_1k: {} bytecodes, {} raw bytes",
+            instructions.len(),
+            ba.bytecodes().len()
+        );
+        for (idx, instr) in instructions.iter().enumerate() {
+            eprintln!("  [{idx:3}] {:?}", instr.opcode);
+        }
+
+        let feedback = FeedbackVector::new(ba.feedback_metadata());
+        let graph = GraphBuilder::build(&ba, &feedback).unwrap();
+
+        // Check that no block has a Deoptimize control node (which would
+        // indicate an unhandled opcode falling through to the catch-all).
+        let mut deopt_blocks = Vec::new();
+        for (block_idx, block) in graph.blocks().iter().enumerate() {
+            if matches!(block.control, Some(ControlNode::Deoptimize { .. })) {
+                deopt_blocks.push(block_idx);
+            }
+        }
+        assert!(
+            deopt_blocks.is_empty(),
+            "graph has Deoptimize control in blocks {deopt_blocks:?} — \
+             indicates unhandled bytecodes"
         );
     }
 }

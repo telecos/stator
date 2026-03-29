@@ -1566,6 +1566,22 @@ impl<'a> MaglevCodegen<'a> {
                     0,
                 );
             }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::PushContext { context } => {
+                self.emit_stub_call_1node(
+                    id,
+                    *context,
+                    jit_runtime::jit_runtime_push_context as usize,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::PopContext { context } => {
+                self.emit_stub_call_1node(
+                    id,
+                    *context,
+                    jit_runtime::jit_runtime_pop_context as usize,
+                );
+            }
 
             // ── Construct via dedicated stub ──────────────────────────────────
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -2935,6 +2951,9 @@ impl<'a> MaglevCodegen<'a> {
             }
             ValueNode::CreateWithContext { object, .. } => {
                 out.insert(*object);
+            }
+            ValueNode::PushContext { context } | ValueNode::PopContext { context } => {
+                out.insert(*context);
             }
 
             // ── Two-input nodes (left, right) ───────────────────────────
