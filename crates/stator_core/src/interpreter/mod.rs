@@ -9113,7 +9113,7 @@ fn is_array_like_plain_object(map: &PropertyMap) -> bool {
         .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
 }
 
-fn make_fast_array_method(target: &JsValue, name: &str, length: i32) -> JsValue {
+pub(crate) fn make_fast_array_method(target: &JsValue, name: &str, length: i32) -> JsValue {
     let bound_target = target.clone();
     let method_name: Rc<str> = name.into();
     let mut props = PropertyMap::new();

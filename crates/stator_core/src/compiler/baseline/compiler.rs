@@ -1365,11 +1365,20 @@ pub(crate) mod jit_runtime {
                 }
                 JsValue::Array(arr) => {
                     let prop_name = get_rt_string_constant_ref(name_idx)?;
-                    if prop_name == "length" {
-                        // SAFETY: single-threaded JIT; no concurrent borrows.
-                        Some(Ok(unsafe { &*arr.as_ptr() }.len() as i64))
-                    } else {
-                        Some(Ok(JIT_UNDEFINED))
+                    match prop_name {
+                        "length" => {
+                            // SAFETY: single-threaded JIT; no concurrent borrows.
+                            Some(Ok(unsafe { &*arr.as_ptr() }.len() as i64))
+                        }
+                        "push" | "pop" | "indexOf" | "includes" => {
+                            let arr_val = JsValue::Array(Rc::clone(arr));
+                            let len = if prop_name == "pop" { 0 } else { 1 };
+                            let method = crate::interpreter::make_fast_array_method(
+                                &arr_val, prop_name, len,
+                            );
+                            Some(Err(method))
+                        }
+                        _ => Some(Ok(JIT_UNDEFINED)),
                     }
                 }
                 JsValue::Function(ba) => {
@@ -1418,10 +1427,17 @@ pub(crate) mod jit_runtime {
                     }
                     JsValue::Array(arr) => {
                         let prop_name = get_rt_string_constant_ref(name_idx)?;
-                        if prop_name == "length" {
-                            Some(Ok(arr.borrow().len() as i64))
-                        } else {
-                            Some(Ok(JIT_UNDEFINED))
+                        match prop_name {
+                            "length" => Some(Ok(arr.borrow().len() as i64)),
+                            "push" | "pop" | "indexOf" | "includes" => {
+                                let arr_val = JsValue::Array(Rc::clone(arr));
+                                let len = if prop_name == "pop" { 0 } else { 1 };
+                                let method = crate::interpreter::make_fast_array_method(
+                                    &arr_val, prop_name, len,
+                                );
+                                Some(Err(method))
+                            }
+                            _ => Some(Ok(JIT_UNDEFINED)),
                         }
                     }
                     JsValue::Function(ba) => {
@@ -1493,10 +1509,15 @@ pub(crate) mod jit_runtime {
             }
             JsValue::Array(arr) => {
                 let prop_name = get_rt_string_constant_ref(name_idx)?;
-                if prop_name == "length" {
-                    Some(arr.borrow().len() as i64)
-                } else {
-                    Some(JIT_UNDEFINED)
+                match prop_name {
+                    "length" => Some(arr.borrow().len() as i64),
+                    "push" | "pop" | "indexOf" | "includes" => {
+                        let len = if prop_name == "pop" { 0 } else { 1 };
+                        let method =
+                            crate::interpreter::make_fast_array_method(&obj, prop_name, len);
+                        Some(jsvalue_to_jit_i64(method))
+                    }
+                    _ => Some(JIT_UNDEFINED),
                 }
             }
             JsValue::Function(ba) => {
