@@ -669,6 +669,16 @@ impl MacroAssembler {
         self.emit_modrm_rr(lhs, rhs);
     }
 
+    /// `CMP r32, r32` — 32-bit compare, setting flags based on the lower
+    /// 32 bits only (no REX.W prefix).
+    ///
+    /// Encoding: `[REX] 3B /r` (CMP r32, r/m32).
+    pub fn cmp32_rr(&mut self, lhs: Reg64, rhs: Reg64) {
+        self.emit_rex_rb_if_needed(lhs, rhs);
+        self.buf.push(0x3B);
+        self.emit_modrm_rr(lhs, rhs);
+    }
+
     /// `CMP reg, imm` — compare a register against a sign-extended 32-bit
     /// immediate.
     ///
@@ -676,6 +686,23 @@ impl MacroAssembler {
     /// byte.
     pub fn cmp_ri(&mut self, reg: Reg64, imm: i32) {
         self.emit_rex_wrb(Reg64::Rax, reg);
+        if (i8::MIN as i32..=i8::MAX as i32).contains(&imm) {
+            self.buf.push(0x83);
+            self.emit_modrm_digit(7, reg);
+            self.buf.push(imm as i8 as u8);
+        } else {
+            self.buf.push(0x81);
+            self.emit_modrm_digit(7, reg);
+            self.emit_i32(imm);
+        }
+    }
+
+    /// `CMP r32, imm` — 32-bit compare register against immediate (no
+    /// REX.W prefix).
+    ///
+    /// Encoding: `[REX] 83 /7 imm8` or `[REX] 81 /7 imm32`.
+    pub fn cmp32_ri(&mut self, reg: Reg64, imm: i32) {
+        self.emit_rex_rb_if_needed(Reg64::Rax, reg);
         if (i8::MIN as i32..=i8::MAX as i32).contains(&imm) {
             self.buf.push(0x83);
             self.emit_modrm_digit(7, reg);

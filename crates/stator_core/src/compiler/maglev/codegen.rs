@@ -453,6 +453,10 @@ struct MaglevCodegen<'a> {
     /// for save/restore around stub calls.
     #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
     used_caller_saved: u8,
+    /// Set of wrapping Int32 operation results whose consumers ALL only use
+    /// the lower 32 bits.  For these nodes the post-operation `movsxd` can be
+    /// skipped because the next consumer will operate on 32-bit values anyway.
+    narrow_int32: HashSet<NodeId>,
 }
 
 impl<'a> MaglevCodegen<'a> {
@@ -489,6 +493,7 @@ impl<'a> MaglevCodegen<'a> {
             promoted_globals: Vec::new(),
             promoted_extra_slots: 0,
             used_caller_saved,
+            narrow_int32: HashSet::new(),
         }
     }
 
@@ -502,6 +507,11 @@ impl<'a> MaglevCodegen<'a> {
         // extra register-file slot beyond the allocator's spill area.
         self.scan_and_promote_globals(base_slots);
         let register_file_slots = base_slots + self.promoted_extra_slots;
+
+        // Precompute the set of wrapping Int32 results that only flow into
+        // other 32-bit operations, allowing us to skip the MOVSXD
+        // sign-extension for those nodes.
+        self.narrow_int32 = Self::compute_narrow_int32(self.graph);
 
         self.emit_prologue();
         self.emit_promoted_global_loads();
@@ -882,48 +892,69 @@ impl<'a> MaglevCodegen<'a> {
             }
 
             // ── Int32 unary arithmetic ───────────────────────────────────────
-            ValueNode::Int32Negate { value } => match self.alloc.location(id) {
-                Some(Location::Register(n)) => {
-                    let dst = phys_reg(n);
-                    self.emit_load(*value, dst);
-                    self.masm.neg_r(dst);
-                    self.masm.movsxd_sign_extend(dst, dst);
+            ValueNode::Int32Negate { value } => {
+                let narrow = self.narrow_int32.contains(&id);
+                match self.alloc.location(id) {
+                    Some(Location::Register(n)) => {
+                        let dst = phys_reg(n);
+                        self.emit_load(*value, dst);
+                        self.masm.neg_r(dst);
+                        if !narrow {
+                            self.masm.movsxd_sign_extend(dst, dst);
+                        }
+                    }
+                    _ => {
+                        self.emit_load(*value, Reg64::R11);
+                        self.masm.neg_r(Reg64::R11);
+                        if !narrow {
+                            self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
+                        }
+                        self.emit_store(id, Reg64::R11);
+                    }
                 }
-                _ => {
-                    self.emit_load(*value, Reg64::R11);
-                    self.masm.neg_r(Reg64::R11);
-                    self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
-                    self.emit_store(id, Reg64::R11);
+            }
+            ValueNode::Int32Increment { value } => {
+                let narrow = self.narrow_int32.contains(&id);
+                match self.alloc.location(id) {
+                    Some(Location::Register(n)) => {
+                        let dst = phys_reg(n);
+                        self.emit_load(*value, dst);
+                        self.masm.add32_ri(dst, 1);
+                        if !narrow {
+                            self.masm.movsxd_sign_extend(dst, dst);
+                        }
+                    }
+                    _ => {
+                        self.emit_load(*value, Reg64::R11);
+                        self.masm.add32_ri(Reg64::R11, 1);
+                        if !narrow {
+                            self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
+                        }
+                        self.emit_store(id, Reg64::R11);
+                    }
                 }
-            },
-            ValueNode::Int32Increment { value } => match self.alloc.location(id) {
-                Some(Location::Register(n)) => {
-                    let dst = phys_reg(n);
-                    self.emit_load(*value, dst);
-                    self.masm.add32_ri(dst, 1);
-                    self.masm.movsxd_sign_extend(dst, dst);
+            }
+            ValueNode::Int32Decrement { value } => {
+                let narrow = self.narrow_int32.contains(&id);
+                match self.alloc.location(id) {
+                    Some(Location::Register(n)) => {
+                        let dst = phys_reg(n);
+                        self.emit_load(*value, dst);
+                        self.masm.sub32_ri(dst, 1);
+                        if !narrow {
+                            self.masm.movsxd_sign_extend(dst, dst);
+                        }
+                    }
+                    _ => {
+                        self.emit_load(*value, Reg64::R11);
+                        self.masm.sub32_ri(Reg64::R11, 1);
+                        if !narrow {
+                            self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
+                        }
+                        self.emit_store(id, Reg64::R11);
+                    }
                 }
-                _ => {
-                    self.emit_load(*value, Reg64::R11);
-                    self.masm.add32_ri(Reg64::R11, 1);
-                    self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
-                    self.emit_store(id, Reg64::R11);
-                }
-            },
-            ValueNode::Int32Decrement { value } => match self.alloc.location(id) {
-                Some(Location::Register(n)) => {
-                    let dst = phys_reg(n);
-                    self.emit_load(*value, dst);
-                    self.masm.sub32_ri(dst, 1);
-                    self.masm.movsxd_sign_extend(dst, dst);
-                }
-                _ => {
-                    self.emit_load(*value, Reg64::R11);
-                    self.masm.sub32_ri(Reg64::R11, 1);
-                    self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
-                    self.emit_store(id, Reg64::R11);
-                }
-            },
+            }
 
             // ── Checked Smi arithmetic (deopt on signed 64-bit overflow) ─────
             //
@@ -1984,45 +2015,6 @@ impl<'a> MaglevCodegen<'a> {
         }
     }
 
-    /// Emit a `CMP` between `left` and `right`, using the most efficient
-    /// encoding: `CMP reg, imm` when right is a small constant, `CMP reg, reg`
-    /// when both are in physical registers, or scratch registers as fallback.
-    fn emit_cmp(&mut self, left: NodeId, right: NodeId) {
-        // Try CMP reg, imm when right is a constant.
-        if let Some(imm) = self.try_get_i32_constant(right) {
-            match self.alloc.location(left) {
-                Some(Location::Register(ln)) => {
-                    self.masm.cmp_ri(phys_reg(ln), imm);
-                    return;
-                }
-                _ => {
-                    self.emit_load(left, Reg64::R11);
-                    self.masm.cmp_ri(Reg64::R11, imm);
-                    return;
-                }
-            }
-        }
-        // Register-to-register paths.
-        match (self.alloc.location(left), self.alloc.location(right)) {
-            (Some(Location::Register(ln)), Some(Location::Register(rn))) => {
-                self.masm.cmp_rr(phys_reg(ln), phys_reg(rn));
-            }
-            (Some(Location::Register(ln)), _) => {
-                self.emit_load(right, Reg64::R10);
-                self.masm.cmp_rr(phys_reg(ln), Reg64::R10);
-            }
-            (_, Some(Location::Register(rn))) => {
-                self.emit_load(left, Reg64::R11);
-                self.masm.cmp_rr(Reg64::R11, phys_reg(rn));
-            }
-            _ => {
-                self.emit_load(left, Reg64::R11);
-                self.emit_load(right, Reg64::R10);
-                self.masm.cmp_rr(Reg64::R11, Reg64::R10);
-            }
-        }
-    }
-
     // ── Direct-register binary operation helpers ────────────────────────────
 
     /// Emit an integer binary operation (`dst = left OP right`) using the
@@ -2113,6 +2105,7 @@ impl<'a> MaglevCodegen<'a> {
         result: NodeId,
         op: fn(&mut MacroAssembler, Reg64, Reg64),
     ) {
+        let narrow = self.narrow_int32.contains(&result);
         match self.alloc.location(result) {
             Some(Location::Register(n)) => {
                 let dst = phys_reg(n);
@@ -2137,13 +2130,17 @@ impl<'a> MaglevCodegen<'a> {
                         }
                     }
                 }
-                self.masm.movsxd_sign_extend(dst, dst);
+                if !narrow {
+                    self.masm.movsxd_sign_extend(dst, dst);
+                }
             }
             _ => {
                 self.emit_load(left, Reg64::R11);
                 self.emit_load(right, Reg64::R10);
                 op(&mut self.masm, Reg64::R11, Reg64::R10);
-                self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
+                if !narrow {
+                    self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
+                }
                 self.emit_store(result, Reg64::R11);
             }
         }
@@ -2157,17 +2154,22 @@ impl<'a> MaglevCodegen<'a> {
         result: NodeId,
         op: fn(&mut MacroAssembler, Reg64, i32),
     ) {
+        let narrow = self.narrow_int32.contains(&result);
         match self.alloc.location(result) {
             Some(Location::Register(n)) => {
                 let dst = phys_reg(n);
                 self.emit_load(src, dst);
                 op(&mut self.masm, dst, imm);
-                self.masm.movsxd_sign_extend(dst, dst);
+                if !narrow {
+                    self.masm.movsxd_sign_extend(dst, dst);
+                }
             }
             _ => {
                 self.emit_load(src, Reg64::R11);
                 op(&mut self.masm, Reg64::R11, imm);
-                self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
+                if !narrow {
+                    self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
+                }
                 self.emit_store(result, Reg64::R11);
             }
         }
@@ -2192,6 +2194,8 @@ impl<'a> MaglevCodegen<'a> {
             _ => None,
         };
 
+        let narrow = self.narrow_int32.contains(&result);
+
         match self.alloc.location(result) {
             Some(Location::Register(n)) => {
                 let dst = phys_reg(n);
@@ -2212,7 +2216,9 @@ impl<'a> MaglevCodegen<'a> {
                 } else {
                     self.masm.imul32_rri(dst, src_reg, imm);
                 }
-                self.masm.movsxd_sign_extend(dst, dst);
+                if !narrow {
+                    self.masm.movsxd_sign_extend(dst, dst);
+                }
             }
             _ => {
                 self.emit_load(src, Reg64::R11);
@@ -2222,7 +2228,9 @@ impl<'a> MaglevCodegen<'a> {
                 } else {
                     self.masm.imul32_rri(Reg64::R11, Reg64::R11, imm);
                 }
-                self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
+                if !narrow {
+                    self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
+                }
                 self.emit_store(result, Reg64::R11);
             }
         }
@@ -2602,10 +2610,10 @@ impl<'a> MaglevCodegen<'a> {
 
     // ── Comparison helper ────────────────────────────────────────────────────
 
-    /// Emit a 64-bit integer comparison, writing `JIT_FALSE` or `JIT_TRUE`
+    /// Emit a 32-bit integer comparison, writing `JIT_FALSE` or `JIT_TRUE`
     /// to `result`'s allocated location.
     fn emit_int32_compare(&mut self, left: NodeId, right: NodeId, cc: CondCode, result: NodeId) {
-        self.emit_cmp(left, right);
+        self.emit_cmp32(left, right);
         self.masm.setcc_al(cc);
         self.masm.movzx_r64_al(Reg64::R11);
         self.masm.mov_ri(Reg64::R10, JIT_FALSE);
@@ -2644,9 +2652,9 @@ impl<'a> MaglevCodegen<'a> {
             _ => return false,
         };
 
-        // Re-emit CMP from the comparison's operands, using physical
+        // Re-emit 32-bit CMP from the comparison's operands, using physical
         // registers directly when available and CMP-immediate for constants.
-        self.emit_cmp(left, right);
+        self.emit_cmp32(left, right);
 
         // Branch directly: condition-false falls through to false phi-copies.
         let if_true_idx = if_true as usize;
@@ -2746,6 +2754,474 @@ impl<'a> MaglevCodegen<'a> {
             u64::MAX
         } else {
             (1u64 << slots) - 1
+        }
+    }
+
+    // ── MOVSXD elimination helpers ──────────────────────────────────────────
+
+    /// Returns `true` when `node` is a wrapping 32-bit operation that emits a
+    /// `movsxd_sign_extend` in the default codegen path.
+    fn is_wrapping_int32_producer(node: &ValueNode) -> bool {
+        matches!(
+            node,
+            ValueNode::Int32Add { .. }
+                | ValueNode::Int32Subtract { .. }
+                | ValueNode::Int32Multiply { .. }
+                | ValueNode::Int32Negate { .. }
+                | ValueNode::Int32Increment { .. }
+                | ValueNode::Int32Decrement { .. }
+        )
+    }
+
+    /// Returns `true` when `node` only reads the lower 32 bits of its
+    /// `NodeId` operands, meaning upstream producers can skip sign-extension.
+    fn is_narrow_int32_consumer(node: &ValueNode) -> bool {
+        matches!(
+            node,
+            ValueNode::Int32Add { .. }
+                | ValueNode::Int32Subtract { .. }
+                | ValueNode::Int32Multiply { .. }
+                | ValueNode::Int32Divide { .. }
+                | ValueNode::Int32Modulus { .. }
+                | ValueNode::Int32Negate { .. }
+                | ValueNode::Int32Increment { .. }
+                | ValueNode::Int32Decrement { .. }
+                | ValueNode::Int32BitwiseAnd { .. }
+                | ValueNode::Int32BitwiseOr { .. }
+                | ValueNode::Int32BitwiseXor { .. }
+                | ValueNode::Int32ShiftLeft { .. }
+                | ValueNode::Int32ShiftRight { .. }
+                | ValueNode::Int32ShiftRightLogical { .. }
+                | ValueNode::Int32Equal { .. }
+                | ValueNode::Int32StrictEqual { .. }
+                | ValueNode::Int32LessThan { .. }
+                | ValueNode::Int32LessThanOrEqual { .. }
+                | ValueNode::Int32GreaterThan { .. }
+                | ValueNode::Int32GreaterThanOrEqual { .. }
+                | ValueNode::Int32Constant { .. }
+        )
+    }
+
+    /// Collect all `NodeId` operands referenced by `node` into `out`.
+    fn collect_node_inputs(node: &ValueNode, out: &mut HashSet<NodeId>) {
+        match node {
+            // ── No NodeId inputs ────────────────────────────────────────
+            ValueNode::SmiConstant { .. }
+            | ValueNode::Float64Constant { .. }
+            | ValueNode::Int32Constant { .. }
+            | ValueNode::Uint32Constant { .. }
+            | ValueNode::BigIntConstant { .. }
+            | ValueNode::TrueConstant
+            | ValueNode::FalseConstant
+            | ValueNode::NullConstant
+            | ValueNode::UndefinedConstant
+            | ValueNode::RootConstant { .. }
+            | ValueNode::ExternalConstant { .. }
+            | ValueNode::StringConstant { .. }
+            | ValueNode::ConstantPoolEntry { .. }
+            | ValueNode::Parameter { .. }
+            | ValueNode::RegisterInput { .. }
+            | ValueNode::ArgumentsLength
+            | ValueNode::RestLength
+            | ValueNode::CreateObjectLiteral { .. }
+            | ValueNode::CreateArrayLiteral { .. }
+            | ValueNode::CreateShallowObjectLiteral { .. }
+            | ValueNode::CreateShallowArrayLiteral { .. }
+            | ValueNode::CreateFunctionContext { .. }
+            | ValueNode::CreateBlockContext { .. }
+            | ValueNode::CreateClosure { .. }
+            | ValueNode::FastCreateClosure { .. }
+            | ValueNode::CreateEmptyObjectLiteral
+            | ValueNode::CreateRegExpLiteral { .. }
+            | ValueNode::ArgumentsElements { .. }
+            | ValueNode::RestElements { .. }
+            | ValueNode::VirtualObject { .. }
+            | ValueNode::GetTemplateObject { .. }
+            | ValueNode::LoadGlobal { .. }
+            | ValueNode::LoadCurrentContextSlot { .. }
+            | ValueNode::Debugger
+            | ValueNode::Abort { .. } => {}
+
+            // ── Single-input nodes (field name: value) ──────────────────
+            ValueNode::Int32Negate { value }
+            | ValueNode::Int32Increment { value }
+            | ValueNode::Int32Decrement { value }
+            | ValueNode::Float64Negate { value }
+            | ValueNode::TestUndetectable { value }
+            | ValueNode::ToBoolean { value }
+            | ValueNode::TypeOf { value }
+            | ValueNode::CheckedSmiIncrement { value }
+            | ValueNode::CheckedSmiDecrement { value } => {
+                out.insert(*value);
+            }
+
+            ValueNode::Float64Ieee754Unary { value, .. }
+            | ValueNode::GenericBitwiseNot { value, .. }
+            | ValueNode::GenericNegate { value, .. }
+            | ValueNode::GenericIncrement { value, .. }
+            | ValueNode::GenericDecrement { value, .. }
+            | ValueNode::ToString { value, .. }
+            | ValueNode::ToObject { value, .. }
+            | ValueNode::ToName { value, .. }
+            | ValueNode::ToNumber { value, .. }
+            | ValueNode::ToNumberOrNumeric { value, .. }
+            | ValueNode::TestTypeOf { value, .. }
+            | ValueNode::NumberToString { value, .. }
+            | ValueNode::StoreGlobal { value, .. }
+            | ValueNode::StoreCurrentContextSlot { value, .. } => {
+                out.insert(*value);
+            }
+
+            // ── Single-input nodes (field name: input) ──────────────────
+            ValueNode::ChangeInt32ToFloat64 { input }
+            | ValueNode::ChangeUint32ToFloat64 { input }
+            | ValueNode::ChangeFloat64ToInt32 { input }
+            | ValueNode::CheckedFloat64ToInt32 { input }
+            | ValueNode::ChangeInt32ToTagged { input }
+            | ValueNode::ChangeUint32ToTagged { input }
+            | ValueNode::ChangeFloat64ToTagged { input }
+            | ValueNode::ChangeTaggedToInt32 { input }
+            | ValueNode::ChangeTaggedToUint32 { input }
+            | ValueNode::ChangeTaggedToFloat64 { input }
+            | ValueNode::CheckedTaggedToInt32 { input }
+            | ValueNode::CheckedTaggedToFloat64 { input }
+            | ValueNode::CheckInt32IsSmi { input }
+            | ValueNode::CheckUint32IsSmi { input }
+            | ValueNode::CheckHoleyFloat64IsSmi { input }
+            | ValueNode::CheckFloat64IsNan { input } => {
+                out.insert(*input);
+            }
+
+            // ── Single-input nodes (field name: receiver) ───────────────
+            ValueNode::CheckSmi { receiver }
+            | ValueNode::CheckNumber { receiver }
+            | ValueNode::CheckHeapObject { receiver }
+            | ValueNode::CheckSymbol { receiver }
+            | ValueNode::CheckString { receiver }
+            | ValueNode::CheckStringOrStringWrapper { receiver }
+            | ValueNode::CheckSeqOneByteString { receiver } => {
+                out.insert(*receiver);
+            }
+            ValueNode::CheckMaps { receiver, .. }
+            | ValueNode::CheckMapsWithMigration { receiver, .. }
+            | ValueNode::CheckValue { receiver, .. } => {
+                out.insert(*receiver);
+            }
+
+            // ── Single-input nodes (other field names) ──────────────────
+            ValueNode::GetArgument { index } => {
+                out.insert(*index);
+            }
+            ValueNode::LoadField { object, .. }
+            | ValueNode::LoadTaggedField { object, .. }
+            | ValueNode::LoadDoubleField { object, .. }
+            | ValueNode::LoadNamedGeneric { object, .. } => {
+                out.insert(*object);
+            }
+            ValueNode::LoadContextSlot { context, .. } => {
+                out.insert(*context);
+            }
+            ValueNode::ForInPrepare { enumerator, .. } => {
+                out.insert(*enumerator);
+            }
+            ValueNode::LoadEnumCacheLength { map } => {
+                out.insert(*map);
+            }
+            ValueNode::StringLength { string } => {
+                out.insert(*string);
+            }
+            ValueNode::CreateCatchContext { exception, .. } => {
+                out.insert(*exception);
+            }
+            ValueNode::CreateWithContext { object, .. } => {
+                out.insert(*object);
+            }
+
+            // ── Two-input nodes (left, right) ───────────────────────────
+            ValueNode::Int32Add { left, right }
+            | ValueNode::Int32Subtract { left, right }
+            | ValueNode::Int32Multiply { left, right }
+            | ValueNode::Int32Divide { left, right }
+            | ValueNode::Int32Modulus { left, right }
+            | ValueNode::Int32BitwiseAnd { left, right }
+            | ValueNode::Int32BitwiseOr { left, right }
+            | ValueNode::Int32BitwiseXor { left, right }
+            | ValueNode::Int32ShiftLeft { left, right }
+            | ValueNode::Int32ShiftRight { left, right }
+            | ValueNode::Int32ShiftRightLogical { left, right }
+            | ValueNode::Int32Equal { left, right }
+            | ValueNode::Int32StrictEqual { left, right }
+            | ValueNode::Int32LessThan { left, right }
+            | ValueNode::Int32LessThanOrEqual { left, right }
+            | ValueNode::Int32GreaterThan { left, right }
+            | ValueNode::Int32GreaterThanOrEqual { left, right }
+            | ValueNode::Uint32Add { left, right }
+            | ValueNode::Uint32Subtract { left, right }
+            | ValueNode::Uint32Multiply { left, right }
+            | ValueNode::Uint32Divide { left, right }
+            | ValueNode::Uint32Modulus { left, right }
+            | ValueNode::Float64Add { left, right }
+            | ValueNode::Float64Subtract { left, right }
+            | ValueNode::Float64Multiply { left, right }
+            | ValueNode::Float64Divide { left, right }
+            | ValueNode::Float64Modulus { left, right }
+            | ValueNode::Float64Exponentiate { left, right }
+            | ValueNode::Float64Equal { left, right }
+            | ValueNode::Float64LessThan { left, right }
+            | ValueNode::Float64LessThanOrEqual { left, right }
+            | ValueNode::Float64GreaterThan { left, right }
+            | ValueNode::Float64GreaterThanOrEqual { left, right }
+            | ValueNode::CheckedSmiAdd { left, right }
+            | ValueNode::CheckedSmiSubtract { left, right }
+            | ValueNode::CheckedSmiMultiply { left, right }
+            | ValueNode::CheckedSmiDivide { left, right }
+            | ValueNode::CheckedSmiModulus { left, right }
+            | ValueNode::StringConcat { left, right }
+            | ValueNode::StringEqual { left, right } => {
+                out.insert(*left);
+                out.insert(*right);
+            }
+
+            ValueNode::GenericAdd { left, right, .. }
+            | ValueNode::GenericSubtract { left, right, .. }
+            | ValueNode::GenericMultiply { left, right, .. }
+            | ValueNode::GenericDivide { left, right, .. }
+            | ValueNode::GenericModulus { left, right, .. }
+            | ValueNode::GenericExponentiate { left, right, .. }
+            | ValueNode::GenericBitwiseAnd { left, right, .. }
+            | ValueNode::GenericBitwiseOr { left, right, .. }
+            | ValueNode::GenericBitwiseXor { left, right, .. }
+            | ValueNode::GenericShiftLeft { left, right, .. }
+            | ValueNode::GenericShiftRight { left, right, .. }
+            | ValueNode::GenericShiftRightLogical { left, right, .. }
+            | ValueNode::TaggedEqual { left, right, .. }
+            | ValueNode::TaggedNotEqual { left, right, .. } => {
+                out.insert(*left);
+                out.insert(*right);
+            }
+
+            // ── Two-input nodes (various field names) ───────────────────
+            ValueNode::CheckDynamicValue { receiver, expected } => {
+                out.insert(*receiver);
+                out.insert(*expected);
+            }
+            ValueNode::CheckInt32Condition { left, right, .. } => {
+                out.insert(*left);
+                out.insert(*right);
+            }
+            ValueNode::CheckCacheIndicesNotCleared { receiver, indices } => {
+                out.insert(*receiver);
+                out.insert(*indices);
+            }
+            ValueNode::StoreField { object, value, .. } => {
+                out.insert(*object);
+                out.insert(*value);
+            }
+            ValueNode::StoreNamedGeneric { object, value, .. } => {
+                out.insert(*object);
+                out.insert(*value);
+            }
+            ValueNode::StoreContextSlot { context, value, .. } => {
+                out.insert(*context);
+                out.insert(*value);
+            }
+            ValueNode::LoadFixedArrayElement { elements, index }
+            | ValueNode::LoadFixedDoubleArrayElement { elements, index }
+            | ValueNode::LoadHoleyFixedDoubleArrayElement { elements, index } => {
+                out.insert(*elements);
+                out.insert(*index);
+            }
+            ValueNode::StringAt { string, index } => {
+                out.insert(*string);
+                out.insert(*index);
+            }
+            ValueNode::HasInPrototypeChain { object, prototype } => {
+                out.insert(*object);
+                out.insert(*prototype);
+            }
+            ValueNode::DeleteProperty { object, key, .. } => {
+                out.insert(*object);
+                out.insert(*key);
+            }
+            ValueNode::TestInstanceOf {
+                object, callable, ..
+            } => {
+                out.insert(*object);
+                out.insert(*callable);
+            }
+            ValueNode::TestIn { key, object, .. } => {
+                out.insert(*key);
+                out.insert(*object);
+            }
+            ValueNode::LoadKeyedGeneric { object, key, .. } => {
+                out.insert(*object);
+                out.insert(*key);
+            }
+
+            // ── Three-input nodes ───────────────────────────────────────
+            ValueNode::StoreFixedArrayElement {
+                elements,
+                index,
+                value,
+            }
+            | ValueNode::StoreFixedDoubleArrayElement {
+                elements,
+                index,
+                value,
+            } => {
+                out.insert(*elements);
+                out.insert(*index);
+                out.insert(*value);
+            }
+            ValueNode::StoreKeyedGeneric {
+                object, key, value, ..
+            } => {
+                out.insert(*object);
+                out.insert(*key);
+                out.insert(*value);
+            }
+            ValueNode::ForInNext {
+                receiver,
+                cache_index,
+                cache_array,
+                ..
+            } => {
+                out.insert(*receiver);
+                out.insert(*cache_index);
+                out.insert(*cache_array);
+            }
+
+            // ── Variable-input nodes ────────────────────────────────────
+            ValueNode::Call {
+                callee,
+                receiver,
+                args,
+                ..
+            }
+            | ValueNode::CallWithSpread {
+                callee,
+                receiver,
+                args,
+                ..
+            } => {
+                out.insert(*callee);
+                out.insert(*receiver);
+                for a in args {
+                    out.insert(*a);
+                }
+            }
+            ValueNode::CallKnownFunction {
+                callee,
+                receiver,
+                args,
+            } => {
+                out.insert(*callee);
+                out.insert(*receiver);
+                for a in args {
+                    out.insert(*a);
+                }
+            }
+            ValueNode::CallBuiltin { args, .. } | ValueNode::CallRuntime { args, .. } => {
+                for a in args {
+                    out.insert(*a);
+                }
+            }
+            ValueNode::Construct {
+                constructor, args, ..
+            }
+            | ValueNode::ConstructWithSpread {
+                constructor, args, ..
+            } => {
+                out.insert(*constructor);
+                for a in args {
+                    out.insert(*a);
+                }
+            }
+            ValueNode::Phi { inputs } => {
+                for i in inputs {
+                    out.insert(*i);
+                }
+            }
+        }
+    }
+
+    /// Precompute the set of wrapping Int32 nodes whose consumers all operate
+    /// on 32-bit values, allowing the post-operation `movsxd` to be elided.
+    fn compute_narrow_int32(graph: &MaglevGraph) -> HashSet<NodeId> {
+        // Step 1: collect all wrapping Int32 producer IDs.
+        let mut candidates: HashSet<NodeId> = HashSet::new();
+        for block in graph.blocks() {
+            for (id, node) in &block.nodes {
+                if Self::is_wrapping_int32_producer(node) {
+                    candidates.insert(*id);
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            return candidates;
+        }
+
+        // Step 2: walk every node and control-flow terminator.  If a
+        // non-32-bit consumer references a candidate, remove it.
+        let mut non_narrow: HashSet<NodeId> = HashSet::new();
+        for block in graph.blocks() {
+            for (_, node) in &block.nodes {
+                if !Self::is_narrow_int32_consumer(node) {
+                    Self::collect_node_inputs(node, &mut non_narrow);
+                }
+            }
+            if let Some(ctrl) = &block.control {
+                match ctrl {
+                    ControlNode::Return { value } => {
+                        non_narrow.insert(*value);
+                    }
+                    ControlNode::Branch { condition, .. } => {
+                        non_narrow.insert(*condition);
+                    }
+                    ControlNode::Jump { .. } | ControlNode::Deoptimize { .. } => {}
+                }
+            }
+        }
+
+        candidates.retain(|id| !non_narrow.contains(id));
+        candidates
+    }
+
+    /// Emit a 32-bit `CMP` between `left` and `right`, using the most
+    /// efficient encoding.  Emits the operand-size-32 variant (no REX.W) so
+    /// that only the lower 32 bits matter.
+    fn emit_cmp32(&mut self, left: NodeId, right: NodeId) {
+        if let Some(imm) = self.try_get_i32_constant(right) {
+            match self.alloc.location(left) {
+                Some(Location::Register(ln)) => {
+                    self.masm.cmp32_ri(phys_reg(ln), imm);
+                    return;
+                }
+                _ => {
+                    self.emit_load(left, Reg64::R11);
+                    self.masm.cmp32_ri(Reg64::R11, imm);
+                    return;
+                }
+            }
+        }
+        match (self.alloc.location(left), self.alloc.location(right)) {
+            (Some(Location::Register(ln)), Some(Location::Register(rn))) => {
+                self.masm.cmp32_rr(phys_reg(ln), phys_reg(rn));
+            }
+            (Some(Location::Register(ln)), _) => {
+                self.emit_load(right, Reg64::R10);
+                self.masm.cmp32_rr(phys_reg(ln), Reg64::R10);
+            }
+            (_, Some(Location::Register(rn))) => {
+                self.emit_load(left, Reg64::R11);
+                self.masm.cmp32_rr(Reg64::R11, phys_reg(rn));
+            }
+            _ => {
+                self.emit_load(left, Reg64::R11);
+                self.emit_load(right, Reg64::R10);
+                self.masm.cmp32_rr(Reg64::R11, Reg64::R10);
+            }
         }
     }
 }
