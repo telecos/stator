@@ -736,6 +736,11 @@ fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
     let ba = Rc::new(bytecode);
+    eprintln!(
+        "BENCH_SETUP[arithmetic_loop]: ba_ptr={:p} bc_len={}",
+        &*ba as *const _,
+        ba.bytecodes().len()
+    );
     let env = make_global_env();
     c.bench_function("arithmetic_loop_10k_precompiled", |b| {
         b.iter(|| {
@@ -787,6 +792,11 @@ fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
     let ba = Rc::new(bytecode);
+    eprintln!(
+        "BENCH_SETUP[fib_40]: ba_ptr={:p} bc_len={}",
+        &*ba as *const _,
+        ba.bytecodes().len()
+    );
     let env = make_global_env();
     c.bench_function("fib_40_iterative_precompiled", |b| {
         b.iter(|| {
@@ -814,6 +824,11 @@ fn bench_property_access_1k_precompiled(c: &mut Criterion) {
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
     let ba = Rc::new(bytecode);
+    eprintln!(
+        "BENCH_SETUP[property_access]: ba_ptr={:p} bc_len={}",
+        &*ba as *const _,
+        ba.bytecodes().len()
+    );
     let env = make_global_env();
     c.bench_function("property_access_1k_precompiled", |b| {
         b.iter(|| {
@@ -840,6 +855,11 @@ fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
     let ba = Rc::new(bytecode);
+    eprintln!(
+        "BENCH_SETUP[object_creation]: ba_ptr={:p} bc_len={}",
+        &*ba as *const _,
+        ba.bytecodes().len()
+    );
     let env = make_global_env();
     c.bench_function("object_creation_1k_precompiled", |b| {
         b.iter(|| {
@@ -870,6 +890,11 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
     let ba = Rc::new(bytecode);
+    eprintln!(
+        "BENCH_SETUP[array_push]: ba_ptr={:p} bc_len={}",
+        &*ba as *const _,
+        ba.bytecodes().len()
+    );
     let env = make_global_env();
     c.bench_function("array_push_sum_1k_precompiled", |b| {
         b.iter(|| {
@@ -901,6 +926,11 @@ fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
     let ba = Rc::new(bytecode);
+    eprintln!(
+        "BENCH_SETUP[closure_counter]: ba_ptr={:p} bc_len={}",
+        &*ba as *const _,
+        ba.bytecodes().len()
+    );
     let env = make_global_env();
     c.bench_function("closure_counter_1k_precompiled", |b| {
         b.iter(|| {
@@ -934,6 +964,11 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
     let ba = Rc::new(bytecode);
+    eprintln!(
+        "BENCH_SETUP[prototype_chain]: ba_ptr={:p} bc_len={}",
+        &*ba as *const _,
+        ba.bytecodes().len()
+    );
     let env = make_global_env();
     c.bench_function("prototype_chain_1k_precompiled", |b| {
         b.iter(|| {
@@ -972,6 +1007,11 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
     let ba = Rc::new(bytecode);
+    eprintln!(
+        "BENCH_SETUP[sieve_primes]: ba_ptr={:p} bc_len={}",
+        &*ba as *const _,
+        ba.bytecodes().len()
+    );
     let env = make_global_env();
     c.bench_function("sieve_primes_1k_precompiled", |b| {
         b.iter(|| {
@@ -999,6 +1039,11 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
     let ba = Rc::new(bytecode);
+    eprintln!(
+        "BENCH_SETUP[deep_object]: ba_ptr={:p} bc_len={}",
+        &*ba as *const _,
+        ba.bytecodes().len()
+    );
     let env = make_global_env();
     c.bench_function("deep_object_access_1k_precompiled", |b| {
         b.iter(|| {

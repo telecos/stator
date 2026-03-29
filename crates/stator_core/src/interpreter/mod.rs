@@ -1117,7 +1117,21 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
         }
 
         MAGLEV_COMPILATION_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("MAGLEV_COMPILE: starting bc_len={}", ba.bytecodes().len());
+        // Print first 8 opcodes for fingerprinting which script is being compiled.
+        let bc = ba.bytecodes();
+        let first_ops: Vec<String> = ba
+            .instructions()
+            .unwrap_or_default()
+            .iter()
+            .take(8)
+            .map(|i| format!("{:?}", i.opcode))
+            .collect();
+        eprintln!(
+            "MAGLEV_COMPILE: starting bc_len={} ba_ptr={:p} opcodes=[{}]",
+            bc.len(),
+            ba as *const _,
+            first_ops.join(", ")
+        );
 
         let compile_ba = BytecodeArray::new(
             ba.bytecodes().to_vec(),
