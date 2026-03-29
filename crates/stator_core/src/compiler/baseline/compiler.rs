@@ -623,6 +623,25 @@ pub(crate) mod jit_runtime {
                             JsValue::Undefined
                         }
                     }
+                    JsValue::Function(ba) => {
+                        let val = crate::interpreter::fn_props_get(ba, prop_name);
+                        if !matches!(val, JsValue::Undefined) {
+                            val
+                        } else if prop_name == "prototype" && !ba.is_arrow() && !ba.is_generator() {
+                            let func_val = JsValue::Function(Rc::clone(ba));
+                            let mut proto_map = PropertyMap::new();
+                            proto_map.insert("constructor".to_string(), func_val);
+                            let proto_obj = JsValue::PlainObject(Rc::new(RefCell::new(proto_map)));
+                            crate::interpreter::fn_props_set(
+                                ba,
+                                "prototype".to_string(),
+                                proto_obj.clone(),
+                            );
+                            proto_obj
+                        } else {
+                            JsValue::Undefined
+                        }
+                    }
                     _ => return None,
                 };
                 Some(jsvalue_to_jit_i64(result))
@@ -643,6 +662,9 @@ pub(crate) mod jit_runtime {
                 match &obj {
                     JsValue::PlainObject(map) => {
                         map.borrow_mut().insert(prop_name.to_string(), value);
+                    }
+                    JsValue::Function(ba) => {
+                        crate::interpreter::fn_props_set(ba, prop_name.to_string(), value);
                     }
                     _ => return None,
                 }
@@ -1350,6 +1372,17 @@ pub(crate) mod jit_runtime {
                         Some(Ok(JIT_UNDEFINED))
                     }
                 }
+                JsValue::Function(ba) => {
+                    // Look up ad-hoc properties stored in the
+                    // thread-local side table (e.g. `.prototype`).
+                    let prop_name = get_rt_string_constant_ref(name_idx)?;
+                    let val = crate::interpreter::fn_props_get(ba, &prop_name);
+                    if matches!(val, JsValue::Undefined) {
+                        None // IC miss → Phase 2 for lazy prototype creation
+                    } else {
+                        Some(encode_or_clone_ref(&val).map_err(|_| val))
+                    }
+                }
                 _ => None,
             }
         } else {
@@ -1389,6 +1422,15 @@ pub(crate) mod jit_runtime {
                             Some(Ok(arr.borrow().len() as i64))
                         } else {
                             Some(Ok(JIT_UNDEFINED))
+                        }
+                    }
+                    JsValue::Function(ba) => {
+                        let prop_name = get_rt_string_constant_ref(name_idx)?;
+                        let val = crate::interpreter::fn_props_get(ba, &prop_name);
+                        if matches!(val, JsValue::Undefined) {
+                            None // IC miss → Phase 2
+                        } else {
+                            Some(encode_or_clone_ref(&val).map_err(|_| val))
                         }
                     }
                     _ => None,
@@ -1453,6 +1495,27 @@ pub(crate) mod jit_runtime {
                 let prop_name = get_rt_string_constant_ref(name_idx)?;
                 if prop_name == "length" {
                     Some(arr.borrow().len() as i64)
+                } else {
+                    Some(JIT_UNDEFINED)
+                }
+            }
+            JsValue::Function(ba) => {
+                let prop_name = get_rt_string_constant_ref(name_idx)?;
+                let val = crate::interpreter::fn_props_get(ba, &prop_name);
+                if !matches!(val, JsValue::Undefined) {
+                    Some(jsvalue_to_jit_i64(val))
+                } else if prop_name == "prototype" && !ba.is_arrow() && !ba.is_generator() {
+                    // Lazy prototype creation (ES §10.2.5).
+                    let func_val = JsValue::Function(Rc::clone(ba));
+                    let mut proto_map = PropertyMap::new();
+                    proto_map.insert("constructor".to_string(), func_val);
+                    let proto_obj = JsValue::PlainObject(Rc::new(RefCell::new(proto_map)));
+                    crate::interpreter::fn_props_set(
+                        ba,
+                        "prototype".to_string(),
+                        proto_obj.clone(),
+                    );
+                    Some(jsvalue_to_jit_i64(proto_obj))
                 } else {
                     Some(JIT_UNDEFINED)
                 }
@@ -2583,6 +2646,11 @@ pub(crate) mod jit_runtime {
             JsValue::PlainObject(map_rc) => {
                 let prop_name = get_rt_string_constant_ref(name_idx)?;
                 map_rc.borrow_mut().insert(prop_name.to_string(), value);
+                Some(value_i64)
+            }
+            JsValue::Function(ba) => {
+                let prop_name = get_rt_string_constant_ref(name_idx)?;
+                crate::interpreter::fn_props_set(ba, prop_name.to_string(), value);
                 Some(value_i64)
             }
             _ => None,
