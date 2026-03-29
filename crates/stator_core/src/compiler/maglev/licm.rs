@@ -346,13 +346,6 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
                 // After hoisting this node, its NodeId becomes "outside" too,
                 // so subsequent nodes that reference it may also qualify.
                 outside_defs.insert(*id);
-            } else {
-                eprintln!(
-                    "LICM_SKIP: blk={} {:?} pure={pure} inputs_out={inputs_out} \
-                     alias_store={alias_store} alias_glob={alias_glob}",
-                    block.id,
-                    std::mem::discriminant(node),
-                );
             }
         }
     }

@@ -216,19 +216,6 @@ impl<'a> GraphBuilder<'a> {
         let frame_size = bytecode.frame_size() as usize;
         let parameter_count = bytecode.parameter_count();
 
-        // Fingerprint: print the opcodes the graph builder will process.
-        let opcode_names: Vec<_> = instructions
-            .iter()
-            .take(12)
-            .map(|i| format!("{:?}", i.opcode))
-            .collect();
-        eprintln!(
-            "GRAPH_BUILD: bc_len={} instr_count={} first_ops=[{}]",
-            bytecode.bytecodes().len(),
-            instructions.len(),
-            opcode_names.join(", "),
-        );
-
         let mut builder = Self {
             bytecode,
             _feedback: feedback,

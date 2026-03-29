@@ -79,42 +79,6 @@ use std::collections::{HashMap, HashSet};
 use crate::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, NodeId, ValueNode};
 use crate::compiler::maglev::licm;
 
-/// Short variant name for diagnostic dumps.
-fn node_variant_name(n: &ValueNode) -> &'static str {
-    match n {
-        ValueNode::SmiConstant { .. } => "SmiConst",
-        ValueNode::Int32Constant { .. } => "I32Const",
-        ValueNode::Float64Constant { .. } => "F64Const",
-        ValueNode::CheckSmi { .. } => "CheckSmi",
-        ValueNode::CheckNumber { .. } => "CheckNum",
-        ValueNode::CheckedSmiAdd { .. } => "ChkAdd",
-        ValueNode::CheckedSmiSubtract { .. } => "ChkSub",
-        ValueNode::CheckedSmiMultiply { .. } => "ChkMul",
-        ValueNode::CheckedSmiDivide { .. } => "ChkDiv",
-        ValueNode::CheckedSmiModulus { .. } => "ChkMod",
-        ValueNode::CheckedSmiIncrement { .. } => "ChkInc",
-        ValueNode::CheckedSmiDecrement { .. } => "ChkDec",
-        ValueNode::Int32Add { .. } => "I32Add",
-        ValueNode::Int32Subtract { .. } => "I32Sub",
-        ValueNode::Int32Multiply { .. } => "I32Mul",
-        ValueNode::Int32BitwiseOr { .. } => "I32Or",
-        ValueNode::Int32BitwiseXor { .. } => "I32Xor",
-        ValueNode::Int32BitwiseAnd { .. } => "I32And",
-        ValueNode::Int32ShiftLeft { .. } => "I32Shl",
-        ValueNode::Int32ShiftRight { .. } => "I32Shr",
-        ValueNode::Int32ShiftRightLogical { .. } => "I32Ushr",
-        ValueNode::Int32LessThan { .. } => "I32Lt",
-        ValueNode::Int32GreaterThan { .. } => "I32Gt",
-        ValueNode::Int32LessThanOrEqual { .. } => "I32Le",
-        ValueNode::Int32GreaterThanOrEqual { .. } => "I32Ge",
-        ValueNode::LoadGlobal { .. } => "LdGlob",
-        ValueNode::StoreGlobal { .. } => "StGlob",
-        ValueNode::LoadNamedGeneric { .. } => "LdNamed",
-        ValueNode::Phi { .. } => "Phi",
-        _ => "Other",
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry-point
 // ─────────────────────────────────────────────────────────────────────────────
@@ -132,20 +96,6 @@ pub fn optimize(graph: &mut MaglevGraph) {
     let node_count: usize = graph.blocks().iter().map(|b| b.nodes.len()).sum();
 
     fold_constants(graph);
-
-    // Diagnostic: dump all node types per block before truncation runs.
-    for block in graph.blocks() {
-        let names: Vec<String> = block
-            .nodes
-            .iter()
-            .map(|(id, n)| format!("{}:{}", id.0, node_variant_name(n)))
-            .collect();
-        eprintln!(
-            "GRAPH_DUMP: block={} nodes=[{}]",
-            block.id,
-            names.join(", ")
-        );
-    }
 
     let truncations = propagate_int32_truncation(graph);
     simplify_identities(graph);
@@ -435,7 +385,7 @@ fn propagate_int32_truncation(graph: &mut MaglevGraph) -> usize {
     // 3. Find truncation points (bitwise/shift ops) and walk backward.
     let mut replacements: HashMap<NodeId, ValueNode> = HashMap::new();
     for block in graph.blocks() {
-        for (node_id, node) in &block.nodes {
+        for (_node_id, node) in &block.nodes {
             match node {
                 ValueNode::Int32BitwiseOr { left, right }
                 | ValueNode::Int32BitwiseXor { left, right }
@@ -443,17 +393,6 @@ fn propagate_int32_truncation(graph: &mut MaglevGraph) -> usize {
                 | ValueNode::Int32ShiftLeft { left, right }
                 | ValueNode::Int32ShiftRight { left, right }
                 | ValueNode::Int32ShiftRightLogical { left, right } => {
-                    eprintln!(
-                        "TRUNC_POINT: node={} left={} (use_count={:?}) right={} (use_count={:?})",
-                        node_id.0,
-                        left.0,
-                        use_counts.get(left),
-                        right.0,
-                        use_counts.get(right),
-                    );
-                    if let Some(left_node) = node_map.get(left) {
-                        eprintln!("  left_node: {:?}", std::mem::discriminant(left_node));
-                    }
                     mark_truncated(*left, &use_counts, &node_map, &mut replacements);
                     mark_truncated(*right, &use_counts, &node_map, &mut replacements);
                 }
@@ -487,7 +426,6 @@ fn mark_truncated(
 ) {
     let uc = use_counts.get(&id);
     if uc != Some(&1) {
-        eprintln!("  TRUNC_SKIP: node={} use_count={:?} (need 1)", id.0, uc);
         return;
     }
     if let Some(node) = node_map.get(&id) {
@@ -513,6 +451,12 @@ fn mark_truncated(
                 },
                 vec![*left, *right],
             ),
+            ValueNode::CheckedSmiIncrement { value } => {
+                (ValueNode::Int32Increment { value: *value }, vec![*value])
+            }
+            ValueNode::CheckedSmiDecrement { value } => {
+                (ValueNode::Int32Decrement { value: *value }, vec![*value])
+            }
             _ => return,
         };
 
