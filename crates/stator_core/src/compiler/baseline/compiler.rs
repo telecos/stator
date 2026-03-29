@@ -122,8 +122,11 @@ pub(crate) const JIT_HEAP_TAG: i64 = 0x2_0000_0000_i64;
 
 /// Convert a JIT `i64` value back to a [`crate::objects::value::JsValue`].
 ///
-/// Returns `None` if `v` is not a recognised sentinel and does not fit in
-/// `i32` (i.e. is an out-of-range or deopt value).
+/// Returns `None` if `v` is the [`JIT_DEOPT`] sentinel (the JIT requested
+/// a fall-back to the interpreter).  All other values are mapped to a
+/// concrete `JsValue`: sentinels → booleans/undefined/null, i32-range →
+/// Smi, and everything else is reinterpreted as an IEEE 754 `f64` bit
+/// pattern (the inverse of the `jsvalue_to_jit` HeapNumber encoding).
 pub fn jit_to_jsvalue(v: i64) -> Option<crate::objects::value::JsValue> {
     use crate::objects::value::JsValue;
     // Fast path: Smi values are the overwhelmingly common case (loop
@@ -140,9 +143,9 @@ pub fn jit_to_jsvalue(v: i64) -> Option<crate::objects::value::JsValue> {
     } else if v == JIT_NULL {
         Some(JsValue::Null)
     } else {
-        // Large integer outside Smi range: promote to HeapNumber (f64).
-        // All integers up to 2^53 are exactly representable as f64, so
-        // arithmetic results that overflow i32 can be returned faithfully.
+        // Value outside Smi range — promote to HeapNumber via lossy f64 cast.
+        // JIT arithmetic that overflows i32 produces large i64 values that
+        // must be presented to JS as floating-point numbers.
         Some(JsValue::HeapNumber(v as f64))
     }
 }
@@ -3423,6 +3426,23 @@ struct MetadataFooter {
     deopt_table_start: u32,
 }
 
+#[cfg(all(target_arch = "x86_64", unix))]
+const STACK_REGISTER_FILE_SLOTS: usize = 32;
+
+#[cfg(all(target_arch = "x86_64", unix))]
+fn init_register_file(
+    args: &[i64],
+    register_file_slots: usize,
+) -> smallvec::SmallVec<[i64; STACK_REGISTER_FILE_SLOTS]> {
+    use smallvec::{SmallVec, smallvec};
+
+    let mut regs: SmallVec<[i64; STACK_REGISTER_FILE_SLOTS]> = smallvec![0i64; register_file_slots];
+    for (i, &value) in args.iter().enumerate().take(regs.len()) {
+        regs[i] = value;
+    }
+    regs
+}
+
 impl CompiledCode {
     /// Look up the safepoint entry whose `code_offset` equals `offset`.
     ///
@@ -3560,11 +3580,9 @@ impl CompiledCode {
             ptr::copy_nonoverlapping(self.code.as_ptr(), mem.cast::<u8>(), code_size);
         }
 
-        // Build the register file: fill with zeros, then overwrite with args.
-        let mut regs = vec![0i64; self.register_file_slots];
-        for (i, &v) in args.iter().enumerate().take(regs.len()) {
-            regs[i] = v;
-        }
+        // Keep small register files on the stack to avoid per-call heap churn
+        // on hot JIT entry paths.
+        let mut regs = init_register_file(args, self.register_file_slots);
 
         // Transmute and call the JIT function.
         //
@@ -3583,6 +3601,146 @@ impl CompiledCode {
         unsafe {
             libc::munmap(mem, code_size);
         }
+
+        if result == JIT_DEOPT {
+            Err(StatorError::Internal("jit deopt".into()))
+        } else {
+            Ok(result)
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CachedExecutableCode
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Persistent JIT code page that caches the `mmap`'d executable memory.
+///
+/// The page is allocated once (by [`CachedExecutableCode::from_compiled`]) and
+/// reused for all subsequent calls, eliminating the per-call `mmap`/`munmap`
+/// syscall overhead.
+#[cfg(all(target_arch = "x86_64", unix))]
+pub struct CachedExecutableCode {
+    /// Pointer to the `mmap`'d executable memory.
+    ptr: *mut u8,
+    /// Size of the `mmap`'d region.
+    len: usize,
+    /// Function pointer to the JIT code (transmuted from `ptr`).
+    func: extern "C" fn(*mut i64) -> i64,
+    /// Number of `i64` slots needed in the register file.
+    pub register_file_slots: usize,
+}
+
+// SAFETY: The mmap'd code is position-independent and can be shared across
+// threads.  The memory is owned exclusively by this struct and freed on Drop.
+#[cfg(all(target_arch = "x86_64", unix))]
+unsafe impl Send for CachedExecutableCode {}
+
+// SAFETY: The mmap'd code is immutable after construction and the function
+// pointer is safe to call from any thread (the register file is caller-owned).
+#[cfg(all(target_arch = "x86_64", unix))]
+unsafe impl Sync for CachedExecutableCode {}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+impl std::fmt::Debug for CachedExecutableCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedExecutableCode")
+            .field("len", &self.len)
+            .field("register_file_slots", &self.register_file_slots)
+            .finish()
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+impl Drop for CachedExecutableCode {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` and `len` were set by a successful `mmap` call in
+        // `from_compiled`.
+        unsafe {
+            libc::munmap(self.ptr.cast(), self.len);
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+impl CachedExecutableCode {
+    /// Allocate executable memory, copy `code` into it, and transmute to a
+    /// persistent function pointer.
+    ///
+    /// This performs the `mmap` + `copy_nonoverlapping` + `transmute` sequence
+    /// **once**.  The resulting [`CachedExecutableCode`] can then be called
+    /// many times via [`execute`](Self::execute) without further syscalls.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StatorError::Internal`] if `code` is empty or `mmap` fails.
+    ///
+    /// # Safety
+    ///
+    /// `code` must be valid x86-64 machine code emitted by the baseline or
+    /// Maglev compiler.
+    pub unsafe fn from_compiled(code: &[u8], register_file_slots: usize) -> StatorResult<Self> {
+        use std::ptr;
+
+        let code_size = code.len();
+        if code_size == 0 {
+            return Err(StatorError::Internal("compiled code is empty".into()));
+        }
+
+        // SAFETY: arguments are valid; MAP_FAILED is checked before use.
+        let mem = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                code_size,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if mem == libc::MAP_FAILED {
+            return Err(StatorError::Internal("mmap failed for JIT code".into()));
+        }
+
+        // SAFETY: `mem` is valid, page-aligned, and sized for `code_size` bytes.
+        unsafe {
+            ptr::copy_nonoverlapping(code.as_ptr(), mem.cast::<u8>(), code_size);
+        }
+
+        // SAFETY:
+        // - `mem` contains correctly-encoded x86-64 machine code.
+        // - The function signature matches the JIT calling convention:
+        //   `extern "C" fn(*mut i64) -> i64` (SysV AMD64).
+        let func: extern "C" fn(*mut i64) -> i64 = unsafe { std::mem::transmute(mem) };
+
+        Ok(Self {
+            ptr: mem.cast::<u8>(),
+            len: code_size,
+            func,
+            register_file_slots,
+        })
+    }
+
+    /// Execute the cached JIT code with the given arguments.
+    ///
+    /// Allocates only the register file and calls the persistent function
+    /// pointer.  Small register files stay on the stack; no `mmap`/`munmap`
+    /// syscalls are issued.
+    ///
+    /// `args` provides the initial values for the parameter slots.  Missing
+    /// arguments are filled with `0` (`Smi(0)`); extra arguments are ignored.
+    ///
+    /// Returns the accumulator value on success, or
+    /// [`StatorError::Internal`] if the JIT function returns [`JIT_DEOPT`].
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure this `CachedExecutableCode` was constructed from
+    /// valid x86-64 machine code emitted by the baseline or Maglev compiler.
+    pub unsafe fn execute(&self, args: &[i64]) -> StatorResult<i64> {
+        let mut regs = init_register_file(args, self.register_file_slots);
+
+        let result = (self.func)(regs.as_mut_ptr());
 
         if result == JIT_DEOPT {
             Err(StatorError::Internal("jit deopt".into()))
@@ -3622,6 +3780,11 @@ pub struct BaselineCompiler<'a> {
     promoted_globals: Vec<(u32, usize)>,
     /// Number of extra register-file slots allocated for promoted globals.
     promoted_extra_slots: usize,
+    /// Mapping from register-file operand value to a callee-saved physical
+    /// register used as a cache.  Loads from cached slots read the physical
+    /// register directly; stores write both memory and the cached register.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    cache_map: Vec<(u32, Reg64)>,
 }
 
 impl<'a> BaselineCompiler<'a> {
@@ -3642,6 +3805,8 @@ impl<'a> BaselineCompiler<'a> {
             deopt_label: Label::new(),
             promoted_globals: Vec::new(),
             promoted_extra_slots: 0,
+            #[cfg(all(target_arch = "x86_64", unix))]
+            cache_map: Vec::new(),
         };
         c.compile_function()?;
         let register_file_slots = bytecode.parameter_count() as usize
@@ -3694,6 +3859,9 @@ impl<'a> BaselineCompiler<'a> {
     /// Five callee-saved registers are pushed (odd count) so that the stack
     /// is 16-byte aligned after the return-address push by the caller.
     ///
+    /// When register caching is active, also pushes callee-saved cache
+    /// registers and pre-loads them from the register file.
+    ///
     /// ```text
     /// push rbp
     /// mov  rbp, rsp
@@ -3713,11 +3881,22 @@ impl<'a> BaselineCompiler<'a> {
         self.masm.push(Reg64::R14);
         // Push R15 for 16-byte stack alignment (5 pushes + return addr = even).
         self.masm.push(Reg64::R15);
+        // Push callee-saved registers used for register-file caching.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        for &(_, phys_reg) in &self.cache_map {
+            self.masm.push(phys_reg);
+        }
         self.masm.mov_rr(Reg64::R14, Reg64::Rdi);
         // RSI carries the raw closure-context pointer (passed by execute).
         // Store in RBX (callee-saved) for use by context-slot stubs.
         self.masm.mov_rr(Reg64::Rbx, Reg64::Rsi);
         self.masm.xor_rr(Reg64::R12, Reg64::R12);
+        // Pre-load cached registers from the register file.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        for &(virt_reg, phys_reg) in &self.cache_map {
+            let off = self.reg_offset(virt_reg);
+            self.masm.mov_load_base_disp32(phys_reg, Reg64::R14, off);
+        }
     }
 
     /// Emit the normal function epilogue.
@@ -3733,6 +3912,11 @@ impl<'a> BaselineCompiler<'a> {
     /// ```
     fn emit_normal_epilogue(&mut self) {
         self.masm.mov_rr(Reg64::Rax, Reg64::R12);
+        // Pop cache registers in reverse push order.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        for &(_, phys_reg) in self.cache_map.iter().rev() {
+            self.masm.pop(phys_reg);
+        }
         self.masm.pop(Reg64::R15);
         self.masm.pop(Reg64::R14);
         self.masm.pop(Reg64::R12);
@@ -3791,15 +3975,35 @@ impl<'a> BaselineCompiler<'a> {
     }
 
     /// Emit code to load register `v` into `dst`.
+    ///
+    /// When register caching is active and `v` is cached in a physical
+    /// register, emits a register-to-register move instead of a memory load.
     fn emit_load_reg(&mut self, dst: Reg64, v: u32) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        if let Some(&(_, phys)) = self.cache_map.iter().find(|(vr, _)| *vr == v) {
+            if dst != phys {
+                self.masm.mov_rr(dst, phys);
+            }
+            return;
+        }
         let off = self.reg_offset(v);
         self.masm.mov_load_base_disp32(dst, Reg64::R14, off);
     }
 
     /// Emit code to store `src` into register `v`.
+    ///
+    /// Always writes to memory (so the register file is up-to-date for deopt).
+    /// When register caching is active, also updates the cached physical
+    /// register.
     fn emit_store_reg(&mut self, v: u32, src: Reg64) {
         let off = self.reg_offset(v);
         self.masm.mov_store_base_disp32(Reg64::R14, off, src);
+        #[cfg(all(target_arch = "x86_64", unix))]
+        if let Some(&(_, phys)) = self.cache_map.iter().find(|(vr, _)| *vr == v)
+            && src != phys
+        {
+            self.masm.mov_rr(phys, src);
+        }
     }
 
     // ── Global register promotion helpers ────────────────────────────────────
@@ -3815,7 +4019,7 @@ impl<'a> BaselineCompiler<'a> {
         let mut seen = std::collections::HashSet::new();
         for instr in instructions {
             if matches!(instr.opcode, Opcode::LdaGlobal | Opcode::StaGlobal)
-                && let Operand::ConstantPoolIdx(idx) = instr.operands[0]
+                && let Operand::ConstantPoolIdx(idx) = *instr.operand(0)
             {
                 seen.insert(idx);
             }
@@ -3938,7 +4142,7 @@ impl<'a> BaselineCompiler<'a> {
             _ => return Ok(0),
         };
 
-        let Operand::JumpOffset(delta) = next.operands[0] else {
+        let Operand::JumpOffset(delta) = *next.operand(0) else {
             return Ok(0);
         };
 
@@ -3993,6 +4197,149 @@ impl<'a> BaselineCompiler<'a> {
     /// Emit a conditional JMP (`cc`) to `target_idx`.
     fn emit_cond_jump(&mut self, cc: CondCode, target_idx: usize) {
         self.masm.jcc(cc, &mut self.labels[target_idx]);
+    }
+
+    // ── Codegen optimizations (x86-64 + unix only) ──────────────────────────
+
+    /// Emit an optimized load of a Smi immediate into the accumulator (R12).
+    ///
+    /// Uses shorter instruction encodings when possible:
+    /// - `xor r12d, r12d` for zero (3 bytes vs 7).
+    /// - `mov r12d, imm32` for positive values (6 bytes vs 7).
+    /// - `mov r12, imm64` (sign-extended i32) for negative values (7 bytes).
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_lda_smi_optimized(&mut self, imm: i32) {
+        if imm == 0 {
+            self.masm.xor_rr(Reg64::R12, Reg64::R12);
+        } else if imm > 0 {
+            self.masm.mov_ri32(Reg64::R12, imm as u32);
+        } else {
+            self.masm.mov_ri(Reg64::R12, imm as i64);
+        }
+    }
+
+    /// Emit an arithmetic operation (add/sub) with i64 overflow checking.
+    ///
+    /// On overflow, jumps to a deopt stub.  On success, commits the result
+    /// from the scratch register (R11) into the accumulator (R12).
+    ///
+    /// `is_sub` selects between ADD and SUB.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_arith_with_overflow_check(&mut self, v: u32, bytecode_offset: u32, is_sub: bool) {
+        self.emit_load_reg(Reg64::Rax, v);
+        self.masm.mov_rr(Reg64::R11, Reg64::R12);
+        if is_sub {
+            self.masm.sub_rr(Reg64::R11, Reg64::Rax);
+        } else {
+            self.masm.add_rr(Reg64::R11, Reg64::Rax);
+        }
+        let mut overflow = Label::new();
+        let mut done = Label::new();
+        self.masm.jo(&mut overflow);
+        // Fast path: commit result.
+        self.masm.mov_rr(Reg64::R12, Reg64::R11);
+        self.masm.jmp(&mut done);
+        // Slow path: overflow → deopt.
+        self.masm.bind_label(&mut overflow);
+        self.emit_deopt(bytecode_offset);
+        self.masm.bind_label(&mut done);
+    }
+
+    /// Emit a multiply with i64 overflow checking.
+    ///
+    /// On overflow, jumps to a deopt stub.  On success, commits the result
+    /// from the scratch register (R11) into the accumulator (R12).
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_mul_with_overflow_check(&mut self, v: u32, bytecode_offset: u32) {
+        self.emit_load_reg(Reg64::Rax, v);
+        self.masm.mov_rr(Reg64::R11, Reg64::R12);
+        self.masm.imul_rr(Reg64::R11, Reg64::Rax);
+        let mut overflow = Label::new();
+        let mut done = Label::new();
+        self.masm.jo(&mut overflow);
+        self.masm.mov_rr(Reg64::R12, Reg64::R11);
+        self.masm.jmp(&mut done);
+        self.masm.bind_label(&mut overflow);
+        self.emit_deopt(bytecode_offset);
+        self.masm.bind_label(&mut done);
+    }
+
+    /// Analyse bytecodes to identify hot registers inside loop bodies and
+    /// build a cache mapping from virtual register-file slots to spare
+    /// callee-saved physical registers (RBX, R13, R15).
+    ///
+    /// Only the first (outermost) loop is considered.  At most 3 registers
+    /// are cached.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn analyze_register_caching(
+        instructions: &[Instruction],
+        byte_offsets: &[usize],
+        n: usize,
+    ) -> Vec<(u32, Reg64)> {
+        const AVAILABLE: [Reg64; 3] = [Reg64::Rbx, Reg64::R13, Reg64::R15];
+
+        // Find backward jumps to identify loop bodies.
+        let mut best_loop: Option<(usize, usize)> = None;
+        for (idx, instr) in instructions.iter().enumerate() {
+            let delta = match instr.opcode {
+                Opcode::JumpLoop => {
+                    if let Operand::JumpOffset(d) = *instr.operand(0) {
+                        d
+                    } else {
+                        continue;
+                    }
+                }
+                Opcode::Jump => {
+                    if let Operand::JumpOffset(d) = *instr.operand(0) {
+                        if d >= 0 {
+                            continue;
+                        }
+                        d
+                    } else {
+                        continue;
+                    }
+                }
+                _ => continue,
+            };
+            let target_byte = jump_target_byte(idx, delta, byte_offsets);
+            if let Ok(target_idx) = Self::resolve_target(target_byte, byte_offsets, n) {
+                // Pick the loop with the most iterations (longest body).
+                let body_len = idx - target_idx;
+                if best_loop.is_none_or(|(_, prev_len)| body_len > prev_len) {
+                    best_loop = Some((target_idx, body_len));
+                }
+            }
+        }
+
+        let (entry_idx, body_len) = match best_loop {
+            Some(v) => v,
+            None => return Vec::new(),
+        };
+
+        // Count register-file accesses within the loop body.
+        let mut counts: Vec<(u32, usize)> = Vec::new();
+        let end = (entry_idx + body_len + 1).min(n);
+        for instr in &instructions[entry_idx..end] {
+            for op in instr.operands() {
+                if let Operand::Register(v) = op {
+                    if let Some(entry) = counts.iter_mut().find(|(vr, _)| *vr == *v) {
+                        entry.1 += 1;
+                    } else {
+                        counts.push((*v, 1));
+                    }
+                }
+            }
+        }
+
+        // Sort by descending access count and take at most AVAILABLE.len().
+        counts.sort_by(|a, b| b.1.cmp(&a.1));
+        counts
+            .into_iter()
+            .filter(|&(_, c)| c >= 2) // only cache if accessed at least twice
+            .take(AVAILABLE.len())
+            .enumerate()
+            .map(|(i, (v, _))| (v, AVAILABLE[i]))
+            .collect()
     }
 
     // ── Deopt helper ─────────────────────────────────────────────────────────
@@ -4594,11 +4941,20 @@ impl<'a> BaselineCompiler<'a> {
         // Pre-create one label per instruction.
         self.labels = (0..n).map(|_| Label::new()).collect();
 
+        // Analyse register usage in loop bodies and set up the cache map
+        // before emitting the prologue (which pushes the cache registers).
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            self.cache_map = Self::analyze_register_caching(&instructions, &byte_offsets, n);
+        }
+
         self.emit_prologue();
 
         // Load all promoted globals into their register-file slots (once).
         self.emit_promoted_global_loads();
 
+        // Use a while loop instead of for so that compile_instruction can
+        // consume extra instructions (e.g. comparison + jump fusion).
         let mut idx = 0;
         while idx < n {
             let instr = &instructions[idx];
@@ -4659,10 +5015,34 @@ impl<'a> BaselineCompiler<'a> {
                 self.masm.xor_rr(Reg64::R12, Reg64::R12);
             }
             Opcode::LdaSmi => {
-                let Operand::Immediate(v) = instr.operands[0] else {
+                let Operand::Immediate(v) = *instr.operand(0) else {
                     return Err(bad_operand("LdaSmi", 0));
                 };
-                self.masm.mov_ri(Reg64::R12, v as i64);
+                #[cfg(all(target_arch = "x86_64", unix))]
+                {
+                    self.emit_lda_smi_optimized(v);
+                }
+                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                {
+                    self.masm.mov_ri(Reg64::R12, v as i64);
+                }
+            }
+            Opcode::LdaSmiStar => {
+                let Operand::Immediate(v) = *instr.operand(0) else {
+                    return Err(bad_operand("LdaSmiStar", 0));
+                };
+                let Operand::Register(dst) = *instr.operand(1) else {
+                    return Err(bad_operand("LdaSmiStar", 1));
+                };
+                #[cfg(all(target_arch = "x86_64", unix))]
+                {
+                    self.emit_lda_smi_optimized(v);
+                }
+                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                {
+                    self.masm.mov_ri(Reg64::R12, v as i64);
+                }
+                self.emit_store_reg(dst, Reg64::R12);
             }
             Opcode::LdaUndefined => {
                 self.masm.mov_ri(Reg64::R12, JIT_UNDEFINED);
@@ -4678,7 +5058,7 @@ impl<'a> BaselineCompiler<'a> {
             }
             Opcode::Nop => {}
             Opcode::LdaConstant => {
-                let Operand::ConstantPoolIdx(idx_cp) = instr.operands[0] else {
+                let Operand::ConstantPoolIdx(idx_cp) = *instr.operand(0) else {
                     return Err(bad_operand("LdaConstant", 0));
                 };
                 match self.bytecode.get_constant(idx_cp) {
@@ -4715,22 +5095,22 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── Register moves ───────────────────────────────────────────────
             Opcode::Ldar => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("Ldar", 0));
                 };
                 self.emit_load_reg(Reg64::R12, v);
             }
             Opcode::LdarAddStar => {
-                let Operand::Register(src) = instr.operands[0] else {
+                let Operand::Register(src) = *instr.operand(0) else {
                     return Err(bad_operand("LdarAddStar", 0));
                 };
-                let Operand::Register(add_reg) = instr.operands[1] else {
+                let Operand::Register(add_reg) = *instr.operand(1) else {
                     return Err(bad_operand("LdarAddStar", 1));
                 };
-                let Operand::Register(dst) = instr.operands[2] else {
+                let Operand::Register(dst) = *instr.operand(2) else {
                     return Err(bad_operand("LdarAddStar", 2));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[3] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(3) else {
                     return Err(bad_operand("LdarAddStar", 3));
                 };
                 self.emit_load_reg(Reg64::R12, src);
@@ -4739,16 +5119,16 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_store_reg(dst, Reg64::R12);
             }
             Opcode::LdarSubStar => {
-                let Operand::Register(src) = instr.operands[0] else {
+                let Operand::Register(src) = *instr.operand(0) else {
                     return Err(bad_operand("LdarSubStar", 0));
                 };
-                let Operand::Register(sub_reg) = instr.operands[1] else {
+                let Operand::Register(sub_reg) = *instr.operand(1) else {
                     return Err(bad_operand("LdarSubStar", 1));
                 };
-                let Operand::Register(dst) = instr.operands[2] else {
+                let Operand::Register(dst) = *instr.operand(2) else {
                     return Err(bad_operand("LdarSubStar", 2));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[3] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(3) else {
                     return Err(bad_operand("LdarSubStar", 3));
                 };
                 self.emit_load_reg(Reg64::R12, src);
@@ -4756,17 +5136,35 @@ impl<'a> BaselineCompiler<'a> {
                 self.masm.sub_rr(Reg64::R12, Reg64::R11);
                 self.emit_store_reg(dst, Reg64::R12);
             }
+            Opcode::LdarMulStar => {
+                let Operand::Register(src) = *instr.operand(0) else {
+                    return Err(bad_operand("LdarMulStar", 0));
+                };
+                let Operand::Register(mul_reg) = *instr.operand(1) else {
+                    return Err(bad_operand("LdarMulStar", 1));
+                };
+                let Operand::Register(dst) = *instr.operand(2) else {
+                    return Err(bad_operand("LdarMulStar", 2));
+                };
+                let Operand::FeedbackSlot(_slot) = *instr.operand(3) else {
+                    return Err(bad_operand("LdarMulStar", 3));
+                };
+                self.emit_load_reg(Reg64::R12, src);
+                self.emit_load_reg(Reg64::R11, mul_reg);
+                self.masm.imul_rr(Reg64::R12, Reg64::R11);
+                self.emit_store_reg(dst, Reg64::R12);
+            }
             Opcode::Star => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("Star", 0));
                 };
                 self.emit_store_reg(v, Reg64::R12);
             }
             Opcode::Mov => {
-                let Operand::Register(src) = instr.operands[0] else {
+                let Operand::Register(src) = *instr.operand(0) else {
                     return Err(bad_operand("Mov", 0));
                 };
-                let Operand::Register(dst) = instr.operands[1] else {
+                let Operand::Register(dst) = *instr.operand(1) else {
                     return Err(bad_operand("Mov", 1));
                 };
                 self.emit_load_reg(Reg64::R11, src);
@@ -4775,25 +5173,46 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── Arithmetic ───────────────────────────────────────────────────
             Opcode::Add => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("Add", 0));
                 };
-                self.emit_load_reg(Reg64::R11, v);
-                self.masm.add_rr(Reg64::R12, Reg64::R11);
+                #[cfg(all(target_arch = "x86_64", unix))]
+                {
+                    self.emit_arith_with_overflow_check(v, bytecode_offset, false);
+                }
+                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                {
+                    self.emit_load_reg(Reg64::R11, v);
+                    self.masm.add_rr(Reg64::R12, Reg64::R11);
+                }
             }
             Opcode::Sub => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("Sub", 0));
                 };
-                self.emit_load_reg(Reg64::R11, v);
-                self.masm.sub_rr(Reg64::R12, Reg64::R11);
+                #[cfg(all(target_arch = "x86_64", unix))]
+                {
+                    self.emit_arith_with_overflow_check(v, bytecode_offset, true);
+                }
+                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                {
+                    self.emit_load_reg(Reg64::R11, v);
+                    self.masm.sub_rr(Reg64::R12, Reg64::R11);
+                }
             }
             Opcode::Mul => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("Mul", 0));
                 };
-                self.emit_load_reg(Reg64::R11, v);
-                self.masm.imul_rr(Reg64::R12, Reg64::R11);
+                #[cfg(all(target_arch = "x86_64", unix))]
+                {
+                    self.emit_mul_with_overflow_check(v, bytecode_offset);
+                }
+                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                {
+                    self.emit_load_reg(Reg64::R11, v);
+                    self.masm.imul_rr(Reg64::R12, Reg64::R11);
+                }
             }
             Opcode::Inc => {
                 self.masm.add_ri(Reg64::R12, 1);
@@ -4802,77 +5221,101 @@ impl<'a> BaselineCompiler<'a> {
                 self.masm.sub_ri(Reg64::R12, 1);
             }
             Opcode::AddSmi => {
-                let Operand::Immediate(imm) = instr.operands[0] else {
+                let Operand::Immediate(imm) = *instr.operand(0) else {
                     return Err(bad_operand("AddSmi", 0));
                 };
                 self.masm.add_ri(Reg64::R12, imm);
             }
             Opcode::AddSmiStar => {
-                let Operand::Immediate(imm) = instr.operands[0] else {
+                let Operand::Immediate(imm) = *instr.operand(0) else {
                     return Err(bad_operand("AddSmiStar", 0));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
                     return Err(bad_operand("AddSmiStar", 1));
                 };
-                let Operand::Register(dst) = instr.operands[2] else {
+                let Operand::Register(dst) = *instr.operand(2) else {
                     return Err(bad_operand("AddSmiStar", 2));
                 };
                 self.masm.add_ri(Reg64::R12, imm);
                 self.emit_store_reg(dst, Reg64::R12);
             }
             Opcode::SubSmi => {
-                let Operand::Immediate(imm) = instr.operands[0] else {
+                let Operand::Immediate(imm) = *instr.operand(0) else {
                     return Err(bad_operand("SubSmi", 0));
                 };
                 self.masm.sub_ri(Reg64::R12, imm);
             }
             Opcode::MulSmi => {
-                let Operand::Immediate(imm) = instr.operands[0] else {
+                let Operand::Immediate(imm) = *instr.operand(0) else {
                     return Err(bad_operand("MulSmi", 0));
                 };
                 self.masm.mov_ri(Reg64::R11, imm as i64);
                 self.masm.imul_rr(Reg64::R12, Reg64::R11);
             }
+            Opcode::MulSmiStar => {
+                let Operand::Immediate(imm) = *instr.operand(0) else {
+                    return Err(bad_operand("MulSmiStar", 0));
+                };
+                let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
+                    return Err(bad_operand("MulSmiStar", 1));
+                };
+                let Operand::Register(dst) = *instr.operand(2) else {
+                    return Err(bad_operand("MulSmiStar", 2));
+                };
+                self.masm.mov_ri(Reg64::R11, imm as i64);
+                self.masm.imul_rr(Reg64::R12, Reg64::R11);
+                self.emit_store_reg(dst, Reg64::R12);
+            }
             Opcode::Negate => {
                 self.masm.neg_r(Reg64::R12);
+            }
+            Opcode::IncStar => {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(0) else {
+                    return Err(bad_operand("IncStar", 0));
+                };
+                let Operand::Register(dst) = *instr.operand(1) else {
+                    return Err(bad_operand("IncStar", 1));
+                };
+                self.masm.add_ri(Reg64::R12, 1);
+                self.emit_store_reg(dst, Reg64::R12);
             }
 
             // ── Bitwise ─────────────────────────────────────────────────────
             Opcode::BitwiseOr => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("BitwiseOr", 0));
                 };
                 self.emit_load_reg(Reg64::R11, v);
                 self.masm.or_rr(Reg64::R12, Reg64::R11);
             }
             Opcode::BitwiseAnd => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("BitwiseAnd", 0));
                 };
                 self.emit_load_reg(Reg64::R11, v);
                 self.masm.and_rr(Reg64::R12, Reg64::R11);
             }
             Opcode::BitwiseXor => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("BitwiseXor", 0));
                 };
                 self.emit_load_reg(Reg64::R11, v);
                 self.masm.xor_rr(Reg64::R12, Reg64::R11);
             }
             Opcode::BitwiseOrSmi => {
-                let Operand::Immediate(imm) = instr.operands[0] else {
+                let Operand::Immediate(imm) = *instr.operand(0) else {
                     return Err(bad_operand("BitwiseOrSmi", 0));
                 };
                 self.masm.or_ri(Reg64::R12, imm);
             }
             Opcode::BitwiseAndSmi => {
-                let Operand::Immediate(imm) = instr.operands[0] else {
+                let Operand::Immediate(imm) = *instr.operand(0) else {
                     return Err(bad_operand("BitwiseAndSmi", 0));
                 };
                 self.masm.and_ri(Reg64::R12, imm);
             }
             Opcode::BitwiseXorSmi => {
-                let Operand::Immediate(imm) = instr.operands[0] else {
+                let Operand::Immediate(imm) = *instr.operand(0) else {
                     return Err(bad_operand("BitwiseXorSmi", 0));
                 };
                 self.masm.xor_ri(Reg64::R12, imm);
@@ -4883,7 +5326,7 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── Comparisons ──────────────────────────────────────────────────
             Opcode::TestLessThan => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestLessThan", 0));
                 };
                 let fused =
@@ -4894,16 +5337,16 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_compare_and_set(v, CondCode::Less);
             }
             Opcode::TestLessThanJump => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestLessThanJump", 0));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
                     return Err(bad_operand("TestLessThanJump", 1));
                 };
-                let Operand::JumpOffset(delta) = instr.operands[2] else {
+                let Operand::JumpOffset(delta) = *instr.operand(2) else {
                     return Err(bad_operand("TestLessThanJump", 2));
                 };
-                let Operand::Flag(is_true_flag) = instr.operands[3] else {
+                let Operand::Flag(is_true_flag) = *instr.operand(3) else {
                     return Err(bad_operand("TestLessThanJump", 3));
                 };
                 let target = Self::resolve_target(
@@ -4921,16 +5364,16 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(fused_cc, target);
             }
             Opcode::TestGreaterThanJump => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestGreaterThanJump", 0));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
                     return Err(bad_operand("TestGreaterThanJump", 1));
                 };
-                let Operand::JumpOffset(delta) = instr.operands[2] else {
+                let Operand::JumpOffset(delta) = *instr.operand(2) else {
                     return Err(bad_operand("TestGreaterThanJump", 2));
                 };
-                let Operand::Flag(is_true_flag) = instr.operands[3] else {
+                let Operand::Flag(is_true_flag) = *instr.operand(3) else {
                     return Err(bad_operand("TestGreaterThanJump", 3));
                 };
                 let target = Self::resolve_target(
@@ -4948,16 +5391,16 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(fused_cc, target);
             }
             Opcode::TestEqualJump => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestEqualJump", 0));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
                     return Err(bad_operand("TestEqualJump", 1));
                 };
-                let Operand::JumpOffset(delta) = instr.operands[2] else {
+                let Operand::JumpOffset(delta) = *instr.operand(2) else {
                     return Err(bad_operand("TestEqualJump", 2));
                 };
-                let Operand::Flag(is_true_flag) = instr.operands[3] else {
+                let Operand::Flag(is_true_flag) = *instr.operand(3) else {
                     return Err(bad_operand("TestEqualJump", 3));
                 };
                 let target = Self::resolve_target(
@@ -4974,17 +5417,44 @@ impl<'a> BaselineCompiler<'a> {
                 self.masm.cmp_rr(Reg64::R12, Reg64::R11);
                 self.emit_cond_jump(fused_cc, target);
             }
+            Opcode::TestNotEqualJump => {
+                let Operand::Register(v) = *instr.operand(0) else {
+                    return Err(bad_operand("TestNotEqualJump", 0));
+                };
+                let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
+                    return Err(bad_operand("TestNotEqualJump", 1));
+                };
+                let Operand::JumpOffset(delta) = *instr.operand(2) else {
+                    return Err(bad_operand("TestNotEqualJump", 2));
+                };
+                let Operand::Flag(is_true_flag) = *instr.operand(3) else {
+                    return Err(bad_operand("TestNotEqualJump", 3));
+                };
+                let target = Self::resolve_target(
+                    jump_target_byte(idx, delta, byte_offsets),
+                    byte_offsets,
+                    n,
+                )?;
+                let fused_cc = if is_true_flag == 0 {
+                    negate_cc(CondCode::NotEqual)
+                } else {
+                    CondCode::NotEqual
+                };
+                self.emit_load_reg(Reg64::R11, v);
+                self.masm.cmp_rr(Reg64::R12, Reg64::R11);
+                self.emit_cond_jump(fused_cc, target);
+            }
             Opcode::TestEqualStrictJump => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestEqualStrictJump", 0));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
                     return Err(bad_operand("TestEqualStrictJump", 1));
                 };
-                let Operand::JumpOffset(delta) = instr.operands[2] else {
+                let Operand::JumpOffset(delta) = *instr.operand(2) else {
                     return Err(bad_operand("TestEqualStrictJump", 2));
                 };
-                let Operand::Flag(is_true_flag) = instr.operands[3] else {
+                let Operand::Flag(is_true_flag) = *instr.operand(3) else {
                     return Err(bad_operand("TestEqualStrictJump", 3));
                 };
                 let target = Self::resolve_target(
@@ -5001,21 +5471,75 @@ impl<'a> BaselineCompiler<'a> {
                 self.masm.cmp_rr(Reg64::R12, Reg64::R11);
                 self.emit_cond_jump(fused_cc, target);
             }
+            Opcode::TestLessThanOrEqualJump => {
+                let Operand::Register(v) = *instr.operand(0) else {
+                    return Err(bad_operand("TestLessThanOrEqualJump", 0));
+                };
+                let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
+                    return Err(bad_operand("TestLessThanOrEqualJump", 1));
+                };
+                let Operand::JumpOffset(delta) = *instr.operand(2) else {
+                    return Err(bad_operand("TestLessThanOrEqualJump", 2));
+                };
+                let Operand::Flag(is_true_flag) = *instr.operand(3) else {
+                    return Err(bad_operand("TestLessThanOrEqualJump", 3));
+                };
+                let target = Self::resolve_target(
+                    jump_target_byte(idx, delta, byte_offsets),
+                    byte_offsets,
+                    n,
+                )?;
+                let fused_cc = if is_true_flag == 0 {
+                    negate_cc(CondCode::LessEq)
+                } else {
+                    CondCode::LessEq
+                };
+                self.emit_load_reg(Reg64::R11, v);
+                self.masm.cmp_rr(Reg64::R12, Reg64::R11);
+                self.emit_cond_jump(fused_cc, target);
+            }
+            Opcode::TestGreaterThanOrEqualJump => {
+                let Operand::Register(v) = *instr.operand(0) else {
+                    return Err(bad_operand("TestGreaterThanOrEqualJump", 0));
+                };
+                let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
+                    return Err(bad_operand("TestGreaterThanOrEqualJump", 1));
+                };
+                let Operand::JumpOffset(delta) = *instr.operand(2) else {
+                    return Err(bad_operand("TestGreaterThanOrEqualJump", 2));
+                };
+                let Operand::Flag(is_true_flag) = *instr.operand(3) else {
+                    return Err(bad_operand("TestGreaterThanOrEqualJump", 3));
+                };
+                let target = Self::resolve_target(
+                    jump_target_byte(idx, delta, byte_offsets),
+                    byte_offsets,
+                    n,
+                )?;
+                let fused_cc = if is_true_flag == 0 {
+                    negate_cc(CondCode::GreaterEq)
+                } else {
+                    CondCode::GreaterEq
+                };
+                self.emit_load_reg(Reg64::R11, v);
+                self.masm.cmp_rr(Reg64::R12, Reg64::R11);
+                self.emit_cond_jump(fused_cc, target);
+            }
             Opcode::SubSmiStar => {
-                let Operand::Immediate(imm) = instr.operands[0] else {
+                let Operand::Immediate(imm) = *instr.operand(0) else {
                     return Err(bad_operand("SubSmiStar", 0));
                 };
-                let Operand::FeedbackSlot(_slot) = instr.operands[1] else {
+                let Operand::FeedbackSlot(_slot) = *instr.operand(1) else {
                     return Err(bad_operand("SubSmiStar", 1));
                 };
-                let Operand::Register(dst) = instr.operands[2] else {
+                let Operand::Register(dst) = *instr.operand(2) else {
                     return Err(bad_operand("SubSmiStar", 2));
                 };
                 self.masm.sub_ri(Reg64::R12, imm);
                 self.emit_store_reg(dst, Reg64::R12);
             }
             Opcode::TestGreaterThan => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestGreaterThan", 0));
                 };
                 let fused = self.try_fuse_compare_jump(
@@ -5031,7 +5555,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_compare_and_set(v, CondCode::Greater);
             }
             Opcode::TestLessThanOrEqual => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestLessThanOrEqual", 0));
                 };
                 let fused = self.try_fuse_compare_jump(
@@ -5047,7 +5571,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_compare_and_set(v, CondCode::LessEq);
             }
             Opcode::TestGreaterThanOrEqual => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestGreaterThanOrEqual", 0));
                 };
                 let fused = self.try_fuse_compare_jump(
@@ -5063,7 +5587,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_compare_and_set(v, CondCode::GreaterEq);
             }
             Opcode::TestEqual | Opcode::TestEqualStrict => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestEqual", 0));
                 };
                 let fused = self.try_fuse_compare_jump(
@@ -5079,7 +5603,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_compare_and_set(v, CondCode::Equal);
             }
             Opcode::TestNotEqual => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("TestNotEqual", 0));
                 };
                 let fused = self.try_fuse_compare_jump(
@@ -5111,7 +5635,7 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── Control flow ─────────────────────────────────────────────────
             Opcode::Jump => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("Jump", 0));
                 };
                 let target = Self::resolve_target(
@@ -5122,7 +5646,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_jump(target);
             }
             Opcode::JumpLoop => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("JumpLoop", 0));
                 };
                 let target = Self::resolve_target(
@@ -5133,7 +5657,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_jump(target);
             }
             Opcode::JumpIfTrue => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("JumpIfTrue", 0));
                 };
                 let target = Self::resolve_target(
@@ -5147,7 +5671,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::Equal, target);
             }
             Opcode::JumpIfFalse => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("JumpIfFalse", 0));
                 };
                 let target = Self::resolve_target(
@@ -5160,7 +5684,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::Equal, target);
             }
             Opcode::JumpIfToBooleanTrue => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("JumpIfToBooleanTrue", 0));
                 };
                 let target = Self::resolve_target(
@@ -5174,7 +5698,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::NotEqual, target);
             }
             Opcode::JumpIfToBooleanFalse => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("JumpIfToBooleanFalse", 0));
                 };
                 let target = Self::resolve_target(
@@ -5188,7 +5712,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::Equal, target);
             }
             Opcode::JumpIfNull => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("JumpIfNull", 0));
                 };
                 let target = Self::resolve_target(
@@ -5201,7 +5725,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::Equal, target);
             }
             Opcode::JumpIfNotNull => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("JumpIfNotNull", 0));
                 };
                 let target = Self::resolve_target(
@@ -5214,7 +5738,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::NotEqual, target);
             }
             Opcode::JumpIfUndefined => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("JumpIfUndefined", 0));
                 };
                 let target = Self::resolve_target(
@@ -5227,7 +5751,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::Equal, target);
             }
             Opcode::JumpIfNotUndefined => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("JumpIfNotUndefined", 0));
                 };
                 let target = Self::resolve_target(
@@ -5240,7 +5764,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.emit_cond_jump(CondCode::NotEqual, target);
             }
             Opcode::JumpIfUndefinedOrNull => {
-                let Operand::JumpOffset(delta) = instr.operands[0] else {
+                let Operand::JumpOffset(delta) = *instr.operand(0) else {
                     return Err(bad_operand("JumpIfUndefinedOrNull", 0));
                 };
                 let target = Self::resolve_target(
@@ -5283,11 +5807,11 @@ impl<'a> BaselineCompiler<'a> {
             }
 
             Opcode::CreateObjectLiteral => {
-                let feedback_slot = match instr.operands.get(1) {
+                let feedback_slot = match instr.operand_at(1) {
                     Some(Operand::FeedbackSlot(s)) => i64::from(*s),
                     _ => -1,
                 };
-                let capacity = match instr.operands.get(2) {
+                let capacity = match instr.operand_at(2) {
                     Some(Operand::Flag(count)) if *count > 0 => i64::from(*count),
                     _ => 4,
                 };
@@ -5308,10 +5832,10 @@ impl<'a> BaselineCompiler<'a> {
             }
 
             Opcode::LdaNamedProperty => {
-                let Operand::Register(obj_v) = instr.operands[0] else {
+                let Operand::Register(obj_v) = *instr.operand(0) else {
                     return Err(bad_operand("LdaNamedProperty", 0));
                 };
-                let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+                let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1) else {
                     return Err(bad_operand("LdaNamedProperty", 1));
                 };
                 let obj_flat = self.reg_flat_index(obj_v) as i64;
@@ -5326,10 +5850,10 @@ impl<'a> BaselineCompiler<'a> {
                     Opcode::StaNamedOwnProperty => "StaNamedOwnProperty",
                     _ => "DefineNamedOwnProperty",
                 };
-                let Operand::Register(obj_v) = instr.operands[0] else {
+                let Operand::Register(obj_v) = *instr.operand(0) else {
                     return Err(bad_operand(opname, 0));
                 };
-                let Operand::ConstantPoolIdx(name_idx) = instr.operands[1] else {
+                let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1) else {
                     return Err(bad_operand(opname, 1));
                 };
                 let obj_flat = self.reg_flat_index(obj_v) as i64;
@@ -5337,7 +5861,7 @@ impl<'a> BaselineCompiler<'a> {
             }
 
             Opcode::LdaKeyedProperty => {
-                let Operand::Register(obj_v) = instr.operands[0] else {
+                let Operand::Register(obj_v) = *instr.operand(0) else {
                     return Err(bad_operand("LdaKeyedProperty", 0));
                 };
                 let obj_flat = self.reg_flat_index(obj_v) as i64;
@@ -5345,10 +5869,10 @@ impl<'a> BaselineCompiler<'a> {
             }
 
             Opcode::StaKeyedProperty => {
-                let Operand::Register(obj_v) = instr.operands[0] else {
+                let Operand::Register(obj_v) = *instr.operand(0) else {
                     return Err(bad_operand("StaKeyedProperty", 0));
                 };
-                let Operand::Register(key_v) = instr.operands[1] else {
+                let Operand::Register(key_v) = *instr.operand(1) else {
                     return Err(bad_operand("StaKeyedProperty", 1));
                 };
                 let obj_flat = self.reg_flat_index(obj_v) as i64;
@@ -5357,10 +5881,10 @@ impl<'a> BaselineCompiler<'a> {
             }
 
             Opcode::StaInArrayLiteral => {
-                let Operand::Register(arr_v) = instr.operands[0] else {
+                let Operand::Register(arr_v) = *instr.operand(0) else {
                     return Err(bad_operand("StaInArrayLiteral", 0));
                 };
-                let Operand::Register(idx_v) = instr.operands[1] else {
+                let Operand::Register(idx_v) = *instr.operand(1) else {
                     return Err(bad_operand("StaInArrayLiteral", 1));
                 };
                 let arr_flat = self.reg_flat_index(arr_v) as i64;
@@ -5374,7 +5898,7 @@ impl<'a> BaselineCompiler<'a> {
             }
 
             Opcode::CallUndefinedReceiver0 => {
-                let Operand::Register(callee_v) = instr.operands[0] else {
+                let Operand::Register(callee_v) = *instr.operand(0) else {
                     return Err(bad_operand("CallUndefinedReceiver0", 0));
                 };
                 let callee_flat = self.reg_flat_index(callee_v) as i64;
@@ -5384,10 +5908,10 @@ impl<'a> BaselineCompiler<'a> {
             }
 
             Opcode::CallUndefinedReceiver1 => {
-                let Operand::Register(callee_v) = instr.operands[0] else {
+                let Operand::Register(callee_v) = *instr.operand(0) else {
                     return Err(bad_operand("CallUndefinedReceiver1", 0));
                 };
-                let Operand::Register(arg1_v) = instr.operands[1] else {
+                let Operand::Register(arg1_v) = *instr.operand(1) else {
                     return Err(bad_operand("CallUndefinedReceiver1", 1));
                 };
                 let callee_flat = self.reg_flat_index(callee_v) as i64;
@@ -5408,24 +5932,24 @@ impl<'a> BaselineCompiler<'a> {
             // context. LdaCurrentContextSlot reads from the current context;
             // LdaContextSlot walks the chain via a register-held context.
             Opcode::LdaCurrentContextSlot | Opcode::LdaImmutableCurrentContextSlot => {
-                let Operand::ConstantPoolIdx(slot) = instr.operands[0] else {
+                let Operand::ConstantPoolIdx(slot) = *instr.operand(0) else {
                     return Err(bad_operand("LdaCurrentContextSlot", 0));
                 };
                 self.emit_lda_context_slot_stub(slot, bytecode_offset);
             }
 
             Opcode::StaCurrentContextSlot => {
-                let Operand::ConstantPoolIdx(slot) = instr.operands[0] else {
+                let Operand::ConstantPoolIdx(slot) = *instr.operand(0) else {
                     return Err(bad_operand("StaCurrentContextSlot", 0));
                 };
                 self.emit_sta_context_slot_stub(slot, bytecode_offset);
             }
 
             Opcode::LdaContextSlot | Opcode::LdaImmutableContextSlot => {
-                let Operand::Register(ctx_v) = instr.operands[0] else {
+                let Operand::Register(ctx_v) = *instr.operand(0) else {
                     return Err(bad_operand("LdaContextSlot", 0));
                 };
-                let Operand::ConstantPoolIdx(slot) = instr.operands[1] else {
+                let Operand::ConstantPoolIdx(slot) = *instr.operand(1) else {
                     return Err(bad_operand("LdaContextSlot", 1));
                 };
                 let ctx_flat = self.reg_flat_index(ctx_v) as i64;
@@ -5433,10 +5957,10 @@ impl<'a> BaselineCompiler<'a> {
             }
 
             Opcode::StaContextSlot => {
-                let Operand::Register(ctx_v) = instr.operands[0] else {
+                let Operand::Register(ctx_v) = *instr.operand(0) else {
                     return Err(bad_operand("StaContextSlot", 0));
                 };
-                let Operand::ConstantPoolIdx(slot) = instr.operands[1] else {
+                let Operand::ConstantPoolIdx(slot) = *instr.operand(1) else {
                     return Err(bad_operand("StaContextSlot", 1));
                 };
                 let ctx_flat = self.reg_flat_index(ctx_v) as i64;
@@ -5450,13 +5974,13 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── Construct (new) runtime stub ─────────────────────────────────
             Opcode::Construct => {
-                let Operand::Register(ctor_v) = instr.operands[0] else {
+                let Operand::Register(ctor_v) = *instr.operand(0) else {
                     return Err(bad_operand("Construct", 0));
                 };
-                let Operand::Register(args_start_v) = instr.operands[1] else {
+                let Operand::Register(args_start_v) = *instr.operand(1) else {
                     return Err(bad_operand("Construct", 1));
                 };
-                let Operand::RegisterCount(arg_count) = instr.operands[2] else {
+                let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
                     return Err(bad_operand("Construct", 2));
                 };
                 let ctor_flat = self.reg_flat_index(ctor_v) as i64;
@@ -5472,7 +5996,7 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── Global variable specialized stubs ────────────────────────────
             Opcode::LdaGlobal => {
-                let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+                let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
                     return Err(bad_operand("LdaGlobal", 0));
                 };
                 #[allow(unused_variables)]
@@ -5495,8 +6019,36 @@ impl<'a> BaselineCompiler<'a> {
                 }
             }
 
+            Opcode::LdaGlobalStar => {
+                let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
+                    return Err(bad_operand("LdaGlobalStar", 0));
+                };
+                let Operand::Register(dst) = *instr.operand(2) else {
+                    return Err(bad_operand("LdaGlobalStar", 2));
+                };
+                #[allow(unused_variables)]
+                if let Some(flat) = self.promoted_slot_for(name_idx) {
+                    #[cfg(all(target_arch = "x86_64", unix))]
+                    {
+                        self.masm.mov_load_base_disp32(
+                            Reg64::R12,
+                            Reg64::R14,
+                            Self::promoted_offset(flat),
+                        );
+                        self.emit_store_reg(dst, Reg64::R12);
+                    }
+                    #[cfg(not(all(target_arch = "x86_64", unix)))]
+                    {
+                        self.emit_deopt(bytecode_offset);
+                    }
+                } else {
+                    self.emit_lda_global_stub(name_idx, bytecode_offset);
+                    self.emit_store_reg(dst, Reg64::R12);
+                }
+            }
+
             Opcode::StaGlobal => {
-                let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+                let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
                     return Err(bad_operand("StaGlobal", 0));
                 };
                 #[allow(unused_variables)]
@@ -5521,7 +6073,7 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── Dynamic scope lookup stub ────────────────────────────────────
             Opcode::LdaLookupSlot => {
-                let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+                let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
                     return Err(bad_operand("LdaLookupSlot", 0));
                 };
                 self.emit_runtime_stub(
@@ -5548,7 +6100,7 @@ impl<'a> BaselineCompiler<'a> {
                     Opcode::ShiftRight => "ShiftRight",
                     _ => "ShiftRightLogical",
                 };
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand(opname, 0));
                 };
                 let lhs_flat = self.reg_flat_index(v) as i64;
@@ -5557,7 +6109,7 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── TestTypeOf runtime stub ──────────────────────────────────────
             Opcode::TestTypeOf => {
-                let Operand::Flag(type_flag) = instr.operands[0] else {
+                let Operand::Flag(type_flag) = *instr.operand(0) else {
                     return Err(bad_operand("TestTypeOf", 0));
                 };
                 self.emit_runtime_stub(
@@ -5570,7 +6122,7 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── TestInstanceOf runtime stub ──────────────────────────────────
             Opcode::TestInstanceOf => {
-                let Operand::Register(rhs_v) = instr.operands[0] else {
+                let Operand::Register(rhs_v) = *instr.operand(0) else {
                     return Err(bad_operand("TestInstanceOf", 0));
                 };
                 let rhs_flat = self.reg_flat_index(rhs_v) as i64;
@@ -5579,7 +6131,7 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── TestIn runtime stub ─────────────────────────────────────────
             Opcode::TestIn => {
-                let Operand::Register(obj_v) = instr.operands[0] else {
+                let Operand::Register(obj_v) = *instr.operand(0) else {
                     return Err(bad_operand("TestIn", 0));
                 };
                 let obj_flat = self.reg_flat_index(obj_v) as i64;
@@ -5588,7 +6140,7 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── ThrowReferenceErrorIfHole runtime stub ──────────────────────
             Opcode::ThrowReferenceErrorIfHole => {
-                let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] else {
+                let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) else {
                     return Err(bad_operand("ThrowReferenceErrorIfHole", 0));
                 };
                 self.emit_runtime_stub(
@@ -5611,7 +6163,7 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── CreateClosure runtime stub ──────────────────────────────────
             Opcode::CreateClosure => {
-                let Operand::ConstantPoolIdx(cp_idx) = instr.operands[0] else {
+                let Operand::ConstantPoolIdx(cp_idx) = *instr.operand(0) else {
                     return Err(bad_operand("CreateClosure", 0));
                 };
                 self.emit_runtime_stub(
@@ -5624,7 +6176,7 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── CreateFunctionContext runtime stub ───────────────────────────
             Opcode::CreateFunctionContext => {
-                let slot_count = match instr.operands.get(1) {
+                let slot_count = match instr.operand_at(1) {
                     Some(Operand::Immediate(n)) => i64::from(*n),
                     _ => 0,
                 };
@@ -5638,7 +6190,7 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── PushContext / PopContext runtime stubs ────────────────────────
             Opcode::PushContext => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("PushContext", 0));
                 };
                 let reg_flat = self.reg_flat_index(v) as i64;
@@ -5646,7 +6198,7 @@ impl<'a> BaselineCompiler<'a> {
             }
 
             Opcode::PopContext => {
-                let Operand::Register(v) = instr.operands[0] else {
+                let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("PopContext", 0));
                 };
                 let reg_flat = self.reg_flat_index(v) as i64;
@@ -5655,7 +6207,7 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── Div / Mod runtime stubs ─────────────────────────────────────
             Opcode::Div => {
-                let Operand::Register(lhs_v) = instr.operands[0] else {
+                let Operand::Register(lhs_v) = *instr.operand(0) else {
                     return Err(bad_operand("Div", 0));
                 };
                 let lhs_flat = self.reg_flat_index(lhs_v) as i64;
@@ -5663,7 +6215,7 @@ impl<'a> BaselineCompiler<'a> {
             }
 
             Opcode::Mod => {
-                let Operand::Register(lhs_v) = instr.operands[0] else {
+                let Operand::Register(lhs_v) = *instr.operand(0) else {
                     return Err(bad_operand("Mod", 0));
                 };
                 let lhs_flat = self.reg_flat_index(lhs_v) as i64;
@@ -5672,10 +6224,10 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── CallProperty0 specialized stub ─────────────────────────────
             Opcode::CallProperty0 => {
-                let Operand::Register(callee_v) = instr.operands[0] else {
+                let Operand::Register(callee_v) = *instr.operand(0) else {
                     return Err(bad_operand("CallProperty0", 0));
                 };
-                let Operand::Register(receiver_v) = instr.operands[1] else {
+                let Operand::Register(receiver_v) = *instr.operand(1) else {
                     return Err(bad_operand("CallProperty0", 1));
                 };
                 let callee_flat = self.reg_flat_index(callee_v) as i64;
@@ -5687,13 +6239,13 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── CallProperty1 specialized stub ─────────────────────────────
             Opcode::CallProperty1 => {
-                let Operand::Register(callee_v) = instr.operands[0] else {
+                let Operand::Register(callee_v) = *instr.operand(0) else {
                     return Err(bad_operand("CallProperty1", 0));
                 };
-                let Operand::Register(receiver_v) = instr.operands[1] else {
+                let Operand::Register(receiver_v) = *instr.operand(1) else {
                     return Err(bad_operand("CallProperty1", 1));
                 };
-                let Operand::Register(arg0_v) = instr.operands[2] else {
+                let Operand::Register(arg0_v) = *instr.operand(2) else {
                     return Err(bad_operand("CallProperty1", 2));
                 };
                 let callee_flat = self.reg_flat_index(callee_v) as i64;
@@ -5711,7 +6263,7 @@ impl<'a> BaselineCompiler<'a> {
 
             // ── DivSmi / ModSmi runtime stubs ───────────────────────────────
             Opcode::DivSmi => {
-                let imm = match instr.operands.first() {
+                let imm = match instr.operand_at(0) {
                     Some(Operand::Immediate(n)) => i64::from(*n),
                     _ => return Err(bad_operand("DivSmi", 0)),
                 };
@@ -5719,7 +6271,7 @@ impl<'a> BaselineCompiler<'a> {
             }
 
             Opcode::ModSmi => {
-                let imm = match instr.operands.first() {
+                let imm = match instr.operand_at(0) {
                     Some(Operand::Immediate(n)) => i64::from(*n),
                     _ => return Err(bad_operand("ModSmi", 0)),
                 };

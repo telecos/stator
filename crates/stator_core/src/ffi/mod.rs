@@ -243,7 +243,7 @@ impl V8Object {
     pub fn get_property_names(&self) -> Vec<String> {
         match &self.inner {
             JsValue::PlainObject(map) => {
-                let mut names: Vec<String> = map.borrow().keys().cloned().collect();
+                let mut names: Vec<String> = map.borrow().keys().map(|k| k.to_string()).collect();
                 names.sort();
                 names
             }

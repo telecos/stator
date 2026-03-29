@@ -185,6 +185,7 @@ impl MaglevCompiledCode {
     /// pointer is undefined behaviour.
     #[cfg(all(target_arch = "x86_64", unix))]
     pub unsafe fn execute(&self, args: &[i64]) -> StatorResult<i64> {
+        use smallvec::{SmallVec, smallvec};
         use std::ptr;
 
         let code_size = self.native_code_len;
@@ -212,9 +213,9 @@ impl MaglevCompiledCode {
             ptr::copy_nonoverlapping(self.code.as_ptr(), mem.cast::<u8>(), code_size);
         }
 
-        let mut regs = vec![0i64; self.register_file_slots];
-        for (i, &v) in args.iter().enumerate().take(regs.len()) {
-            regs[i] = v;
+        let mut regs: SmallVec<[i64; 32]> = smallvec![0i64; self.register_file_slots];
+        for (i, &value) in args.iter().enumerate().take(regs.len()) {
+            regs[i] = value;
         }
 
         // SAFETY:

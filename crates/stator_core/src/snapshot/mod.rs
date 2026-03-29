@@ -474,7 +474,7 @@ fn write_jsvalue(buf: &mut Vec<u8>, value: &JsValue, ctx: &mut SerContext) {
         }
         JsValue::BigInt(n) => {
             write_u8(buf, TAG_BIGINT);
-            write_i128(buf, *n);
+            write_i128(buf, **n);
         }
         JsValue::Function(rc) => {
             let addr = Rc::as_ptr(rc) as *const () as usize;
@@ -518,8 +518,8 @@ fn write_jsvalue(buf: &mut Vec<u8>, value: &JsValue, ctx: &mut SerContext) {
                 write_u8(buf, TAG_PLAIN_OBJECT);
                 write_u32(buf, borrow.len() as u32);
                 // Sort for determinism.
-                let mut entries: Vec<(&String, &JsValue)> = borrow.iter().collect();
-                entries.sort_by_key(|(k, _)| k.as_str());
+                let mut entries: Vec<(&Rc<str>, &JsValue)> = borrow.iter().collect();
+                entries.sort_by(|(left, _), (right, _)| left.as_ref().cmp(right.as_ref()));
                 for (k, v) in entries {
                     write_str32(buf, k);
                     write_jsvalue(buf, v, ctx);
@@ -895,7 +895,7 @@ fn read_jsvalue_by_tag(
         }
         TAG_BIGINT => {
             let n = read_i128(bytes, cursor)?;
-            Ok(JsValue::BigInt(n))
+            Ok(JsValue::BigInt(Box::new(n)))
         }
         TAG_FUNCTION => {
             let ba = read_bytecode_array(bytes, cursor)?;
@@ -1246,11 +1246,11 @@ mod tests {
     fn test_round_trip_bigint() {
         let big = i128::MAX;
         let mut g = HashMap::new();
-        g.insert("big".to_string(), JsValue::BigInt(big));
-        g.insert("neg".to_string(), JsValue::BigInt(-1_i128));
+        g.insert("big".to_string(), JsValue::BigInt(Box::new(big)));
+        g.insert("neg".to_string(), JsValue::BigInt(Box::new(-1_i128)));
         let r = round_trip(g);
-        assert_eq!(r.get("big"), Some(&JsValue::BigInt(big)));
-        assert_eq!(r.get("neg"), Some(&JsValue::BigInt(-1)));
+        assert_eq!(r.get("big"), Some(&JsValue::BigInt(Box::new(big))));
+        assert_eq!(r.get("neg"), Some(&JsValue::BigInt(Box::new(-1))));
     }
 
     // ── composite values ──────────────────────────────────────────────────────

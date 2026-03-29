@@ -5,9 +5,9 @@
 //!
 //! # Overview
 //!
-//! - [`InterpreterFrame`] — holds the register file, accumulator,
+//! - [`InterpreterFrame`] ΓÇö holds the register file, accumulator,
 //!   program counter, and scope context for a single function activation.
-//! - [`Interpreter`] — stateless executor; call [`Interpreter::run`] with
+//! - [`Interpreter`] ΓÇö stateless executor; call [`Interpreter::run`] with
 //!   a mutable frame to execute it.
 //!
 //! # Supported opcodes
@@ -16,55 +16,55 @@
 //!
 //! | Opcode                 | Semantics                                |
 //! |------------------------|------------------------------------------|
-//! | `LdaZero`              | `acc ← 0`                                |
-//! | `LdaSmi(imm)`          | `acc ← imm`                              |
-//! | `LdaUndefined`         | `acc ← undefined`                        |
-//! | `LdaNull`              | `acc ← null`                             |
-//! | `LdaTrue`              | `acc ← true`                             |
-//! | `LdaFalse`             | `acc ← false`                            |
-//! | `LdaConstant(k)`       | `acc ← constant_pool[k]`                 |
-//! | `Ldar(reg)`            | `acc ← reg`                              |
-//! | `Star(reg)`            | `reg ← acc`                              |
+//! | `LdaZero`              | `acc ΓåÉ 0`                                |
+//! | `LdaSmi(imm)`          | `acc ΓåÉ imm`                              |
+//! | `LdaUndefined`         | `acc ΓåÉ undefined`                        |
+//! | `LdaNull`              | `acc ΓåÉ null`                             |
+//! | `LdaTrue`              | `acc ΓåÉ true`                             |
+//! | `LdaFalse`             | `acc ΓåÉ false`                            |
+//! | `LdaConstant(k)`       | `acc ΓåÉ constant_pool[k]`                 |
+//! | `Ldar(reg)`            | `acc ΓåÉ reg`                              |
+//! | `Star(reg)`            | `reg ΓåÉ acc`                              |
 //!
 //! ## Arithmetic
 //!
 //! | Opcode                 | Semantics                                |
 //! |------------------------|------------------------------------------|
-//! | `Add(reg, _)`          | `acc ← acc + reg`                        |
-//! | `Sub(reg, _)`          | `acc ← acc − reg`                        |
-//! | `Mul(reg, _)`          | `acc ← acc × reg`                        |
-//! | `Div(reg, _)`          | `acc ← acc ÷ reg`                        |
-//! | `Mod(reg, _)`          | `acc ← acc % reg`                        |
-//! | `Inc(_)`               | `acc ← acc + 1`                          |
-//! | `Dec(_)`               | `acc ← acc − 1`                          |
+//! | `Add(reg, _)`          | `acc ΓåÉ acc + reg`                        |
+//! | `Sub(reg, _)`          | `acc ΓåÉ acc ΓêÆ reg`                        |
+//! | `Mul(reg, _)`          | `acc ΓåÉ acc ├ù reg`                        |
+//! | `Div(reg, _)`          | `acc ΓåÉ acc ├╖ reg`                        |
+//! | `Mod(reg, _)`          | `acc ΓåÉ acc % reg`                        |
+//! | `Inc(_)`               | `acc ΓåÉ acc + 1`                          |
+//! | `Dec(_)`               | `acc ΓåÉ acc ΓêÆ 1`                          |
 //!
 //! ## Comparison
 //!
 //! | Opcode                    | Semantics                             |
 //! |---------------------------|---------------------------------------|
-//! | `TestEqual(reg, _)`       | `acc ← acc == reg`  (abstract eq)    |
-//! | `TestNotEqual(reg, _)`    | `acc ← acc != reg`  (abstract neq)   |
-//! | `TestEqualStrict(reg, _)` | `acc ← acc === reg` (strict eq)      |
-//! | `TestLessThan(reg, _)`    | `acc ← acc < reg`                    |
-//! | `TestGreaterThan(reg, _)` | `acc ← acc > reg`                    |
-//! | `TestLessThanOrEqual(r,_)`| `acc ← acc <= reg`                   |
-//! | `TestGreaterThanOrEqual`  | `acc ← acc >= reg`                   |
-//! | `TestNull`                | `acc ← acc === null`                 |
-//! | `TestUndefined`           | `acc ← acc === undefined`            |
+//! | `TestEqual(reg, _)`       | `acc ΓåÉ acc == reg`  (abstract eq)    |
+//! | `TestNotEqual(reg, _)`    | `acc ΓåÉ acc != reg`  (abstract neq)   |
+//! | `TestEqualStrict(reg, _)` | `acc ΓåÉ acc === reg` (strict eq)      |
+//! | `TestLessThan(reg, _)`    | `acc ΓåÉ acc < reg`                    |
+//! | `TestGreaterThan(reg, _)` | `acc ΓåÉ acc > reg`                    |
+//! | `TestLessThanOrEqual(r,_)`| `acc ΓåÉ acc <= reg`                   |
+//! | `TestGreaterThanOrEqual`  | `acc ΓåÉ acc >= reg`                   |
+//! | `TestNull`                | `acc ΓåÉ acc === null`                 |
+//! | `TestUndefined`           | `acc ΓåÉ acc === undefined`            |
 //!
 //! ## Logical / Boolean
 //!
 //! | Opcode                 | Semantics                                |
 //! |------------------------|------------------------------------------|
-//! | `LogicalNot`           | `acc ← !acc` (boolean-only)              |
-//! | `ToBooleanLogicalNot`  | `acc ← !ToBoolean(acc)`                  |
+//! | `LogicalNot`           | `acc ΓåÉ !acc` (boolean-only)              |
+//! | `ToBooleanLogicalNot`  | `acc ΓåÉ !ToBoolean(acc)`                  |
 //!
 //! ## Control flow
 //!
 //! | Opcode                    | Semantics                                              |
 //! |---------------------------|--------------------------------------------------------|
 //! | `Jump(offset)`            | unconditional forward/backward jump                   |
-//! | `JumpLoop(offset,…)`      | back-edge jump (loop repeat)                          |
+//! | `JumpLoop(offset,ΓÇª)`      | back-edge jump (loop repeat)                          |
 //! | `JumpIfTrue(offset)`      | jump if `acc === true`                                |
 //! | `JumpIfFalse(offset)`     | jump if `acc === false`                               |
 //! | `JumpIfToBooleanTrue`     | jump if `ToBoolean(acc)` is truthy                    |
@@ -80,16 +80,16 @@
 //!
 //! | Opcode                    | Semantics                                              |
 //! |---------------------------|--------------------------------------------------------|
-//! | `CreateClosure(k,_,_)`    | `acc ← Function(constant_pool[k])`                    |
+//! | `CreateClosure(k,_,_)`    | `acc ΓåÉ Function(constant_pool[k])`                    |
 //!
 //! ## Function calls
 //!
 //! | Opcode                       | Semantics                                           |
 //! |------------------------------|-----------------------------------------------------|
-//! | `CallAnyReceiver(f,a,n,_)`   | `acc ← f(a, a+1, …, a+n−1)` (undefined receiver)  |
-//! | `CallUndefinedReceiver0(f,_)` | `acc ← f()` (zero args)                            |
-//! | `CallUndefinedReceiver1(f,a,_)` | `acc ← f(a)` (one arg)                           |
-//! | `CallUndefinedReceiver2(f,a,b,_)` | `acc ← f(a, b)` (two args)                    |
+//! | `CallAnyReceiver(f,a,n,_)`   | `acc ΓåÉ f(a, a+1, ΓÇª, a+nΓêÆ1)` (undefined receiver)  |
+//! | `CallUndefinedReceiver0(f,_)` | `acc ΓåÉ f()` (zero args)                            |
+//! | `CallUndefinedReceiver1(f,a,_)` | `acc ΓåÉ f(a)` (one arg)                           |
+//! | `CallUndefinedReceiver2(f,a,b,_)` | `acc ΓåÉ f(a, b)` (two args)                    |
 //! | `CallProperty(f,recv,n,_)`   | method call; `this` = `recv`, `n` args after `f`   |
 //! | `CallWithSpread(f,a,n,_)`    | same as `CallAnyReceiver` (spread pre-evaluated)   |
 //!
@@ -97,7 +97,7 @@
 //!
 //! | Opcode                       | Semantics                                           |
 //! |------------------------------|-----------------------------------------------------|
-//! | `Construct(f,a,n,_)`         | `acc ← new f(a, …, a+n−1)` (P3: returns body acc) |
+//! | `Construct(f,a,n,_)`         | `acc ΓåÉ new f(a, ΓÇª, a+nΓêÆ1)` (P3: returns body acc) |
 //! | `ConstructWithSpread(f,a,n,_)` | same as `Construct`                               |
 //! | `ConstructForwardAllArgs(f,_)` | like `Construct` but forward all current-frame args |
 //!
@@ -105,8 +105,8 @@
 //!
 //! | Opcode                    | Semantics                                              |
 //! |---------------------------|--------------------------------------------------------|
-//! | `PushContext(reg)`        | `reg ← old_ctx; ctx ← acc`                           |
-//! | `PopContext(reg)`         | `ctx ← reg`                                           |
+//! | `PushContext(reg)`        | `reg ΓåÉ old_ctx; ctx ΓåÉ acc`                           |
+//! | `PopContext(reg)`         | `ctx ΓåÉ reg`                                           |
 //!
 //! ## Exception handling
 //!
@@ -119,10 +119,10 @@
 //!
 //! | Opcode                       | Semantics                                                   |
 //! |------------------------------|-------------------------------------------------------------|
-//! | `SuspendGenerator(…)`        | yield `acc`; save registers + PC; exit loop via `suspend_result` |
-//! | `ResumeGenerator(…)`         | restore registers from `GeneratorState`; acc = sent value   |
-//! | `GetGeneratorState(gen)`     | `acc ← generator.status` as Smi (−2/−1/0/1)                |
-//! | `SetGeneratorState(gen)`     | `generator.status ← acc` (Smi)                              |
+//! | `SuspendGenerator(ΓÇª)`        | yield `acc`; save registers + PC; exit loop via `suspend_result` |
+//! | `ResumeGenerator(ΓÇª)`         | restore registers from `GeneratorState`; acc = sent value   |
+//! | `GetGeneratorState(gen)`     | `acc ΓåÉ generator.status` as Smi (ΓêÆ2/ΓêÆ1/0/1)                |
+//! | `SetGeneratorState(gen)`     | `generator.status ΓåÉ acc` (Smi)                              |
 //! | `SwitchOnGeneratorState(gen)`| jump to `resume_pc` if generator was previously suspended   |
 //!
 //! Generator execution is driven by [`Interpreter::run_generator_step`], which
@@ -147,16 +147,16 @@
 //! file:
 //!
 //! ```text
-//! [ param[0], param[1], …, local[0], local[1], … ]
-//! │←── parameter_count ──→│←────── frame_size ────→│
+//! [ param[0], param[1], ΓÇª, local[0], local[1], ΓÇª ]
+//! ΓöéΓåÉΓöÇΓöÇ parameter_count ΓöÇΓöÇΓåÆΓöéΓåÉΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ frame_size ΓöÇΓöÇΓöÇΓöÇΓåÆΓöé
 //! ```
 //!
 //! Bytecode operands encode register indices as `u32` using a two's-complement
 //! bit-cast of the compiler's `i32` register index:
 //!
-//! - `v as i32 >= 0` — local or temporary register; flat index =
+//! - `v as i32 >= 0` ΓÇö local or temporary register; flat index =
 //!   `parameter_count + v`.
-//! - `v as i32 < 0`  — parameter register; flat index = `-(v as i32 + 1)`.
+//! - `v as i32 < 0`  ΓÇö parameter register; flat index = `-(v as i32 + 1)`.
 //!
 //! # Dispatch strategy
 //!
@@ -178,6 +178,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Instant;
 
+use arrayvec::ArrayVec;
 use smallvec::SmallVec;
 
 use crate::builtins::error::{
@@ -191,6 +192,9 @@ use crate::bytecode::bytecode_array::{
 };
 #[cfg(all(target_arch = "x86_64", unix))]
 use crate::bytecode::bytecode_array::{MaglevJitCodeCache, TurbofanJitCodeCache};
+use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
+#[cfg(all(target_arch = "x86_64", unix))]
+use crate::bytecode::feedback::{FeedbackSlotKind, FeedbackVector, InlineCacheState};
 use crate::error::{StatorError, StatorResult};
 use crate::inspector::debugger::Debugger;
 use crate::objects::map::PropertyAttributes;
@@ -198,6 +202,10 @@ use crate::objects::nanbox::NanBoxedValue;
 use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
 use crate::objects::string_intern::intern;
 use crate::objects::value::{JsContext, JsValue};
+#[cfg(all(target_arch = "x86_64", unix))]
+use std::sync::Arc;
+#[cfg(all(target_arch = "x86_64", unix))]
+use std::sync::atomic::AtomicBool;
 
 // Re-export generator types and bring them into scope so external code can
 // import them from `stator_core::interpreter` (backwards-compatible path).
@@ -205,9 +213,9 @@ pub use crate::objects::value::{
     GeneratorResumeMode, GeneratorState, GeneratorStatus, GeneratorStep, NativeIterator,
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 // Debugger integration
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /// Property map for a single `Function` value in the side-table.
 type FnPropMap = Rc<RefCell<HashMap<String, JsValue>>>;
@@ -215,18 +223,7 @@ type MonoLoadCache = HashMap<u32, (usize, JsValue)>;
 type PolyLoadCache = HashMap<u32, Vec<(usize, JsValue)>>;
 type ProtoLoadIcCache = HashMap<u32, ProtoLoadIc>;
 type StringCache = HashMap<u32, Rc<str>>;
-/// Number of slots in the direct-mapped global variable inline cache.
-const GLOBAL_IC_SLOTS: usize = 32;
-/// Bitmask for mapping a constant-pool index to an IC slot.
-const GLOBAL_IC_MASK: u32 = (GLOBAL_IC_SLOTS as u32) - 1;
-/// Sentinel tag indicating an empty IC slot.
-const GLOBAL_IC_EMPTY: u32 = u32::MAX;
-/// A single IC entry: `(name_idx tag, slot_index, generation)`.
-type GlobalIcEntry = (u32, usize, u64);
-/// Fixed-size direct-mapped global variable IC array.
-type GlobalIcArray = [GlobalIcEntry; GLOBAL_IC_SLOTS];
-/// Empty IC array constant used to initialise / reset the cache.
-const GLOBAL_IC_INIT: GlobalIcArray = [(GLOBAL_IC_EMPTY, 0, 0); GLOBAL_IC_SLOTS];
+type GlobalIcCache = HashMap<u32, (usize, u64)>;
 
 thread_local! {
     /// The currently-attached debugger for this thread, if any.
@@ -261,6 +258,10 @@ thread_local! {
     /// Thread-local pool of spilled register file buffers.
     /// Avoids repeated heap allocation for large interpreter frames.
     static REGISTER_POOL: RefCell<Vec<Vec<JsValue>>> = const { RefCell::new(Vec::new()) };
+
+    /// Thread-local pool of reusable [`InterpreterFrame`] structs.
+    /// Avoids heap allocation for every function call by recycling frames.
+    static FRAME_POOL: RefCell<Vec<InterpreterFrame>> = const { RefCell::new(Vec::new()) };
 }
 
 thread_local! {
@@ -284,6 +285,25 @@ thread_local! {
     #[allow(clippy::type_complexity)]
     static CURRENT_GLOBALS: RefCell<Option<Rc<RefCell<GlobalEnv>>>> =
         const { RefCell::new(None) };
+
+    /// Per-thread cache of resolved prototype lookups for plain-object receivers.
+    ///
+    /// The cache key uses receiver pointer identity plus property-key pointer
+    /// identity, which keeps hot repeated lookups O(1) for stable object shapes.
+    static PROTO_CACHE: RefCell<HashMap<(usize, u64), (JsValue, u8)>> =
+        RefCell::new(HashMap::with_capacity(64));
+
+    /// Validation generation for entries stored in [`PROTO_CACHE`].
+    static PROTO_CACHE_GENERATIONS: RefCell<HashMap<(usize, u64), u32>> =
+        RefCell::new(HashMap::with_capacity(64));
+
+    /// Last observed global prototype-mutation epoch for the thread-local caches.
+    static PROTO_CACHE_EPOCH: Cell<u64> = const { Cell::new(0) };
+
+    /// Small cache for built-in Object.prototype resolutions that do not depend
+    /// on a specific receiver instance.
+    static BUILTIN_METHODS: RefCell<HashMap<&'static str, JsValue>> =
+        RefCell::new(HashMap::with_capacity(8));
 }
 
 /// Attach a [`Debugger`] to the current thread's interpreter.
@@ -332,7 +352,12 @@ pub fn clear_interpreter_state() {
         *table.borrow_mut() = crate::objects::js_string::StringTable::new();
     });
     REGISTER_POOL.with(|pool| pool.borrow_mut().clear());
+    FRAME_POOL.with(|pool| pool.borrow_mut().clear());
     CURRENT_GLOBALS.with(|g| *g.borrow_mut() = None);
+    PROTO_CACHE.with(|cache| cache.borrow_mut().clear());
+    PROTO_CACHE_GENERATIONS.with(|cache| cache.borrow_mut().clear());
+    PROTO_CACHE_EPOCH.with(|epoch| epoch.set(0));
+    BUILTIN_METHODS.with(|cache| cache.borrow_mut().clear());
 }
 
 /// Look up a built-in constructor by name from the current global environment.
@@ -482,6 +507,93 @@ pub(crate) fn plain_object_has_own_property(map: &PropertyMap, key: &str) -> boo
         && (map.contains_key(key) || map.has_getter_for(key) || map.has_setter_for(key))
 }
 
+#[inline]
+fn is_known_object_prototype_builtin(key: &str) -> bool {
+    matches!(
+        key,
+        "hasOwnProperty"
+            | "propertyIsEnumerable"
+            | "isPrototypeOf"
+            | "constructor"
+            | "toString"
+            | "valueOf"
+            | "toLocaleString"
+    )
+}
+
+#[inline]
+fn refresh_proto_resolution_caches() {
+    let epoch = PropertyMap::global_proto_mutation_epoch();
+    PROTO_CACHE_EPOCH.with(|cached_epoch| {
+        if cached_epoch.get() == epoch {
+            return;
+        }
+        PROTO_CACHE.with(|cache| cache.borrow_mut().clear());
+        PROTO_CACHE_GENERATIONS.with(|cache| cache.borrow_mut().clear());
+        BUILTIN_METHODS.with(|cache| cache.borrow_mut().clear());
+        cached_epoch.set(epoch);
+    });
+}
+
+#[inline]
+fn proto_cache_key(map: &Rc<RefCell<PropertyMap>>, key: &str) -> (usize, u64) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    (Rc::as_ptr(map) as usize, hasher.finish())
+}
+
+#[inline]
+fn proto_cache_store(
+    map: &Rc<RefCell<PropertyMap>>,
+    key: &str,
+    generation: u32,
+    value: &JsValue,
+    depth: u8,
+) {
+    refresh_proto_resolution_caches();
+    let cache_key = proto_cache_key(map, key);
+    PROTO_CACHE.with(|cache| {
+        cache.borrow_mut().insert(cache_key, (value.clone(), depth));
+    });
+    PROTO_CACHE_GENERATIONS.with(|cache| {
+        cache.borrow_mut().insert(cache_key, generation);
+    });
+}
+
+#[inline]
+fn proto_cache_lookup(
+    map: &Rc<RefCell<PropertyMap>>,
+    key: &str,
+    generation: u32,
+) -> Option<(JsValue, u8)> {
+    refresh_proto_resolution_caches();
+    let cache_key = proto_cache_key(map, key);
+    let cached_generation =
+        PROTO_CACHE_GENERATIONS.with(|cache| cache.borrow().get(&cache_key).copied());
+    if cached_generation != Some(generation) {
+        if cached_generation.is_some() {
+            PROTO_CACHE.with(|cache| {
+                cache.borrow_mut().remove(&cache_key);
+            });
+            PROTO_CACHE_GENERATIONS.with(|cache| {
+                cache.borrow_mut().remove(&cache_key);
+            });
+        }
+        return None;
+    }
+    PROTO_CACHE.with(|cache| cache.borrow().get(&cache_key).cloned())
+}
+
+pub(super) fn proto_lookup_cached_resolution(
+    map: &Rc<RefCell<PropertyMap>>,
+    key: &str,
+) -> Option<(JsValue, u8)> {
+    let generation = map.borrow().proto_generation();
+    proto_cache_lookup(map, key, generation)
+}
+
 /// Returns `true` if `key` exists anywhere on `obj`'s prototype chain.
 #[allow(dead_code)]
 pub(crate) fn has_property_in_chain(obj: &JsValue, key: &str) -> bool {
@@ -603,9 +715,9 @@ pub fn with_debugger<R, F: FnOnce(&mut Debugger) -> R>(f: F) -> Option<R> {
     })
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 // Function property side-table helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /// Return the identity key for a `Function`'s property table entry.
 ///
@@ -693,9 +805,9 @@ pub(crate) fn set_function_name_if_missing(value: &JsValue, name: &str) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Tiering: interpreter → baseline JIT → Maglev JIT → Turbofan JIT
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// Tiering: interpreter ΓåÆ baseline JIT ΓåÆ Maglev JIT ΓåÆ Turbofan JIT
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /// Number of loop back-edges taken before OSR baseline compilation is triggered.
 ///
@@ -705,18 +817,27 @@ pub(crate) fn set_function_name_if_missing(value: &JsValue, name: &str) {
 /// executes via native code.
 pub(super) const OSR_LOOP_THRESHOLD: u32 = 5;
 
+/// Number of loop back-edges taken before a Maglev background compilation is
+/// triggered via OSR.
+///
+/// When a loop has already caused baseline JIT compilation and the back-edge
+/// count exceeds this threshold (15 back-edges), a Maglev compilation is
+/// scheduled in a background thread so the next *call* can use the optimised
+/// tier.
+pub(super) const MAGLEV_OSR_LOOP_THRESHOLD: u32 = 15;
+
 /// Number of loop back-edges taken before a Turbofan background compilation is
 /// triggered via OSR.
 ///
 /// When a loop has already caused Maglev JIT compilation and the back-edge
-/// count exceeds this threshold (200 back-edges), a Turbofan compilation
+/// count exceeds this threshold (50 back-edges), a Turbofan compilation
 /// is scheduled in a background thread so the next *call* can use the
 /// fully-optimised tier.
-pub(super) const TURBOFAN_OSR_LOOP_THRESHOLD: u32 = 200;
+pub(super) const TURBOFAN_OSR_LOOP_THRESHOLD: u32 = 50;
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 // Generator return completion sentinel
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /// Sentinel string used by `.return()` to force a return completion through the
 /// handler table so that `finally` blocks execute before the generator completes.
@@ -756,9 +877,9 @@ pub(crate) fn get_generator_return_completion_value(value: &JsValue) -> Option<J
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 // Cross-frame exception propagation
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 thread_local! {
     /// Holds the original thrown [`JsValue`] when a `Throw`/`ReThrow` opcode
@@ -783,9 +904,9 @@ pub(super) fn take_pending_exception() -> Option<JsValue> {
     PENDING_EXCEPTION.with(|p| p.borrow_mut().take())
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 // JIT compilation statistics
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 thread_local! {
     /// Number of successful baseline JIT compilations in this thread.
@@ -823,17 +944,6 @@ thread_local! {
     static MAGLEV_DIAG_GLOBAL_DEOPT: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Set a wall-clock deadline for all interpreter execution on the current
-/// thread.  Passing `None` clears any existing deadline.
-pub fn set_execution_deadline(deadline: Option<Instant>) {
-    EXECUTION_DEADLINE.with(|d| d.set(deadline));
-}
-
-/// Return the current thread-local execution deadline, if any.
-pub fn get_execution_deadline() -> Option<Instant> {
-    EXECUTION_DEADLINE.with(|d| d.get())
-}
-
 /// Increment the Maglev global-load deopt counter (called from
 /// [`jit_runtime_lda_global`] when it returns `JIT_DEOPT`).
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -849,12 +959,29 @@ pub fn maglev_track_global_deopt() {
 #[cfg(not(all(target_arch = "x86_64", unix)))]
 pub fn maglev_track_global_deopt() {}
 
+/// Set a wall-clock deadline for all interpreter execution on the current
+/// thread.  Passing `None` clears any existing deadline.
+pub fn set_execution_deadline(deadline: Option<Instant>) {
+    EXECUTION_DEADLINE.with(|d| d.set(deadline));
+}
+
+/// Return the current thread-local execution deadline, if any.
+pub fn get_execution_deadline() -> Option<Instant> {
+    EXECUTION_DEADLINE.with(|d| d.get())
+}
+
 /// Process-wide count of successful Maglev compilations.
 ///
 /// Uses atomics so the background compilation thread can update the counter
 /// while the interpreter thread reads it.
 static MAGLEV_COMPILATION_COUNT: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
+
+/// Process-wide total machine-code bytes produced by Maglev compilations.
+///
+/// Uses atomics so the background compilation thread can update the counter
+/// while the interpreter thread reads it.
+static MAGLEV_CODE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Process-wide count of Maglev compilation attempts (threads spawned).
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -870,12 +997,6 @@ static MAGLEV_COMPILATION_FAILED: std::sync::atomic::AtomicU32 =
 #[cfg(all(target_arch = "x86_64", unix))]
 static MAGLEV_COMPILATION_PANICKED: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
-
-/// Process-wide total machine-code bytes produced by Maglev compilations.
-///
-/// Uses atomics so the background compilation thread can update the counter
-/// while the interpreter thread reads it.
-static MAGLEV_CODE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Process-wide count of successful Turbofan compilations.
 ///
@@ -934,14 +1055,8 @@ pub fn turbofan_stats() -> (u32, usize) {
 
 /// Return Maglev diagnostic counters for the current thread.
 ///
-/// Returns `(tried, executed, deopted, not_ready, compilations, code_bytes)`.
-///
-/// * `tried` – entries into `try_execute_maglev` past the deopt guard.
-/// * `executed` – successful JIT executions (no deopt).
-/// * `deopted` – executions that returned `JIT_DEOPT`.
-/// * `not_ready` – times the background compilation had not yet delivered code.
-/// * `compilations` – process-wide Maglev compilation count (from [`maglev_stats`]).
-/// * `code_bytes` – process-wide Maglev code bytes (from [`maglev_stats`]).
+/// Returns `(tried, executed, deopted, not_ready, compilations, code_bytes,
+/// started, failed, panicked)`.
 ///
 /// On platforms without Maglev JIT support all values are zero.
 pub fn maglev_diagnostics() -> (u64, u64, u64, u64, u32, usize, u32, u32, u32) {
@@ -969,6 +1084,36 @@ pub fn maglev_diagnostics() -> (u64, u64, u64, u64, u32, usize, u32, u32, u32) {
     }
     #[allow(unreachable_code)]
     (0, 0, 0, 0, 0, 0, 0, 0, 0)
+}
+
+/// Return per-tier compilation counts as `(baseline, maglev, turbofan)`.
+pub fn jit_tier_stats() -> (u64, u64, u64) {
+    (
+        u64::from(JIT_COMPILATION_COUNT.with(|c| c.get())),
+        u64::from(MAGLEV_COMPILATION_COUNT.load(std::sync::atomic::Ordering::Relaxed)),
+        u64::from(TURBOFAN_COMPILATION_COUNT.load(std::sync::atomic::Ordering::Relaxed)),
+    )
+}
+
+#[allow(dead_code)]
+#[cfg(all(target_arch = "x86_64", unix))]
+fn seed_jit_feedback(ba: &BytecodeArray) -> FeedbackVector {
+    let mut feedback = ba.feedback_vector_snapshot();
+    for slot in 0..ba.feedback_metadata().slot_count() {
+        if feedback.get_state(slot) == Some(InlineCacheState::Uninitialized)
+            && matches!(
+                ba.feedback_metadata().kind_of(slot),
+                Some(
+                    FeedbackSlotKind::BinaryOp
+                        | FeedbackSlotKind::Compare
+                        | FeedbackSlotKind::BinaryOpInc
+                )
+            )
+        {
+            let _ = feedback.set_state(slot, InlineCacheState::Monomorphic);
+        }
+    }
+    feedback
 }
 
 /// Convert a [`JsValue`] to its JIT `i64` representation.
@@ -1008,8 +1153,8 @@ fn jsvalue_to_jit(v: &JsValue) -> i64 {
 /// Request baseline JIT compilation for `ba` and cache the result.
 ///
 /// On supported platforms (x86-64 Unix) this calls [`BaselineCompiler::compile`]
-/// and stores the output via [`BytecodeArray::store_jit_code`].  On other
-/// platforms this is a no-op.
+/// and stores the cached executable code via [`BytecodeArray::store_jit_code`].
+/// On other platforms this is a no-op.
 pub(super) fn maybe_compile_baseline(ba: &BytecodeArray) {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
@@ -1096,9 +1241,9 @@ struct MaglevCompileInput {
 /// Schedule a Maglev background compilation for `ba`.
 ///
 /// On x86-64 Unix this spawns a background thread that runs the full Maglev
-/// pipeline (graph build → optimise → codegen) and writes the resulting code
+/// pipeline (graph build ΓåÆ optimise ΓåÆ codegen) and writes the resulting code
 /// into `ba`'s Maglev JIT cache.  Subsequent calls will pick up the compiled
-/// code via [`BytecodeArray::try_get_maglev_jit_code`].
+/// code via [`BytecodeArray::has_maglev_jit_code`].
 ///
 /// The function is a no-op when:
 /// - compilation has already been started (atomic flag check), or
@@ -1222,11 +1367,6 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
                     let exec = unsafe { CachedMaglevCode::new(&code, register_file_slots) };
                     *cache.borrow_mut() = exec;
                 } else {
-                    // Maglev code not ready yet — trigger compilation if it
-                    // hasn't been started.  This is the primary trigger for
-                    // top-level scripts whose loops were already captured by
-                    // the baseline JIT (so the interpreter's JumpLoop handler
-                    // never fires again).
                     maybe_compile_maglev(ba);
                     MAGLEV_DIAG_NOT_READY.with(|c| c.set(c.get() + 1));
                 }
@@ -1260,11 +1400,6 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
         let deopt_offset = (result as u64).wrapping_sub(JIT_DEOPT as u64);
         let ret = if deopt_offset <= 5 {
             MAGLEV_DIAG_DEOPTED.with(|c| c.set(c.get() + 1));
-            // Permanently mark as deopted UNLESS the reason is loop_counter.
-            // Loop-counter deopts allow retries (up to 3) so functions with
-            // correct Phi resolution succeed once the stack-based counter is
-            // immune to R13 clobber.  After 3 loop-counter deopts, the
-            // function is permanently marked (genuine infinite loop bug).
             if deopt_offset == 4 {
                 // loop_counter deopt — allow retries with limit.
                 if ba.record_maglev_loop_deopt() {
@@ -1512,9 +1647,9 @@ pub(super) fn try_execute_best_jit(
     try_execute_jit(ba, args)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MegamorphicIc – shape-based inline cache with fixed-size direct-mapped table
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// MegamorphicIc ΓÇô shape-based inline cache with fixed-size direct-mapped table
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /// Number of entries in the megamorphic inline-cache table.
 ///
@@ -1625,7 +1760,7 @@ pub type CallArgs = SmallVec<[JsValue; 4]>;
 /// 16 slots (384 bytes) covers the vast majority of closures and small
 /// functions while keeping `InterpreterFrame` compact.  Larger register
 /// files spill to the thread-local register pool.
-pub const SMALL_REG_THRESHOLD: usize = 16;
+pub const SMALL_REG_THRESHOLD: usize = 24;
 
 /// Inline-buffered register storage for interpreter frames.
 pub type RegisterFile = SmallVec<[JsValue; SMALL_REG_THRESHOLD]>;
@@ -1668,9 +1803,109 @@ fn release_registers(regs: RegisterFile) {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+/// Maximum number of [`InterpreterFrame`] structs kept in the thread-local pool.
+const FRAME_POOL_CAP: usize = 16;
+
+/// Acquire an [`InterpreterFrame`] from the thread-local pool, or allocate a
+/// new one.  When a pooled frame is available its fields are reset in-place,
+/// avoiding a fresh heap allocation for the register file, IC caches, and
+/// other per-frame state.
+#[inline]
+pub(super) fn acquire_frame(
+    bytecode_array: Rc<BytecodeArray>,
+    args: impl IntoIterator<Item = JsValue>,
+    global_env: Rc<RefCell<GlobalEnv>>,
+) -> InterpreterFrame {
+    let maybe_frame = FRAME_POOL.with(|pool| pool.borrow_mut().pop());
+
+    if let Some(mut frame) = maybe_frame {
+        let args: CallArgs = args.into_iter().collect();
+        let param_count = bytecode_array.parameter_count() as usize;
+        let frame_size = bytecode_array.frame_size() as usize;
+        let total_regs = param_count + frame_size;
+
+        // Reuse the register buffer via the register pool.
+        release_registers(std::mem::take(&mut frame.registers));
+        frame.registers = acquire_registers(total_regs);
+        for (i, arg) in args.iter().cloned().enumerate().take(param_count) {
+            frame.registers[i] = arg;
+        }
+
+        frame.bytecode_array = bytecode_array;
+        frame.call_args = args;
+        frame.accumulator = JsValue::Undefined;
+        frame.pc = 0;
+        frame.context = None;
+        frame.suspend_result = None;
+        frame.generator_state = None;
+        frame.global_env = global_env;
+        frame.osr_loop_count = 0;
+        frame.instruction_limit = 0;
+        frame.instructions_executed = 0;
+        frame.deadline = None;
+        frame.pending_message = JsValue::Undefined;
+        frame.new_target = JsValue::Undefined;
+        // IC caches are lazily allocated ΓÇö reset to None.
+        frame.mono_load_cache = None;
+        frame.poly_load_cache = None;
+        frame.mega_load_ic = None;
+        frame.proto_load_ic = None;
+        frame.mega_store_ic = None;
+        frame.string_cache = None;
+        frame.global_ic = None;
+        frame.global_cache = None;
+        frame.cache_generation = 0;
+        frame.smi_mode = false;
+        frame.hot_registers = None;
+        frame.loop_end_pc = 0;
+        frame.loop_trip_counts.clear();
+        return frame;
+    }
+
+    // No pooled frame available ΓÇö allocate a new one.
+    InterpreterFrame::new_callee_frame(bytecode_array, args, global_env)
+}
+
+/// Return an [`InterpreterFrame`] to the thread-local pool for reuse.
+///
+/// All `JsValue` fields are cleared to prevent reference leaks.  The frame's
+/// register buffer has already been returned to `REGISTER_POOL` by
+/// [`Interpreter::run_inner`], so we do not touch it here.
+#[inline]
+fn release_frame(mut frame: InterpreterFrame) {
+    // Clear all JsValue / Rc fields to allow them to be dropped.
+    frame.accumulator = JsValue::Undefined;
+    frame.context = None;
+    frame.call_args.clear();
+    frame.pending_message = JsValue::Undefined;
+    frame.new_target = JsValue::Undefined;
+    frame.suspend_result = None;
+    frame.generator_state = None;
+    // Drop remaining IC caches ΓÇö they were already written back to
+    // the BytecodeArray in run_inner.
+    frame.mono_load_cache = None;
+    frame.poly_load_cache = None;
+    frame.mega_load_ic = None;
+    frame.proto_load_ic = None;
+    frame.mega_store_ic = None;
+    frame.string_cache = None;
+    frame.global_ic = None;
+    frame.global_cache = None;
+    frame.hot_registers = None;
+    frame.loop_trip_counts.clear();
+
+    FRAME_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < FRAME_POOL_CAP {
+            pool.push(frame);
+        }
+        // else: drop the frame, releasing its memory
+    });
+}
+
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 // GlobalEnv
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /// Global environment with a generation counter for cache invalidation.
 ///
@@ -1687,7 +1922,7 @@ pub struct GlobalEnv {
     slots: Vec<JsValue>,
     /// Maps global variable name to its slot index in `slots`.
     name_to_index: HashMap<String, usize>,
-    /// Dedicated `this` binding — avoids HashMap lookup and String
+    /// Dedicated `this` binding ΓÇö avoids HashMap lookup and String
     /// allocation on the hot call path.  `None` means `this` is not
     /// bound (equivalent to the old `remove("this")`).
     this_binding: Option<JsValue>,
@@ -1806,7 +2041,7 @@ impl GlobalEnv {
     /// Call after bulk-inserting into `vars` directly (e.g. via
     /// [`install_globals`](crate::builtins::install_globals::install_globals)).
     pub fn rebuild_slots(&mut self) {
-        // Sync the dedicated this_binding from vars — install_globals
+        // Sync the dedicated this_binding from vars ΓÇö install_globals
         // writes "this" directly into vars bypassing set_this().
         if self.this_binding.is_none()
             && let Some(v) = self.vars.remove("this")
@@ -1838,7 +2073,7 @@ impl GlobalEnv {
     /// Store by slot index **and** sync the `vars` HashMap.
     ///
     /// Unlike [`insert`], this avoids allocating a new `String` key when the
-    /// variable already exists—which is the overwhelmingly common case for
+    /// variable already existsΓÇöwhich is the overwhelmingly common case for
     /// `StaGlobal` in loops.
     #[inline(always)]
     pub fn store_by_index_sync(&mut self, idx: usize, key: &str, value: JsValue) {
@@ -1849,30 +2084,10 @@ impl GlobalEnv {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// Store by slot index with HashMap sync but **no generation bump**.
-    ///
-    /// Used by the JIT runtime where the IC only tracks structural validity
-    /// (name → slot-index mapping).  A value-only change does not invalidate
-    /// that mapping, so we can skip the generation bump.  This avoids
-    /// cascading IC misses for *other* variables in the same loop iteration.
-    #[inline(always)]
-    pub fn store_by_index_fast(&mut self, idx: usize, key: &str, value: JsValue) {
-        self.slots[idx] = value.clone();
-        if let Some(v) = self.vars.get_mut(key) {
-            *v = value;
-        }
-    }
-
     /// Look up the slot index for a global variable name.
     #[inline(always)]
     pub fn slot_index_for(&self, key: &str) -> Option<usize> {
         self.name_to_index.get(key).copied()
-    }
-
-    /// Number of indexed slots.
-    #[inline(always)]
-    pub fn slot_count(&self) -> usize {
-        self.slots.len()
     }
 }
 
@@ -1882,9 +2097,9 @@ impl Default for GlobalEnv {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HotRegisters — NaN-boxed register cache
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// HotRegisters ΓÇö NaN-boxed register cache
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /// Hot register cache using NaN-boxed values (8 bytes each vs 24 bytes for
 /// [`JsValue`]).
@@ -1894,11 +2109,11 @@ impl Default for GlobalEnv {
 /// etc.), the corresponding hot register is marked invalid and the regular
 /// register file is used instead.
 ///
-/// This gives us 3× better cache density for tight arithmetic loops where
+/// This gives us 3├ù better cache density for tight arithmetic loops where
 /// all values are Smi.
 pub struct HotRegisters {
     /// NaN-boxed values, indexed the same as the flat register file.
-    /// Inline for ≤32 registers (covers nearly all frames), spills to heap
+    /// Inline for Γëñ32 registers (covers nearly all frames), spills to heap
     /// only for unusually large frames.
     values: SmallVec<[NanBoxedValue; SMALL_REG_THRESHOLD]>,
     /// Bitset: bit `i` is set if `values[i]` mirrors `registers[i]`.
@@ -1965,7 +2180,7 @@ impl HotRegisters {
     #[inline(always)]
     fn try_read(&self, idx: usize) -> Option<JsValue> {
         if idx < self.len && self.is_valid(idx) {
-            // SAFETY: idx < self.len ≤ self.values.len().
+            // SAFETY: idx < self.len Γëñ self.values.len().
             let nb = unsafe { *self.values.get_unchecked(idx) };
             Some(Self::decode(nb))
         } else {
@@ -1981,7 +2196,7 @@ impl HotRegisters {
             return false;
         }
         if let Some(nb) = Self::try_encode(value) {
-            // SAFETY: idx < self.len ≤ self.values.len().
+            // SAFETY: idx < self.len Γëñ self.values.len().
             unsafe {
                 *self.values.get_unchecked_mut(idx) = nb;
             }
@@ -2000,6 +2215,64 @@ impl HotRegisters {
     fn invalidate(&mut self, idx: usize) {
         if idx < self.len {
             self.clear_valid(idx);
+        }
+    }
+
+    /// Invalidate all hot registers, forcing subsequent reads to fall back
+    /// to the real register file.
+    #[inline(always)]
+    fn invalidate_all(&mut self) {
+        self.valid_lo = 0;
+        self.valid_hi = 0;
+    }
+
+    /// Read the raw [`NanBoxedValue`] stored for register `idx`, if valid.
+    #[inline(always)]
+    fn read_raw(&self, idx: usize) -> Option<NanBoxedValue> {
+        if idx < self.len && self.is_valid(idx) {
+            Some(self.values[idx])
+        } else {
+            None
+        }
+    }
+
+    /// Read register `idx` as an `i32` (Smi payload or boolean-as-int).
+    #[inline(always)]
+    fn read_as_i32(&self, idx: usize) -> Option<i32> {
+        let nb = self.read_raw(idx)?;
+        if nb.is_smi() {
+            Some(nb.as_smi())
+        } else if nb.is_boolean() {
+            Some(nb.as_boolean() as i32)
+        } else {
+            None
+        }
+    }
+
+    /// Write a Smi value into the hot register file.
+    #[inline(always)]
+    fn write_smi(&mut self, idx: usize, val: i32) {
+        if idx < self.len {
+            self.values[idx] = NanBoxedValue::from_smi(val);
+            self.set_valid(idx);
+        }
+    }
+
+    /// Write a boolean value into the hot register file.
+    #[inline(always)]
+    fn write_bool(&mut self, idx: usize, val: bool) {
+        if idx < self.len {
+            self.values[idx] = NanBoxedValue::from_boolean(val);
+            self.set_valid(idx);
+        }
+    }
+
+    /// Write an already-encoded [`NanBoxedValue`] into the hot register file.
+    #[inline(always)]
+    fn write_nanboxed(&mut self, idx: usize, nb: NanBoxedValue) {
+        if idx < self.len {
+            self.values[idx] = nb;
+            self.set_valid(idx);
         }
     }
 
@@ -2036,9 +2309,9 @@ impl HotRegisters {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 // InterpreterFrame
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /// A single activation frame for the Stator bytecode interpreter.
 ///
@@ -2051,7 +2324,7 @@ impl HotRegisters {
 pub struct InterpreterFrame {
     /// The bytecode for the currently-executing function.
     pub bytecode_array: Rc<BytecodeArray>,
-    /// Flat register file: `[params…, locals/temps…]`.
+    /// Flat register file: `[paramsΓÇª, locals/tempsΓÇª]`.
     ///
     /// Length = `bytecode_array.parameter_count() + bytecode_array.frame_size()`.
     pub registers: RegisterFile,
@@ -2098,11 +2371,11 @@ pub struct InterpreterFrame {
     /// The `new.target` value for this frame.  Set to the constructor function
     /// when invoked via `[[Construct]]`, or `undefined` for normal calls.
     pub new_target: JsValue,
-    /// Monomorphic property-load cache: `slot → (map_ptr, cached_value)`.
+    /// Monomorphic property-load cache: `slot ΓåÆ (map_ptr, cached_value)`.
     /// Lazily allocated on first write so leaf calls that never touch inline
     /// caches pay no HashMap allocation cost.
     pub mono_load_cache: Option<Box<MonoLoadCache>>,
-    /// Polymorphic property-load cache: `slot → [(ptr, cached_value)]`.
+    /// Polymorphic property-load cache: `slot ΓåÆ [(ptr, cached_value)]`.
     /// Holds up to 4 entries per feedback slot, supporting polymorphic sites.
     /// Lazily allocated on first write.
     pub poly_load_cache: Option<Box<PolyLoadCache>>,
@@ -2121,15 +2394,13 @@ pub struct InterpreterFrame {
     /// Pre-decoded string constants from the constant pool, keyed by index.
     /// Avoids repeated `String::clone()` from the constant pool.
     pub string_cache: Option<Box<StringCache>>,
-    /// Direct-mapped global variable IC: `[(name_idx, slot_index, generation); 32]`.
-    /// Indexed by `name_idx & 31`.  Tag `GLOBAL_IC_EMPTY` (`u32::MAX`) = vacant.
-    /// Always present — no `Option` / `Box` indirection on the hot path.
-    pub global_ic: GlobalIcArray,
-    /// `true` once the IC has been seeded from the shared `BytecodeArray` cache.
-    global_ic_seeded: bool,
+    /// Global variable inline cache: `constant_pool_idx ΓåÆ (slot_index, generation)`.
+    /// Maps bytecode constant-pool indices to indexed `GlobalEnv` slots for
+    /// O(1) global variable access.  Lazily allocated on first IC miss.
+    pub global_ic: Option<Box<GlobalIcCache>>,
     /// Cache of recently-accessed global variable values.
-    /// Avoids repeated `Rc→RefCell→HashMap` lookups for hot globals.
-    /// Format: `[(name_hash, name, value); 8]` — direct-mapped by hash.
+    /// Avoids repeated `RcΓåÆRefCellΓåÆHashMap` lookups for hot globals.
+    /// Format: `[(name_hash, name, value); 8]` ΓÇö direct-mapped by hash.
     /// Lazily allocated on first `global_cache_put` so closure frames that
     /// never access globals pay zero initialization cost (~320 bytes saved).
     pub global_cache: Option<Box<GlobalCacheArray>>,
@@ -2146,7 +2417,7 @@ pub struct InterpreterFrame {
     /// frames pay zero cost.
     pub hot_registers: Option<HotRegisters>,
     /// When non-zero, the dispatch loop is inside a validated loop body.
-    /// The value is the instruction index one past the `JumpLoop` — we
+    /// The value is the instruction index one past the `JumpLoop` ΓÇö we
     /// skip the bounds check for every PC strictly below this point
     /// because the entire range was validated during bytecode decoding.
     loop_end_pc: usize,
@@ -2208,8 +2479,7 @@ impl InterpreterFrame {
             proto_load_ic: None,
             mega_store_ic: None,
             string_cache: None,
-            global_ic: GLOBAL_IC_INIT,
-            global_ic_seeded: false,
+            global_ic: None,
             global_cache: None,
             cache_generation: 0,
             smi_mode: false,
@@ -2277,7 +2547,7 @@ impl InterpreterFrame {
         }
         // ICs start as None and are seeded lazily from the shared
         // BytecodeArray cache on first IC miss.  This avoids cloning
-        // (potentially large) IC HashMaps for every function call — a
+        // (potentially large) IC HashMaps for every function call ΓÇö a
         // significant win for closures that never access named properties.
         Self {
             bytecode_array,
@@ -2301,8 +2571,7 @@ impl InterpreterFrame {
             proto_load_ic: None,
             mega_store_ic: None,
             string_cache: None,
-            global_ic: GLOBAL_IC_INIT,
-            global_ic_seeded: false,
+            global_ic: None,
             global_cache: None,
             cache_generation: 0,
             smi_mode: false,
@@ -2383,7 +2652,7 @@ impl InterpreterFrame {
     /// Falls back to [`HotRegisters`] when available.
     ///
     /// Read a register as an i32 in the SMI loop, handling both
-    /// `Smi(v) → v` and `Boolean(b) → b as i32`.
+    /// `Smi(v) ΓåÆ v` and `Boolean(b) ΓåÆ b as i32`.
     ///
     /// This is the correct accessor for SMI-loop arithmetic/comparison
     /// operands because `Star` with `smi_acc_bool = true` may write
@@ -2393,6 +2662,7 @@ impl InterpreterFrame {
     ///
     /// The caller must ensure `reg` maps to an in-bounds register that
     /// contains either `JsValue::Smi` or `JsValue::Boolean`.
+    #[allow(dead_code)]
     #[inline(always)]
     unsafe fn read_reg_num_unchecked(&self, reg: u32) -> i32 {
         let signed = reg as i32;
@@ -2403,6 +2673,30 @@ impl InterpreterFrame {
         };
         debug_assert!(idx < self.registers.len());
         // SAFETY: Caller guarantees register is in bounds and holds Smi or Boolean.
+        let val = unsafe { self.registers.get_unchecked(idx) };
+        match val {
+            JsValue::Smi(v) => *v,
+            JsValue::Boolean(b) => *b as i32,
+            _ => unsafe { std::hint::unreachable_unchecked() },
+        }
+    }
+
+    /// Like [`read_reg_num_unchecked`] but tries the [`HotRegisters`] cache
+    /// first, avoiding the `JsValue` match when the register is already
+    /// NaN-boxed.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `reg` maps to an in-bounds register that
+    /// contains either `JsValue::Smi` or `JsValue::Boolean`.
+    #[inline(always)]
+    unsafe fn read_reg_num_hot_unchecked(&self, reg: u32) -> i32 {
+        let idx = self.reg_flat_index_unchecked(reg);
+        if let Some(ref hr) = self.hot_registers
+            && let Some(v) = hr.read_as_i32(idx)
+        {
+            return v;
+        }
         let val = unsafe { self.registers.get_unchecked(idx) };
         match val {
             JsValue::Smi(v) => *v,
@@ -2522,38 +2816,36 @@ impl InterpreterFrame {
         self.mega_store_ic.as_mut().unwrap()
     }
 
-    /// O(1) lookup in the direct-mapped global IC.
-    #[inline(always)]
-    pub(super) fn global_ic_get(&self, name_idx: u32) -> Option<(usize, u64)> {
-        let entry = &self.global_ic[(name_idx & GLOBAL_IC_MASK) as usize];
-        if entry.0 == name_idx {
-            Some((entry.1, entry.2))
-        } else {
-            None
+    #[inline]
+    fn global_ic_mut(&mut self) -> &mut GlobalIcCache {
+        if self.global_ic.is_none() {
+            self.global_ic = self
+                .bytecode_array
+                .shared_global_ic()
+                .or_else(|| Some(Box::default()));
         }
+        self.global_ic.as_mut().unwrap()
     }
 
-    /// Insert / overwrite an entry in the direct-mapped global IC.
-    /// On first write, seeds from the shared `BytecodeArray` cache so that
-    /// subsequent calls to the same function start warm.
-    #[inline(always)]
-    pub(super) fn global_ic_put(&mut self, name_idx: u32, slot_idx: usize, generation_val: u64) {
-        if !self.global_ic_seeded {
-            self.global_ic_seeded = true;
-            if let Some(shared) = self.bytecode_array.shared_global_ic() {
-                for (&k, &(si, g)) in shared.iter() {
-                    self.global_ic[(k & GLOBAL_IC_MASK) as usize] = (k, si, g);
-                }
-            }
-        }
-        self.global_ic[(name_idx & GLOBAL_IC_MASK) as usize] = (name_idx, slot_idx, generation_val);
+    /// Fast-path lookup: returns `(slot_index, generation)` if cached.
+    #[inline]
+    fn global_ic_get(&self, name_idx: u32) -> Option<(usize, u64)> {
+        self.global_ic.as_ref()?.get(&name_idx).copied()
     }
 
-    /// Reset the direct-mapped global IC (e.g. on tail-call reuse).
-    #[inline(always)]
-    pub(super) fn global_ic_reset(&mut self) {
-        self.global_ic = GLOBAL_IC_INIT;
-        self.global_ic_seeded = false;
+    /// Cache a global variable's slot index and generation.
+    #[inline]
+    fn global_ic_put(&mut self, name_idx: u32, slot_idx: usize, generation: u64) {
+        self.global_ic_mut()
+            .insert(name_idx, (slot_idx, generation));
+    }
+
+    /// Clear the global IC cache (e.g. on tail-call invalidation).
+    #[inline]
+    fn global_ic_reset(&mut self) {
+        if let Some(ref mut ic) = self.global_ic {
+            ic.clear();
+        }
     }
 
     #[inline]
@@ -2623,19 +2915,20 @@ impl InterpreterFrame {
     /// Store a global variable, using the IC slot index when available.
     ///
     /// When the global IC has a valid entry for `name_idx`, this stores
-    /// directly via `store_by_index_sync` — avoiding the `String` allocation
+    /// directly via `store_by_index_sync` ΓÇö avoiding the `String` allocation
     /// that [`GlobalEnv::insert`] requires for the key.
     #[inline]
     pub(super) fn store_global(&mut self, name_idx: u32, name: &Rc<str>, value: JsValue) {
         // IC fast path: known slot, generation matches.
-        // Single borrow_mut avoids the double RefCell overhead of
-        // borrow() for generation + borrow_mut() for store.
-        if let Some((slot_idx, cached_gen)) = self.global_ic_get(name_idx) {
-            let mut env = self.global_env.borrow_mut();
-            if env.generation() == cached_gen {
+        if let Some(ref ic) = self.global_ic
+            && let Some(&(slot_idx, cached_gen)) = ic.get(&name_idx)
+        {
+            let current_gen = self.global_env.borrow().generation();
+            if current_gen == cached_gen {
                 set_function_name_if_missing(&value, name);
-                env.store_by_index_sync(slot_idx, name, value.clone());
-                drop(env);
+                self.global_env
+                    .borrow_mut()
+                    .store_by_index_sync(slot_idx, name, value.clone());
                 self.global_cache_put(name, value);
                 return;
             }
@@ -2646,8 +2939,9 @@ impl InterpreterFrame {
         env.insert(name.to_string(), value.clone());
         let slot_gen = env.slot_index_for(name).map(|idx| (idx, env.generation()));
         drop(env);
-        if let Some((slot_idx, generation_val)) = slot_gen {
-            self.global_ic_put(name_idx, slot_idx, generation_val);
+        if let Some((slot_idx, cached_gen)) = slot_gen {
+            self.global_ic_mut()
+                .insert(name_idx, (slot_idx, cached_gen));
         }
         self.global_cache_put(name, value);
     }
@@ -2728,9 +3022,9 @@ impl InterpreterFrame {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 // Interpreter
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /// Stateless bytecode interpreter.
 ///
@@ -2759,6 +3053,26 @@ impl Interpreter {
     }
 
     fn run_inner(frame: &mut InterpreterFrame, skip_globals: bool) -> StatorResult<JsValue> {
+        // Increment invocation count for tiering ΓÇö ensures top-level code
+        // (not just function calls) participates in JIT compilation decisions.
+        let inv_count = frame.bytecode_array.increment_invocation_count();
+
+        // Trigger JIT compilation based on invocation count so that top-level
+        // scripts (called via Interpreter::run()) participate in tiering, not
+        // only through OSR loop back-edges.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            if inv_count == TIERING_THRESHOLD {
+                maybe_compile_baseline(&frame.bytecode_array);
+            } else if inv_count == MAGLEV_TIERING_THRESHOLD {
+                maybe_compile_maglev(&frame.bytecode_array);
+            } else if inv_count == TURBOFAN_TIERING_THRESHOLD {
+                maybe_compile_turbofan(&frame.bytecode_array);
+            }
+        }
+        #[cfg(not(all(target_arch = "x86_64", unix)))]
+        let _ = inv_count;
+
         let result = (|| {
             if skip_globals {
                 // Caller guarantees CURRENT_GLOBALS is already published.
@@ -2806,18 +3120,8 @@ impl Interpreter {
         if let Some(ic) = frame.proto_load_ic.take() {
             frame.bytecode_array.set_shared_proto_load_ic(ic);
         }
-        // Write back the direct-mapped global IC to the shared HashMap cache
-        // on the BytecodeArray so subsequent invocations start warm.
-        if frame.global_ic_seeded {
-            let mut map: HashMap<u32, (usize, u64)> = HashMap::new();
-            for &(tag, slot_idx, generation_val) in &frame.global_ic {
-                if tag != GLOBAL_IC_EMPTY {
-                    map.insert(tag, (slot_idx, generation_val));
-                }
-            }
-            if !map.is_empty() {
-                frame.bytecode_array.set_shared_global_ic(Box::new(map));
-            }
+        if let Some(ic) = frame.global_ic.take() {
+            frame.bytecode_array.set_shared_global_ic(ic);
         }
         release_registers(std::mem::take(&mut frame.registers));
         result
@@ -2879,19 +3183,7 @@ impl Interpreter {
             let mut acc = frame.accumulator.cheap_clone();
 
             'dispatch: loop {
-                // Inside a validated loop body we know every PC in
-                // [jump_target, loop_end_pc) was decoded successfully, so
-                // the bounds check is redundant.
-                if pc >= frame.loop_end_pc {
-                    frame.loop_end_pc = 0;
-                    if pc >= instructions.len() {
-                        frame.pc = pc;
-                        frame.accumulator = acc;
-                        return Err(bytecode_end_error());
-                    }
-                }
-
-                // ── Debug hook (pre-fetch) ─────────────────────────────────────
+                // ΓöÇΓöÇ Debug hook (pre-fetch) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
                 if debug_active {
                     let current_offset = byte_offsets[pc] as u32;
                     if let Some(pause_err) = ACTIVE_DEBUGGER.with(|d| {
@@ -2905,54 +3197,35 @@ impl Interpreter {
                     }
                 }
 
-                // ── Fetch ──────────────────────────────────────────────────────
-                // SAFETY: The bounds check (or loop_end_pc guard) guarantees
-                // pc < instructions.len().
+                // ΓöÇΓöÇ Fetch ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+                // SAFETY: Well-formed bytecode always terminates with a
+                // `Return` before pc reaches `instructions.len()`.  All
+                // jump targets are pre-computed and validated during decode
+                // so forward jumps cannot overshoot.  The only backward
+                // jump (`JumpLoop`) uses a pre-computed target that is
+                // always in bounds.  Periodic checks (instruction limit,
+                // timeout) are handled exclusively on the `JumpLoop`
+                // back-edge, removing two branches from every forward
+                // instruction.
+                if pc >= instructions.len() {
+                    // Malformed bytecode ΓÇö no Return terminator.
+                    frame.pc = pc;
+                    frame.accumulator = acc;
+                    return Err(StatorError::Internal(
+                        "bytecode fell off the end without Return".into(),
+                    ));
+                }
                 let instr = unsafe { instructions.get_unchecked(pc) };
                 pc += 1;
 
-                // ── Approximate instruction counting & periodic checks ──────────
-                //
-                // Inside a validated loop body (loop_end_pc != 0) the
-                // periodic check is deferred to the JumpLoop back-edge,
-                // saving a branch per hot instruction.
-                if frame.loop_end_pc == 0 && pc & 0x3FF == 0 {
-                    frame.instructions_executed += 0x400;
-
-                    if frame.instruction_limit > 0
-                        && frame.instructions_executed > frame.instruction_limit
-                    {
-                        frame.pc = pc;
-                        frame.accumulator = acc;
-                        return Err(instruction_limit_error());
-                    }
-
-                    let thread_deadline = EXECUTION_DEADLINE.with(|d| d.get());
-                    if frame.deadline.is_some() || thread_deadline.is_some() {
-                        let now = Instant::now();
-                        if frame.deadline.is_some_and(|dl| now > dl)
-                            || thread_deadline.is_some_and(|dl| now > dl)
-                        {
-                            frame.pc = pc;
-                            frame.accumulator = acc;
-                            return Err(execution_timeout_error());
-                        }
-                    }
-
-                    if pc & 0xFFF == 0 {
-                        crate::inspector::profiler::maybe_record_sample();
-                        debug_active = DEBUG_ATTACHED.with(Cell::get);
-                    }
-                }
-
-                // ── Dispatch (hot-path inline + table fallback) ───────────
+                // ΓöÇΓöÇ Dispatch (hot-path inline + table fallback) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
                 //
                 // The hottest opcodes are dispatched via a direct `match`
                 // with unsafe operand extraction to eliminate all overhead.
                 // Rare opcodes fall back to the table in `dispatch.rs`.
                 use crate::bytecode::bytecodes::{Opcode, Operand};
 
-                // ── SMI-specialised inner loop ─────────────────────────
+                // ΓöÇΓöÇ SMI-specialised inner loop ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
                 //
                 // When `smi_mode` is active we enter a dedicated inner
                 // loop whose accumulator is a raw `i32`.  LLVM can
@@ -2968,7 +3241,7 @@ impl Interpreter {
                     pc -= 1;
 
                     // Extract the raw i32 accumulator.  The JumpLoop handler
-                    // converts Boolean→Smi before setting smi_mode, but guard
+                    // converts BooleanΓåÆSmi before setting smi_mode, but guard
                     // against Boolean anyway (defensive).
                     let mut sa: i32 = match acc {
                         JsValue::Smi(v) => v,
@@ -2985,6 +3258,7 @@ impl Interpreter {
                     // correct JsValue type when spilling to registers
                     // or arrays.
                     let mut smi_acc_bool = false;
+                    let mut smi_acc_spilled = false;
                     // Helper: materialize the accumulator as the correct
                     // JsValue type (Boolean when smi_acc_bool, Smi otherwise).
                     macro_rules! smi_to_val {
@@ -2996,71 +3270,190 @@ impl Interpreter {
                             }
                         };
                     }
+                    macro_rules! materialize_acc {
+                        () => {
+                            if smi_acc_spilled {
+                                acc.cheap_clone()
+                            } else {
+                                smi_to_val!()
+                            }
+                        };
+                    }
+                    let mut hot_acc: Option<NanBoxedValue> = Some(if smi_acc_bool {
+                        NanBoxedValue::from_boolean(sa != 0)
+                    } else {
+                        NanBoxedValue::from_smi(sa)
+                    });
                     'smi: loop {
                         if pc >= frame.loop_end_pc {
                             frame.loop_end_pc = 0;
-                            acc = smi_to_val!();
+                            acc = materialize_acc!();
                             frame.smi_mode = false;
                             break 'smi;
                         }
                         let instr = unsafe { instructions.get_unchecked(pc) };
                         pc += 1;
 
+                        if smi_acc_spilled
+                            && !matches!(
+                                instr.opcode,
+                                Opcode::LdaSmi
+                                    | Opcode::LdaZero
+                                    | Opcode::LdaTrue
+                                    | Opcode::LdaFalse
+                                    | Opcode::Star
+                                    | Opcode::Ldar
+                                    | Opcode::Mov
+                                    | Opcode::StaGlobal
+                                    | Opcode::StaKeyedProperty
+                                    | Opcode::StaNamedProperty
+                                    | Opcode::StaContextSlot
+                                    | Opcode::StaCurrentContextSlot
+                                    | Opcode::CreateEmptyArrayLiteral
+                                    | Opcode::CreateArrayLiteral
+                                    | Opcode::TypeOf
+                                    | Opcode::CallUndefinedReceiver0
+                                    | Opcode::CallUndefinedReceiver1
+                                    | Opcode::CallUndefinedReceiver2
+                                    | Opcode::LdaCurrentContextSlot
+                                    | Opcode::LdaImmutableCurrentContextSlot
+                                    | Opcode::LdaContextSlot
+                                    | Opcode::LdaNamedProperty
+                                    | Opcode::LdaKeyedProperty
+                                    | Opcode::LdaGlobal
+                                    | Opcode::Jump
+                                    | Opcode::Return
+                                    | Opcode::Nop
+                            )
+                        {
+                            acc = materialize_acc!();
+                            frame.smi_mode = false;
+                            frame.loop_end_pc = 0;
+                            pc -= 1;
+                            break 'smi;
+                        }
+
                         match instr.opcode {
                             Opcode::LdaSmi => {
                                 sa = unsafe { operand_imm_unchecked(instr, 0) };
                                 smi_acc_bool = false;
+                                smi_acc_spilled = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
+                            }
+                            Opcode::LdaSmiStar => {
+                                sa = unsafe { operand_imm_unchecked(instr, 0) };
+                                smi_acc_bool = false;
+                                smi_acc_spilled = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
+                                let reg = unsafe { operand_reg_unchecked(instr, 1) };
+                                let idx = frame.reg_flat_index_unchecked(reg);
+                                unsafe { frame.write_reg_unchecked(reg, JsValue::Smi(sa)) };
+                                if let Some(ref mut hr) = frame.hot_registers {
+                                    hr.write_smi(idx, sa);
+                                }
                             }
                             Opcode::LdaZero => {
                                 sa = 0;
                                 smi_acc_bool = false;
+                                smi_acc_spilled = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(0));
                             }
                             Opcode::LdaTrue => {
                                 sa = 1;
                                 smi_acc_bool = true;
+                                smi_acc_spilled = false;
+                                hot_acc = Some(NanBoxedValue::from_boolean(true));
                             }
                             Opcode::LdaFalse => {
                                 sa = 0;
                                 smi_acc_bool = true;
+                                smi_acc_spilled = false;
+                                hot_acc = Some(NanBoxedValue::from_boolean(false));
                             }
                             Opcode::Star => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let val = smi_to_val!();
+                                let idx = frame.reg_flat_index_unchecked(reg);
+                                let val = materialize_acc!();
                                 unsafe { frame.write_reg_unchecked(reg, val) };
+                                if let Some(nb) = hot_acc
+                                    && let Some(ref mut hr) = frame.hot_registers
+                                {
+                                    hr.write_nanboxed(idx, nb);
+                                }
                             }
                             Opcode::Ldar => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                // In a hot integer loop the registers touched
-                                // by Ldar are the same ones written by Star
-                                // with Smi values.  Check anyway for safety.
+                                let idx = frame.reg_flat_index_unchecked(reg);
+                                if let Some(ref hr) = frame.hot_registers
+                                    && let Some(nb) = hr.read_raw(idx)
+                                {
+                                    if nb.is_smi() {
+                                        sa = nb.as_smi();
+                                        smi_acc_bool = false;
+                                        smi_acc_spilled = false;
+                                        hot_acc = Some(nb);
+                                        continue 'smi;
+                                    }
+                                    if nb.is_boolean() {
+                                        sa = nb.as_boolean() as i32;
+                                        smi_acc_bool = true;
+                                        smi_acc_spilled = false;
+                                        hot_acc = Some(nb);
+                                        continue 'smi;
+                                    }
+                                }
                                 let val = unsafe { frame.read_reg_unchecked(reg) };
                                 if let JsValue::Smi(v) = val {
                                     sa = *v;
                                     smi_acc_bool = false;
+                                    smi_acc_spilled = false;
+                                    hot_acc = Some(NanBoxedValue::from_smi(*v));
                                 } else if let JsValue::Boolean(b) = val {
                                     sa = *b as i32;
                                     smi_acc_bool = true;
+                                    smi_acc_spilled = false;
+                                    hot_acc = Some(NanBoxedValue::from_boolean(*b));
                                 } else {
                                     acc = val.cheap_clone();
-                                    frame.smi_mode = false;
-                                    frame.loop_end_pc = 0;
-                                    break 'smi;
+                                    smi_acc_spilled = true;
+                                    smi_acc_bool = false;
+                                    hot_acc = None;
                                 }
                             }
                             Opcode::Mov => {
                                 let src = unsafe { operand_reg_unchecked(instr, 0) };
                                 let dst = unsafe { operand_reg_unchecked(instr, 1) };
+                                let src_idx = frame.reg_flat_index_unchecked(src);
+                                let dst_idx = frame.reg_flat_index_unchecked(dst);
                                 let val = unsafe { frame.read_reg_unchecked(src) }.cheap_clone();
                                 unsafe { frame.write_reg_unchecked(dst, val) };
+                                if let Some(ref mut hr) = frame.hot_registers {
+                                    let cached = hr.read_raw(src_idx);
+                                    if let Some(nb) = cached {
+                                        hr.write_nanboxed(dst_idx, nb);
+                                    } else {
+                                        hr.invalidate(dst_idx);
+                                    }
+                                }
                             }
                             Opcode::Add => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 smi_acc_bool = false;
                                 match sa.checked_add(b) {
-                                    Some(r) => sa = r,
+                                    Some(r) => {
+                                        sa = r;
+                                        hot_acc = Some(NanBoxedValue::from_smi(r));
+                                    }
                                     None => {
-                                        acc = JsValue::HeapNumber(sa as f64 + b as f64);
+                                        acc = number_to_jsvalue(sa as f64 + b as f64);
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3071,9 +3464,19 @@ impl Interpreter {
                                 let b = unsafe { operand_imm_unchecked(instr, 0) };
                                 smi_acc_bool = false;
                                 match sa.checked_add(b) {
-                                    Some(r) => sa = r,
+                                    Some(r) => {
+                                        sa = r;
+                                        hot_acc = Some(NanBoxedValue::from_smi(r));
+                                    }
                                     None => {
-                                        acc = JsValue::HeapNumber(sa as f64 + b as f64);
+                                        acc = number_to_jsvalue(sa as f64 + b as f64);
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3082,12 +3485,22 @@ impl Interpreter {
                             }
                             Opcode::Sub => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 smi_acc_bool = false;
                                 match sa.checked_sub(b) {
-                                    Some(r) => sa = r,
+                                    Some(r) => {
+                                        sa = r;
+                                        hot_acc = Some(NanBoxedValue::from_smi(r));
+                                    }
                                     None => {
-                                        acc = JsValue::HeapNumber(sa as f64 - b as f64);
+                                        acc = number_to_jsvalue(sa as f64 - b as f64);
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3098,9 +3511,19 @@ impl Interpreter {
                                 let b = unsafe { operand_imm_unchecked(instr, 0) };
                                 smi_acc_bool = false;
                                 match sa.checked_sub(b) {
-                                    Some(r) => sa = r,
+                                    Some(r) => {
+                                        sa = r;
+                                        hot_acc = Some(NanBoxedValue::from_smi(r));
+                                    }
                                     None => {
-                                        acc = JsValue::HeapNumber(sa as f64 - b as f64);
+                                        acc = number_to_jsvalue(sa as f64 - b as f64);
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3109,12 +3532,22 @@ impl Interpreter {
                             }
                             Opcode::Mul => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 smi_acc_bool = false;
                                 match sa.checked_mul(b) {
-                                    Some(r) => sa = r,
+                                    Some(r) => {
+                                        sa = r;
+                                        hot_acc = Some(NanBoxedValue::from_smi(r));
+                                    }
                                     None => {
-                                        acc = JsValue::HeapNumber(sa as f64 * b as f64);
+                                        acc = number_to_jsvalue(sa as f64 * b as f64);
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3125,9 +3558,78 @@ impl Interpreter {
                                 let b = unsafe { operand_imm_unchecked(instr, 0) };
                                 smi_acc_bool = false;
                                 match sa.checked_mul(b) {
-                                    Some(r) => sa = r,
+                                    Some(r) => {
+                                        sa = r;
+                                        hot_acc = Some(NanBoxedValue::from_smi(r));
+                                    }
                                     None => {
-                                        acc = JsValue::HeapNumber(sa as f64 * b as f64);
+                                        acc = number_to_jsvalue(sa as f64 * b as f64);
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
+                                        frame.smi_mode = false;
+                                        frame.loop_end_pc = 0;
+                                        break 'smi;
+                                    }
+                                }
+                            }
+                            Opcode::MulSmiStar => {
+                                let b = unsafe { operand_imm_unchecked(instr, 0) };
+                                smi_acc_bool = false;
+                                match sa.checked_mul(b) {
+                                    Some(r) => {
+                                        sa = r;
+                                        let dst = unsafe { operand_reg_unchecked(instr, 2) };
+                                        unsafe { frame.write_reg_unchecked(dst, JsValue::Smi(sa)) };
+                                    }
+                                    None => {
+                                        let dst = unsafe { operand_reg_unchecked(instr, 2) };
+                                        acc = number_to_jsvalue(sa as f64 * b as f64);
+                                        unsafe {
+                                            frame.write_reg_unchecked(dst, acc.cheap_clone())
+                                        };
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
+                                        frame.smi_mode = false;
+                                        frame.loop_end_pc = 0;
+                                        break 'smi;
+                                    }
+                                }
+                            }
+                            Opcode::LdarMulStar => {
+                                let src = unsafe { operand_reg_unchecked(instr, 0) };
+                                sa = unsafe { frame.read_reg_num_hot_unchecked(src) };
+                                let mul_reg = unsafe { operand_reg_unchecked(instr, 1) };
+                                let b = unsafe { frame.read_reg_num_hot_unchecked(mul_reg) };
+                                smi_acc_bool = false;
+                                match sa.checked_mul(b) {
+                                    Some(r) => {
+                                        sa = r;
+                                        let dst = unsafe { operand_reg_unchecked(instr, 2) };
+                                        unsafe { frame.write_reg_unchecked(dst, JsValue::Smi(sa)) };
+                                    }
+                                    None => {
+                                        let dst = unsafe { operand_reg_unchecked(instr, 2) };
+                                        acc = number_to_jsvalue(sa as f64 * b as f64);
+                                        unsafe {
+                                            frame.write_reg_unchecked(dst, acc.cheap_clone())
+                                        };
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3136,12 +3638,13 @@ impl Interpreter {
                             }
                             Opcode::Div => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 smi_acc_bool = false;
                                 if b != 0 && sa % b == 0 {
                                     sa /= b;
+                                    hot_acc = Some(NanBoxedValue::from_smi(sa));
                                 } else {
-                                    // Non-exact or div-by-zero → float result
+                                    // Non-exact or div-by-zero ΓåÆ float result
                                     acc = JsValue::HeapNumber(sa as f64 / b as f64);
                                     frame.smi_mode = false;
                                     frame.loop_end_pc = 0;
@@ -3150,10 +3653,11 @@ impl Interpreter {
                             }
                             Opcode::Mod => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 smi_acc_bool = false;
                                 if b != 0 {
                                     sa %= b;
+                                    hot_acc = Some(NanBoxedValue::from_smi(sa));
                                 } else {
                                     acc = JsValue::HeapNumber(f64::NAN);
                                     frame.smi_mode = false;
@@ -3166,6 +3670,7 @@ impl Interpreter {
                                 smi_acc_bool = false;
                                 if b != 0 {
                                     sa %= b;
+                                    hot_acc = Some(NanBoxedValue::from_smi(sa));
                                 } else {
                                     acc = JsValue::HeapNumber(f64::NAN);
                                     frame.smi_mode = false;
@@ -3175,61 +3680,72 @@ impl Interpreter {
                             }
                             Opcode::BitwiseOr => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                sa |= unsafe { frame.read_reg_num_unchecked(reg) };
+                                sa |= unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::BitwiseOrSmi => {
                                 sa |= unsafe { operand_imm_unchecked(instr, 0) };
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::BitwiseAnd => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                sa &= unsafe { frame.read_reg_num_unchecked(reg) };
+                                sa &= unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::BitwiseAndSmi => {
                                 sa &= unsafe { operand_imm_unchecked(instr, 0) };
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::BitwiseXor => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                sa ^= unsafe { frame.read_reg_num_unchecked(reg) };
+                                sa ^= unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::BitwiseXorSmi => {
                                 sa ^= unsafe { operand_imm_unchecked(instr, 0) };
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::BitwiseNot => {
                                 sa = !sa;
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::ShiftLeft => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 sa <<= (b as u32) & 0x1f;
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::ShiftLeftSmi => {
                                 let b = unsafe { operand_imm_unchecked(instr, 0) };
                                 sa <<= (b as u32) & 0x1f;
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::ShiftRight => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 sa >>= (b as u32) & 0x1f;
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::ShiftRightSmi => {
                                 let b = unsafe { operand_imm_unchecked(instr, 0) };
                                 sa >>= (b as u32) & 0x1f;
                                 smi_acc_bool = false;
+                                hot_acc = Some(NanBoxedValue::from_smi(sa));
                             }
                             Opcode::ShiftRightLogical | Opcode::ShiftRightLogicalSmi => {
                                 let b = if instr.opcode == Opcode::ShiftRightLogical {
                                     let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                    unsafe { frame.read_reg_num_unchecked(reg) }
+                                    unsafe { frame.read_reg_num_hot_unchecked(reg) }
                                 } else {
                                     unsafe { operand_imm_unchecked(instr, 0) }
                                 };
@@ -3237,6 +3753,7 @@ impl Interpreter {
                                 let r = (sa as u32) >> ((b as u32) & 0x1f);
                                 if r <= i32::MAX as u32 {
                                     sa = r as i32;
+                                    hot_acc = Some(NanBoxedValue::from_smi(sa));
                                 } else {
                                     acc = JsValue::HeapNumber(r as f64);
                                     frame.smi_mode = false;
@@ -3247,9 +3764,46 @@ impl Interpreter {
                             Opcode::Inc => {
                                 smi_acc_bool = false;
                                 match sa.checked_add(1) {
-                                    Some(r) => sa = r,
+                                    Some(r) => {
+                                        sa = r;
+                                        hot_acc = Some(NanBoxedValue::from_smi(r));
+                                    }
                                     None => {
-                                        acc = JsValue::HeapNumber(sa as f64 + 1.0);
+                                        acc = number_to_jsvalue(sa as f64 + 1.0);
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
+                                        frame.smi_mode = false;
+                                        frame.loop_end_pc = 0;
+                                        break 'smi;
+                                    }
+                                }
+                            }
+                            Opcode::IncStar => {
+                                smi_acc_bool = false;
+                                match sa.checked_add(1) {
+                                    Some(r) => {
+                                        sa = r;
+                                        let dst = unsafe { operand_reg_unchecked(instr, 1) };
+                                        unsafe { frame.write_reg_unchecked(dst, JsValue::Smi(sa)) };
+                                    }
+                                    None => {
+                                        let dst = unsafe { operand_reg_unchecked(instr, 1) };
+                                        acc = number_to_jsvalue(sa as f64 + 1.0);
+                                        unsafe {
+                                            frame.write_reg_unchecked(dst, acc.cheap_clone())
+                                        };
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3259,9 +3813,19 @@ impl Interpreter {
                             Opcode::Dec => {
                                 smi_acc_bool = false;
                                 match sa.checked_sub(1) {
-                                    Some(r) => sa = r,
+                                    Some(r) => {
+                                        sa = r;
+                                        hot_acc = Some(NanBoxedValue::from_smi(r));
+                                    }
                                     None => {
-                                        acc = JsValue::HeapNumber(sa as f64 - 1.0);
+                                        acc = number_to_jsvalue(sa as f64 - 1.0);
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3271,9 +3835,19 @@ impl Interpreter {
                             Opcode::Negate => {
                                 smi_acc_bool = false;
                                 match 0i32.checked_sub(sa) {
-                                    Some(r) => sa = r,
+                                    Some(r) => {
+                                        sa = r;
+                                        hot_acc = Some(NanBoxedValue::from_smi(r));
+                                    }
                                     None => {
-                                        acc = JsValue::HeapNumber(-(sa as f64));
+                                        acc = number_to_jsvalue(-(sa as f64));
+                                        if let JsValue::Smi(r) = &acc {
+                                            sa = *r;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*r));
+                                            continue 'smi;
+                                        }
                                         frame.smi_mode = false;
                                         frame.loop_end_pc = 0;
                                         break 'smi;
@@ -3286,7 +3860,7 @@ impl Interpreter {
                             | Opcode::TestLessThanOrEqual
                             | Opcode::TestGreaterThanOrEqual => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 let cmp = match instr.opcode {
                                     Opcode::TestLessThan => sa < b,
                                     Opcode::TestGreaterThan => sa > b,
@@ -3322,22 +3896,66 @@ impl Interpreter {
                                         _ => {}
                                     }
                                 }
-                                // No jump fusion — stay in SMI mode with
-                                // boolean-typed accumulator.
+                                // No jump fusion ΓÇö keep boolean result in SMI
+                                // mode via smi_acc_bool encoding.
                                 sa = cmp as i32;
                                 smi_acc_bool = true;
+                                smi_acc_spilled = false;
+                                hot_acc = Some(NanBoxedValue::from_boolean(cmp));
+                            }
+                            Opcode::TestLessThanJump
+                            | Opcode::TestGreaterThanJump
+                            | Opcode::TestEqualJump
+                            | Opcode::TestNotEqualJump
+                            | Opcode::TestLessThanOrEqualJump
+                            | Opcode::TestGreaterThanOrEqualJump => {
+                                let reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                let b = unsafe { frame.read_reg_num_hot_unchecked(reg) };
+                                let cmp = match instr.opcode {
+                                    Opcode::TestLessThanJump => sa < b,
+                                    Opcode::TestGreaterThanJump => sa > b,
+                                    Opcode::TestEqualJump => sa == b,
+                                    Opcode::TestNotEqualJump => sa != b,
+                                    Opcode::TestLessThanOrEqualJump => sa <= b,
+                                    Opcode::TestGreaterThanOrEqualJump => sa >= b,
+                                    _ => unsafe { std::hint::unreachable_unchecked() },
+                                };
+                                smi_acc_bool = true;
+                                sa = cmp as i32;
+                                let is_true = unsafe { operand_flag_unchecked(instr, 3) } != 0;
+                                if cmp == is_true {
+                                    pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
+                                }
                             }
                             Opcode::TestEqualStrict => {
                                 // Strict equality requires same type: Smi===Smi
-                                // or Boolean===Boolean.  Mixed types → always
+                                // or Boolean===Boolean.  Mixed types ΓåÆ always
                                 // false.
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let rhs = unsafe { frame.read_reg_unchecked(reg) };
-                                let cmp = match (smi_acc_bool, rhs) {
-                                    (false, JsValue::Smi(b)) => sa == *b,
-                                    (true, JsValue::Boolean(b)) => (sa != 0) == *b,
-                                    _ => false,
+                                let idx = frame.reg_flat_index_unchecked(reg);
+                                let cmp = if let Some(ref hr) = frame.hot_registers {
+                                    if let Some(nb) = hr.read_raw(idx) {
+                                        if nb.is_smi() && !smi_acc_bool {
+                                            Some(sa == nb.as_smi())
+                                        } else if nb.is_boolean() && smi_acc_bool {
+                                            Some((sa != 0) == nb.as_boolean())
+                                        } else {
+                                            Some(false)
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
                                 };
+                                let cmp = cmp.unwrap_or_else(|| {
+                                    let rhs = unsafe { frame.read_reg_unchecked(reg) };
+                                    match (smi_acc_bool, rhs) {
+                                        (false, JsValue::Smi(b)) => sa == *b,
+                                        (true, JsValue::Boolean(b)) => (sa != 0) == *b,
+                                        _ => false,
+                                    }
+                                });
                                 if let Some(next) = instructions.get(pc) {
                                     match next.opcode {
                                         Opcode::JumpIfTrue | Opcode::JumpIfToBooleanTrue => {
@@ -3365,10 +3983,12 @@ impl Interpreter {
                                 }
                                 sa = cmp as i32;
                                 smi_acc_bool = true;
+                                smi_acc_spilled = false;
+                                hot_acc = Some(NanBoxedValue::from_boolean(cmp));
                             }
                             Opcode::TestNotEqual => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let b = unsafe { frame.read_reg_num_unchecked(reg) };
+                                let b = unsafe { frame.read_reg_num_hot_unchecked(reg) };
                                 let cmp = sa != b;
                                 if let Some(next) = instructions.get(pc) {
                                     match next.opcode {
@@ -3397,15 +4017,17 @@ impl Interpreter {
                                 }
                                 sa = cmp as i32;
                                 smi_acc_bool = true;
+                                smi_acc_spilled = false;
+                                hot_acc = Some(NanBoxedValue::from_boolean(cmp));
                             }
                             Opcode::JumpIfTrue | Opcode::JumpIfToBooleanTrue => {
-                                // Accumulator is Smi — truthy iff non-zero.
+                                // Accumulator is Smi ΓÇö truthy iff non-zero.
                                 if sa != 0 {
                                     pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
                                 }
                             }
                             Opcode::JumpIfFalse | Opcode::JumpIfToBooleanFalse => {
-                                // Accumulator is Smi — falsy iff zero.
+                                // Accumulator is Smi ΓÇö falsy iff zero.
                                 if sa == 0 {
                                     pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
                                 }
@@ -3429,8 +4051,7 @@ impl Interpreter {
                                     }
                                     // Kick off Maglev compilation early so
                                     // the background thread finishes before
-                                    // baseline JIT returns — the next call
-                                    // picks up optimised Maglev code.
+                                    // baseline JIT returns.
                                     maybe_compile_maglev(&frame.bytecode_array);
                                     if let Some(jit_result) = try_execute_best_jit(
                                         &frame.bytecode_array,
@@ -3438,12 +4059,12 @@ impl Interpreter {
                                     ) {
                                         return jit_result;
                                     }
-                                }
-                                if frame.osr_loop_count == TURBOFAN_OSR_LOOP_THRESHOLD {
+                                } else if frame.osr_loop_count == MAGLEV_OSR_LOOP_THRESHOLD {
+                                    maybe_compile_maglev(&frame.bytecode_array);
+                                } else if frame.osr_loop_count == TURBOFAN_OSR_LOOP_THRESHOLD {
                                     maybe_compile_turbofan(&frame.bytecode_array);
                                 }
-
-                                // Only EXPAND loop_end_pc — never shrink it.
+                                // Only EXPAND loop_end_pc ΓÇö never shrink it.
                                 // Nested loops have smaller loop_end values;
                                 // shrinking would cause the outer loop to
                                 // exit SMI mode prematurely.
@@ -3454,7 +4075,7 @@ impl Interpreter {
                                 if frame.instruction_limit > 0
                                     && frame.instructions_executed > frame.instruction_limit
                                 {
-                                    acc = smi_to_val!();
+                                    acc = materialize_acc!();
                                     frame.pc = pc;
                                     frame.accumulator = acc.cheap_clone();
                                     return Err(instruction_limit_error());
@@ -3466,7 +4087,7 @@ impl Interpreter {
                                         if frame.deadline.is_some_and(|dl| now > dl)
                                             || thread_deadline.is_some_and(|dl| now > dl)
                                         {
-                                            acc = smi_to_val!();
+                                            acc = materialize_acc!();
                                             frame.pc = pc;
                                             frame.accumulator = acc.cheap_clone();
                                             return Err(execution_timeout_error());
@@ -3478,34 +4099,13 @@ impl Interpreter {
                             }
                             Opcode::Return => {
                                 frame.pc = pc;
-                                return Ok(smi_to_val!());
+                                return Ok(materialize_acc!());
                             }
                             Opcode::LdaGlobal => {
                                 let name_idx =
                                     unsafe { operand_constant_pool_idx_unchecked(instr, 0) };
-                                // IC fast path: read directly from the GlobalEnv
-                                // slot, avoiding get_string_constant + load_global.
-                                let ic_hit = frame.global_ic_get(name_idx);
-                                if let Some((slot_idx, cached_gen)) = ic_hit {
-                                    let env = frame.global_env.borrow();
-                                    if env.generation() == cached_gen {
-                                        let value = env.get_by_index(slot_idx);
-                                        if let JsValue::Smi(v) = value {
-                                            sa = *v;
-                                            smi_acc_bool = false;
-                                            continue 'smi;
-                                        }
-                                        if *value != JsValue::TheHole {
-                                            acc = value.clone();
-                                            drop(env);
-                                            frame.smi_mode = false;
-                                            frame.loop_end_pc = 0;
-                                            break 'smi;
-                                        }
-                                    }
-                                }
-                                // IC miss / generation stale / TheHole -- slow path.
-                                acc = smi_to_val!();
+                                // Sync state before fallible frame methods.
+                                acc = materialize_acc!();
                                 frame.pc = pc;
                                 frame.accumulator = acc.cheap_clone();
                                 let name = frame.get_string_constant(name_idx)?;
@@ -3513,59 +4113,23 @@ impl Interpreter {
                                 if let JsValue::Smi(v) = value {
                                     sa = v;
                                     smi_acc_bool = false;
+                                    smi_acc_spilled = false;
+                                    hot_acc = Some(NanBoxedValue::from_smi(v));
                                 } else {
                                     acc = value;
-                                    frame.smi_mode = false;
-                                    frame.loop_end_pc = 0;
-                                    break 'smi;
+                                    smi_acc_spilled = true;
+                                    smi_acc_bool = false;
+                                    hot_acc = None;
                                 }
                             }
                             Opcode::StaGlobal => {
                                 let name_idx =
                                     unsafe { operand_constant_pool_idx_unchecked(instr, 0) };
-                                let val = smi_to_val!();
-                                // IC fast path: inline the store and refresh the
-                                // IC entry so subsequent iterations stay fast.
-                                let ic_hit = frame.global_ic_get(name_idx);
-                                if let Some((slot_idx, cached_gen)) = ic_hit {
-                                    let cur_gen = frame.global_env.borrow().generation();
-                                    if cur_gen == cached_gen {
-                                        frame.pc = pc;
-                                        frame.accumulator = val.cheap_clone();
-                                        let name = frame.get_string_constant(name_idx)?;
-                                        frame.global_env.borrow_mut().store_by_index_sync(
-                                            slot_idx,
-                                            &name,
-                                            val.cheap_clone(),
-                                        );
-                                        let new_gen = frame.global_env.borrow().generation();
-                                        frame.global_ic_put(name_idx, slot_idx, new_gen);
-                                        frame.global_cache_put(&name, val);
-                                        continue 'smi;
-                                    }
-                                }
-                                // IC miss -- fall back to store_global (populates IC).
+                                acc = materialize_acc!();
                                 frame.pc = pc;
-                                frame.accumulator = val.cheap_clone();
+                                frame.accumulator = acc.cheap_clone();
                                 let name = frame.get_string_constant(name_idx)?;
-                                frame.store_global(name_idx, &name, val);
-                            }
-                            Opcode::LdaConstant => {
-                                let idx = unsafe { operand_constant_pool_idx_unchecked(instr, 0) };
-                                if let Some(entry) = frame.bytecode_array.get_constant(idx) {
-                                    let value = constant_to_value(entry);
-                                    if let JsValue::Smi(v) = value {
-                                        sa = v;
-                                        smi_acc_bool = false;
-                                        continue 'smi;
-                                    }
-                                    acc = value;
-                                } else {
-                                    acc = JsValue::Undefined;
-                                }
-                                frame.smi_mode = false;
-                                frame.loop_end_pc = 0;
-                                break 'smi;
+                                frame.store_global(name_idx, &name, acc.cheap_clone());
                             }
                             Opcode::CallUndefinedReceiver0 => {
                                 // Handle function calls inside SMI-mode loops
@@ -3573,22 +4137,60 @@ impl Interpreter {
                                 // the callee returns a Smi result.
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
                                 let callee = unsafe { frame.read_reg_unchecked(reg) };
+                                if let JsValue::NativeFunction(native_fn) = callee {
+                                    match native_fn(Vec::new())? {
+                                        JsValue::Smi(v) => {
+                                            sa = v;
+                                            hot_acc = Some(NanBoxedValue::from_smi(v));
+                                            frame.global_cache_invalidate();
+                                            continue 'smi;
+                                        }
+                                        v => {
+                                            acc = v;
+                                            frame.global_cache_invalidate();
+                                            frame.smi_mode = false;
+                                            frame.loop_end_pc = 0;
+                                            break 'smi;
+                                        }
+                                    }
+                                }
                                 if let JsValue::Function(ba) = callee
                                     && !ba.is_generator()
                                     && !ba.is_async()
                                 {
+                                    // Try inline BEFORE any Rc clones.
+                                    if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+                                        && !ba.has_exception_handler()
+                                        && let Some(result) =
+                                            try_inline_small_function(ba, &[], &frame.global_env)
+                                    {
+                                        match result {
+                                            JsValue::Smi(v) => {
+                                                sa = v;
+                                                hot_acc = Some(NanBoxedValue::from_smi(v));
+                                                continue 'smi;
+                                            }
+                                            v => {
+                                                acc = v;
+                                                frame.smi_mode = false;
+                                                frame.loop_end_pc = 0;
+                                                break 'smi;
+                                            }
+                                        }
+                                    }
+                                    // Only sync the PC for error traces ΓÇö the
+                                    // accumulator is dead here (overwritten by
+                                    // the call result or rebuilt on Err).
+                                    // Extract all data from ba and clone it before
+                                    // mutating frame (releases the register borrow).
                                     let is_arrow = ba.is_arrow();
                                     let is_strict = ba.is_strict();
                                     let has_self_name = ba.self_name_register().is_some();
                                     let has_fn_props = is_arrow && ba.has_fn_props();
                                     let closure_ctx = ba.closure_context().map(Rc::clone);
                                     let ba = Rc::clone(ba);
-                                    // Only sync the PC for error traces — the
-                                    // accumulator is dead here (overwritten by
-                                    // the call result or rebuilt on Err).
                                     frame.pc = pc;
 
-                                    let args = CallArgs::new();
                                     let saved_this = if !is_arrow && is_strict {
                                         let old = frame.global_env.borrow().get_this().cloned();
                                         frame.global_env.borrow_mut().set_this(JsValue::Undefined);
@@ -3596,13 +4198,21 @@ impl Interpreter {
                                     } else {
                                         None
                                     };
-                                    // Move ba into the callee frame — avoids
+                                    // Move ba into the callee frame ΓÇö avoids
                                     // a second Rc::clone.
-                                    let mut callee_frame = InterpreterFrame::new_callee_frame(
-                                        ba,
-                                        args,
-                                        Rc::clone(&frame.global_env),
-                                    );
+                                    let mut callee_frame = if ba.parameter_count() == 0 {
+                                        acquire_frame(
+                                            ba,
+                                            std::iter::empty(),
+                                            clone_shared_global_env(&frame.global_env),
+                                        )
+                                    } else {
+                                        acquire_frame(
+                                            ba,
+                                            CallArgs::new(),
+                                            clone_shared_global_env(&frame.global_env),
+                                        )
+                                    };
                                     if let Some(ctx) = closure_ctx {
                                         callee_frame.context = Some(JsValue::Context(ctx));
                                     }
@@ -3627,7 +4237,8 @@ impl Interpreter {
                                             })
                                         }
                                     });
-                                    if (frame.global_cache.is_some() || frame.global_ic_seeded)
+                                    release_frame(callee_frame);
+                                    if (frame.global_cache.is_some() || frame.global_ic.is_some())
                                         && gen_before != frame.global_env.borrow().generation()
                                     {
                                         frame.global_cache_invalidate();
@@ -3645,6 +4256,9 @@ impl Interpreter {
                                     match result {
                                         Ok(JsValue::Smi(v)) => {
                                             sa = v;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(v));
                                             continue 'smi;
                                         }
                                         Ok(v) => {
@@ -3654,30 +4268,77 @@ impl Interpreter {
                                             break 'smi;
                                         }
                                         Err(e) => {
-                                            acc = smi_to_val!();
+                                            acc = materialize_acc!();
                                             frame.pc = pc;
                                             frame.accumulator = acc.cheap_clone();
                                             return Err(e);
                                         }
                                     }
                                 }
-                                // Non-function callee — exit SMI mode.
-                                acc = smi_to_val!();
+                                // Non-function callee ΓÇö exit SMI mode.
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
                                 break 'smi;
                             }
                             Opcode::CallUndefinedReceiver1 => {
-                                // f(arg) inside SMI loop — stays in SMI mode
+                                // f(arg) inside SMI loop ΓÇö stays in SMI mode
                                 // when the callee returns a Smi result.
                                 let callee_reg = unsafe { operand_reg_unchecked(instr, 0) };
                                 let arg_reg = unsafe { operand_reg_unchecked(instr, 1) };
                                 let callee = unsafe { frame.read_reg_unchecked(callee_reg) };
+                                if let JsValue::NativeFunction(native_fn) = callee {
+                                    let arg1 =
+                                        unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
+                                    match native_fn(vec![arg1])? {
+                                        JsValue::Smi(v) => {
+                                            sa = v;
+                                            hot_acc = Some(NanBoxedValue::from_smi(v));
+                                            frame.global_cache_invalidate();
+                                            continue 'smi;
+                                        }
+                                        v => {
+                                            acc = v;
+                                            frame.global_cache_invalidate();
+                                            frame.smi_mode = false;
+                                            frame.loop_end_pc = 0;
+                                            break 'smi;
+                                        }
+                                    }
+                                }
                                 if let JsValue::Function(ba) = callee
                                     && !ba.is_generator()
                                     && !ba.is_async()
                                 {
+                                    // Try inline BEFORE cloning Rc ΓÇö saves atomic
+                                    // refcount bump when function is small.
+                                    if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+                                        && !ba.has_exception_handler()
+                                    {
+                                        let arg1 = unsafe { frame.read_reg_unchecked(arg_reg) }
+                                            .cheap_clone();
+                                        let inline_args = [arg1];
+                                        if let Some(result) = try_inline_small_function(
+                                            ba,
+                                            &inline_args,
+                                            &frame.global_env,
+                                        ) {
+                                            match result {
+                                                JsValue::Smi(v) => {
+                                                    sa = v;
+                                                    hot_acc = Some(NanBoxedValue::from_smi(v));
+                                                    continue 'smi;
+                                                }
+                                                v => {
+                                                    acc = v;
+                                                    frame.smi_mode = false;
+                                                    frame.loop_end_pc = 0;
+                                                    break 'smi;
+                                                }
+                                            }
+                                        }
+                                    }
                                     let is_arrow = ba.is_arrow();
                                     let is_strict = ba.is_strict();
                                     let has_self_name = ba.self_name_register().is_some();
@@ -3696,12 +4357,12 @@ impl Interpreter {
                                     } else {
                                         None
                                     };
-                                    // Move ba into callee frame — avoids a
+                                    // Move ba into callee frame ΓÇö avoids a
                                     // second Rc::clone.
-                                    let mut callee_frame = InterpreterFrame::new_callee_frame(
+                                    let mut callee_frame = acquire_frame(
                                         ba,
                                         args,
-                                        Rc::clone(&frame.global_env),
+                                        clone_shared_global_env(&frame.global_env),
                                     );
                                     if let Some(ctx) = closure_ctx {
                                         callee_frame.context = Some(JsValue::Context(ctx));
@@ -3727,7 +4388,8 @@ impl Interpreter {
                                             })
                                         }
                                     });
-                                    if (frame.global_cache.is_some() || frame.global_ic_seeded)
+                                    release_frame(callee_frame);
+                                    if (frame.global_cache.is_some() || frame.global_ic.is_some())
                                         && gen_before != frame.global_env.borrow().generation()
                                     {
                                         frame.global_cache_invalidate();
@@ -3745,6 +4407,9 @@ impl Interpreter {
                                     match result {
                                         Ok(JsValue::Smi(v)) => {
                                             sa = v;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(v));
                                             continue 'smi;
                                         }
                                         Ok(v) => {
@@ -3754,15 +4419,113 @@ impl Interpreter {
                                             break 'smi;
                                         }
                                         Err(e) => {
-                                            acc = smi_to_val!();
+                                            acc = materialize_acc!();
                                             frame.pc = pc;
                                             frame.accumulator = acc.cheap_clone();
                                             return Err(e);
                                         }
                                     }
                                 }
-                                // Non-function callee — exit SMI mode.
-                                acc = smi_to_val!();
+                                // Non-function callee ΓÇö exit SMI mode.
+                                acc = materialize_acc!();
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                pc -= 1;
+                                break 'smi;
+                            }
+                            Opcode::CallUndefinedReceiver2 => {
+                                let callee_reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                let arg1_reg = unsafe { operand_reg_unchecked(instr, 1) };
+                                let arg2_reg = unsafe { operand_reg_unchecked(instr, 2) };
+                                let callee = unsafe { frame.read_reg_unchecked(callee_reg) };
+                                if let JsValue::Function(ba) = callee
+                                    && !ba.is_generator()
+                                    && !ba.is_async()
+                                {
+                                    let is_arrow = ba.is_arrow();
+                                    let is_strict = ba.is_strict();
+                                    let has_self_name = ba.self_name_register().is_some();
+                                    let has_fn_props = is_arrow && ba.has_fn_props();
+                                    let closure_ctx = ba.closure_context().map(Rc::clone);
+                                    let ba = Rc::clone(ba);
+                                    let arg1 =
+                                        unsafe { frame.read_reg_unchecked(arg1_reg) }.cheap_clone();
+                                    let arg2 =
+                                        unsafe { frame.read_reg_unchecked(arg2_reg) }.cheap_clone();
+                                    frame.pc = pc;
+                                    let args: CallArgs = smallvec::smallvec![arg1, arg2];
+                                    let saved_this = if !is_arrow && is_strict {
+                                        let old = frame.global_env.borrow().get_this().cloned();
+                                        frame.global_env.borrow_mut().set_this(JsValue::Undefined);
+                                        old
+                                    } else {
+                                        None
+                                    };
+                                    let mut callee_frame =
+                                        acquire_frame(ba, args, Rc::clone(&frame.global_env));
+                                    if let Some(ctx) = closure_ctx {
+                                        callee_frame.context = Some(JsValue::Context(ctx));
+                                    }
+                                    if has_fn_props {
+                                        callee_frame.new_target = fn_props_get(
+                                            &callee_frame.bytecode_array,
+                                            ".new_target",
+                                        );
+                                    }
+                                    if has_self_name {
+                                        let ba_rc = Rc::clone(&callee_frame.bytecode_array);
+                                        let ba_val = JsValue::Function(Rc::clone(&ba_rc));
+                                        populate_self_name(&mut callee_frame, &ba_rc, &ba_val);
+                                    }
+                                    let gen_before = frame.cache_generation;
+                                    let result = with_anon_call_frame(|depth| {
+                                        if depth < 64 {
+                                            Interpreter::run_same_env(&mut callee_frame)
+                                        } else {
+                                            stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || {
+                                                Interpreter::run_same_env(&mut callee_frame)
+                                            })
+                                        }
+                                    });
+                                    release_frame(callee_frame);
+                                    if (frame.global_cache.is_some() || frame.global_ic.is_some())
+                                        && gen_before != frame.global_env.borrow().generation()
+                                    {
+                                        frame.global_cache_invalidate();
+                                    }
+                                    if !is_arrow && is_strict {
+                                        match saved_this {
+                                            Some(v) => {
+                                                frame.global_env.borrow_mut().set_this(v);
+                                            }
+                                            None => {
+                                                frame.global_env.borrow_mut().remove_this();
+                                            }
+                                        }
+                                    }
+                                    match result {
+                                        Ok(JsValue::Smi(v)) => {
+                                            sa = v;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(v));
+                                            continue 'smi;
+                                        }
+                                        Ok(v) => {
+                                            acc = v;
+                                            frame.smi_mode = false;
+                                            frame.loop_end_pc = 0;
+                                            break 'smi;
+                                        }
+                                        Err(e) => {
+                                            acc = materialize_acc!();
+                                            frame.pc = pc;
+                                            frame.accumulator = acc.cheap_clone();
+                                            return Err(e);
+                                        }
+                                    }
+                                }
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -3770,10 +4533,11 @@ impl Interpreter {
                             }
                             Opcode::LdaNamedProperty => {
                                 // Mega-IC fast path (direct + proto): stays in
-                                // SMI mode when the loaded value is Smi.
+                                // SMI mode for both Smi (direct) and non-Smi
+                                // (spilled) values.
                                 let obj_v = unsafe { operand_reg_unchecked(instr, 0) };
                                 let slot = unsafe {
-                                    match *instr.operands.get_unchecked(2) {
+                                    match *instr.operand_unchecked(2) {
                                         Operand::FeedbackSlot(s) => s,
                                         _ => std::hint::unreachable_unchecked(),
                                     }
@@ -3792,6 +4556,9 @@ impl Interpreter {
                                         let len = items.borrow().len();
                                         if len <= i32::MAX as usize {
                                             sa = len as i32;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(sa));
                                             continue 'smi;
                                         }
                                     }
@@ -3811,13 +4578,16 @@ impl Interpreter {
                                             {
                                                 if let JsValue::Smi(v) = val {
                                                     sa = *v;
+                                                    smi_acc_bool = false;
+                                                    smi_acc_spilled = false;
+                                                    hot_acc = Some(NanBoxedValue::from_smi(*v));
                                                     continue 'smi;
                                                 }
                                                 acc = val.clone();
-                                                drop(pm);
-                                                frame.smi_mode = false;
-                                                frame.loop_end_pc = 0;
-                                                break 'smi;
+                                                smi_acc_spilled = true;
+                                                smi_acc_bool = false;
+                                                hot_acc = None;
+                                                continue 'smi;
                                             }
                                         } else {
                                             // Proto-IC: load from prototype.
@@ -3833,21 +4603,54 @@ impl Interpreter {
                                                 {
                                                     if let JsValue::Smi(v) = val {
                                                         sa = *v;
+                                                        smi_acc_bool = false;
+                                                        smi_acc_spilled = false;
+                                                        hot_acc = Some(NanBoxedValue::from_smi(*v));
                                                         continue 'smi;
                                                     }
                                                     acc = val.clone();
-                                                    drop(proto_pm);
-                                                    drop(pm);
-                                                    frame.smi_mode = false;
-                                                    frame.loop_end_pc = 0;
-                                                    break 'smi;
+                                                    smi_acc_spilled = true;
+                                                    smi_acc_bool = false;
+                                                    hot_acc = None;
+                                                    continue 'smi;
                                                 }
                                             }
                                         }
                                     }
+                                    if let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1) {
+                                        let prop_name = frame.get_string_constant(name_idx)?;
+                                        if let Some(ic) = frame
+                                            .proto_load_ic
+                                            .as_ref()
+                                            .and_then(|cache| cache.get(&slot))
+                                            && ic.receiver_shape == layout
+                                            && ic.proto_depth != 0
+                                            && ic.property_key.as_ref() == prop_name.as_ref()
+                                            && ic.proto_generation == pm.proto_generation()
+                                            && !plain_object_has_own_property(
+                                                &pm,
+                                                prop_name.as_ref(),
+                                            )
+                                        {
+                                            let val = ic.value.clone();
+                                            drop(pm);
+                                            if let JsValue::Smi(v) = &val {
+                                                sa = *v;
+                                                smi_acc_bool = false;
+                                                smi_acc_spilled = false;
+                                                hot_acc = Some(NanBoxedValue::from_smi(*v));
+                                            } else {
+                                                acc = val;
+                                                smi_acc_spilled = true;
+                                                smi_acc_bool = false;
+                                                hot_acc = None;
+                                            }
+                                            continue 'smi;
+                                        }
+                                    }
                                 }
-                                // IC miss or non-PlainObject — exit SMI mode.
-                                acc = smi_to_val!();
+                                // IC miss or non-PlainObject ΓÇö exit SMI mode.
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -3862,73 +4665,24 @@ impl Interpreter {
                                     && let JsValue::Array(items) = obj
                                 {
                                     let borrow = items.borrow();
-                                    if let Some(val) = borrow.get(sa as usize) {
-                                        if let JsValue::Smi(v) = val {
-                                            sa = *v;
-                                            continue 'smi;
-                                        }
-                                        // Boolean element — try to fuse with
-                                        // JumpIfToBooleanFalse/True to stay
-                                        // in SMI mode (sieve pattern).
-                                        if let JsValue::Boolean(b) = val {
-                                            let bv = *b;
-                                            drop(borrow);
-                                            if let Some(next) = instructions.get(pc) {
-                                                match next.opcode {
-                                                    Opcode::JumpIfToBooleanFalse
-                                                    | Opcode::JumpIfFalse => {
-                                                        if !bv {
-                                                            pc = unsafe {
-                                                                resolve_jump_unchecked(
-                                                                    pc + 1,
-                                                                    jump_targets,
-                                                                )
-                                                            };
-                                                        } else {
-                                                            pc += 1;
-                                                        }
-                                                        continue 'smi;
-                                                    }
-                                                    Opcode::JumpIfToBooleanTrue
-                                                    | Opcode::JumpIfTrue => {
-                                                        if bv {
-                                                            pc = unsafe {
-                                                                resolve_jump_unchecked(
-                                                                    pc + 1,
-                                                                    jump_targets,
-                                                                )
-                                                            };
-                                                        } else {
-                                                            pc += 1;
-                                                        }
-                                                        continue 'smi;
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                            // No fusion — stay in SMI mode
-                                            // with boolean tracking.
-                                            sa = bv as i32;
-                                            smi_acc_bool = true;
-                                            continue 'smi;
-                                        }
-                                        // Non-Smi, non-Boolean element —
-                                        // exit SMI mode with the loaded value.
-                                        acc = val.clone();
-                                        drop(borrow);
-                                        frame.smi_mode = false;
-                                        frame.loop_end_pc = 0;
-                                        break 'smi;
-                                    }
+                                    let result = borrow
+                                        .get(sa as usize)
+                                        .cloned()
+                                        .unwrap_or(JsValue::Undefined);
                                     drop(borrow);
-                                    // Out-of-bounds → Undefined
-                                    acc = JsValue::Undefined;
-                                    frame.smi_mode = false;
-                                    frame.loop_end_pc = 0;
-                                    break 'smi;
+                                    if let JsValue::Smi(v) = result {
+                                        sa = v;
+                                        smi_acc_bool = false;
+                                        smi_acc_spilled = false;
+                                        hot_acc = Some(NanBoxedValue::from_smi(v));
+                                    } else {
+                                        acc = result;
+                                        smi_acc_spilled = true;
+                                    }
+                                    continue 'smi;
                                 }
-                                // Non-Array or negative index — fall through
-                                acc = smi_to_val!();
+                                // Non-Array or negative index ΓÇö fall through
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -3946,19 +4700,17 @@ impl Interpreter {
                                     let i = *idx as usize;
                                     let obj_ref = unsafe { frame.read_reg_unchecked(obj_v) };
                                     if let JsValue::Array(items) = obj_ref {
-                                        let mut v = items.borrow_mut();
+                                        let items_rc = Rc::clone(items);
+                                        let mut v = items_rc.borrow_mut();
                                         if i >= v.len() {
-                                            let cur_len = v.len();
-                                            let new_cap = (i + 1).next_power_of_two();
-                                            v.reserve(new_cap - cur_len);
                                             v.resize(i + 1, JsValue::TheHole);
                                         }
-                                        v[i] = smi_to_val!();
+                                        v[i] = materialize_acc!();
                                         continue 'smi;
                                     }
                                 }
                                 // Fall through
-                                acc = smi_to_val!();
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -3969,7 +4721,7 @@ impl Interpreter {
                                 // the receiver's PropertyMap at cached offset.
                                 let obj_v = unsafe { operand_reg_unchecked(instr, 0) };
                                 let slot = unsafe {
-                                    match *instr.operands.get_unchecked(2) {
+                                    match *instr.operand_unchecked(2) {
                                         Operand::FeedbackSlot(s) => s,
                                         _ => std::hint::unreachable_unchecked(),
                                     }
@@ -3985,23 +4737,25 @@ impl Interpreter {
                                         .as_ref()
                                         .and_then(|cache| cache.probe(slot, layout))
                                         && !ic.is_proto
-                                        && pm
-                                            .set_by_offset(ic.cached_offset as usize, smi_to_val!())
+                                        && pm.set_by_offset(
+                                            ic.cached_offset as usize,
+                                            materialize_acc!(),
+                                        )
                                     {
                                         continue 'smi;
                                     }
                                 }
-                                // IC miss — exit SMI mode and let normal
+                                // IC miss ΓÇö exit SMI mode and let normal
                                 // dispatch handle the store.
-                                acc = smi_to_val!();
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
                                 break 'smi;
                             }
-                            Opcode::LdaContextSlot | Opcode::LdaImmutableContextSlot => {
-                                // Load from closure context — stay in SMI mode
-                                // if the loaded value is Smi.
+                            Opcode::LdaContextSlot => {
+                                // Load from closure context ΓÇö stay in SMI mode
+                                // for both Smi and non-Smi values (spilled).
                                 let ctx_reg = unsafe { operand_reg_unchecked(instr, 0) };
                                 let ctx_val = unsafe { frame.read_reg_unchecked(ctx_reg) };
                                 if let JsValue::Context(ctx_rc) = ctx_val {
@@ -4009,37 +4763,73 @@ impl Interpreter {
                                         unsafe { operand_constant_pool_idx_unchecked(instr, 1) }
                                             as usize;
                                     let depth = unsafe { operand_imm_unchecked(instr, 2) };
-                                    let ctx_ref = Rc::clone(ctx_rc);
-                                    let mut current = ctx_ref;
-                                    let mut d = depth;
-                                    while d > 0 {
-                                        let next = {
-                                            let borrow = current.borrow();
-                                            if let Some(p) = &borrow.parent {
-                                                Rc::clone(p)
-                                            } else {
-                                                break;
-                                            }
+                                    if depth == 0 {
+                                        let slot_val = {
+                                            let borrow = ctx_rc.borrow();
+                                            borrow.slots.get(slot).cloned()
                                         };
-                                        current = next;
-                                        d -= 1;
-                                    }
-                                    let borrow = current.borrow();
-                                    if let Some(val) = borrow.slots.get(slot) {
-                                        if let JsValue::Smi(v) = val {
-                                            sa = *v;
+                                        if let Some(JsValue::Smi(v)) = slot_val {
+                                            sa = v;
                                             smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(v));
+                                            continue 'smi;
+                                        } else if let Some(val) = slot_val {
+                                            acc = val;
+                                            smi_acc_spilled = true;
+                                            smi_acc_bool = false;
+                                            hot_acc = None;
                                             continue 'smi;
                                         }
-                                        // Non-Smi value — exit SMI mode.
-                                        acc = val.clone();
-                                        frame.smi_mode = false;
-                                        frame.loop_end_pc = 0;
-                                        break 'smi;
+                                        // Slot missing ΓåÆ Undefined
+                                        acc = JsValue::Undefined;
+                                        smi_acc_spilled = true;
+                                        smi_acc_bool = false;
+                                        hot_acc = None;
+                                        continue 'smi;
+                                    } else {
+                                        let ctx_ref = Rc::clone(ctx_rc);
+                                        let mut current = ctx_ref;
+                                        let mut d = depth;
+                                        while d > 0 {
+                                            let next = {
+                                                let borrow = current.borrow();
+                                                if let Some(p) = &borrow.parent {
+                                                    Rc::clone(p)
+                                                } else {
+                                                    break;
+                                                }
+                                            };
+                                            current = next;
+                                            d -= 1;
+                                        }
+                                        let slot_val = {
+                                            let borrow = current.borrow();
+                                            borrow.slots.get(slot).cloned()
+                                        };
+                                        if let Some(JsValue::Smi(v)) = slot_val {
+                                            sa = v;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(v));
+                                            continue 'smi;
+                                        } else if let Some(val) = slot_val {
+                                            acc = val;
+                                            smi_acc_spilled = true;
+                                            smi_acc_bool = false;
+                                            hot_acc = None;
+                                            continue 'smi;
+                                        }
+                                        // Slot missing ΓåÆ Undefined
+                                        acc = JsValue::Undefined;
+                                        smi_acc_spilled = true;
+                                        smi_acc_bool = false;
+                                        hot_acc = None;
+                                        continue 'smi;
                                     }
                                 }
-                                // No context or missing slot — fall through.
-                                acc = smi_to_val!();
+                                // No context ΓÇö fall through.
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -4054,29 +4844,39 @@ impl Interpreter {
                                         unsafe { operand_constant_pool_idx_unchecked(instr, 1) }
                                             as usize;
                                     let depth = unsafe { operand_imm_unchecked(instr, 2) };
-                                    let ctx_ref = Rc::clone(ctx_rc);
-                                    let mut current = ctx_ref;
-                                    let mut d = depth;
-                                    while d > 0 {
-                                        let next = {
-                                            let borrow = current.borrow();
-                                            if let Some(p) = &borrow.parent {
-                                                Rc::clone(p)
-                                            } else {
-                                                break;
-                                            }
-                                        };
-                                        current = next;
-                                        d -= 1;
-                                    }
-                                    let mut borrow = current.borrow_mut();
-                                    if slot < borrow.slots.len() {
-                                        borrow.slots[slot] = smi_to_val!();
-                                        continue 'smi;
+                                    // Fast path: depth-0 stores directly into
+                                    // the register context without Rc::clone.
+                                    if depth == 0 {
+                                        let mut borrow = ctx_rc.borrow_mut();
+                                        if slot < borrow.slots.len() {
+                                            borrow.slots[slot] = materialize_acc!();
+                                            continue 'smi;
+                                        }
+                                    } else {
+                                        let ctx_ref = Rc::clone(ctx_rc);
+                                        let mut current = ctx_ref;
+                                        let mut d = depth;
+                                        while d > 0 {
+                                            let next = {
+                                                let borrow = current.borrow();
+                                                if let Some(p) = &borrow.parent {
+                                                    Rc::clone(p)
+                                                } else {
+                                                    break;
+                                                }
+                                            };
+                                            current = next;
+                                            d -= 1;
+                                        }
+                                        let mut borrow = current.borrow_mut();
+                                        if slot < borrow.slots.len() {
+                                            borrow.slots[slot] = materialize_acc!();
+                                            continue 'smi;
+                                        }
                                     }
                                 }
-                                // No context or slot out of range — fall through.
-                                acc = smi_to_val!();
+                                // No context or slot out of range ΓÇö fall through.
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
@@ -4088,131 +4888,120 @@ impl Interpreter {
                                     let slot =
                                         unsafe { operand_constant_pool_idx_unchecked(instr, 0) }
                                             as usize;
-                                    let borrow = ctx_rc.borrow();
-                                    if let Some(val) = borrow.slots.get(slot) {
-                                        if let JsValue::Smi(v) = val {
-                                            sa = *v;
-                                            smi_acc_bool = false;
-                                            continue 'smi;
-                                        }
-                                        acc = val.clone();
-                                        frame.smi_mode = false;
-                                        frame.loop_end_pc = 0;
-                                        break 'smi;
+                                    let slot_val = {
+                                        let borrow = ctx_rc.borrow();
+                                        borrow.slots.get(slot).cloned()
+                                    };
+                                    if let Some(JsValue::Smi(v)) = slot_val {
+                                        sa = v;
+                                        smi_acc_bool = false;
+                                        smi_acc_spilled = false;
+                                        hot_acc = Some(NanBoxedValue::from_smi(v));
+                                        continue 'smi;
+                                    } else if let Some(val) = slot_val {
+                                        acc = val;
+                                        smi_acc_spilled = true;
+                                        smi_acc_bool = false;
+                                        hot_acc = None;
+                                        continue 'smi;
                                     }
+                                    // Slot missing ΓåÆ Undefined
+                                    acc = JsValue::Undefined;
+                                    smi_acc_spilled = true;
+                                    smi_acc_bool = false;
+                                    hot_acc = None;
+                                    continue 'smi;
                                 }
-                                acc = smi_to_val!();
+                                // No context ΓÇö exit SMI mode.
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
                                 break 'smi;
                             }
                             Opcode::StaCurrentContextSlot => {
-                                // Store to depth-0 context.
+                                // Store to depth-0 context (with resize).
                                 if let Some(JsValue::Context(ctx_rc)) = &frame.context {
                                     let slot =
                                         unsafe { operand_constant_pool_idx_unchecked(instr, 0) }
                                             as usize;
                                     let mut borrow = ctx_rc.borrow_mut();
-                                    if slot < borrow.slots.len() {
-                                        borrow.slots[slot] = smi_to_val!();
-                                        continue 'smi;
+                                    if slot >= borrow.slots.len() {
+                                        borrow.slots.resize(slot + 1, JsValue::Undefined);
                                     }
+                                    borrow.slots[slot] = materialize_acc!();
+                                    continue 'smi;
                                 }
-                                acc = smi_to_val!();
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1;
                                 break 'smi;
                             }
-                            Opcode::CreateObjectLiteral => {
-                                // Create object and fuse with the following
-                                // Star to stay in SMI mode.  sa is stale but
-                                // will be overwritten by the next Ldar/LdaSmi.
-                                let slot = match instr.operands.get(1) {
-                                    Some(Operand::FeedbackSlot(s)) => Some(*s),
-                                    _ => None,
-                                };
-                                let capacity = match instr.operands.get(2) {
-                                    Some(Operand::Flag(count)) if *count > 0 => *count as usize,
-                                    _ => 4,
-                                };
-                                let obj = if let Some(slot) = slot {
-                                    if let Some(map) =
-                                        frame.bytecode_array.clone_object_literal_template(slot)
-                                    {
-                                        JsValue::PlainObject(Rc::new(RefCell::new(map)))
-                                    } else if let Some(map) =
-                                        frame.bytecode_array.promote_object_literal_template(slot)
-                                    {
-                                        JsValue::PlainObject(Rc::new(RefCell::new(map)))
-                                    } else {
-                                        let map = PropertyMap::with_capacity(capacity);
-                                        let rc = Rc::new(RefCell::new(map));
-                                        frame
-                                            .bytecode_array
-                                            .set_object_literal_pending(slot, Rc::clone(&rc));
-                                        JsValue::PlainObject(rc)
-                                    }
-                                } else {
-                                    JsValue::PlainObject(Rc::new(RefCell::new(
-                                        PropertyMap::with_capacity(capacity),
-                                    )))
-                                };
-                                // Fuse with following Star: write object to
-                                // register without leaving SMI mode.
-                                if let Some(next) = instructions.get(pc)
-                                    && next.opcode == Opcode::Star
-                                {
-                                    let reg = unsafe { operand_reg_unchecked(next, 0) };
-                                    unsafe {
-                                        frame.write_reg_unchecked(reg, obj);
-                                    }
-                                    pc += 1;
-                                    continue 'smi;
-                                }
-                                acc = obj;
-                                frame.smi_mode = false;
-                                frame.loop_end_pc = 0;
-                                break 'smi;
-                            }
-                            Opcode::CreateEmptyObjectLiteral => {
-                                let obj = JsValue::PlainObject(Rc::new(RefCell::new(
-                                    PropertyMap::with_capacity(4),
-                                )));
-                                if let Some(next) = instructions.get(pc)
-                                    && next.opcode == Opcode::Star
-                                {
-                                    let reg = unsafe { operand_reg_unchecked(next, 0) };
-                                    unsafe {
-                                        frame.write_reg_unchecked(reg, obj);
-                                    }
-                                    pc += 1;
-                                    continue 'smi;
-                                }
-                                acc = obj;
-                                frame.smi_mode = false;
-                                frame.loop_end_pc = 0;
-                                break 'smi;
-                            }
-                            Opcode::CreateEmptyArrayLiteral | Opcode::CreateArrayLiteral => {
-                                let arr = JsValue::Array(Rc::new(RefCell::new(Vec::new())));
-                                if let Some(next) = instructions.get(pc)
-                                    && next.opcode == Opcode::Star
-                                {
-                                    let reg = unsafe { operand_reg_unchecked(next, 0) };
-                                    unsafe {
-                                        frame.write_reg_unchecked(reg, arr);
-                                    }
-                                    pc += 1;
-                                    continue 'smi;
-                                }
-                                acc = arr;
-                                frame.smi_mode = false;
-                                frame.loop_end_pc = 0;
-                                break 'smi;
-                            }
                             Opcode::Nop => {}
+                            Opcode::CreateEmptyArrayLiteral => {
+                                acc = JsValue::Array(Rc::new(RefCell::new(Vec::new())));
+                                smi_acc_spilled = true;
+                                continue 'smi;
+                            }
+                            Opcode::CreateArrayLiteral => {
+                                let capacity = match instr.operand_at(2) {
+                                    Some(Operand::Flag(hint)) => usize::from(*hint),
+                                    _ => 0,
+                                };
+                                acc = JsValue::Array(Rc::new(RefCell::new(Vec::with_capacity(
+                                    capacity,
+                                ))));
+                                smi_acc_spilled = true;
+                                continue 'smi;
+                            }
+                            Opcode::TypeOf => {
+                                let type_str = if smi_acc_spilled {
+                                    match &acc {
+                                        JsValue::Undefined | JsValue::TheHole => "undefined",
+                                        JsValue::Null => "object",
+                                        JsValue::Boolean(_) => "boolean",
+                                        JsValue::Smi(_) | JsValue::HeapNumber(_) => "number",
+                                        JsValue::String(_) => "string",
+                                        JsValue::Symbol(_) => "symbol",
+                                        JsValue::BigInt(_) => "bigint",
+                                        JsValue::Function(_) | JsValue::NativeFunction(_) => {
+                                            "function"
+                                        }
+                                        JsValue::Object(_)
+                                        | JsValue::Array(_)
+                                        | JsValue::Error(_)
+                                        | JsValue::Generator(_)
+                                        | JsValue::Iterator(_)
+                                        | JsValue::Promise(_)
+                                        | JsValue::Context(_)
+                                        | JsValue::ArrayBuffer(_)
+                                        | JsValue::TypedArray(_)
+                                        | JsValue::DataView(_) => "object",
+                                        JsValue::PlainObject(map) => {
+                                            if map.borrow().get("__call__").is_some() {
+                                                "function"
+                                            } else {
+                                                "object"
+                                            }
+                                        }
+                                        JsValue::Proxy(proxy) => {
+                                            if proxy.borrow().is_callable() {
+                                                "function"
+                                            } else {
+                                                "object"
+                                            }
+                                        }
+                                    }
+                                } else if smi_acc_bool {
+                                    "boolean"
+                                } else {
+                                    "number"
+                                };
+                                acc = JsValue::String(type_str.to_owned().into());
+                                smi_acc_spilled = true;
+                                continue 'smi;
+                            }
                             Opcode::LdaUndefined => {
                                 acc = JsValue::Undefined;
                                 frame.smi_mode = false;
@@ -4226,9 +5015,9 @@ impl Interpreter {
                                 break 'smi;
                             }
                             _ => {
-                                // Unsupported opcode — exit SMI loop and let
+                                // Unsupported opcode ΓÇö exit SMI loop and let
                                 // the regular dispatch handle it.
-                                acc = smi_to_val!();
+                                acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 pc -= 1; // re-process this instruction
@@ -4241,12 +5030,26 @@ impl Interpreter {
                 }
 
                 match instr.opcode {
-                    // ── Load / Store (ultra-tight) ───────────────
+                    // ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+                    // Tier 1 ΓÇö ~60% of executed instructions.
+                    // Grouped first for I-cache locality.  All handlers
+                    // are fully inlined and use `continue 'dispatch`
+                    // without touching frame.accumulator.
+                    // ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+
+                    // ΓöÇΓöÇ Load / Store (ultra-tight) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
                     Opcode::LdaSmi => {
                         // SAFETY: Bytecode generator guarantees operand[0]
                         // is Immediate for LdaSmi.
                         let val = unsafe { operand_imm_unchecked(instr, 0) };
                         acc = JsValue::Smi(val);
+                        continue 'dispatch;
+                    }
+                    Opcode::LdaSmiStar => {
+                        let val = unsafe { operand_imm_unchecked(instr, 0) };
+                        let dst = unsafe { operand_reg_unchecked(instr, 1) };
+                        acc = JsValue::Smi(val);
+                        unsafe { frame.write_reg_unchecked(dst, acc.cheap_clone()) };
                         continue 'dispatch;
                     }
                     Opcode::Star => {
@@ -4297,9 +5100,17 @@ impl Interpreter {
                     Opcode::Nop => {
                         continue 'dispatch;
                     }
-                    // ── Array creation (inline, no table dispatch) ──
-                    Opcode::CreateEmptyArrayLiteral | Opcode::CreateArrayLiteral => {
+                    // ΓöÇΓöÇ Array creation (inline, no table dispatch) ΓöÇΓöÇ
+                    Opcode::CreateEmptyArrayLiteral => {
                         acc = JsValue::Array(Rc::new(RefCell::new(Vec::new())));
+                        continue 'dispatch;
+                    }
+                    Opcode::CreateArrayLiteral => {
+                        let capacity = match instr.operand_at(2) {
+                            Some(Operand::Flag(hint)) => usize::from(*hint),
+                            _ => 0,
+                        };
+                        acc = JsValue::Array(Rc::new(RefCell::new(Vec::with_capacity(capacity))));
                         continue 'dispatch;
                     }
                     Opcode::CreateEmptyObjectLiteral => {
@@ -4319,17 +5130,41 @@ impl Interpreter {
                         continue 'dispatch;
                     }
 
-                    // ── Arithmetic (SMI fast path, table fallback) ──
+                    // ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+                    // Tier 2 ΓÇö ~30% of executed instructions.
+                    // Arithmetic, comparisons, jumps, property access.
+                    // SMI fast-path inlined; non-Smi falls through to
+                    // the dispatch table.
+                    // ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+
+                    // ΓöÇΓöÇ Arithmetic (SMI fast path, table fallback) ΓöÇΓöÇ
                     Opcode::Add => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
-                            if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs)
-                                && let Some(result) = a.checked_add(*b)
-                            {
-                                acc = JsValue::Smi(result);
-                                continue 'dispatch;
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = if let Some(result) = a.checked_add(*b) {
+                                        JsValue::Smi(result)
+                                    } else {
+                                        JsValue::HeapNumber(*a as f64 + *b as f64)
+                                    };
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = number_to_jsvalue(*a + *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = number_to_jsvalue(*a as f64 + *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = number_to_jsvalue(*a + *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
                         }
                         // Write back locals before cold-path dispatch.
@@ -4345,7 +5180,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4355,7 +5190,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4363,15 +5201,32 @@ impl Interpreter {
                         }
                     }
                     Opcode::Sub => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
-                            if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs)
-                                && let Some(result) = a.checked_sub(*b)
-                            {
-                                acc = JsValue::Smi(result);
-                                continue 'dispatch;
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = if let Some(result) = a.checked_sub(*b) {
+                                        JsValue::Smi(result)
+                                    } else {
+                                        JsValue::HeapNumber(*a as f64 - *b as f64)
+                                    };
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = number_to_jsvalue(*a - *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = number_to_jsvalue(*a as f64 - *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = number_to_jsvalue(*a - *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
                         }
                         frame.pc = pc;
@@ -4386,7 +5241,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4396,7 +5251,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4404,15 +5262,32 @@ impl Interpreter {
                         }
                     }
                     Opcode::Mul => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
-                            if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs)
-                                && let Some(result) = a.checked_mul(*b)
-                            {
-                                acc = JsValue::Smi(result);
-                                continue 'dispatch;
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = if let Some(result) = a.checked_mul(*b) {
+                                        JsValue::Smi(result)
+                                    } else {
+                                        JsValue::HeapNumber(*a as f64 * *b as f64)
+                                    };
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = number_to_jsvalue(*a * *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = number_to_jsvalue(*a as f64 * *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = number_to_jsvalue(*a * *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
                         }
                         frame.pc = pc;
@@ -4427,7 +5302,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4437,7 +5312,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4445,12 +5323,22 @@ impl Interpreter {
                         }
                     }
                     Opcode::AddSmi => {
-                        if let Operand::Immediate(imm) = instr.operands[0]
-                            && let JsValue::Smi(n) = acc
-                            && let Some(result) = n.checked_add(imm)
-                        {
-                            acc = JsValue::Smi(result);
-                            continue 'dispatch;
+                        if let Operand::Immediate(imm) = *instr.operand(0) {
+                            match &acc {
+                                JsValue::Smi(n) => {
+                                    acc = if let Some(result) = n.checked_add(imm) {
+                                        JsValue::Smi(result)
+                                    } else {
+                                        JsValue::HeapNumber(*n as f64 + imm as f64)
+                                    };
+                                    continue 'dispatch;
+                                }
+                                JsValue::HeapNumber(n) => {
+                                    acc = number_to_jsvalue(*n + imm as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
+                            }
                         }
                         frame.pc = pc;
                         frame.accumulator = acc;
@@ -4464,7 +5352,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4474,7 +5362,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4482,12 +5373,22 @@ impl Interpreter {
                         }
                     }
                     Opcode::SubSmi => {
-                        if let Operand::Immediate(imm) = instr.operands[0]
-                            && let JsValue::Smi(n) = acc
-                            && let Some(result) = n.checked_sub(imm)
-                        {
-                            acc = JsValue::Smi(result);
-                            continue 'dispatch;
+                        if let Operand::Immediate(imm) = *instr.operand(0) {
+                            match &acc {
+                                JsValue::Smi(n) => {
+                                    acc = if let Some(result) = n.checked_sub(imm) {
+                                        JsValue::Smi(result)
+                                    } else {
+                                        JsValue::HeapNumber(*n as f64 - imm as f64)
+                                    };
+                                    continue 'dispatch;
+                                }
+                                JsValue::HeapNumber(n) => {
+                                    acc = number_to_jsvalue(*n - imm as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
+                            }
                         }
                         frame.pc = pc;
                         frame.accumulator = acc;
@@ -4501,7 +5402,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4511,7 +5412,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4519,12 +5423,22 @@ impl Interpreter {
                         }
                     }
                     Opcode::MulSmi => {
-                        if let Operand::Immediate(imm) = instr.operands[0]
-                            && let JsValue::Smi(n) = acc
-                            && let Some(result) = n.checked_mul(imm)
-                        {
-                            acc = JsValue::Smi(result);
-                            continue 'dispatch;
+                        if let Operand::Immediate(imm) = *instr.operand(0) {
+                            match &acc {
+                                JsValue::Smi(n) => {
+                                    acc = if let Some(result) = n.checked_mul(imm) {
+                                        JsValue::Smi(result)
+                                    } else {
+                                        JsValue::HeapNumber(*n as f64 * imm as f64)
+                                    };
+                                    continue 'dispatch;
+                                }
+                                JsValue::HeapNumber(n) => {
+                                    acc = number_to_jsvalue(*n * imm as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
+                            }
                         }
                         frame.pc = pc;
                         frame.accumulator = acc;
@@ -4538,7 +5452,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4548,7 +5462,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4556,7 +5473,7 @@ impl Interpreter {
                         }
                     }
 
-                    // ── Inc / Dec (Smi fast path) ────────────
+                    // ΓöÇΓöÇ Inc / Dec (Smi fast path) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
                     Opcode::Inc => {
                         if let JsValue::Smi(n) = acc
                             && let Some(result) = n.checked_add(1)
@@ -4576,7 +5493,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4586,7 +5503,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4612,7 +5532,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4622,16 +5542,19 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
                             }
                         }
                     }
-                    // ── BitwiseOr (Smi fast path + HeapNumber→Smi coercion) ──
+                    // ΓöÇΓöÇ BitwiseOr (Smi fast path + HeapNumberΓåÆSmi coercion) ΓöÇΓöÇ
                     Opcode::BitwiseOr => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
                             // Fast path: Smi | Smi
                             if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
@@ -4643,7 +5566,7 @@ impl Interpreter {
                                 }
                                 continue 'dispatch;
                             }
-                            // HeapNumber | Smi — common after float division: `(a/b) | 0`
+                            // HeapNumber | Smi ΓÇö common after float division: `(a/b) | 0`
                             if let (JsValue::HeapNumber(a), JsValue::Smi(b)) = (&acc, rhs) {
                                 acc = JsValue::Smi(crate::objects::value::f64_to_int32(*a) | *b);
                                 if !frame.smi_mode && !frame.loop_trip_counts.is_empty() {
@@ -4672,7 +5595,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4682,7 +5605,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4690,7 +5616,7 @@ impl Interpreter {
                         }
                     }
                     Opcode::BitwiseOrSmi => {
-                        if let Operand::Immediate(imm) = instr.operands[0] {
+                        if let Operand::Immediate(imm) = *instr.operand(0) {
                             match acc {
                                 JsValue::Smi(n) => {
                                     acc = JsValue::Smi(n | imm);
@@ -4721,7 +5647,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4731,23 +5657,42 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
                             }
                         }
                     }
-                    // ── Div (Smi fast path, exact only) ───────
+                    // ΓöÇΓöÇ Div (Smi fast path, exact only) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
                     Opcode::Div => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
-                            if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs)
-                                && *b != 0
-                                && *a % *b == 0
-                            {
-                                acc = JsValue::Smi(*a / *b);
-                                continue 'dispatch;
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = if *b != 0 && *a % *b == 0 {
+                                        JsValue::Smi(*a / *b)
+                                    } else {
+                                        number_to_jsvalue(*a as f64 / *b as f64)
+                                    };
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = number_to_jsvalue(*a / *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = number_to_jsvalue(*a as f64 / *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = number_to_jsvalue(*a / *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
                         }
                         frame.pc = pc;
@@ -4762,7 +5707,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4772,16 +5717,19 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
                             }
                         }
                     }
-                    // ── BitwiseAnd (Smi fast path) ────────────
+                    // ΓöÇΓöÇ BitwiseAnd (Smi fast path) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
                     Opcode::BitwiseAnd => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
                             if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
                                 acc = JsValue::Smi(*a & *b);
@@ -4800,7 +5748,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4810,22 +5758,42 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
                             }
                         }
                     }
-                    // ── Mod (Smi fast path) ───────────────────
+                    // ΓöÇΓöÇ Mod (Smi fast path) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
                     Opcode::Mod => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
-                            if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs)
-                                && *b != 0
-                            {
-                                acc = JsValue::Smi(*a % *b);
-                                continue 'dispatch;
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = if *b != 0 {
+                                        JsValue::Smi(*a % *b)
+                                    } else {
+                                        number_to_jsvalue(*a as f64 % *b as f64)
+                                    };
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = number_to_jsvalue(*a % *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = number_to_jsvalue(*a as f64 % *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = number_to_jsvalue(*a % *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
                         }
                         frame.pc = pc;
@@ -4840,7 +5808,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4850,16 +5818,19 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
                             }
                         }
                     }
-                    // ── BitwiseAndSmi / ShiftLeftSmi / ShiftRightSmi ──
+                    // ΓöÇΓöÇ BitwiseAndSmi / ShiftLeftSmi / ShiftRightSmi ΓöÇΓöÇ
                     Opcode::BitwiseAndSmi => {
-                        if let Operand::Immediate(imm) = instr.operands[0]
+                        if let Operand::Immediate(imm) = *instr.operand(0)
                             && let JsValue::Smi(n) = acc
                         {
                             acc = JsValue::Smi(n & imm);
@@ -4877,7 +5848,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4887,7 +5858,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4895,7 +5869,7 @@ impl Interpreter {
                         }
                     }
                     Opcode::ShiftRightSmi => {
-                        if let Operand::Immediate(imm) = instr.operands[0]
+                        if let Operand::Immediate(imm) = *instr.operand(0)
                             && let JsValue::Smi(n) = acc
                         {
                             acc = JsValue::Smi(n >> (imm & 0x1f));
@@ -4913,7 +5887,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4923,7 +5897,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4931,7 +5908,7 @@ impl Interpreter {
                         }
                     }
                     Opcode::ShiftLeftSmi => {
-                        if let Operand::Immediate(imm) = instr.operands[0]
+                        if let Operand::Immediate(imm) = *instr.operand(0)
                             && let JsValue::Smi(n) = acc
                         {
                             acc = JsValue::Smi(n << (imm & 0x1f));
@@ -4949,7 +5926,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -4959,7 +5936,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -4967,14 +5947,16 @@ impl Interpreter {
                         }
                     }
 
-                    // ── LdaGlobal (IC fast path) ────────────
+                    // ΓöÇΓöÇ LdaGlobal (IC fast path) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
                     Opcode::LdaGlobal => {
-                        if let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] {
+                        if let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) {
                             // IC fast path: known slot, generation matches.
-                            if let Some((slot_idx, cached_gen)) = frame.global_ic_get(name_idx) {
+                            if let Some(ref ic) = frame.global_ic
+                                && let Some(&(slot_idx, cached_gen)) = ic.get(&name_idx)
+                            {
                                 let env = frame.global_env.borrow();
                                 if env.generation() == cached_gen {
-                                    let value = env.get_by_index(slot_idx).cheap_clone();
+                                    let value = env.get_by_index(slot_idx).clone();
                                     drop(env);
                                     if value != JsValue::TheHole {
                                         acc = value;
@@ -4996,7 +5978,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5006,7 +5988,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5014,13 +5999,13 @@ impl Interpreter {
                         }
                     }
 
-                    // ── Return ───────────────────────────────
+                    // ΓöÇΓöÇ Return ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
                     Opcode::Return => {
                         frame.pc = pc;
                         return Ok(acc);
                     }
 
-                    // ── Jumps (unsafe target resolution) ─────
+                    // ΓöÇΓöÇ Jumps (unsafe target resolution) ΓöÇΓöÇΓöÇΓöÇΓöÇ
                     Opcode::Jump => {
                         // SAFETY: Bytecode compiler guarantees all Jump
                         // instructions have pre-computed targets.
@@ -5044,7 +6029,7 @@ impl Interpreter {
                         continue 'dispatch;
                     }
 
-                    // ── JumpIfToBooleanTrue/False (inline to_boolean) ──
+                    // ΓöÇΓöÇ JumpIfToBooleanTrue/False (inline to_boolean) ΓöÇΓöÇ
                     Opcode::JumpIfToBooleanTrue => {
                         let truthy = match &acc {
                             JsValue::Boolean(b) => *b,
@@ -5052,7 +6037,7 @@ impl Interpreter {
                             JsValue::Undefined | JsValue::Null | JsValue::TheHole => false,
                             JsValue::HeapNumber(n) => !n.is_nan() && *n != 0.0,
                             JsValue::String(s) => !s.is_empty(),
-                            JsValue::BigInt(n) => *n != 0,
+                            JsValue::BigInt(n) => **n != 0,
                             // Objects, functions, arrays, etc. are always truthy.
                             _ => true,
                         };
@@ -5068,7 +6053,7 @@ impl Interpreter {
                             JsValue::Undefined | JsValue::Null | JsValue::TheHole => false,
                             JsValue::HeapNumber(n) => !n.is_nan() && *n != 0.0,
                             JsValue::String(s) => !s.is_empty(),
-                            JsValue::BigInt(n) => *n != 0,
+                            JsValue::BigInt(n) => **n != 0,
                             _ => true,
                         };
                         if !truthy {
@@ -5083,36 +6068,62 @@ impl Interpreter {
                         let loop_end = pc; // Position after this JumpLoop
                         pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
                         frame.osr_loop_count = frame.osr_loop_count.saturating_add(1);
-                        // Use exact-match (`==`) to minimise hot-path cost.
                         if frame.osr_loop_count == OSR_LOOP_THRESHOLD {
                             if frame.bytecode_array.try_get_jit_code().is_none()
                                 && !frame.bytecode_array.jit_baseline_has_deopted()
                             {
                                 maybe_compile_baseline(&frame.bytecode_array);
                             }
-                            // Kick off Maglev compilation early so the
-                            // background thread finishes before the next
-                            // call to this function.
                             maybe_compile_maglev(&frame.bytecode_array);
-                            // OSR: switch to JIT if code is now available.
                             if let Some(jit_result) =
                                 try_execute_best_jit(&frame.bytecode_array, &frame.call_args)
                             {
                                 return jit_result;
                             }
-                        }
-                        if frame.osr_loop_count == TURBOFAN_OSR_LOOP_THRESHOLD {
+                        } else if frame.osr_loop_count == MAGLEV_OSR_LOOP_THRESHOLD {
+                            maybe_compile_maglev(&frame.bytecode_array);
+                        } else if frame.osr_loop_count == TURBOFAN_OSR_LOOP_THRESHOLD {
                             maybe_compile_turbofan(&frame.bytecode_array);
                         }
+
+                        // ΓöÇΓöÇ Back-edge periodic checks ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+                        // All periodic work (instruction limit, wall-clock
+                        // deadline, profiler sampling) is concentrated on
+                        // back-edges so the forward-instruction hot path
+                        // is branch-free.
+                        frame.instructions_executed += (loop_end - pc) as u64;
+                        if frame.instruction_limit > 0
+                            && frame.instructions_executed > frame.instruction_limit
+                        {
+                            frame.pc = pc;
+                            frame.accumulator = acc;
+                            return Err(instruction_limit_error());
+                        }
+                        if frame.instructions_executed & 0xFFFF == 0 {
+                            let thread_deadline = EXECUTION_DEADLINE.with(|d| d.get());
+                            if frame.deadline.is_some() || thread_deadline.is_some() {
+                                let now = Instant::now();
+                                if frame.deadline.is_some_and(|dl| now > dl)
+                                    || thread_deadline.is_some_and(|dl| now > dl)
+                                {
+                                    frame.pc = pc;
+                                    frame.accumulator = acc;
+                                    return Err(execution_timeout_error());
+                                }
+                            }
+                            crate::inspector::profiler::maybe_record_sample();
+                            debug_active = DEBUG_ATTACHED.with(Cell::get);
+                        }
+
                         // SMI-mode detection: if the accumulator is Smi
-                        // (or Boolean — common for comparison-terminated
+                        // (or Boolean ΓÇö common for comparison-terminated
                         // loops like `for(;;i++){if(cond) ...}`) after
                         // several back-edge trips, enter SMI fast dispatch.
                         if !frame.smi_mode && matches!(&acc, JsValue::Smi(_) | JsValue::Boolean(_))
                         {
                             let target_pc = pc;
                             // Lazily grow the trip-count vector on first
-                            // JumpLoop — avoids Vec allocation for functions
+                            // JumpLoop ΓÇö avoids Vec allocation for functions
                             // with no loops.
                             if frame.loop_trip_counts.len() <= target_pc {
                                 frame.loop_trip_counts.resize(instructions.len(), 0);
@@ -5122,7 +6133,7 @@ impl Interpreter {
                                 unsafe { frame.loop_trip_counts.get_unchecked_mut(target_pc) };
                             *count = count.saturating_add(1);
                             if *count >= 4 {
-                                // Convert Boolean → Smi so the SMI loop entry
+                                // Convert Boolean ΓåÆ Smi so the SMI loop entry
                                 // succeeds.  Inside the loop, comparisons
                                 // produce 0/1 which is equivalent to
                                 // false/true for control-flow purposes
@@ -5135,7 +6146,13 @@ impl Interpreter {
                                 // so it can detect when execution flows past
                                 // the back-edge (e.g. loop exit).
                                 frame.loop_end_pc = loop_end;
-                                if frame.hot_registers.is_none() {
+                                // Invalidate hot_registers when re-entering
+                                // smi_mode: the outer dispatch loop may have
+                                // modified registers via table-dispatched
+                                // handlers that don't update the hot cache.
+                                if let Some(ref mut hr) = frame.hot_registers {
+                                    hr.invalidate_all();
+                                } else {
                                     frame.hot_registers =
                                         Some(HotRegisters::new(frame.registers.len()));
                                 }
@@ -5144,15 +6161,30 @@ impl Interpreter {
                         continue 'dispatch;
                     }
 
-                    // ── Comparisons (SMI fast path, table fallback) ──
+                    // ΓöÇΓöÇ Comparisons (SMI fast path, table fallback) ΓöÇΓöÇ
                     Opcode::TestLessThan => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
-                            if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
-                                acc = JsValue::Boolean(*a < *b);
-                                continue 'dispatch;
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a < *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean(*a < *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean((*a as f64) < *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a < *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
                         }
                         frame.pc = pc;
@@ -5167,7 +6199,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5177,7 +6209,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5185,13 +6220,28 @@ impl Interpreter {
                         }
                     }
                     Opcode::TestGreaterThan => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
-                            if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
-                                acc = JsValue::Boolean(*a > *b);
-                                continue 'dispatch;
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a > *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean(*a > *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean((*a as f64) > *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a > *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
                         }
                         frame.pc = pc;
@@ -5206,7 +6256,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5216,7 +6266,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5224,10 +6277,29 @@ impl Interpreter {
                         }
                     }
                     Opcode::TestEqual => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a == *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean(*a == *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean((*a as f64) == *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a == *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
+                            }
                             let result = abstract_eq(&acc, rhs);
                             acc = JsValue::Boolean(result);
                             continue 'dispatch;
@@ -5244,7 +6316,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5254,7 +6326,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5262,13 +6337,28 @@ impl Interpreter {
                         }
                     }
                     Opcode::TestEqualStrict => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             // SAFETY: Bytecode validator guarantees register
                             // operands are in bounds.
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
-                            if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
-                                acc = JsValue::Boolean(*a == *b);
-                                continue 'dispatch;
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a == *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean(*a == *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean((*a as f64) == *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a == *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
                             let result = strict_eq(&acc, rhs);
                             acc = JsValue::Boolean(result);
@@ -5286,7 +6376,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5296,7 +6386,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5304,8 +6397,27 @@ impl Interpreter {
                         }
                     }
                     Opcode::TestNotEqual => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a != *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean(*a != *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean((*a as f64) != *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a != *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
+                            }
                             let result = abstract_eq(&acc, rhs);
                             acc = JsValue::Boolean(!result);
                             continue 'dispatch;
@@ -5322,7 +6434,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5332,7 +6444,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5340,11 +6455,26 @@ impl Interpreter {
                         }
                     }
                     Opcode::TestLessThanOrEqual => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
-                            if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
-                                acc = JsValue::Boolean(*a <= *b);
-                                continue 'dispatch;
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a <= *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean(*a <= *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean((*a as f64) <= *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a <= *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
                         }
                         frame.pc = pc;
@@ -5359,7 +6489,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5369,7 +6499,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5377,11 +6510,26 @@ impl Interpreter {
                         }
                     }
                     Opcode::TestGreaterThanOrEqual => {
-                        if let Operand::Register(v) = instr.operands[0] {
+                        if let Operand::Register(v) = *instr.operand(0) {
                             let rhs = unsafe { frame.read_reg_unchecked(v) };
-                            if let (JsValue::Smi(a), JsValue::Smi(b)) = (&acc, rhs) {
-                                acc = JsValue::Boolean(*a >= *b);
-                                continue 'dispatch;
+                            match (&acc, rhs) {
+                                (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a >= *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean(*a >= *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::Smi(a), JsValue::HeapNumber(b)) => {
+                                    acc = JsValue::Boolean((*a as f64) >= *b);
+                                    continue 'dispatch;
+                                }
+                                (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
+                                    acc = JsValue::Boolean(*a >= *b as f64);
+                                    continue 'dispatch;
+                                }
+                                _ => {}
                             }
                         }
                         frame.pc = pc;
@@ -5396,7 +6544,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5406,7 +6554,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5414,10 +6565,10 @@ impl Interpreter {
                         }
                     }
 
-                    // ── LdaNamedProperty: inline mega-IC hit ─────
+                    // ΓöÇΓöÇ LdaNamedProperty: inline mega-IC hit ΓöÇΓöÇΓöÇΓöÇΓöÇ
                     Opcode::LdaNamedProperty => {
-                        if let Operand::Register(obj_v) = instr.operands[0]
-                            && let Operand::FeedbackSlot(slot) = instr.operands[2]
+                        if let Operand::Register(obj_v) = *instr.operand(0)
+                            && let Operand::FeedbackSlot(slot) = *instr.operand(2)
                         {
                             // SAFETY: read_reg_unchecked returns a reference into
                             // frame.registers.  We use a raw pointer so we can
@@ -5427,9 +6578,9 @@ impl Interpreter {
                                 unsafe { frame.read_reg_unchecked(obj_v) } as *const JsValue;
                             let obj = unsafe { &*obj_ptr };
 
-                            // Fast path: arr.length on JsValue::Array — avoids
+                            // Fast path: arr.length on JsValue::Array ΓÇö avoids
                             // prototype chain walk and string comparison.
-                            if let Operand::ConstantPoolIdx(name_idx) = instr.operands[1]
+                            if let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1)
                                 && frame.is_length_constant(name_idx)
                             {
                                 match obj {
@@ -5488,6 +6639,22 @@ impl Interpreter {
                                         }
                                     }
                                 }
+                                if let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1) {
+                                    let prop_name = frame.get_string_constant(name_idx)?;
+                                    if let Some(ic) = frame
+                                        .proto_load_ic
+                                        .as_ref()
+                                        .and_then(|cache| cache.get(&slot))
+                                        && ic.receiver_shape == layout
+                                        && ic.proto_depth != 0
+                                        && ic.property_key.as_ref() == prop_name.as_ref()
+                                        && ic.proto_generation == pm.proto_generation()
+                                        && !plain_object_has_own_property(&pm, prop_name.as_ref())
+                                    {
+                                        acc = ic.value.clone();
+                                        continue 'dispatch;
+                                    }
+                                }
                             }
                         }
                         // Fall through to table dispatch for misses and
@@ -5504,7 +6671,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5514,7 +6681,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5522,9 +6692,9 @@ impl Interpreter {
                         }
                     }
 
-                    // ── StaGlobal (IC fast path) ────────────
+                    // ΓöÇΓöÇ StaGlobal (IC fast path) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
                     Opcode::StaGlobal => {
-                        if let Operand::ConstantPoolIdx(name_idx) = instr.operands[0] {
+                        if let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) {
                             frame.pc = pc;
                             frame.accumulator = acc.cheap_clone();
                             let name = frame.get_string_constant(name_idx)?;
@@ -5532,9 +6702,7 @@ impl Interpreter {
                             if frame.bytecode_array.is_strict()
                                 && !frame.global_env.borrow().contains_key(&name)
                             {
-                                return Err(StatorError::ReferenceError(format!(
-                                    "{name} is not defined"
-                                )));
+                                return Err(sta_global_undefined_error(&name));
                             }
                             frame.store_global(name_idx, &name, val);
                             continue 'dispatch;
@@ -5552,7 +6720,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5562,7 +6730,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5570,11 +6741,11 @@ impl Interpreter {
                         }
                     }
 
-                    // ── StaNamedProperty (mega-IC fast path) ──
+                    // ΓöÇΓöÇ StaNamedProperty (mega-IC fast path) ΓöÇΓöÇ
                     Opcode::StaNamedProperty => {
-                        if let Operand::Register(obj_v) = instr.operands[0]
-                            && let Operand::ConstantPoolIdx(name_idx) = instr.operands[1]
-                            && let Operand::FeedbackSlot(slot) = instr.operands[2]
+                        if let Operand::Register(obj_v) = *instr.operand(0)
+                            && let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1)
+                            && let Operand::FeedbackSlot(slot) = *instr.operand(2)
                         {
                             let obj_ref = unsafe { frame.read_reg_unchecked(obj_v) };
                             if let JsValue::PlainObject(map) = obj_ref {
@@ -5614,7 +6785,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5624,7 +6795,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5632,9 +6806,9 @@ impl Interpreter {
                         }
                     }
 
-                    // ── LdaKeyedProperty (Smi index on Array) ──
+                    // ΓöÇΓöÇ LdaKeyedProperty (Smi index on Array) ΓöÇΓöÇ
                     Opcode::LdaKeyedProperty => {
-                        if let Operand::Register(obj_v) = instr.operands[0]
+                        if let Operand::Register(obj_v) = *instr.operand(0)
                             && let JsValue::Smi(idx) = &acc
                             && *idx >= 0
                         {
@@ -5664,7 +6838,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5674,7 +6848,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5682,10 +6859,10 @@ impl Interpreter {
                         }
                     }
 
-                    // ── StaKeyedProperty (Smi index on Array) ──
+                    // ΓöÇΓöÇ StaKeyedProperty (Smi index on Array) ΓöÇΓöÇ
                     Opcode::StaKeyedProperty => {
-                        if let Operand::Register(obj_v) = instr.operands[0]
-                            && let Operand::Register(key_v) = instr.operands[1]
+                        if let Operand::Register(obj_v) = *instr.operand(0)
+                            && let Operand::Register(key_v) = *instr.operand(1)
                         {
                             let key_ref = unsafe { frame.read_reg_unchecked(key_v) };
                             if let JsValue::Smi(idx) = key_ref
@@ -5697,13 +6874,14 @@ impl Interpreter {
                                     let items_rc = Rc::clone(items);
                                     let val = acc.cheap_clone();
                                     let mut v = items_rc.borrow_mut();
-                                    if i >= v.len() {
-                                        let cur_len = v.len();
-                                        let new_cap = (i + 1).next_power_of_two();
-                                        v.reserve(new_cap - cur_len);
-                                        v.resize(i + 1, JsValue::TheHole);
+                                    if i < v.len() {
+                                        v[i] = val;
+                                    } else if i == v.len() {
+                                        v.push(val);
+                                    } else {
+                                        v.resize(i, JsValue::TheHole);
+                                        v.push(val);
                                     }
-                                    v[i] = val;
                                     continue 'dispatch;
                                 }
                             }
@@ -5721,7 +6899,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5731,7 +6909,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5739,9 +6920,9 @@ impl Interpreter {
                         }
                     }
 
-                    // ── LdaCurrentContextSlot (closure var load) ──
+                    // ΓöÇΓöÇ LdaCurrentContextSlot (closure var load) ΓöÇΓöÇ
                     Opcode::LdaCurrentContextSlot | Opcode::LdaImmutableCurrentContextSlot => {
-                        if let Operand::ConstantPoolIdx(slot_idx) = instr.operands[0]
+                        if let Operand::ConstantPoolIdx(slot_idx) = *instr.operand(0)
                             && let Some(JsValue::Context(js_ctx)) = &frame.context
                         {
                             let borrowed = js_ctx.borrow();
@@ -5766,7 +6947,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5776,7 +6957,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5784,9 +6968,9 @@ impl Interpreter {
                         }
                     }
 
-                    // ── StaCurrentContextSlot (closure var store) ──
+                    // ΓöÇΓöÇ StaCurrentContextSlot (closure var store) ΓöÇΓöÇ
                     Opcode::StaCurrentContextSlot => {
-                        if let Operand::ConstantPoolIdx(slot_idx) = instr.operands[0]
+                        if let Operand::ConstantPoolIdx(slot_idx) = *instr.operand(0)
                             && let Some(JsValue::Context(js_ctx)) = &frame.context
                         {
                             let mut borrowed = js_ctx.borrow_mut();
@@ -5810,7 +6994,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5820,7 +7004,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5828,7 +7015,7 @@ impl Interpreter {
                         }
                     }
 
-                    // ── Inline CallUndefinedReceiver0 (hot path) ────
+                    // ΓöÇΓöÇ Inline CallUndefinedReceiver0 (hot path) ΓöÇΓöÇΓöÇΓöÇ
                     //
                     // The most common call opcode for `f()`.  Handles
                     // the normal case (non-generator, non-async, non-JIT)
@@ -5837,6 +7024,11 @@ impl Interpreter {
                     Opcode::CallUndefinedReceiver0 => {
                         let reg = unsafe { operand_reg_unchecked(instr, 0) };
                         let callee = unsafe { frame.read_reg_unchecked(reg) };
+                        if let JsValue::NativeFunction(native_fn) = callee {
+                            acc = native_fn(Vec::new())?;
+                            frame.global_cache_invalidate();
+                            continue 'dispatch;
+                        }
                         if let JsValue::Function(ba) = callee
                             && !ba.is_generator()
                             && !ba.is_async()
@@ -5845,11 +7037,21 @@ impl Interpreter {
                             let is_strict = ba.is_strict();
                             let has_self_name = ba.self_name_register().is_some();
                             let has_fn_props = is_arrow && ba.has_fn_props();
+                            // Try inline BEFORE cloning Rc ΓÇö avoids atomic
+                            // refcount bump when the function is small enough
+                            // to be inlined.
+                            if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+                                && !ba.has_exception_handler()
+                                && let Some(result) =
+                                    try_inline_small_function(ba, &[], &frame.global_env)
+                            {
+                                acc = result;
+                                continue 'dispatch;
+                            }
                             let closure_ctx = ba.closure_context().map(Rc::clone);
                             let ba = Rc::clone(ba);
                             frame.pc = pc;
 
-                            let args = CallArgs::new();
                             let saved_this = if !is_arrow && is_strict {
                                 let old = frame.global_env.borrow().get_this().cloned();
                                 frame.global_env.borrow_mut().set_this(JsValue::Undefined);
@@ -5857,11 +7059,19 @@ impl Interpreter {
                             } else {
                                 None
                             };
-                            let mut callee_frame = InterpreterFrame::new_callee_frame(
-                                ba,
-                                args,
-                                Rc::clone(&frame.global_env),
-                            );
+                            let mut callee_frame = if ba.parameter_count() == 0 {
+                                acquire_frame(
+                                    ba,
+                                    std::iter::empty(),
+                                    clone_shared_global_env(&frame.global_env),
+                                )
+                            } else {
+                                acquire_frame(
+                                    ba,
+                                    CallArgs::new(),
+                                    clone_shared_global_env(&frame.global_env),
+                                )
+                            };
                             if let Some(ctx) = closure_ctx {
                                 callee_frame.context = Some(JsValue::Context(ctx));
                             }
@@ -5884,8 +7094,9 @@ impl Interpreter {
                                     })
                                 }
                             });
+                            release_frame(callee_frame);
                             // Only invalidate if the callee actually mutated globals.
-                            if (frame.global_cache.is_some() || frame.global_ic_seeded)
+                            if (frame.global_cache.is_some() || frame.global_ic.is_some())
                                 && gen_before != frame.global_env.borrow().generation()
                             {
                                 frame.global_cache_invalidate();
@@ -5911,7 +7122,10 @@ impl Interpreter {
                                         handle_dispatch_error(&e, frame, handler_table.as_slice())
                                     {
                                         pc = resume_pc;
-                                        acc = frame.accumulator.cheap_clone();
+                                        acc = std::mem::replace(
+                                            &mut frame.accumulator,
+                                            JsValue::Undefined,
+                                        );
                                         continue 'dispatch;
                                     }
                                     return Err(e);
@@ -5931,7 +7145,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -5941,7 +7155,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -5949,13 +7166,28 @@ impl Interpreter {
                         }
                     }
 
-                    // ── Inline CallUndefinedReceiver1 (hot path) ────
+                    // ΓöÇΓöÇ Inline CallUndefinedReceiver1 (hot path) ΓöÇΓöÇΓöÇΓöÇ
                     //
                     // The second most common call opcode: `f(arg)`.
                     Opcode::CallUndefinedReceiver1 => {
                         let callee_reg = unsafe { operand_reg_unchecked(instr, 0) };
                         let arg_reg = unsafe { operand_reg_unchecked(instr, 1) };
                         let callee = unsafe { frame.read_reg_unchecked(callee_reg) };
+                        if fast_array_method_name(callee).as_deref() == Some("push")
+                            && let Some(JsValue::Array(arr)) = fast_array_method_target(callee)
+                        {
+                            let arg1 = unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
+                            let mut items = arr.borrow_mut();
+                            items.push(arg1);
+                            acc = JsValue::Smi(items.len() as i32);
+                            continue 'dispatch;
+                        }
+                        if let JsValue::NativeFunction(native_fn) = callee {
+                            let arg1 = unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
+                            acc = native_fn(vec![arg1])?;
+                            frame.global_cache_invalidate();
+                            continue 'dispatch;
+                        }
                         if let JsValue::Function(ba) = callee
                             && !ba.is_generator()
                             && !ba.is_async()
@@ -5964,11 +7196,28 @@ impl Interpreter {
                             let is_strict = ba.is_strict();
                             let has_self_name = ba.self_name_register().is_some();
                             let has_fn_props = is_arrow && ba.has_fn_props();
+                            // Try inline BEFORE cloning Rc/arg ΓÇö avoids
+                            // atomic refcount bumps + arg clone when the
+                            // function is small enough to be inlined.
+                            // SAFETY: arg_ptr points into frame.registers
+                            // which is not mutated during the inline check.
+                            let arg_ptr =
+                                unsafe { frame.read_reg_unchecked(arg_reg) } as *const JsValue;
+                            if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+                                && !ba.has_exception_handler()
+                                && let Some(result) = try_inline_small_function(
+                                    ba,
+                                    unsafe { std::slice::from_ref(&*arg_ptr) },
+                                    &frame.global_env,
+                                )
+                            {
+                                acc = result;
+                                continue 'dispatch;
+                            }
                             let closure_ctx = ba.closure_context().map(Rc::clone);
                             let ba = Rc::clone(ba);
                             let arg1 = unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
                             frame.pc = pc;
-                            let args: CallArgs = smallvec::smallvec![arg1];
                             let saved_this = if !is_arrow && is_strict {
                                 let old = frame.global_env.borrow().get_this().cloned();
                                 frame.global_env.borrow_mut().set_this(JsValue::Undefined);
@@ -5976,11 +7225,9 @@ impl Interpreter {
                             } else {
                                 None
                             };
-                            let mut callee_frame = InterpreterFrame::new_callee_frame(
-                                ba,
-                                args,
-                                Rc::clone(&frame.global_env),
-                            );
+                            let args: CallArgs = smallvec::smallvec![arg1];
+                            let mut callee_frame =
+                                acquire_frame(ba, args, clone_shared_global_env(&frame.global_env));
                             if let Some(ctx) = closure_ctx {
                                 callee_frame.context = Some(JsValue::Context(ctx));
                             }
@@ -6003,7 +7250,8 @@ impl Interpreter {
                                     })
                                 }
                             });
-                            if (frame.global_cache.is_some() || frame.global_ic_seeded)
+                            release_frame(callee_frame);
+                            if (frame.global_cache.is_some() || frame.global_ic.is_some())
                                 && gen_before != frame.global_env.borrow().generation()
                             {
                                 frame.global_cache_invalidate();
@@ -6029,7 +7277,10 @@ impl Interpreter {
                                         handle_dispatch_error(&e, frame, handler_table.as_slice())
                                     {
                                         pc = resume_pc;
-                                        acc = frame.accumulator.cheap_clone();
+                                        acc = std::mem::replace(
+                                            &mut frame.accumulator,
+                                            JsValue::Undefined,
+                                        );
                                         continue 'dispatch;
                                     }
                                     return Err(e);
@@ -6049,7 +7300,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6059,7 +7310,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6067,7 +7321,7 @@ impl Interpreter {
                         }
                     }
 
-                    // ── Inline CallProperty1 (array method fast path) ────
+                    // ΓöÇΓöÇ Inline CallProperty1 (array method fast path) ΓöÇΓöÇΓöÇΓöÇ
                     //
                     // The common pattern for `arr.push(val)`, `arr.pop()`, etc.
                     // When callee is a fast-array-method PlainObject AND the
@@ -6109,7 +7363,7 @@ impl Interpreter {
                                             )? {
                                                 result
                                             } else {
-                                                // Unknown method — fall through to dispatch table.
+                                                // Unknown method ΓÇö fall through to dispatch table.
                                                 frame.pc = pc;
                                                 frame.accumulator = acc;
                                                 match dispatch_via_table(
@@ -6122,7 +7376,10 @@ impl Interpreter {
                                                 ) {
                                                     Ok(dispatch::DispatchAction::Continue) => {
                                                         pc = frame.pc;
-                                                        acc = frame.accumulator.cheap_clone();
+                                                        acc = std::mem::replace(
+                                                            &mut frame.accumulator,
+                                                            JsValue::Undefined,
+                                                        );
                                                         continue 'dispatch;
                                                     }
                                                     Ok(dispatch::DispatchAction::Return(v)) => {
@@ -6140,7 +7397,10 @@ impl Interpreter {
                                                             )
                                                         {
                                                             pc = resume_pc;
-                                                            acc = frame.accumulator.cheap_clone();
+                                                            acc = std::mem::replace(
+                                                                &mut frame.accumulator,
+                                                                JsValue::Undefined,
+                                                            );
                                                             continue 'dispatch;
                                                         }
                                                         return Err(e);
@@ -6166,7 +7426,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6176,7 +7436,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6184,7 +7447,181 @@ impl Interpreter {
                         }
                     }
 
-                    // ── All other opcodes: dispatch table ────
+                    // ΓöÇΓöÇ Inline CreateClosure (hot path for closures) ΓöÇΓöÇ
+                    //
+                    // Closure creation is frequent in idiomatic JS.
+                    // The common case (non-arrow, non-generator) is
+                    // handled inline to avoid the dispatch-table
+                    // indirection.  Edge cases fall through.
+                    Opcode::CreateClosure => {
+                        // SAFETY: Bytecode generator guarantees operand[0]
+                        // is ConstantPoolIdx for CreateClosure.
+                        let cp_idx = unsafe { operand_constant_pool_idx_unchecked(instr, 0) };
+                        if let Some(ConstantPoolEntry::Function(ba)) =
+                            frame.bytecode_array.get_constant(cp_idx)
+                        {
+                            let closure_ctx = match &frame.context {
+                                Some(JsValue::Context(c)) => Some(Rc::clone(c)),
+                                _ => None,
+                            };
+                            let func_rc = Rc::new(ba.clone_for_closure(closure_ctx));
+                            let is_arrow = matches!(instr.operand_at(2), Some(Operand::Flag(1)));
+                            if !is_arrow && !func_rc.is_generator() {
+                                // Common case: non-arrow, non-generator.
+                                // Prototype is created lazily on first `new`
+                                // call or `.prototype` access.
+                                acc = JsValue::Function(func_rc);
+                                continue 'dispatch;
+                            }
+                            // Arrow / generator paths need fn_props setup;
+                            // fall through to the dispatch table which
+                            // handles all edge cases.
+                        }
+                        frame.pc = pc;
+                        frame.accumulator = acc;
+                        match dispatch_via_table(
+                            frame,
+                            instructions,
+                            byte_offsets,
+                            jump_targets,
+                            handler_table.as_slice(),
+                            instr,
+                        ) {
+                            Ok(dispatch::DispatchAction::Continue) => {
+                                pc = frame.pc;
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                continue 'dispatch;
+                            }
+                            Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                            Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                            Err(e) => {
+                                if let Some(resume_pc) =
+                                    handle_dispatch_error(&e, frame, handler_table.as_slice())
+                                {
+                                    pc = resume_pc;
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
+                                    continue 'dispatch;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+
+                    // ΓöÇΓöÇ Inline LdaContextSlot (closure variable load) ΓöÇΓöÇ
+                    //
+                    // Depth-0 access (current context) is the common case
+                    // for closures and avoids Rc::clone + chain walk.
+                    Opcode::LdaContextSlot => {
+                        let ctx_reg = unsafe { operand_reg_unchecked(instr, 0) };
+                        let ctx_val = unsafe { frame.read_reg_unchecked(ctx_reg) };
+                        if let JsValue::Context(ctx_rc) = ctx_val {
+                            let slot =
+                                unsafe { operand_constant_pool_idx_unchecked(instr, 1) } as usize;
+                            let depth = unsafe { operand_imm_unchecked(instr, 2) };
+                            if depth == 0 {
+                                let borrow = ctx_rc.borrow();
+                                acc = borrow
+                                    .slots
+                                    .get(slot)
+                                    .map(|v| v.cheap_clone())
+                                    .unwrap_or(JsValue::Undefined);
+                                continue 'dispatch;
+                            }
+                        }
+                        // Non-zero depth or missing context ΓÇö dispatch table.
+                        frame.pc = pc;
+                        frame.accumulator = acc;
+                        match dispatch_via_table(
+                            frame,
+                            instructions,
+                            byte_offsets,
+                            jump_targets,
+                            handler_table.as_slice(),
+                            instr,
+                        ) {
+                            Ok(dispatch::DispatchAction::Continue) => {
+                                pc = frame.pc;
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                continue 'dispatch;
+                            }
+                            Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                            Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                            Err(e) => {
+                                if let Some(resume_pc) =
+                                    handle_dispatch_error(&e, frame, handler_table.as_slice())
+                                {
+                                    pc = resume_pc;
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
+                                    continue 'dispatch;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+
+                    // ΓöÇΓöÇ Inline StaContextSlot (closure variable store) ΓöÇΓöÇ
+                    Opcode::StaContextSlot => {
+                        let ctx_reg = unsafe { operand_reg_unchecked(instr, 0) };
+                        let ctx_val = unsafe { frame.read_reg_unchecked(ctx_reg) };
+                        if let JsValue::Context(ctx_rc) = ctx_val {
+                            let slot =
+                                unsafe { operand_constant_pool_idx_unchecked(instr, 1) } as usize;
+                            let depth = unsafe { operand_imm_unchecked(instr, 2) };
+                            if depth == 0 {
+                                let mut borrow = ctx_rc.borrow_mut();
+                                if slot < borrow.slots.len() {
+                                    borrow.slots[slot] = acc.cheap_clone();
+                                    continue 'dispatch;
+                                }
+                            }
+                        }
+                        // Non-zero depth or missing context ΓÇö dispatch table.
+                        frame.pc = pc;
+                        frame.accumulator = acc;
+                        match dispatch_via_table(
+                            frame,
+                            instructions,
+                            byte_offsets,
+                            jump_targets,
+                            handler_table.as_slice(),
+                            instr,
+                        ) {
+                            Ok(dispatch::DispatchAction::Continue) => {
+                                pc = frame.pc;
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                continue 'dispatch;
+                            }
+                            Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                            Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                            Err(e) => {
+                                if let Some(resume_pc) =
+                                    handle_dispatch_error(&e, frame, handler_table.as_slice())
+                                {
+                                    pc = resume_pc;
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
+                                    continue 'dispatch;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+
+                    // ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+                    // Tier 3 ΓÇö ~10% of executed instructions (rare).
+                    // Full dispatch via function-pointer table.  Cold
+                    // code kept out of the I-cache hot region above.
+                    // ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+
+                    // ΓöÇΓöÇ All other opcodes: dispatch table ΓöÇΓöÇΓöÇΓöÇ
                     _ => {
                         // Write back locals before cold-path dispatch.
                         frame.pc = pc;
@@ -6199,7 +7636,7 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = frame.accumulator.cheap_clone();
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
@@ -6209,7 +7646,10 @@ impl Interpreter {
                                     handle_dispatch_error(&e, frame, handler_table.as_slice())
                                 {
                                     pc = resume_pc;
-                                    acc = frame.accumulator.cheap_clone();
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
                                     continue 'dispatch;
                                 }
                                 return Err(e);
@@ -6230,10 +7670,10 @@ impl Interpreter {
     ///
     /// # Return value
     ///
-    /// - [`GeneratorStep::Yield`] — a `SuspendGenerator` instruction was
+    /// - [`GeneratorStep::Yield`] ΓÇö a `SuspendGenerator` instruction was
     ///   reached; the generator state is updated and can be resumed with
     ///   another call.
-    /// - [`GeneratorStep::Return`] — a `Return` instruction was reached; the
+    /// - [`GeneratorStep::Return`] ΓÇö a `Return` instruction was reached; the
     ///   generator is marked [`GeneratorStatus::Completed`].
     ///
     /// Calling this method on an already-completed generator immediately
@@ -6299,8 +7739,7 @@ impl Interpreter {
             proto_load_ic: None,
             mega_store_ic: None,
             string_cache: None,
-            global_ic: GLOBAL_IC_INIT,
-            global_ic_seeded: false,
+            global_ic: None,
             global_cache: None,
             cache_generation: 0,
             smi_mode: false,
@@ -6402,7 +7841,7 @@ impl Interpreter {
                 }
                 Err(e) => {
                     // JavaScript exceptions inside the async body become
-                    // rejected promises per §27.7.5.2.  Engine-level errors
+                    // rejected promises per ┬º27.7.5.2.  Engine-level errors
                     // (OOM, sandbox violations, debugger) still propagate.
                     if let Some(reason) = Self::js_error_to_rejection_reason(&e) {
                         state.borrow_mut().status = GeneratorStatus::Completed;
@@ -6452,7 +7891,7 @@ impl Interpreter {
     ///
     /// If the generator is suspended, marks it as completed and returns
     /// `{ value, done: true }`.  If already completed, also returns
-    /// `{ value, done: true }` per §27.5.3.4 step 2a.
+    /// `{ value, done: true }` per ┬º27.5.3.4 step 2a.
     pub fn generator_return(
         state: &Rc<RefCell<GeneratorState>>,
         value: JsValue,
@@ -6504,7 +7943,7 @@ impl Interpreter {
                     Ok(GeneratorStep::Yield(v)) => Ok(make_iterator_result(v, false)),
                     Ok(GeneratorStep::Return(v)) => Ok(make_iterator_result(v, true)),
                     Err(e) => {
-                        // Uncaught — mark the generator as completed.
+                        // Uncaught ΓÇö mark the generator as completed.
                         state.borrow_mut().status = GeneratorStatus::Completed;
                         Err(e)
                     }
@@ -6550,9 +7989,9 @@ pub(crate) fn resolve_promise_like(
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 // Private helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /// Create a `{ value, done }` iterator result object.
 pub(crate) fn make_iterator_result(value: JsValue, done: bool) -> JsValue {
@@ -6812,7 +8251,7 @@ pub(super) fn constant_pool_jump_delta(
 /// Convert a constant-pool entry to a [`JsValue`].
 ///
 /// String entries that represent JavaScript string literals (i.e. those whose
-/// raw source text is surrounded by `'…'`, `"…"`, or backtick `` `…` ``)
+/// raw source text is surrounded by `'ΓÇª'`, `"ΓÇª"`, or backtick `` `ΓÇª` ``)
 /// are decoded: the surrounding delimiters are stripped and standard escape
 /// sequences (`\\`, `\'`, `\"`, `\n`, `\r`, `\t`) are expanded.  Plain
 /// identifier strings (property names, variable names) are stored without
@@ -6825,7 +8264,7 @@ pub(super) fn constant_to_value(entry: &ConstantPoolEntry) -> JsValue {
         ConstantPoolEntry::Boolean(b) => JsValue::Boolean(*b),
         ConstantPoolEntry::Null => JsValue::Null,
         ConstantPoolEntry::Undefined => JsValue::Undefined,
-        ConstantPoolEntry::BigInt(n) => JsValue::BigInt(*n),
+        ConstantPoolEntry::BigInt(n) => JsValue::BigInt(Box::new(*n)),
         ConstantPoolEntry::Function(ba) => JsValue::Function(Rc::clone(ba)),
         ConstantPoolEntry::TemplateObject { cooked, raw } => build_template_object(cooked, raw),
     }
@@ -6945,7 +8384,7 @@ pub(super) fn decode_string_constant(raw: &str) -> String {
                     push_string_escape_char(&mut out, &mut pending_high_surrogate, '\0');
                 }
                 Some(d @ '0'..='7') => {
-                    // Legacy octal escape — collect up to 3 octal digits.
+                    // Legacy octal escape ΓÇö collect up to 3 octal digits.
                     // The first digit was already consumed by `chars.next()`.
                     let mut val = (d as u32) - ('0' as u32);
                     // A leading 0-3 allows up to two more digits (three total);
@@ -6965,7 +8404,7 @@ pub(super) fn decode_string_constant(raw: &str) -> String {
                     }
                 }
                 Some('x') => {
-                    // \xHH — two hex digits
+                    // \xHH ΓÇö two hex digits
                     let h = take_hex_digits(&mut chars, 2);
                     if let Some(cp) = u32::from_str_radix(&h, 16).ok().and_then(char::from_u32) {
                         push_string_escape_char(&mut out, &mut pending_high_surrogate, cp);
@@ -6973,7 +8412,7 @@ pub(super) fn decode_string_constant(raw: &str) -> String {
                 }
                 Some('u') => {
                     if chars.peek() == Some(&'{') {
-                        // \u{HHHH…} — braced code point
+                        // \u{HHHHΓÇª} ΓÇö braced code point
                         chars.next(); // consume '{'
                         let mut hex = String::new();
                         while let Some(&d) = chars.peek() {
@@ -6990,7 +8429,7 @@ pub(super) fn decode_string_constant(raw: &str) -> String {
                             push_string_escape_char(&mut out, &mut pending_high_surrogate, cp);
                         }
                     } else {
-                        // \uHHHH — exactly four hex digits
+                        // \uHHHH ΓÇö exactly four hex digits
                         let h = take_hex_digits(&mut chars, 4);
                         if let Ok(unit) = u16::from_str_radix(&h, 16) {
                             push_string_escape_code_unit(
@@ -7046,14 +8485,16 @@ pub(super) fn number_to_jsvalue(n: f64) -> JsValue {
     if n == 0.0 && n.is_sign_negative() {
         return JsValue::HeapNumber(n);
     }
-    if n.is_finite() && n.fract() == 0.0 && (i32::MIN as f64..=i32::MAX as f64).contains(&n) {
-        JsValue::Smi(n as i32)
-    } else {
-        JsValue::HeapNumber(n)
+    if n >= i32::MIN as f64 && n <= i32::MAX as f64 {
+        let i = n as i32;
+        if i as f64 == n {
+            return JsValue::Smi(i);
+        }
     }
+    JsValue::HeapNumber(n)
 }
 
-/// Convert a JsValue to boolean (ECMAScript §7.1.2).
+/// Convert a JsValue to boolean (ECMAScript ┬º7.1.2).
 fn to_boolean_val(v: &JsValue) -> bool {
     v.to_boolean()
 }
@@ -7085,7 +8526,7 @@ fn mixed_bigint_number_error() -> StatorError {
 /// Extract the `i128` value from a BigInt, or return a TypeError for mixed operations.
 pub(super) fn to_bigint(val: &JsValue) -> StatorResult<i128> {
     match val {
-        JsValue::BigInt(n) => Ok(*n),
+        JsValue::BigInt(n) => Ok(**n),
         _ => Err(mixed_bigint_number_error()),
     }
 }
@@ -7099,34 +8540,48 @@ pub(super) fn bigint_pow(base: i128, exp: u32) -> i128 {
     result
 }
 
-thread_local! {
-    /// Reusable buffer for string concatenation.  Avoids a fresh allocation on
-    /// every `+` when building strings in a loop (e.g. `a + b + c + d`).  The
-    /// buffer is cleared before each use but retains its heap allocation across
-    /// calls within the same thread.
-    static STRING_BUILDER: RefCell<String> = RefCell::new(String::with_capacity(4096));
-}
+const SMALL_STRING_CONCAT_LIMIT: usize = 128;
 
-/// Concatenate two string slices, reusing a thread-local buffer.
+/// Concatenate two string slices with a stack buffer for small results and an
+/// exact-capacity `String` for larger ones.
 ///
 /// The caller must already have validated `MAX_STRING_LEN`.
 #[inline]
-pub(super) fn concat_rc_strs(l: &str, r: &str) -> JsValue {
-    STRING_BUILDER.with(|sb| {
-        let mut buf = sb.borrow_mut();
-        buf.clear();
-        let total = l.len() + r.len();
-        let cap = buf.capacity();
-        if total > cap {
-            buf.reserve(total - cap);
-        }
-        buf.push_str(l);
-        buf.push_str(r);
-        JsValue::String(Rc::from(buf.as_str()))
-    })
+fn concat_str_slices(l: &str, r: &str) -> JsValue {
+    let total = l.len() + r.len();
+    if total <= SMALL_STRING_CONCAT_LIMIT {
+        let mut buf = ArrayVec::<u8, SMALL_STRING_CONCAT_LIMIT>::new();
+        buf.try_extend_from_slice(l.as_bytes())
+            .expect("left string already fits in the stack concat buffer");
+        buf.try_extend_from_slice(r.as_bytes())
+            .expect("right string already fits in the stack concat buffer");
+        let s = std::str::from_utf8(buf.as_slice())
+            .expect("concatenating valid UTF-8 strings must stay valid UTF-8");
+        return JsValue::String(Rc::from(s));
+    }
+
+    let mut result = String::with_capacity(total);
+    result.push_str(l);
+    result.push_str(r);
+    JsValue::String(Rc::from(result))
 }
 
-/// ECMAScript §13.15.3 **ApplyStringOrNumericBinaryOperator** for `+`.
+/// Concatenate two `Rc<str>` values, reusing existing allocations for empty
+/// operands when possible.
+///
+/// The caller must already have validated `MAX_STRING_LEN`.
+#[inline]
+pub(super) fn concat_rc_strs(l: &Rc<str>, r: &Rc<str>) -> JsValue {
+    if l.is_empty() {
+        return JsValue::String(Rc::clone(r));
+    }
+    if r.is_empty() {
+        return JsValue::String(Rc::clone(l));
+    }
+    concat_str_slices(l, r)
+}
+
+/// ECMAScript ┬º13.15.3 **ApplyStringOrNumericBinaryOperator** for `+`.
 ///
 /// 1. Call `ToPrimitive` on both operands (with no hint, i.e. `Default`).
 /// 2. If *either* resulting primitive is a string, convert both to strings and
@@ -7135,27 +8590,34 @@ pub(super) fn concat_rc_strs(l: &str, r: &str) -> JsValue {
 ///
 /// BigInt operands are added together; mixing BigInt and Number is a TypeError.
 ///
-/// String concatenation reuses a thread-local buffer so that chains like
-/// `a + b + c + d` avoid allocating a fresh `String` for every intermediate
-/// result.
+/// String concatenation uses a stack buffer for small results and exact
+/// capacity pre-allocation for larger ones.
 pub(super) fn js_add(lhs: &JsValue, rhs: &JsValue) -> StatorResult<JsValue> {
-    // §12.8.3 step 1-2: ToPrimitive on both operands.
+    // ┬º12.8.3 step 1-2: ToPrimitive on both operands.
     let lprim = lhs.to_primitive(crate::objects::value::ToPrimitiveHint::Default)?;
     let rprim = rhs.to_primitive(crate::objects::value::ToPrimitiveHint::Default)?;
 
-    // §12.8.3 step 3: if either primitive is a string, concatenate.
+    // ┬º12.8.3 step 3: if either primitive is a string, concatenate.
     if lprim.is_string() || rprim.is_string() {
+        if let (JsValue::String(l), JsValue::String(r)) = (&lprim, &rprim) {
+            let total = l.len().saturating_add(r.len());
+            if total > crate::builtins::string::MAX_STRING_LEN {
+                return Err(StatorError::RangeError("Invalid string length".into()));
+            }
+            return Ok(concat_rc_strs(l, r));
+        }
+
         let l = lprim.to_js_string()?;
         let r = rprim.to_js_string()?;
         let total = l.len().saturating_add(r.len());
         if total > crate::builtins::string::MAX_STRING_LEN {
             return Err(StatorError::RangeError("Invalid string length".into()));
         }
-        Ok(concat_rc_strs(&l, &r))
+        Ok(concat_str_slices(&l, &r))
     } else if lprim.is_bigint() || rprim.is_bigint() {
         let l = to_bigint(&lprim)?;
         let r = to_bigint(&rprim)?;
-        Ok(JsValue::BigInt(l.wrapping_add(r)))
+        Ok(JsValue::BigInt(Box::new(l.wrapping_add(r))))
     } else {
         let l = lprim.to_number()?;
         let r = rprim.to_number()?;
@@ -7163,7 +8625,7 @@ pub(super) fn js_add(lhs: &JsValue, rhs: &JsValue) -> StatorResult<JsValue> {
     }
 }
 
-/// ECMAScript §7.2.14 **IsLessThan** (`<`).
+/// ECMAScript ┬º7.2.14 **IsLessThan** (`<`).
 ///
 /// Delegates to [`JsValue::abstract_relational_comparison`] which performs the
 /// full spec algorithm including ToPrimitive on objects.  Fast paths for Smi
@@ -7176,12 +8638,12 @@ pub(super) fn js_less_than(lhs: &JsValue, rhs: &JsValue) -> StatorResult<bool> {
     if let (JsValue::String(a), JsValue::String(b)) = (lhs, rhs) {
         return Ok(a < b);
     }
-    // Full spec: §7.2.14 IsLessThan(x, y, true)
-    // Returns None for undefined (NaN cases) → map to false
+    // Full spec: ┬º7.2.14 IsLessThan(x, y, true)
+    // Returns None for undefined (NaN cases) ΓåÆ map to false
     Ok(JsValue::abstract_relational_comparison(lhs, rhs, true)?.unwrap_or(false))
 }
 
-/// ECMAScript §7.2.13 **Abstract Equality Comparison** (`==`).
+/// ECMAScript ┬º7.2.13 **Abstract Equality Comparison** (`==`).
 ///
 /// Delegates to [`JsValue::is_loosely_equal`] which implements the full spec
 /// algorithm including ToPrimitive coercion for objects.
@@ -7189,7 +8651,7 @@ pub(super) fn abstract_eq(lhs: &JsValue, rhs: &JsValue) -> bool {
     lhs.is_loosely_equal(rhs).unwrap_or(false)
 }
 
-/// ECMAScript §7.2.15 **Strict Equality Comparison** (`===`).
+/// ECMAScript ┬º7.2.15 **Strict Equality Comparison** (`===`).
 ///
 /// Delegates to [`JsValue::is_strictly_equal`] which handles all JsValue
 /// variants including Generator, Iterator, ArrayBuffer, TypedArray, DataView,
@@ -7207,13 +8669,6 @@ pub(super) fn err_bad_operand(opcode_name: &'static str, operand_index: usize) -
     ))
 }
 
-/// Error returned when the bytecode stream ends without a `Return`.
-#[cold]
-#[inline(never)]
-fn bytecode_end_error() -> StatorError {
-    StatorError::Internal("bytecode ended without a Return instruction".into())
-}
-
 /// Error returned when the per-frame instruction limit is exceeded.
 #[cold]
 #[inline(never)]
@@ -7228,6 +8683,13 @@ fn execution_timeout_error() -> StatorError {
     StatorError::RangeError("execution timeout exceeded".to_string())
 }
 
+/// Error returned when a strict-mode `StaGlobal` targets an undefined binding.
+#[cold]
+#[inline(never)]
+fn sta_global_undefined_error(name: &str) -> StatorError {
+    StatorError::ReferenceError(format!("{name} is not defined"))
+}
+
 /// Extract a `Register(u32)` operand without checking the variant tag.
 ///
 /// # Safety
@@ -7240,7 +8702,7 @@ unsafe fn operand_reg_unchecked(
     idx: usize,
 ) -> u32 {
     // SAFETY: Caller guarantees idx < operands.len() and the variant is Register.
-    match *unsafe { instr.operands.get_unchecked(idx) } {
+    match *unsafe { instr.operand_unchecked(idx) } {
         crate::bytecode::bytecodes::Operand::Register(v) => v,
         // SAFETY: The bytecode generator guarantees the operand is Register.
         _ => unsafe { std::hint::unreachable_unchecked() },
@@ -7259,7 +8721,7 @@ unsafe fn operand_imm_unchecked(
     idx: usize,
 ) -> i32 {
     // SAFETY: Caller guarantees idx < operands.len() and the variant is Immediate.
-    match *unsafe { instr.operands.get_unchecked(idx) } {
+    match *unsafe { instr.operand_unchecked(idx) } {
         crate::bytecode::bytecodes::Operand::Immediate(v) => v,
         // SAFETY: The bytecode generator guarantees the operand is Immediate.
         _ => unsafe { std::hint::unreachable_unchecked() },
@@ -7278,9 +8740,26 @@ unsafe fn operand_constant_pool_idx_unchecked(
     idx: usize,
 ) -> u32 {
     // SAFETY: Caller guarantees idx < operands.len() and the variant is ConstantPoolIdx.
-    match *unsafe { instr.operands.get_unchecked(idx) } {
+    match *unsafe { instr.operand_unchecked(idx) } {
         crate::bytecode::bytecodes::Operand::ConstantPoolIdx(v) => v,
         // SAFETY: The bytecode generator guarantees the operand is ConstantPoolIdx.
+        _ => unsafe { std::hint::unreachable_unchecked() },
+    }
+}
+
+/// Extract a `Flag(u8)` operand without checking the variant tag.
+///
+/// # Safety
+///
+/// The bytecode generator guarantees `instr.operands[idx]` is
+/// [`Operand::Flag`] for the calling opcode. `idx` must be in bounds.
+#[inline(always)]
+unsafe fn operand_flag_unchecked(
+    instr: &crate::bytecode::bytecodes::Instruction,
+    idx: usize,
+) -> u8 {
+    match *unsafe { instr.operand_unchecked(idx) } {
+        crate::bytecode::bytecodes::Operand::Flag(v) => v,
         _ => unsafe { std::hint::unreachable_unchecked() },
     }
 }
@@ -7347,8 +8826,8 @@ fn handle_dispatch_error(
 ) -> Option<usize> {
     let instr_idx = (frame.pc - 1) as u32;
     let handler_pc = find_handler(instr_idx, handler_table)?;
-    // Engine errors (TypeError, etc.) → JsValue::Error.
-    // JsException from a nested throw → recover the
+    // Engine errors (TypeError, etc.) ΓåÆ JsValue::Error.
+    // JsException from a nested throw ΓåÆ recover the
     // original thrown JsValue via the thread-local slot.
     let js_val = stator_error_to_js_value(e).or_else(|| {
         if matches!(e, StatorError::JsException(_)) {
@@ -7392,6 +8871,17 @@ fn run_callee(callee_frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
     }
 }
 
+/// Run a callee frame and return it to the thread-local pool afterward.
+///
+/// Takes ownership of the frame so it can be recycled.  Use this in call
+/// sites that do not need to inspect the frame after execution completes.
+#[inline(always)]
+fn run_callee_pooled(mut callee_frame: InterpreterFrame) -> StatorResult<JsValue> {
+    let result = run_callee(&mut callee_frame);
+    release_frame(callee_frame);
+    result
+}
+
 /// Dispatch a function call with the given arguments, writing the result to
 /// the frame's accumulator.  Handles `Function`, `NativeFunction`, and
 /// callable `PlainObject` values (those with a `__call__` property).
@@ -7414,11 +8904,9 @@ pub(super) fn dispatch_call(
             } else {
                 let count = ba.increment_invocation_count();
                 // Only check tiering/JIT when the function has been called
-                // enough times — cold calls skip all JIT overhead entirely.
+                // enough times ΓÇö cold calls skip all JIT overhead entirely.
                 if count >= TIERING_THRESHOLD {
-                    // Skip baseline compilation if it previously deopted
-                    // (unsupported opcodes like LdaCurrentContextSlot).
-                    if ba.try_get_jit_code().is_none() && !ba.jit_baseline_has_deopted() {
+                    if ba.try_get_jit_code().is_none() {
                         maybe_compile_baseline(ba);
                     }
                     if count >= MAGLEV_TIERING_THRESHOLD {
@@ -7433,14 +8921,11 @@ pub(super) fn dispatch_call(
                     }
                 }
                 {
-                    let mut callee_frame = InterpreterFrame::new_callee_frame(
-                        Rc::clone(ba),
-                        args,
-                        Rc::clone(&frame.global_env),
-                    );
+                    let mut callee_frame =
+                        acquire_frame(Rc::clone(ba), args, Rc::clone(&frame.global_env));
                     restore_closure_context(&mut callee_frame, ba);
                     // Only construct the JsValue::Function wrapper when the
-                    // bytecode actually has a self-name register — avoids an
+                    // bytecode actually has a self-name register ΓÇö avoids an
                     // Rc::clone per call for anonymous closures.
                     if ba.self_name_register().is_some() {
                         populate_self_name(
@@ -7459,7 +8944,8 @@ pub(super) fn dispatch_call(
                             })
                         }
                     });
-                    if (frame.global_cache.is_some() || frame.global_ic_seeded)
+                    release_frame(callee_frame);
+                    if (frame.global_cache.is_some() || frame.global_ic.is_some())
                         && gen_before != frame.global_env.borrow().generation()
                     {
                         frame.global_cache_invalidate();
@@ -7517,7 +9003,7 @@ pub(super) fn dispatch_call_property(
             } else {
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD {
-                    if ba.try_get_jit_code().is_none() && !ba.jit_baseline_has_deopted() {
+                    if ba.try_get_jit_code().is_none() {
                         maybe_compile_baseline(ba);
                     }
                     if count >= MAGLEV_TIERING_THRESHOLD {
@@ -7532,11 +9018,8 @@ pub(super) fn dispatch_call_property(
                     }
                 }
                 {
-                    let mut callee_frame = InterpreterFrame::new_callee_frame(
-                        Rc::clone(ba),
-                        args,
-                        Rc::clone(&frame.global_env),
-                    );
+                    let mut callee_frame =
+                        acquire_frame(Rc::clone(ba), args, Rc::clone(&frame.global_env));
                     restore_closure_context(&mut callee_frame, ba);
                     if ba.self_name_register().is_some() {
                         populate_self_name(
@@ -7545,7 +9028,7 @@ pub(super) fn dispatch_call_property(
                             &JsValue::Function(Rc::clone(ba)),
                         );
                     }
-                    // Arrow functions use lexical `this` — do NOT override.
+                    // Arrow functions use lexical `this` ΓÇö do NOT override.
                     if !ba.is_arrow() {
                         callee_frame.global_env.borrow_mut().set_this(this_val);
                     }
@@ -7559,7 +9042,8 @@ pub(super) fn dispatch_call_property(
                             })
                         }
                     });
-                    if (frame.global_cache.is_some() || frame.global_ic_seeded)
+                    release_frame(callee_frame);
+                    if (frame.global_cache.is_some() || frame.global_ic.is_some())
                         && gen_before != frame.global_env.borrow().generation()
                     {
                         frame.global_cache_invalidate();
@@ -7592,6 +9076,7 @@ pub(super) fn dispatch_call_property(
 }
 
 const FAST_ARRAY_METHOD_KEY: &str = "\0stator.fast_array_method";
+const FAST_ARRAY_METHOD_TARGET_KEY: &str = "\0stator.fast_array_target";
 
 fn array_like_length_from_property_map(map: &PropertyMap) -> usize {
     match map.get("length") {
@@ -7619,6 +9104,11 @@ fn make_fast_array_method(target: &JsValue, name: &str, length: i32) -> JsValue 
         PropertyAttributes::empty(),
     );
     props.insert_with_attrs(
+        FAST_ARRAY_METHOD_TARGET_KEY.into(),
+        target.clone(),
+        PropertyAttributes::empty(),
+    );
+    props.insert_with_attrs(
         "__call__".into(),
         JsValue::NativeFunction(Rc::new(move |args| {
             dispatch_fast_array_method(&bound_target, method_name.as_ref(), &args)?.ok_or_else(
@@ -7639,6 +9129,13 @@ fn fast_array_method_name(callee: &JsValue) -> Option<Rc<str>> {
         Some(JsValue::String(name)) => Some(Rc::clone(name)),
         _ => None,
     }
+}
+
+fn fast_array_method_target(callee: &JsValue) -> Option<JsValue> {
+    let JsValue::PlainObject(map) = callee else {
+        return None;
+    };
+    map.borrow().get(FAST_ARRAY_METHOD_TARGET_KEY).cloned()
 }
 
 fn normalize_from_index(len: usize, arg: Option<&JsValue>) -> usize {
@@ -7839,7 +9336,7 @@ pub(super) fn walk_context_chain(
 /// If `ba` was created by `CreateClosure` with an enclosing scope, this sets
 /// the callee frame's context so that `CreateFunctionContext` chains to the
 /// captured scope and context-slot opcodes can walk up to outer variables.
-pub(crate) fn restore_closure_context(
+pub(super) fn restore_closure_context(
     frame: &mut InterpreterFrame,
     ba: &Rc<crate::bytecode::bytecode_array::BytecodeArray>,
 ) {
@@ -7880,12 +9377,550 @@ pub(crate) fn restore_closure_context(
     }
 }
 
+#[inline(always)]
+pub(super) fn clone_shared_global_env(
+    global_env: &Rc<RefCell<GlobalEnv>>,
+) -> Rc<RefCell<GlobalEnv>> {
+    let ptr = Rc::as_ptr(global_env);
+    // SAFETY: `ptr` was produced by `Rc::as_ptr` from a live allocation. We
+    // increment the strong count before reconstructing the cloned handle, so
+    // the returned `Rc` shares ownership with the original value.
+    unsafe {
+        Rc::increment_strong_count(ptr);
+        Rc::from_raw(ptr)
+    }
+}
+
+#[inline(always)]
+fn inline_arg_from_reg(args: &[JsValue], reg: u32) -> Option<JsValue> {
+    let signed = reg as i32;
+    if signed >= 0 {
+        return None;
+    }
+    let index = (-(signed + 1)) as usize;
+    Some(args.get(index).cloned().unwrap_or(JsValue::Undefined))
+}
+
+#[inline(always)]
+fn checked_operand_reg(instr: &Instruction, idx: usize) -> Option<u32> {
+    match instr.operand_at(idx)? {
+        Operand::Register(reg) => Some(*reg),
+        _ => None,
+    }
+}
+
+#[inline(always)]
+fn checked_operand_imm(instr: &Instruction, idx: usize) -> Option<i32> {
+    match instr.operand_at(idx)? {
+        Operand::Immediate(imm) => Some(*imm),
+        _ => None,
+    }
+}
+
+#[inline(always)]
+fn checked_operand_constant_pool_idx(instr: &Instruction, idx: usize) -> Option<u32> {
+    match instr.operand_at(idx)? {
+        Operand::ConstantPoolIdx(const_idx) => Some(*const_idx),
+        _ => None,
+    }
+}
+
+#[inline(always)]
+fn inline_property_lookup(obj: &JsValue, key: &str) -> Option<JsValue> {
+    if let Some(value) = try_fast_named_property_lookup(obj, key) {
+        return Some(value);
+    }
+
+    match obj {
+        JsValue::PlainObject(map) => {
+            let borrow = map.borrow();
+            if borrow.has_accessors {
+                None
+            } else {
+                borrow.get(key).cloned()
+            }
+        }
+        _ => None,
+    }
+}
+
+#[inline(always)]
+fn is_inline_primitive(value: &JsValue) -> bool {
+    matches!(
+        value,
+        JsValue::Smi(_)
+            | JsValue::HeapNumber(_)
+            | JsValue::Boolean(_)
+            | JsValue::Undefined
+            | JsValue::Null
+            | JsValue::String(_)
+            | JsValue::BigInt(_)
+    )
+}
+
+#[inline(always)]
+fn inline_binary_op(opcode: Opcode, lhs: &JsValue, rhs: &JsValue) -> Option<JsValue> {
+    if !is_inline_primitive(lhs) || !is_inline_primitive(rhs) {
+        return None;
+    }
+
+    match opcode {
+        Opcode::Add => js_add(lhs, rhs).ok(),
+        Opcode::Sub => Some(number_to_jsvalue(
+            lhs.to_number().ok()? - rhs.to_number().ok()?,
+        )),
+        Opcode::Mul => Some(number_to_jsvalue(
+            lhs.to_number().ok()? * rhs.to_number().ok()?,
+        )),
+        Opcode::Div => Some(number_to_jsvalue(
+            lhs.to_number().ok()? / rhs.to_number().ok()?,
+        )),
+        Opcode::Mod => Some(number_to_jsvalue(
+            lhs.to_number().ok()? % rhs.to_number().ok()?,
+        )),
+        _ => None,
+    }
+}
+
+#[inline(always)]
+fn inline_smi_binary_opcode(opcode: Opcode) -> Option<Opcode> {
+    match opcode {
+        Opcode::AddSmi => Some(Opcode::Add),
+        Opcode::SubSmi => Some(Opcode::Sub),
+        Opcode::MulSmi => Some(Opcode::Mul),
+        Opcode::DivSmi => Some(Opcode::Div),
+        Opcode::ModSmi => Some(Opcode::Mod),
+        _ => None,
+    }
+}
+
+#[inline(always)]
+fn is_inline_current_context_load(opcode: Opcode) -> bool {
+    matches!(
+        opcode,
+        Opcode::LdaCurrentContextSlot | Opcode::LdaImmutableCurrentContextSlot
+    )
+}
+
+#[inline(always)]
+fn inline_context_slot_update(
+    ba: &BytecodeArray,
+    slot_idx: u32,
+    update: &Instruction,
+) -> Option<JsValue> {
+    let js_ctx = ba.closure_context()?;
+    let mut borrowed = js_ctx.borrow_mut();
+    let slot = slot_idx as usize;
+    if slot >= borrowed.slots.len() {
+        borrowed.slots.resize(slot + 1, JsValue::Undefined);
+    }
+
+    let current = borrowed.slots[slot].cheap_clone();
+    let next = match update.opcode {
+        Opcode::Inc => match current {
+            JsValue::Smi(value) => match value.checked_add(1) {
+                Some(result) => JsValue::Smi(result),
+                None => JsValue::HeapNumber(value as f64 + 1.0),
+            },
+            JsValue::BigInt(value) => JsValue::BigInt(Box::new(value.wrapping_add(1))),
+            _ if is_inline_primitive(&current) => {
+                number_to_jsvalue(current.to_number().ok()? + 1.0)
+            }
+            _ => return None,
+        },
+        Opcode::Dec => match current {
+            JsValue::Smi(value) => match value.checked_sub(1) {
+                Some(result) => JsValue::Smi(result),
+                None => JsValue::HeapNumber(value as f64 - 1.0),
+            },
+            JsValue::BigInt(value) => JsValue::BigInt(Box::new(value.wrapping_sub(1))),
+            _ if is_inline_primitive(&current) => {
+                number_to_jsvalue(current.to_number().ok()? - 1.0)
+            }
+            _ => return None,
+        },
+        Opcode::AddSmi => {
+            if matches!(current, JsValue::BigInt(_)) {
+                return None;
+            }
+            number_to_jsvalue(
+                current.to_number().ok()? + f64::from(checked_operand_imm(update, 0)?),
+            )
+        }
+        Opcode::SubSmi => {
+            if matches!(current, JsValue::BigInt(_)) {
+                return None;
+            }
+            number_to_jsvalue(
+                current.to_number().ok()? - f64::from(checked_operand_imm(update, 0)?),
+            )
+        }
+        _ => return None,
+    };
+    borrowed.slots[slot] = next.cheap_clone();
+    Some(next)
+}
+
+/// Returns `true` for `LdaContextSlot` and `LdaImmutableContextSlot` (chain-walking variants).
+#[inline(always)]
+fn is_inline_chained_context_load(opcode: Opcode) -> bool {
+    matches!(
+        opcode,
+        Opcode::LdaContextSlot | Opcode::LdaImmutableContextSlot
+    )
+}
+
+/// Returns `true` for binary arithmetic opcodes that can be inlined.
+#[inline(always)]
+fn is_inline_arithmetic(opcode: Opcode) -> bool {
+    matches!(
+        opcode,
+        Opcode::Add
+            | Opcode::Sub
+            | Opcode::Mul
+            | Opcode::Div
+            | Opcode::Mod
+            | Opcode::AddSmi
+            | Opcode::SubSmi
+            | Opcode::MulSmi
+    )
+}
+
+/// Perform a context-slot load-update-store through the context chain.
+///
+/// Like [`inline_context_slot_update`] but resolves the target context by
+/// walking `depth` levels from the closure context.
+#[inline(always)]
+fn inline_chained_context_slot_update(
+    ba: &BytecodeArray,
+    slot_idx: u32,
+    depth: u32,
+    update: &Instruction,
+) -> Option<JsValue> {
+    let js_ctx = ba.closure_context()?;
+    let target = walk_context_chain(js_ctx, depth, "inline_chained").ok()?;
+    let mut borrowed = target.borrow_mut();
+    let slot = slot_idx as usize;
+    if slot >= borrowed.slots.len() {
+        borrowed.slots.resize(slot + 1, JsValue::Undefined);
+    }
+
+    let current = borrowed.slots[slot].cheap_clone();
+    let next = match update.opcode {
+        Opcode::Inc => match current {
+            JsValue::Smi(value) => match value.checked_add(1) {
+                Some(result) => JsValue::Smi(result),
+                None => JsValue::HeapNumber(value as f64 + 1.0),
+            },
+            JsValue::BigInt(value) => JsValue::BigInt(Box::new(value.wrapping_add(1))),
+            _ if is_inline_primitive(&current) => {
+                number_to_jsvalue(current.to_number().ok()? + 1.0)
+            }
+            _ => return None,
+        },
+        Opcode::Dec => match current {
+            JsValue::Smi(value) => match value.checked_sub(1) {
+                Some(result) => JsValue::Smi(result),
+                None => JsValue::HeapNumber(value as f64 - 1.0),
+            },
+            JsValue::BigInt(value) => JsValue::BigInt(Box::new(value.wrapping_sub(1))),
+            _ if is_inline_primitive(&current) => {
+                number_to_jsvalue(current.to_number().ok()? - 1.0)
+            }
+            _ => return None,
+        },
+        Opcode::AddSmi => {
+            if matches!(current, JsValue::BigInt(_)) {
+                return None;
+            }
+            number_to_jsvalue(
+                current.to_number().ok()? + f64::from(checked_operand_imm(update, 0)?),
+            )
+        }
+        Opcode::SubSmi => {
+            if matches!(current, JsValue::BigInt(_)) {
+                return None;
+            }
+            number_to_jsvalue(
+                current.to_number().ok()? - f64::from(checked_operand_imm(update, 0)?),
+            )
+        }
+        _ => return None,
+    };
+    borrowed.slots[slot] = next.cheap_clone();
+    Some(next)
+}
+
+/// Binary arithmetic on a current-context slot: `load slot ΓåÆ op(acc, arg) ΓåÆ store slot`.
+#[inline(always)]
+fn inline_context_slot_binary_op(
+    ba: &BytecodeArray,
+    slot_idx: u32,
+    op: &Instruction,
+    args: &[JsValue],
+) -> Option<JsValue> {
+    let js_ctx = ba.closure_context()?;
+    let mut borrowed = js_ctx.borrow_mut();
+    let slot = slot_idx as usize;
+    if slot >= borrowed.slots.len() {
+        return None;
+    }
+    let lhs = borrowed.slots[slot].cheap_clone();
+    let rhs = inline_arg_from_reg(args, checked_operand_reg(op, 0)?)?;
+    let result = inline_binary_op(op.opcode, &lhs, &rhs)?;
+    borrowed.slots[slot] = result.cheap_clone();
+    Some(result)
+}
+
+/// Binary arithmetic on a chained-context slot with depth walking.
+#[inline(always)]
+fn inline_chained_context_slot_binary_op(
+    ba: &BytecodeArray,
+    slot_idx: u32,
+    depth: u32,
+    op: &Instruction,
+    args: &[JsValue],
+) -> Option<JsValue> {
+    let js_ctx = ba.closure_context()?;
+    let target = walk_context_chain(js_ctx, depth, "inline_chained_binop").ok()?;
+    let mut borrowed = target.borrow_mut();
+    let slot = slot_idx as usize;
+    if slot >= borrowed.slots.len() {
+        return None;
+    }
+    let lhs = borrowed.slots[slot].cheap_clone();
+    let rhs = inline_arg_from_reg(args, checked_operand_reg(op, 0)?)?;
+    let result = inline_binary_op(op.opcode, &lhs, &rhs)?;
+    borrowed.slots[slot] = result.cheap_clone();
+    Some(result)
+}
+
+/// Maximum bytecode instruction count eligible for interpreter-level inlining.
+pub(super) const INLINE_BYTECODE_THRESHOLD: usize = 40;
+
+pub(super) fn try_inline_small_function(
+    ba: &BytecodeArray,
+    args: &[JsValue],
+    _global_env: &Rc<RefCell<GlobalEnv>>,
+) -> Option<JsValue> {
+    if ba.bytecode_count() > INLINE_BYTECODE_THRESHOLD || ba.has_exception_handler() {
+        return None;
+    }
+
+    let decoded = ba.shared_decoded_instructions().ok()?;
+    let instrs = decoded.0.as_slice();
+
+    match instrs {
+        [lda, ret] if lda.opcode == Opcode::LdaSmi && ret.opcode == Opcode::Return => {
+            Some(JsValue::Smi(checked_operand_imm(lda, 0)?))
+        }
+        [lda, ret] if lda.opcode == Opcode::LdaUndefined && ret.opcode == Opcode::Return => {
+            Some(JsValue::Undefined)
+        }
+        [lda, ret] if lda.opcode == Opcode::LdaZero && ret.opcode == Opcode::Return => {
+            Some(JsValue::Smi(0))
+        }
+        [lda, ret] if lda.opcode == Opcode::LdaNull && ret.opcode == Opcode::Return => {
+            Some(JsValue::Null)
+        }
+        [lda, ret] if lda.opcode == Opcode::LdaTrue && ret.opcode == Opcode::Return => {
+            Some(JsValue::Boolean(true))
+        }
+        [lda, ret] if lda.opcode == Opcode::LdaFalse && ret.opcode == Opcode::Return => {
+            Some(JsValue::Boolean(false))
+        }
+        [lda, ret] if lda.opcode == Opcode::LdaConstant && ret.opcode == Opcode::Return => Some(
+            constant_to_value(ba.get_constant(checked_operand_constant_pool_idx(lda, 0)?)?),
+        ),
+        [lda, ret] if lda.opcode == Opcode::Ldar && ret.opcode == Opcode::Return => {
+            inline_arg_from_reg(args, checked_operand_reg(lda, 0)?)
+        }
+        // ΓöÇΓöÇ Identity with side-effect: Ldar + Star + Return ΓöÇΓöÇ
+        [lda, _star, ret]
+            if lda.opcode == Opcode::Ldar
+                && _star.opcode == Opcode::Star
+                && ret.opcode == Opcode::Return =>
+        {
+            inline_arg_from_reg(args, checked_operand_reg(lda, 0)?)
+        }
+        // ΓöÇΓöÇ Current-context slot update (4 instrs) ΓöÇΓöÇ
+        [load, update, store, ret]
+            if is_inline_current_context_load(load.opcode)
+                && store.opcode == Opcode::StaCurrentContextSlot
+                && ret.opcode == Opcode::Return =>
+        {
+            let load_slot = checked_operand_constant_pool_idx(load, 0)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 0)?;
+            if load_slot != store_slot {
+                return None;
+            }
+            inline_context_slot_update(ba, load_slot, update)
+        }
+        // ΓöÇΓöÇ Chained-context slot update: LdaContextSlot + update + StaContextSlot + Return ΓöÇΓöÇ
+        [load, update, store, ret]
+            if is_inline_chained_context_load(load.opcode)
+                && store.opcode == Opcode::StaContextSlot
+                && ret.opcode == Opcode::Return =>
+        {
+            let load_slot = checked_operand_constant_pool_idx(load, 1)?;
+            let load_depth = checked_operand_imm(load, 2)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 1)?;
+            let store_depth = checked_operand_imm(store, 2)?;
+            if load_slot != store_slot || load_depth != store_depth {
+                return None;
+            }
+            inline_chained_context_slot_update(ba, load_slot, load_depth as u32, update)
+        }
+        // ΓöÇΓöÇ Current-context slot update with reload (5 instrs) ΓöÇΓöÇ
+        [load, update, store, reload, ret]
+            if is_inline_current_context_load(load.opcode)
+                && store.opcode == Opcode::StaCurrentContextSlot
+                && is_inline_current_context_load(reload.opcode)
+                && ret.opcode == Opcode::Return =>
+        {
+            let load_slot = checked_operand_constant_pool_idx(load, 0)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 0)?;
+            let reload_slot = checked_operand_constant_pool_idx(reload, 0)?;
+            if load_slot != store_slot || store_slot != reload_slot {
+                return None;
+            }
+            inline_context_slot_update(ba, load_slot, update)
+        }
+        // ΓöÇΓöÇ Chained-context slot update with reload (5 instrs) ΓöÇΓöÇ
+        [load, update, store, reload, ret]
+            if is_inline_chained_context_load(load.opcode)
+                && store.opcode == Opcode::StaContextSlot
+                && is_inline_chained_context_load(reload.opcode)
+                && ret.opcode == Opcode::Return =>
+        {
+            let load_slot = checked_operand_constant_pool_idx(load, 1)?;
+            let load_depth = checked_operand_imm(load, 2)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 1)?;
+            let store_depth = checked_operand_imm(store, 2)?;
+            let reload_slot = checked_operand_constant_pool_idx(reload, 1)?;
+            let reload_depth = checked_operand_imm(reload, 2)?;
+            if load_slot != store_slot
+                || store_slot != reload_slot
+                || load_depth != store_depth
+                || store_depth != reload_depth
+            {
+                return None;
+            }
+            inline_chained_context_slot_update(ba, load_slot, load_depth as u32, update)
+        }
+        // ΓöÇΓöÇ Current-context slot update through temp register (6 instrs) ΓöÇΓöÇ
+        // LdaCurrentContextSlot + update + Star + StaCurrentContextSlot + Ldar + Return
+        [load, update, star, store, ldar, ret]
+            if is_inline_current_context_load(load.opcode)
+                && star.opcode == Opcode::Star
+                && store.opcode == Opcode::StaCurrentContextSlot
+                && ldar.opcode == Opcode::Ldar
+                && ret.opcode == Opcode::Return =>
+        {
+            let load_slot = checked_operand_constant_pool_idx(load, 0)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 0)?;
+            let temp_reg = checked_operand_reg(star, 0)?;
+            if load_slot != store_slot || checked_operand_reg(ldar, 0)? != temp_reg {
+                return None;
+            }
+            inline_context_slot_update(ba, load_slot, update)
+        }
+        // ΓöÇΓöÇ Chained-context slot update through temp register (6 instrs) ΓöÇΓöÇ
+        // LdaContextSlot + update + Star + StaContextSlot + Ldar + Return
+        [load, update, star, store, ldar, ret]
+            if is_inline_chained_context_load(load.opcode)
+                && star.opcode == Opcode::Star
+                && store.opcode == Opcode::StaContextSlot
+                && ldar.opcode == Opcode::Ldar
+                && ret.opcode == Opcode::Return =>
+        {
+            let load_slot = checked_operand_constant_pool_idx(load, 1)?;
+            let load_depth = checked_operand_imm(load, 2)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 1)?;
+            let store_depth = checked_operand_imm(store, 2)?;
+            let temp_reg = checked_operand_reg(star, 0)?;
+            if load_slot != store_slot
+                || load_depth != store_depth
+                || checked_operand_reg(ldar, 0)? != temp_reg
+            {
+                return None;
+            }
+            inline_chained_context_slot_update(ba, load_slot, load_depth as u32, update)
+        }
+        // ΓöÇΓöÇ Binary arithmetic with current-context slot ΓöÇΓöÇ
+        // LdaCurrentContextSlot + Ldar + Add/Sub/Mul + StaCurrentContextSlot + Return
+        [load, ldar, op, store, ret]
+            if is_inline_current_context_load(load.opcode)
+                && ldar.opcode == Opcode::Ldar
+                && store.opcode == Opcode::StaCurrentContextSlot
+                && ret.opcode == Opcode::Return
+                && is_inline_arithmetic(op.opcode) =>
+        {
+            let load_slot = checked_operand_constant_pool_idx(load, 0)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 0)?;
+            if load_slot != store_slot {
+                return None;
+            }
+            inline_context_slot_binary_op(ba, load_slot, op, args)
+        }
+        // ΓöÇΓöÇ Binary arithmetic with chained-context slot ΓöÇΓöÇ
+        // LdaContextSlot + Ldar + Add/Sub/Mul + StaContextSlot + Return
+        [load, ldar, op, store, ret]
+            if is_inline_chained_context_load(load.opcode)
+                && ldar.opcode == Opcode::Ldar
+                && store.opcode == Opcode::StaContextSlot
+                && ret.opcode == Opcode::Return
+                && is_inline_arithmetic(op.opcode) =>
+        {
+            let load_slot = checked_operand_constant_pool_idx(load, 1)?;
+            let load_depth = checked_operand_imm(load, 2)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 1)?;
+            let store_depth = checked_operand_imm(store, 2)?;
+            if load_slot != store_slot || load_depth != store_depth {
+                return None;
+            }
+            inline_chained_context_slot_binary_op(ba, load_slot, load_depth as u32, op, args)
+        }
+        // ΓöÇΓöÇ Simple property read: LdaNamedProperty + Return ΓöÇΓöÇ
+        [lda, ret] if lda.opcode == Opcode::LdaNamedProperty && ret.opcode == Opcode::Return => {
+            let obj = inline_arg_from_reg(args, checked_operand_reg(lda, 0)?)?;
+            let ConstantPoolEntry::String(key) =
+                ba.get_constant(checked_operand_constant_pool_idx(lda, 1)?)?
+            else {
+                return None;
+            };
+            inline_property_lookup(&obj, key)
+        }
+        [ret] if ret.opcode == Opcode::Return => Some(JsValue::Undefined),
+        [lhs, op, ret] if lhs.opcode == Opcode::Ldar && ret.opcode == Opcode::Return => {
+            let opcode = inline_smi_binary_opcode(op.opcode)?;
+            let lhs = inline_arg_from_reg(args, checked_operand_reg(lhs, 0)?)?;
+            inline_binary_op(opcode, &lhs, &JsValue::Smi(checked_operand_imm(op, 0)?))
+        }
+        [rhs, star, lhs, op, ret]
+            if rhs.opcode == Opcode::Ldar
+                && star.opcode == Opcode::Star
+                && lhs.opcode == Opcode::Ldar
+                && ret.opcode == Opcode::Return =>
+        {
+            let temp = checked_operand_reg(star, 0)?;
+            if checked_operand_reg(op, 0)? != temp {
+                return None;
+            }
+            let lhs = inline_arg_from_reg(args, checked_operand_reg(lhs, 0)?)?;
+            let rhs = inline_arg_from_reg(args, checked_operand_reg(rhs, 0)?)?;
+            inline_binary_op(op.opcode, &lhs, &rhs)
+        }
+        _ => None,
+    }
+}
+
 /// Populate the self-name register for named function expressions.
 ///
-/// When a named function expression (`var f = function g() { … }`) is
+/// When a named function expression (`var f = function g() { ΓÇª }`) is
 /// called, the bytecode compiler allocates a register for the name `g`.
 /// This helper writes the function value into that register so the body
-/// can reference the function by its own name (ES §15.2.4).
+/// can reference the function by its own name (ES ┬º15.2.4).
 pub(super) fn populate_self_name(
     frame: &mut InterpreterFrame,
     ba: &crate::bytecode::bytecode_array::BytecodeArray,
@@ -7985,7 +10020,7 @@ pub(super) fn to_array_index(key: &JsValue) -> Option<usize> {
 
 /// Convert a [`JsValue`] to a property key string.
 ///
-/// ECMAScript §7.1.19 ToPropertyKey.
+/// ECMAScript ┬º7.1.19 ToPropertyKey.
 pub(super) fn to_property_key(key: &JsValue) -> StatorResult<String> {
     match key {
         JsValue::Symbol(id) => Ok(crate::builtins::symbol::symbol_to_property_key(*id)),
@@ -8000,6 +10035,115 @@ fn plain_object_proto_value(map: &PropertyMap) -> Option<JsValue> {
     map.get(INTERNAL_PROTO_PROPERTY_KEY)
         .or_else(|| map.get("__proto__"))
         .cloned()
+}
+
+#[inline]
+fn cached_object_constructor() -> JsValue {
+    refresh_proto_resolution_caches();
+    BUILTIN_METHODS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache
+            .entry("constructor")
+            .or_insert_with(|| lookup_global_constructor("Object"))
+            .clone()
+    })
+}
+
+fn object_prototype_builtin(this_obj: &JsValue, key: &str) -> Option<JsValue> {
+    match key {
+        "hasOwnProperty" => {
+            let this = this_obj.clone();
+            Some(JsValue::NativeFunction(Rc::new(move |args| {
+                let prop = match args.first() {
+                    Some(JsValue::String(s)) => s.to_string(),
+                    Some(JsValue::Smi(n)) => n.to_string(),
+                    Some(JsValue::HeapNumber(n)) => format!("{n}"),
+                    Some(JsValue::Boolean(b)) => b.to_string(),
+                    Some(JsValue::Null) => "null".to_string(),
+                    Some(JsValue::Undefined) => "undefined".to_string(),
+                    _ => return Ok(JsValue::Boolean(false)),
+                };
+                if let JsValue::PlainObject(ref map) = this {
+                    return Ok(JsValue::Boolean(plain_object_has_own_property(
+                        &map.borrow(),
+                        &prop,
+                    )));
+                }
+                Ok(JsValue::Boolean(false))
+            })))
+        }
+        "propertyIsEnumerable" => {
+            let this = this_obj.clone();
+            Some(JsValue::NativeFunction(Rc::new(move |args| {
+                let prop = match args.first() {
+                    Some(JsValue::String(s)) => s.to_string(),
+                    Some(JsValue::Smi(n)) => n.to_string(),
+                    _ => return Ok(JsValue::Boolean(false)),
+                };
+                if let JsValue::PlainObject(ref map) = this {
+                    return Ok(JsValue::Boolean(map.borrow().is_enumerable(&prop)));
+                }
+                Ok(JsValue::Boolean(false))
+            })))
+        }
+        "isPrototypeOf" => {
+            let this = this_obj.clone();
+            Some(JsValue::NativeFunction(Rc::new(move |args| {
+                let target = args.first().cloned().unwrap_or(JsValue::Undefined);
+                Ok(JsValue::Boolean(
+                    matches!(this, JsValue::PlainObject(_))
+                        && target.is_object_like()
+                        && has_prototype_in_chain(&target, &this),
+                ))
+            })))
+        }
+        "constructor" => Some(cached_object_constructor()),
+        "toString" => {
+            let this = this_obj.clone();
+            Some(JsValue::NativeFunction(Rc::new(move |args| {
+                if let Some(value) = args.first() {
+                    return Ok(JsValue::String(value.obj_to_string_tag().into()));
+                }
+                Ok(JsValue::String(this.obj_to_string_tag().into()))
+            })))
+        }
+        "valueOf" => {
+            let this = this_obj.clone();
+            Some(JsValue::NativeFunction(Rc::new(move |_args| {
+                Ok(this.clone())
+            })))
+        }
+        "toLocaleString" => {
+            let this = this_obj.clone();
+            Some(JsValue::NativeFunction(Rc::new(move |_args| {
+                let to_string = proto_lookup(&this, "toString");
+                dispatch_call_value(&to_string, vec![this.clone()])
+            })))
+        }
+        _ => None,
+    }
+}
+
+fn implicit_object_prototype_depth(current: &JsValue) -> u8 {
+    let mut current = current.clone();
+    let mut depth = 1u8;
+    for _ in 0..u8::MAX {
+        match current {
+            JsValue::PlainObject(ref map) => {
+                let borrow = map.borrow();
+                if let Some(next) = plain_object_proto_value(&borrow) {
+                    drop(borrow);
+                    current = next;
+                    depth = depth.saturating_add(1);
+                    continue;
+                }
+            }
+            JsValue::Null | JsValue::Undefined => {}
+            _ => {}
+        }
+        break;
+    }
+    depth
 }
 
 /// Walks the prototype chain starting from `current` and returns the depth
@@ -8040,10 +10184,14 @@ fn proto_lookup_chain_depth(current: &JsValue, key: &str) -> Option<u8> {
 ///
 /// Returns `JsValue::Undefined` if the property is not found after exhausting
 /// the chain or hitting a depth limit of 256 links.
-pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
-    // Fast path: PlainObject — the most common case.
+pub(super) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
+    // Fast path: PlainObject ΓÇö the most common case.
     if let JsValue::PlainObject(map) = obj {
         let borrow = map.borrow();
+        let proto_generation = borrow.proto_generation();
+        if let Some((cached, _depth)) = proto_cache_lookup(map, key, proto_generation) {
+            return cached;
+        }
         // Check for getter accessor (__get_<key>__) BEFORE the data key so
         // that accessor properties defined via Object.defineProperty are
         // dispatched correctly even when a placeholder data key exists.
@@ -8079,93 +10227,17 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         // Object.prototype methods for internal plain objects without an
         // explicit `__proto__` slot.
         if explicit_proto.is_none() {
+            if let Some(builtin) = object_prototype_builtin(obj, key) {
+                drop(borrow);
+                proto_cache_store(map, key, proto_generation, &builtin, 1);
+                return builtin;
+            }
             match key {
-                "hasOwnProperty" => {
-                    let map = Rc::clone(map);
-                    drop(borrow);
-                    return JsValue::NativeFunction(Rc::new(move |args| {
-                        let prop = match args.first() {
-                            Some(JsValue::String(s)) => s.to_string(),
-                            Some(JsValue::Smi(n)) => n.to_string(),
-                            Some(JsValue::HeapNumber(n)) => {
-                                let s = format!("{n}");
-                                s
-                            }
-                            Some(JsValue::Boolean(b)) => b.to_string(),
-                            Some(JsValue::Null) => "null".to_string(),
-                            Some(JsValue::Undefined) => "undefined".to_string(),
-                            _ => return Ok(JsValue::Boolean(false)),
-                        };
-                        Ok(JsValue::Boolean(plain_object_has_own_property(
-                            &map.borrow(),
-                            &prop,
-                        )))
-                    }));
-                }
-                "propertyIsEnumerable" => {
-                    let map = Rc::clone(map);
-                    drop(borrow);
-                    return JsValue::NativeFunction(Rc::new(move |args| {
-                        let prop = match args.first() {
-                            Some(JsValue::String(s)) => s.to_string(),
-                            Some(JsValue::Smi(n)) => n.to_string(),
-                            _ => return Ok(JsValue::Boolean(false)),
-                        };
-                        Ok(JsValue::Boolean(map.borrow().is_enumerable(&prop)))
-                    }));
-                }
-                "isPrototypeOf" => {
-                    let this_map = Rc::clone(map);
-                    drop(borrow);
-                    return JsValue::NativeFunction(Rc::new(move |args| {
-                        let target = args.first().cloned().unwrap_or(JsValue::Undefined);
-                        Ok(JsValue::Boolean(
-                            target.is_object_like()
-                                && has_prototype_in_chain(
-                                    &target,
-                                    &JsValue::PlainObject(Rc::clone(&this_map)),
-                                ),
-                        ))
-                    }));
-                }
-                "constructor" => {
-                    // Walk __proto__ chain to find constructor (set by finalize_ctor).
-                    if let Some(proto) = plain_object_proto_value(&borrow) {
-                        drop(borrow);
-                        return proto_lookup(&proto, "constructor");
-                    }
-                    drop(borrow);
-                    return lookup_global_constructor("Object");
-                }
-                "toString" => {
-                    let obj_clone = obj.clone();
-                    drop(borrow);
-                    return JsValue::NativeFunction(Rc::new(move |args| {
-                        // When called via .call(value), classify that value.
-                        if let Some(value) = args.first() {
-                            return Ok(JsValue::String(value.obj_to_string_tag().into()));
-                        }
-                        // Direct call: classify the captured receiver.
-                        Ok(JsValue::String(obj_clone.obj_to_string_tag().into()))
-                    }));
-                }
-                "valueOf" => {
-                    let obj_clone = obj.clone();
-                    drop(borrow);
-                    return JsValue::NativeFunction(Rc::new(move |_args| Ok(obj_clone.clone())));
-                }
-                "toLocaleString" => {
-                    let obj_clone = obj.clone();
-                    drop(borrow);
-                    return JsValue::NativeFunction(Rc::new(move |_args| {
-                        let ts = proto_lookup(&obj_clone, "toString");
-                        dispatch_call_value(&ts, vec![obj_clone.clone()])
-                    }));
-                }
                 "__lookupGetter__" => {
                     let map = Rc::clone(map);
+                    let cache_map = Rc::clone(&map);
                     drop(borrow);
-                    return JsValue::NativeFunction(Rc::new(move |args| {
+                    let value = JsValue::NativeFunction(Rc::new(move |args| {
                         let prop = match args.first() {
                             Some(JsValue::String(s)) => s.to_string(),
                             Some(v) => js_to_string(v),
@@ -8195,11 +10267,14 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         }
                         Ok(JsValue::Undefined)
                     }));
+                    proto_cache_store(&cache_map, key, proto_generation, &value, 1);
+                    return value;
                 }
                 "__lookupSetter__" => {
                     let map = Rc::clone(map);
+                    let cache_map = Rc::clone(&map);
                     drop(borrow);
-                    return JsValue::NativeFunction(Rc::new(move |args| {
+                    let value = JsValue::NativeFunction(Rc::new(move |args| {
                         let prop = match args.first() {
                             Some(JsValue::String(s)) => s.to_string(),
                             Some(v) => js_to_string(v),
@@ -8228,11 +10303,14 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         }
                         Ok(JsValue::Undefined)
                     }));
+                    proto_cache_store(&cache_map, key, proto_generation, &value, 1);
+                    return value;
                 }
                 "__defineGetter__" => {
                     let map = Rc::clone(map);
+                    let cache_map = Rc::clone(&map);
                     drop(borrow);
-                    return JsValue::NativeFunction(Rc::new(move |args| {
+                    let value = JsValue::NativeFunction(Rc::new(move |args| {
                         let prop = match args.first() {
                             Some(JsValue::String(s)) => s.to_string(),
                             Some(v) => js_to_string(v),
@@ -8243,11 +10321,14 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         map.borrow_mut().insert(getter_key, getter);
                         Ok(JsValue::Undefined)
                     }));
+                    proto_cache_store(&cache_map, key, proto_generation, &value, 1);
+                    return value;
                 }
                 "__defineSetter__" => {
                     let map = Rc::clone(map);
+                    let cache_map = Rc::clone(&map);
                     drop(borrow);
-                    return JsValue::NativeFunction(Rc::new(move |args| {
+                    let value = JsValue::NativeFunction(Rc::new(move |args| {
                         let prop = match args.first() {
                             Some(JsValue::String(s)) => s.to_string(),
                             Some(v) => js_to_string(v),
@@ -8258,6 +10339,8 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         map.borrow_mut().insert(setter_key, setter);
                         Ok(JsValue::Undefined)
                     }));
+                    proto_cache_store(&cache_map, key, proto_generation, &value, 1);
+                    return value;
                 }
                 _ => {}
             }
@@ -8265,8 +10348,21 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         // Walk __proto__ chain.
         if let Some(proto) = explicit_proto {
             drop(borrow);
-            return proto_lookup_chain(&proto, key, obj);
+            let result = proto_lookup_chain(&proto, key, obj);
+            let depth = if matches!(result, JsValue::Undefined) {
+                0
+            } else if let Some(depth) = proto_lookup_chain_depth(&proto, key) {
+                depth
+            } else if is_known_object_prototype_builtin(key) {
+                implicit_object_prototype_depth(&proto)
+            } else {
+                0
+            };
+            proto_cache_store(map, key, proto_generation, &result, depth);
+            return result;
         }
+        drop(borrow);
+        proto_cache_store(map, key, proto_generation, &JsValue::Undefined, 0);
         return JsValue::Undefined;
     }
     // Fast path: primitive toString/valueOf.
@@ -8533,7 +10629,7 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "includes" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    // §22.1.3.7 step 4: throw TypeError if searchString is a RegExp
+                    // ┬º22.1.3.7 step 4: throw TypeError if searchString is a RegExp
                     if let Some(JsValue::PlainObject(re_obj)) = args.first()
                         && re_obj.borrow().get("__is_regexp__") == Some(&JsValue::Boolean(true))
                     {
@@ -8680,7 +10776,7 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "startsWith" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    // §22.1.3.22 step 4: throw TypeError if searchString is a RegExp
+                    // ┬º22.1.3.22 step 4: throw TypeError if searchString is a RegExp
                     if let Some(JsValue::PlainObject(re_obj)) = args.first()
                         && re_obj.borrow().get("__is_regexp__") == Some(&JsValue::Boolean(true))
                     {
@@ -8704,7 +10800,7 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "endsWith" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    // §22.1.3.7 step 4: throw TypeError if searchString is a RegExp
+                    // ┬º22.1.3.7 step 4: throw TypeError if searchString is a RegExp
                     if let Some(JsValue::PlainObject(re_obj)) = args.first()
                         && re_obj.borrow().get("__is_regexp__") == Some(&JsValue::Boolean(true))
                     {
@@ -8732,7 +10828,7 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                         Some(v) => v.to_number()?,
                         None => 0.0,
                     };
-                    // ES §22.1.3.16 step 3: ToIntegerOrInfinity(NaN) → 0
+                    // ES ┬º22.1.3.16 step 3: ToIntegerOrInfinity(NaN) ΓåÆ 0
                     let count_f = if count_f.is_nan() { 0.0 } else { count_f };
                     if count_f < 0.0 || count_f.is_infinite() {
                         return Err(crate::error::StatorError::RangeError(
@@ -8937,7 +11033,7 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             "normalize" => {
                 let s = s.clone();
                 return JsValue::NativeFunction(Rc::new(move |args| {
-                    // ES §22.1.3.13 String.prototype.normalize([form])
+                    // ES ┬º22.1.3.13 String.prototype.normalize([form])
                     // Determine the normalization form (default: "NFC").
                     let form = match args.first() {
                         None | Some(JsValue::Undefined) => "NFC".to_string(),
@@ -9069,7 +11165,7 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                                 Some(JsValue::String(s)) => s.to_string(),
                                 _ => String::new(),
                             };
-                            // ES §22.1.3.12: matchAll requires the global flag.
+                            // ES ┬º22.1.3.12: matchAll requires the global flag.
                             if !flags.contains('g') {
                                 return Err(StatorError::TypeError(
                                     "String.prototype.matchAll called with a non-global RegExp argument".to_string(),
@@ -9347,7 +11443,7 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 return JsValue::NativeFunction(Rc::new(|_args| Ok(JsValue::Boolean(false))));
             }
             _ => {
-                // Numeric string indexing: "0", "1", … → UTF-16 code unit at index.
+                // Numeric string indexing: "0", "1", ΓÇª ΓåÆ UTF-16 code unit at index.
                 if let Ok(idx) = key.parse::<usize>() {
                     let utf16: Vec<u16> = s.encode_utf16().collect();
                     if idx < utf16.len() {
@@ -10220,18 +12316,20 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                 }));
             }
             "valueOf" => {
-                let n = *n;
-                return JsValue::NativeFunction(Rc::new(move |_args| Ok(JsValue::BigInt(n))));
+                let n = **n;
+                return JsValue::NativeFunction(Rc::new(move |_args| {
+                    Ok(JsValue::BigInt(Box::new(n)))
+                }));
             }
             _ => {}
         },
         _ => {}
     }
-    // Handle JsValue::Proxy — delegate to the proxy get trap.
+    // Handle JsValue::Proxy ΓÇö delegate to the proxy get trap.
     if let JsValue::Proxy(p) = obj {
         return proxy_get_with_receiver(&p.borrow(), key, obj).unwrap_or(JsValue::Undefined);
     }
-    // Handle JsValue::Symbol — delegate property access to Symbol.prototype.
+    // Handle JsValue::Symbol ΓÇö delegate property access to Symbol.prototype.
     if let JsValue::Symbol(_) = obj {
         if key == "__proto__" {
             return global_constructor_prototype("Symbol").unwrap_or(JsValue::Undefined);
@@ -10245,7 +12343,7 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             _ => JsValue::Undefined,
         };
     }
-    // Handle JsValue::Error — expose name, message, stack, cause, errors properties.
+    // Handle JsValue::Error ΓÇö expose name, message, stack, cause, errors properties.
     if let JsValue::Error(e) = obj {
         // Check user-set property overlay first.
         {
@@ -10325,7 +12423,7 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             }
         };
     }
-    // Handle JsValue::Generator — expose next/return/throw/@@iterator methods.
+    // Handle JsValue::Generator ΓÇö expose next/return/throw/@@iterator methods.
     if let JsValue::Generator(gs) = obj {
         let gs = Rc::clone(gs);
         let is_async_generator = gs.borrow().bytecode_array.is_async();
@@ -10381,7 +12479,7 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     }))
                 }
             }
-            // §27.5.1.2 — Generator.prototype[@@iterator]() returns `this`.
+            // ┬º27.5.1.2 ΓÇö Generator.prototype[@@iterator]() returns `this`.
             "@@iterator" | "Symbol(1)" if !is_async_generator => {
                 let generator = obj.clone();
                 JsValue::NativeFunction(Rc::new(move |_args| Ok(generator.clone())))
@@ -10400,7 +12498,7 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             }
         };
     }
-    // Handle JsValue::Iterator — expose next/return/@@iterator so that
+    // Handle JsValue::Iterator ΓÇö expose next/return/@@iterator so that
     // user-land code can call `iter.next()` and iterators satisfy the
     // iterable protocol (`iter[Symbol.iterator]() === iter`).
     if let JsValue::Iterator(ni) = obj {
@@ -10427,7 +12525,7 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     Ok(make_iterator_result(value, true))
                 }))
             }
-            // §27.1.2 %IteratorPrototype%[@@iterator]() — return this.
+            // ┬º27.1.2 %IteratorPrototype%[@@iterator]() ΓÇö return this.
             // Handle both internal "@@iterator" and computed "Symbol(1)".
             "@@iterator" | "Symbol(1)" => {
                 let iter = obj.clone();
@@ -10442,7 +12540,7 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
         }
         return JsValue::Undefined;
     }
-    // Handle JsValue::Function — look up ad-hoc properties stored in the
+    // Handle JsValue::Function ΓÇö look up ad-hoc properties stored in the
     // thread-local side table (e.g. `assert.sameValue`).
     if let JsValue::Function(ba) = obj {
         let val = fn_props_get(ba, key);
@@ -10450,7 +12548,7 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             return val;
         }
         // Lazy prototype creation: non-arrow, non-generator functions get
-        // a .prototype object on first access (ES §10.2.5).
+        // a .prototype object on first access (ES ┬º10.2.5).
         if key == "prototype" && !ba.is_arrow() && !ba.is_generator() {
             let func_val = JsValue::Function(Rc::clone(ba));
             let mut proto_map = PropertyMap::new();
@@ -10527,7 +12625,7 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     let bound_name = function_bound_name(&function_display_name(&target));
 
                     // Build bound function as a PlainObject with __call__,
-                    // carrying the correct `name` and `length` per ES §20.2.3.2.
+                    // carrying the correct `name` and `length` per ES ┬º20.2.3.2.
                     let call_fn =
                         JsValue::NativeFunction(Rc::new(move |call_args: Vec<JsValue>| {
                             let mut all_args = bound_args.clone();
@@ -10764,7 +12862,14 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
                     Err(_) => JsValue::Undefined,
                 };
             }
-            if let Some(next) = plain_object_proto_value(&borrow) {
+            let next = plain_object_proto_value(&borrow);
+            if next.is_none()
+                && let Some(builtin) = object_prototype_builtin(obj, key)
+            {
+                drop(borrow);
+                return builtin;
+            }
+            if let Some(next) = next {
                 drop(borrow);
                 current = next;
                 continue;
@@ -10782,10 +12887,10 @@ pub(crate) fn proto_lookup(obj: &JsValue, key: &str) -> JsValue {
 /// `Array.prototype` methods (push, map, filter, etc.) just work.
 fn array_literal_proto_lookup(obj: &JsValue, key: &str) -> JsValue {
     if let JsValue::PlainObject(map) = obj {
-        // ── Fast paths for common array methods ──────────────────────────
+        // ΓöÇΓöÇ Fast paths for common array methods ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         // Operate directly on the PlainObject HashMap to avoid the O(n)
         // reconstruction + O(n) sync-back that would otherwise make
-        // repeated push/pop calls O(n²).
+        // repeated push/pop calls O(n┬▓).
 
         if key == "length" {
             let borrow = map.borrow();
@@ -10797,7 +12902,7 @@ fn array_literal_proto_lookup(obj: &JsValue, key: &str) -> JsValue {
             return make_fast_array_method(obj, key, length);
         }
 
-        // ── Slow path: reconstruct Array for other methods ───────────────
+        // ΓöÇΓöÇ Slow path: reconstruct Array for other methods ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         let borrow = map.borrow();
         let len = match borrow.get("length") {
             Some(JsValue::Smi(n)) => *n as usize,
@@ -10876,7 +12981,12 @@ fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsVal
             if let Some(val) = borrow.get(key) {
                 return val.clone();
             }
-            if let Some(next) = plain_object_proto_value(&borrow) {
+            let next = plain_object_proto_value(&borrow);
+            if next.is_none() && is_known_object_prototype_builtin(key) {
+                drop(borrow);
+                return object_prototype_builtin(this_obj, key).unwrap_or(JsValue::Undefined);
+            }
+            if let Some(next) = next {
                 drop(borrow);
                 current = next;
                 continue;
@@ -10884,77 +12994,50 @@ fn proto_lookup_chain(current: &JsValue, key: &str, this_obj: &JsValue) -> JsVal
         }
         break;
     }
-    // Object.prototype fallback — provide basic methods when the __proto__
+    // Object.prototype fallback ΓÇö provide basic methods when the __proto__
     // chain is exhausted without an explicit Object.prototype.
-    match key {
-        "hasOwnProperty" => {
-            let this = this_obj.clone();
-            return JsValue::NativeFunction(Rc::new(move |args| {
-                let prop = match args.first() {
-                    Some(JsValue::String(s)) => s.to_string(),
-                    Some(JsValue::Smi(n)) => n.to_string(),
-                    Some(JsValue::HeapNumber(n)) => format!("{n}"),
-                    Some(JsValue::Boolean(b)) => b.to_string(),
-                    Some(JsValue::Null) => "null".to_string(),
-                    Some(JsValue::Undefined) => "undefined".to_string(),
-                    _ => return Ok(JsValue::Boolean(false)),
+    if let Some(builtin) = object_prototype_builtin(this_obj, key) {
+        return builtin;
+    }
+    JsValue::Undefined
+}
+
+fn proto_lookup_chain_rc(current: &JsValue, key: &Rc<str>, this_obj: &JsValue) -> JsValue {
+    let key_str = key.as_ref();
+    let mut current = current.clone();
+    for _ in 0..256 {
+        if matches!(current, JsValue::Null | JsValue::Undefined) {
+            return JsValue::Undefined;
+        }
+        if let JsValue::PlainObject(ref map) = current {
+            let borrow = map.borrow();
+            if borrow.has_accessors
+                && let Some(getter) = borrow.get_getter_for(key_str).cloned()
+            {
+                drop(borrow);
+                return match dispatch_getter(&getter, this_obj) {
+                    Ok(v) => v,
+                    Err(_) => JsValue::Undefined,
                 };
-                if let JsValue::PlainObject(ref m) = this {
-                    return Ok(JsValue::Boolean(plain_object_has_own_property(
-                        &m.borrow(),
-                        &prop,
-                    )));
-                }
-                Ok(JsValue::Boolean(false))
-            }));
+            }
+            if let Some(val) = borrow.get_by_rc(key) {
+                return val.clone();
+            }
+            let next = plain_object_proto_value(&borrow);
+            if next.is_none() && is_known_object_prototype_builtin(key_str) {
+                drop(borrow);
+                return object_prototype_builtin(this_obj, key_str).unwrap_or(JsValue::Undefined);
+            }
+            if let Some(next) = next {
+                drop(borrow);
+                current = next;
+                continue;
+            }
         }
-        "propertyIsEnumerable" => {
-            let this = this_obj.clone();
-            return JsValue::NativeFunction(Rc::new(move |args| {
-                let prop = match args.first() {
-                    Some(JsValue::String(s)) => s.to_string(),
-                    Some(JsValue::Smi(n)) => n.to_string(),
-                    _ => return Ok(JsValue::Boolean(false)),
-                };
-                if let JsValue::PlainObject(ref m) = this {
-                    return Ok(JsValue::Boolean(m.borrow().is_enumerable(&prop)));
-                }
-                Ok(JsValue::Boolean(false))
-            }));
-        }
-        "isPrototypeOf" => {
-            let this = this_obj.clone();
-            return JsValue::NativeFunction(Rc::new(move |args| {
-                let target = args.first().cloned().unwrap_or(JsValue::Undefined);
-                Ok(JsValue::Boolean(
-                    matches!(this, JsValue::PlainObject(_))
-                        && target.is_object_like()
-                        && has_prototype_in_chain(&target, &this),
-                ))
-            }));
-        }
-        "constructor" => return lookup_global_constructor("Object"),
-        "toString" => {
-            let this = this_obj.clone();
-            return JsValue::NativeFunction(Rc::new(move |args| {
-                if let Some(value) = args.first() {
-                    return Ok(JsValue::String(value.obj_to_string_tag().into()));
-                }
-                Ok(JsValue::String(this.obj_to_string_tag().into()))
-            }));
-        }
-        "valueOf" => {
-            let this = this_obj.clone();
-            return JsValue::NativeFunction(Rc::new(move |_args| Ok(this.clone())));
-        }
-        "toLocaleString" => {
-            let this = this_obj.clone();
-            return JsValue::NativeFunction(Rc::new(move |_args| {
-                let ts = proto_lookup(&this, "toString");
-                dispatch_call_value(&ts, vec![this.clone()])
-            }));
-        }
-        _ => {}
+        break;
+    }
+    if let Some(builtin) = object_prototype_builtin(this_obj, key_str) {
+        return builtin;
     }
     JsValue::Undefined
 }
@@ -10968,13 +13051,13 @@ fn dispatch_getter(getter: &JsValue, this: &JsValue) -> StatorResult<JsValue> {
         JsValue::Function(ba) => {
             push_call_frame("<getter>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                InterpreterFrame::new_callee_frame(Rc::clone(ba), vec![], globals)
+                acquire_frame(Rc::clone(ba), vec![], globals)
             } else {
                 InterpreterFrame::new(Rc::clone(ba), vec![])
             };
             restore_closure_context(&mut frame, ba);
             frame.global_env.borrow_mut().set_this(this.clone());
-            let result = run_callee(&mut frame);
+            let result = run_callee_pooled(frame);
             pop_call_frame();
             result
         }
@@ -10983,19 +13066,195 @@ fn dispatch_getter(getter: &JsValue, this: &JsValue) -> StatorResult<JsValue> {
     }
 }
 
+/// Variant of [`proto_lookup`] for interned property keys.
+pub(super) fn proto_lookup_rc(obj: &JsValue, key: &Rc<str>) -> JsValue {
+    if let JsValue::PlainObject(map) = obj {
+        let key_str = key.as_ref();
+        let borrow = map.borrow();
+        let proto_generation = borrow.proto_generation();
+        if let Some((cached, _depth)) = proto_cache_lookup(map, key_str, proto_generation) {
+            return cached;
+        }
+        if borrow.has_accessors
+            && let Some(getter) = borrow.get_getter_for(key_str).cloned()
+        {
+            drop(borrow);
+            return match dispatch_getter(&getter, obj) {
+                Ok(v) => v,
+                Err(_) => JsValue::Undefined,
+            };
+        }
+        if let Some(val) = borrow.get_by_rc(key) {
+            return val.clone();
+        }
+        if borrow
+            .get("__is_array__")
+            .is_some_and(|v| matches!(v, JsValue::Boolean(true)))
+        {
+            drop(borrow);
+            return array_literal_proto_lookup(obj, key_str);
+        }
+        let explicit_proto = plain_object_proto_value(&borrow);
+        if key_str == "__proto__" {
+            if let Some(proto) = explicit_proto.clone() {
+                return proto;
+            }
+            drop(borrow);
+            return JsValue::Undefined;
+        }
+        if explicit_proto.is_none() {
+            if let Some(builtin) = object_prototype_builtin(obj, key_str) {
+                drop(borrow);
+                proto_cache_store(map, key_str, proto_generation, &builtin, 1);
+                return builtin;
+            }
+            match key_str {
+                "__lookupGetter__" => {
+                    let map = Rc::clone(map);
+                    let cache_map = Rc::clone(&map);
+                    drop(borrow);
+                    let value = JsValue::NativeFunction(Rc::new(move |args| {
+                        let prop = match args.first() {
+                            Some(JsValue::String(s)) => s.to_string(),
+                            Some(v) => js_to_string(v),
+                            None => return Ok(JsValue::Undefined),
+                        };
+                        let getter_key = format!("__get_{prop}__");
+                        let mut cur = JsValue::PlainObject(Rc::clone(&map));
+                        for _ in 0..256 {
+                            if let JsValue::PlainObject(ref m) = cur {
+                                let b = m.borrow();
+                                if b.has_accessors
+                                    && let Some(g) = b.get(&getter_key)
+                                {
+                                    return Ok(g.clone());
+                                }
+                                match plain_object_proto_value(&b) {
+                                    Some(next) => {
+                                        drop(b);
+                                        cur = next;
+                                        continue;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            break;
+                        }
+                        Ok(JsValue::Undefined)
+                    }));
+                    proto_cache_store(&cache_map, key_str, proto_generation, &value, 1);
+                    return value;
+                }
+                "__lookupSetter__" => {
+                    let map = Rc::clone(map);
+                    let cache_map = Rc::clone(&map);
+                    drop(borrow);
+                    let value = JsValue::NativeFunction(Rc::new(move |args| {
+                        let prop = match args.first() {
+                            Some(JsValue::String(s)) => s.to_string(),
+                            Some(v) => js_to_string(v),
+                            None => return Ok(JsValue::Undefined),
+                        };
+                        let setter_key = format!("__set_{prop}__");
+                        let mut cur = JsValue::PlainObject(Rc::clone(&map));
+                        for _ in 0..256 {
+                            if let JsValue::PlainObject(ref m) = cur {
+                                let b = m.borrow();
+                                if b.has_accessors
+                                    && let Some(s) = b.get(&setter_key)
+                                {
+                                    return Ok(s.clone());
+                                }
+                                match plain_object_proto_value(&b) {
+                                    Some(next) => {
+                                        drop(b);
+                                        cur = next;
+                                        continue;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            break;
+                        }
+                        Ok(JsValue::Undefined)
+                    }));
+                    proto_cache_store(&cache_map, key_str, proto_generation, &value, 1);
+                    return value;
+                }
+                "__defineGetter__" => {
+                    let map = Rc::clone(map);
+                    let cache_map = Rc::clone(&map);
+                    drop(borrow);
+                    let value = JsValue::NativeFunction(Rc::new(move |args| {
+                        let prop = match args.first() {
+                            Some(JsValue::String(s)) => s.to_string(),
+                            Some(v) => js_to_string(v),
+                            None => return Ok(JsValue::Undefined),
+                        };
+                        let getter = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        let getter_key = format!("__get_{prop}__");
+                        map.borrow_mut().insert(getter_key, getter);
+                        Ok(JsValue::Undefined)
+                    }));
+                    proto_cache_store(&cache_map, key_str, proto_generation, &value, 1);
+                    return value;
+                }
+                "__defineSetter__" => {
+                    let map = Rc::clone(map);
+                    let cache_map = Rc::clone(&map);
+                    drop(borrow);
+                    let value = JsValue::NativeFunction(Rc::new(move |args| {
+                        let prop = match args.first() {
+                            Some(JsValue::String(s)) => s.to_string(),
+                            Some(v) => js_to_string(v),
+                            None => return Ok(JsValue::Undefined),
+                        };
+                        let setter = args.get(1).cloned().unwrap_or(JsValue::Undefined);
+                        let setter_key = format!("__set_{prop}__");
+                        map.borrow_mut().insert(setter_key, setter);
+                        Ok(JsValue::Undefined)
+                    }));
+                    proto_cache_store(&cache_map, key_str, proto_generation, &value, 1);
+                    return value;
+                }
+                _ => {}
+            }
+        }
+        if let Some(proto) = explicit_proto {
+            drop(borrow);
+            let result = proto_lookup_chain_rc(&proto, key, obj);
+            let depth = if matches!(result, JsValue::Undefined) {
+                0
+            } else if let Some(depth) = proto_lookup_chain_depth(&proto, key_str) {
+                depth
+            } else if is_known_object_prototype_builtin(key_str) {
+                implicit_object_prototype_depth(&proto)
+            } else {
+                0
+            };
+            proto_cache_store(map, key_str, proto_generation, &result, depth);
+            return result;
+        }
+        drop(borrow);
+        proto_cache_store(map, key_str, proto_generation, &JsValue::Undefined, 0);
+        return JsValue::Undefined;
+    }
+    proto_lookup(obj, key.as_ref())
+}
+
 /// Invoke a setter accessor function with the given value.
 pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) -> StatorResult<()> {
     match setter {
         JsValue::Function(ba) => {
             push_call_frame("<setter>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                InterpreterFrame::new_callee_frame(Rc::clone(ba), vec![val], globals)
+                acquire_frame(Rc::clone(ba), vec![val], globals)
             } else {
                 InterpreterFrame::new(Rc::clone(ba), vec![val])
             };
             restore_closure_context(&mut frame, ba);
             frame.global_env.borrow_mut().set_this(this.clone());
-            let result = run_callee(&mut frame);
+            let result = run_callee_pooled(frame);
             pop_call_frame();
             result?;
             Ok(())
@@ -11013,9 +13272,9 @@ pub(super) fn dispatch_setter(setter: &JsValue, this: &JsValue, val: JsValue) ->
 ///
 /// This is the engine's primary mechanism for calling any JS-callable value
 /// from native Rust code.  It handles:
-/// - `JsValue::Function` (bytecode) — creates a new interpreter frame
-/// - `JsValue::NativeFunction` — calls the Rust closure directly
-/// - `JsValue::PlainObject` with `__call__` — delegates to the callable slot
+/// - `JsValue::Function` (bytecode) ΓÇö creates a new interpreter frame
+/// - `JsValue::NativeFunction` ΓÇö calls the Rust closure directly
+/// - `JsValue::PlainObject` with `__call__` ΓÇö delegates to the callable slot
 pub fn dispatch_call_value(
     callee: &JsValue,
     args: impl IntoIterator<Item = JsValue>,
@@ -11024,7 +13283,7 @@ pub fn dispatch_call_value(
     match callee {
         JsValue::Function(ba) => {
             // Generator functions return a suspended generator object instead
-            // of executing the body (§27.3.3.1).
+            // of executing the body (┬º27.3.3.1).
             if ba.is_generator() {
                 let state = GeneratorState::new(Rc::clone(ba));
                 init_generator_state_prototype(&state, ba);
@@ -11032,13 +13291,13 @@ pub fn dispatch_call_value(
             }
             push_call_frame("<anonymous>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                InterpreterFrame::new_callee_frame(Rc::clone(ba), args, globals)
+                acquire_frame(Rc::clone(ba), args, globals)
             } else {
                 InterpreterFrame::new(Rc::clone(ba), args)
             };
             restore_closure_context(&mut frame, ba);
             populate_self_name(&mut frame, ba, &JsValue::Function(Rc::clone(ba)));
-            let result = run_callee(&mut frame);
+            let result = run_callee_pooled(frame);
             pop_call_frame();
             result
         }
@@ -11068,7 +13327,7 @@ pub fn dispatch_call_with_this(
     match callee {
         JsValue::Function(ba) => {
             // Generator functions return a suspended generator object instead
-            // of executing the body (§27.3.3.1).
+            // of executing the body (┬º27.3.3.1).
             if ba.is_generator() {
                 let state = GeneratorState::new(Rc::clone(ba));
                 init_generator_state_prototype(&state, ba);
@@ -11076,7 +13335,7 @@ pub fn dispatch_call_with_this(
             }
             push_call_frame("<anonymous>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                InterpreterFrame::new_callee_frame(Rc::clone(ba), args, globals)
+                acquire_frame(Rc::clone(ba), args, globals)
             } else {
                 InterpreterFrame::new(Rc::clone(ba), args)
             };
@@ -11086,9 +13345,9 @@ pub fn dispatch_call_with_this(
             if ba.is_arrow() {
                 frame.new_target = fn_props_get(ba, ".new_target");
             }
-            // Arrow functions use lexical `this` — do NOT override.
+            // Arrow functions use lexical `this` ΓÇö do NOT override.
             if !ba.is_arrow() {
-                // ES §10.2.1.2: in sloppy mode, null/undefined `this` → globalThis.
+                // ES ┬º10.2.1.2: in sloppy mode, null/undefined `this` ΓåÆ globalThis.
                 let effective_this = if !ba.is_strict() && this_val.is_nullish() {
                     frame
                         .global_env
@@ -11101,7 +13360,7 @@ pub fn dispatch_call_with_this(
                 };
                 frame.global_env.borrow_mut().set_this(effective_this);
             }
-            let result = run_callee(&mut frame);
+            let result = run_callee_pooled(frame);
             pop_call_frame();
             result
         }
@@ -11151,7 +13410,7 @@ pub fn dispatch_construct_call(
         JsValue::Function(ba) => {
             push_call_frame("<anonymous>")?;
             let mut frame = if let Some(globals) = CURRENT_GLOBALS.with(|g| g.borrow().clone()) {
-                InterpreterFrame::new_callee_frame(Rc::clone(ba), args, globals)
+                acquire_frame(Rc::clone(ba), args, globals)
             } else {
                 InterpreterFrame::new(Rc::clone(ba), args)
             };
@@ -11159,7 +13418,7 @@ pub fn dispatch_construct_call(
             populate_self_name(&mut frame, ba, &JsValue::Function(Rc::clone(ba)));
             frame.new_target = new_target;
             frame.global_env.borrow_mut().set_this(this_val);
-            let result = run_callee(&mut frame);
+            let result = run_callee_pooled(frame);
             pop_call_frame();
             result
         }
@@ -11229,17 +13488,17 @@ pub(super) fn wire_construct_prototype(result: JsValue, ctor_proto: &JsValue) ->
     result
 }
 
-// ─── Constructor fast-path helpers ───────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Constructor fast-path helpers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /// Resolve the constructor's `.prototype` value, using the per-bytecode-array
 /// cache when available to avoid a property lookup on every `new` call.
-pub(crate) fn resolve_construct_proto(ctor: &JsValue, ba: &Rc<BytecodeArray>) -> JsValue {
+pub(super) fn resolve_construct_proto(ctor: &JsValue, ba: &Rc<BytecodeArray>) -> JsValue {
     if let Some(cached) = ba.cached_construct_proto() {
         return cached;
     }
     let proto = proto_lookup(ctor, "prototype");
     // Lazy prototype creation: if no prototype was set (e.g., non-generator
-    // closure), create one on-demand per ES §10.2.5.
+    // closure), create one on-demand per ES ┬º10.2.5.
     if matches!(proto, JsValue::Undefined) && !ba.is_arrow() {
         let func_val = JsValue::Function(Rc::clone(ba));
         let mut proto_map = PropertyMap::new();
@@ -11255,7 +13514,7 @@ pub(crate) fn resolve_construct_proto(ctor: &JsValue, ba: &Rc<BytecodeArray>) ->
 
 /// Create the `this` object for a `[[Construct]]` call, optionally using
 /// the boilerplate shape cache on `ba` to pre-allocate property slots.
-pub(crate) fn make_construct_this(ba: &Rc<BytecodeArray>, ctor_proto: &JsValue) -> JsValue {
+pub(super) fn make_construct_this(ba: &Rc<BytecodeArray>, ctor_proto: &JsValue) -> JsValue {
     let this_obj: Rc<RefCell<PropertyMap>> = if let Some(bp) = ba.cached_construct_boilerplate() {
         Rc::new(RefCell::new(PropertyMap::from_boilerplate(
             &bp.keys, &bp.attrs,
@@ -11264,9 +13523,10 @@ pub(crate) fn make_construct_this(ba: &Rc<BytecodeArray>, ctor_proto: &JsValue) 
         Rc::new(RefCell::new(PropertyMap::new()))
     };
     if !matches!(ctor_proto, JsValue::Undefined) {
-        this_obj
-            .borrow_mut()
-            .insert("__proto__".to_string(), ctor_proto.clone());
+        let mut map = this_obj.borrow_mut();
+        if let Err(ctor_proto) = map.try_template_fill("__proto__", ctor_proto.clone()) {
+            map.insert("__proto__".to_string(), ctor_proto);
+        }
     }
     JsValue::PlainObject(this_obj)
 }
@@ -11274,14 +13534,14 @@ pub(crate) fn make_construct_this(ba: &Rc<BytecodeArray>, ctor_proto: &JsValue) 
 /// After a successful `[[Construct]]` where `this_val` was used (not an
 /// explicitly returned object), capture the object's shape as a
 /// boilerplate for future constructions.
-pub(crate) fn maybe_cache_construct_boilerplate(ba: &Rc<BytecodeArray>, this_val: &JsValue) {
-    // Only cache once — the first execution defines the expected shape.
+pub(super) fn maybe_cache_construct_boilerplate(ba: &Rc<BytecodeArray>, this_val: &JsValue) {
+    // Only cache once ΓÇö the first execution defines the expected shape.
     if ba.cached_construct_boilerplate().is_some() {
         return;
     }
     if let JsValue::PlainObject(map) = this_val {
         let borrow = map.borrow();
-        // Skip trivially empty objects — nothing to cache.
+        // Skip trivially empty objects ΓÇö nothing to cache.
         if borrow.is_empty() {
             return;
         }
@@ -11291,7 +13551,7 @@ pub(crate) fn maybe_cache_construct_boilerplate(ba: &Rc<BytecodeArray>, this_val
 }
 
 pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> {
-    // TypeError for keyed property access on null or undefined (ES §13.10.3).
+    // TypeError for keyed property access on null or undefined (ES ┬º13.10.3).
     if matches!(obj, JsValue::Null | JsValue::Undefined) {
         let key_str = to_property_key(key).unwrap_or_default();
         return Err(StatorError::TypeError(format!(
@@ -11326,7 +13586,7 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
                     _ => JsValue::Undefined,
                 });
             }
-            // Named property — delegate to proto_lookup for method access.
+            // Named property ΓÇö delegate to proto_lookup for method access.
             let prop_name = to_property_key(key)?;
             Ok(proto_lookup(obj, &prop_name))
         }
@@ -11349,7 +13609,7 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
                     JsValue::Undefined
                 });
             }
-            // Named property — delegate to proto_lookup for method access.
+            // Named property ΓÇö delegate to proto_lookup for method access.
             let prop_name = to_property_key(key)?;
             Ok(proto_lookup(obj, &prop_name))
         }
@@ -11370,7 +13630,7 @@ pub(super) fn keyed_load(obj: &JsValue, key: &JsValue) -> StatorResult<JsValue> 
 /// invariants:
 /// - **Accessor properties**: if a setter (`__set_<key>__`) is defined, the
 ///   setter is invoked; if only a getter exists (no setter) the store is
-///   silently ignored (sloppy mode — strict mode callers add a TypeError
+///   silently ignored (sloppy mode ΓÇö strict mode callers add a TypeError
 ///   before reaching this helper).
 /// - **Non-writable properties**: the store is silently ignored.
 /// - **Non-extensible objects**: adding a new property is silently ignored.
@@ -11389,7 +13649,7 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
                 }
                 return Ok(());
             }
-            // Check for setter accessor (__set_<key>__) first — accessor
+            // Check for setter accessor (__set_<key>__) first ΓÇö accessor
             // properties take precedence over data properties.
             if map.borrow().has_accessors {
                 let pm = map.borrow();
@@ -11489,9 +13749,10 @@ pub(super) fn keyed_store(obj: &JsValue, key: &JsValue, value: JsValue) -> Stato
                 }
             } else if let Some(idx) = to_array_index(key) {
                 let mut v = arr.borrow_mut();
-                // Extend the array if needed
+                // Extend the array if needed, filling gaps with TheHole to
+                // represent sparse (unset) elements.
                 if idx >= v.len() {
-                    v.resize(idx + 1, JsValue::Undefined);
+                    v.resize(idx + 1, JsValue::TheHole);
                 }
                 v[idx] = value;
             }
@@ -11524,9 +13785,9 @@ pub(super) fn plain_object_to_array_items(map: &Rc<RefCell<PropertyMap>>) -> Vec
         .collect()
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 // Tests
-// ─────────────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 #[cfg(test)]
 mod tests {
@@ -11577,7 +13838,148 @@ mod tests {
         Ok((result, frame))
     }
 
-    // ── LdaSmi / LdaUndefined / Return ──────────────────────────────────────
+    #[test]
+    fn test_try_inline_small_function_constant() {
+        let ba = make_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+            0,
+        );
+        let global_env = Rc::new(RefCell::new(GlobalEnv::new()));
+
+        let result = try_inline_small_function(&ba, &[], &global_env);
+
+        assert_eq!(result, Some(JsValue::Smi(42)));
+    }
+
+    #[test]
+    fn test_try_inline_small_function_adds_parameters() {
+        let param0_v = (-1i32) as u32;
+        let param1_v = (-2i32) as u32;
+        let ba = make_bytecode(
+            vec![
+                Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(param1_v)]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(param0_v)]),
+                Instruction::new_unchecked(
+                    Opcode::Add,
+                    vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            1,
+            2,
+        );
+        let global_env = Rc::new(RefCell::new(GlobalEnv::new()));
+
+        let result =
+            try_inline_small_function(&ba, &[JsValue::Smi(4), JsValue::Smi(3)], &global_env);
+
+        assert_eq!(result, Some(JsValue::Smi(7)));
+    }
+
+    #[test]
+    fn test_try_inline_small_function_named_property_accessor() {
+        let param0_v = (-1i32) as u32;
+        let instrs = vec![
+            Instruction::new_unchecked(
+                Opcode::LdaNamedProperty,
+                vec![
+                    Operand::Register(param0_v),
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let ba = BytecodeArray::new(
+            encode(&instrs),
+            vec![ConstantPoolEntry::String("x".to_string())],
+            0,
+            1,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        );
+        let mut props = PropertyMap::new();
+        props.insert("x".to_string(), JsValue::Smi(9));
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(props)));
+        let global_env = Rc::new(RefCell::new(GlobalEnv::new()));
+
+        let result = try_inline_small_function(&ba, &[obj], &global_env);
+
+        assert_eq!(result, Some(JsValue::Smi(9)));
+    }
+
+    #[test]
+    fn test_try_inline_small_function_updates_current_context_slot_with_inc() {
+        let mut ba = make_bytecode(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::LdaCurrentContextSlot,
+                    vec![Operand::ConstantPoolIdx(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Inc, vec![Operand::FeedbackSlot(0)]),
+                Instruction::new_unchecked(
+                    Opcode::StaCurrentContextSlot,
+                    vec![Operand::ConstantPoolIdx(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+            0,
+        );
+        let closure_ctx = JsContext::new(1, None);
+        closure_ctx.borrow_mut().slots[0] = JsValue::Smi(41);
+        ba.set_closure_context(Rc::clone(&closure_ctx));
+        let global_env = Rc::new(RefCell::new(GlobalEnv::new()));
+
+        let result = try_inline_small_function(&ba, &[], &global_env);
+
+        assert_eq!(result, Some(JsValue::Smi(42)));
+        assert_eq!(closure_ctx.borrow().slots[0], JsValue::Smi(42));
+    }
+
+    #[test]
+    fn test_try_inline_small_function_updates_current_context_slot_with_add_smi() {
+        let mut ba = make_bytecode(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::LdaCurrentContextSlot,
+                    vec![Operand::ConstantPoolIdx(0)],
+                ),
+                Instruction::new_unchecked(
+                    Opcode::AddSmi,
+                    vec![Operand::Immediate(1), Operand::FeedbackSlot(0)],
+                ),
+                Instruction::new_unchecked(
+                    Opcode::StaCurrentContextSlot,
+                    vec![Operand::ConstantPoolIdx(0)],
+                ),
+                Instruction::new_unchecked(
+                    Opcode::LdaCurrentContextSlot,
+                    vec![Operand::ConstantPoolIdx(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            0,
+            0,
+        );
+        let closure_ctx = JsContext::new(1, None);
+        closure_ctx.borrow_mut().slots[0] = JsValue::Smi(7);
+        ba.set_closure_context(Rc::clone(&closure_ctx));
+        let global_env = Rc::new(RefCell::new(GlobalEnv::new()));
+
+        let result = try_inline_small_function(&ba, &[], &global_env);
+
+        assert_eq!(result, Some(JsValue::Smi(8)));
+        assert_eq!(closure_ctx.borrow().slots[0], JsValue::Smi(8));
+    }
+
+    // ΓöÇΓöÇ LdaSmi / LdaUndefined / Return ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_lda_smi_and_return() {
@@ -11654,11 +14056,11 @@ mod tests {
         assert_eq!(f, JsValue::Boolean(false));
     }
 
-    // ── Star / Ldar ──────────────────────────────────────────────────────────
+    // ΓöÇΓöÇ Star / Ldar ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_star_ldar_round_trip() {
-        // lda 7 → r0, lda 0, ldar r0 → return 7
+        // lda 7 ΓåÆ r0, lda 0, ldar r0 ΓåÆ return 7
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(7)]),
@@ -11673,10 +14075,10 @@ mod tests {
         assert_eq!(result, JsValue::Smi(7));
     }
 
-    // ── Arithmetic ───────────────────────────────────────────────────────────
+    // ΓöÇΓöÇ Arithmetic ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     /// Helper: evaluate `lhs <op> rhs` using the standard Ignition pattern:
-    /// evaluate rhs → r0, evaluate lhs → acc, apply op.
+    /// evaluate rhs ΓåÆ r0, evaluate lhs ΓåÆ acc, apply op.
     fn arith_op(lhs: i32, rhs: i32, op: Opcode) -> StatorResult<JsValue> {
         run_bytecode(
             vec![
@@ -11705,6 +14107,36 @@ mod tests {
     }
 
     #[test]
+    fn test_concat_rc_strs_reuses_empty_operand() {
+        let empty: Rc<str> = Rc::from("");
+        let text: Rc<str> = Rc::from("hello");
+
+        let left_empty = concat_rc_strs(&empty, &text);
+        let right_empty = concat_rc_strs(&text, &empty);
+
+        let JsValue::String(left_empty) = left_empty else {
+            panic!("expected string result");
+        };
+        let JsValue::String(right_empty) = right_empty else {
+            panic!("expected string result");
+        };
+
+        assert!(Rc::ptr_eq(&left_empty, &text));
+        assert!(Rc::ptr_eq(&right_empty, &text));
+    }
+
+    #[test]
+    fn test_js_add_fast_path_concatenates_strings() {
+        let lhs = JsValue::String(Rc::from("foo"));
+        let rhs = JsValue::String(Rc::from("bar"));
+
+        assert_eq!(
+            js_add(&lhs, &rhs).unwrap(),
+            JsValue::String(Rc::from("foobar"))
+        );
+    }
+
+    #[test]
     fn test_sub_integers() {
         assert_eq!(arith_op(10, 3, Opcode::Sub).unwrap(), JsValue::Smi(7));
         assert_eq!(arith_op(0, 5, Opcode::Sub).unwrap(), JsValue::Smi(-5));
@@ -11719,9 +14151,9 @@ mod tests {
 
     #[test]
     fn test_div_integers() {
-        // 10 / 2 = 5 (exact → Smi)
+        // 10 / 2 = 5 (exact ΓåÆ Smi)
         assert_eq!(arith_op(10, 2, Opcode::Div).unwrap(), JsValue::Smi(5));
-        // 7 / 2 = 3.5 (fractional → HeapNumber)
+        // 7 / 2 = 3.5 (fractional ΓåÆ HeapNumber)
         assert_eq!(
             arith_op(7, 2, Opcode::Div).unwrap(),
             JsValue::HeapNumber(3.5)
@@ -11759,7 +14191,7 @@ mod tests {
 
         assert_eq!(result, JsValue::Smi(-7));
         // smi_mode is cleared when the SMI loop hits an unsupported
-        // opcode (Return) — checking the result is sufficient.
+        // opcode (Return) ΓÇö checking the result is sufficient.
         let _ = frame;
     }
 
@@ -11790,8 +14222,133 @@ mod tests {
 
         assert_eq!(result, JsValue::Smi(5));
         // smi_mode is cleared when the SMI loop hits an unsupported
-        // opcode (Return) — checking the result is sufficient.
+        // opcode (Return) ΓÇö checking the result is sufficient.
         let _ = frame;
+    }
+
+    fn run_forced_smi_loop_bytecode(
+        instrs: Vec<Instruction>,
+        frame_size: u32,
+        registers: &[(u32, JsValue)],
+    ) -> StatorResult<JsValue> {
+        let loop_end_pc = instrs.len().saturating_sub(1);
+        let ba = make_bytecode(instrs, frame_size, 0);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
+        for (reg, value) in registers {
+            unsafe { frame.write_reg_unchecked(*reg, value.clone()) };
+        }
+        frame.smi_mode = true;
+        frame.loop_end_pc = loop_end_pc;
+        frame.accumulator = JsValue::Smi(0);
+        frame.hot_registers = Some(HotRegisters::new(frame.registers.len()));
+        Interpreter::run(&mut frame)
+    }
+
+    #[test]
+    fn test_smi_mode_call_undefined_receiver2_reenters_on_smi_result() {
+        let add = Rc::new(make_add_bytecode());
+        let instrs = vec![
+            Instruction::new_unchecked(
+                Opcode::CallUndefinedReceiver2,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                    Operand::FeedbackSlot(0),
+                ],
+            ),
+            Instruction::new_unchecked(
+                Opcode::AddSmi,
+                vec![Operand::Immediate(1), Operand::FeedbackSlot(1)],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let result = run_forced_smi_loop_bytecode(
+            instrs,
+            3,
+            &[
+                (0, JsValue::Function(add)),
+                (1, JsValue::Smi(3)),
+                (2, JsValue::Smi(4)),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(result, JsValue::Smi(8));
+    }
+
+    #[test]
+    fn test_smi_mode_lda_keyed_property_array_smi_stays_in_loop() {
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            Instruction::new_unchecked(
+                Opcode::LdaKeyedProperty,
+                vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(
+                Opcode::AddSmi,
+                vec![Operand::Immediate(1), Operand::FeedbackSlot(1)],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let result = run_forced_smi_loop_bytecode(
+            instrs,
+            1,
+            &[(
+                0,
+                JsValue::Array(Rc::new(RefCell::new(vec![
+                    JsValue::Smi(10),
+                    JsValue::Smi(20),
+                ]))),
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(result, JsValue::Smi(21));
+    }
+
+    #[test]
+    fn test_smi_mode_create_empty_array_keyed_load_and_typeof() {
+        let instrs = vec![
+            Instruction::new_unchecked(
+                Opcode::CreateEmptyArrayLiteral,
+                vec![Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(0)]),
+            Instruction::new_unchecked(
+                Opcode::LdaKeyedProperty,
+                vec![Operand::Register(0), Operand::FeedbackSlot(1)],
+            ),
+            Instruction::new_unchecked(Opcode::TypeOf, vec![Operand::FeedbackSlot(2)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let result = run_forced_smi_loop_bytecode(instrs, 1, &[]).unwrap();
+
+        assert_eq!(result, JsValue::String("undefined".to_owned().into()));
+    }
+
+    #[test]
+    fn test_smi_mode_create_array_literal_and_typeof() {
+        let instrs = vec![
+            Instruction::new_unchecked(
+                Opcode::CreateArrayLiteral,
+                vec![
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(0),
+                    Operand::Flag(4),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::TypeOf, vec![Operand::FeedbackSlot(1)]),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+
+        let result = run_forced_smi_loop_bytecode(instrs, 0, &[]).unwrap();
+
+        assert_eq!(result, JsValue::String("object".to_owned().into()));
     }
 
     fn run_smi_compare_branch(
@@ -11864,11 +14421,11 @@ mod tests {
         );
     }
 
-    // ── TestEqual ────────────────────────────────────────────────────────────
+    // ΓöÇΓöÇ TestEqual ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_equal_same_smis() {
-        // 5 == 5 → true
+        // 5 == 5 ΓåÆ true
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
@@ -11888,7 +14445,7 @@ mod tests {
 
     #[test]
     fn test_equal_different_smis() {
-        // 3 == 7 → false
+        // 3 == 7 ΓåÆ false
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(7)]),
@@ -11906,7 +14463,7 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(false));
     }
 
-    // ── TestEqualStrict ──────────────────────────────────────────────────────
+    // ΓöÇΓöÇ TestEqualStrict ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_strict_equal_same_smis() {
@@ -11947,12 +14504,12 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(false));
     }
 
-    // ── Parameter registers ──────────────────────────────────────────────────
+    // ΓöÇΓöÇ Parameter registers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_parameter_registers() {
         // Function: return first argument (param[0]).
-        // param[0] → Register(-1) → encoded as Register(0xFFFF_FFFF)
+        // param[0] ΓåÆ Register(-1) ΓåÆ encoded as Register(0xFFFF_FFFF)
         let param_reg = (-1_i32) as u32;
         let ba = make_bytecode(
             vec![
@@ -11967,24 +14524,24 @@ mod tests {
         assert_eq!(result, JsValue::Smi(99));
     }
 
-    // ── Arithmetic expression sequence ───────────────────────────────────────
+    // ΓöÇΓöÇ Arithmetic expression sequence ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_arithmetic_expression_sequence() {
-        // Simulate: (3 + 4) * 2 − 1 = 13
+        // Simulate: (3 + 4) * 2 ΓêÆ 1 = 13
         //
         // Bytecode layout:
-        //   lda 4      → r0          (rhs of +)
+        //   lda 4      ΓåÆ r0          (rhs of +)
         //   lda 3                    (lhs of +)
-        //   add r0     → acc = 7
+        //   add r0     ΓåÆ acc = 7
         //   star r1                  (save 7)
-        //   lda 2      → r0          (rhs of *)
-        //   ldar r1    → acc = 7     (lhs of *)
-        //   mul r0     → acc = 14
+        //   lda 2      ΓåÆ r0          (rhs of *)
+        //   ldar r1    ΓåÆ acc = 7     (lhs of *)
+        //   mul r0     ΓåÆ acc = 14
         //   star r1                  (save 14)
-        //   lda 1      → r0          (rhs of −)
-        //   ldar r1    → acc = 14    (lhs of −)
-        //   sub r0     → acc = 13
+        //   lda 1      ΓåÆ r0          (rhs of ΓêÆ)
+        //   ldar r1    ΓåÆ acc = 14    (lhs of ΓêÆ)
+        //   sub r0     ΓåÆ acc = 13
         //   return
         let result = run_bytecode(
             vec![
@@ -11996,7 +14553,7 @@ mod tests {
                     Opcode::Add,
                     vec![Operand::Register(0), Operand::FeedbackSlot(0)],
                 ),
-                // save 7 → r1
+                // save 7 ΓåÆ r1
                 Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
                 // acc = 7 * 2
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(2)]),
@@ -12006,7 +14563,7 @@ mod tests {
                     Opcode::Mul,
                     vec![Operand::Register(0), Operand::FeedbackSlot(0)],
                 ),
-                // save 14 → r1
+                // save 14 ΓåÆ r1
                 Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
                 // acc = 14 - 1
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
@@ -12024,7 +14581,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(13));
     }
 
-    // ── Error cases ──────────────────────────────────────────────────────────
+    // ΓöÇΓöÇ Error cases ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_no_return_is_error() {
@@ -12055,16 +14612,16 @@ mod tests {
         assert_eq!(result, JsValue::Smi(42));
     }
 
-    // ── Jump (unconditional) ─────────────────────────────────────────────────
+    // ΓöÇΓöÇ Jump (unconditional) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_jump_forward_skips_instructions() {
         // Jump with offset 2 skips the next 2-byte instruction (LdaSmi(99)).
         // Byte layout:
-        //   [0] LdaSmi(1)   → 2 bytes (opcode + narrow immediate)
-        //   [2] Jump(2)     → 2 bytes (opcode + narrow offset)
-        //   [4] LdaSmi(99)  → 2 bytes ← skipped; end-of-jump=4, target=4+2=6
-        //   [6] Return      → 1 byte
+        //   [0] LdaSmi(1)   ΓåÆ 2 bytes (opcode + narrow immediate)
+        //   [2] Jump(2)     ΓåÆ 2 bytes (opcode + narrow offset)
+        //   [4] LdaSmi(99)  ΓåÆ 2 bytes ΓåÉ skipped; end-of-jump=4, target=4+2=6
+        //   [6] Return      ΓåÆ 1 byte
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
@@ -12084,13 +14641,13 @@ mod tests {
     fn test_jump_if_to_boolean_false_taken_skips_instruction() {
         // When acc is falsy the jump is taken and LdaSmi(99) is skipped.
         // Byte layout:
-        //   [0] LdaSmi(42)             → 2 bytes  (acc = 42)
-        //   [2] Star(r0)               → 2 bytes  (r0 = 42)
-        //   [4] LdaFalse               → 1 byte   (acc = false)
-        //   [5] JumpIfToBooleanFalse(2)→ 2 bytes  end=7; if taken target=9
-        //   [7] LdaSmi(99)             → 2 bytes  ← skipped when jump taken
-        //   [9] Ldar(r0)               → 2 bytes  (acc = 42)
-        //  [11] Return                 → 1 byte
+        //   [0] LdaSmi(42)             ΓåÆ 2 bytes  (acc = 42)
+        //   [2] Star(r0)               ΓåÆ 2 bytes  (r0 = 42)
+        //   [4] LdaFalse               ΓåÆ 1 byte   (acc = false)
+        //   [5] JumpIfToBooleanFalse(2)ΓåÆ 2 bytes  end=7; if taken target=9
+        //   [7] LdaSmi(99)             ΓåÆ 2 bytes  ΓåÉ skipped when jump taken
+        //   [9] Ldar(r0)               ΓåÆ 2 bytes  (acc = 42)
+        //  [11] Return                 ΓåÆ 1 byte
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
@@ -12136,11 +14693,11 @@ mod tests {
         assert_eq!(result, JsValue::Smi(42));
     }
 
-    // ── Comparison opcodes ───────────────────────────────────────────────────
+    // ΓöÇΓöÇ Comparison opcodes ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_less_than() {
-        // 3 < 5 → true
+        // 3 < 5 ΓåÆ true
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
@@ -12157,7 +14714,7 @@ mod tests {
         .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
 
-        // 7 < 3 → false
+        // 7 < 3 ΓåÆ false
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(3)]),
@@ -12177,7 +14734,7 @@ mod tests {
 
     #[test]
     fn test_greater_than() {
-        // 7 > 3 → true
+        // 7 > 3 ΓåÆ true
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(3)]),
@@ -12197,7 +14754,7 @@ mod tests {
 
     #[test]
     fn test_less_than_or_equal() {
-        // 5 <= 5 → true
+        // 5 <= 5 ΓåÆ true
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
@@ -12217,7 +14774,7 @@ mod tests {
 
     #[test]
     fn test_greater_than_or_equal() {
-        // 5 >= 6 → false
+        // 5 >= 6 ΓåÆ false
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(6)]),
@@ -12237,7 +14794,7 @@ mod tests {
 
     #[test]
     fn test_not_equal() {
-        // 3 != 5 → true
+        // 3 != 5 ΓåÆ true
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
@@ -12257,7 +14814,7 @@ mod tests {
 
     #[test]
     fn test_test_null_and_undefined() {
-        // null → true for TestNull
+        // null ΓåÆ true for TestNull
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaNull, vec![]),
@@ -12269,7 +14826,7 @@ mod tests {
         .unwrap();
         assert_eq!(result, JsValue::Boolean(true));
 
-        // 42 → false for TestUndefined
+        // 42 ΓåÆ false for TestUndefined
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
@@ -12282,11 +14839,11 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(false));
     }
 
-    // ── Inc / Dec / Mod ──────────────────────────────────────────────────────
+    // ΓöÇΓöÇ Inc / Dec / Mod ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_inc_and_dec() {
-        // inc: 5 → 6
+        // inc: 5 ΓåÆ 6
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
@@ -12298,7 +14855,7 @@ mod tests {
         .unwrap();
         assert_eq!(result, JsValue::Smi(6));
 
-        // dec: 5 → 4
+        // dec: 5 ΓåÆ 4
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
@@ -12331,7 +14888,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(1));
     }
 
-    // ── LogicalNot / ToBooleanLogicalNot ─────────────────────────────────────
+    // ΓöÇΓöÇ LogicalNot / ToBooleanLogicalNot ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_logical_not() {
@@ -12349,7 +14906,7 @@ mod tests {
 
     #[test]
     fn test_to_boolean_logical_not() {
-        // !0 → true
+        // !0 ΓåÆ true
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaZero, vec![]),
@@ -12362,7 +14919,7 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
-    // ── End-to-end: compiler → interpreter ──────────────────────────────────
+    // ΓöÇΓöÇ End-to-end: compiler ΓåÆ interpreter ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     //
     // These tests use BytecodeGenerator to compile a hand-built AST, then run
     // the resulting BytecodeArray through the interpreter.
@@ -12465,7 +15022,7 @@ mod tests {
         }))
     }
 
-    /// Test: if/else branching — return "big" if x > 5, else "small".
+    /// Test: if/else branching ΓÇö return "big" if x > 5, else "small".
     #[test]
     fn test_e2e_if_else_branching() {
         use crate::parser::ast::{BinaryOp, IfStmt, ReturnStmt, Stmt};
@@ -12512,7 +15069,7 @@ mod tests {
         assert_eq!(result2, JsValue::Smi(0)); // x=3 <= 5, so return 0
     }
 
-    /// Test: for loop computing the sum 0+1+2+…+9 = 45.
+    /// Test: for loop computing the sum 0+1+2+ΓÇª+9 = 45.
     #[test]
     fn test_e2e_for_loop_sum() {
         use crate::parser::ast::{
@@ -12564,10 +15121,10 @@ mod tests {
         ];
 
         let result = compile_and_run(stmts).unwrap();
-        assert_eq!(result, JsValue::Smi(45)); // 0+1+…+9 = 45
+        assert_eq!(result, JsValue::Smi(45)); // 0+1+ΓÇª+9 = 45
     }
 
-    /// Test: while loop with break — count up to 5 then stop.
+    /// Test: while loop with break ΓÇö count up to 5 then stop.
     #[test]
     fn test_e2e_while_with_break() {
         use crate::parser::ast::{
@@ -12620,7 +15177,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(5));
     }
 
-    // ── Function calls and closures (P3) ─────────────────────────────────────
+    // ΓöÇΓöÇ Function calls and closures (P3) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     /// Helper: build a BytecodeArray with an explicit constant pool.
     fn make_bytecode_with_pool(
@@ -12646,10 +15203,10 @@ mod tests {
     /// Simulates: `function add(a, b) { return a + b; } ; return add(3, 4);`
     #[test]
     fn test_create_closure_and_call_any_receiver() {
-        // ── Inner function: add(a, b) { return a + b; } ─────────────────────
+        // ΓöÇΓöÇ Inner function: add(a, b) { return a + b; } ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         //
-        // param[0] = a → encoded register (-1i32 as u32)
-        // param[1] = b → encoded register (-2i32 as u32)
+        // param[0] = a ΓåÆ encoded register (-1i32 as u32)
+        // param[1] = b ΓåÆ encoded register (-2i32 as u32)
         // r0 = local register used as RHS of Add.
         let param0_v: u32 = (-1i32) as u32;
         let param1_v: u32 = (-2i32) as u32;
@@ -12670,7 +15227,7 @@ mod tests {
         ];
         let inner_ba = make_bytecode(inner_instrs, 1, 2); // frame_size=1, param_count=2
 
-        // ── Outer script ────────────────────────────────────────────────────
+        // ΓöÇΓöÇ Outer script ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         //
         // constant pool: [Function(inner_ba)]
         // r0 = closure, r1 = arg0 (3), r2 = arg1 (4)
@@ -12935,7 +15492,7 @@ mod tests {
 
         assert!(f.to_boolean());
         assert!(f.is_function());
-        // Function → ToPrimitive → "function () { [native code] }" → NaN
+        // Function ΓåÆ ToPrimitive ΓåÆ "function () { [native code] }" ΓåÆ NaN
         assert!(f.to_number().unwrap().is_nan());
         assert_eq!(f.to_js_string().unwrap(), "function () { [native code] }");
     }
@@ -12963,7 +15520,7 @@ mod tests {
         assert!(matches!(err, StatorError::TypeError(_)));
     }
 
-    // ── Exception handling (Throw / ReThrow / handler table) ─────────────────
+    // ΓöÇΓöÇ Exception handling (Throw / ReThrow / handler table) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     /// Helper: build a [`BytecodeArray`] with an explicit handler table.
     fn make_bytecode_with_handlers(
@@ -12984,13 +15541,13 @@ mod tests {
         )
     }
 
-    /// `try { throw 42; } catch(e) { return e; }` → returns 42.
+    /// `try { throw 42; } catch(e) { return e; }` ΓåÆ returns 42.
     ///
     /// Bytecode layout (indices):
     ///   0: LdaSmi(42)
     ///   1: Throw
-    ///   2: Jump(past handler) ← try_end = 2, never reached
-    ///   3: Star(r0)           ← catch handler, acc = 42
+    ///   2: Jump(past handler) ΓåÉ try_end = 2, never reached
+    ///   3: Star(r0)           ΓåÉ catch handler, acc = 42
     ///   4: Ldar(r0)
     ///   5: Return
     ///
@@ -13001,17 +15558,17 @@ mod tests {
 
         // Build instructions manually so we know exact instruction indices.
         let instrs = vec![
-            // idx 0 — try body: load 42
+            // idx 0 ΓÇö try body: load 42
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
-            // idx 1 — throw it
+            // idx 1 ΓÇö throw it
             Instruction::new_unchecked(Opcode::Throw, vec![]),
-            // idx 2 — normal-exit jump (never reached in this test)
+            // idx 2 ΓÇö normal-exit jump (never reached in this test)
             Instruction::new_unchecked(Opcode::Jump, vec![Operand::JumpOffset(0)]),
-            // idx 3 — catch handler: acc holds thrown value; save to r0
+            // idx 3 ΓÇö catch handler: acc holds thrown value; save to r0
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
-            // idx 4 — load caught value
+            // idx 4 ΓÇö load caught value
             Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
-            // idx 5 — return it
+            // idx 5 ΓÇö return it
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
 
@@ -13039,19 +15596,19 @@ mod tests {
         assert_eq!(result, JsValue::Smi(42));
     }
 
-    /// `try { } finally { }` — finally runs on normal path.
+    /// `try { } finally { }` ΓÇö finally runs on normal path.
     ///
     /// The normal-path inlined finally simply sets r0 = 99 before returning.
     /// We verify the return value is from the try body, and the finally ran.
     ///
     /// Layout (indices):
-    ///   0: LdaSmi(1)    ← try body sets acc = 1
-    ///   1: Star(r0)     ← save it
-    ///   2: LdaSmi(99)   ← finally (normal path): acc = 99
-    ///   3: Star(r1)     ← save finally sentinel to r1
-    ///   4: Jump(6)      ← skip exception-path handler
-    ///   5: ReThrow      ← exception-path handler (never reached on normal path)
-    ///   6: Ldar(r0)     ← restore try result
+    ///   0: LdaSmi(1)    ΓåÉ try body sets acc = 1
+    ///   1: Star(r0)     ΓåÉ save it
+    ///   2: LdaSmi(99)   ΓåÉ finally (normal path): acc = 99
+    ///   3: Star(r1)     ΓåÉ save finally sentinel to r1
+    ///   4: Jump(6)      ΓåÉ skip exception-path handler
+    ///   5: ReThrow      ΓåÉ exception-path handler (never reached on normal path)
+    ///   6: Ldar(r0)     ΓåÉ restore try result
     ///   7: Return
     ///
     /// Handler table: { try_start=0, try_end=2, handler=5, is_finally=true }
@@ -13061,33 +15618,33 @@ mod tests {
         use crate::bytecode::bytecode_array::HandlerTableEntry;
 
         // Byte layout:
-        //   0: LdaSmi(1)  → 2 bytes  (ends at 2)
-        //   1: Star(r0)   → 2 bytes  (ends at 4)
+        //   0: LdaSmi(1)  ΓåÆ 2 bytes  (ends at 2)
+        //   1: Star(r0)   ΓåÆ 2 bytes  (ends at 4)
         //   --- try_end = 2 (instruction index) / byte 4 ---
-        //   2: LdaSmi(99) → 2 bytes  (ends at 6)
-        //   3: Star(r1)   → 2 bytes  (ends at 8)
-        //   4: Jump(δ)    → 2 bytes  (ends at 10; target = idx 6 = byte 11)
-        //                    δ = 11 - 10 = 1
-        //   5: ReThrow    → 1 byte   (ends at 11)
-        //   6: Ldar(r0)   → 2 bytes  (ends at 13)
-        //   7: Return     → 1 byte
+        //   2: LdaSmi(99) ΓåÆ 2 bytes  (ends at 6)
+        //   3: Star(r1)   ΓåÆ 2 bytes  (ends at 8)
+        //   4: Jump(╬┤)    ΓåÆ 2 bytes  (ends at 10; target = idx 6 = byte 11)
+        //                    ╬┤ = 11 - 10 = 1
+        //   5: ReThrow    ΓåÆ 1 byte   (ends at 11)
+        //   6: Ldar(r0)   ΓåÆ 2 bytes  (ends at 13)
+        //   7: Return     ΓåÆ 1 byte
 
         let instrs = vec![
-            // idx 0 — try body: acc = 1
+            // idx 0 ΓÇö try body: acc = 1
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
-            // idx 1 — save to r0
+            // idx 1 ΓÇö save to r0
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
-            // idx 2 — finally (normal path): acc = 99
+            // idx 2 ΓÇö finally (normal path): acc = 99
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
-            // idx 3 — save sentinel to r1
+            // idx 3 ΓÇö save sentinel to r1
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
-            // idx 4 — jump past exception handler (δ = 1 → target byte = 10+1 = 11 = idx 6)
+            // idx 4 ΓÇö jump past exception handler (╬┤ = 1 ΓåÆ target byte = 10+1 = 11 = idx 6)
             Instruction::new_unchecked(Opcode::Jump, vec![Operand::JumpOffset(1)]),
-            // idx 5 — exception handler: ReThrow (never reached in this test)
+            // idx 5 ΓÇö exception handler: ReThrow (never reached in this test)
             Instruction::new_unchecked(Opcode::ReThrow, vec![]),
-            // idx 6 — restore result from r0
+            // idx 6 ΓÇö restore result from r0
             Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
-            // idx 7 — return
+            // idx 7 ΓÇö return
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ];
 
@@ -13104,7 +15661,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(1));
     }
 
-    /// `try { throw 5; } finally { /* runs */ }` — finally runs on exception path
+    /// `try { throw 5; } finally { /* runs */ }` ΓÇö finally runs on exception path
     /// and the exception propagates after finally.
     ///
     /// Uses the bytecode generator to compile the equivalent JavaScript so we
@@ -13114,7 +15671,7 @@ mod tests {
         use crate::bytecode::bytecode_generator::BytecodeGenerator;
         use crate::parser::parse;
 
-        // try { throw 5; } finally { /* nothing — just let it propagate */ }
+        // try { throw 5; } finally { /* nothing ΓÇö just let it propagate */ }
         // After finally the exception should propagate out.
         let src = "try { throw 5; } finally { }";
         let program = parse(src).unwrap();
@@ -13130,7 +15687,7 @@ mod tests {
 
     /// `try { throw 7; } catch(e) { return e; }` via the bytecode generator.
     ///
-    /// Tests the full pipeline: parse → compile → run.
+    /// Tests the full pipeline: parse ΓåÆ compile ΓåÆ run.
     #[test]
     fn test_try_catch_via_generator() {
         use crate::bytecode::bytecode_generator::BytecodeGenerator;
@@ -13168,7 +15725,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(2));
     }
 
-    /// `try { } catch(e) { } finally { }` — finally runs on normal path.
+    /// `try { } catch(e) { } finally { }` ΓÇö finally runs on normal path.
     ///
     /// ```javascript
     /// var ran = 0;
@@ -13219,13 +15776,13 @@ mod tests {
 
         // r0 = 42 (not callable), call r0(), expect TypeError in catch.
         // Layout:
-        //   0: LdaSmi(42)          — 2 bytes (offset 0)
-        //   1: Star(r1)            — 2 bytes (offset 2)
-        //   2: CallUndefinedReceiver0(r1, slot0) — 3 bytes (offset 4)
-        //   3: Jump(+0)            — 2 bytes (offset 7) — never reached
-        //   4: Star(r0)            — 2 bytes (offset 9) — catch handler
-        //   5: Ldar(r0)            — 2 bytes (offset 11)
-        //   6: Return              — 1 byte  (offset 13)
+        //   0: LdaSmi(42)          ΓÇö 2 bytes (offset 0)
+        //   1: Star(r1)            ΓÇö 2 bytes (offset 2)
+        //   2: CallUndefinedReceiver0(r1, slot0) ΓÇö 3 bytes (offset 4)
+        //   3: Jump(+0)            ΓÇö 2 bytes (offset 7) ΓÇö never reached
+        //   4: Star(r0)            ΓÇö 2 bytes (offset 9) ΓÇö catch handler
+        //   5: Ldar(r0)            ΓÇö 2 bytes (offset 11)
+        //   6: Return              ΓÇö 1 byte  (offset 13)
         let instrs = vec![
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
@@ -13254,7 +15811,7 @@ mod tests {
         );
     }
 
-    /// `try { (42)(); } catch(e) { return e.name; }` — catches a TypeError
+    /// `try { (42)(); } catch(e) { return e.name; }` ΓÇö catches a TypeError
     /// thrown by the engine as a proper `JsValue::Error` with `.name` property.
     #[test]
     fn test_try_catch_catches_type_error_via_generator() {
@@ -13274,9 +15831,9 @@ mod tests {
         assert_eq!(result, JsValue::String("TypeError".to_string().into()));
     }
 
-    // ── Throw any value type ────────────────────────────────────────────────
+    // ΓöÇΓöÇ Throw any value type ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
-    /// `throw 42` — catch receives a number.
+    /// `throw 42` ΓÇö catch receives a number.
     #[test]
     fn test_throw_number_caught() {
         use crate::bytecode::bytecode_generator::BytecodeGenerator;
@@ -13290,7 +15847,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(42));
     }
 
-    /// `throw "message"` — catch receives a string.
+    /// `throw "message"` ΓÇö catch receives a string.
     #[test]
     fn test_throw_string_caught() {
         use crate::bytecode::bytecode_generator::BytecodeGenerator;
@@ -13304,7 +15861,7 @@ mod tests {
         assert_eq!(result, JsValue::String("message".to_string().into()));
     }
 
-    /// `throw new Error("msg")` — catch receives an Error object.
+    /// `throw new Error("msg")` ΓÇö catch receives an Error object.
     #[test]
     fn test_throw_error_object_caught() {
         use crate::bytecode::bytecode_generator::BytecodeGenerator;
@@ -13320,7 +15877,7 @@ mod tests {
         assert_eq!(result, JsValue::String("msg".to_string().into()));
     }
 
-    /// `throw {custom: true}` — catch receives a plain object.
+    /// `throw {custom: true}` ΓÇö catch receives a plain object.
     #[test]
     fn test_throw_object_caught() {
         use crate::bytecode::bytecode_generator::BytecodeGenerator;
@@ -13334,9 +15891,9 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
-    // ── Finally edge cases ──────────────────────────────────────────────────
+    // ΓöÇΓöÇ Finally edge cases ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
-    /// `try { return 1; } finally { ran = true; }` — finally runs even after
+    /// `try { return 1; } finally { ran = true; }` ΓÇö finally runs even after
     /// return in try.
     #[test]
     fn test_try_finally_runs_after_return_in_try() {
@@ -13355,7 +15912,7 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
-    /// `try { throw 1; } catch(e) { throw e + 1; }` — re-throw from catch
+    /// `try { throw 1; } catch(e) { throw e + 1; }` ΓÇö re-throw from catch
     /// propagates as `JsException`.
     #[test]
     fn test_rethrow_from_catch_propagates() {
@@ -13373,7 +15930,7 @@ mod tests {
         );
     }
 
-    /// `try { throw 3; } catch(e) { } finally { ran = true }` — catch +
+    /// `try { throw 3; } catch(e) { } finally { ran = true }` ΓÇö catch +
     /// finally both run on exception path.
     #[test]
     fn test_try_catch_finally_exception_path() {
@@ -13389,7 +15946,7 @@ mod tests {
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
         let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         let result = Interpreter::run(&mut frame).unwrap();
-        // catch sets ran = 3, finally adds 10 → 13
+        // catch sets ran = 3, finally adds 10 ΓåÆ 13
         assert_eq!(result, JsValue::Smi(13));
     }
 
@@ -13451,7 +16008,7 @@ mod tests {
         assert_eq!(result, JsValue::String("boom".to_string().into()));
     }
 
-    // ── Generators (SuspendGenerator / ResumeGenerator) ─────────────────────
+    // ΓöÇΓöÇ Generators (SuspendGenerator / ResumeGenerator) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     /// Helper: encode `Register(0)` as the generator-register operand.
     const GEN_REG: Operand = Operand::Register(0);
@@ -13464,13 +16021,13 @@ mod tests {
     ///
     /// ```text
     /// [0] LdaSmi 1
-    /// [1] SuspendGenerator r0 r0 0 0   ← yield 1, resume_pc = 2
-    /// [2] ResumeGenerator  r0 r0 0     ← restore (nop), acc = next's arg
+    /// [1] SuspendGenerator r0 r0 0 0   ΓåÉ yield 1, resume_pc = 2
+    /// [2] ResumeGenerator  r0 r0 0     ΓåÉ restore (nop), acc = next's arg
     /// [3] LdaSmi 2
-    /// [4] SuspendGenerator r0 r0 0 1   ← yield 2, resume_pc = 5
+    /// [4] SuspendGenerator r0 r0 0 1   ΓåÉ yield 2, resume_pc = 5
     /// [5] ResumeGenerator  r0 r0 0
     /// [6] LdaUndefined
-    /// [7] Return                        ← done
+    /// [7] Return                        ΓåÉ done
     /// ```
     fn gen_bytecode_yield_1_yield_2() -> BytecodeArray {
         let instrs = vec![
@@ -13518,17 +16075,17 @@ mod tests {
         let ba = gen_bytecode_yield_1_yield_2();
         let gs = GeneratorState::new(Rc::new(ba));
 
-        // First .next() → yields 1
+        // First .next() ΓåÆ yields 1
         let step1 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 1 ok");
         assert_eq!(step1, GeneratorStep::Yield(JsValue::Smi(1)));
         assert_eq!(gs.borrow().status, GeneratorStatus::SuspendedAtYield);
 
-        // Second .next() → yields 2
+        // Second .next() ΓåÆ yields 2
         let step2 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 2 ok");
         assert_eq!(step2, GeneratorStep::Yield(JsValue::Smi(2)));
         assert_eq!(gs.borrow().status, GeneratorStatus::SuspendedAtYield);
 
-        // Third .next() → done, returns undefined
+        // Third .next() ΓåÆ done, returns undefined
         let step3 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 3 ok");
         assert_eq!(step3, GeneratorStep::Return(JsValue::Undefined));
         assert_eq!(gs.borrow().status, GeneratorStatus::Completed);
@@ -13547,13 +16104,13 @@ mod tests {
         //
         // Bytecode:
         //   [0] LdaSmi 10
-        //   [1] SuspendGenerator r0 r0 0 0   ← yield 10, resume_pc=2
-        //   [2] ResumeGenerator  r0 r0 0      ← acc = sent_value
-        //   [3] Star r1                       ← x = sent_value
+        //   [1] SuspendGenerator r0 r0 0 0   ΓåÉ yield 10, resume_pc=2
+        //   [2] ResumeGenerator  r0 r0 0      ΓåÉ acc = sent_value
+        //   [3] Star r1                       ΓåÉ x = sent_value
         //   [4] LdaSmi 1
-        //   [5] Star r2                       ← save 1 to r2
-        //   [6] Ldar r1                       ← acc = x
-        //   [7] Add r2 slot0                  ← acc = x + 1
+        //   [5] Star r2                       ΓåÉ save 1 to r2
+        //   [6] Ldar r1                       ΓåÉ acc = x
+        //   [7] Add r2 slot0                  ΓåÉ acc = x + 1
         //   [8] Return
         let instrs = vec![
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(10)]),
@@ -13585,16 +16142,16 @@ mod tests {
         let ba = make_bytecode(instrs, 3, 0); // r0, r1, r2
         let gs = GeneratorState::new(Rc::new(ba));
 
-        // First .next() → yields 10
+        // First .next() ΓåÆ yields 10
         let step1 = Interpreter::run_generator_step(&gs, JsValue::Undefined).expect("step 1 ok");
         assert_eq!(step1, GeneratorStep::Yield(JsValue::Smi(10)));
 
-        // Second .next(5) → sends 5 as the yield result; function returns 5 + 1 = 6
+        // Second .next(5) ΓåÆ sends 5 as the yield result; function returns 5 + 1 = 6
         let step2 = Interpreter::run_generator_step(&gs, JsValue::Smi(5)).expect("step 2 ok");
         assert_eq!(step2, GeneratorStep::Return(JsValue::Smi(6)));
     }
 
-    // ── Async / Await (desugared to generator) ───────────────────────────────
+    // ΓöÇΓöÇ Async / Await (desugared to generator) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     /// Test that async/await semantics can be modelled as a generator.
     ///
@@ -13607,8 +16164,8 @@ mod tests {
     #[test]
     fn test_async_function_as_generator() {
         // Bytecode (same shape as test_generator_send_value, different constants):
-        //   yield 42            ← models `await Promise.resolve(42)`
-        //   acc = sent_value    ← models promise resolution
+        //   yield 42            ΓåÉ models `await Promise.resolve(42)`
+        //   acc = sent_value    ΓåÉ models promise resolution
         //   return acc + 1
         let instrs = vec![
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
@@ -13651,7 +16208,7 @@ mod tests {
         assert_eq!(step2, GeneratorStep::Return(JsValue::Smi(8)));
     }
 
-    // ── GetGeneratorState / SetGeneratorState ────────────────────────────────
+    // ΓöÇΓöÇ GetGeneratorState / SetGeneratorState ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_get_generator_state_initial() {
@@ -13663,7 +16220,7 @@ mod tests {
         let ba = make_bytecode(instrs, 1, 0);
         let gs = GeneratorState::new(Rc::new(ba.clone()));
 
-        // Attach generator state and run one step (not a generator step — direct frame).
+        // Attach generator state and run one step (not a generator step ΓÇö direct frame).
         let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
         frame.generator_state = Some(Rc::clone(&gs));
         let result = Interpreter::run(&mut frame).unwrap();
@@ -13690,7 +16247,7 @@ mod tests {
         assert_eq!(gs.borrow().status, GeneratorStatus::Completed);
     }
 
-    // ── SwitchOnGeneratorState ───────────────────────────────────────────────
+    // ΓöÇΓöÇ SwitchOnGeneratorState ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_switch_on_generator_state_fresh_falls_through() {
@@ -13698,9 +16255,9 @@ mod tests {
         // SwitchOnGeneratorState is a no-op and execution falls through.
         //
         // Bytecode:
-        //   [0] SwitchOnGeneratorState r0   ← fresh: no-op, fall through
+        //   [0] SwitchOnGeneratorState r0   ΓåÉ fresh: no-op, fall through
         //   [1] LdaSmi 99
-        //   [2] Return                      ← should return 99
+        //   [2] Return                      ΓåÉ should return 99
         let instrs = vec![
             Instruction::new_unchecked(Opcode::SwitchOnGeneratorState, vec![GEN_REG]),
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
@@ -13721,11 +16278,11 @@ mod tests {
         // jumps directly to the saved resume_pc, bypassing any code before it.
         //
         // Bytecode:
-        //   [0] SwitchOnGeneratorState r0   ← if resume_pc>0: jump there
-        //   [1] LdaSmi 1                    ← skipped when jumped over
-        //   [2] SuspendGenerator r0 r0 0 0  ← saves resume_pc=3
+        //   [0] SwitchOnGeneratorState r0   ΓåÉ if resume_pc>0: jump there
+        //   [1] LdaSmi 1                    ΓåÉ skipped when jumped over
+        //   [2] SuspendGenerator r0 r0 0 0  ΓåÉ saves resume_pc=3
         //   [3] ResumeGenerator  r0 r0 0
-        //   [4] LdaSmi 2                    ← runs after jump
+        //   [4] LdaSmi 2                    ΓåÉ runs after jump
         //   [5] Return
         let instrs = vec![
             Instruction::new_unchecked(Opcode::SwitchOnGeneratorState, vec![GEN_REG]),
@@ -13766,17 +16323,17 @@ mod tests {
         gs.borrow_mut().status = GeneratorStatus::SuspendedAtYield;
         frame.generator_state = Some(Rc::clone(&gs));
         let result = Interpreter::run(&mut frame).unwrap();
-        // SwitchOnGeneratorState jumped to 3 (ResumeGenerator → no-op),
-        // then LdaSmi 2, then Return → 2.
+        // SwitchOnGeneratorState jumped to 3 (ResumeGenerator ΓåÆ no-op),
+        // then LdaSmi 2, then Return ΓåÆ 2.
         assert_eq!(result, JsValue::Smi(2));
     }
 
-    // ── Tiering: interpreter → baseline JIT ─────────────────────────────────
+    // ΓöÇΓöÇ Tiering: interpreter ΓåÆ baseline JIT ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     /// Build the `add(a, b)` inner bytecode used by tiering tests.
     ///
     /// Implements `function add(a, b) { return a + b; }` where both parameters
-    /// are Smi integers — values the JIT tier can handle natively.
+    /// are Smi integers ΓÇö values the JIT tier can handle natively.
     fn make_add_bytecode() -> BytecodeArray {
         let param0_v: u32 = (-1i32) as u32;
         let param1_v: u32 = (-2i32) as u32;
@@ -13810,7 +16367,7 @@ mod tests {
 
         // Build a tiny outer script that calls `add` once:
         //   r0 = <function>, r1 = arg1, r2 = arg2
-        //   acc = CallAnyReceiver(r0, r1, 2, slot0) → result
+        //   acc = CallAnyReceiver(r0, r1, 2, slot0) ΓåÆ result
         //   Return acc
         let outer_instrs = vec![
             Instruction::new_unchecked(
@@ -13872,7 +16429,7 @@ mod tests {
     }
 
     /// After tiering is triggered the function must continue to return the
-    /// correct result — whether executed by the JIT or the interpreter
+    /// correct result ΓÇö whether executed by the JIT or the interpreter
     /// fallback.
     #[test]
     fn test_tiering_correct_result_after_jit() {
@@ -13938,11 +16495,11 @@ mod tests {
         //   LdaSmi 2000
         //   Star r1
         //   TestLessThan r1 slot0
-        //   JumpIfFalse → exit
+        //   JumpIfFalse ΓåÆ exit
         //   Ldar r0
         //   Inc slot1
         //   Star r0
-        //   JumpLoop → loop_start
+        //   JumpLoop ΓåÆ loop_start
         // exit:
         //   Ldar r0
         //   Return
@@ -13968,7 +16525,7 @@ mod tests {
                 Opcode::TestLessThan,
                 vec![Operand::Register(r1), Operand::FeedbackSlot(0)],
             ),
-            // [7] if !acc → exit (offset computed below)
+            // [7] if !acc ΓåÆ exit (offset computed below)
             Instruction::new_unchecked(Opcode::JumpIfFalse, vec![Operand::JumpOffset(0)]),
             // [8] acc = r0
             Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(r0)]),
@@ -14056,7 +16613,7 @@ mod tests {
     /// JIT.  The test captures a snapshot before and after triggering
     /// compilation and asserts that the counters increase on x86-64 Unix.
     #[test]
-    #[ignore] // TODO: hangs in CI – JIT stats polling
+    #[ignore] // TODO: hangs in CI ΓÇô JIT stats polling
     fn test_jit_stats_updated_after_compilation() {
         use super::jit_stats;
         use crate::bytecode::bytecode_array::TIERING_THRESHOLD;
@@ -14132,7 +16689,7 @@ mod tests {
     /// The test calls `add(1, 2)` well above the Maglev threshold and then
     /// polls for the Maglev cache to be populated, asserting the correct result.
     #[test]
-    #[ignore] // TODO: hangs in CI – Maglev tiering polling
+    #[ignore] // TODO: hangs in CI ΓÇô Maglev tiering polling
     fn test_maglev_compiled_after_threshold() {
         use super::maglev_stats;
         use crate::bytecode::bytecode_array::MAGLEV_TIERING_THRESHOLD;
@@ -14191,12 +16748,12 @@ mod tests {
             // Poll for Maglev compilation to finish (background thread).
             let timeout = std::time::Duration::from_secs(5);
             let start = std::time::Instant::now();
-            while inner_ba.try_get_maglev_jit_code().is_none() && start.elapsed() < timeout {
+            while !inner_ba.has_maglev_jit_code() && start.elapsed() < timeout {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
 
             assert!(
-                inner_ba.try_get_maglev_jit_code().is_some(),
+                inner_ba.has_maglev_jit_code(),
                 "Maglev code should be cached after {} calls (threshold={})",
                 call_count,
                 MAGLEV_TIERING_THRESHOLD,
@@ -14219,7 +16776,7 @@ mod tests {
     /// After the Maglev tier is installed the function must continue to return
     /// the correct result for all argument combinations.
     #[test]
-    #[ignore] // TODO: hangs in CI – Maglev tier-up polling
+    #[ignore] // TODO: hangs in CI ΓÇô Maglev tier-up polling
     fn test_maglev_correct_result_after_tier_up() {
         use crate::bytecode::bytecode_array::MAGLEV_TIERING_THRESHOLD;
 
@@ -14408,7 +16965,7 @@ mod tests {
         }
     }
 
-    // ── TypeOf ───────────────────────────────────────────────────────────────
+    // ΓöÇΓöÇ TypeOf ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_typeof_undefined() {
@@ -14483,11 +17040,11 @@ mod tests {
         assert_eq!(result, JsValue::String("string".to_owned().into()));
     }
 
-    // ── TestTypeOf ───────────────────────────────────────────────────────────
+    // ΓöÇΓöÇ TestTypeOf ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_testtypeof_number_match() {
-        // TestTypeOf flag=0 (number) on a Smi → true
+        // TestTypeOf flag=0 (number) on a Smi ΓåÆ true
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(7)]),
@@ -14502,7 +17059,7 @@ mod tests {
 
     #[test]
     fn test_testtypeof_number_mismatch() {
-        // TestTypeOf flag=0 (number) on undefined → false
+        // TestTypeOf flag=0 (number) on undefined ΓåÆ false
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaUndefined, vec![]),
@@ -14547,7 +17104,7 @@ mod tests {
 
     #[test]
     fn test_testtypeof_object_for_null() {
-        // TestTypeOf flag=7 (object) on null → true (typeof null === "object")
+        // TestTypeOf flag=7 (object) on null ΓåÆ true (typeof null === "object")
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaNull, vec![]),
@@ -14562,8 +17119,8 @@ mod tests {
 
     #[test]
     fn test_testtypeof_undefined_for_thehole() {
-        // TestTypeOf flag=5 (undefined) on TheHole → true
-        // Consistent with TypeOf which maps TheHole → "undefined".
+        // TestTypeOf flag=5 (undefined) on TheHole ΓåÆ true
+        // Consistent with TypeOf which maps TheHole ΓåÆ "undefined".
         let result = run_with_acc_and_regs(
             JsValue::TheHole,
             &[],
@@ -14576,7 +17133,7 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
-    // ── ToNumber ─────────────────────────────────────────────────────────────
+    // ΓöÇΓöÇ ToNumber ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_to_number_from_string() {
@@ -14632,7 +17189,7 @@ mod tests {
         }
     }
 
-    // ── ToString ─────────────────────────────────────────────────────────────
+    // ΓöÇΓöÇ ToString ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_to_string_from_smi() {
@@ -14676,7 +17233,7 @@ mod tests {
         assert_eq!(result, JsValue::String("null".to_string().into()));
     }
 
-    // ── ToBoolean ────────────────────────────────────────────────────────────
+    // ΓöÇΓöÇ ToBoolean ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_to_boolean_from_zero() {
@@ -14720,7 +17277,7 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(false));
     }
 
-    // ── ToObject ─────────────────────────────────────────────────────────────
+    // ΓöÇΓöÇ ToObject ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_to_object_null_throws() {
@@ -14750,7 +17307,7 @@ mod tests {
 
     #[test]
     fn test_to_object_smi_wrapper() {
-        // Smi primitives are wrapped in a PlainObject per ECMAScript §7.1.18.
+        // Smi primitives are wrapped in a PlainObject per ECMAScript ┬º7.1.18.
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
@@ -14770,7 +17327,7 @@ mod tests {
         }
     }
 
-    // ── ToName ───────────────────────────────────────────────────────────────
+    // ΓöÇΓöÇ ToName ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_to_name_from_smi() {
@@ -14811,7 +17368,7 @@ mod tests {
         assert_eq!(result, JsValue::String("hello".to_string().into()));
     }
 
-    // ── Negate ───────────────────────────────────────────────────────────────
+    // ΓöÇΓöÇ Negate ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_negate_positive() {
@@ -14858,7 +17415,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(3));
     }
 
-    // ── BitwiseNot ───────────────────────────────────────────────────────────
+    // ΓöÇΓöÇ BitwiseNot ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_bitwise_not_zero() {
@@ -14902,7 +17459,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(0));
     }
 
-    // ── BitwiseOr / BitwiseAnd / BitwiseXor (register) ──────────────────────
+    // ΓöÇΓöÇ BitwiseOr / BitwiseAnd / BitwiseXor (register) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_bitwise_or() {
@@ -14950,7 +17507,7 @@ mod tests {
         assert_eq!(arith_op(5, 5, Opcode::BitwiseXor).unwrap(), JsValue::Smi(0));
     }
 
-    // ── ShiftLeft / ShiftRight / ShiftRightLogical (register) ───────────────
+    // ΓöÇΓöÇ ShiftLeft / ShiftRight / ShiftRightLogical (register) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_shift_left() {
@@ -14983,12 +17540,12 @@ mod tests {
             arith_op(16, 2, Opcode::ShiftRightLogical).unwrap(),
             JsValue::Smi(4)
         );
-        // -1 >>> 0 = 4294967295 (0xFFFFFFFF as u32, doesn't fit Smi → HeapNumber)
+        // -1 >>> 0 = 4294967295 (0xFFFFFFFF as u32, doesn't fit Smi ΓåÆ HeapNumber)
         let result = arith_op(-1, 0, Opcode::ShiftRightLogical).unwrap();
         assert_eq!(result, JsValue::HeapNumber(4294967295.0));
     }
 
-    // ── Exp (register) ──────────────────────────────────────────────────────
+    // ΓöÇΓöÇ Exp (register) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_exp() {
@@ -15000,7 +17557,7 @@ mod tests {
         assert_eq!(arith_op(5, 1, Opcode::Exp).unwrap(), JsValue::Smi(5));
     }
 
-    // ── Smi immediate variants ──────────────────────────────────────────────
+    // ΓöÇΓöÇ Smi immediate variants ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     /// Helper: evaluate `acc <op> imm` using the Smi immediate pattern.
     fn smi_op(acc: i32, imm: i32, op: Opcode) -> StatorResult<JsValue> {
@@ -15117,7 +17674,7 @@ mod tests {
         assert_eq!(smi_op(10, 3, Opcode::ModSmi).unwrap(), JsValue::Smi(1));
     }
 
-    // ── Keyed Property Access ────────────────────────────────────────────────
+    // ΓöÇΓöÇ Keyed Property Access ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     /// Helper: create a PlainObject from key-value pairs.
     fn make_plain_object(pairs: Vec<(&str, JsValue)>) -> JsValue {
@@ -15157,7 +17714,7 @@ mod tests {
             keyed_load(&arr, &JsValue::Smi(2)).unwrap(),
             JsValue::Smi(30)
         );
-        // Out-of-bounds → undefined
+        // Out-of-bounds ΓåÆ undefined
         assert_eq!(
             keyed_load(&arr, &JsValue::Smi(5)).unwrap(),
             JsValue::Undefined
@@ -15174,7 +17731,7 @@ mod tests {
         );
     }
 
-    // ── Prototype chain tests ────────────────────────────────────────────
+    // ΓöÇΓöÇ Prototype chain tests ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_proto_lookup_own_property() {
@@ -15183,7 +17740,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_proto_lookup_inherited_property() {
         let parent = make_plain_object(vec![("inherited", JsValue::Smi(99))]);
         let child = make_plain_object(vec![("own", JsValue::Smi(1)), ("__proto__", parent)]);
@@ -15204,7 +17761,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_proto_lookup_multi_level_chain() {
         let grandparent = make_plain_object(vec![("deep", JsValue::String("gp".into()))]);
         let parent = make_plain_object(vec![
@@ -15244,6 +17801,38 @@ mod tests {
     }
 
     #[test]
+    fn test_proto_lookup_cache_invalidates_after_proto_mutation() {
+        clear_interpreter_state();
+        let parent = make_plain_object(vec![("x", JsValue::Smi(1))]);
+        let child = make_plain_object(vec![("__proto__", parent.clone())]);
+        assert_eq!(proto_lookup(&child, "x"), JsValue::Smi(1));
+        let JsValue::PlainObject(parent_map) = parent else {
+            panic!("expected plain object");
+        };
+        parent_map
+            .borrow_mut()
+            .insert("x".to_string(), JsValue::Smi(2));
+        assert_eq!(proto_lookup(&child, "x"), JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_proto_lookup_cache_invalidates_after_proto_replacement() {
+        clear_interpreter_state();
+        let first_parent = make_plain_object(vec![("x", JsValue::Smi(1))]);
+        let second_parent = make_plain_object(vec![("x", JsValue::Smi(2))]);
+        let child = make_plain_object(vec![("__proto__", first_parent)]);
+        assert_eq!(proto_lookup(&child, "x"), JsValue::Smi(1));
+        let JsValue::PlainObject(child_map_rc) = child.clone() else {
+            panic!("expected plain object");
+        };
+        let mut child_map = child_map_rc.borrow_mut();
+        child_map.remove("__proto__");
+        child_map.insert("__proto__".to_string(), second_parent);
+        drop(child_map);
+        assert_eq!(proto_lookup(&child, "x"), JsValue::Smi(2));
+    }
+
+    #[test]
     #[ignore] // TODO: proto chain keyed load regression
     fn test_keyed_load_walks_proto_chain() {
         let parent = make_plain_object(vec![("greet", JsValue::String("hello".into()))]);
@@ -15263,7 +17852,7 @@ mod tests {
             keyed_load(&s, &JsValue::Smi(4)).unwrap(),
             JsValue::String("o".to_string().into())
         );
-        // Out-of-bounds → undefined
+        // Out-of-bounds ΓåÆ undefined
         assert_eq!(
             keyed_load(&s, &JsValue::Smi(10)).unwrap(),
             JsValue::Undefined
@@ -15569,7 +18158,7 @@ mod tests {
         assert_eq!(to_array_index(&JsValue::Undefined), None);
     }
 
-    // ── TestInstanceOf ───────────────────────────────────────────────────────
+    // ΓöÇΓöÇ TestInstanceOf ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     /// Helper: build bytecode from `instrs` (plus a trailing `Return`),
     /// create a frame with `frame_size` register slots, pre-set the
@@ -15605,7 +18194,7 @@ mod tests {
 
     #[test]
     fn test_test_instance_of_non_callable_throws_type_error() {
-        // §7.3.21: RHS of instanceof must be callable, else TypeError.
+        // ┬º7.3.21: RHS of instanceof must be callable, else TypeError.
         // acc = Smi(42), constructor in r0 = Smi(0) (not callable)
         let result = run_with_acc_and_regs_result(
             JsValue::Smi(42),
@@ -15661,7 +18250,7 @@ mod tests {
 
     #[test]
     fn test_test_instance_of_no_match() {
-        // Two different prototypes — should return false.
+        // Two different prototypes ΓÇö should return false.
         let proto_a = Rc::new(RefCell::new(PropertyMap::new()));
         let proto_b = Rc::new(RefCell::new(PropertyMap::new()));
 
@@ -15690,11 +18279,11 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(false));
     }
 
-    // ── TestIn ───────────────────────────────────────────────────────────────
+    // ΓöÇΓöÇ TestIn ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_test_in_plain_object_existing_key() {
-        // "x" in { x: 1 } → true
+        // "x" in { x: 1 } ΓåÆ true
         let mut map = PropertyMap::new();
         map.insert("x".to_string(), JsValue::Smi(1));
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
@@ -15713,7 +18302,7 @@ mod tests {
 
     #[test]
     fn test_test_in_plain_object_missing_key() {
-        // "y" in { x: 1 } → false
+        // "y" in { x: 1 } ΓåÆ false
         let mut map = PropertyMap::new();
         map.insert("x".to_string(), JsValue::Smi(1));
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
@@ -15732,7 +18321,7 @@ mod tests {
 
     #[test]
     fn test_test_in_array_valid_index() {
-        // 1 in [10, 20, 30] → true
+        // 1 in [10, 20, 30] ΓåÆ true
         let arr = JsValue::new_array(vec![JsValue::Smi(10), JsValue::Smi(20), JsValue::Smi(30)]);
 
         let result = run_with_acc_and_regs(
@@ -15749,7 +18338,7 @@ mod tests {
 
     #[test]
     fn test_test_in_array_out_of_bounds() {
-        // 5 in [10, 20, 30] → false
+        // 5 in [10, 20, 30] ΓåÆ false
         let arr = JsValue::new_array(vec![JsValue::Smi(10), JsValue::Smi(20), JsValue::Smi(30)]);
 
         let result = run_with_acc_and_regs(
@@ -15766,7 +18355,7 @@ mod tests {
 
     #[test]
     fn test_test_in_array_length_key() {
-        // "length" in [10, 20] → true
+        // "length" in [10, 20] ΓåÆ true
         let arr = JsValue::new_array(vec![JsValue::Smi(10), JsValue::Smi(20)]);
 
         let result = run_with_acc_and_regs(
@@ -15783,7 +18372,7 @@ mod tests {
 
     #[test]
     fn test_test_in_non_object() {
-        // "x" in 42 → TypeError (non-object target per spec)
+        // "x" in 42 ΓåÆ TypeError (non-object target per spec)
         let mut all = vec![Instruction::new_unchecked(
             Opcode::TestIn,
             vec![Operand::Register(0), Operand::FeedbackSlot(0)],
@@ -15797,11 +18386,11 @@ mod tests {
         assert!(result.is_err(), "expected TypeError for `in` on non-object");
     }
 
-    // ── CreateEmptyArrayLiteral + StaInArrayLiteral ─────────────────────────
+    // ΓöÇΓöÇ CreateEmptyArrayLiteral + StaInArrayLiteral ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_create_empty_array_literal() {
-        // CreateEmptyArrayLiteral [slot=0] → acc = [] (PlainObject with length=0)
+        // CreateEmptyArrayLiteral [slot=0] ΓåÆ acc = [] (PlainObject with length=0)
         // Return
         let ba = make_bytecode_with_pool(
             vec![
@@ -15949,7 +18538,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(42));
     }
 
-    // ── DefineNamedOwnProperty ──────────────────────────────────────────────
+    // ΓöÇΓöÇ DefineNamedOwnProperty ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_define_named_own_property() {
@@ -16045,7 +18634,7 @@ mod tests {
         }
     }
 
-    // ── DefineKeyedOwnProperty ──────────────────────────────────────────────
+    // ΓöÇΓöÇ DefineKeyedOwnProperty ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_define_keyed_own_property() {
@@ -16095,7 +18684,7 @@ mod tests {
         }
     }
 
-    // ── CreateRegExpLiteral ─────────────────────────────────────────────────
+    // ΓöÇΓöÇ CreateRegExpLiteral ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_create_regexp_literal() {
@@ -16241,11 +18830,11 @@ mod tests {
         }
     }
 
-    // ── CreateArrayLiteral / CreateObjectLiteral stubs ──────────────────────
+    // ΓöÇΓöÇ CreateArrayLiteral / CreateObjectLiteral stubs ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_create_array_literal_stub() {
-        // CreateArrayLiteral [idx=0, slot=0, flags=0] → empty array-like
+        // CreateArrayLiteral [idx=0, slot=0, flags=0] ΓåÆ empty array-like
         let ba = make_bytecode_with_pool(
             vec![
                 Instruction::new_unchecked(
@@ -16272,8 +18861,35 @@ mod tests {
     }
 
     #[test]
+    fn test_create_array_literal_uses_capacity_hint() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::CreateArrayLiteral,
+                    vec![
+                        Operand::ConstantPoolIdx(0),
+                        Operand::FeedbackSlot(0),
+                        Operand::Flag(4),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::Undefined],
+            0,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        if let JsValue::Array(items) = &result {
+            assert!(items.borrow().capacity() >= 4);
+        } else {
+            panic!("expected Array, got {result:?}");
+        }
+    }
+
+    #[test]
     fn test_create_object_literal_stub() {
-        // CreateObjectLiteral [idx=0, slot=0, flags=0] → empty object
+        // CreateObjectLiteral [idx=0, slot=0, flags=0] ΓåÆ empty object
         let ba = make_bytecode_with_pool(
             vec![
                 Instruction::new_unchecked(
@@ -16299,7 +18915,7 @@ mod tests {
         }
     }
 
-    // ── Array-like PlainObject keyed access ─────────────────────────────────
+    // ΓöÇΓöÇ Array-like PlainObject keyed access ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_keyed_load_on_array_like_plain_object() {
@@ -16422,7 +19038,107 @@ mod tests {
         assert_eq!(result, JsValue::Smi(3));
     }
 
-    // ── PlainObject array iteration via GetIterator ─────────────────────────
+    #[test]
+    fn test_lda_named_property_array_length_fast_path() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::LdaNamedProperty,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstantPoolIdx(0),
+                        Operand::FeedbackSlot(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![ConstantPoolEntry::String("length".to_string())],
+            1,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
+        frame
+            .write_reg(
+                0,
+                JsValue::new_array(vec![JsValue::Smi(1), JsValue::Smi(2)]),
+            )
+            .unwrap();
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(2));
+    }
+
+    #[test]
+    fn test_sta_keyed_property_array_gap_fills_the_hole() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::CreateEmptyArrayLiteral,
+                    vec![Operand::FeedbackSlot(0)],
+                ),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(2)]),
+                Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+                Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(99)]),
+                Instruction::new_unchecked(
+                    Opcode::StaKeyedProperty,
+                    vec![
+                        Operand::Register(0),
+                        Operand::Register(1),
+                        Operand::FeedbackSlot(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Ldar, vec![Operand::Register(0)]),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![],
+            2,
+            0,
+        );
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
+        let result = Interpreter::run(&mut frame).unwrap();
+        if let JsValue::Array(items) = result {
+            let borrow = items.borrow();
+            assert_eq!(
+                borrow.as_slice(),
+                &[JsValue::TheHole, JsValue::TheHole, JsValue::Smi(99)]
+            );
+        } else {
+            panic!("expected Array, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_call_undefined_receiver1_fast_array_push() {
+        let ba = make_bytecode_with_pool(
+            vec![
+                Instruction::new_unchecked(
+                    Opcode::CallUndefinedReceiver1,
+                    vec![
+                        Operand::Register(0),
+                        Operand::Register(1),
+                        Operand::FeedbackSlot(0),
+                    ],
+                ),
+                Instruction::new_unchecked(Opcode::Return, vec![]),
+            ],
+            vec![],
+            2,
+            0,
+        );
+        let array = JsValue::new_array(vec![]);
+        let push = make_fast_array_method(&array, "push", 1);
+        let mut frame = InterpreterFrame::new(Rc::new(ba), vec![]);
+        frame.write_reg(0, push).unwrap();
+        frame.write_reg(1, JsValue::Smi(7)).unwrap();
+        let result = Interpreter::run(&mut frame).unwrap();
+        assert_eq!(result, JsValue::Smi(1));
+        let JsValue::Array(items) = array else {
+            panic!("expected Array");
+        };
+        assert_eq!(&*items.borrow(), &[JsValue::Smi(7)]);
+    }
+
+    // ΓöÇΓöÇ PlainObject array iteration via GetIterator ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_plain_object_to_array_items() {
@@ -16443,7 +19159,7 @@ mod tests {
         assert_eq!(items[2], JsValue::Boolean(true));
     }
 
-    // ── For-in bytecode-level tests ─────────────────────────────────────────
+    // ΓöÇΓöÇ For-in bytecode-level tests ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     /// Low-level test: ForInEnumerate + ForInPrepare + ForInNext + ForInStep +
     /// JumpIfForInDone working together to iterate over the keys of a
@@ -16486,10 +19202,10 @@ mod tests {
                     Operand::FeedbackSlot(0),
                 ],
             ),
-            //  6: ForInEnumerate r0 → acc = keys array
+            //  6: ForInEnumerate r0 ΓåÆ acc = keys array
             Instruction::new_unchecked(Opcode::ForInEnumerate, vec![Operand::Register(0)]),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
-            //  8: ForInPrepare r1, slot → acc = length
+            //  8: ForInPrepare r1, slot ΓåÆ acc = length
             Instruction::new_unchecked(
                 Opcode::ForInPrepare,
                 vec![Operand::Register(1), Operand::FeedbackSlot(0)],
@@ -16501,7 +19217,7 @@ mod tests {
             // 12: count = 0
             Instruction::new_unchecked(Opcode::LdaZero, vec![]),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(5)]),
-            // 14: loop_start — JumpIfForInDone [offset, r3(index), r2(length)]
+            // 14: loop_start ΓÇö JumpIfForInDone [offset, r3(index), r2(length)]
             //     If done, jump to instruction 21 (Return).  The offset will
             //     be resolved by the encoder/decoder, but in raw instructions
             //     we encode byte offsets.  We'll use `compile_and_run` for a
@@ -16525,7 +19241,7 @@ mod tests {
                 vec![Operand::Immediate(1), Operand::FeedbackSlot(0)],
             ),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(5)]),
-            // 19: ForInStep r3 → acc = index + 1
+            // 19: ForInStep r3 ΓåÆ acc = index + 1
             Instruction::new_unchecked(Opcode::ForInStep, vec![Operand::Register(3)]),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(3)]),
             // 21: Check if index < length manually (since we can't use
@@ -16599,7 +19315,7 @@ mod tests {
             // ForInEnumerate r0
             Instruction::new_unchecked(Opcode::ForInEnumerate, vec![Operand::Register(0)]),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
-            // ForInPrepare r1, slot → acc = length
+            // ForInPrepare r1, slot ΓåÆ acc = length
             Instruction::new_unchecked(
                 Opcode::ForInPrepare,
                 vec![Operand::Register(1), Operand::FeedbackSlot(0)],
@@ -16624,7 +19340,7 @@ mod tests {
     /// Test ForInStep increments the index.
     #[test]
     fn test_for_in_step() {
-        // r0 = 5; ForInStep r0 → acc = 6
+        // r0 = 5; ForInStep r0 ΓåÆ acc = 6
         let instrs = vec![
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
@@ -16635,7 +19351,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(6));
     }
 
-    // ── End-to-end for-in tests ─────────────────────────────────────────────
+    // ΓöÇΓöÇ End-to-end for-in tests ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     /// E2E test: for-in loop collecting keys of a plain object.
     ///
@@ -16943,7 +19659,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(0)); // no iterations
     }
 
-    // ── Context slot opcode tests ────────────────────────────────────────
+    // ΓöÇΓöÇ Context slot opcode tests ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     /// Create a function context, push it, store a value into slot 0 via
     /// StaCurrentContextSlot, then load it back via LdaCurrentContextSlot.
@@ -17001,7 +19717,7 @@ mod tests {
                 Opcode::StaCurrentContextSlot,
                 vec![Operand::ConstantPoolIdx(1)],
             ),
-            // Load slot 0 — should be 10
+            // Load slot 0 ΓÇö should be 10
             Instruction::new_unchecked(
                 Opcode::LdaCurrentContextSlot,
                 vec![Operand::ConstantPoolIdx(0)],
@@ -17016,16 +19732,16 @@ mod tests {
     #[test]
     fn test_lda_sta_context_slot_with_depth() {
         // Build: outer context with 2 slots, inner context chained to it.
-        //   CreateFunctionContext [_, 2]    ; outer with 2 slots → acc
+        //   CreateFunctionContext [_, 2]    ; outer with 2 slots ΓåÆ acc
         //   PushContext r0                  ; install outer
         //   LdaSmi 99
         //   StaCurrentContextSlot [0]      ; outer.slots[0] = 99
         //   Star r1                        ; r1 = 99 (unused, just free reg)
         //   Ldar r0                        ; r0 = saved old ctx (undefined)
-        //   — We need to save the outer ctx ref in a register.
-        //   — Let's approach differently: after PushContext, frame.context holds outer.
-        //   — Then create inner context (which chains to outer), push it.
-        //   — Use LdaContextSlot from r1 (inner) with depth=1 to reach outer.
+        //   ΓÇö We need to save the outer ctx ref in a register.
+        //   ΓÇö Let's approach differently: after PushContext, frame.context holds outer.
+        //   ΓÇö Then create inner context (which chains to outer), push it.
+        //   ΓÇö Use LdaContextSlot from r1 (inner) with depth=1 to reach outer.
 
         // Step 1: create outer context
         let instrs = vec![
@@ -17071,7 +19787,7 @@ mod tests {
             // And frame.context holds the inner context.
             // We can read from r1 (outer) with depth=0 to get outer.slots[0] = 99.
 
-            // LdaContextSlot [r1, slot=0, depth=0] → should load outer.slots[0] = 99
+            // LdaContextSlot [r1, slot=0, depth=0] ΓåÆ should load outer.slots[0] = 99
             Instruction::new_unchecked(
                 Opcode::LdaContextSlot,
                 vec![
@@ -17119,7 +19835,7 @@ mod tests {
             // r1 = outer ctx, frame.context = inner
 
             // Use LdaContextSlot to read from inner (r3) with depth=1, slot=1
-            // This walks inner→parent(outer).slots[1] = 55
+            // This walks innerΓåÆparent(outer).slots[1] = 55
             Instruction::new_unchecked(
                 Opcode::LdaContextSlot,
                 vec![
@@ -17214,7 +19930,7 @@ mod tests {
                 vec![Operand::ConstantPoolIdx(0), Operand::Immediate(3)],
             ),
             Instruction::new_unchecked(Opcode::PushContext, vec![Operand::Register(0)]),
-            // Load slot 2 without writing to it — should be undefined
+            // Load slot 2 without writing to it ΓÇö should be undefined
             Instruction::new_unchecked(
                 Opcode::LdaCurrentContextSlot,
                 vec![Operand::ConstantPoolIdx(2)],
@@ -17278,7 +19994,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(404));
     }
 
-    // ── Error constructor tests ──────────────────────────────────────────────
+    // ΓöÇΓöÇ Error constructor tests ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     /// Helper: build bytecode that loads an error constructor global, calls
     /// `Construct` with a message argument, then loads a named property from
@@ -17304,11 +20020,11 @@ mod tests {
                 Opcode::LdaGlobal,
                 vec![Operand::ConstantPoolIdx(0), Operand::FeedbackSlot(0)],
             ),
-            // Star r0 — store constructor in r0
+            // Star r0 ΓÇö store constructor in r0
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
             // LdaConstant [message_idx=1]
             Instruction::new_unchecked(Opcode::LdaConstant, vec![Operand::ConstantPoolIdx(1)]),
-            // Star r1 — store message argument in r1
+            // Star r1 ΓÇö store message argument in r1
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
             // Construct [ctor=r0, args_start=r1, arg_count=1, feedback_slot=0]
             Instruction::new_unchecked(
@@ -17320,7 +20036,7 @@ mod tests {
                     Operand::FeedbackSlot(0),
                 ],
             ),
-            // Star r2 — store constructed error in r2
+            // Star r2 ΓÇö store constructed error in r2
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(2)]),
             // LdaNamedProperty [obj=r2, prop_name_idx=2, feedback_slot=0]
             Instruction::new_unchecked(
@@ -17417,7 +20133,7 @@ mod tests {
 
     #[test]
     fn test_new_error_no_message() {
-        // Construct Error() with no arguments — message should be empty string.
+        // Construct Error() with no arguments ΓÇö message should be empty string.
         let pool = vec![
             ConstantPoolEntry::String("Error".to_string()),
             ConstantPoolEntry::String("message".to_string()),
@@ -17594,7 +20310,7 @@ mod tests {
         assert_eq!(proto_lookup(&err, "code"), JsValue::Smi(42));
     }
 
-    // ── DeletePropertySloppy / DeletePropertyStrict ──────────────────────
+    // ΓöÇΓöÇ DeletePropertySloppy / DeletePropertyStrict ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_delete_property_sloppy_removes_key() {
@@ -17653,7 +20369,7 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
-    // ── CreateRestParameter ─────────────────────────────────────────────
+    // ΓöÇΓöÇ CreateRestParameter ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_create_rest_parameter() {
@@ -17675,7 +20391,7 @@ mod tests {
         }
     }
 
-    // ── CreateMappedArguments / CreateUnmappedArguments ──────────────────
+    // ΓöÇΓöÇ CreateMappedArguments / CreateUnmappedArguments ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_create_mapped_arguments() {
@@ -17734,7 +20450,7 @@ mod tests {
         }
     }
 
-    // ── ThrowReferenceErrorIfHole ───────────────────────────────────────
+    // ΓöÇΓöÇ ThrowReferenceErrorIfHole ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_throw_reference_error_if_hole_fires_on_the_hole() {
@@ -17782,7 +20498,7 @@ mod tests {
 
     #[test]
     fn test_throw_reference_error_if_hole_noop_for_undefined() {
-        // `let x = undefined; x` must NOT throw — undefined is a valid
+        // `let x = undefined; x` must NOT throw ΓÇö undefined is a valid
         // initialised value, distinct from the internal hole sentinel.
         let ba = make_bytecode_with_pool(
             vec![
@@ -17802,7 +20518,7 @@ mod tests {
         assert_eq!(result, JsValue::Undefined);
     }
 
-    // ── ThrowSuperNotCalledIfHole ───────────────────────────────────────
+    // ΓöÇΓöÇ ThrowSuperNotCalledIfHole ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_throw_super_not_called_if_hole() {
@@ -17836,7 +20552,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(1));
     }
 
-    // ── ThrowSuperAlreadyCalledIfNotHole ─────────────────────────────────
+    // ΓöÇΓöÇ ThrowSuperAlreadyCalledIfNotHole ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_throw_super_already_called_if_not_hole() {
@@ -17870,7 +20586,7 @@ mod tests {
         assert_eq!(result, JsValue::TheHole);
     }
 
-    // ── CallRuntime (stub / no-op) ──────────────────────────────────────
+    // ΓöÇΓöÇ CallRuntime (stub / no-op) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_call_runtime_is_noop() {
@@ -17924,7 +20640,7 @@ mod tests {
         );
     }
 
-    // ── StaNamedOwnProperty ─────────────────────────────────────────────
+    // ΓöÇΓöÇ StaNamedOwnProperty ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_sta_named_own_property() {
@@ -18026,7 +20742,7 @@ mod tests {
         // return value and IC metadata here.
     }
 
-    // ── StaLookupSlot ───────────────────────────────────────────────────
+    // ΓöÇΓöÇ StaLookupSlot ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_sta_lookup_slot_stores_in_global_env() {
@@ -18051,7 +20767,7 @@ mod tests {
         );
     }
 
-    // ── LdaLookupSlot ───────────────────────────────────────────────────
+    // ΓöÇΓöÇ LdaLookupSlot ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_lda_lookup_slot_found() {
@@ -18098,7 +20814,7 @@ mod tests {
         assert!(matches!(err, StatorError::ReferenceError(_)));
     }
 
-    // ── LdaLookupSlotInsideTypeof ───────────────────────────────────────
+    // ΓöÇΓöÇ LdaLookupSlotInsideTypeof ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_lda_lookup_slot_inside_typeof_found() {
@@ -18143,7 +20859,7 @@ mod tests {
         assert_eq!(result, JsValue::Undefined);
     }
 
-    // ── LdaLookupContextSlot ────────────────────────────────────────────
+    // ΓöÇΓöÇ LdaLookupContextSlot ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_lda_lookup_context_slot_found() {
@@ -18196,7 +20912,7 @@ mod tests {
         assert!(matches!(err, StatorError::ReferenceError(_)));
     }
 
-    // ── LdaLookupContextSlotInsideTypeof ────────────────────────────────
+    // ΓöÇΓöÇ LdaLookupContextSlotInsideTypeof ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_lda_lookup_context_slot_inside_typeof_not_found() {
@@ -18221,7 +20937,7 @@ mod tests {
         assert_eq!(result, JsValue::Undefined);
     }
 
-    // ── LdaLookupGlobalSlot ─────────────────────────────────────────────
+    // ΓöÇΓöÇ LdaLookupGlobalSlot ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_lda_lookup_global_slot_found() {
@@ -18274,7 +20990,7 @@ mod tests {
         assert!(matches!(err, StatorError::ReferenceError(_)));
     }
 
-    // ── LdaLookupGlobalSlotInsideTypeof ─────────────────────────────────
+    // ΓöÇΓöÇ LdaLookupGlobalSlotInsideTypeof ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_lda_lookup_global_slot_inside_typeof_not_found() {
@@ -18299,9 +21015,9 @@ mod tests {
         assert_eq!(result, JsValue::Undefined);
     }
 
-    // ── LdaNamedPropertyFromSuper ───────────────────────────────────────
+    // ΓöÇΓöÇ LdaNamedPropertyFromSuper ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
-    // NOTE: LdaNamedPropertyFromSuper bytecode-level test — super property lookup not fully wired
+    // NOTE: LdaNamedPropertyFromSuper bytecode-level test ΓÇö super property lookup not fully wired
     #[test]
     #[ignore]
     fn test_lda_named_property_from_super() {
@@ -18364,7 +21080,7 @@ mod tests {
         assert_eq!(result, JsValue::Undefined);
     }
 
-    // ── GetTemplateObject ───────────────────────────────────────────────
+    // ΓöÇΓöÇ GetTemplateObject ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_get_template_object() {
@@ -18439,7 +21155,7 @@ mod tests {
         }
     }
 
-    // ── SetPendingMessage ───────────────────────────────────────────────
+    // ΓöÇΓöÇ SetPendingMessage ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_set_pending_message_swaps() {
@@ -18479,7 +21195,7 @@ mod tests {
         assert_eq!(frame.pending_message, JsValue::Smi(2));
     }
 
-    // ── TestReferenceEqual ──────────────────────────────────────────────
+    // ΓöÇΓöÇ TestReferenceEqual ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_test_reference_equal_same_smi() {
@@ -18513,7 +21229,7 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(false));
     }
 
-    // ── TestUndetectable ────────────────────────────────────────────────
+    // ΓöÇΓöÇ TestUndetectable ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_test_undetectable_null() {
@@ -18557,15 +21273,15 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(false));
     }
 
-    // ── JumpIfJSReceiver ────────────────────────────────────────────────
+    // ΓöÇΓöÇ JumpIfJSReceiver ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_jump_if_js_receiver_object_jumps() {
         // Byte layout:
-        //   [0] CreateEmptyObjectLiteral → 1 byte
-        //   [1] JumpIfJSReceiver(2)      → 2 bytes, end=3, target=3+2=5
-        //   [3] LdaSmi(0)               → 2 bytes ← skipped
-        //   [5] Return                  → 1 byte
+        //   [0] CreateEmptyObjectLiteral ΓåÆ 1 byte
+        //   [1] JumpIfJSReceiver(2)      ΓåÆ 2 bytes, end=3, target=3+2=5
+        //   [3] LdaSmi(0)               ΓåÆ 2 bytes ΓåÉ skipped
+        //   [5] Return                  ΓåÆ 1 byte
         let ba = make_bytecode_with_pool(
             vec![
                 Instruction::new_unchecked(Opcode::CreateEmptyObjectLiteral, vec![]),
@@ -18585,10 +21301,10 @@ mod tests {
     #[test]
     fn test_jump_if_js_receiver_primitive_no_jump() {
         // Byte layout:
-        //   [0] LdaSmi(5)               → 2 bytes
-        //   [2] JumpIfJSReceiver(2)      → 2 bytes, end=4, target=4+2=6
-        //   [4] LdaSmi(99)              → 2 bytes
-        //   [6] Return                  → 1 byte
+        //   [0] LdaSmi(5)               ΓåÆ 2 bytes
+        //   [2] JumpIfJSReceiver(2)      ΓåÆ 2 bytes, end=4, target=4+2=6
+        //   [4] LdaSmi(99)              ΓåÆ 2 bytes
+        //   [6] Return                  ΓåÆ 1 byte
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(5)]),
@@ -18602,7 +21318,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(99));
     }
 
-    // ── ToNumeric ───────────────────────────────────────────────────────
+    // ΓöÇΓöÇ ToNumeric ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_to_numeric_from_smi() {
@@ -18649,7 +21365,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(1));
     }
 
-    // ── Wide / ExtraWide prefix opcodes ──────────────────────────────────
+    // ΓöÇΓöÇ Wide / ExtraWide prefix opcodes ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_wide_prefix_never_reaches_dispatch() {
@@ -18671,15 +21387,15 @@ mod tests {
         assert_eq!(result, JsValue::Smi(300));
     }
 
-    // ── Constant-pool jump variants ──────────────────────────────────────
+    // ΓöÇΓöÇ Constant-pool jump variants ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_jump_constant_unconditional() {
         // Bytecode layout:
-        //   [0] JumpConstant(0)  → 2 bytes, end=2, target=2+2=4
-        //   [2] LdaSmi(99)       → 2 bytes
-        //   [4] LdaSmi(42)       → 2 bytes
-        //   [6] Return           → 1 byte
+        //   [0] JumpConstant(0)  ΓåÆ 2 bytes, end=2, target=2+2=4
+        //   [2] LdaSmi(99)       ΓåÆ 2 bytes
+        //   [4] LdaSmi(42)       ΓåÆ 2 bytes
+        //   [6] Return           ΓåÆ 1 byte
         let pool = vec![ConstantPoolEntry::Number(2.0)];
         let instrs = vec![
             Instruction::new_unchecked(Opcode::JumpConstant, vec![Operand::ConstantPoolIdx(0)]),
@@ -18891,7 +21607,7 @@ mod tests {
         assert_eq!(result, JsValue::Undefined);
     }
 
-    // ── Host integration calls ───────────────────────────────────────────
+    // ΓöÇΓöÇ Host integration calls ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_call_js_runtime_noop() {
@@ -18957,7 +21673,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(3));
     }
 
-    // ── CollectTypeProfile ───────────────────────────────────────────────
+    // ΓöÇΓöÇ CollectTypeProfile ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_collect_type_profile_noop() {
@@ -18973,7 +21689,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(10));
     }
 
-    // ── ConstructForwardAllArgs ──────────────────────────────────────────
+    // ΓöÇΓöÇ ConstructForwardAllArgs ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_construct_forward_all_args_native() {
@@ -19066,7 +21782,7 @@ mod tests {
         );
     }
 
-    // ── CreateObjectFromIterable ─────────────────────────────────────────
+    // ΓöÇΓöÇ CreateObjectFromIterable ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_create_object_from_iterable_plain_object() {
@@ -19102,7 +21818,7 @@ mod tests {
 
     #[test]
     fn test_create_object_from_iterable_empty() {
-        // CreateObjectFromIterable with undefined accumulator → empty object.
+        // CreateObjectFromIterable with undefined accumulator ΓåÆ empty object.
         let result = run_bytecode(
             vec![
                 Instruction::new_unchecked(Opcode::LdaUndefined, vec![]),
@@ -19119,7 +21835,7 @@ mod tests {
         }
     }
 
-    // ── Tagged template literal integration tests ───────────────────────
+    // ΓöÇΓöÇ Tagged template literal integration tests ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     /// Compile a JavaScript source string and run it through the interpreter.
     fn compile_source_and_run(src: &str) -> StatorResult<JsValue> {
@@ -19199,7 +21915,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_eval_direct_returns_undefined_for_statement_only_program() {
         assert_script_result(
             "typeof eval('var x = 1; if (x) { }');",
@@ -19250,7 +21966,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_eval_strict_var_declaration_does_not_leak() {
         assert_script_result(
             "function f() { eval('\"use strict\"; var x = 1'); return typeof x; } f();",
@@ -19285,7 +22001,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_eval_direct_invalid_return_throws_syntax_error() {
         assert_script_syntax_error("eval('return 1;');");
     }
@@ -19304,7 +22020,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_eval_direct_this_is_undefined_in_strict_free_function() {
         assert_script_result(
             "function f() { 'use strict'; return eval('this') === undefined; } f();",
@@ -19390,7 +22106,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_function_constructor_body_reads_global_this() {
         assert_script_result(
             "var marker = 8; var f = new Function('return this.marker'); f();",
@@ -19504,7 +22220,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(1));
     }
 
-    // ── Async function execution ──────────────────────────────────────────────
+    // ΓöÇΓöÇ Async function execution ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_async_function_returns_promise() {
@@ -19650,7 +22366,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_promise_resolve_thenable_unwraps() {
         let result =
             compile_source_and_run(r#"Promise.resolve({ then(resolve) { resolve(14); } })"#)
@@ -19716,7 +22432,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_for_await_of_custom_async_iterable() {
         let result = compile_source_and_run(
             r#"async function f() {
@@ -19773,7 +22489,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_generator_return_method() {
         let result = compile_source_and_run(
             "async function* g() { yield 1; yield 2; } async function f() { var it = g(); await it.next(); var r = await it.return(5); return r.value + (r.done ? 1 : 0); } f()",
@@ -19846,7 +22562,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_generator_return_after_completion_keeps_done_true() {
         let result = compile_source_and_run(
             "async function* g() { yield 1; } async function f() { var it = g(); await it.next(); await it.next(); var r = await it.return(7); return r.value + (r.done ? 1 : 0); } f()",
@@ -19856,7 +22572,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_generator_return_awaits_return_argument() {
         let result = compile_source_and_run(
             "async function* g() { yield 1; } async function f() { var it = g(); await it.next(); var r = await it.return(Promise.resolve(6)); return r.value + (r.done ? 1 : 0); } f()",
@@ -19902,7 +22618,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_for_await_of_symbol_async_iterator() {
         let result = compile_source_and_run(
             r#"async function f() {
@@ -19928,7 +22644,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_for_await_of_symbol_iterator_fallback() {
         let result = compile_source_and_run(
             r#"async function f() {
@@ -19954,7 +22670,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_for_await_of_async_iterator_awaits_value_promises() {
         let result = compile_source_and_run(
             r#"async function f() {
@@ -19989,7 +22705,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_for_await_of_break_calls_async_iterator_return() {
         let result = compile_source_and_run(
             r#"async function f() {
@@ -20018,7 +22734,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_for_await_of_break_calls_sync_iterator_return_via_wrapper() {
         let result = compile_source_and_run(
             r#"async function f() {
@@ -20093,7 +22809,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_generator_yield_star_symbol_async_iterator() {
         let result = compile_source_and_run(
             r#"async function* outer() {
@@ -20125,7 +22841,7 @@ mod tests {
         assert_fulfilled_promise_value(result, JsValue::Smi(15));
     }
 
-    // ── Async generator deep conformance tests ────────────────────────────────
+    // ΓöÇΓöÇ Async generator deep conformance tests ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_async_gen_yield_undefined_without_value() {
@@ -20147,9 +22863,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_yield_await_chain() {
-        // yield await p1; yield await p2 — two awaits in sequence.
+        // yield await p1; yield await p2 ΓÇö two awaits in sequence.
         let result = compile_source_and_run(
             "async function* g() { yield await Promise.resolve(3); yield await Promise.resolve(7); } async function f() { var it = g(); var a = await it.next(); var b = await it.next(); return a.value + b.value; } f()",
         )
@@ -20176,7 +22892,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_for_await_break_early() {
         let result = compile_source_and_run(
             "async function* g() { yield 1; yield 2; yield 3; } async function f() { var s = 0; for await (const x of g()) { s = s + x; if (x === 2) break; } return s; } f()",
@@ -20232,7 +22948,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_return_promise_value_is_awaited() {
         // .return(Promise.resolve(X)) should await the promise.
         let result = compile_source_and_run(
@@ -20310,7 +23026,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_return_on_completed_gen() {
         let result = compile_source_and_run(
             "async function* g() { yield 1; } async function f() { var it = g(); await it.next(); await it.next(); var r = await it.return(55); return r.value + (r.done ? 1 : 0); } f()",
@@ -20320,7 +23036,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_throw_on_completed_gen_rejects() {
         let result = compile_source_and_run(
             "async function* g() { yield 1; } async function f() { var it = g(); await it.next(); await it.next(); return await it.throw('late'); } f()",
@@ -20350,7 +23066,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_with_closure_captures() {
         let result = compile_source_and_run(
             r#"function makeGen(start) {
@@ -20370,7 +23086,7 @@ mod tests {
 
     #[test]
     fn test_async_gen_empty_generator() {
-        // Generator with no yields — first next() returns done:true.
+        // Generator with no yields ΓÇö first next() returns done:true.
         let result = compile_source_and_run(
             "async function* g() {} async function f() { var r = await g().next(); return (r.done ? 1 : 0) + (r.value === undefined ? 10 : 0); } f()",
         )
@@ -20390,7 +23106,7 @@ mod tests {
 
     #[test]
     fn test_async_gen_return_promise_inside_body() {
-        // `return Promise.resolve(X)` — the returned promise value is awaited.
+        // `return Promise.resolve(X)` ΓÇö the returned promise value is awaited.
         let result = compile_source_and_run(
             "async function* g() { return Promise.resolve(50); } async function f() { var r = await g().next(); return r.value + (r.done ? 1 : 0); } f()",
         )
@@ -20485,7 +23201,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_with_parameters() {
         let result = compile_source_and_run(
             "async function* g(a, b) { yield a; yield b; yield a + b; } async function f() { var s = 0; for await (const x of g(3, 7)) { s = s + x; } return s; } f()",
@@ -20515,7 +23231,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_async_gen_for_await_with_yield_await() {
         let result = compile_source_and_run(
             "async function* g() { yield await Promise.resolve(5); yield await Promise.resolve(15); } async function f() { var s = 0; for await (const x of g()) { s = s + x; } return s; } f()",
@@ -20524,7 +23240,7 @@ mod tests {
         assert_fulfilled_promise_value(result, JsValue::Smi(20));
     }
 
-    // ── Generator .next()/.return()/.throw() ──────────────────────────────────
+    // ΓöÇΓöÇ Generator .next()/.return()/.throw() ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_generator_next_method() {
@@ -20543,7 +23259,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_generator_return_method() {
         // Generator .return(val) should complete the generator.
         let ba = gen_bytecode_yield_1_yield_2();
@@ -20583,7 +23299,7 @@ mod tests {
     #[ignore] // TODO: generator return on completed regression
     fn test_generator_return_on_completed() {
         // .return(val) on a completed generator returns { value: val, done: true }
-        // per §27.5.3.4 GeneratorResumeAbrupt step 2a.
+        // per ┬º27.5.3.4 GeneratorResumeAbrupt step 2a.
         let ba = gen_bytecode_yield_1_yield_2();
         let gs = GeneratorState::new(Rc::new(ba));
 
@@ -20626,7 +23342,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_generator_not_resumable_after_return() {
         // After .return(), .next() should return { value: undefined, done: true }.
         let ba = gen_bytecode_yield_1_yield_2();
@@ -20658,7 +23374,7 @@ mod tests {
 
     #[test]
     fn test_generator_symbol_iterator_returns_self() {
-        // gen[@@iterator]() must return the generator itself (§27.5.1.2).
+        // gen[@@iterator]() must return the generator itself (┬º27.5.1.2).
         let ba = gen_bytecode_yield_1_yield_2();
         let gs = GeneratorState::new(Rc::new(ba));
         let generator = JsValue::Generator(gs);
@@ -20676,7 +23392,7 @@ mod tests {
 
     #[test]
     fn test_generator_throw_caught_by_try_catch() {
-        // §27.5.3.3 — .throw(err) resumes at the yield inside a try/catch;
+        // ┬º27.5.3.3 ΓÇö .throw(err) resumes at the yield inside a try/catch;
         // the catch block catches the error and execution continues.
         //
         // function* gen() {
@@ -20707,7 +23423,7 @@ mod tests {
         // Advance to first yield.
         Interpreter::run_generator_step(&gs, JsValue::Undefined).unwrap();
 
-        // .throw(err) — no handler, error must propagate.
+        // .throw(err) ΓÇö no handler, error must propagate.
         let result = Interpreter::generator_throw(&gs, JsValue::String("boom".into()));
         assert!(result.is_err(), "generator_throw should propagate error");
         assert_eq!(gs.borrow().status, GeneratorStatus::Completed);
@@ -20730,11 +23446,11 @@ mod tests {
         assert!(result.is_err(), "throw on completed should error");
     }
 
-    // ── Async function (run_async_function) ───────────────────────────────────
+    // ΓöÇΓöÇ Async function (run_async_function) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_run_async_function_simple_return() {
-        // Simulate `async function f() { return 42; }` — no await points.
+        // Simulate `async function f() { return 42; }` ΓÇö no await points.
         let instrs = vec![
             Instruction::new_unchecked(Opcode::SwitchOnGeneratorState, vec![GEN_REG]),
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
@@ -20796,7 +23512,7 @@ mod tests {
 
     #[test]
     fn test_run_async_function_throw_returns_rejected_promise() {
-        // Simulate `async function f() { throw "boom"; }` — the thrown
+        // Simulate `async function f() { throw "boom"; }` ΓÇö the thrown
         // exception should be caught and surfaced as a rejected promise.
         let instrs = vec![
             Instruction::new_unchecked(Opcode::SwitchOnGeneratorState, vec![GEN_REG]),
@@ -20844,7 +23560,7 @@ mod tests {
 
     #[test]
     fn test_js_error_to_rejection_reason_engine_errors() {
-        // Engine-level errors should NOT be converted — they propagate.
+        // Engine-level errors should NOT be converted ΓÇö they propagate.
         assert!(Interpreter::js_error_to_rejection_reason(&StatorError::OutOfMemory).is_none());
         assert!(
             Interpreter::js_error_to_rejection_reason(&StatorError::Internal("bug".into()))
@@ -20852,7 +23568,7 @@ mod tests {
         );
     }
 
-    // ── Tail call optimisation ────────────────────────────────────────────────
+    // ΓöÇΓöÇ Tail call optimisation ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     fn test_tail_call_eval_source(source: &str) -> JsValue {
         crate::builtins::global::global_eval(source).unwrap()
@@ -21017,7 +23733,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_tail_call_varying_argument_counts_strict() {
         test_tail_call_assert_smi(
             "function bounce(n, a, b, c) { \
@@ -21049,7 +23765,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_tail_call_named_function_expression_strict() {
         test_tail_call_assert_smi(
             "var sum = function inner(n, acc) { \
@@ -21062,7 +23778,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_tail_call_arrow_function_strict() {
         test_tail_call_assert_smi(
             "function run(n) { \
@@ -21163,6 +23879,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "debug frames too large for mutual recursion depth"
+    )]
     fn test_tail_call_mutual_recursion_sloppy_small() {
         test_tail_call_assert_bool(
             "function even(n) { \
@@ -21223,7 +23943,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_tail_call_varying_argument_counts_sloppy_small() {
         test_tail_call_assert_smi(
             "function bounce(n, a, b, c) { \
@@ -21236,7 +23956,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_tail_call_named_function_expression_sloppy_small() {
         test_tail_call_assert_smi(
             "var sum = function inner(n, acc) { \
@@ -21247,7 +23967,7 @@ mod tests {
         );
     }
 
-    // ── Class-inheritance conformance ────────────────────────────────────
+    // ΓöÇΓöÇ Class-inheritance conformance ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     /// Basic class construction: `new Foo()` creates an instance with
     /// `this` bound in the constructor.
@@ -21263,9 +23983,9 @@ mod tests {
     }
 
     /// Static methods: `class Foo { static bar() { return 1; } }`
-    /// — `Foo.bar()` should work.
+    /// ΓÇö `Foo.bar()` should work.
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_class_static_method() {
         let result = crate::builtins::global::global_eval(
             "class Foo { static bar() { return 99; } } \
@@ -21275,7 +23995,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(99));
     }
 
-    /// Static class fields: `class Foo { static x = 1; }` — `Foo.x`.
+    /// Static class fields: `class Foo { static x = 1; }` ΓÇö `Foo.x`.
     #[test]
     fn test_class_static_field() {
         let result = crate::builtins::global::global_eval(
@@ -21286,7 +24006,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(7));
     }
 
-    /// Instance fields: `class Foo { x = 1; }` — instance properties
+    /// Instance fields: `class Foo { x = 1; }` ΓÇö instance properties
     /// initialized during construction.
     #[test]
     fn test_class_instance_field() {
@@ -21303,7 +24023,7 @@ mod tests {
     /// `Foo.prototype.__proto__ === Bar.prototype` and
     /// `Foo.__proto__ === Bar` (static inheritance).
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_class_extends_prototype_chain() {
         // Verify that an instance of Child can access Parent prototype methods.
         let result = crate::builtins::global::global_eval(
@@ -21332,7 +24052,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(3));
     }
 
-    /// `new.target` — in constructors, references the constructor
+    /// `new.target` ΓÇö in constructors, references the constructor
     /// being `new`-ed.
     #[test]
     fn test_class_new_target() {
@@ -21348,7 +24068,7 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
-    // ── proto_lookup: Object.prototype valueOf / toLocaleString ───────────
+    // ΓöÇΓöÇ proto_lookup: Object.prototype valueOf / toLocaleString ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_proto_lookup_plain_object_valueof() {
@@ -21366,7 +24086,7 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
-    // ── proto_lookup: Number.prototype.toLocaleString ─────────────────────
+    // ΓöÇΓöÇ proto_lookup: Number.prototype.toLocaleString ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_proto_lookup_smi_tolocalestring() {
@@ -21382,7 +24102,7 @@ mod tests {
         assert_eq!(result, JsValue::String("3.14".into()));
     }
 
-    // ── proto_lookup: __lookupGetter__ / __lookupSetter__ ─────────────────
+    // ΓöÇΓöÇ proto_lookup: __lookupGetter__ / __lookupSetter__ ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_proto_lookup_lookup_getter() {
@@ -21415,7 +24135,7 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
-    // ── proto_lookup: __defineGetter__ / __defineSetter__ ─────────────────
+    // ΓöÇΓöÇ proto_lookup: __defineGetter__ / __defineSetter__ ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_proto_lookup_define_getter() {
@@ -21440,7 +24160,7 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
-    // ── proto_lookup: Function/NativeFunction toLocaleString ──────────────
+    // ΓöÇΓöÇ proto_lookup: Function/NativeFunction toLocaleString ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_proto_lookup_function_tolocalestring() {
@@ -21451,7 +24171,7 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
-    // ── proto_lookup_chain: Object.prototype fallback ─────────────────────
+    // ΓöÇΓöÇ proto_lookup_chain: Object.prototype fallback ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_proto_lookup_chain_tostring_fallback() {
@@ -21488,7 +24208,7 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
-    // —— Comparison with ToPrimitive ————————————————
+    // ΓÇöΓÇö Comparison with ToPrimitive ΓÇöΓÇöΓÇöΓÇöΓÇöΓÇöΓÇöΓÇöΓÇöΓÇöΓÇöΓÇöΓÇöΓÇöΓÇöΓÇö
 
     #[test]
     fn test_js_less_than_with_valueof() {
@@ -21544,7 +24264,7 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(false));
     }
 
-    // ── Constructor property resolution tests ─────────────────────────
+    // ΓöÇΓöÇ Constructor property resolution tests ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     /// `[].constructor` resolves to a callable constructor.
     #[test]
@@ -21606,7 +24326,7 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
-    // ── TypeError on null / undefined property access ────────────────────
+    // ΓöÇΓöÇ TypeError on null / undefined property access ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_null_property_access_throws() {
@@ -21638,7 +24358,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── proto_lookup: String method fast-path tests ──────────────────────
+    // ΓöÇΓöÇ proto_lookup: String method fast-path tests ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_proto_lookup_string_starts_with() {
@@ -21792,7 +24512,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(65));
     }
 
-    // ── proto_lookup: Array method fast-path tests ───────────────────────
+    // ΓöÇΓöÇ proto_lookup: Array method fast-path tests ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_proto_lookup_array_at_positive() {
@@ -21870,7 +24590,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(10));
     }
 
-    // ── proto_lookup: Object method fast-path tests ──────────────────────
+    // ΓöÇΓöÇ proto_lookup: Object method fast-path tests ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_proto_lookup_object_has_own_property() {
@@ -21896,7 +24616,7 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
-    // ── Array join/toString null/undefined handling ─────────────────────────
+    // ΓöÇΓöÇ Array join/toString null/undefined handling ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_array_join_null_undefined() {
@@ -21913,7 +24633,7 @@ mod tests {
         assert_eq!(result, JsValue::String(",".into()));
     }
 
-    // ── Array.prototype.includes — SameValueZero ──────────────────────────────
+    // ΓöÇΓöÇ Array.prototype.includes ΓÇö SameValueZero ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_array_includes_nan() {
@@ -21954,7 +24674,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(3));
     }
 
-    // ── Array.prototype.indexOf — strict equality (NaN !== NaN) ───────────────
+    // ΓöÇΓöÇ Array.prototype.indexOf ΓÇö strict equality (NaN !== NaN) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_array_indexof_nan_not_found() {
@@ -21969,7 +24689,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(-1));
     }
 
-    // ── Array.prototype.splice — returns removed elements ─────────────────────
+    // ΓöÇΓöÇ Array.prototype.splice ΓÇö returns removed elements ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_array_splice_returns_removed() {
@@ -21987,7 +24707,7 @@ mod tests {
         assert_eq!(result, JsValue::Smi(3));
     }
 
-    // ── Array.prototype.every / some — third callback arg ─────────────────────
+    // ΓöÇΓöÇ Array.prototype.every / some ΓÇö third callback arg ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_array_every_short_circuits() {
@@ -22026,7 +24746,7 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(true));
     }
 
-    // ── Array.prototype.fill ──────────────────────────────────────────────────
+    // ΓöÇΓöÇ Array.prototype.fill ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_array_fill_all() {
@@ -22041,7 +24761,7 @@ mod tests {
         assert_eq!(result, JsValue::String("1,4,3".into()));
     }
 
-    // ── Array.prototype.copyWithin ────────────────────────────────────────────
+    // ΓöÇΓöÇ Array.prototype.copyWithin ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_array_copyin_basic() {
@@ -22050,7 +24770,7 @@ mod tests {
         assert_eq!(result, JsValue::String("4,5,3,4,5".into()));
     }
 
-    // ── Boolean.prototype fast-path tests ────────────────────────────────────
+    // ΓöÇΓöÇ Boolean.prototype fast-path tests ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_boolean_to_string() {
@@ -22064,7 +24784,7 @@ mod tests {
         assert_eq!(result, JsValue::Boolean(false));
     }
 
-    // ── String.prototype fast-path edge-case tests ───────────────────────────
+    // ΓöÇΓöÇ String.prototype fast-path edge-case tests ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_string_at_positive() {
@@ -22102,7 +24822,7 @@ mod tests {
         assert_eq!(result, JsValue::String("  x".into()));
     }
 
-    // ── Conformance: typeof ─────────────────────────────────────────────────
+    // ΓöÇΓöÇ Conformance: typeof ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_typeof_number_literal() {
@@ -22154,12 +24874,12 @@ mod tests {
 
     #[test]
     fn test_typeof_undeclared_var_no_throw() {
-        // typeof on an undeclared variable must NOT throw — returns "undefined".
+        // typeof on an undeclared variable must NOT throw ΓÇö returns "undefined".
         let r = crate::builtins::global::global_eval("typeof undeclaredXYZ123").unwrap();
         assert_eq!(r, JsValue::String("undefined".into()));
     }
 
-    // ── Conformance: abstract equality (==) ─────────────────────────────────
+    // ΓöÇΓöÇ Conformance: abstract equality (==) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_eq_null_undefined() {
@@ -22205,7 +24925,7 @@ mod tests {
 
     #[test]
     fn test_eq_boolean_number_coercion() {
-        // true is coerced to 1, then 1 == 1 → true
+        // true is coerced to 1, then 1 == 1 ΓåÆ true
         let r = crate::builtins::global::global_eval("true == 1").unwrap();
         assert_eq!(r, JsValue::Boolean(true));
     }
@@ -22218,12 +24938,12 @@ mod tests {
 
     #[test]
     fn test_eq_boolean_string_coercion() {
-        // true → 1, '1' → 1, so true == '1' is true
+        // true ΓåÆ 1, '1' ΓåÆ 1, so true == '1' is true
         let r = crate::builtins::global::global_eval("true == '1'").unwrap();
         assert_eq!(r, JsValue::Boolean(true));
     }
 
-    // ── Conformance: strict equality (===) ──────────────────────────────────
+    // ΓöÇΓöÇ Conformance: strict equality (===) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_strict_eq_no_coercion() {
@@ -22250,7 +24970,7 @@ mod tests {
         assert_eq!(r, JsValue::Boolean(true));
     }
 
-    // ── Conformance: relational comparisons ─────────────────────────────────
+    // ΓöÇΓöÇ Conformance: relational comparisons ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_less_than_numbers() {
@@ -22266,7 +24986,7 @@ mod tests {
 
     #[test]
     fn test_greater_than_mixed_types() {
-        // '10' > 9 → 10 > 9 → true
+        // '10' > 9 ΓåÆ 10 > 9 ΓåÆ true
         let r = crate::builtins::global::global_eval("'10' > 9").unwrap();
         assert_eq!(r, JsValue::Boolean(true));
     }
@@ -22283,7 +25003,7 @@ mod tests {
         assert_eq!(r, JsValue::Boolean(true));
     }
 
-    // ── Conformance: property access on primitives ──────────────────────────
+    // ΓöÇΓöÇ Conformance: property access on primitives ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_string_length_property() {
@@ -22293,7 +25013,7 @@ mod tests {
 
     #[test]
     fn test_string_length_unicode() {
-        // 'café' has 4 characters; .length must not return byte count (5 in UTF-8)
+        // 'caf├⌐' has 4 characters; .length must not return byte count (5 in UTF-8)
         let r = crate::builtins::global::global_eval("'caf\\u00e9'.length").unwrap();
         assert_eq!(r, JsValue::Smi(4));
     }
@@ -22346,7 +25066,7 @@ mod tests {
         assert_eq!(r, JsValue::String("h".into()));
     }
 
-    // ── Conformance: throw non-Error values ─────────────────────────────────
+    // ΓöÇΓöÇ Conformance: throw non-Error values ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_throw_string_value() {
@@ -22384,7 +25104,7 @@ mod tests {
         assert_eq!(r, JsValue::Undefined);
     }
 
-    // ── Conformance: Object.keys on arrays ──────────────────────────────────
+    // ΓöÇΓöÇ Conformance: Object.keys on arrays ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_object_keys_array() {
@@ -22402,7 +25122,7 @@ mod tests {
         assert_eq!(r, JsValue::Smi(3));
     }
 
-    // ── Conformance: primitive hasOwnProperty ───────────────────────────────
+    // ΓöÇΓöÇ Conformance: primitive hasOwnProperty ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_string_has_own_property_length() {
@@ -22424,7 +25144,7 @@ mod tests {
         let hop = proto_lookup(&b, "hasOwnProperty");
         assert!(matches!(hop, JsValue::NativeFunction(_)));
     }
-    // ── String .length UTF-16 semantics ──────────────────────────────────────────
+    // ΓöÇΓöÇ String .length UTF-16 semantics ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_string_length_ascii() {
@@ -22435,21 +25155,21 @@ mod tests {
     #[test]
     fn test_string_length_bmp_accented() {
         // All BMP characters, each is one UTF-16 code unit.
-        let s = JsValue::String("café".to_string().into());
+        let s = JsValue::String("caf\u{00E9}".to_string().into());
         assert_eq!(proto_lookup(&s, "length"), JsValue::Smi(4));
     }
 
     #[test]
     fn test_string_length_surrogate_pair() {
         // U+1D11E MUSICAL SYMBOL G CLEF encodes as a surrogate pair in UTF-16.
-        let s = JsValue::String("𝄞".to_string().into());
+        let s = JsValue::String("\u{1D11E}".to_string().into());
         assert_eq!(proto_lookup(&s, "length"), JsValue::Smi(2));
     }
 
     #[test]
     fn test_string_length_mixed_bmp_and_surrogate() {
         // a (1) + surrogate pair (2) + b (1) = 4 UTF-16 code units
-        let s = JsValue::String("a𝄞b".to_string().into());
+        let s = JsValue::String("a\u{1D11E}b".to_string().into());
         assert_eq!(proto_lookup(&s, "length"), JsValue::Smi(4));
     }
 
@@ -22461,14 +25181,14 @@ mod tests {
 
     #[test]
     fn test_keyed_load_string_length_utf16() {
-        let s = JsValue::String("𝄞".to_string().into());
+        let s = JsValue::String("\u{1D11E}".to_string().into());
         assert_eq!(
             keyed_load(&s, &JsValue::String("length".to_string().into())).unwrap(),
             JsValue::Smi(2)
         );
     }
 
-    // ── with-statement e2e tests ─────────────────────────────────────────
+    // ΓöÇΓöÇ with-statement e2e tests ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     /// Helper: parse + compile + run JS source and return the result.
     fn eval(src: &str) -> StatorResult<JsValue> {
@@ -22527,7 +25247,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: conformance — not yet passing
+    #[ignore] // TODO: conformance ΓÇö not yet passing
     fn test_with_closure_captures_with_scope() {
         let r = eval(
             "var obj = {x: 7}; var fn; with (obj) { fn = function() { return x; }; } return fn();",
@@ -22743,11 +25463,11 @@ mod tests {
         );
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
+    // ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
     // Operator edge-case e2e tests
-    // ═══════════════════════════════════════════════════════════════════════
+    // ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
 
-    // ── Comma operator ──────────────────────────────────────────────────
+    // ΓöÇΓöÇ Comma operator ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_comma_returns_last() {
@@ -22773,7 +25493,7 @@ mod tests {
         assert_eq!(r, JsValue::String("hello".into()));
     }
 
-    // ── void operator ───────────────────────────────────────────────────
+    // ΓöÇΓöÇ void operator ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_void_returns_undefined() {
@@ -22799,7 +25519,7 @@ mod tests {
         assert_eq!(r, JsValue::Undefined);
     }
 
-    // ── delete operator ─────────────────────────────────────────────────
+    // ΓöÇΓöÇ delete operator ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_delete_obj_property() {
@@ -22859,7 +25579,7 @@ mod tests {
         assert_eq!(r, JsValue::Undefined);
     }
 
-    // ── typeof operator ─────────────────────────────────────────────────
+    // ΓöÇΓöÇ typeof operator ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_typeof_number_v2() {
@@ -22905,7 +25625,7 @@ mod tests {
 
     #[test]
     fn test_typeof_undeclared_no_error() {
-        // typeof on undeclared variable must NOT throw — returns "undefined"
+        // typeof on undeclared variable must NOT throw ΓÇö returns "undefined"
         let r = eval(r#"return typeof someUndeclaredVariable;"#).unwrap();
         assert_eq!(r, JsValue::String("undefined".into()));
     }
@@ -22916,7 +25636,7 @@ mod tests {
         assert_eq!(r, JsValue::String("symbol".into()));
     }
 
-    // ── in operator ─────────────────────────────────────────────────────
+    // ΓöÇΓöÇ in operator ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_in_existing_property() {
@@ -22954,7 +25674,7 @@ mod tests {
         assert_eq!(r, JsValue::Boolean(true));
     }
 
-    // ── instanceof operator ─────────────────────────────────────────────
+    // ΓöÇΓöÇ instanceof operator ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     #[ignore] // TODO: instanceof Array regression
@@ -22998,7 +25718,7 @@ mod tests {
         assert_eq!(r, JsValue::Boolean(false));
     }
 
-    // ── Nullish coalescing (??) ─────────────────────────────────────────
+    // ΓöÇΓöÇ Nullish coalescing (??) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_nullish_null_uses_rhs() {
@@ -23054,7 +25774,7 @@ mod tests {
         assert_eq!(r, JsValue::Smi(42));
     }
 
-    // ── Optional chaining (?.) ──────────────────────────────────────────
+    // ΓöÇΓöÇ Optional chaining (?.) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_optional_chain_property_exists() {
@@ -23156,7 +25876,7 @@ mod tests {
         assert_eq!(r, JsValue::Boolean(false));
     }
 
-    // ── Exponentiation (**) ─────────────────────────────────────────────
+    // ΓöÇΓöÇ Exponentiation (**) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_exp_basic() {
@@ -23180,7 +25900,7 @@ mod tests {
 
     #[test]
     fn test_exp_unary_before_starstar_syntax_error() {
-        // -2 ** 2 is a SyntaxError — need parens
+        // -2 ** 2 is a SyntaxError ΓÇö need parens
         let r = crate::parser::parse("-2 ** 2");
         assert!(r.is_err(), "unary minus before ** should be SyntaxError");
     }
@@ -23215,7 +25935,7 @@ mod tests {
         assert!((n - 2.0).abs() < f64::EPSILON);
     }
 
-    // ── Combined / integration tests ────────────────────────────────────
+    // ΓöÇΓöÇ Combined / integration tests ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_typeof_equals_string() {
@@ -23264,7 +25984,7 @@ mod tests {
         assert_eq!(r, JsValue::Smi(10 + 9 + 8));
     }
 
-    // ── HotRegisters unit tests ─────────────────────────────────────────────
+    // ΓöÇΓöÇ HotRegisters unit tests ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
     #[test]
     fn test_hot_registers_smi_round_trip() {
@@ -23305,10 +26025,10 @@ mod tests {
     #[test]
     fn test_hot_registers_invalidates_for_string() {
         let mut hr = HotRegisters::new(4);
-        // First write an Smi — should be valid.
+        // First write an Smi ΓÇö should be valid.
         assert!(hr.try_write(0, &JsValue::Smi(1)));
         assert!(hr.try_read(0).is_some());
-        // Now write a String — not NaN-boxable, should invalidate.
+        // Now write a String ΓÇö not NaN-boxable, should invalidate.
         let s: Rc<str> = "hello".into();
         assert!(!hr.try_write(0, &JsValue::String(s)));
         assert!(hr.try_read(0).is_none());

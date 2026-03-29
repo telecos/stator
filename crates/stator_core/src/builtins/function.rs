@@ -576,7 +576,7 @@ mod tests {
         ));
         assert!(!function_has_instance(
             &JsValue::Undefined,
-            &JsValue::BigInt(99)
+            &JsValue::BigInt(Box::new(99))
         ));
     }
 

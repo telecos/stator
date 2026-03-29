@@ -708,7 +708,7 @@ mod tests {
             JsValue::HeapNumber(3.14),
             JsValue::String("hello".into()),
             JsValue::Symbol(42),
-            JsValue::BigInt(123),
+            JsValue::BigInt(Box::new(123)),
         ];
         for v in &unsupported {
             assert!(

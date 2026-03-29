@@ -85,6 +85,23 @@ impl CondCode {
             Self::Overflow => 0x80,
         }
     }
+
+    /// Return the logically inverted condition code.
+    ///
+    /// For example, `Less` inverts to `GreaterEq`, `Equal` inverts to
+    /// `NotEqual`, and so on.  Used by comparison-branch fusion to reverse
+    /// the sense of a conditional jump.
+    pub fn invert(self) -> Self {
+        match self {
+            Self::Equal => Self::NotEqual,
+            Self::NotEqual => Self::Equal,
+            Self::Less => Self::GreaterEq,
+            Self::LessEq => Self::Greater,
+            Self::Greater => Self::LessEq,
+            Self::GreaterEq => Self::Less,
+            Self::Overflow => Self::Overflow, // no logical inverse for OF
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -469,6 +486,21 @@ impl MacroAssembler {
         }
     }
 
+    /// `MOV dst_32, imm32` — load a 32-bit immediate into a register,
+    /// zero-extending to 64 bits.
+    ///
+    /// Shorter than [`mov_ri`] for non-negative values that fit in `u32`:
+    /// 5 bytes (classic registers) or 6 bytes (R8–R15) vs 7 bytes for the
+    /// sign-extended 64-bit form.
+    ///
+    /// Encoding: `[REX.B] B8+rd imm32` (no REX.W — 32-bit operand size
+    /// implicitly zero-extends the upper 32 bits).
+    pub fn mov_ri32(&mut self, dst: Reg64, imm: u32) {
+        self.emit_rex_b_only(dst);
+        self.buf.push(0xB8 | dst.enc());
+        self.buf.extend_from_slice(&imm.to_le_bytes());
+    }
+
     /// `LEA dst, [RIP + offset]` — load a RIP-relative address.
     ///
     /// `offset` is the signed byte displacement from the **end** of this LEA
@@ -699,6 +731,15 @@ impl MacroAssembler {
     pub fn jne(&mut self, label: &mut Label) {
         self.buf.push(0x0F);
         self.buf.push(0x85);
+        self.emit_rel32_for_label(label);
+    }
+
+    /// `JO label` — jump if overflow (OF=1).
+    ///
+    /// Encoding: `0F 80 rel32`.
+    pub fn jo(&mut self, label: &mut Label) {
+        self.buf.push(0x0F);
+        self.buf.push(0x80);
         self.emit_rel32_for_label(label);
     }
 

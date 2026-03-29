@@ -565,7 +565,7 @@ pub fn object_define_properties(obj: &mut JsObject, props: &JsValue) -> StatorRe
         JsValue::PlainObject(map) => map
             .borrow()
             .enumerable_iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| (k.to_string(), v.clone()))
             .collect(),
         _ => {
             return Err(StatorError::TypeError(
@@ -2185,7 +2185,7 @@ mod tests {
         pm.insert("a".to_string(), JsValue::Smi(3));
         pm.insert("2".to_string(), JsValue::Smi(4));
 
-        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        let keys: Vec<&str> = pm.keys().map(|s| &**s).collect();
         assert_eq!(keys, vec!["2", "10", "z", "a"]);
     }
 
@@ -3251,8 +3251,14 @@ mod tests {
 
     #[test]
     fn test_e2e_object_is_bigint_equality() {
-        assert!(object_is(&JsValue::BigInt(42), &JsValue::BigInt(42)));
-        assert!(!object_is(&JsValue::BigInt(1), &JsValue::BigInt(2)));
+        assert!(object_is(
+            &JsValue::BigInt(Box::new(42)),
+            &JsValue::BigInt(Box::new(42))
+        ));
+        assert!(!object_is(
+            &JsValue::BigInt(Box::new(1)),
+            &JsValue::BigInt(Box::new(2))
+        ));
     }
 
     #[test]

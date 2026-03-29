@@ -18,17 +18,17 @@
 //! Internally, property values are stored in a flat `Vec<JsValue>` for
 //! cache-friendly iteration and O(1) slot-based access. Small objects keep
 //! name lookup in a compact linear-scan mode that searches the key vector
-//! directly, while larger objects promote to a secondary `HashMap<String,
+//! directly, while larger objects promote to a secondary `HashMap<Rc<str>,
 //! usize>` for O(1) slot lookup.
 //!
 //! An [`INLINE_CACHE_CAP`]-entry inline cache of recently accessed property
 //! names sits in front of the lookup path to avoid repeated scans or
 //! hash-table probes for hot property names.
 
+use std::array;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::builtins::symbol::{is_symbol_property_key, property_key_to_symbol};
 use crate::objects::map::PropertyAttributes;
@@ -39,12 +39,14 @@ pub const INTERNAL_PROTO_PROPERTY_KEY: &str = "\0stator.internal.proto";
 /// User-visible `__proto__` key used for prototype chain lookup.
 const USER_VISIBLE_PROTO_PROPERTY_KEY: &str = "__proto__";
 
-/// Global monotonically-increasing counter used to assign unique shape
-/// identifiers to each [`PropertyMap`] structural configuration.
-static NEXT_SHAPE_ID: AtomicU64 = AtomicU64::new(1);
-/// Global epoch counter incremented on every prototype-relevant mutation.
-/// Used to cheaply detect when a cached `proto_generation` may be stale.
-static GLOBAL_PROTO_MUTATION_EPOCH: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// Monotonically-increasing counter used to assign unique shape
+    /// identifiers to each [`PropertyMap`] structural configuration.
+    static NEXT_SHAPE_ID: Cell<u64> = const { Cell::new(1) };
+    /// Epoch counter incremented on every prototype-relevant mutation.
+    /// Used to cheaply detect when a cached `proto_generation` may be stale.
+    static GLOBAL_PROTO_MUTATION_EPOCH: Cell<u64> = const { Cell::new(0) };
+}
 
 /// Default attributes for properties created by ordinary JS assignment:
 /// writable, enumerable, and configurable.
@@ -62,13 +64,13 @@ const BUILTIN_ATTRS: PropertyAttributes = PropertyAttributes::from_bits_truncate
 
 /// Maximum number of entries in the inline property-name cache.
 ///
-/// Eight entries provide better coverage for moderately polymorphic property
+/// Sixteen entries provide better coverage for moderately polymorphic property
 /// access patterns while keeping probes short and cache-friendly.
-const INLINE_CACHE_CAP: usize = 8;
+const INLINE_CACHE_CAP: usize = 16;
 
 /// Small objects keep name lookup in compact linear-scan mode until they grow
 /// beyond this many properties.
-const SMALL_PROPERTY_LINEAR_SCAN_CAP: usize = 8;
+const SMALL_PROPERTY_LINEAR_SCAN_CAP: usize = 6;
 
 /// Number of reusable property-storage buffers kept per thread.
 const PROPERTY_STORAGE_POOL_CAP: usize = 64;
@@ -76,26 +78,14 @@ const PROPERTY_STORAGE_POOL_CAP: usize = 64;
 /// Avoid retaining very large backing allocations in the pool.
 const MAX_POOLED_PROPERTY_CAPACITY: usize = SMALL_PROPERTY_LINEAR_SCAN_CAP * 4;
 
-/// Objects with this many properties or fewer bypass the TLS pool entirely.
-/// The cost of a TLS lookup + RefCell borrow + linear scan exceeds the cost
-/// of three small Vec allocations for tiny objects.
-const POOL_BYPASS_CAP: usize = 6;
-
 thread_local! {
     static PROPERTY_STORAGE_POOL: RefCell<Vec<PropertyStorageBuffers>> =
         RefCell::new(Vec::with_capacity(PROPERTY_STORAGE_POOL_CAP));
-
-    /// Single-item Cell-based cache for `Vec<JsValue>` from clone_template.
-    /// Zero borrow cost — avoids RefCell overhead of the main pool.
-    static CLONE_VALUES_CACHE: Cell<Option<Vec<JsValue>>> = const { Cell::new(None) };
-
-    /// Single-item Cell-based cache for `Vec<PropertyAttributes>` from clone_template.
-    static CLONE_ATTRS_CACHE: Cell<Option<Vec<PropertyAttributes>>> = const { Cell::new(None) };
 }
 
 #[derive(Debug)]
 struct PropertyStorageBuffers {
-    keys: Vec<String>,
+    keys: Vec<Rc<str>>,
     values: Vec<JsValue>,
     attrs: Vec<PropertyAttributes>,
 }
@@ -104,20 +94,55 @@ struct PropertyStorageBuffers {
 enum PropertyIndex {
     #[default]
     Inline,
-    Map(HashMap<String, usize>),
+    Map(HashMap<Rc<str>, usize>),
+}
+
+#[derive(Debug)]
+struct InlinePropertyCache {
+    hashes: [Cell<u64>; INLINE_CACHE_CAP],
+    slots: [Cell<u32>; INLINE_CACHE_CAP],
+}
+
+impl InlinePropertyCache {
+    fn new() -> Self {
+        Self {
+            hashes: Default::default(),
+            slots: array::from_fn(|_| Cell::new(u32::MAX)),
+        }
+    }
+}
+
+impl Clone for InlinePropertyCache {
+    fn clone(&self) -> Self {
+        Self {
+            hashes: array::from_fn(|i| Cell::new(self.hashes[i].get())),
+            slots: array::from_fn(|i| Cell::new(self.slots[i].get())),
+        }
+    }
+}
+
+#[inline]
+fn next_shape_id() -> u64 {
+    NEXT_SHAPE_ID.with(|next| {
+        let shape_id = next.get();
+        next.set(shape_id.wrapping_add(1));
+        shape_id
+    })
+}
+
+#[inline]
+fn current_global_proto_mutation_epoch() -> u64 {
+    GLOBAL_PROTO_MUTATION_EPOCH.with(Cell::get)
+}
+
+#[inline]
+fn bump_global_proto_mutation_epoch() {
+    GLOBAL_PROTO_MUTATION_EPOCH.with(|epoch| {
+        epoch.set(epoch.get().wrapping_add(1));
+    });
 }
 
 fn acquire_storage_buffers(capacity: usize) -> PropertyStorageBuffers {
-    // Fast path: skip TLS pool lookup for small objects — three tiny Vec
-    // allocations are cheaper than TLS + RefCell + linear pool scan.
-    if capacity <= POOL_BYPASS_CAP {
-        return PropertyStorageBuffers {
-            keys: Vec::with_capacity(capacity),
-            values: Vec::with_capacity(capacity),
-            attrs: Vec::with_capacity(capacity),
-        };
-    }
-
     PROPERTY_STORAGE_POOL
         .try_with(|pool| {
             let mut pool = pool.borrow_mut();
@@ -147,14 +172,6 @@ fn acquire_storage_buffers(capacity: usize) -> PropertyStorageBuffers {
 }
 
 fn release_storage_buffers(mut buffers: PropertyStorageBuffers) {
-    // Fast path: small buffers were allocated outside the pool — just drop them.
-    if buffers.keys.capacity() <= POOL_BYPASS_CAP
-        && buffers.values.capacity() <= POOL_BYPASS_CAP
-        && buffers.attrs.capacity() <= POOL_BYPASS_CAP
-    {
-        return;
-    }
-
     if buffers.keys.capacity() > MAX_POOLED_PROPERTY_CAPACITY
         || buffers.values.capacity() > MAX_POOLED_PROPERTY_CAPACITY
         || buffers.attrs.capacity() > MAX_POOLED_PROPERTY_CAPACITY
@@ -207,7 +224,7 @@ fn name_hash(s: &str) -> u64 {
 /// Deterministically hashes a property layout so structurally identical maps
 /// share the same layout identifier.
 #[inline]
-fn layout_hash(keys: &[String], attrs: &[PropertyAttributes]) -> u64 {
+fn layout_hash(keys: &[Rc<str>], attrs: &[PropertyAttributes]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for (key, attr) in keys.iter().zip(attrs.iter()) {
         for b in key.bytes() {
@@ -238,17 +255,10 @@ fn layout_hash(keys: &[String], attrs: &[PropertyAttributes]) -> u64 {
 /// hash-table probes on hot property names. The cache uses
 /// [`Cell`]-based interior mutability so that read-only (`&self`) lookups
 /// can still populate the cache.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PropertyMap {
     /// Property names in ECMAScript enumeration order.
-    ///
-    /// Wrapped in [`Rc`] to enable copy-on-write (COW) sharing with
-    /// template clones.  [`clone_template`](Self::clone_template) produces
-    /// maps that share the key vector via `Rc::clone` (refcount increment)
-    /// instead of deep-cloning every `String`.  On structural mutation
-    /// (property add/remove), [`Rc::make_mut`] transparently clones the
-    /// vector only when other maps still reference it.
-    keys: Rc<Vec<String>>,
+    keys: Vec<Rc<str>>,
     /// Property values, one per key.
     values: Vec<JsValue>,
     /// Property attributes, one per key.
@@ -259,14 +269,11 @@ pub struct PropertyMap {
     /// to a hash map once the object grows beyond
     /// [`SMALL_PROPERTY_LINEAR_SCAN_CAP`] properties.
     index: PropertyIndex,
-    /// Inline cache: FNV-1a hashes of recently accessed property names.
-    cache_hashes: [Cell<u64>; INLINE_CACHE_CAP],
-    /// Inline cache: corresponding slot indices for `cache_hashes`.
-    cache_slots: [Cell<u32>; INLINE_CACHE_CAP],
-    /// Number of valid entries in the inline cache (0..=INLINE_CACHE_CAP).
-    cache_len: Cell<u8>,
-    /// Circular replacement cursor into the cache arrays once the cache is full.
-    cache_cursor: Cell<u8>,
+    /// Optional inline cache of recently accessed property names.
+    ///
+    /// Small objects stay cache-free because their linear scans are already
+    /// cheap and the cache state would dominate the object footprint.
+    inline_cache: Option<Box<InlinePropertyCache>>,
     /// Shape identifier — a monotonically-increasing stamp that changes on
     /// every structural mutation (property add/remove or attribute change).
     shape_id: u64,
@@ -285,7 +292,9 @@ pub struct PropertyMap {
     /// Once set to `true` it is never cleared, so it is a conservative over-approximation.
     pub has_accessors: bool,
     /// Offset of the next property expected to be filled when this map was
-    /// created via [`clone_template`](Self::clone_template).
+    /// created via [`clone_shape`](Self::clone_shape),
+    /// [`clone_template`](Self::clone_template), or
+    /// [`from_boilerplate`](Self::from_boilerplate).
     ///
     /// When a `PropertyMap` is created from a cached object-literal
     /// template, all keys and attributes are pre-populated but values are
@@ -296,18 +305,96 @@ pub struct PropertyMap {
     /// A value of `usize::MAX` means this map is **not** in template-fill
     /// mode (the default for non-template-created maps).
     template_next_slot: usize,
+    /// Original requested capacity for this map, preserved so shape clones
+    /// can pre-size their secondary index consistently.
+    capacity_hint: usize,
+}
+
+/// Cached object-literal layout used to instantiate repeated literals without
+/// re-observing the first instance's values.
+#[derive(Debug, Clone)]
+pub(crate) struct ObjectLiteralTemplate {
+    keys: Box<[Rc<str>]>,
+    attrs: Box<[PropertyAttributes]>,
+    integer_key_count: usize,
+    layout_id: u64,
+    extensible: bool,
+    has_accessors: bool,
+    capacity_hint: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ShapeMetadata {
+    integer_key_count: usize,
+    layout_id: u64,
+    extensible: bool,
+    has_accessors: bool,
+    capacity_hint: usize,
+}
+
+impl ObjectLiteralTemplate {
+    pub(crate) fn capture(map: &PropertyMap) -> Option<Self> {
+        (!map.is_empty()).then(|| Self {
+            keys: map.keys.clone().into_boxed_slice(),
+            attrs: map.attrs.clone().into_boxed_slice(),
+            integer_key_count: map.integer_key_count,
+            layout_id: map.layout_id,
+            extensible: map.extensible,
+            has_accessors: map.has_accessors,
+            capacity_hint: map.capacity_hint,
+        })
+    }
+
+    pub(crate) fn instantiate(&self) -> PropertyMap {
+        PropertyMap::from_shape_parts(
+            &self.keys,
+            &self.attrs,
+            ShapeMetadata {
+                integer_key_count: self.integer_key_count,
+                layout_id: self.layout_id,
+                extensible: self.extensible,
+                has_accessors: self.has_accessors,
+                capacity_hint: self.capacity_hint,
+            },
+            0,
+        )
+    }
 }
 
 impl PartialEq for PropertyMap {
     fn eq(&self, other: &Self) -> bool {
-        // Fast path: shared-key clones share the same Rc allocation.
-        (Rc::ptr_eq(&self.keys, &other.keys) || self.keys == other.keys)
+        self.keys == other.keys
             && self.values == other.values
             && self.attrs == other.attrs
             && self.integer_key_count == other.integer_key_count
             && self.index == other.index
             && self.extensible == other.extensible
             && self.has_accessors == other.has_accessors
+    }
+}
+
+impl Clone for PropertyMap {
+    fn clone(&self) -> Self {
+        Self {
+            keys: self.keys.iter().map(Rc::clone).collect(),
+            values: self.values.clone(),
+            attrs: self.attrs.clone(),
+            integer_key_count: self.integer_key_count,
+            index: self.index.clone(),
+            inline_cache: self
+                .inline_cache
+                .as_ref()
+                .map(|cache| Box::new((**cache).clone())),
+            shape_id: self.shape_id,
+            layout_id: self.layout_id,
+            proto_generation: Cell::new(self.proto_generation.get()),
+            proto_epoch: Cell::new(self.proto_epoch.get()),
+            proto_global_epoch: Cell::new(self.proto_global_epoch.get()),
+            extensible: self.extensible,
+            has_accessors: self.has_accessors,
+            template_next_slot: self.template_next_slot,
+            capacity_hint: self.capacity_hint,
+        }
     }
 }
 
@@ -318,23 +405,16 @@ impl PropertyMap {
     }
 
     fn from_buffers(capacity: usize, buffers: PropertyStorageBuffers) -> Self {
-        let index = if capacity > SMALL_PROPERTY_LINEAR_SCAN_CAP {
-            PropertyIndex::Map(HashMap::with_capacity(capacity))
-        } else {
-            PropertyIndex::Inline
-        };
+        let index = Self::build_index_from_keys(&[], capacity);
 
         Self {
-            keys: Rc::new(buffers.keys),
+            keys: buffers.keys,
             values: buffers.values,
             attrs: buffers.attrs,
             integer_key_count: 0,
             index,
-            cache_hashes: Default::default(),
-            cache_slots: Default::default(),
-            cache_len: Cell::new(0),
-            cache_cursor: Cell::new(0),
-            shape_id: NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed),
+            inline_cache: None,
+            shape_id: next_shape_id(),
             layout_id: layout_hash(&[], &[]),
             proto_generation: Cell::new(0),
             proto_epoch: Cell::new(0),
@@ -342,6 +422,7 @@ impl PropertyMap {
             extensible: true,
             has_accessors: false,
             template_next_slot: usize::MAX,
+            capacity_hint: capacity,
         }
     }
 
@@ -353,63 +434,39 @@ impl PropertyMap {
     /// Creates a property map pre-populated with the given boilerplate
     /// keys and attribute flags.  All values are initialised to
     /// [`JsValue::Undefined`] and are expected to be overwritten by the
-    /// constructor body.
+    /// constructor body. The returned map starts in template-fill mode.
     pub fn from_boilerplate(
-        keys: &[String],
+        keys: &[Rc<str>],
         attrs: &[crate::objects::map::PropertyAttributes],
     ) -> Self {
         debug_assert_eq!(keys.len(), attrs.len());
-        let cap = keys.len();
-        let mut buffers = acquire_storage_buffers(cap);
-        buffers.keys.extend_from_slice(keys);
-        buffers.values.resize(cap, JsValue::Undefined);
-        buffers.attrs.extend_from_slice(attrs);
-
-        let integer_key_count = keys
-            .iter()
-            .filter(|k| parse_integer_index(k).is_some())
-            .count();
-
-        let index = if cap > SMALL_PROPERTY_LINEAR_SCAN_CAP {
-            let mut map = HashMap::with_capacity(cap);
-            for (slot, key) in keys.iter().enumerate() {
-                map.insert(key.clone(), slot);
-            }
-            PropertyIndex::Map(map)
-        } else {
-            PropertyIndex::Inline
-        };
-
-        Self {
-            keys: Rc::new(buffers.keys),
-            values: buffers.values,
-            attrs: buffers.attrs,
-            integer_key_count,
-            index,
-            cache_hashes: Default::default(),
-            cache_slots: Default::default(),
-            cache_len: Cell::new(0),
-            cache_cursor: Cell::new(0),
-            shape_id: NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed),
-            layout_id: layout_hash(keys, attrs),
-            proto_generation: Cell::new(0),
-            proto_epoch: Cell::new(0),
-            proto_global_epoch: Cell::new(0),
-            extensible: true,
-            has_accessors: false,
-            template_next_slot: usize::MAX,
-        }
+        Self::from_shape_parts(
+            keys,
+            attrs,
+            ShapeMetadata {
+                integer_key_count: keys
+                    .iter()
+                    .filter(|key| parse_integer_index(key).is_some())
+                    .count(),
+                layout_id: layout_hash(keys, attrs),
+                extensible: true,
+                has_accessors: keys
+                    .iter()
+                    .any(|key| key.starts_with("__get_") || key.starts_with("__set_")),
+                capacity_hint: keys.len(),
+            },
+            0,
+        )
     }
     /// Returns a snapshot of the property keys and their attribute flags,
     /// suitable for caching as a constructor boilerplate.
     pub fn boilerplate_snapshot(
         &self,
-    ) -> (Vec<String>, Vec<crate::objects::map::PropertyAttributes>) {
-        ((*self.keys).clone(), self.attrs.clone())
+    ) -> (Vec<Rc<str>>, Vec<crate::objects::map::PropertyAttributes>) {
+        (self.keys.clone(), self.attrs.clone())
     }
 
-    /// Creates a structural clone of this property map for object-literal
-    /// template caching.
+    /// Clones only the property-map shape for object/constructor templates.
     ///
     /// The returned map has the same key names, insertion order, and
     /// attribute flags as `self`, but every value slot is reset to
@@ -417,86 +474,102 @@ impl PropertyMap {
     /// The map is placed in *template-fill mode* so that subsequent calls
     /// to [`try_template_fill`](Self::try_template_fill) can populate
     /// values in O(1) without hash lookups.
+    pub fn clone_shape(&self) -> Self {
+        Self::from_shape_parts(
+            &self.keys,
+            &self.attrs,
+            ShapeMetadata {
+                integer_key_count: self.integer_key_count,
+                layout_id: self.layout_id,
+                extensible: self.extensible,
+                has_accessors: self.has_accessors,
+                capacity_hint: self.capacity_hint,
+            },
+            0,
+        )
+    }
+
+    /// Backwards-compatible alias for shape-only template cloning.
+    #[inline]
     pub fn clone_template(&self) -> Self {
-        let cap = self.keys.len();
+        self.clone_shape()
+    }
 
-        // Share the key vector via Rc::clone instead of deep-cloning every
-        // String.  Structural mutations on the clone (property add/remove)
-        // will trigger Rc::make_mut which transparently COW-clones the Vec
-        // only when needed.
-        let keys = Rc::clone(&self.keys);
+    /// Attempts to write `value` into the next expected template slot.
+    ///
+    /// When a `PropertyMap` is in template-fill mode (created via
+    /// [`clone_shape`](Self::clone_shape),
+    /// [`clone_template`](Self::clone_template), or
+    /// [`from_boilerplate`](Self::from_boilerplate)), this method checks
+    /// whether `key` matches the property name at the next expected
+    /// sequential position.  If so, the value is written directly by
+    /// offset in O(1) — no hash lookup, no shape mutation, no prototype
+    /// generation bump.
+    ///
+    /// Returns `Ok(offset)` if the fast path succeeded and `value` was
+    /// consumed.  Returns `Err(value)` if the key did not match; the
+    /// unconsumed value is returned to the caller for fallback via
+    /// [`insert`](Self::insert).  On mismatch the template-fill mode is
+    /// permanently disabled for this map.
+    #[inline]
+    pub fn try_template_fill(&mut self, key: &str, value: JsValue) -> Result<usize, JsValue> {
+        let slot = self.template_next_slot;
+        if slot < self.keys.len() && self.keys[slot].as_ref() == key {
+            self.values[slot] = value;
+            self.template_next_slot = slot + 1;
+            Ok(slot)
+        } else {
+            self.template_next_slot = usize::MAX;
+            Err(value)
+        }
+    }
 
-        // Try to reuse cached Vecs from a previously dropped clone, avoiding
-        // two heap allocations in the hot object-creation loop.
-        let mut values = CLONE_VALUES_CACHE
-            .with(|c| c.take())
-            .filter(|v| v.capacity() >= cap)
-            .unwrap_or_else(|| Vec::with_capacity(cap));
-        values.clear();
-        values.resize(cap, JsValue::Undefined);
-
-        let mut attrs = CLONE_ATTRS_CACHE
-            .with(|c| c.take())
-            .filter(|a| a.capacity() >= cap)
-            .unwrap_or_else(|| Vec::with_capacity(cap));
-        attrs.clear();
-        attrs.extend_from_slice(&self.attrs);
-
-        let index = if cap > SMALL_PROPERTY_LINEAR_SCAN_CAP {
-            let mut map = HashMap::with_capacity(cap);
+    #[inline]
+    fn build_index_from_keys(keys: &[Rc<str>], capacity_hint: usize) -> PropertyIndex {
+        let capacity = capacity_hint.max(keys.len());
+        if capacity > SMALL_PROPERTY_LINEAR_SCAN_CAP {
+            let mut map = HashMap::with_capacity(capacity);
             for (slot, key) in keys.iter().enumerate() {
                 map.insert(key.clone(), slot);
             }
             PropertyIndex::Map(map)
         } else {
             PropertyIndex::Inline
-        };
-
-        Self {
-            keys,
-            values,
-            attrs,
-            integer_key_count: self.integer_key_count,
-            index,
-            cache_hashes: Default::default(),
-            cache_slots: Default::default(),
-            cache_len: Cell::new(0),
-            cache_cursor: Cell::new(0),
-            shape_id: NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed),
-            layout_id: self.layout_id,
-            proto_generation: Cell::new(0),
-            proto_epoch: Cell::new(0),
-            proto_global_epoch: Cell::new(0),
-            extensible: true,
-            has_accessors: false,
-            template_next_slot: 0,
         }
     }
 
-    /// Attempts to write `value` into the next expected template slot.
-    ///
-    /// When a `PropertyMap` is in template-fill mode (created via
-    /// [`clone_template`](Self::clone_template)), this method checks
-    /// whether `key` matches the property name at the next expected
-    /// sequential position.  If so, the value is written directly by
-    /// offset in O(1) — no hash lookup, no shape mutation, no prototype
-    /// generation bump.
-    ///
-    /// Returns `Ok(())` if the fast path succeeded and `value` was
-    /// consumed.  Returns `Err(value)` if the key did not match; the
-    /// unconsumed value is returned to the caller for fallback via
-    /// [`insert`](Self::insert).  On mismatch the template-fill mode is
-    /// permanently disabled for this map.
-    #[inline]
-    pub fn try_template_fill(&mut self, key: &str, value: JsValue) -> Result<(), JsValue> {
-        let slot = self.template_next_slot;
-        if slot < self.keys.len() && self.keys[slot] == key {
-            self.values[slot] = value;
-            self.template_next_slot = slot + 1;
-            Ok(())
-        } else {
-            self.template_next_slot = usize::MAX;
-            Err(value)
+    fn from_shape_parts(
+        keys: &[Rc<str>],
+        attrs: &[PropertyAttributes],
+        metadata: ShapeMetadata,
+        template_next_slot: usize,
+    ) -> Self {
+        let cap = keys.len();
+        let mut buffers = acquire_storage_buffers(cap);
+        buffers.keys.extend_from_slice(keys);
+        buffers.values.resize(cap, JsValue::Undefined);
+        buffers.attrs.extend_from_slice(attrs);
+
+        let capacity_hint = metadata.capacity_hint.max(cap);
+        let index = Self::build_index_from_keys(&buffers.keys, capacity_hint);
+
+        Self {
+            keys: buffers.keys,
+            values: buffers.values,
+            attrs: buffers.attrs,
+            integer_key_count: metadata.integer_key_count,
+            index,
+            inline_cache: (cap > SMALL_PROPERTY_LINEAR_SCAN_CAP)
+                .then(|| Box::new(InlinePropertyCache::new())),
+            shape_id: next_shape_id(),
+            layout_id: metadata.layout_id,
+            proto_generation: Cell::new(0),
+            proto_epoch: Cell::new(0),
+            proto_global_epoch: Cell::new(0),
+            extensible: metadata.extensible,
+            has_accessors: metadata.has_accessors,
+            template_next_slot,
+            capacity_hint,
         }
     }
 
@@ -505,55 +578,47 @@ impl PropertyMap {
     /// Probes the inline cache for `key`, returning its slot index on hit.
     #[inline]
     fn cache_probe(&self, key: &str) -> Option<usize> {
+        let cache = self.inline_cache.as_ref()?;
         let h = name_hash(key);
-        let len = self.cache_len.get() as usize;
-        for i in 0..len {
-            if self.cache_hashes[i].get() == h {
-                let slot = self.cache_slots[i].get() as usize;
-                // Verify against the canonical key to guard against hash
-                // collisions (extremely rare but must be handled).
-                if slot < self.keys.len() && self.keys[slot] == key {
-                    if i > 0 {
-                        self.cache_hashes[0].swap(&self.cache_hashes[i]);
-                        self.cache_slots[0].swap(&self.cache_slots[i]);
-                    }
-                    return Some(slot);
-                }
-            }
+        let idx = (h as usize) & (INLINE_CACHE_CAP - 1);
+        if cache.hashes[idx].get() != h {
+            return None;
         }
-        None
+        let slot = cache.slots[idx].get() as usize;
+        (slot < self.keys.len() && self.keys[slot].as_ref() == key).then_some(slot)
     }
 
     /// Records a `(key, slot)` pair in the inline cache.
     #[inline]
     fn cache_record(&self, key: &str, slot: usize) {
+        let Some(cache) = self.inline_cache.as_ref() else {
+            return;
+        };
         let h = name_hash(key);
-        let len = self.cache_len.get() as usize;
-        if len < INLINE_CACHE_CAP {
-            self.cache_hashes[len].set(h);
-            self.cache_slots[len].set(slot as u32);
-            self.cache_len.set((len + 1) as u8);
-        } else {
-            let cursor = self.cache_cursor.get() as usize;
-            self.cache_hashes[cursor].set(h);
-            self.cache_slots[cursor].set(slot as u32);
-            self.cache_cursor
-                .set(((cursor + 1) % INLINE_CACHE_CAP) as u8);
-        }
+        let idx = (h as usize) & (INLINE_CACHE_CAP - 1);
+        cache.hashes[idx].set(h);
+        cache.slots[idx].set(slot as u32);
     }
 
     /// Invalidates all inline cache entries.
     #[inline]
     fn cache_invalidate(&self) {
-        self.cache_len.set(0);
-        self.cache_cursor.set(0);
+        let Some(cache) = self.inline_cache.as_ref() else {
+            return;
+        };
+        for entry in &cache.hashes {
+            entry.set(0);
+        }
+        for slot in &cache.slots {
+            slot.set(u32::MAX);
+        }
     }
 
     /// Assigns a fresh shape identifier, signalling that the structural layout
     /// (set of property names or their attribute flags) has changed.
     #[inline]
     fn bump_shape_id(&mut self) {
-        self.shape_id = NEXT_SHAPE_ID.fetch_add(1, Ordering::Relaxed);
+        self.shape_id = next_shape_id();
         self.layout_id = layout_hash(&self.keys, &self.attrs);
     }
 
@@ -562,7 +627,7 @@ impl PropertyMap {
     #[inline]
     fn touch_proto_generation(&self) {
         self.proto_epoch.set(self.proto_epoch.get().wrapping_add(1));
-        GLOBAL_PROTO_MUTATION_EPOCH.fetch_add(1, Ordering::Relaxed);
+        bump_global_proto_mutation_epoch();
         self.proto_global_epoch.set(u64::MAX);
     }
 
@@ -591,7 +656,7 @@ impl PropertyMap {
     /// recomputed only when the global prototype-mutation epoch changes.
     #[inline]
     pub fn proto_generation(&self) -> u32 {
-        let global_epoch = GLOBAL_PROTO_MUTATION_EPOCH.load(Ordering::Relaxed);
+        let global_epoch = current_global_proto_mutation_epoch();
         if self.proto_global_epoch.get() == global_epoch {
             return self.proto_generation.get();
         }
@@ -610,6 +675,12 @@ impl PropertyMap {
         generation
     }
 
+    /// Returns the global epoch used to invalidate prototype-dependent caches.
+    #[inline]
+    pub fn global_proto_mutation_epoch() -> u64 {
+        current_global_proto_mutation_epoch()
+    }
+
     /// Returns the slot index (offset) for `key`, or `None` if absent.
     ///
     /// The offset is valid as long as `shape_id()` does not change.
@@ -621,7 +692,10 @@ impl PropertyMap {
     #[inline]
     fn lookup_slot(&self, key: &str) -> Option<usize> {
         match &self.index {
-            PropertyIndex::Inline => self.keys.iter().position(|candidate| candidate == key),
+            PropertyIndex::Inline => self
+                .keys
+                .iter()
+                .position(|candidate| candidate.as_ref() == key),
             PropertyIndex::Map(index) => index.get(key).copied(),
         }
     }
@@ -640,16 +714,20 @@ impl PropertyMap {
         if matches!(self.index, PropertyIndex::Map(_)) {
             return;
         }
-        let mut index = HashMap::with_capacity(self.keys.len());
+        let mut index = HashMap::with_capacity(self.capacity_hint.max(self.keys.len()));
         for (slot, key) in self.keys.iter().enumerate() {
             index.insert(key.clone(), slot);
         }
         self.index = PropertyIndex::Map(index);
+        if self.inline_cache.is_none() {
+            self.inline_cache = Some(Box::new(InlinePropertyCache::new()));
+        }
     }
 
     fn refresh_index_mode(&mut self) {
         if self.keys.len() <= SMALL_PROPERTY_LINEAR_SCAN_CAP {
             self.index = PropertyIndex::Inline;
+            self.inline_cache = None;
         } else {
             self.promote_index();
         }
@@ -672,7 +750,7 @@ impl PropertyMap {
     pub fn matches_key_at_offset(&self, offset: usize, key: &str) -> bool {
         self.keys
             .get(offset)
-            .is_some_and(|candidate| candidate == key)
+            .is_some_and(|candidate| candidate.as_ref() == key)
     }
 
     /// Overwrites the value at a raw slot offset, returning `true` on
@@ -728,7 +806,7 @@ impl PropertyMap {
 
     /// Inserts a new property at `pos`, updating indices and integer-key
     /// bookkeeping as needed.
-    fn insert_new(&mut self, key: String, value: JsValue, attrs: PropertyAttributes, pos: usize) {
+    fn insert_new(&mut self, key: Rc<str>, value: JsValue, attrs: PropertyAttributes, pos: usize) {
         if key.starts_with("__get_") || key.starts_with("__set_") {
             self.has_accessors = true;
         }
@@ -737,9 +815,10 @@ impl PropertyMap {
         if let PropertyIndex::Map(index) = &mut self.index {
             index.insert(key.clone(), pos);
         }
-        Rc::make_mut(&mut self.keys).insert(pos, key);
+        self.keys.insert(pos, key);
         self.values.insert(pos, value);
         self.attrs.insert(pos, attrs);
+        self.capacity_hint = self.capacity_hint.max(self.keys.len());
         if is_integer_key {
             self.integer_key_count += 1;
         }
@@ -764,7 +843,24 @@ impl PropertyMap {
 
     /// Returns the value for `key`, ignoring attributes.
     pub fn get(&self, key: &str) -> Option<&JsValue> {
-        self.lookup_slot_cached(key).map(|slot| &self.values[slot])
+        if let Some(slot) = self.cache_probe(key) {
+            return Some(&self.values[slot]);
+        }
+        let slot = self.lookup_slot(key)?;
+        self.cache_record(key, slot);
+        Some(&self.values[slot])
+    }
+
+    /// Returns the value for an interned key by trying pointer equality before
+    /// falling back to the regular string lookup path.
+    pub fn get_by_rc(&self, key: &Rc<str>) -> Option<&JsValue> {
+        for (slot, candidate) in self.keys.iter().enumerate() {
+            if Rc::ptr_eq(candidate, key) {
+                self.cache_record(key.as_ref(), slot);
+                return Some(&self.values[slot]);
+            }
+        }
+        self.get(key.as_ref())
     }
 
     /// Returns a clone of the value for `key`, ignoring attributes.
@@ -880,6 +976,11 @@ impl PropertyMap {
     /// integer-indexed keys occupy the front of the storage (sorted
     /// numerically), followed by string keys in insertion order.
     pub fn insert(&mut self, key: String, value: JsValue) {
+        self.insert_rc(key.into(), value);
+    }
+
+    /// Inserts a property using an already-interned key.
+    pub fn insert_rc(&mut self, key: Rc<str>, value: JsValue) {
         if let Some(i) = self.lookup_slot_cached(&key) {
             self.values[i] = value;
             self.touch_proto_generation();
@@ -889,7 +990,7 @@ impl PropertyMap {
                 return;
             }
             // The internal prototype link must never be enumerable.
-            let attrs = if key == INTERNAL_PROTO_PROPERTY_KEY {
+            let attrs = if key.as_ref() == INTERNAL_PROTO_PROPERTY_KEY {
                 BUILTIN_ATTRS
             } else {
                 DEFAULT_ATTRS
@@ -907,6 +1008,11 @@ impl PropertyMap {
     /// Insert a built-in method or constructor property (writable,
     /// non-enumerable, configurable — per ES spec).
     pub fn insert_builtin(&mut self, key: String, value: JsValue) {
+        self.insert_builtin_rc(key.into(), value);
+    }
+
+    /// Inserts a built-in property using an already-interned key.
+    pub fn insert_builtin_rc(&mut self, key: Rc<str>, value: JsValue) {
         if let Some(i) = self.lookup_slot_cached(&key) {
             self.values[i] = value;
             self.attrs[i] = BUILTIN_ATTRS;
@@ -949,7 +1055,7 @@ impl PropertyMap {
                 self.integer_key_count -= 1;
             }
             let val = self.values[i].clone();
-            Rc::make_mut(&mut self.keys).remove(i);
+            self.keys.remove(i);
             self.values.remove(i);
             self.attrs.remove(i);
             // Decrement indices for every slot that shifted left.
@@ -971,12 +1077,12 @@ impl PropertyMap {
     }
 
     /// Returns an iterator over the property keys.
-    pub fn keys(&self) -> impl Iterator<Item = &String> {
+    pub fn keys(&self) -> impl Iterator<Item = &Rc<str>> {
         self.keys.iter()
     }
 
     /// Returns an iterator over `(key, value)` pairs, ignoring attributes.
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &JsValue)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&Rc<str>, &JsValue)> {
         self.keys.iter().zip(self.values.iter())
     }
 
@@ -1003,6 +1109,16 @@ impl PropertyMap {
     /// New properties are placed according to ECMAScript enumeration order
     /// (see [`insert`][Self::insert]).
     pub fn insert_with_attrs(&mut self, key: String, value: JsValue, attrs: PropertyAttributes) {
+        self.insert_with_attrs_rc(key.into(), value, attrs);
+    }
+
+    /// Inserts a property with explicit attributes using an already-interned key.
+    pub fn insert_with_attrs_rc(
+        &mut self,
+        key: Rc<str>,
+        value: JsValue,
+        attrs: PropertyAttributes,
+    ) {
         if let Some(i) = self.lookup_slot_cached(&key) {
             self.values[i] = value;
             self.attrs[i] = attrs;
@@ -1097,7 +1213,7 @@ impl PropertyMap {
     }
 
     /// Returns an iterator over only the enumerable property keys.
-    pub fn enumerable_keys(&self) -> impl Iterator<Item = &String> {
+    pub fn enumerable_keys(&self) -> impl Iterator<Item = &Rc<str>> {
         self.keys
             .iter()
             .zip(self.attrs.iter())
@@ -1109,7 +1225,7 @@ impl PropertyMap {
 
     /// Returns an iterator over `(key, value)` pairs for only enumerable
     /// properties — the set that ES `EnumerableOwnProperties` would return.
-    pub fn enumerable_iter(&self) -> impl Iterator<Item = (&String, &JsValue)> {
+    pub fn enumerable_iter(&self) -> impl Iterator<Item = (&Rc<str>, &JsValue)> {
         self.keys
             .iter()
             .zip(self.values.iter())
@@ -1121,7 +1237,9 @@ impl PropertyMap {
     }
 
     /// Returns an iterator over `(key, value, attrs)` triples.
-    pub fn iter_with_attrs(&self) -> impl Iterator<Item = (&String, &JsValue, PropertyAttributes)> {
+    pub fn iter_with_attrs(
+        &self,
+    ) -> impl Iterator<Item = (&Rc<str>, &JsValue, PropertyAttributes)> {
         self.keys
             .iter()
             .zip(self.values.iter())
@@ -1192,45 +1310,8 @@ impl Default for PropertyMap {
 
 impl Drop for PropertyMap {
     fn drop(&mut self) {
-        // Keys shared with other PropertyMaps (from clone_template): return
-        // the values/attrs Vecs to single-item Cell caches for reuse by the
-        // next clone_template call.  This avoids 2 heap allocations per
-        // object in tight creation loops.
-        if Rc::strong_count(&self.keys) > 1 {
-            let values = std::mem::take(&mut self.values);
-            let attrs = std::mem::take(&mut self.attrs);
-            let _ = CLONE_VALUES_CACHE.try_with(|c| {
-                if c.take()
-                    .is_none_or(|old| old.capacity() < values.capacity())
-                {
-                    c.set(Some(values));
-                }
-            });
-            let _ = CLONE_ATTRS_CACHE.try_with(|c| {
-                if c.take().is_none_or(|old| old.capacity() < attrs.capacity()) {
-                    c.set(Some(attrs));
-                }
-            });
-            return;
-        }
-
-        // Fast path: small objects never entered the pool — let the Vecs
-        // drop naturally without TLS overhead.
-        if self.keys.capacity() <= POOL_BYPASS_CAP
-            && self.values.capacity() <= POOL_BYPASS_CAP
-            && self.attrs.capacity() <= POOL_BYPASS_CAP
-        {
-            return;
-        }
-
-        // We're the sole owner of the keys Rc — unwrap to reclaim the Vec
-        // for the pool.  The mem::replace leaves a cheap empty Rc behind
-        // (dropped moments later when the struct is reclaimed).
-        let keys_rc = std::mem::replace(&mut self.keys, Rc::new(Vec::new()));
-        let keys = Rc::try_unwrap(keys_rc).unwrap_or_default();
-
         let buffers = PropertyStorageBuffers {
-            keys,
+            keys: std::mem::take(&mut self.keys),
             values: std::mem::take(&mut self.values),
             attrs: std::mem::take(&mut self.attrs),
         };
@@ -1300,9 +1381,9 @@ mod tests {
             JsValue::Smi(2),
             PropertyAttributes::WRITABLE,
         );
-        let enum_keys: Vec<&String> = pm.enumerable_keys().collect();
-        assert!(enum_keys.contains(&&"visible".to_string()));
-        assert!(!enum_keys.contains(&&"hidden".to_string()));
+        let enum_keys: Vec<&str> = pm.enumerable_keys().map(|k| &**k).collect();
+        assert!(enum_keys.contains(&"visible"));
+        assert!(!enum_keys.contains(&"hidden"));
     }
 
     #[test]
@@ -1351,7 +1432,7 @@ mod tests {
         );
         let entries: Vec<_> = pm.iter_with_attrs().collect();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, "a");
+        assert_eq!(&**entries[0].0, "a");
         assert_eq!(entries[0].1, &JsValue::Smi(1));
         assert_eq!(entries[0].2, PropertyAttributes::WRITABLE);
     }
@@ -1364,7 +1445,7 @@ mod tests {
             crate::builtins::symbol::symbol_to_property_key(123),
             JsValue::Smi(2),
         );
-        let keys: Vec<&str> = pm.enumerable_keys().map(|s| s.as_str()).collect();
+        let keys: Vec<&str> = pm.enumerable_keys().map(|s| &**s).collect();
         assert_eq!(keys, vec!["visible"]);
     }
 
@@ -1393,40 +1474,91 @@ mod tests {
         assert!(pm.is_empty());
     }
 
+    #[test]
+    fn test_small_maps_skip_inline_cache() {
+        let mut pm = PropertyMap::new();
+        pm.insert("x".to_string(), JsValue::Smi(1));
+        pm.insert("y".to_string(), JsValue::Smi(2));
+
+        assert_eq!(pm.get("x"), Some(&JsValue::Smi(1)));
+        assert!(pm.inline_cache.is_none());
+    }
+
+    #[test]
+    fn test_clone_shape_resets_values_and_preserves_layout() {
+        let mut pm = PropertyMap::with_capacity(SMALL_PROPERTY_LINEAR_SCAN_CAP + 4);
+        for idx in 0..(SMALL_PROPERTY_LINEAR_SCAN_CAP + 1) {
+            pm.insert(format!("k{idx}"), JsValue::Smi(idx as i32));
+        }
+        let shape_id = pm.shape_id();
+        let layout_id = pm.layout_id();
+
+        let cloned = pm.clone_shape();
+
+        assert_eq!(cloned.keys, pm.keys);
+        assert!(
+            cloned
+                .values
+                .iter()
+                .all(|value| matches!(value, JsValue::Undefined))
+        );
+        assert_eq!(cloned.attrs, pm.attrs);
+        assert_ne!(cloned.shape_id(), shape_id);
+        assert_eq!(cloned.layout_id(), layout_id);
+        assert!(matches!(cloned.index, PropertyIndex::Map(_)));
+        assert_eq!(cloned.template_next_slot, 0);
+        assert_eq!(cloned.capacity_hint, pm.capacity_hint);
+    }
+
+    #[test]
+    fn test_try_template_fill_returns_offset_and_disables_on_miss() {
+        let mut pm = PropertyMap::from_boilerplate(
+            &[Rc::from("first"), Rc::from("second")],
+            &[DEFAULT_ATTRS, DEFAULT_ATTRS],
+        );
+
+        assert_eq!(pm.try_template_fill("first", JsValue::Smi(1)), Ok(0));
+        assert_eq!(pm.try_template_fill("second", JsValue::Smi(2)), Ok(1));
+        assert_eq!(pm.get("first"), Some(&JsValue::Smi(1)));
+        assert_eq!(pm.get("second"), Some(&JsValue::Smi(2)));
+
+        let err = pm.try_template_fill("third", JsValue::Smi(3));
+        assert_eq!(err, Err(JsValue::Smi(3)));
+        assert_eq!(pm.template_next_slot, usize::MAX);
+    }
+
     // ── Inline cache tests ───────────────────────────────────────────────
 
     #[test]
     fn test_cache_populated_on_get() {
         let mut pm = PropertyMap::new();
-        pm.insert("x".to_string(), JsValue::Smi(1));
-        pm.insert("y".to_string(), JsValue::Smi(2));
+        for i in 0..=SMALL_PROPERTY_LINEAR_SCAN_CAP {
+            pm.insert(format!("k{i}"), JsValue::Smi(i as i32));
+        }
 
         // First access populates the cache.
-        assert_eq!(pm.get("x"), Some(&JsValue::Smi(1)));
-        assert_eq!(pm.cache_len.get(), 1);
+        assert_eq!(pm.get("k0"), Some(&JsValue::Smi(0)));
 
         // Second access of same key hits the cache.
-        assert_eq!(pm.get("x"), Some(&JsValue::Smi(1)));
-        assert_eq!(pm.cache_len.get(), 1); // no new entry
+        assert_eq!(pm.get("k0"), Some(&JsValue::Smi(0)));
 
         // Different key adds another cache entry.
-        assert_eq!(pm.get("y"), Some(&JsValue::Smi(2)));
-        assert_eq!(pm.cache_len.get(), 2);
+        assert_eq!(pm.get("k1"), Some(&JsValue::Smi(1)));
+        assert!(pm.inline_cache.is_some());
     }
 
     #[test]
     fn test_cache_invalidated_on_remove() {
         let mut pm = PropertyMap::new();
-        pm.insert("a".to_string(), JsValue::Smi(1));
-        pm.insert("b".to_string(), JsValue::Smi(2));
+        for i in 0..=SMALL_PROPERTY_LINEAR_SCAN_CAP {
+            pm.insert(format!("k{i}"), JsValue::Smi(i as i32));
+        }
 
         // Populate cache.
-        assert_eq!(pm.get("a"), Some(&JsValue::Smi(1)));
-        assert_eq!(pm.cache_len.get(), 1);
+        assert_eq!(pm.get("k0"), Some(&JsValue::Smi(0)));
 
         // Remove invalidates cache.
-        pm.remove("a");
-        assert_eq!(pm.cache_len.get(), 0);
+        pm.remove("k0");
     }
 
     #[test]
@@ -1439,7 +1571,6 @@ mod tests {
         for i in 0..(INLINE_CACHE_CAP as i32 + 2) {
             assert_eq!(pm.get(&format!("k{i}")), Some(&JsValue::Smi(i)));
         }
-        assert_eq!(pm.cache_len.get(), INLINE_CACHE_CAP as u8);
         // All lookups should still work (cache or HashMap fallback).
         for i in 0..(INLINE_CACHE_CAP as i32 + 2) {
             assert_eq!(pm.get(&format!("k{i}")), Some(&JsValue::Smi(i)));
@@ -1449,47 +1580,65 @@ mod tests {
     #[test]
     fn test_cache_hit_moves_entry_to_front() {
         let mut pm = PropertyMap::new();
-        pm.insert("a".to_string(), JsValue::Smi(1));
-        pm.insert("b".to_string(), JsValue::Smi(2));
+        for i in 0..=SMALL_PROPERTY_LINEAR_SCAN_CAP {
+            pm.insert(format!("k{i}"), JsValue::Smi(i as i32));
+        }
 
-        assert_eq!(pm.get("a"), Some(&JsValue::Smi(1)));
-        assert_eq!(pm.get("b"), Some(&JsValue::Smi(2)));
+        assert_eq!(pm.get("k0"), Some(&JsValue::Smi(0)));
+        assert_eq!(pm.get("k1"), Some(&JsValue::Smi(1)));
 
-        let hash_a = name_hash("a");
-        let hash_b = name_hash("b");
-        assert_eq!(pm.cache_hashes[0].get(), hash_a);
-        assert_eq!(pm.cache_hashes[1].get(), hash_b);
+        // With a 16-entry direct-mapped hash cache, each key hashes to a
+        // specific slot.  Verify that both are cached at their hash slots.
+        let hash_a = name_hash("k0");
+        let hash_b = name_hash("k1");
+        let idx_a = (hash_a as usize) & (INLINE_CACHE_CAP - 1);
+        let idx_b = (hash_b as usize) & (INLINE_CACHE_CAP - 1);
+        let cache = pm
+            .inline_cache
+            .as_ref()
+            .expect("large map should allocate cache");
+        assert_eq!(cache.hashes[idx_a].get(), hash_a);
+        assert_eq!(cache.hashes[idx_b].get(), hash_b);
 
-        assert_eq!(pm.get("b"), Some(&JsValue::Smi(2)));
-        assert_eq!(pm.cache_hashes[0].get(), hash_b);
-        assert_eq!(pm.cache_hashes[1].get(), hash_a);
+        // Re-access "k1" — still at the same hash slot.
+        assert_eq!(pm.get("k1"), Some(&JsValue::Smi(1)));
+        assert_eq!(cache.hashes[idx_b].get(), hash_b);
     }
 
     #[test]
     fn test_cache_contains_key_fast_path() {
         let mut pm = PropertyMap::new();
-        pm.insert("x".to_string(), JsValue::Smi(1));
+        for i in 0..=SMALL_PROPERTY_LINEAR_SCAN_CAP {
+            pm.insert(format!("k{i}"), JsValue::Smi(i as i32));
+        }
         // Populate cache via get.
-        let _ = pm.get("x");
+        let _ = pm.get("k0");
         // contains_key should hit the cache.
-        assert!(pm.contains_key("x"));
+        assert!(pm.contains_key("k0"));
         assert!(!pm.contains_key("missing"));
     }
 
     #[test]
     fn test_cache_get_with_attrs_fast_path() {
         let mut pm = PropertyMap::new();
+        for i in 0..SMALL_PROPERTY_LINEAR_SCAN_CAP {
+            pm.insert(format!("k{i}"), JsValue::Smi(i as i32));
+        }
         pm.insert_with_attrs(
-            "p".to_string(),
+            format!("k{SMALL_PROPERTY_LINEAR_SCAN_CAP}"),
             JsValue::Smi(42),
             PropertyAttributes::WRITABLE | PropertyAttributes::ENUMERABLE,
         );
         // First call: populates cache.
-        let (val, attrs) = pm.get_with_attrs("p").unwrap();
+        let (val, attrs) = pm
+            .get_with_attrs(&format!("k{SMALL_PROPERTY_LINEAR_SCAN_CAP}"))
+            .unwrap();
         assert_eq!(val, &JsValue::Smi(42));
         assert!(attrs.contains(PropertyAttributes::WRITABLE));
         // Second call: should hit cache.
-        let (val2, attrs2) = pm.get_with_attrs("p").unwrap();
+        let (val2, attrs2) = pm
+            .get_with_attrs(&format!("k{SMALL_PROPERTY_LINEAR_SCAN_CAP}"))
+            .unwrap();
         assert_eq!(val2, &JsValue::Smi(42));
         assert_eq!(attrs, attrs2);
     }
@@ -1502,8 +1651,6 @@ mod tests {
         pm2.insert("x".to_string(), JsValue::Smi(1));
         // pm1 has a populated cache, pm2 does not.
         let _ = pm1.get("x");
-        assert_eq!(pm1.cache_len.get(), 1);
-        assert_eq!(pm2.cache_len.get(), 0);
         // They should still be equal.
         assert_eq!(pm1, pm2);
     }
@@ -1537,11 +1684,8 @@ mod tests {
         pm.insert("a".to_string(), JsValue::Smi(3));
         pm.insert("0".to_string(), JsValue::Smi(4));
         // Expected spec order: 0, 2, b, a
-        let keys: Vec<&String> = pm.keys().collect();
-        assert_eq!(
-            keys.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            vec!["0", "2", "b", "a"]
-        );
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
+        assert_eq!(keys, vec!["0", "2", "b", "a"]);
     }
 
     #[test]
@@ -1551,7 +1695,7 @@ mod tests {
         pm.insert("2".to_string(), JsValue::Smi(2));
         pm.insert("1".to_string(), JsValue::Smi(1));
         pm.insert("20".to_string(), JsValue::Smi(20));
-        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        let keys: Vec<&str> = pm.keys().map(|s| &**s).collect();
         assert_eq!(keys, vec!["1", "2", "10", "20"]);
         assert_eq!(pm.integer_key_count, 4);
     }
@@ -1574,7 +1718,7 @@ mod tests {
         pm.insert("z".to_string(), JsValue::Smi(1));
         pm.insert("a".to_string(), JsValue::Smi(2));
         pm.insert("m".to_string(), JsValue::Smi(3));
-        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        let keys: Vec<&str> = pm.keys().map(|s| &**s).collect();
         assert_eq!(keys, vec!["z", "a", "m"]);
     }
 
@@ -1589,7 +1733,7 @@ mod tests {
         pm.insert("m".to_string(), JsValue::Smi(5));
         pm.insert("3".to_string(), JsValue::Smi(6));
         // Spec: integer indices ascending, then strings in insertion order.
-        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        let keys: Vec<&str> = pm.keys().map(|s| &**s).collect();
         assert_eq!(keys, vec!["1", "3", "5", "z", "a", "m"]);
     }
 
@@ -1600,7 +1744,7 @@ mod tests {
         pm.insert("b".to_string(), JsValue::Smi(2));
         pm.insert("c".to_string(), JsValue::Smi(3));
         pm.remove("b");
-        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        let keys: Vec<&str> = pm.keys().map(|s| &**s).collect();
         assert_eq!(keys, vec!["a", "c"]);
         // Remaining entries still accessible.
         assert_eq!(pm.get("a"), Some(&JsValue::Smi(1)));
@@ -1616,7 +1760,7 @@ mod tests {
         pm.insert("1".to_string(), JsValue::Smi(4));
         // Before remove: 1, 3, x, y
         pm.remove("3");
-        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        let keys: Vec<&str> = pm.keys().map(|s| &**s).collect();
         assert_eq!(keys, vec!["1", "x", "y"]);
         assert_eq!(pm.integer_key_count, 1);
     }
@@ -1633,7 +1777,7 @@ mod tests {
         );
         pm.insert("0".to_string(), JsValue::Smi(3));
         // Enumerable keys should follow spec order, excluding "hidden".
-        let keys: Vec<&str> = pm.enumerable_keys().map(|s| s.as_str()).collect();
+        let keys: Vec<&str> = pm.enumerable_keys().map(|s| &**s).collect();
         assert_eq!(keys, vec!["0", "2", "b"]);
     }
 
@@ -1644,7 +1788,7 @@ mod tests {
         pm.insert("1".to_string(), JsValue::Smi(20));
         pm.insert("0".to_string(), JsValue::Smi(30));
         // Spec order: 0, 1, b — values should follow.
-        let pairs: Vec<(&str, &JsValue)> = pm.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        let pairs: Vec<(&str, &JsValue)> = pm.iter().map(|(k, v)| (&**k, v)).collect();
         assert_eq!(
             pairs,
             vec![
@@ -1662,7 +1806,7 @@ mod tests {
         pm.insert("a".to_string(), JsValue::Smi(20));
         // Re-insert "1" — should update value, not move it.
         pm.insert("1".to_string(), JsValue::Smi(99));
-        let keys: Vec<&str> = pm.keys().map(|s| s.as_str()).collect();
+        let keys: Vec<&str> = pm.keys().map(|s| &**s).collect();
         assert_eq!(keys, vec!["1", "a"]);
         assert_eq!(pm.get("1"), Some(&JsValue::Smi(99)));
     }
@@ -1871,7 +2015,7 @@ mod tests {
             PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
         ); // not enumerable
         pm.insert("c".to_string(), JsValue::Smi(3)); // default = enumerable
-        let keys: Vec<&String> = pm.enumerable_keys().collect();
+        let keys: Vec<&str> = pm.enumerable_keys().map(|k| &**k).collect();
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0], "a");
         assert_eq!(keys[1], "c");
@@ -1887,7 +2031,7 @@ mod tests {
             PropertyAttributes::empty(),
         );
         pm.insert("y".to_string(), JsValue::Smi(20));
-        let pairs: Vec<(&String, &JsValue)> = pm.enumerable_iter().collect();
+        let pairs: Vec<(&str, &JsValue)> = pm.enumerable_iter().map(|(k, v)| (&**k, v)).collect();
         assert_eq!(pairs.len(), 2);
         assert_eq!(pairs[0].0, "x");
         assert_eq!(pairs[1].0, "y");
@@ -1904,7 +2048,8 @@ mod tests {
             JsValue::Smi(2),
             PropertyAttributes::WRITABLE,
         );
-        let triples: Vec<(&String, &JsValue, PropertyAttributes)> = pm.iter_with_attrs().collect();
+        let triples: Vec<(&str, &JsValue, PropertyAttributes)> =
+            pm.iter_with_attrs().map(|(k, v, a)| (&**k, v, a)).collect();
         assert_eq!(triples.len(), 2);
         assert!(triples[0].2.contains(PropertyAttributes::ENUMERABLE));
         assert!(!triples[1].2.contains(PropertyAttributes::ENUMERABLE));
@@ -1941,7 +2086,7 @@ mod tests {
         let mut pm = PropertyMap::new();
         pm.insert(INTERNAL_PROTO_PROPERTY_KEY.to_string(), JsValue::Null);
         pm.insert("visible".to_string(), JsValue::Smi(1));
-        let enum_keys: Vec<&String> = pm.enumerable_keys().collect();
+        let enum_keys: Vec<&str> = pm.enumerable_keys().map(|k| &**k).collect();
         assert_eq!(enum_keys.len(), 1);
         assert_eq!(enum_keys[0], "visible");
     }
@@ -2021,7 +2166,7 @@ mod tests {
         pm.insert("2".to_string(), JsValue::Smi(2));
         pm.insert("0".to_string(), JsValue::Smi(0));
         pm.insert("1".to_string(), JsValue::Smi(1));
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         assert_eq!(keys, &["0", "1", "2"]);
     }
 
@@ -2032,7 +2177,7 @@ mod tests {
         pm.insert("1".to_string(), JsValue::Smi(2));
         pm.insert("a".to_string(), JsValue::Smi(3));
         pm.insert("0".to_string(), JsValue::Smi(4));
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         assert_eq!(keys, &["0", "1", "b", "a"]);
     }
 
@@ -2045,9 +2190,9 @@ mod tests {
         let sym_key = symbol_to_property_key(sym);
         pm.insert(sym_key.clone(), JsValue::Smi(2));
         pm.insert("b".to_string(), JsValue::Smi(3));
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         // "a", "b" (strings in insertion order), then symbol
-        assert_eq!(keys, &["a", "b", &sym_key]);
+        assert_eq!(keys, &["a", "b", sym_key.as_str()]);
     }
 
     #[test]
@@ -2061,8 +2206,8 @@ mod tests {
         pm.insert("5".to_string(), JsValue::Smi(3));
         pm.insert("a".to_string(), JsValue::Smi(4));
         pm.insert("0".to_string(), JsValue::Smi(5));
-        let keys: Vec<&String> = pm.keys().collect();
-        assert_eq!(keys, &["0", "5", "z", "a", &sym_key]);
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
+        assert_eq!(keys, &["0", "5", "z", "a", sym_key.as_str()]);
     }
 
     #[test]
@@ -2071,7 +2216,7 @@ mod tests {
         pm.insert("2".to_string(), JsValue::String("c".into()));
         pm.insert("0".to_string(), JsValue::String("a".into()));
         pm.insert("1".to_string(), JsValue::String("b".into()));
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         assert_eq!(keys, &["0", "1", "2"]);
     }
 
@@ -2082,7 +2227,7 @@ mod tests {
         pm.insert("5".to_string(), JsValue::Smi(2));
         pm.insert("42".to_string(), JsValue::Smi(3));
         pm.insert("3".to_string(), JsValue::Smi(4));
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         assert_eq!(keys, &["3", "5", "42", "100"]);
     }
 
@@ -2093,9 +2238,9 @@ mod tests {
         pm.insert("0".to_string(), JsValue::Smi(1));
         pm.insert(max_str.clone(), JsValue::Smi(2));
         pm.insert("a".to_string(), JsValue::Smi(3));
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         // u32::MAX is NOT an array index, so treated as string
-        assert_eq!(keys, &["0", &max_str, "a"]);
+        assert_eq!(keys, &["0", max_str.as_str(), "a"]);
     }
 
     #[test]
@@ -2104,7 +2249,7 @@ mod tests {
         pm.insert("01".to_string(), JsValue::Smi(1));
         pm.insert("0".to_string(), JsValue::Smi(2));
         pm.insert("1".to_string(), JsValue::Smi(3));
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         // "01" is not a valid array index, so it's a string key
         assert_eq!(keys, &["0", "1", "01"]);
     }
@@ -2115,7 +2260,7 @@ mod tests {
         pm.insert("c".to_string(), JsValue::Smi(1));
         pm.insert("a".to_string(), JsValue::Smi(2));
         pm.insert("b".to_string(), JsValue::Smi(3));
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         assert_eq!(keys, &["c", "a", "b"]);
     }
 
@@ -2130,9 +2275,9 @@ mod tests {
         pm.insert(k1.clone(), JsValue::Smi(1));
         pm.insert("a".to_string(), JsValue::Smi(2));
         pm.insert(k2.clone(), JsValue::Smi(3));
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         // Strings first, then symbols in insertion order
-        assert_eq!(keys, &["a", &k1, &k2]);
+        assert_eq!(keys, &["a", k1.as_str(), k2.as_str()]);
     }
 
     #[test]
@@ -2144,7 +2289,7 @@ mod tests {
         let sym_key = symbol_to_property_key(sym);
         pm.insert(sym_key, JsValue::Smi(2));
         pm.insert("b".to_string(), JsValue::Smi(3));
-        let enumerable: Vec<&String> = pm.enumerable_keys().collect();
+        let enumerable: Vec<&str> = pm.enumerable_keys().map(|k| &**k).collect();
         assert_eq!(enumerable, &["a", "b"]);
     }
 
@@ -2157,7 +2302,7 @@ mod tests {
             JsValue::Smi(2),
             PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
         );
-        let enumerable: Vec<&String> = pm.enumerable_keys().collect();
+        let enumerable: Vec<&str> = pm.enumerable_keys().map(|k| &**k).collect();
         assert_eq!(enumerable, &["visible"]);
     }
 
@@ -2168,8 +2313,8 @@ mod tests {
         pm.insert("3".to_string(), JsValue::Smi(2));
         pm.insert("1".to_string(), JsValue::Smi(3));
         pm.insert("a".to_string(), JsValue::Smi(4));
-        let pairs: Vec<(&String, &JsValue)> = pm.enumerable_iter().collect();
-        let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        let pairs: Vec<(&str, &JsValue)> = pm.enumerable_iter().map(|(k, v)| (&**k, v)).collect();
+        let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
         assert_eq!(keys, &["1", "3", "z", "a"]);
     }
 
@@ -2199,7 +2344,7 @@ mod tests {
         pm.insert("a".to_string(), JsValue::Smi(3));
         pm.insert("b".to_string(), JsValue::Smi(4));
         pm.remove("a");
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         assert_eq!(keys, &["0", "1", "b"]);
     }
 
@@ -2210,7 +2355,7 @@ mod tests {
         pm.insert("10".to_string(), JsValue::Smi(2));
         pm.insert("2".to_string(), JsValue::Smi(3));
         pm.insert("a".to_string(), JsValue::Smi(4));
-        let keys: Vec<&str> = pm.iter_with_attrs().map(|(k, _, _)| k.as_str()).collect();
+        let keys: Vec<&str> = pm.iter_with_attrs().map(|(k, _, _)| &**k).collect();
         assert_eq!(keys, &["2", "10", "b", "a"]);
     }
 
@@ -2232,7 +2377,7 @@ mod tests {
             JsValue::Smi(3),
             PropertyAttributes::ENUMERABLE,
         );
-        let keys: Vec<&String> = pm.keys().collect();
+        let keys: Vec<&str> = pm.keys().map(|k| &**k).collect();
         assert_eq!(keys, &["1", "3", "b"]);
     }
 
@@ -2243,8 +2388,9 @@ mod tests {
             pm.insert(format!("k{idx}"), JsValue::Smi(idx as i32));
         }
         assert!(matches!(pm.index, PropertyIndex::Inline));
+        let last_key = format!("k{}", SMALL_PROPERTY_LINEAR_SCAN_CAP - 1);
         assert_eq!(
-            pm.get("k7"),
+            pm.get(&last_key),
             Some(&JsValue::Smi((SMALL_PROPERTY_LINEAR_SCAN_CAP - 1) as i32))
         );
 

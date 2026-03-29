@@ -405,7 +405,7 @@ impl<'a> GraphBuilder<'a> {
             | Opcode::JumpIfUndefinedOrNull
             | Opcode::JumpIfJSReceiver
             | Opcode::JumpLoop => {
-                if let Operand::JumpOffset(off) = instr.operands[0] {
+                if let Operand::JumpOffset(off) = *instr.operand(0) {
                     off
                 } else {
                     return None;
@@ -1918,7 +1918,7 @@ impl<'a> GraphBuilder<'a> {
     // ── Operand accessors ─────────────────────────────────────────────────────
 
     fn operand_register(&self, instr: &Instruction, idx: usize) -> StatorResult<u32> {
-        match instr.operands.get(idx) {
+        match instr.operand_at(idx) {
             Some(Operand::Register(r)) => Ok(*r),
             _ => Err(StatorError::Internal(format!(
                 "{:?}: expected Register at operand {idx}",
@@ -1928,7 +1928,7 @@ impl<'a> GraphBuilder<'a> {
     }
 
     fn operand_register_count(&self, instr: &Instruction, idx: usize) -> StatorResult<u32> {
-        match instr.operands.get(idx) {
+        match instr.operand_at(idx) {
             Some(Operand::RegisterCount(c)) => Ok(*c),
             Some(Operand::Register(r)) => Ok(*r), // some encodings reuse Register
             _ => Err(StatorError::Internal(format!(
@@ -1939,7 +1939,7 @@ impl<'a> GraphBuilder<'a> {
     }
 
     fn operand_immediate(&self, instr: &Instruction, idx: usize) -> StatorResult<i32> {
-        match instr.operands.get(idx) {
+        match instr.operand_at(idx) {
             Some(Operand::Immediate(v)) => Ok(*v),
             _ => Err(StatorError::Internal(format!(
                 "{:?}: expected Immediate at operand {idx}",
@@ -1949,7 +1949,7 @@ impl<'a> GraphBuilder<'a> {
     }
 
     fn operand_constant_pool_idx(&self, instr: &Instruction, idx: usize) -> StatorResult<u32> {
-        match instr.operands.get(idx) {
+        match instr.operand_at(idx) {
             Some(Operand::ConstantPoolIdx(v)) => Ok(*v),
             _ => Err(StatorError::Internal(format!(
                 "{:?}: expected ConstantPoolIdx at operand {idx}",
@@ -1959,7 +1959,7 @@ impl<'a> GraphBuilder<'a> {
     }
 
     fn operand_feedback_slot(&self, instr: &Instruction, idx: usize) -> StatorResult<u32> {
-        match instr.operands.get(idx) {
+        match instr.operand_at(idx) {
             Some(Operand::FeedbackSlot(v)) => Ok(*v),
             _ => Err(StatorError::Internal(format!(
                 "{:?}: expected FeedbackSlot at operand {idx}",
@@ -1969,7 +1969,7 @@ impl<'a> GraphBuilder<'a> {
     }
 
     fn operand_runtime_id(&self, instr: &Instruction, idx: usize) -> StatorResult<u32> {
-        match instr.operands.get(idx) {
+        match instr.operand_at(idx) {
             Some(Operand::RuntimeId(v)) => Ok(*v),
             _ => Err(StatorError::Internal(format!(
                 "{:?}: expected RuntimeId at operand {idx}",
@@ -1979,7 +1979,7 @@ impl<'a> GraphBuilder<'a> {
     }
 
     fn operand_flag(&self, instr: &Instruction, idx: usize) -> StatorResult<u8> {
-        match instr.operands.get(idx) {
+        match instr.operand_at(idx) {
             Some(Operand::Flag(v)) => Ok(*v),
             _ => Err(StatorError::Internal(format!(
                 "{:?}: expected Flag at operand {idx}",

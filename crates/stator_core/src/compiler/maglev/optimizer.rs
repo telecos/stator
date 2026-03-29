@@ -516,7 +516,9 @@ fn visit_value_node_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
         | ValueNode::Int32LessThanOrEqual { left, right }
         | ValueNode::Int32GreaterThan { left, right }
         | ValueNode::Int32GreaterThanOrEqual { left, right }
+        | ValueNode::Int32Equal { left, right }
         | ValueNode::Int32StrictEqual { left, right }
+        | ValueNode::Float64Equal { left, right }
         | ValueNode::Float64LessThan { left, right }
         | ValueNode::Float64LessThanOrEqual { left, right }
         | ValueNode::Float64GreaterThan { left, right }

@@ -282,7 +282,10 @@ pub enum JsValue {
     /// A pointer to a GC-managed heap object.
     Object(*mut HeapObject),
     /// A JavaScript `BigInt` value (represented as a 128-bit signed integer).
-    BigInt(i128),
+    ///
+    /// Boxed to keep `JsValue` at 16 bytes (pointer-sized) instead of 24.
+    /// BigInt is rare in hot paths, so the extra indirection is negligible.
+    BigInt(Box<i128>),
     /// A callable JavaScript function backed by a [`BytecodeArray`] closure.
     ///
     /// The [`Rc`] allows function values to be cheaply cloned and shared
@@ -352,6 +355,12 @@ pub enum JsValue {
     /// A JavaScript `DataView` (ECMAScript §25.3) — byte-level buffer accessor.
     DataView(Rc<RefCell<crate::builtins::typed_array::JsDataView>>),
 }
+
+// Compile-time assertion: JsValue is 24 bytes (discriminant + 16-byte max payload).
+// Boxing BigInt removes i128 from the enum layout, but String(Rc<str>) and
+// NativeFunction(Rc<dyn Fn(…)>) are still 16-byte fat pointers.
+// TODO: Use thin-pointer wrappers for Rc<str>/Rc<dyn Fn> to reach 16 bytes.
+const _: () = assert!(std::mem::size_of::<JsValue>() == 24);
 
 /// A scope context representing the environment for captured variables.
 ///
@@ -488,13 +497,13 @@ impl JsValue {
     /// Returns `true` if this value is a boolean.
     #[inline(always)]
     pub fn is_boolean(&self) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(&Self::Boolean(false))
+        matches!(self, Self::Boolean(_))
     }
 
     /// Returns `true` if this value is a small integer ([`Smi`][JsValue::Smi]).
     #[inline(always)]
     pub fn is_smi(&self) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(&Self::Smi(0))
+        matches!(self, Self::Smi(_))
     }
 
     /// Extract the Smi payload without re-checking the discriminant.
@@ -516,7 +525,7 @@ impl JsValue {
     /// Returns `true` if this value is a heap number ([`HeapNumber`][JsValue::HeapNumber]).
     #[inline(always)]
     pub fn is_heap_number(&self) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(&Self::HeapNumber(0.0))
+        matches!(self, Self::HeapNumber(_))
     }
 
     /// Extract the heap-number payload without re-checking the discriminant.
@@ -562,23 +571,37 @@ impl JsValue {
     /// Returns `true` if this value is any numeric type (`Smi` or `HeapNumber`).
     #[inline(always)]
     pub fn is_number(&self) -> bool {
-        self.is_smi() || self.is_heap_number()
+        matches!(self, Self::Smi(_) | Self::HeapNumber(_))
+    }
+
+    /// Convert to `f64` if this is a numeric type (`Smi` or `HeapNumber`).
+    ///
+    /// Returns `None` for non-numeric values without invoking the full
+    /// `ToNumber` abstract operation.  Use this on the interpreter fast path
+    /// where both operands are already known to be numbers.
+    #[inline(always)]
+    pub fn as_number_fast(&self) -> Option<f64> {
+        match self {
+            Self::Smi(v) => Some(*v as f64),
+            Self::HeapNumber(v) => Some(*v),
+            _ => None,
+        }
     }
 
     /// Returns `true` if this value is a string.
     #[inline(always)]
     pub fn is_string(&self) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(&Self::String(Rc::from("")))
+        matches!(self, Self::String(_))
     }
 
     /// Returns `true` if this value is a symbol.
-    #[inline]
+    #[inline(always)]
     pub fn is_symbol(&self) -> bool {
         matches!(self, Self::Symbol(_))
     }
 
     /// Returns `true` if this value is an object.
-    #[inline]
+    #[inline(always)]
     pub fn is_object(&self) -> bool {
         matches!(self, Self::Object(_))
     }
@@ -590,7 +613,7 @@ impl JsValue {
     }
 
     /// Returns `true` if this value is a callable function.
-    #[inline]
+    #[inline(always)]
     pub fn is_function(&self) -> bool {
         matches!(self, Self::Function(_) | Self::NativeFunction(_))
     }
@@ -627,7 +650,7 @@ impl JsValue {
 
     /// Returns `true` if this value is an ECMAScript primitive
     /// (Undefined, Null, Boolean, Number, String, Symbol, or BigInt).
-    #[inline]
+    #[inline(always)]
     pub fn is_primitive(&self) -> bool {
         matches!(
             self,
@@ -643,7 +666,7 @@ impl JsValue {
     }
 
     /// Returns `true` if this value is an object-like type (not a primitive).
-    #[inline]
+    #[inline(always)]
     pub fn is_object_like(&self) -> bool {
         !self.is_primitive()
     }
@@ -664,12 +687,13 @@ impl JsValue {
             | Self::Smi(_)
             | Self::HeapNumber(_)
             | Self::Symbol(_)
-            | Self::Object(_)
-            | Self::BigInt(_) => {
+            | Self::Object(_) => {
                 // SAFETY: The checked variants are stack-only scalars or raw pointers with
                 // no reference-counted ownership to update, so bitwise copy is valid.
                 unsafe { self.stack_clone() }
             }
+            // BigInt(Box<i128>) owns heap memory — must use proper Clone.
+            Self::BigInt(_) => self.clone(),
             _ => self.clone(),
         }
     }
@@ -685,6 +709,20 @@ impl JsValue {
         // SAFETY: Caller guarantees this value is stack-only, so bitwise copy
         // preserves correctness without reference-count updates.
         unsafe { std::ptr::read(self) }
+    }
+
+    /// Fast path for Smi equality — avoids the full abstract/strict equality
+    /// machinery.
+    ///
+    /// Returns `Some(true/false)` when **both** operands are [`Smi`] values,
+    /// or `None` if either operand is not a Smi.
+    #[inline(always)]
+    pub fn smi_eq(&self, other: &Self) -> Option<bool> {
+        if let (Self::Smi(a), Self::Smi(b)) = (self, other) {
+            Some(a == b)
+        } else {
+            None
+        }
     }
 
     /// Extract the boolean payload without re-checking the discriminant.
@@ -783,7 +821,7 @@ impl JsValue {
     /// | `Symbol` | `true` |
     /// | `Object` | `true` |
     /// | `BigInt` | `false` if `0`, otherwise `true` |
-    #[inline]
+    #[inline(always)]
     pub fn to_boolean(&self) -> bool {
         match self {
             Self::Undefined | Self::Null | Self::TheHole => false,
@@ -806,7 +844,7 @@ impl JsValue {
             | Self::ArrayBuffer(_)
             | Self::TypedArray(_)
             | Self::DataView(_) => true,
-            Self::BigInt(n) => *n != 0,
+            Self::BigInt(n) => **n != 0,
         }
     }
 
@@ -875,7 +913,7 @@ impl JsValue {
     ///
     /// String parsing handles hex (`0x`), octal (`0o`), and binary (`0b`)
     /// integer literals as well as `"Infinity"` / `"-Infinity"`.
-    #[inline]
+    #[inline(always)]
     pub fn to_number(&self) -> StatorResult<f64> {
         match self {
             Self::Undefined | Self::TheHole => Ok(f64::NAN),
@@ -1359,11 +1397,11 @@ impl JsValue {
 
         // Step 4a: BigInt × String
         if let (JsValue::BigInt(n), JsValue::String(s)) = (&px, &py) {
-            return Ok(s.trim().parse::<i128>().ok().map(|parsed| *n < parsed));
+            return Ok(s.trim().parse::<i128>().ok().map(|parsed| **n < parsed));
         }
         // Step 4b: String × BigInt
         if let (JsValue::String(s), JsValue::BigInt(n)) = (&px, &py) {
-            return Ok(s.trim().parse::<i128>().ok().map(|parsed| parsed < *n));
+            return Ok(s.trim().parse::<i128>().ok().map(|parsed| parsed < **n));
         }
 
         // Step 4d-e: ToNumeric on both sides.
@@ -1389,7 +1427,7 @@ impl JsValue {
                 if b.is_infinite() {
                     return Ok(Some(b.is_sign_positive()));
                 }
-                Ok(Some((*a as f64) < *b))
+                Ok(Some((**a as f64) < *b))
             }
             // Number × BigInt
             (JsValue::HeapNumber(a), JsValue::BigInt(b)) => {
@@ -1399,7 +1437,7 @@ impl JsValue {
                 if a.is_infinite() {
                     return Ok(Some(a.is_sign_negative()));
                 }
-                Ok(Some(*a < (*b as f64)))
+                Ok(Some(*a < (**b as f64)))
             }
             _ => Ok(None),
         }
@@ -1800,7 +1838,7 @@ fn is_loosely_equal_inner(lhs: &JsValue, rhs: &JsValue, depth: u8) -> StatorResu
         if let JsValue::String(s) = rhs
             && let Ok(n) = s.trim().parse::<i128>()
         {
-            return is_loosely_equal_inner(lhs, &JsValue::BigInt(n), depth + 1);
+            return is_loosely_equal_inner(lhs, &JsValue::BigInt(Box::new(n)), depth + 1);
         }
         return Ok(false);
     }
@@ -1839,7 +1877,7 @@ fn is_loosely_equal_inner(lhs: &JsValue, rhs: &JsValue, depth: u8) -> StatorResu
             return Ok(false);
         }
         // Compare exactly: the BigInt must equal the truncated f64.
-        return Ok(*x as f64 == y && y as i128 == *x);
+        return Ok(**x as f64 == y && y as i128 == **x);
     }
     if let (_, JsValue::BigInt(y)) = (lhs, rhs)
         && lhs.is_number()
@@ -1848,7 +1886,7 @@ fn is_loosely_equal_inner(lhs: &JsValue, rhs: &JsValue, depth: u8) -> StatorResu
         if x.is_nan() || x.is_infinite() {
             return Ok(false);
         }
-        return Ok(*y as f64 == x && x as i128 == *y);
+        return Ok(**y as f64 == x && x as i128 == **y);
     }
 
     // Step 13: Return false.
@@ -2072,7 +2110,7 @@ mod tests {
 
     #[test]
     fn test_is_bigint() {
-        assert!(JsValue::BigInt(0).is_bigint());
+        assert!(JsValue::BigInt(Box::new(0)).is_bigint());
         assert!(!JsValue::Smi(0).is_bigint());
     }
 
@@ -2085,7 +2123,7 @@ mod tests {
         assert!(JsValue::HeapNumber(0.0).is_primitive());
         assert!(JsValue::String("".to_string().into()).is_primitive());
         assert!(JsValue::Symbol(0).is_primitive());
-        assert!(JsValue::BigInt(0).is_primitive());
+        assert!(JsValue::BigInt(Box::new(0)).is_primitive());
         assert!(!JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new()))).is_primitive());
         assert!(!JsValue::new_array(vec![]).is_primitive());
     }
@@ -2155,9 +2193,9 @@ mod tests {
 
     #[test]
     fn test_to_boolean_bigint_zero_is_false() {
-        assert!(!JsValue::BigInt(0).to_boolean());
-        assert!(JsValue::BigInt(1).to_boolean());
-        assert!(JsValue::BigInt(-1).to_boolean());
+        assert!(!JsValue::BigInt(Box::new(0)).to_boolean());
+        assert!(JsValue::BigInt(Box::new(1)).to_boolean());
+        assert!(JsValue::BigInt(Box::new(-1)).to_boolean());
     }
 
     #[test]
@@ -2194,7 +2232,7 @@ mod tests {
             JsValue::HeapNumber(3.14),
             JsValue::String("hi".to_string().into()),
             JsValue::Symbol(7),
-            JsValue::BigInt(99),
+            JsValue::BigInt(Box::new(99)),
         ];
         for v in &vals {
             assert_eq!(&v.to_primitive(ToPrimitiveHint::Default).unwrap(), v);
@@ -2579,14 +2617,14 @@ mod tests {
     #[test]
     fn test_to_number_bigint_is_type_error() {
         assert!(matches!(
-            JsValue::BigInt(42).to_number(),
+            JsValue::BigInt(Box::new(42)).to_number(),
             Err(StatorError::TypeError(_))
         ));
     }
 
     #[test]
     fn test_to_number_bigint_error_message() {
-        let err = JsValue::BigInt(0).to_number().unwrap_err();
+        let err = JsValue::BigInt(Box::new(0)).to_number().unwrap_err();
         match err {
             StatorError::TypeError(msg) => {
                 assert_eq!(msg, "Cannot convert a BigInt value to a number");
@@ -2715,9 +2753,15 @@ mod tests {
 
     #[test]
     fn test_to_js_string_bigint_v2() {
-        assert_eq!(JsValue::BigInt(0).to_js_string().unwrap(), "0");
-        assert_eq!(JsValue::BigInt(12345).to_js_string().unwrap(), "12345");
-        assert_eq!(JsValue::BigInt(-99).to_js_string().unwrap(), "-99");
+        assert_eq!(JsValue::BigInt(Box::new(0)).to_js_string().unwrap(), "0");
+        assert_eq!(
+            JsValue::BigInt(Box::new(12345)).to_js_string().unwrap(),
+            "12345"
+        );
+        assert_eq!(
+            JsValue::BigInt(Box::new(-99)).to_js_string().unwrap(),
+            "-99"
+        );
     }
 
     // ── to_int32 ─────────────────────────────────────────────────────────────
@@ -3076,18 +3120,18 @@ mod tests {
     #[test]
     fn test_is_loosely_equal_bigint_number() {
         assert!(
-            JsValue::BigInt(1)
+            JsValue::BigInt(Box::new(1))
                 .is_loosely_equal(&JsValue::Smi(1))
                 .unwrap()
         );
         assert!(
-            !JsValue::BigInt(1)
+            !JsValue::BigInt(Box::new(1))
                 .is_loosely_equal(&JsValue::Smi(2))
                 .unwrap()
         );
         // NaN != BigInt
         assert!(
-            !JsValue::BigInt(0)
+            !JsValue::BigInt(Box::new(0))
                 .is_loosely_equal(&JsValue::HeapNumber(f64::NAN))
                 .unwrap()
         );
@@ -3096,12 +3140,12 @@ mod tests {
     #[test]
     fn test_is_loosely_equal_bigint_string() {
         assert!(
-            JsValue::BigInt(42)
+            JsValue::BigInt(Box::new(42))
                 .is_loosely_equal(&JsValue::String("42".to_string().into()))
                 .unwrap()
         );
         assert!(
-            !JsValue::BigInt(42)
+            !JsValue::BigInt(Box::new(42))
                 .is_loosely_equal(&JsValue::String("abc".to_string().into()))
                 .unwrap()
         );
@@ -3354,7 +3398,11 @@ mod tests {
 
     #[test]
     fn test_to_integer_or_infinity_bigint_error() {
-        assert!(JsValue::BigInt(42).to_integer_or_infinity().is_err());
+        assert!(
+            JsValue::BigInt(Box::new(42))
+                .to_integer_or_infinity()
+                .is_err()
+        );
     }
 
     // ── to_length ────────────────────────────────────────────────────────────
@@ -3401,8 +3449,8 @@ mod tests {
 
     #[test]
     fn test_to_numeric_bigint_passthrough() {
-        let result = JsValue::BigInt(42).to_numeric().unwrap();
-        assert_eq!(result, JsValue::BigInt(42));
+        let result = JsValue::BigInt(Box::new(42)).to_numeric().unwrap();
+        assert_eq!(result, JsValue::BigInt(Box::new(42)));
     }
 
     #[test]
@@ -3522,25 +3570,47 @@ mod tests {
 
     #[test]
     fn test_less_than_bigint() {
-        assert!(JsValue::js_less_than(&JsValue::BigInt(1), &JsValue::BigInt(2)).unwrap());
-        assert!(!JsValue::js_less_than(&JsValue::BigInt(2), &JsValue::BigInt(1)).unwrap());
+        assert!(
+            JsValue::js_less_than(&JsValue::BigInt(Box::new(1)), &JsValue::BigInt(Box::new(2)))
+                .unwrap()
+        );
+        assert!(
+            !JsValue::js_less_than(&JsValue::BigInt(Box::new(2)), &JsValue::BigInt(Box::new(1)))
+                .unwrap()
+        );
     }
 
     #[test]
     fn test_less_than_bigint_vs_number() {
-        assert!(JsValue::js_less_than(&JsValue::BigInt(1), &JsValue::HeapNumber(1.5)).unwrap());
-        assert!(!JsValue::js_less_than(&JsValue::HeapNumber(2.5), &JsValue::BigInt(2)).unwrap());
+        assert!(
+            JsValue::js_less_than(&JsValue::BigInt(Box::new(1)), &JsValue::HeapNumber(1.5))
+                .unwrap()
+        );
+        assert!(
+            !JsValue::js_less_than(&JsValue::HeapNumber(2.5), &JsValue::BigInt(Box::new(2)))
+                .unwrap()
+        );
     }
 
     #[test]
     fn test_less_than_bigint_vs_string() {
         // BigInt(1) < "2" → 1 < 2 → true
-        assert!(JsValue::js_less_than(&JsValue::BigInt(1), &JsValue::String("2".into())).unwrap());
+        assert!(
+            JsValue::js_less_than(&JsValue::BigInt(Box::new(1)), &JsValue::String("2".into()))
+                .unwrap()
+        );
         // "1" < BigInt(2) → 1 < 2 → true
-        assert!(JsValue::js_less_than(&JsValue::String("1".into()), &JsValue::BigInt(2)).unwrap());
+        assert!(
+            JsValue::js_less_than(&JsValue::String("1".into()), &JsValue::BigInt(Box::new(2)))
+                .unwrap()
+        );
         // BigInt vs unparseable string → None → false
         assert!(
-            !JsValue::js_less_than(&JsValue::BigInt(1), &JsValue::String("abc".into())).unwrap()
+            !JsValue::js_less_than(
+                &JsValue::BigInt(Box::new(1)),
+                &JsValue::String("abc".into())
+            )
+            .unwrap()
         );
     }
 
@@ -3764,7 +3834,7 @@ mod tests {
 
     #[test]
     fn test_bigint_to_number_throws() {
-        let big = JsValue::BigInt(123);
+        let big = JsValue::BigInt(Box::new(123));
         assert!(big.to_number().is_err());
         match big.to_number() {
             Err(StatorError::TypeError(msg)) => {
@@ -3777,7 +3847,7 @@ mod tests {
     #[test]
     fn test_bigint_to_int32_propagates_type_error() {
         assert!(matches!(
-            JsValue::BigInt(1).to_int32(),
+            JsValue::BigInt(Box::new(1)).to_int32(),
             Err(StatorError::TypeError(_))
         ));
     }
@@ -3785,7 +3855,7 @@ mod tests {
     #[test]
     fn test_bigint_to_uint32_propagates_type_error() {
         assert!(matches!(
-            JsValue::BigInt(1).to_uint32(),
+            JsValue::BigInt(Box::new(1)).to_uint32(),
             Err(StatorError::TypeError(_))
         ));
     }
@@ -3822,17 +3892,17 @@ mod tests {
     #[test]
     fn test_bigint_to_js_string_succeeds() {
         // BigInt → ToString should produce the decimal representation.
-        assert_eq!(JsValue::BigInt(42).to_js_string().unwrap(), "42");
-        assert_eq!(JsValue::BigInt(-1).to_js_string().unwrap(), "-1");
-        assert_eq!(JsValue::BigInt(0).to_js_string().unwrap(), "0");
+        assert_eq!(JsValue::BigInt(Box::new(42)).to_js_string().unwrap(), "42");
+        assert_eq!(JsValue::BigInt(Box::new(-1)).to_js_string().unwrap(), "-1");
+        assert_eq!(JsValue::BigInt(Box::new(0)).to_js_string().unwrap(), "0");
     }
 
     #[test]
     fn test_bigint_to_numeric_passthrough() {
         // to_numeric on BigInt returns itself, not HeapNumber.
         assert_eq!(
-            JsValue::BigInt(99).to_numeric().unwrap(),
-            JsValue::BigInt(99)
+            JsValue::BigInt(Box::new(99)).to_numeric().unwrap(),
+            JsValue::BigInt(Box::new(99))
         );
     }
 
@@ -3955,7 +4025,7 @@ mod tests {
 
     #[test]
     fn test_to_boolean_bigint_negative_is_true() {
-        assert!(JsValue::BigInt(-1).to_boolean());
+        assert!(JsValue::BigInt(Box::new(-1)).to_boolean());
     }
 
     // ── to_int32 / to_uint32: cross-type coercion ────────────────────────────
@@ -4248,7 +4318,10 @@ mod tests {
 
     #[test]
     fn test_to_js_string_bigint() {
-        assert_eq!(JsValue::BigInt(123).to_js_string().unwrap(), "123");
+        assert_eq!(
+            JsValue::BigInt(Box::new(123)).to_js_string().unwrap(),
+            "123"
+        );
     }
 
     // ── to_number (ToNumber) edge cases ──────────────────────────────────
@@ -4285,7 +4358,7 @@ mod tests {
 
     #[test]
     fn test_to_number_bigint_throws() {
-        assert!(JsValue::BigInt(1).to_number().is_err());
+        assert!(JsValue::BigInt(Box::new(1)).to_number().is_err());
     }
 
     // ── is_loosely_equal (==) edge cases ─────────────────────────────────

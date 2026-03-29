@@ -186,7 +186,7 @@ mod tests {
             JsValue::HeapNumber(1.0),
             JsValue::String("x".into()),
             JsValue::Symbol(1),
-            JsValue::BigInt(99),
+            JsValue::BigInt(Box::new(99)),
         ] {
             v.trace(&mut tracer);
         }

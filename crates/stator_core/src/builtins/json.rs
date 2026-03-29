@@ -1103,7 +1103,7 @@ fn js_value_to_json_inner(
             // §25.5.2 step 6: only enumerable own properties are serialised.
             for (k, v) in map.borrow().enumerable_iter() {
                 if let Some(jv) = js_value_to_json_inner(v, seen)? {
-                    entries.push((k.clone(), jv));
+                    entries.push((k.to_string(), jv));
                 }
             }
             seen.remove(&ptr);
@@ -1760,7 +1760,7 @@ mod tests {
 
     #[test]
     fn test_js_value_stringify_bigint_throws_type_error() {
-        let result = json_stringify_js_value(&JsValue::BigInt(42), None, None);
+        let result = json_stringify_js_value(&JsValue::BigInt(Box::new(42)), None, None);
         assert!(
             matches!(&result, Err(StatorError::TypeError(msg)) if msg.contains("BigInt")),
             "expected BigInt TypeError, got {result:?}"
