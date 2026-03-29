@@ -1257,6 +1257,14 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
         use crate::compiler::maglev::graph_builder::GraphBuilder;
         use crate::compiler::maglev::optimizer::optimize;
 
+        // Top-level scripts use global variables for all `var` declarations,
+        // making the promoted-global prologue/epilogue expensive and the
+        // speculative Smi guards unreliable.  Skip Maglev and let baseline
+        // JIT handle them instead.
+        if ba.is_top_level() {
+            return;
+        }
+
         // Only one compilation thread per function.
         if !ba.try_start_maglev_compile() {
             return;
@@ -1352,6 +1360,12 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
 fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
+        // Skip top-level scripts — they rely on global variables that are
+        // poorly suited for Maglev's speculative optimisation model.
+        if ba.is_top_level() {
+            return None;
+        }
+
         // Skip if Maglev previously deopted.
         if ba.jit_maglev_has_deopted() {
             return None;
@@ -1469,6 +1483,11 @@ pub(super) fn maybe_compile_turbofan(ba: &BytecodeArray) {
         use crate::compiler::maglev::graph_builder::GraphBuilder;
         use crate::compiler::maglev::optimizer::optimize;
         use crate::compiler::turbofan;
+
+        // Skip top-level scripts (same rationale as Maglev).
+        if ba.is_top_level() {
+            return;
+        }
 
         // Only one compilation thread per function.
         if !ba.try_start_turbofan_compile() {

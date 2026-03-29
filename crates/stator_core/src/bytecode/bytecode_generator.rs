@@ -6964,6 +6964,7 @@ impl FunctionCompiler {
             .with_async_flag(self.is_async)
             .with_module_flag(self.is_module)
             .with_strict_flag(self.is_strict)
+            .with_top_level_flag(self.is_program)
             .with_binding_registers(binding_registers))
     }
 }

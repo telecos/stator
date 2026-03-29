@@ -462,6 +462,13 @@ pub struct BytecodeArray {
     /// Arrow functions are not constructable — invoking them with `new`
     /// must throw a `TypeError`.
     is_arrow: bool,
+    /// `true` if this bytecode belongs to a top-level script (not a function).
+    ///
+    /// Top-level scripts use global variables (`LdaGlobal` / `StaGlobal`)
+    /// for all `var` declarations, making speculative optimisations
+    /// unreliable.  Maglev and Turbofan skip these bytecodes and let
+    /// the baseline JIT handle them instead.
+    is_top_level: bool,
     // ─── Tiering state (shared across clones via Rc / Arc) ───────────────────
     /// Number of times this function has been invoked.
     ///
@@ -660,6 +667,7 @@ impl PartialEq for BytecodeArray {
             && self.is_module == other.is_module
             && self.is_strict == other.is_strict
             && self.is_arrow == other.is_arrow
+            && self.is_top_level == other.is_top_level
             && self.self_name_register == other.self_name_register
             && self.writes_closure_vars == other.writes_closure_vars
     }
@@ -710,6 +718,7 @@ impl BytecodeArray {
             is_module: false,
             is_strict: false,
             is_arrow: false,
+            is_top_level: false,
             invocation_count: Rc::new(Cell::new(0)),
             jit_code: Rc::new(RefCell::new(None)),
             has_jit_code: Rc::new(Cell::new(false)),
@@ -832,6 +841,22 @@ impl BytecodeArray {
     /// Returns `true` if this bytecode belongs to an arrow function (`=>`).
     pub fn is_arrow(&self) -> bool {
         self.is_arrow
+    }
+
+    /// Mark this bytecode as a top-level script.
+    pub fn set_top_level(&mut self, flag: bool) {
+        self.is_top_level = flag;
+    }
+
+    /// Returns `true` if this bytecode belongs to a top-level script.
+    pub fn is_top_level(&self) -> bool {
+        self.is_top_level
+    }
+
+    /// Builder-style: mark this bytecode as a top-level script.
+    pub fn with_top_level_flag(mut self, flag: bool) -> Self {
+        self.is_top_level = flag;
+        self
     }
 
     /// Returns the captured closure context, if any.
