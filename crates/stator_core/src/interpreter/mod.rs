@@ -1113,6 +1113,17 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
 
         // Only one compilation thread per function.
         if !ba.try_start_maglev_compile() {
+            // Log first 5 failures to understand if the same BA is being retried
+            // or if a different BA is somehow sharing the flag.
+            static SKIP_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = SKIP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 5 {
+                eprintln!(
+                    "MAGLEV_SKIP: already started bc_len={} ba_ptr={:p}",
+                    ba.bytecodes().len(),
+                    ba as *const _,
+                );
+            }
             return;
         }
 
@@ -1233,6 +1244,18 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
             let needs_init = cache.borrow().is_none();
             if needs_init {
                 if let Some((code, register_file_slots)) = ba.try_get_maglev_jit_code() {
+                    static INIT_LOG: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let n = INIT_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 3 {
+                        eprintln!(
+                            "MAGLEV_CACHE_INIT: code_len={} regs={} ba_ptr={:p} bc_len={}",
+                            code.len(),
+                            register_file_slots,
+                            ba as *const _,
+                            ba.bytecodes().len(),
+                        );
+                    }
                     // SAFETY: `code` was produced by `maglev_codegen::compile`.
                     let exec = unsafe { CachedMaglevCode::new(&code, register_file_slots) };
                     *cache.borrow_mut() = exec;
@@ -1293,12 +1316,20 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
                 5 => "div_by_zero",
                 _ => "unknown",
             };
+            let first_ops: Vec<String> = ba
+                .instructions()
+                .unwrap_or_default()
+                .iter()
+                .take(6)
+                .map(|i| format!("{:?}", i.opcode))
+                .collect();
             eprintln!(
-                "MAGLEV_DEOPT: reason={} bc_len={} global_deopts={} result=0x{:x}",
+                "MAGLEV_DEOPT: reason={} bc_len={} global_deopts={} result=0x{:x} opcodes=[{}]",
                 reason,
                 ba.bytecodes().len(),
                 global_deopts,
                 result as u64,
+                first_ops.join(", "),
             );
             // Permanently mark as deopted UNLESS the reason is loop_counter.
             // Loop-counter deopts allow retries (up to 3) so functions with

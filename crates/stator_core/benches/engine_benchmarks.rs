@@ -762,7 +762,6 @@ criterion_group! {
     targets =
         bench_fib_40_iterative,
         bench_arithmetic_loop_10k,
-        bench_js_arithmetic_precompiled,
         bench_property_access_1k,
         bench_object_creation_1k,
         bench_array_push_sum_1k,

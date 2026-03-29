@@ -32,7 +32,7 @@ jobs:
           shared-key: "bench"
 
       - name: Build benchmarks
-        run: cargo bench --package stator_core --no-run --jobs 1
+        run: cargo bench --package stator_core --no-run --jobs 1 2>&1 | tail -50
         env:
           CARGO_INCREMENTAL: "0"
 
