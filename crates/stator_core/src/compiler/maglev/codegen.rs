@@ -506,10 +506,12 @@ impl<'a> MaglevCodegen<'a> {
         self.scan_and_promote_globals(base_slots);
         let register_file_slots = base_slots + self.promoted_extra_slots;
 
-        // Precompute the set of wrapping Int32 results that only flow into
-        // other 32-bit operations, allowing us to skip the MOVSXD
-        // sign-extension for those nodes.
-        self.narrow_int32 = Self::compute_narrow_int32(self.graph, self.alloc);
+        // NOTE: narrow-Int32 analysis disabled — it causes SIGSEGV on
+        // Linux CI when Maglev compiles certain patterns (Phi + spill
+        // interactions).  The empty set means every wrapping Int32
+        // result will emit MOVSXD (safe but ~1 extra instruction).
+        // TODO: re-enable once the root cause is identified.
+        // self.narrow_int32 = Self::compute_narrow_int32(self.graph, self.alloc);
 
         self.emit_prologue();
         self.emit_promoted_global_loads();
@@ -1232,7 +1234,7 @@ impl<'a> MaglevCodegen<'a> {
                     *object,
                     i64::from(*name),
                     NodeOrImm::Imm(i64::from(*feedback_slot)),
-                    jit_runtime::jit_runtime_lda_named_property as usize,
+                    jit_runtime::jit_runtime_lda_named_property as *const () as usize,
                 );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -1247,7 +1249,7 @@ impl<'a> MaglevCodegen<'a> {
                     *object,
                     i64::from(*name),
                     NodeOrImm::Node(*value),
-                    jit_runtime::jit_runtime_sta_named_property as usize,
+                    jit_runtime::jit_runtime_sta_named_property as *const () as usize,
                 );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -1256,7 +1258,7 @@ impl<'a> MaglevCodegen<'a> {
                     id,
                     *object,
                     *key,
-                    jit_runtime::jit_runtime_lda_keyed_property as usize,
+                    jit_runtime::jit_runtime_lda_keyed_property as *const () as usize,
                 );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -1268,7 +1270,7 @@ impl<'a> MaglevCodegen<'a> {
                     *object,
                     *key,
                     *value,
-                    jit_runtime::jit_runtime_sta_keyed_property as usize,
+                    jit_runtime::jit_runtime_sta_keyed_property as *const () as usize,
                 );
             }
 
@@ -1281,7 +1283,7 @@ impl<'a> MaglevCodegen<'a> {
                     id,
                     *elements,
                     *index,
-                    jit_runtime::jit_runtime_lda_keyed_property as usize,
+                    jit_runtime::jit_runtime_lda_keyed_property as *const () as usize,
                 );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -1300,7 +1302,7 @@ impl<'a> MaglevCodegen<'a> {
                     *elements,
                     *index,
                     *value,
-                    jit_runtime::jit_runtime_sta_keyed_property as usize,
+                    jit_runtime::jit_runtime_sta_keyed_property as *const () as usize,
                 );
             }
 
@@ -1323,7 +1325,7 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.mov_ri(Reg64::Rdi, i64::from(*slot));
                 self.masm.mov_ri(
                     Reg64::R11,
-                    jit_runtime::jit_runtime_lda_context_slot as usize as i64,
+                    jit_runtime::jit_runtime_lda_context_slot as *const () as usize as i64,
                 );
                 self.masm.call_reg(Reg64::R11);
                 self.emit_restore_caller_saved();
@@ -1339,7 +1341,7 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_load(*value, Reg64::Rsi);
                 self.masm.mov_ri(
                     Reg64::R11,
-                    jit_runtime::jit_runtime_sta_context_slot as usize as i64,
+                    jit_runtime::jit_runtime_sta_context_slot as *const () as usize as i64,
                 );
                 self.masm.call_reg(Reg64::R11);
                 self.emit_restore_caller_saved();
@@ -1368,7 +1370,7 @@ impl<'a> MaglevCodegen<'a> {
                         self.emit_stub_call_1node(
                             id,
                             *callee,
-                            jit_runtime::jit_runtime_call_undefined_receiver0 as usize,
+                            jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize,
                         );
                     }
                     // CallUndefinedReceiver1
@@ -1377,7 +1379,7 @@ impl<'a> MaglevCodegen<'a> {
                             id,
                             *callee,
                             args[0],
-                            jit_runtime::jit_runtime_call_undefined_receiver1 as usize,
+                            jit_runtime::jit_runtime_call_undefined_receiver1 as *const () as usize,
                         );
                     }
                     // CallUndefinedReceiver2
@@ -1387,7 +1389,7 @@ impl<'a> MaglevCodegen<'a> {
                             *callee,
                             args[0],
                             args[1],
-                            jit_runtime::jit_runtime_call_undefined_receiver2 as usize,
+                            jit_runtime::jit_runtime_call_undefined_receiver2 as *const () as usize,
                         );
                     }
                     // CallProperty0
@@ -1396,7 +1398,7 @@ impl<'a> MaglevCodegen<'a> {
                             id,
                             *callee,
                             *receiver,
-                            jit_runtime::jit_runtime_call_property0 as usize,
+                            jit_runtime::jit_runtime_call_property0 as *const () as usize,
                         );
                     }
                     // CallProperty1
@@ -1406,7 +1408,7 @@ impl<'a> MaglevCodegen<'a> {
                             *callee,
                             *receiver,
                             args[0],
-                            jit_runtime::jit_runtime_call_property1 as usize,
+                            jit_runtime::jit_runtime_call_property1 as *const () as usize,
                         );
                     }
                     // Unsupported arity — deopt.
@@ -1433,7 +1435,7 @@ impl<'a> MaglevCodegen<'a> {
                         self.emit_stub_call_1node(
                             id,
                             *callee,
-                            jit_runtime::jit_runtime_call_undefined_receiver0 as usize,
+                            jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize,
                         );
                     }
                     (true, 1) => {
@@ -1441,7 +1443,7 @@ impl<'a> MaglevCodegen<'a> {
                             id,
                             *callee,
                             args[0],
-                            jit_runtime::jit_runtime_call_undefined_receiver1 as usize,
+                            jit_runtime::jit_runtime_call_undefined_receiver1 as *const () as usize,
                         );
                     }
                     (true, 2) => {
@@ -1450,7 +1452,7 @@ impl<'a> MaglevCodegen<'a> {
                             *callee,
                             args[0],
                             args[1],
-                            jit_runtime::jit_runtime_call_undefined_receiver2 as usize,
+                            jit_runtime::jit_runtime_call_undefined_receiver2 as *const () as usize,
                         );
                     }
                     (false, 0) => {
@@ -1458,7 +1460,7 @@ impl<'a> MaglevCodegen<'a> {
                             id,
                             *callee,
                             *receiver,
-                            jit_runtime::jit_runtime_call_property0 as usize,
+                            jit_runtime::jit_runtime_call_property0 as *const () as usize,
                         );
                     }
                     (false, 1) => {
@@ -1467,7 +1469,7 @@ impl<'a> MaglevCodegen<'a> {
                             *callee,
                             *receiver,
                             args[0],
-                            jit_runtime::jit_runtime_call_property1 as usize,
+                            jit_runtime::jit_runtime_call_property1 as *const () as usize,
                         );
                     }
                     _ => {
@@ -1565,7 +1567,7 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_stub_call_1node(
                     id,
                     *context,
-                    jit_runtime::jit_runtime_push_context as usize,
+                    jit_runtime::jit_runtime_push_context as *const () as usize,
                 );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -1573,7 +1575,7 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_stub_call_1node(
                     id,
                     *context,
-                    jit_runtime::jit_runtime_pop_context as usize,
+                    jit_runtime::jit_runtime_pop_context as *const () as usize,
                 );
             }
 
@@ -1587,7 +1589,7 @@ impl<'a> MaglevCodegen<'a> {
                     self.emit_stub_call_1node(
                         id,
                         *constructor,
-                        jit_runtime::jit_runtime_construct0 as usize,
+                        jit_runtime::jit_runtime_construct0 as *const () as usize,
                     );
                 } else {
                     self.emit_deopt_unconditional(0);
@@ -1603,7 +1605,7 @@ impl<'a> MaglevCodegen<'a> {
                     id,
                     *left,
                     *right,
-                    jit_runtime::jit_runtime_generic_add as usize,
+                    jit_runtime::jit_runtime_generic_add as *const () as usize,
                 );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -1612,7 +1614,7 @@ impl<'a> MaglevCodegen<'a> {
                     id,
                     *left,
                     *right,
-                    jit_runtime::jit_runtime_generic_sub as usize,
+                    jit_runtime::jit_runtime_generic_sub as *const () as usize,
                 );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -1621,7 +1623,7 @@ impl<'a> MaglevCodegen<'a> {
                     id,
                     *left,
                     *right,
-                    jit_runtime::jit_runtime_generic_mul as usize,
+                    jit_runtime::jit_runtime_generic_mul as *const () as usize,
                 );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -1630,7 +1632,7 @@ impl<'a> MaglevCodegen<'a> {
                     id,
                     *left,
                     *right,
-                    jit_runtime::jit_runtime_generic_div as usize,
+                    jit_runtime::jit_runtime_generic_div as *const () as usize,
                 );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -1639,7 +1641,7 @@ impl<'a> MaglevCodegen<'a> {
                     id,
                     *left,
                     *right,
-                    jit_runtime::jit_runtime_generic_mod as usize,
+                    jit_runtime::jit_runtime_generic_mod as *const () as usize,
                 );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -1648,7 +1650,7 @@ impl<'a> MaglevCodegen<'a> {
                     id,
                     *left,
                     *right,
-                    jit_runtime::jit_runtime_generic_bitwise_and as usize,
+                    jit_runtime::jit_runtime_generic_bitwise_and as *const () as usize,
                 );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -1657,7 +1659,7 @@ impl<'a> MaglevCodegen<'a> {
                     id,
                     *left,
                     *right,
-                    jit_runtime::jit_runtime_generic_bitwise_or as usize,
+                    jit_runtime::jit_runtime_generic_bitwise_or as *const () as usize,
                 );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -1666,7 +1668,7 @@ impl<'a> MaglevCodegen<'a> {
                     id,
                     *left,
                     *right,
-                    jit_runtime::jit_runtime_generic_bitwise_xor as usize,
+                    jit_runtime::jit_runtime_generic_bitwise_xor as *const () as usize,
                 );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -1675,7 +1677,7 @@ impl<'a> MaglevCodegen<'a> {
                     id,
                     *left,
                     *right,
-                    jit_runtime::jit_runtime_generic_shift_left as usize,
+                    jit_runtime::jit_runtime_generic_shift_left as *const () as usize,
                 );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -1684,7 +1686,7 @@ impl<'a> MaglevCodegen<'a> {
                     id,
                     *left,
                     *right,
-                    jit_runtime::jit_runtime_generic_shift_right as usize,
+                    jit_runtime::jit_runtime_generic_shift_right as *const () as usize,
                 );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -1693,7 +1695,7 @@ impl<'a> MaglevCodegen<'a> {
                     id,
                     *left,
                     *right,
-                    jit_runtime::jit_runtime_generic_shift_right_logical as usize,
+                    jit_runtime::jit_runtime_generic_shift_right_logical as *const () as usize,
                 );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -1701,7 +1703,7 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_stub_call_1node(
                     id,
                     *value,
-                    jit_runtime::jit_runtime_generic_negate as usize,
+                    jit_runtime::jit_runtime_generic_negate as *const () as usize,
                 );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -1709,7 +1711,7 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_stub_call_1node(
                     id,
                     *value,
-                    jit_runtime::jit_runtime_generic_increment as usize,
+                    jit_runtime::jit_runtime_generic_increment as *const () as usize,
                 );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -1717,7 +1719,7 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_stub_call_1node(
                     id,
                     *value,
-                    jit_runtime::jit_runtime_generic_decrement as usize,
+                    jit_runtime::jit_runtime_generic_decrement as *const () as usize,
                 );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -1725,7 +1727,7 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_stub_call_1node(
                     id,
                     *value,
-                    jit_runtime::jit_runtime_generic_bitwise_not as usize,
+                    jit_runtime::jit_runtime_generic_bitwise_not as *const () as usize,
                 );
             }
 
@@ -1736,15 +1738,27 @@ impl<'a> MaglevCodegen<'a> {
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::ToString { value, .. } => {
-                self.emit_stub_call_1node(id, *value, jit_runtime::jit_runtime_tostring as usize);
+                self.emit_stub_call_1node(
+                    id,
+                    *value,
+                    jit_runtime::jit_runtime_tostring as *const () as usize,
+                );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::ToNumber { value, .. } => {
-                self.emit_stub_call_1node(id, *value, jit_runtime::jit_runtime_tonumber as usize);
+                self.emit_stub_call_1node(
+                    id,
+                    *value,
+                    jit_runtime::jit_runtime_tonumber as *const () as usize,
+                );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::TypeOf { value } => {
-                self.emit_stub_call_1node(id, *value, jit_runtime::jit_runtime_typeof as usize);
+                self.emit_stub_call_1node(
+                    id,
+                    *value,
+                    jit_runtime::jit_runtime_typeof as *const () as usize,
+                );
             }
 
             // ── Deep context slot access via trampoline ───────────────────────
@@ -1779,7 +1793,7 @@ impl<'a> MaglevCodegen<'a> {
                     id,
                     *left,
                     *right,
-                    jit_runtime::jit_runtime_tagged_equal as usize,
+                    jit_runtime::jit_runtime_tagged_equal as *const () as usize,
                 );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -1788,7 +1802,7 @@ impl<'a> MaglevCodegen<'a> {
                     id,
                     *left,
                     *right,
-                    jit_runtime::jit_runtime_tagged_not_equal as usize,
+                    jit_runtime::jit_runtime_tagged_not_equal as *const () as usize,
                 );
             }
 
@@ -2771,6 +2785,7 @@ impl<'a> MaglevCodegen<'a> {
 
     /// Returns `true` when `node` is a wrapping 32-bit operation that emits a
     /// `movsxd_sign_extend` in the default codegen path.
+    #[allow(dead_code)]
     fn is_wrapping_int32_producer(node: &ValueNode) -> bool {
         matches!(
             node,
@@ -2790,6 +2805,7 @@ impl<'a> MaglevCodegen<'a> {
     /// Int32 operations (divide, modulus, bitwise, shifts) are deliberately
     /// excluded for safety — they may participate in address calculations or
     /// feed into Phi / type-conversion nodes in hard-to-predict ways.
+    #[allow(dead_code)]
     fn is_narrow_int32_consumer(node: &ValueNode) -> bool {
         matches!(
             node,
@@ -2811,6 +2827,7 @@ impl<'a> MaglevCodegen<'a> {
     }
 
     /// Collect all `NodeId` operands referenced by `node` into `out`.
+    #[allow(dead_code)]
     fn collect_node_inputs(node: &ValueNode, out: &mut HashSet<NodeId>) {
         match node {
             // ── No NodeId inputs ────────────────────────────────────────
@@ -3164,6 +3181,7 @@ impl<'a> MaglevCodegen<'a> {
     /// consumer such as a `Phi`, `StoreGlobal`, `Return`, or any type check.
     /// Spilled values are also excluded because spill/reload uses 64-bit MOVs
     /// and the upper 32 bits must therefore be well-defined.
+    #[allow(dead_code)]
     fn compute_narrow_int32(graph: &MaglevGraph, alloc: &AllocationResult) -> HashSet<NodeId> {
         // Step 1: collect all wrapping Int32 producer IDs.
         let mut candidates: HashSet<NodeId> = HashSet::new();
