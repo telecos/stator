@@ -2771,7 +2771,6 @@ impl<'a> MaglevCodegen<'a> {
 
     /// Returns `true` when `node` is a wrapping 32-bit operation that emits a
     /// `movsxd_sign_extend` in the default codegen path.
-    #[allow(dead_code)]
     fn is_wrapping_int32_producer(node: &ValueNode) -> bool {
         matches!(
             node,
@@ -2791,7 +2790,6 @@ impl<'a> MaglevCodegen<'a> {
     /// Int32 operations (divide, modulus, bitwise, shifts) are deliberately
     /// excluded for safety — they may participate in address calculations or
     /// feed into Phi / type-conversion nodes in hard-to-predict ways.
-    #[allow(dead_code)]
     fn is_narrow_int32_consumer(node: &ValueNode) -> bool {
         matches!(
             node,
@@ -2813,7 +2811,6 @@ impl<'a> MaglevCodegen<'a> {
     }
 
     /// Collect all `NodeId` operands referenced by `node` into `out`.
-    #[allow(dead_code)]
     fn collect_node_inputs(node: &ValueNode, out: &mut HashSet<NodeId>) {
         match node {
             // ── No NodeId inputs ────────────────────────────────────────
@@ -3167,15 +3164,7 @@ impl<'a> MaglevCodegen<'a> {
     /// consumer such as a `Phi`, `StoreGlobal`, `Return`, or any type check.
     /// Spilled values are also excluded because spill/reload uses 64-bit MOVs
     /// and the upper 32 bits must therefore be well-defined.
-    #[allow(unreachable_code, unused_variables, unused_mut)]
     fn compute_narrow_int32(graph: &MaglevGraph, alloc: &AllocationResult) -> HashSet<NodeId> {
-        // DISABLED: the narrow-Int32 analysis has a bug that leaves garbage in
-        // upper 32 bits, causing SIGSEGV when those values flow into 64-bit
-        // consumers (StoreGlobal, Return, Phi → spill).  Return empty set so
-        // every wrapping-Int32 result gets a MOVSXD sign-extension.
-        // TODO: re-enable once the analysis handles Phi back-edges correctly.
-        return HashSet::new();
-
         // Step 1: collect all wrapping Int32 producer IDs.
         let mut candidates: HashSet<NodeId> = HashSet::new();
         for block in graph.blocks() {
@@ -3642,7 +3631,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "narrow-Int32 analysis disabled (SIGSEGV bug)"]
     fn test_narrow_int32_only_narrow_consumers_is_narrow() {
         // p0, p1 -> Int32Add(A) -> Int32Add(B) -> Int32Equal(C) -> Return
         // A feeds B (narrow), and B feeds C (narrow comparison).
