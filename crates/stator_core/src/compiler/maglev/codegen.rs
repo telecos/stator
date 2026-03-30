@@ -456,6 +456,12 @@ struct MaglevCodegen<'a> {
     /// the lower 32 bits.  For these nodes the post-operation `movsxd` can be
     /// skipped because the next consumer will operate on 32-bit values anyway.
     narrow_int32: HashSet<NodeId>,
+    /// Set of nodes whose values are provably within the i32 range.  Computed
+    /// by a forward (producer-driven) analysis.  Used to enable 32-bit
+    /// emission of `CheckedSmi*` operations when both inputs are i32-range,
+    /// eliminating the 64-bit ALU + MOVSXD pattern in favour of a single
+    /// 32-bit ALU instruction + `JO` deopt.
+    i32_range: HashSet<NodeId>,
 }
 
 impl<'a> MaglevCodegen<'a> {
@@ -492,6 +498,7 @@ impl<'a> MaglevCodegen<'a> {
             promoted_extra_slots: 0,
             used_caller_saved,
             narrow_int32: HashSet::new(),
+            i32_range: HashSet::new(),
         }
     }
 
@@ -511,7 +518,14 @@ impl<'a> MaglevCodegen<'a> {
         // post-operation MOVSXD sign-extension, saving ~1 instruction per op.
         // Spilled values and values feeding Phis/Returns/StoreGlobals are
         // conservatively excluded.
-        self.narrow_int32 = Self::compute_narrow_int32(self.graph, self.alloc);
+        //
+        // i32-range analysis (forward / producer-driven): identify nodes whose
+        // values are provably within the i32 range.  When both inputs of a
+        // CheckedSmi* operation are i32-range the operation is added as a
+        // narrow candidate so it can be emitted with a 32-bit ALU instruction
+        // + JO, eliminating the extra MOVSXD.
+        self.i32_range = Self::compute_i32_range(self.graph);
+        self.narrow_int32 = Self::compute_narrow_int32(self.graph, self.alloc, &self.i32_range);
 
         self.emit_prologue();
         self.emit_promoted_global_loads();
@@ -952,49 +966,88 @@ impl<'a> MaglevCodegen<'a> {
                 }
             }
 
-            // ── Checked Smi arithmetic (deopt on signed 64-bit overflow) ─────
+            // ── Checked Smi arithmetic (deopt on signed overflow) ────────────
             //
-            // We detect overflow by checking whether the 64-bit result can be
-            // faithfully represented in 32 bits: perform the operation, then
-            // compare the result's low 32 bits (sign-extended to 64) with the
-            // full 64-bit result.  If they differ, the Smi range was exceeded.
+            // When both inputs are proven i32-range the operation can use a
+            // 32-bit ALU instruction whose OF flag captures i32 overflow,
+            // followed by a JO deopt.  The 32-bit result's upper 32 bits
+            // are zero-extended by the CPU; downstream narrow consumers
+            // only read the lower 32 bits, so no MOVSXD is needed.
+            //
+            // When either input may exceed i32 the 64-bit path is used
+            // (identical to the previous code) to correctly handle the
+            // full Smi range.
             ValueNode::CheckedSmiAdd { left, right } => {
-                self.emit_checked_smi_binop(*left, *right, id, MacroAssembler::add_rr);
+                if self.narrow_int32.contains(&id) {
+                    self.emit_checked_smi_binop(*left, *right, id, MacroAssembler::add32_rr);
+                } else {
+                    self.emit_checked_smi_binop(*left, *right, id, MacroAssembler::add_rr);
+                }
             }
             ValueNode::CheckedSmiSubtract { left, right } => {
-                self.emit_checked_smi_binop(*left, *right, id, MacroAssembler::sub_rr);
+                if self.narrow_int32.contains(&id) {
+                    self.emit_checked_smi_binop(*left, *right, id, MacroAssembler::sub32_rr);
+                } else {
+                    self.emit_checked_smi_binop(*left, *right, id, MacroAssembler::sub_rr);
+                }
             }
             ValueNode::CheckedSmiMultiply { left, right } => {
-                self.emit_checked_smi_binop(*left, *right, id, MacroAssembler::imul_rr);
+                if self.narrow_int32.contains(&id) {
+                    self.emit_checked_smi_binop(*left, *right, id, MacroAssembler::imul32_rr);
+                } else {
+                    self.emit_checked_smi_binop(*left, *right, id, MacroAssembler::imul_rr);
+                }
             }
-            ValueNode::CheckedSmiIncrement { value } => match self.alloc.location(id) {
-                Some(Location::Register(n)) => {
-                    let dst = phys_reg(n);
-                    self.emit_load(*value, dst);
-                    self.masm.add_ri(dst, 1);
-                    self.emit_deopt_on_i64_overflow(0);
+            ValueNode::CheckedSmiIncrement { value } => {
+                let narrow = self.narrow_int32.contains(&id);
+                match self.alloc.location(id) {
+                    Some(Location::Register(n)) => {
+                        let dst = phys_reg(n);
+                        self.emit_load(*value, dst);
+                        if narrow {
+                            self.masm.add32_ri(dst, 1);
+                        } else {
+                            self.masm.add_ri(dst, 1);
+                        }
+                        self.emit_deopt_on_i64_overflow(0);
+                    }
+                    _ => {
+                        self.emit_load(*value, Reg64::R11);
+                        if narrow {
+                            self.masm.add32_ri(Reg64::R11, 1);
+                        } else {
+                            self.masm.add_ri(Reg64::R11, 1);
+                        }
+                        self.emit_deopt_on_i64_overflow(0);
+                        self.emit_store(id, Reg64::R11);
+                    }
                 }
-                _ => {
-                    self.emit_load(*value, Reg64::R11);
-                    self.masm.add_ri(Reg64::R11, 1);
-                    self.emit_deopt_on_i64_overflow(0);
-                    self.emit_store(id, Reg64::R11);
+            }
+            ValueNode::CheckedSmiDecrement { value } => {
+                let narrow = self.narrow_int32.contains(&id);
+                match self.alloc.location(id) {
+                    Some(Location::Register(n)) => {
+                        let dst = phys_reg(n);
+                        self.emit_load(*value, dst);
+                        if narrow {
+                            self.masm.sub32_ri(dst, 1);
+                        } else {
+                            self.masm.sub_ri(dst, 1);
+                        }
+                        self.emit_deopt_on_i64_overflow(0);
+                    }
+                    _ => {
+                        self.emit_load(*value, Reg64::R11);
+                        if narrow {
+                            self.masm.sub32_ri(Reg64::R11, 1);
+                        } else {
+                            self.masm.sub_ri(Reg64::R11, 1);
+                        }
+                        self.emit_deopt_on_i64_overflow(0);
+                        self.emit_store(id, Reg64::R11);
+                    }
                 }
-            },
-            ValueNode::CheckedSmiDecrement { value } => match self.alloc.location(id) {
-                Some(Location::Register(n)) => {
-                    let dst = phys_reg(n);
-                    self.emit_load(*value, dst);
-                    self.masm.sub_ri(dst, 1);
-                    self.emit_deopt_on_i64_overflow(0);
-                }
-                _ => {
-                    self.emit_load(*value, Reg64::R11);
-                    self.masm.sub_ri(Reg64::R11, 1);
-                    self.emit_deopt_on_i64_overflow(0);
-                    self.emit_store(id, Reg64::R11);
-                }
-            },
+            }
 
             // ── Int32 comparisons ────────────────────────────────────────────
             ValueNode::Int32Equal { left, right } | ValueNode::Int32StrictEqual { left, right } => {
@@ -2853,6 +2906,24 @@ impl<'a> MaglevCodegen<'a> {
         )
     }
 
+    /// Returns `true` when `node` is a `CheckedSmi*` operation whose inputs
+    /// are all provably within the i32 range.  Such operations can be emitted
+    /// with 32-bit ALU instructions + `JO` and therefore produce a 32-bit
+    /// (zero-extended) result — making them candidates for MOVSXD elision.
+    fn is_i32_range_checked_producer(node: &ValueNode, i32_range: &HashSet<NodeId>) -> bool {
+        match node {
+            ValueNode::CheckedSmiAdd { left, right }
+            | ValueNode::CheckedSmiSubtract { left, right }
+            | ValueNode::CheckedSmiMultiply { left, right } => {
+                i32_range.contains(left) && i32_range.contains(right)
+            }
+            ValueNode::CheckedSmiIncrement { value } | ValueNode::CheckedSmiDecrement { value } => {
+                i32_range.contains(value)
+            }
+            _ => false,
+        }
+    }
+
     /// Returns `true` when `node` only reads the lower 32 bits of its
     /// `NodeId` operands, meaning upstream producers can skip sign-extension.
     ///
@@ -3226,6 +3297,88 @@ impl<'a> MaglevCodegen<'a> {
         }
     }
 
+    /// Compute the set of nodes whose values are provably within the i32
+    /// range.  This is a forward (producer-driven) analysis: a node is
+    /// i32-range if it produces a value that fits in `[-2^31, 2^31)` on
+    /// every non-deopt path.
+    ///
+    /// **Intrinsically i32-range producers:**
+    ///   - `SmiConstant` (its `value` field is `i32`)
+    ///   - `Int32Constant`
+    ///   - All wrapping Int32 arithmetic / bitwise / shift operations (they
+    ///     operate on 32 bits by definition)
+    ///
+    /// **Derived i32-range nodes (fixed-point iteration):**
+    ///   - `Phi` whose *all* inputs are i32-range
+    ///   - `CheckedSmiAdd / Sub / Mul` where *both* operands are i32-range
+    ///     (the result either fits in i32 or the operation deopts)
+    ///   - `CheckedSmiIncrement / Decrement` where the input is i32-range
+    fn compute_i32_range(graph: &MaglevGraph) -> HashSet<NodeId> {
+        let mut i32_range: HashSet<NodeId> = HashSet::new();
+
+        // Phase 1: mark intrinsically i32-range producers.
+        for block in graph.blocks() {
+            for (id, node) in &block.nodes {
+                let is_i32 = matches!(
+                    node,
+                    ValueNode::SmiConstant { .. }
+                        | ValueNode::Int32Constant { .. }
+                        | ValueNode::Int32Add { .. }
+                        | ValueNode::Int32Subtract { .. }
+                        | ValueNode::Int32Multiply { .. }
+                        | ValueNode::Int32Negate { .. }
+                        | ValueNode::Int32Increment { .. }
+                        | ValueNode::Int32Decrement { .. }
+                        | ValueNode::Int32BitwiseAnd { .. }
+                        | ValueNode::Int32BitwiseOr { .. }
+                        | ValueNode::Int32BitwiseXor { .. }
+                        | ValueNode::Int32ShiftLeft { .. }
+                        | ValueNode::Int32ShiftRight { .. }
+                        | ValueNode::Int32ShiftRightLogical { .. }
+                        | ValueNode::Int32Divide { .. }
+                        | ValueNode::Int32Modulus { .. }
+                );
+                if is_i32 {
+                    i32_range.insert(*id);
+                }
+            }
+        }
+
+        // Phase 2: fixed-point iteration for Phi and CheckedSmi nodes.
+        loop {
+            let mut changed = false;
+            for block in graph.blocks() {
+                for (id, node) in &block.nodes {
+                    if i32_range.contains(id) {
+                        continue;
+                    }
+                    let derived = match node {
+                        ValueNode::Phi { inputs } => {
+                            inputs.iter().all(|inp| i32_range.contains(inp))
+                        }
+                        ValueNode::CheckedSmiAdd { left, right }
+                        | ValueNode::CheckedSmiSubtract { left, right }
+                        | ValueNode::CheckedSmiMultiply { left, right } => {
+                            i32_range.contains(left) && i32_range.contains(right)
+                        }
+                        ValueNode::CheckedSmiIncrement { value }
+                        | ValueNode::CheckedSmiDecrement { value } => i32_range.contains(value),
+                        _ => false,
+                    };
+                    if derived {
+                        i32_range.insert(*id);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        i32_range
+    }
+
     /// Precompute the set of wrapping Int32 nodes whose consumers all operate
     /// on 32-bit values, allowing the post-operation `movsxd` to be elided.
     ///
@@ -3241,12 +3394,25 @@ impl<'a> MaglevCodegen<'a> {
     /// garbage upper bits in its inputs are invisible to the downstream
     /// 32-bit consumers.  This lets loop-carried values (e.g. the `i++`
     /// increment feeding a loop-counter Phi) skip `MOVSXD`.
-    fn compute_narrow_int32(graph: &MaglevGraph, alloc: &AllocationResult) -> HashSet<NodeId> {
-        // Step 1: collect all wrapping Int32 producer IDs.
+    ///
+    /// **i32-range extension**: `CheckedSmi*` operations whose inputs are all
+    /// provably within the i32 range (provided by [`compute_i32_range`]) are
+    /// also treated as candidates.  When emitted as 32-bit ALU + `JO`, their
+    /// upper 32 bits become zero-extended — downstream narrow consumers
+    /// only read the lower 32 bits, so the `MOVSXD` can be elided.
+    fn compute_narrow_int32(
+        graph: &MaglevGraph,
+        alloc: &AllocationResult,
+        i32_range: &HashSet<NodeId>,
+    ) -> HashSet<NodeId> {
+        // Step 1: collect all wrapping Int32 producer IDs AND i32-range
+        // CheckedSmi operations (they produce 32-bit results when narrowed).
         let mut candidates: HashSet<NodeId> = HashSet::new();
         for block in graph.blocks() {
             for (id, node) in &block.nodes {
-                if Self::is_wrapping_int32_producer(node) {
+                if Self::is_wrapping_int32_producer(node)
+                    || Self::is_i32_range_checked_producer(node, i32_range)
+                {
                     candidates.insert(*id);
                 }
             }
@@ -3307,6 +3473,9 @@ impl<'a> MaglevCodegen<'a> {
                         node_lookup
                             .get(c)
                             .is_some_and(|n| Self::is_narrow_int32_consumer(n))
+                            || node_lookup
+                                .get(c)
+                                .is_some_and(|n| Self::is_i32_range_checked_producer(n, i32_range))
                             || narrow_phi.contains(c)
                     })
                 });
@@ -3320,13 +3489,16 @@ impl<'a> MaglevCodegen<'a> {
             }
         }
 
-        // Step 4: build the non-narrow set.  Narrow consumers AND
-        // narrow-transparent Phis are skipped — their inputs can have
-        // garbage upper bits without affecting correctness.
+        // Step 4: build the non-narrow set.  Narrow consumers, i32-range
+        // checked ops, AND narrow-transparent Phis are skipped — their
+        // inputs can have garbage upper bits without affecting correctness.
         let mut non_narrow: HashSet<NodeId> = HashSet::new();
         for block in graph.blocks() {
             for (id, node) in &block.nodes {
-                if !Self::is_narrow_int32_consumer(node) && !narrow_phi.contains(id) {
+                if !Self::is_narrow_int32_consumer(node)
+                    && !Self::is_i32_range_checked_producer(node, i32_range)
+                    && !narrow_phi.contains(id)
+                {
                     Self::collect_node_inputs(node, &mut non_narrow);
                 }
             }
@@ -3673,7 +3845,8 @@ mod tests {
     /// Helper: build a graph + run regalloc, then return `compute_narrow_int32`.
     fn narrow_set(graph: &MaglevGraph) -> HashSet<NodeId> {
         let alloc = allocate(graph, NUM_PHYS_REGS);
-        MaglevCodegen::compute_narrow_int32(graph, &alloc)
+        let i32_range = MaglevCodegen::compute_i32_range(graph);
+        MaglevCodegen::compute_narrow_int32(graph, &alloc, &i32_range)
     }
 
     #[test]
@@ -3870,6 +4043,182 @@ mod tests {
 
         let set = narrow_set(&graph);
         assert!(set.is_empty());
+    }
+
+    // ── i32-range analysis tests ─────────────────────────────────────────────
+
+    /// Helper: build a graph and return the `compute_i32_range` set.
+    fn i32_range_set(graph: &MaglevGraph) -> HashSet<NodeId> {
+        MaglevCodegen::compute_i32_range(graph)
+    }
+
+    #[test]
+    fn test_i32_range_analysis() {
+        // Test 1: SmiConstant and Int32Constant are i32-range.
+        {
+            let mut graph = MaglevGraph::new(0);
+            let mut block = BasicBlock::new(0);
+            let smi = block.push_value(ValueNode::SmiConstant { value: 42 });
+            let i32c = block.push_value(ValueNode::Int32Constant { value: -1 });
+            block.set_control(ControlNode::Return { value: smi });
+            graph.add_block(block);
+
+            let set = i32_range_set(&graph);
+            assert!(set.contains(&smi), "SmiConstant must be i32-range");
+            assert!(set.contains(&i32c), "Int32Constant must be i32-range");
+        }
+
+        // Test 2: Int32Add is intrinsically i32-range.
+        {
+            let mut graph = MaglevGraph::new(2);
+            let mut block = BasicBlock::new(0);
+            let p0 = block.push_value(ValueNode::Parameter { index: 0 });
+            let p1 = block.push_value(ValueNode::Parameter { index: 1 });
+            let add = block.push_value(ValueNode::Int32Add {
+                left: p0,
+                right: p1,
+            });
+            block.set_control(ControlNode::Return { value: add });
+            graph.add_block(block);
+
+            let set = i32_range_set(&graph);
+            assert!(set.contains(&add), "Int32Add must be i32-range");
+            assert!(!set.contains(&p0), "Parameter must NOT be i32-range");
+        }
+
+        // Test 3: CheckedSmiAdd with i32-range inputs becomes i32-range.
+        {
+            let mut graph = MaglevGraph::new(0);
+            let mut block = BasicBlock::new(0);
+            let a = block.push_value(ValueNode::SmiConstant { value: 10 });
+            let b = block.push_value(ValueNode::SmiConstant { value: 20 });
+            let add = block.push_value(ValueNode::CheckedSmiAdd { left: a, right: b });
+            block.set_control(ControlNode::Return { value: add });
+            graph.add_block(block);
+
+            let set = i32_range_set(&graph);
+            assert!(
+                set.contains(&add),
+                "CheckedSmiAdd with i32-range inputs must be i32-range"
+            );
+        }
+
+        // Test 4: CheckedSmiAdd with non-i32-range input is NOT i32-range.
+        {
+            let mut graph = MaglevGraph::new(2);
+            let mut block = BasicBlock::new(0);
+            let p0 = block.push_value(ValueNode::Parameter { index: 0 });
+            let p1 = block.push_value(ValueNode::Parameter { index: 1 });
+            let add = block.push_value(ValueNode::CheckedSmiAdd {
+                left: p0,
+                right: p1,
+            });
+            block.set_control(ControlNode::Return { value: add });
+            graph.add_block(block);
+
+            let set = i32_range_set(&graph);
+            assert!(
+                !set.contains(&add),
+                "CheckedSmiAdd with Parameter inputs must NOT be i32-range"
+            );
+        }
+
+        // Test 5: CheckedSmiIncrement with i32-range input is i32-range.
+        {
+            let mut graph = MaglevGraph::new(0);
+            let mut block = BasicBlock::new(0);
+            let c = block.push_value(ValueNode::SmiConstant { value: 5 });
+            let inc = block.push_value(ValueNode::CheckedSmiIncrement { value: c });
+            block.set_control(ControlNode::Return { value: inc });
+            graph.add_block(block);
+
+            let set = i32_range_set(&graph);
+            assert!(
+                set.contains(&inc),
+                "CheckedSmiIncrement with i32-range input must be i32-range"
+            );
+        }
+
+        // Test 6: Phi with all i32-range inputs is i32-range.
+        {
+            let mut graph = MaglevGraph::new(0);
+            let mut b0 = BasicBlock::new(0);
+            let a = b0.push_value(ValueNode::SmiConstant { value: 1 });
+            b0.set_control(ControlNode::Jump { target: 1 });
+            graph.add_block(b0);
+
+            let mut b1 = BasicBlock::new(1);
+            b1.add_predecessor(0);
+            let phi = b1.push_value(ValueNode::Phi { inputs: vec![a, a] });
+            b1.set_control(ControlNode::Return { value: phi });
+            graph.add_block(b1);
+
+            let set = i32_range_set(&graph);
+            assert!(
+                set.contains(&phi),
+                "Phi with all i32-range inputs must be i32-range"
+            );
+        }
+
+        // Test 7: Chained CheckedSmiAdd — result of first feeds second.
+        // Both should be i32-range because inputs propagate.
+        {
+            let mut graph = MaglevGraph::new(0);
+            let mut block = BasicBlock::new(0);
+            let a = block.push_value(ValueNode::SmiConstant { value: 3 });
+            let b = block.push_value(ValueNode::SmiConstant { value: 7 });
+            let sum1 = block.push_value(ValueNode::CheckedSmiAdd { left: a, right: b });
+            let sum2 = block.push_value(ValueNode::CheckedSmiAdd {
+                left: sum1,
+                right: a,
+            });
+            block.set_control(ControlNode::Return { value: sum2 });
+            graph.add_block(block);
+
+            let set = i32_range_set(&graph);
+            assert!(set.contains(&sum1), "sum1 must be i32-range");
+            assert!(set.contains(&sum2), "sum2 (chained) must be i32-range");
+        }
+
+        // Test 8: i32-range CheckedSmiAdd feeding narrow consumer becomes
+        // a narrow candidate (MOVSXD elision).
+        {
+            let mut graph = MaglevGraph::new(0);
+            let mut block = BasicBlock::new(0);
+            let a = block.push_value(ValueNode::SmiConstant { value: 1 });
+            let b = block.push_value(ValueNode::SmiConstant { value: 2 });
+            let sum = block.push_value(ValueNode::CheckedSmiAdd { left: a, right: b });
+            let cmp = block.push_value(ValueNode::Int32LessThan {
+                left: sum,
+                right: a,
+            });
+            block.set_control(ControlNode::Return { value: cmp });
+            graph.add_block(block);
+
+            let set = narrow_set(&graph);
+            assert!(
+                set.contains(&sum),
+                "i32-range CheckedSmiAdd consumed only by narrow \
+                 Int32LessThan must be in narrow_int32"
+            );
+        }
+
+        // Test 9: i32-range CheckedSmiAdd feeding Return is NOT narrow.
+        {
+            let mut graph = MaglevGraph::new(0);
+            let mut block = BasicBlock::new(0);
+            let a = block.push_value(ValueNode::SmiConstant { value: 1 });
+            let b = block.push_value(ValueNode::SmiConstant { value: 2 });
+            let sum = block.push_value(ValueNode::CheckedSmiAdd { left: a, right: b });
+            block.set_control(ControlNode::Return { value: sum });
+            graph.add_block(block);
+
+            let set = narrow_set(&graph);
+            assert!(
+                !set.contains(&sum),
+                "i32-range CheckedSmiAdd feeding Return must NOT be narrow"
+            );
+        }
     }
 
     // ── Execution tests (x86-64 / unix only) ─────────────────────────────────
