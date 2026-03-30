@@ -2130,6 +2130,12 @@ impl GlobalEnv {
     pub fn slot_index_for(&self, key: &str) -> Option<usize> {
         self.name_to_index.get(key).copied()
     }
+
+    /// Return the number of allocated global variable slots.
+    #[inline(always)]
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
 }
 
 impl Default for GlobalEnv {
