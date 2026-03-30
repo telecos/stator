@@ -297,6 +297,7 @@ pub(crate) mod jit_runtime {
         prop_ic: *const RefCell<JitPropertyIcState>,
         /// Generation counter set at cache time.  Compared against
         /// [`RT_SETUP_GEN`] before use; a mismatch forces a re-cache.
+        #[allow(dead_code)]
         generation: u64,
     }
 
@@ -1435,7 +1436,7 @@ pub(crate) mod jit_runtime {
                 let heap = unsafe { &*heap_ref.as_ptr() };
                 heap.get(idx).cloned()
             };
-            let Some(obj) = obj else { return None };
+            let obj = obj?;
 
             match &obj {
                 JsValue::PlainObject(map_rc) => {

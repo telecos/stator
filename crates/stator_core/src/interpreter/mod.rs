@@ -1602,6 +1602,11 @@ pub(super) fn try_execute_best_jit(
     ba: &BytecodeArray,
     args: &[JsValue],
 ) -> Option<StatorResult<JsValue>> {
+    // Never run JIT when a debugger is attached — the debugger needs
+    // to single-step through interpreted bytecodes.
+    if DEBUG_ATTACHED.with(|f| f.get()) {
+        return None;
+    }
     // Try Maglev first — register clobbering fix + deopt check in global loads
     // should resolve SIGSEGV on property-heavy benchmarks.
     if let Some(r) = try_execute_maglev(ba, args) {
@@ -4040,14 +4045,15 @@ impl Interpreter {
                                     }
                                     // Kick off Maglev compilation early so
                                     // the background thread finishes before
-                                    // baseline JIT returns.
+                                    // the next invocation of this function.
                                     maybe_compile_maglev(&frame.bytecode_array);
-                                    if let Some(jit_result) = try_execute_best_jit(
-                                        &frame.bytecode_array,
-                                        &frame.call_args,
-                                    ) {
-                                        return jit_result;
-                                    }
+                                    // NOTE: We do NOT call try_execute_best_jit
+                                    // here (OSR path).  Maglev's global
+                                    // promotion inserts preheader LoadGlobals
+                                    // that read stale interpreter values when
+                                    // OSR restarts the function mid-execution.
+                                    // Maglev execution happens at function
+                                    // entry (run_dispatch top) instead.
                                 } else if frame.osr_loop_count == MAGLEV_OSR_LOOP_THRESHOLD {
                                     maybe_compile_maglev(&frame.bytecode_array);
                                 } else if frame.osr_loop_count == TURBOFAN_OSR_LOOP_THRESHOLD {
@@ -6064,11 +6070,8 @@ impl Interpreter {
                                 maybe_compile_baseline(&frame.bytecode_array);
                             }
                             maybe_compile_maglev(&frame.bytecode_array);
-                            if let Some(jit_result) =
-                                try_execute_best_jit(&frame.bytecode_array, &frame.call_args)
-                            {
-                                return jit_result;
-                            }
+                            // See SMI-mode JumpLoop comment: no OSR JIT
+                            // execution — Maglev fires at function entry.
                         } else if frame.osr_loop_count == MAGLEV_OSR_LOOP_THRESHOLD {
                             maybe_compile_maglev(&frame.bytecode_array);
                         } else if frame.osr_loop_count == TURBOFAN_OSR_LOOP_THRESHOLD {
