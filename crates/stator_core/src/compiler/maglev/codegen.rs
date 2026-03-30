@@ -1479,19 +1479,28 @@ impl<'a> MaglevCodegen<'a> {
                 }
             }
 
-            // ── Object / array / closure creation via trampoline ──────────────
+            // ── Object / array / closure creation ─────────────────────────────
+            //
+            // CreateObjectLiteral and CreateShallowObjectLiteral use a
+            // direct stub call (2 immediate args) instead of the generic
+            // trampoline to avoid the 5-arg setup and opcode-dispatch
+            // overhead.
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::CreateObjectLiteral {
                 feedback_slot,
                 flags,
                 ..
             } => {
-                self.emit_trampoline_call(
-                    id,
-                    Opcode::CreateObjectLiteral as u8,
-                    i64::from(*feedback_slot),
-                    i64::from(*flags),
-                );
+                let saved = self.emit_save_live_regs(id);
+                self.masm.mov_ri(Reg64::Rdi, i64::from(*feedback_slot));
+                self.masm.mov_ri(Reg64::Rsi, i64::from(*flags));
+                let addr = jit_runtime::jit_runtime_fast_create_object_literal as *const () as usize
+                    as i64;
+                self.masm.mov_ri(Reg64::R11, addr);
+                self.masm.call_reg(Reg64::R11);
+                self.emit_restore_live_regs(saved);
+                self.emit_deopt_check_rax();
+                self.emit_store(id, Reg64::Rax);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::CreateShallowObjectLiteral {
@@ -1499,12 +1508,16 @@ impl<'a> MaglevCodegen<'a> {
                 flags,
                 ..
             } => {
-                self.emit_trampoline_call(
-                    id,
-                    Opcode::CreateObjectLiteral as u8,
-                    i64::from(*feedback_slot),
-                    i64::from(*flags),
-                );
+                let saved = self.emit_save_live_regs(id);
+                self.masm.mov_ri(Reg64::Rdi, i64::from(*feedback_slot));
+                self.masm.mov_ri(Reg64::Rsi, i64::from(*flags));
+                let addr = jit_runtime::jit_runtime_fast_create_object_literal as *const () as usize
+                    as i64;
+                self.masm.mov_ri(Reg64::R11, addr);
+                self.masm.call_reg(Reg64::R11);
+                self.emit_restore_live_regs(saved);
+                self.emit_deopt_check_rax();
+                self.emit_store(id, Reg64::Rax);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::CreateEmptyObjectLiteral => {

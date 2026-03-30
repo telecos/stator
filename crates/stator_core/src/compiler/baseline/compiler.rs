@@ -3338,6 +3338,153 @@ pub(crate) mod jit_runtime {
         }
     }
 
+    // ── Fast CreateObjectLiteral stub ───────────────────────────────────
+
+    /// Direct runtime stub for `CreateObjectLiteral` that bypasses the
+    /// generic trampoline dispatch.
+    ///
+    /// Uses the same template-caching mechanism as the trampoline handler
+    /// but avoids the 5-argument setup and opcode-match overhead on every
+    /// call.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`feedback_slot`) – feedback vector slot index (−1 = none).
+    /// * `RSI` (`capacity`)      – minimum property capacity / flags.
+    ///
+    /// Returns a JIT i64 heap handle for the new `PlainObject`, or
+    /// [`JIT_DEOPT`].
+    #[unsafe(no_mangle)]
+    pub extern "C" fn jit_runtime_fast_create_object_literal(
+        feedback_slot: i64,
+        capacity: i64,
+    ) -> i64 {
+        fast_create_object_literal_inner(feedback_slot, capacity).unwrap_or(JIT_DEOPT)
+    }
+
+    /// Inner implementation for [`jit_runtime_fast_create_object_literal`].
+    fn fast_create_object_literal_inner(feedback_slot: i64, capacity: i64) -> Option<i64> {
+        let capacity = capacity.max(4) as usize;
+
+        if feedback_slot >= 0 {
+            let slot = feedback_slot as u32;
+
+            let ptrs = RT_PTRS.with(|p| p.get());
+            let ba = if ptrs.is_cached() {
+                // SAFETY: cached pointer valid for thread lifetime.
+                unsafe { &*ptrs.bytecode }.get()
+            } else {
+                RT_BYTECODE.with(|b| b.get())
+            };
+            if !ba.is_null() {
+                // SAFETY: pointer is valid and points to a live
+                // BytecodeArray.
+                let ba_ref = unsafe { &*ba };
+
+                // Fast path: clone a previously cached template.
+                if let Some(map) = ba_ref.clone_object_literal_template(slot) {
+                    let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                    return Some(jsvalue_to_jit_i64(obj));
+                }
+
+                // Second execution: promote pending → cached.
+                if let Some(map) = ba_ref.promote_object_literal_template(slot) {
+                    let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                    return Some(jsvalue_to_jit_i64(obj));
+                }
+
+                // First execution: create fresh and register as
+                // pending for future promotion.
+                let map = PropertyMap::with_capacity(capacity);
+                let rc = Rc::new(RefCell::new(map));
+                ba_ref.set_object_literal_pending(slot, Rc::clone(&rc));
+                let obj = JsValue::PlainObject(rc);
+                return Some(jsvalue_to_jit_i64(obj));
+            }
+        }
+
+        // Fallback: no feedback slot or no BA pointer.
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::with_capacity(capacity))));
+        Some(jsvalue_to_jit_i64(obj))
+    }
+
+    // ── Fast StaNamedOwnProperty stub ───────────────────────────────────
+
+    /// Specialized runtime stub for `StaNamedOwnProperty` /
+    /// `DefineNamedOwnProperty` on freshly created plain objects.
+    ///
+    /// Compared to [`jit_runtime_sta_named_property`] this stub:
+    /// * skips the `Function` receiver check (own-property stores target
+    ///   plain objects),
+    /// * always attempts the template-fill fast path first.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_i64`)   – JIT i64 heap handle of the receiver.
+    /// * `RSI` (`name_idx`)  – constant-pool index of the property name.
+    /// * `RDX` (`value_i64`) – JIT i64 encoding of the value to store.
+    ///
+    /// Returns `value_i64` on success, or [`JIT_DEOPT`].
+    #[unsafe(no_mangle)]
+    pub extern "C" fn jit_runtime_fast_sta_named_own_property(
+        obj_i64: i64,
+        name_idx: i64,
+        value_i64: i64,
+    ) -> i64 {
+        fast_sta_named_own_property_inner(obj_i64, name_idx as u32, value_i64).unwrap_or(JIT_DEOPT)
+    }
+
+    /// Inner implementation for [`jit_runtime_fast_sta_named_own_property`].
+    fn fast_sta_named_own_property_inner(
+        obj_i64: i64,
+        name_idx: u32,
+        value_i64: i64,
+    ) -> Option<i64> {
+        if !is_heap_handle(obj_i64) {
+            return None;
+        }
+        let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if ptrs.is_cached() {
+            // SAFETY: cached pointers valid for thread lifetime;
+            // single-threaded JIT, no concurrent borrows.
+            let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+            if let Some(JsValue::PlainObject(map_rc)) = heap.get(obj_idx) {
+                let prop_name = get_rt_string_constant_ref(name_idx)?;
+                // Inline Smi decode (common for numeric literals and
+                // loop counters) to avoid heap-handle lookups.
+                let value = if value_i64 >= i32::MIN as i64 && value_i64 <= i32::MAX as i64 {
+                    JsValue::Smi(value_i64 as i32)
+                } else {
+                    jit_i64_to_jsvalue(value_i64)
+                };
+                // SAFETY: single-threaded JIT; no concurrent borrows.
+                let map = unsafe { &mut *map_rc.as_ptr() };
+                match map.try_template_fill(prop_name, value) {
+                    Ok(_) => return Some(value_i64),
+                    Err(value) => {
+                        map.insert(prop_name.to_string(), value);
+                        return Some(value_i64);
+                    }
+                }
+            }
+        }
+
+        // Slow path: clone-based fallback.
+        let obj = jit_i64_to_jsvalue(obj_i64);
+        let value = jit_i64_to_jsvalue(value_i64);
+
+        match &obj {
+            JsValue::PlainObject(map_rc) => {
+                let prop_name = get_rt_string_constant_ref(name_idx)?;
+                map_rc.borrow_mut().insert(prop_name.to_string(), value);
+                Some(value_i64)
+            }
+            _ => None,
+        }
+    }
+
     // ── Specialized CallProperty0 stub ──────────────────────────────────
 
     /// Specialized runtime stub for `CallProperty0`.
