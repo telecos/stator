@@ -820,7 +820,7 @@ pub(super) const OSR_LOOP_THRESHOLD: u32 = 5;
 /// count exceeds this threshold (15 back-edges), a Maglev compilation is
 /// scheduled in a background thread so the next *call* can use the optimised
 /// tier.
-pub(super) const MAGLEV_OSR_LOOP_THRESHOLD: u32 = 15;
+pub(super) const MAGLEV_OSR_LOOP_THRESHOLD: u32 = 500;
 
 /// Number of loop back-edges taken before a Turbofan background compilation is
 /// triggered via OSR.
@@ -1159,7 +1159,7 @@ pub(super) fn maybe_compile_baseline(ba: &BytecodeArray) {
             let code_len = cc.code.len();
             // SAFETY: `cc.code` was produced by `BaselineCompiler::compile`.
             if let Ok(cached) =
-                (unsafe { CachedExecutableCode::from_compiled(&cc.code, cc.register_file_slots) })
+                unsafe { CachedExecutableCode::from_compiled(&cc.code, cc.register_file_slots) }
             {
                 ba.store_jit_code(cached);
                 JIT_COMPILATION_COUNT.with(|c| c.set(c.get().saturating_add(1)));
@@ -1303,12 +1303,12 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
                                 let code_len = cc.code.len();
                                 if let Ok(mut guard) = input.result_cache.lock() {
                                     // SAFETY: `cc.code` was produced by `maglev_codegen::compile`.
-                                    if let Ok(cached) = (unsafe {
+                                    if let Ok(cached) = unsafe {
                                         crate::compiler::baseline::compiler::CachedExecutableCode::from_compiled(
                                             &cc.code,
                                             cc.register_file_slots,
                                         )
-                                    }) {
+                                    } {
                                         *guard = Some(cached);
                                     }
                                     drop(guard);
@@ -1414,7 +1414,7 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
         jit_runtime_setup(ba);
 
         // Convert args — may allocate heap handles in RT_HEAP.
-        let jit_args: Vec<i64> = args.iter().map(|v| jsvalue_to_jit(v)).collect();
+        let jit_args: Vec<i64> = args.iter().map(jsvalue_to_jit).collect();
 
         // Set closure context for context-slot stubs.
         {
@@ -1558,7 +1558,7 @@ fn try_execute_turbofan(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorRe
         jit_runtime_setup(ba);
 
         // Convert args — may allocate heap handles in RT_HEAP.
-        let jit_args: Vec<i64> = args.iter().map(|v| jsvalue_to_jit(v)).collect();
+        let jit_args: Vec<i64> = args.iter().map(jsvalue_to_jit).collect();
 
         // Set closure context for context-slot stubs.
         {
@@ -1630,7 +1630,7 @@ fn try_execute_jit(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<
         jit_runtime_setup(ba);
 
         // Convert args — may allocate heap handles in RT_HEAP.
-        let jit_args: Vec<i64> = args.iter().map(|v| jsvalue_to_jit(v)).collect();
+        let jit_args: Vec<i64> = args.iter().map(jsvalue_to_jit).collect();
 
         // Set closure context for context-slot stubs.
         let ctx_ptr: i64;

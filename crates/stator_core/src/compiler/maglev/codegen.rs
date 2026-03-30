@@ -2426,7 +2426,7 @@ impl<'a> MaglevCodegen<'a> {
         // Need an odd number of pushes for 16-byte stack alignment
         // before the CALL instruction.  After prologue, RSP ≡ 8 mod 16,
         // so an odd push count brings it to 0 mod 16.
-        if count % 2 == 0 {
+        if count.is_multiple_of(2) {
             self.masm.push(Reg64::R11); // alignment padding
         }
         if self.used_caller_saved & (1 << 1) != 0 {
@@ -2466,7 +2466,7 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.pop(Reg64::Rcx);
         }
         let count = self.used_caller_saved.count_ones();
-        if count % 2 == 0 {
+        if count.is_multiple_of(2) {
             self.masm.pop(Reg64::R11); // alignment padding
         }
     }

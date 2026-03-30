@@ -376,10 +376,7 @@ pub(crate) mod jit_runtime {
     pub fn jit_runtime_set_global_env(env: Rc<RefCell<GlobalEnv>>) {
         RT_GLOBAL.with(|g| {
             let mut state = g.borrow_mut();
-            let same_env = state
-                .env
-                .as_ref()
-                .map_or(false, |old| Rc::ptr_eq(old, &env));
+            let same_env = state.env.as_ref().is_some_and(|old| Rc::ptr_eq(old, &env));
             if same_env {
                 return;
             }
@@ -416,7 +413,7 @@ pub(crate) mod jit_runtime {
     /// Returns `true` if `v` is a heap-object handle.
     #[inline]
     fn is_heap_handle(v: i64) -> bool {
-        v >= JIT_HEAP_TAG && v < JIT_HEAP_TAG + 0x1_0000_0000
+        (JIT_HEAP_TAG..JIT_HEAP_TAG + 0x1_0000_0000).contains(&v)
     }
 
     /// Allocate a new heap handle for `val`, returning the `i64` handle.
@@ -509,6 +506,7 @@ pub(crate) mod jit_runtime {
 
     /// Read a string from the constant pool of the currently-executing
     /// JIT function.
+    #[allow(dead_code)]
     fn get_rt_string_constant(idx: u32) -> Option<String> {
         let ptrs = RT_PTRS.with(|p| p.get());
         let ptr = if ptrs.is_cached() {
@@ -786,11 +784,9 @@ pub(crate) mod jit_runtime {
                             .cloned()
                             .unwrap_or(JsValue::Undefined)
                     }
-                    (JsValue::PlainObject(map), JsValue::String(s)) => map
-                        .borrow()
-                        .get(&**s)
-                        .cloned()
-                        .unwrap_or(JsValue::Undefined),
+                    (JsValue::PlainObject(map), JsValue::String(s)) => {
+                        map.borrow().get(s).cloned().unwrap_or(JsValue::Undefined)
+                    }
                     _ => return None,
                 };
                 Some(jsvalue_to_jit_i64(result))
@@ -870,7 +866,7 @@ pub(crate) mod jit_runtime {
                 // triggers inner JIT execution that overwrites it.
                 let saved_ba = RT_BYTECODE.with(|b| b.get());
 
-                let result = match &callee {
+                match &callee {
                     JsValue::NativeFunction(f) => {
                         let r = f(vec![]);
                         RT_BYTECODE.with(|b| b.set(saved_ba));
@@ -884,8 +880,7 @@ pub(crate) mod jit_runtime {
                         RT_BYTECODE.with(|b| b.set(saved_ba));
                         None
                     }
-                };
-                result
+                }
             }
 
             Opcode::CallUndefinedReceiver1 => {
@@ -899,7 +894,7 @@ pub(crate) mod jit_runtime {
 
                 let saved_ba = RT_BYTECODE.with(|b| b.get());
 
-                let result = match &callee {
+                match &callee {
                     JsValue::NativeFunction(f) => {
                         let r = f(vec![arg1]);
                         RT_BYTECODE.with(|b| b.set(saved_ba));
@@ -915,8 +910,7 @@ pub(crate) mod jit_runtime {
                         RT_BYTECODE.with(|b| b.set(saved_ba));
                         None
                     }
-                };
-                result
+                }
             }
 
             // ── Context slot loads/stores ────────────────────────────────
@@ -1514,7 +1508,7 @@ pub(crate) mod jit_runtime {
                     // Look up ad-hoc properties stored in the
                     // thread-local side table (e.g. `.prototype`).
                     let prop_name = get_rt_string_constant_ref(name_idx)?;
-                    let val = crate::interpreter::fn_props_get(ba, &prop_name);
+                    let val = crate::interpreter::fn_props_get(ba, prop_name);
                     if matches!(val, JsValue::Undefined) {
                         None // IC miss → Phase 2 for lazy prototype creation
                     } else {
@@ -1614,7 +1608,7 @@ pub(crate) mod jit_runtime {
                     }
                     JsValue::Function(ba) => {
                         let prop_name = get_rt_string_constant_ref(name_idx)?;
-                        let val = crate::interpreter::fn_props_get(ba, &prop_name);
+                        let val = crate::interpreter::fn_props_get(ba, prop_name);
                         if matches!(val, JsValue::Undefined) {
                             None // IC miss → Phase 2
                         } else {
@@ -1675,7 +1669,7 @@ pub(crate) mod jit_runtime {
                         .or_else(|| map.get("__proto__"))
                         .cloned();
                     let _ = map;
-                    let result = jit_proto_chain_walk(proto.as_ref(), &prop_name);
+                    let result = jit_proto_chain_walk(proto.as_ref(), prop_name);
 
                     let proto_slot = (name_idx & 31) as usize;
                     if ptrs.is_cached() {
@@ -1705,7 +1699,7 @@ pub(crate) mod jit_runtime {
             }
             JsValue::Function(ba) => {
                 let prop_name = get_rt_string_constant_ref(name_idx)?;
-                let val = crate::interpreter::fn_props_get(ba, &prop_name);
+                let val = crate::interpreter::fn_props_get(ba, prop_name);
                 if !matches!(val, JsValue::Undefined) {
                     Some(jsvalue_to_jit_i64(val))
                 } else if prop_name == "prototype" && !ba.is_arrow() && !ba.is_generator() {
@@ -1760,7 +1754,7 @@ pub(crate) mod jit_runtime {
             JsValue::PlainObject(rc) => Rc::as_ptr(rc) as usize,
             JsValue::Array(rc) => Rc::as_ptr(rc) as usize,
             JsValue::Function(rc) => Rc::as_ptr(rc) as usize,
-            JsValue::String(s) => (&**s).as_ptr() as usize,
+            JsValue::String(s) => (**s).as_ptr() as usize,
             _ => 0,
         }
     }
@@ -2758,7 +2752,7 @@ pub(crate) mod jit_runtime {
             (JsValue::PlainObject(map_rc), JsValue::String(s)) => Some(
                 map_rc
                     .borrow()
-                    .get(&**s)
+                    .get(s)
                     .map(jsvalue_ref_to_jit_i64)
                     .unwrap_or(JIT_UNDEFINED),
             ),
