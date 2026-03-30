@@ -93,7 +93,7 @@ use crate::compiler::baseline::masm_x64::{CondCode, Label, MacroAssembler, Reg64
 use crate::compiler::maglev::ir::{ControlNode, MaglevGraph, NodeId, ValueNode};
 use crate::compiler::maglev::regalloc::{AllocationResult, Location, allocate};
 use crate::error::{StatorError, StatorResult};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants & helpers
@@ -3201,43 +3201,13 @@ impl<'a> MaglevCodegen<'a> {
             }
         }
 
-        // Step 3: propagate non-narrow status backwards through candidate
-        // chains.  If candidate B is excluded (e.g. feeds a Phi) and
-        // candidate A is an input to B, then A must also be excluded.
-        // Without this, A would skip MOVSXD and its garbage upper bits
-        // could propagate through spill/reload or register-move sequences
-        // at loop back-edges, causing SIGSEGV.
-        let mut candidate_inputs: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
-        for block in graph.blocks() {
-            for (id, node) in &block.nodes {
-                if candidates.contains(id) {
-                    let mut inputs = HashSet::new();
-                    Self::collect_node_inputs(node, &mut inputs);
-                    let producer_candidates: Vec<NodeId> = inputs
-                        .into_iter()
-                        .filter(|i| candidates.contains(i))
-                        .collect();
-                    if !producer_candidates.is_empty() {
-                        candidate_inputs.insert(*id, producer_candidates);
-                    }
-                }
-            }
-        }
-
-        let mut worklist: Vec<NodeId> = candidates
-            .iter()
-            .filter(|id| non_narrow.contains(id))
-            .copied()
-            .collect();
-        while let Some(id) = worklist.pop() {
-            if let Some(inputs) = candidate_inputs.get(&id) {
-                for inp in inputs {
-                    if non_narrow.insert(*inp) {
-                        worklist.push(*inp);
-                    }
-                }
-            }
-        }
+        // Step 3 (backward propagation) removed: the old pass propagated
+        // non-narrow status from a consumer back to all its candidate inputs.
+        // This was overly conservative -- each non-narrow node already emits
+        // its own MOVSXD, producing clean upper 32 bits.  Its inputs only
+        // feed 32-bit ALU consumers (by definition of is_narrow_int32_consumer),
+        // so garbage upper bits in those inputs are harmless.  Spilled values
+        // are still excluded below.
 
         // Step 4: exclude spilled values — the spill/reload path uses
         // 64-bit MOVs so the upper 32 bits must be well-defined.
@@ -3573,13 +3543,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "transitive propagation not yet implemented in re-enabled analysis"]
     fn test_narrow_int32_add_chain_all_narrow() {
         // p0, p1 -> Int32Add(A) -> Int32Add(B) -> Int32Add(C) -> Return
         // A and B are candidates.  C feeds Return (non-narrow), so C is
-        // excluded.  B feeds C (narrow), so B stays — but with the new
-        // transitive propagation, B is also excluded because C (excluded)
-        // consumes B.  Similarly A is excluded because B is excluded.
+        // excluded.  A feeds B (Int32Add = narrow consumer), so A stays
+        // narrow.  B feeds C (Int32Add = narrow consumer), so B stays
+        // narrow.  Only C is excluded because it feeds Return directly.
         let mut graph = MaglevGraph::new(2);
         let mut block = BasicBlock::new(0);
         let p0 = block.push_value(ValueNode::Parameter { index: 0 });
@@ -3594,15 +3563,17 @@ mod tests {
         graph.add_block(block);
 
         let set = narrow_set(&graph);
-        // C feeds Return → excluded; transitive propagation excludes B and A.
+        // C feeds Return -> excluded.
         assert!(!set.contains(&c), "C feeds Return and must not be narrow");
+        // A and B only feed Int32Add (narrow consumers), so they stay narrow
+        // and skip MOVSXD.
         assert!(
-            !set.contains(&b),
-            "B feeds excluded C and must not be narrow (transitive)"
+            set.contains(&a),
+            "A only feeds narrow consumer B, should be narrow"
         );
         assert!(
-            !set.contains(&a),
-            "A feeds excluded B and must not be narrow (transitive)"
+            set.contains(&b),
+            "B only feeds narrow consumer C, should be narrow"
         );
     }
 

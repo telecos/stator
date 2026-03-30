@@ -451,7 +451,8 @@ fn load_aliases_store(node: &ValueNode, mutated: &HashSet<NodeId>) -> bool {
         ValueNode::LoadField { object, .. }
         | ValueNode::LoadTaggedField { object, .. }
         | ValueNode::LoadDoubleField { object, .. }
-        | ValueNode::LoadNamedGeneric { object, .. } => mutated.contains(object),
+        | ValueNode::LoadNamedGeneric { object, .. }
+        | ValueNode::LoadKeyedGeneric { object, .. } => mutated.contains(object),
         ValueNode::LoadFixedArrayElement { elements, .. }
         | ValueNode::LoadFixedDoubleArrayElement { elements, .. }
         | ValueNode::LoadHoleyFixedDoubleArrayElement { elements, .. } => {

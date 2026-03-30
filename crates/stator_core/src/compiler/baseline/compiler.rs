@@ -332,7 +332,7 @@ pub(crate) mod jit_runtime {
         RT_PROP_IC.with(|ic| {
             let mut c = ic.borrow_mut();
             c.lda = [(u32::MAX, 0, 0); 64];
-            c.proto = [(u32::MAX, 0, 0); 16];
+            c.proto = [(u32::MAX, 0, 0); 32];
         });
         RT_ARRAY_METHOD_IC.with(|c| c.set(ArrayMethodIcEntry::EMPTY));
     }
@@ -373,7 +373,7 @@ pub(crate) mod jit_runtime {
         RT_PROP_IC.with(|ic| {
             let mut c = ic.borrow_mut();
             c.lda = [(u32::MAX, 0, 0); 64];
-            c.proto = [(u32::MAX, 0, 0); 16];
+            c.proto = [(u32::MAX, 0, 0); 32];
         });
         RT_ARRAY_METHOD_IC.with(|c| c.set(ArrayMethodIcEntry::EMPTY));
     }
