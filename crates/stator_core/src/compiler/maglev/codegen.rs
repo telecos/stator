@@ -93,7 +93,7 @@ use crate::compiler::baseline::masm_x64::{CondCode, Label, MacroAssembler, Reg64
 use crate::compiler::maglev::ir::{ControlNode, MaglevGraph, NodeId, ValueNode};
 use crate::compiler::maglev::regalloc::{AllocationResult, Location, allocate};
 use crate::error::{StatorError, StatorResult};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants & helpers
@@ -3174,10 +3174,17 @@ impl<'a> MaglevCodegen<'a> {
     /// on 32-bit values, allowing the post-operation `movsxd` to be elided.
     ///
     /// The analysis is deliberately conservative: candidates are excluded when
-    /// they feed (even transitively through other candidates) into a non-32-bit
-    /// consumer such as a `Phi`, `StoreGlobal`, `Return`, or any type check.
-    /// Spilled values are also excluded because spill/reload uses 64-bit MOVs
-    /// and the upper 32 bits must therefore be well-defined.
+    /// they feed into a non-32-bit consumer such as `StoreGlobal`, `Return`,
+    /// or any type check.  Spilled values are also excluded because
+    /// spill/reload uses 64-bit MOVs and the upper 32 bits must be
+    /// well-defined.
+    ///
+    /// **Phi-aware narrowing**: a `Phi` node whose consumers are *all* narrow
+    /// (32-bit ALU / CMP) or other narrow-transparent Phis is treated as
+    /// transparent — it merely copies 64 bits between registers/slots, so
+    /// garbage upper bits in its inputs are invisible to the downstream
+    /// 32-bit consumers.  This lets loop-carried values (e.g. the `i++`
+    /// increment feeding a loop-counter Phi) skip `MOVSXD`.
     fn compute_narrow_int32(graph: &MaglevGraph, alloc: &AllocationResult) -> HashSet<NodeId> {
         // Step 1: collect all wrapping Int32 producer IDs.
         let mut candidates: HashSet<NodeId> = HashSet::new();
@@ -3193,12 +3200,77 @@ impl<'a> MaglevCodegen<'a> {
             return candidates;
         }
 
-        // Step 2: walk every node and control-flow terminator.  If a
-        // non-32-bit consumer references a candidate, remove it.
+        // Step 2: build a reverse-consumer map (value → consuming nodes)
+        // and identify Phi nodes.
+        let mut consumers_of: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        let mut node_lookup: HashMap<NodeId, &ValueNode> = HashMap::new();
+        let mut ctrl_consumed: HashSet<NodeId> = HashSet::new();
+
+        for block in graph.blocks() {
+            for (id, node) in &block.nodes {
+                node_lookup.insert(*id, node);
+                let mut inputs = HashSet::new();
+                Self::collect_node_inputs(node, &mut inputs);
+                for inp in inputs {
+                    consumers_of.entry(inp).or_default().push(*id);
+                }
+            }
+            if let Some(ctrl) = &block.control {
+                match ctrl {
+                    ControlNode::Return { value } => {
+                        ctrl_consumed.insert(*value);
+                    }
+                    ControlNode::Branch { condition, .. } => {
+                        ctrl_consumed.insert(*condition);
+                    }
+                    ControlNode::Jump { .. } | ControlNode::Deoptimize { .. } => {}
+                }
+            }
+        }
+
+        // Step 3: determine narrow-transparent Phis.
+        //
+        // Start optimistic (all Phis not consumed by control flow are
+        // narrow-transparent) and iterate: if any Phi has a consumer that
+        // is neither a narrow consumer nor a narrow-transparent Phi, remove
+        // it.  Converges in O(#Phi_chains) iterations (typically 1-2).
+        let mut narrow_phi: HashSet<NodeId> = HashSet::new();
+        for block in graph.blocks() {
+            for (id, node) in &block.nodes {
+                if matches!(node, ValueNode::Phi { .. }) && !ctrl_consumed.contains(id) {
+                    narrow_phi.insert(*id);
+                }
+            }
+        }
+
+        loop {
+            let mut changed = false;
+            for phi_id in narrow_phi.clone() {
+                let ok = consumers_of.get(&phi_id).is_none_or(|cs| {
+                    cs.iter().all(|c| {
+                        node_lookup
+                            .get(c)
+                            .is_some_and(|n| Self::is_narrow_int32_consumer(n))
+                            || narrow_phi.contains(c)
+                    })
+                });
+                if !ok {
+                    narrow_phi.remove(&phi_id);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Step 4: build the non-narrow set.  Narrow consumers AND
+        // narrow-transparent Phis are skipped — their inputs can have
+        // garbage upper bits without affecting correctness.
         let mut non_narrow: HashSet<NodeId> = HashSet::new();
         for block in graph.blocks() {
-            for (_, node) in &block.nodes {
-                if !Self::is_narrow_int32_consumer(node) {
+            for (id, node) in &block.nodes {
+                if !Self::is_narrow_int32_consumer(node) && !narrow_phi.contains(id) {
                     Self::collect_node_inputs(node, &mut non_narrow);
                 }
             }
@@ -3215,15 +3287,7 @@ impl<'a> MaglevCodegen<'a> {
             }
         }
 
-        // Step 3 (backward propagation) removed: the old pass propagated
-        // non-narrow status from a consumer back to all its candidate inputs.
-        // This was overly conservative -- each non-narrow node already emits
-        // its own MOVSXD, producing clean upper 32 bits.  Its inputs only
-        // feed 32-bit ALU consumers (by definition of is_narrow_int32_consumer),
-        // so garbage upper bits in those inputs are harmless.  Spilled values
-        // are still excluded below.
-
-        // Step 4: exclude spilled values — the spill/reload path uses
+        // Step 5: exclude spilled values — the spill/reload path uses
         // 64-bit MOVs so the upper 32 bits must be well-defined.
         candidates.retain(|id| {
             !non_narrow.contains(id) && !matches!(alloc.location(*id), Some(Location::StackSlot(_)))
@@ -3595,7 +3659,8 @@ mod tests {
     fn test_narrow_int32_phi_excludes_producers() {
         // Block 0: p0 -> Int32Add(A) -> Jump(1)
         // Block 1: Phi(A, A) -> Return
-        // A feeds a Phi (non-narrow consumer), so A must be excluded.
+        // A feeds a Phi.  The Phi feeds Return (non-narrow), so the Phi is
+        // NOT narrow-transparent.  Therefore A must be excluded.
         let mut graph = MaglevGraph::new(1);
         let mut b0 = BasicBlock::new(0);
         let p0 = b0.push_value(ValueNode::Parameter { index: 0 });
@@ -3613,7 +3678,66 @@ mod tests {
         graph.add_block(b1);
 
         let set = narrow_set(&graph);
-        assert!(!set.contains(&a), "A feeds Phi and must not be narrow");
+        assert!(
+            !set.contains(&a),
+            "A feeds Phi→Return and must not be narrow"
+        );
+    }
+
+    #[test]
+    fn test_narrow_int32_phi_transparent_when_all_consumers_narrow() {
+        // Block 0: p0, p1 -> Int32Add(A) -> Jump(1)
+        // Block 1: Phi(A, A) -> Int32Add(B, p1) -> Return
+        // Phi's ONLY consumer is Int32Add(B) which is narrow.
+        // So Phi is narrow-transparent, and A (feeding Phi) is narrow.
+        // B feeds Return (non-narrow) → B is NOT narrow.
+        let mut graph = MaglevGraph::new(2);
+
+        // Create empty blocks and add them to the graph first so that
+        // `add_value_node` can assign graph-global unique IDs.
+        let mut b0 = BasicBlock::new(0);
+        let mut b1 = BasicBlock::new(1);
+        b1.add_predecessor(0);
+        graph.add_block(b0);
+        graph.add_block(b1);
+
+        let p0 = graph
+            .add_value_node(0, ValueNode::Parameter { index: 0 })
+            .unwrap();
+        let p1 = graph
+            .add_value_node(0, ValueNode::Parameter { index: 1 })
+            .unwrap();
+        let a = graph
+            .add_value_node(
+                0,
+                ValueNode::Int32Add {
+                    left: p0,
+                    right: p1,
+                },
+            )
+            .unwrap();
+        graph.blocks_mut()[0].set_control(ControlNode::Jump { target: 1 });
+
+        let phi = graph
+            .add_value_node(1, ValueNode::Phi { inputs: vec![a, a] })
+            .unwrap();
+        let b = graph
+            .add_value_node(
+                1,
+                ValueNode::Int32Add {
+                    left: phi,
+                    right: p1,
+                },
+            )
+            .unwrap();
+        graph.blocks_mut()[1].set_control(ControlNode::Return { value: b });
+
+        let set = narrow_set(&graph);
+        assert!(
+            set.contains(&a),
+            "A feeds narrow-transparent Phi, should be narrow"
+        );
+        assert!(!set.contains(&b), "B feeds Return and must not be narrow");
     }
 
     #[test]
