@@ -2996,6 +2996,260 @@ pub(crate) mod jit_runtime {
         Some(value_i64)
     }
 
+    // ── Specialized fast-path array element stubs ────────────────────────
+
+    /// Fast-path array element load: `array[integer_index]`.
+    ///
+    /// Skips the generic keyed-property dispatch and only handles the
+    /// `JsValue::Array` case with a non-negative integer index.  Returns
+    /// [`JIT_DEOPT`] if the receiver is not an array or any other
+    /// precondition fails, letting the caller fall back to the generic
+    /// stub or deoptimize.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_handle`) – JIT i64 heap handle for the receiver.
+    /// * `RSI` (`index`) – non-negative Smi-encoded integer index.
+    ///
+    /// Returns the element as a JIT `i64` in `RAX`, or [`JIT_DEOPT`].
+    #[no_mangle]
+    pub extern "C" fn jit_runtime_fast_array_load(obj_handle: i64, index: i64) -> i64 {
+        fast_array_load_inner(obj_handle, index).unwrap_or(JIT_DEOPT)
+    }
+
+    /// Inner implementation for [`jit_runtime_fast_array_load`].
+    fn fast_array_load_inner(obj_handle: i64, index: i64) -> Option<i64> {
+        if !is_heap_handle(obj_handle) || index < 0 || index > i32::MAX as i64 {
+            return None;
+        }
+        let idx = index as usize;
+        let obj_idx = (obj_handle - JIT_HEAP_TAG) as usize;
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if ptrs.is_cached() {
+            // SAFETY: cached pointers set by cache_rt_ptrs;
+            // valid for thread lifetime.
+            let heap_ref = unsafe { &*ptrs.heap };
+            // SAFETY: single-threaded JIT; no concurrent mutable
+            // borrows during a load fast path.
+            let heap = unsafe { &*heap_ref.as_ptr() };
+            match heap.get(obj_idx)? {
+                JsValue::Array(arr) => {
+                    // SAFETY: single-threaded JIT; no concurrent borrows.
+                    let borrow = unsafe { &*arr.as_ptr() };
+                    match borrow.get(idx) {
+                        Some(v) if !matches!(v, JsValue::TheHole) => {
+                            if let Some(fast_val) = encode_element_fast(v) {
+                                Some(fast_val)
+                            } else {
+                                Some(match encode_or_clone_ref(v) {
+                                    Ok(val) => val,
+                                    Err(obj_val) => alloc_heap_handle(obj_val),
+                                })
+                            }
+                        }
+                        _ => Some(JIT_UNDEFINED),
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            RT_HEAP.with(|heap| {
+                let heap = heap.borrow();
+                match heap.get(obj_idx)? {
+                    JsValue::Array(arr) => {
+                        let borrow = arr.borrow();
+                        match borrow.get(idx) {
+                            Some(v) if !matches!(v, JsValue::TheHole) => {
+                                if let Some(fast_val) = encode_element_fast(v) {
+                                    Some(fast_val)
+                                } else {
+                                    Some(match encode_or_clone_ref(v) {
+                                        Ok(val) => val,
+                                        Err(obj_val) => alloc_heap_handle(obj_val),
+                                    })
+                                }
+                            }
+                            _ => Some(JIT_UNDEFINED),
+                        }
+                    }
+                    _ => None,
+                }
+            })
+        }
+    }
+
+    /// Fast-path array element store: `array[integer_index] = value`.
+    ///
+    /// Handles only `JsValue::Array` receivers with a non-negative integer
+    /// index.  Grows the backing `Vec` when `index >= len` (needed for
+    /// patterns like `sieve[i] = true`).  Returns [`JIT_DEOPT`] on any
+    /// type mismatch.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_handle`) – JIT i64 heap handle for the receiver.
+    /// * `RSI` (`index`) – non-negative Smi-encoded integer index.
+    /// * `RDX` (`value_i64`) – JIT i64 encoding of the value to store.
+    ///
+    /// Returns `value_i64` in `RAX` on success, or [`JIT_DEOPT`].
+    #[no_mangle]
+    pub extern "C" fn jit_runtime_fast_array_store(
+        obj_handle: i64,
+        index: i64,
+        value_i64: i64,
+    ) -> i64 {
+        fast_array_store_inner(obj_handle, index, value_i64).unwrap_or(JIT_DEOPT)
+    }
+
+    /// Inner implementation for [`jit_runtime_fast_array_store`].
+    fn fast_array_store_inner(obj_handle: i64, index: i64, value_i64: i64) -> Option<i64> {
+        if !is_heap_handle(obj_handle) || index < 0 || index > i32::MAX as i64 {
+            return None;
+        }
+        let smi_key = index as usize;
+        let obj_idx = (obj_handle - JIT_HEAP_TAG) as usize;
+
+        // Decode value inline for common types (avoids full jit_to_jsvalue).
+        let value = if !is_heap_handle(value_i64) {
+            if value_i64 >= i32::MIN as i64 && value_i64 <= i32::MAX as i64 {
+                JsValue::Smi(value_i64 as i32)
+            } else if value_i64 == JIT_TRUE {
+                JsValue::Boolean(true)
+            } else if value_i64 == JIT_FALSE {
+                JsValue::Boolean(false)
+            } else if value_i64 == JIT_UNDEFINED {
+                JsValue::Undefined
+            } else {
+                super::jit_to_jsvalue(value_i64)?
+            }
+        } else {
+            jit_i64_to_jsvalue(value_i64)
+        };
+
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if ptrs.is_cached() {
+            // SAFETY: cached pointers set by cache_rt_ptrs;
+            // valid for thread lifetime.
+            let heap_ref = unsafe { &*ptrs.heap };
+            // SAFETY: single-threaded JIT; no concurrent mutable
+            // borrows during a store fast path.
+            let heap = unsafe { &*heap_ref.as_ptr() };
+            match heap.get(obj_idx)? {
+                JsValue::Array(arr) => {
+                    // SAFETY: single-threaded JIT; no concurrent borrows.
+                    let v = unsafe { &mut *arr.as_ptr() };
+                    if smi_key >= v.len() {
+                        let cur_len = v.len();
+                        let new_cap = (smi_key + 1).next_power_of_two();
+                        v.reserve(new_cap - cur_len);
+                        v.resize(smi_key + 1, JsValue::TheHole);
+                    }
+                    v[smi_key] = value;
+                    Some(value_i64)
+                }
+                _ => None,
+            }
+        } else {
+            RT_HEAP.with(|heap| {
+                let heap = heap.borrow();
+                match heap.get(obj_idx)? {
+                    JsValue::Array(arr) => {
+                        let mut v = arr.borrow_mut();
+                        if smi_key >= v.len() {
+                            let cur_len = v.len();
+                            let new_cap = (smi_key + 1).next_power_of_two();
+                            v.reserve(new_cap - cur_len);
+                            v.resize(smi_key + 1, JsValue::TheHole);
+                        }
+                        v[smi_key] = value;
+                        Some(value_i64)
+                    }
+                    _ => None,
+                }
+            })
+        }
+    }
+
+    /// Fast-path `Array.prototype.push(value)` stub.
+    ///
+    /// Checks that the receiver is a `JsValue::Array`, appends `value` to
+    /// its backing `Vec`, and returns the new length as a Smi.  Returns
+    /// [`JIT_DEOPT`] if the receiver is not an array.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_handle`) – JIT i64 heap handle for the array.
+    /// * `RSI` (`method_handle`) – ignored (present for call-site compat).
+    /// * `RDX` (`value_i64`) – JIT i64 encoding of the value to push.
+    ///
+    /// Returns the new array length as a Smi `i64`, or [`JIT_DEOPT`].
+    #[no_mangle]
+    pub extern "C" fn jit_runtime_fast_array_push(
+        obj_handle: i64,
+        _method_handle: i64,
+        value_i64: i64,
+    ) -> i64 {
+        fast_array_push_inner(obj_handle, value_i64).unwrap_or(JIT_DEOPT)
+    }
+
+    /// Inner implementation for [`jit_runtime_fast_array_push`].
+    fn fast_array_push_inner(obj_handle: i64, value_i64: i64) -> Option<i64> {
+        if !is_heap_handle(obj_handle) {
+            return None;
+        }
+        let obj_idx = (obj_handle - JIT_HEAP_TAG) as usize;
+
+        // Decode value inline for common types.
+        let value = if !is_heap_handle(value_i64) {
+            if value_i64 >= i32::MIN as i64 && value_i64 <= i32::MAX as i64 {
+                JsValue::Smi(value_i64 as i32)
+            } else if value_i64 == JIT_TRUE {
+                JsValue::Boolean(true)
+            } else if value_i64 == JIT_FALSE {
+                JsValue::Boolean(false)
+            } else if value_i64 == JIT_UNDEFINED {
+                JsValue::Undefined
+            } else {
+                super::jit_to_jsvalue(value_i64)?
+            }
+        } else {
+            jit_i64_to_jsvalue(value_i64)
+        };
+
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if ptrs.is_cached() {
+            // SAFETY: cached pointers set by cache_rt_ptrs;
+            // valid for thread lifetime.
+            let heap_ref = unsafe { &*ptrs.heap };
+            // SAFETY: single-threaded JIT; no concurrent mutable
+            // borrows during push fast path.
+            let heap = unsafe { &*heap_ref.as_ptr() };
+            match heap.get(obj_idx)? {
+                JsValue::Array(arr) => {
+                    // SAFETY: single-threaded JIT; no concurrent borrows.
+                    let v = unsafe { &mut *arr.as_ptr() };
+                    v.push(value);
+                    let new_len = v.len() as i64;
+                    Some(new_len)
+                }
+                _ => None,
+            }
+        } else {
+            RT_HEAP.with(|heap| {
+                let heap = heap.borrow();
+                match heap.get(obj_idx)? {
+                    JsValue::Array(arr) => {
+                        let mut v = arr.borrow_mut();
+                        v.push(value);
+                        let new_len = v.len() as i64;
+                        Some(new_len)
+                    }
+                    _ => None,
+                }
+            })
+        }
+    }
+
     // ── Specialized StaNamedProperty stub ───────────────────────────────
 
     /// Specialized runtime stub for `StaNamedProperty`.

@@ -1254,24 +1254,23 @@ impl<'a> MaglevCodegen<'a> {
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::LoadKeyedGeneric { object, key, .. } => {
-                self.emit_stub_call_2node(
-                    id,
-                    *object,
-                    *key,
-                    jit_runtime::jit_runtime_lda_keyed_property as *const () as usize,
-                );
+                let stub = if self.is_known_int32_key(*key) {
+                    jit_runtime::jit_runtime_fast_array_load as *const () as usize
+                } else {
+                    jit_runtime::jit_runtime_lda_keyed_property as *const () as usize
+                };
+                self.emit_stub_call_2node(id, *object, *key, stub);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::StoreKeyedGeneric {
                 object, key, value, ..
             } => {
-                self.emit_stub_call_3node(
-                    id,
-                    *object,
-                    *key,
-                    *value,
-                    jit_runtime::jit_runtime_sta_keyed_property as *const () as usize,
-                );
+                let stub = if self.is_known_int32_key(*key) {
+                    jit_runtime::jit_runtime_fast_array_store as *const () as usize
+                } else {
+                    jit_runtime::jit_runtime_sta_keyed_property as *const () as usize
+                };
+                self.emit_stub_call_3node(id, *object, *key, *value, stub);
             }
 
             // ── FixedArray element access (routed through keyed-property stubs) ──
@@ -2037,6 +2036,43 @@ impl<'a> MaglevCodegen<'a> {
             }
             _ => None,
         }
+    }
+
+    /// Returns `true` when `id` refers to an IR node that is known to
+    /// produce an integer (Smi / Int32) value.  Used by the keyed-property
+    /// emission logic to route through the fast array element stubs instead
+    /// of the generic keyed-property runtime call.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn is_known_int32_key(&self, id: NodeId) -> bool {
+        matches!(
+            self.graph.node(id),
+            Some(
+                ValueNode::SmiConstant { .. }
+                    | ValueNode::Int32Constant { .. }
+                    | ValueNode::Uint32Constant { .. }
+                    | ValueNode::Int32Add { .. }
+                    | ValueNode::Int32Subtract { .. }
+                    | ValueNode::Int32Multiply { .. }
+                    | ValueNode::Int32Divide { .. }
+                    | ValueNode::Int32Modulus { .. }
+                    | ValueNode::Int32Negate { .. }
+                    | ValueNode::Int32Increment { .. }
+                    | ValueNode::Int32Decrement { .. }
+                    | ValueNode::Int32BitwiseAnd { .. }
+                    | ValueNode::Int32BitwiseOr { .. }
+                    | ValueNode::Int32BitwiseXor { .. }
+                    | ValueNode::Int32ShiftLeft { .. }
+                    | ValueNode::Int32ShiftRight { .. }
+                    | ValueNode::Int32ShiftRightLogical { .. }
+                    | ValueNode::CheckedSmiAdd { .. }
+                    | ValueNode::CheckedSmiSubtract { .. }
+                    | ValueNode::CheckedSmiMultiply { .. }
+                    | ValueNode::CheckedSmiIncrement { .. }
+                    | ValueNode::CheckedSmiDecrement { .. }
+                    | ValueNode::CheckedSmiDivide { .. }
+                    | ValueNode::CheckedSmiModulus { .. }
+            )
+        )
     }
 
     // ── Direct-register binary operation helpers ────────────────────────────

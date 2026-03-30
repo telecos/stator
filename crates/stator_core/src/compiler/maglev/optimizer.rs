@@ -110,21 +110,24 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // current graph structure.
     eliminate_common_subexpressions(graph);
     let globals_promoted = promote_loop_globals_counted(graph);
+    let licm_hoisted2 = crate::compiler::maglev::licm::hoist_loop_invariants(graph);
     // Re-run truncation after global promotion: promotion replaces
     // LoadGlobal/StoreGlobal with Phi nodes, reducing use-counts on
     // arithmetic nodes — allowing CheckedSmi→Int32 conversion.
     let truncations2 = propagate_int32_truncation(graph);
+    eliminate_identity_operations_global(graph);
     eliminate_redundant_type_guards(graph);
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
     eliminate_dead_code(graph);
 
     let total_truncations = truncations + truncations2;
+    let total_licm = licm_hoisted + licm_hoisted2;
     let final_nodes: usize = graph.blocks().iter().map(|b| b.nodes.len()).sum();
     // Always print summary so we can confirm optimizer runs at all.
     eprintln!(
         "MAGLEV_OPT: blocks={block_count} nodes={node_count}->{final_nodes} \
-         licm_hoisted={licm_hoisted} globals_promoted={globals_promoted} \
+         licm_hoisted={total_licm} globals_promoted={globals_promoted} \
          truncated={total_truncations}"
     );
 }
@@ -769,6 +772,112 @@ fn simplify_identities_in_block(block: &mut BasicBlock) {
     }
 
     if !subst.is_empty() {
+        apply_subst_to_block(block, &subst);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass 1.25b — Cross-block identity elimination
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Eliminate identity operations whose constant operand lives in a different
+/// block than the arithmetic node.
+///
+/// The block-local [`simplify_identities`] pass only sees constants defined
+/// within the same basic block.  This global pass collects *all* constants
+/// across the entire graph and then replaces identity patterns such as
+/// `x | 0`, `x & -1`, `x + 0`, `x - 0`, and `x * 1` regardless of which
+/// block the constant was defined in.  Remaining dead placeholders are
+/// cleaned up by the later DCE pass.
+fn eliminate_identity_operations_global(graph: &mut MaglevGraph) {
+    // Step 1: Collect all integer constants across every block.
+    let mut consts: HashMap<NodeId, i32> = HashMap::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            match node {
+                ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } => {
+                    consts.insert(*id, *value);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if consts.is_empty() {
+        return;
+    }
+
+    // Step 2: Scan all blocks for identity patterns, building a global
+    // substitution map and replacing matched nodes with dead placeholders.
+    let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
+    for block in graph.blocks_mut() {
+        for (id, node) in &mut block.nodes {
+            let replacement: Option<NodeId> = match node {
+                // x | 0 → x, 0 | x → x
+                ValueNode::Int32BitwiseOr { left, right } => {
+                    if consts.get(right) == Some(&0) {
+                        Some(*left)
+                    } else if consts.get(left) == Some(&0) {
+                        Some(*right)
+                    } else {
+                        None
+                    }
+                }
+                // x & -1 → x, -1 & x → x
+                ValueNode::Int32BitwiseAnd { left, right } => {
+                    if consts.get(right) == Some(&-1) {
+                        Some(*left)
+                    } else if consts.get(left) == Some(&-1) {
+                        Some(*right)
+                    } else {
+                        None
+                    }
+                }
+                // x + 0 → x, 0 + x → x
+                ValueNode::Int32Add { left, right } => {
+                    if consts.get(right) == Some(&0) {
+                        Some(*left)
+                    } else if consts.get(left) == Some(&0) {
+                        Some(*right)
+                    } else {
+                        None
+                    }
+                }
+                // x - 0 → x
+                ValueNode::Int32Subtract { left, right } => {
+                    if consts.get(right) == Some(&0) {
+                        Some(*left)
+                    } else {
+                        None
+                    }
+                }
+                // x * 1 → x, 1 * x → x
+                ValueNode::Int32Multiply { left, right } => {
+                    if consts.get(right) == Some(&1) {
+                        Some(*left)
+                    } else if consts.get(left) == Some(&1) {
+                        Some(*right)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+
+            if let Some(canonical_id) = replacement {
+                subst.insert(*id, canonical_id);
+                *node = ValueNode::UndefinedConstant;
+            }
+        }
+    }
+
+    if subst.is_empty() {
+        return;
+    }
+
+    // Step 3: Apply substitutions across all blocks so every reference to
+    // an eliminated node is redirected to its non-constant operand.
+    for block in graph.blocks_mut() {
         apply_subst_to_block(block, &subst);
     }
 }
