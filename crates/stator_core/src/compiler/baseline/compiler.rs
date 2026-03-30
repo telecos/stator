@@ -278,6 +278,25 @@ pub(crate) mod jit_runtime {
         static RT_ARRAY_METHOD_IC: Cell<ArrayMethodIcEntry> = const {
             Cell::new(ArrayMethodIcEntry::EMPTY)
         };
+
+        // ── Direct JIT-to-JIT call state ────────────────────────────────
+        //
+        // Saved by `jit_runtime_get_jit_entry`, restored by
+        // `jit_runtime_finish_direct_call`.
+
+        /// Saved `RT_BYTECODE` pointer from before the direct call.
+        static DIRECT_CALL_SAVED_BA: Cell<*const BytecodeArray> =
+            const { Cell::new(std::ptr::null()) };
+
+        /// Heap length before the direct call (for truncation on return).
+        static DIRECT_CALL_HEAP_BASE: Cell<usize> = const { Cell::new(0) };
+
+        /// Whether the closure context was swapped for the direct call.
+        static DIRECT_CALL_CTX_CHANGED: Cell<bool> = const { Cell::new(false) };
+
+        /// Previous context saved before a direct-call context swap.
+        static DIRECT_CALL_OLD_CTX: RefCell<Option<Rc<RefCell<JsContext>>>> =
+            const { RefCell::new(None) };
     }
 
     /// Cached raw pointers to frequently-accessed TLS variables.
@@ -2552,6 +2571,263 @@ pub(crate) mod jit_runtime {
                 None
             }
         }
+    }
+
+    // ── Direct JIT-to-JIT call support ─────────────────────────────────
+    //
+    // The following functions enable Maglev-generated code to call into
+    // baseline JIT code directly, bypassing the full runtime stub overhead.
+    //
+    // Flow:
+    //   1. Generated code calls `jit_runtime_get_jit_entry(callee_i64)`
+    //      which returns a `JitEntryInfo { entry_point, ctx_ptr }`.
+    //   2. If `entry_point != 0`, generated code allocates a register file
+    //      on the stack, stores arguments, and calls the entry point directly.
+    //   3. After the call, generated code calls
+    //      `jit_runtime_finish_direct_call(result)` to restore TLS state
+    //      and encode the result.
+    //   4. If `entry_point == 0`, generated code falls back to the normal
+    //      runtime stub (e.g. `jit_runtime_call_undefined_receiver0`).
+
+    /// Return type for [`jit_runtime_get_jit_entry`].
+    ///
+    /// Returned in RAX:RDX per the SysV AMD64 ABI (two-member C struct).
+    #[repr(C)]
+    pub struct JitEntryInfo {
+        /// JIT code entry point, or 0 if no JIT code is available.
+        pub entry_point: usize,
+        /// Closure context raw pointer to pass as the second argument
+        /// to the baseline JIT entry.  Only valid when `entry_point != 0`.
+        pub ctx_ptr: i64,
+    }
+
+    /// Look up the baseline JIT entry point for a callee and prepare TLS
+    /// state for a direct call.
+    ///
+    /// When a valid entry point is returned, this function has already:
+    ///   - Saved the current `RT_BYTECODE` pointer (for later restore).
+    ///   - Set `RT_BYTECODE` to the callee's [`BytecodeArray`].
+    ///   - Saved the current heap length (for post-call truncation).
+    ///   - Saved and swapped the closure context if necessary.
+    ///
+    /// The caller **must** call [`jit_runtime_finish_direct_call`] after
+    /// the direct call completes to restore TLS state.
+    ///
+    /// Returns `JitEntryInfo { 0, 0 }` if the callee does not have
+    /// baseline JIT code cached (fall back to the full stub).
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`callee_i64`) – JIT i64 encoding of the callee.
+    ///
+    /// Returns `JitEntryInfo` in `RAX` (entry_point) and `RDX` (ctx_ptr).
+    pub extern "C" fn jit_runtime_get_jit_entry(callee_i64: i64) -> JitEntryInfo {
+        let null_info = JitEntryInfo {
+            entry_point: 0,
+            ctx_ptr: 0,
+        };
+
+        if callee_i64 < JIT_HEAP_TAG {
+            return null_info;
+        }
+
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if !ptrs.is_cached() {
+            return null_info;
+        }
+
+        // SAFETY: cached pointer set by cache_rt_ptrs; valid for thread lifetime.
+        let heap_ref = unsafe { &*ptrs.heap };
+        let bc_ref = unsafe { &*ptrs.bytecode };
+        let ctx_ref = unsafe { &*ptrs.context };
+
+        let idx = (callee_i64 - JIT_HEAP_TAG) as usize;
+
+        // Scoped heap borrow: extract the exec-cache pointer and context
+        // info, then drop the heap borrow before calling JIT code.
+        let (exec_ptr, reg_file_slots, ba_ptr, callee_ctx_ptr) = {
+            // SAFETY: single-threaded JIT; no concurrent heap mutation.
+            let heap = unsafe { &*heap_ref.as_ptr() };
+            let callee = match heap.get(idx) {
+                Some(v) => v,
+                None => return null_info,
+            };
+            match callee {
+                JsValue::Function(ba) => {
+                    let exec_cache = ba.jit_executable_cache();
+                    // SAFETY: single-threaded; exec cache is not being
+                    // mutated during JIT execution.
+                    let cache_ref = unsafe { &*exec_cache.as_ptr() };
+                    match cache_ref.as_ref() {
+                        Some(exec) => {
+                            // Only support functions with ≤ 16 register
+                            // file slots for the stack-allocated fast path.
+                            if exec.register_file_slots > 16 {
+                                return null_info;
+                            }
+                            let ctx = ba
+                                .closure_context()
+                                .map(|rc| Rc::as_ptr(rc) as usize)
+                                .unwrap_or(0);
+                            // SAFETY: exec lives as long as the Rc<BytecodeArray>
+                            // in the heap (which outlives this call chain).
+                            let exec_raw = exec as *const JitExecutableCode;
+                            let ba_raw = &**ba as *const BytecodeArray;
+                            (exec_raw, exec.register_file_slots, ba_raw, ctx)
+                        }
+                        None => return null_info,
+                    }
+                }
+                _ => return null_info,
+            }
+        };
+        // Heap borrow is dropped.
+
+        // Save TLS state for jit_runtime_finish_direct_call.
+        let saved_ba = bc_ref.get();
+        // SAFETY: no active heap borrows.
+        let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+
+        // Context swap (skip if same).
+        let callee_ctx_raw_ptr = callee_ctx_ptr as *const RefCell<JsContext>;
+        // SAFETY: no active borrows of context RefCell.
+        let current_ctx_ptr = unsafe {
+            (*ctx_ref.as_ptr())
+                .as_ref()
+                .map(Rc::as_ptr)
+                .unwrap_or(std::ptr::null())
+        };
+        let same_context = std::ptr::eq(callee_ctx_raw_ptr, current_ctx_ptr);
+        if !same_context {
+            // Save the OLD context before swapping. We read it from
+            // the raw ptr (which is still the old value).
+            DIRECT_CALL_OLD_CTX.with(|c| {
+                // SAFETY: single-threaded; no concurrent borrow.
+                *c.borrow_mut() = unsafe { (*ctx_ref.as_ptr()).clone() };
+            });
+
+            // Re-borrow heap to clone callee's context Rc.
+            let callee_ctx = {
+                // SAFETY: single-threaded.
+                let heap = unsafe { &*heap_ref.as_ptr() };
+                match heap.get(idx) {
+                    Some(JsValue::Function(ba)) => ba.closure_context().cloned(),
+                    _ => None,
+                }
+            };
+            // SAFETY: no active borrows of context RefCell.
+            unsafe { *ctx_ref.as_ptr() = callee_ctx };
+        }
+
+        // Set RT_BYTECODE to callee.
+        bc_ref.set(ba_ptr);
+
+        // Stash saved state in TLS for the finish call.
+        DIRECT_CALL_SAVED_BA.with(|c| c.set(saved_ba));
+        DIRECT_CALL_HEAP_BASE.with(|c| c.set(heap_base));
+        DIRECT_CALL_CTX_CHANGED.with(|c| c.set(!same_context));
+
+        // Extract the raw function pointer from JitExecutableCode.
+        // SAFETY: `exec_raw` points to a valid `JitExecutableCode` whose
+        // first field is `ptr: *mut u8`.  We call `execute` with a
+        // pre-allocated register file to obtain the same function pointer.
+        // Instead, we compute the entry point by reading the struct's
+        // internal pointer.  JitExecutableCode has fields:
+        //   ptr: *mut u8, size: usize, register_file_slots: usize
+        // The public `register_file_slots` at a known offset lets us
+        // verify the layout assumption.
+        let entry_point = {
+            // SAFETY: exec_raw is alive (held by Rc in the heap).
+            let exec = unsafe { &*exec_ptr };
+            // The only way to obtain the code pointer is through the
+            // struct's memory layout.  JitExecutableCode is a plain
+            // struct with 3 pointer-sized fields in declaration order.
+            let base = exec as *const JitExecutableCode as *const u8;
+            // Validate: register_file_slots (3rd field) should be at
+            // offset 2 * size_of::<usize>().
+            let expected_offset = 2 * std::mem::size_of::<usize>();
+            // SAFETY: reading within the struct's allocation.
+            let slots_at_offset = unsafe { *(base.add(expected_offset) as *const usize) };
+            debug_assert_eq!(
+                slots_at_offset, reg_file_slots,
+                "JitExecutableCode layout assumption violated"
+            );
+            // SAFETY: first field (ptr) is at offset 0.
+            unsafe { *(base as *const usize) }
+        };
+
+        if entry_point == 0 {
+            // Undo TLS changes.
+            bc_ref.set(saved_ba);
+            return null_info;
+        }
+
+        JitEntryInfo {
+            entry_point,
+            ctx_ptr: callee_ctx_ptr as i64,
+        }
+    }
+
+    /// Restore TLS state after a direct JIT-to-JIT call.
+    ///
+    /// Handles heap truncation, bytecode-pointer restore, context restore,
+    /// and result encoding (heap handle → re-encoded i64).
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`result`) – raw `i64` result from the callee JIT code.
+    ///
+    /// Returns the final result as `i64` in `RAX`, or [`JIT_DEOPT`].
+    pub extern "C" fn jit_runtime_finish_direct_call(result: i64) -> i64 {
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if !ptrs.is_cached() {
+            return JIT_DEOPT;
+        }
+
+        // SAFETY: cached pointer set by cache_rt_ptrs; valid for thread lifetime.
+        let bc_ref = unsafe { &*ptrs.bytecode };
+        let heap_ref = unsafe { &*ptrs.heap };
+        let ctx_ref = unsafe { &*ptrs.context };
+
+        let saved_ba = DIRECT_CALL_SAVED_BA.with(|c| c.get());
+        let heap_base = DIRECT_CALL_HEAP_BASE.with(|c| c.get());
+        let ctx_changed = DIRECT_CALL_CTX_CHANGED.with(|c| c.get());
+
+        // Restore bytecode pointer.
+        bc_ref.set(saved_ba);
+
+        // Fast path: non-heap results don't reference heap handles.
+        if result != JIT_DEOPT && result < JIT_HEAP_TAG {
+            // SAFETY: no active heap borrows.
+            unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+            if ctx_changed {
+                DIRECT_CALL_OLD_CTX.with(|c| {
+                    let old = c.borrow_mut().take();
+                    // SAFETY: single-threaded; no concurrent borrow.
+                    unsafe { *ctx_ref.as_ptr() = old };
+                });
+            }
+            return result;
+        }
+
+        // Heap handle or deopt: resolve before truncation.
+        let result_val = if result == JIT_DEOPT {
+            None
+        } else {
+            jit_to_jsvalue_ext(result)
+        };
+
+        // SAFETY: no active heap borrows.
+        unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+        if ctx_changed {
+            DIRECT_CALL_OLD_CTX.with(|c| {
+                let old = c.borrow_mut().take();
+                // SAFETY: single-threaded; no concurrent borrow.
+                unsafe { *ctx_ref.as_ptr() = old };
+            });
+        }
+
+        result_val.map(jsvalue_to_jit_i64).unwrap_or(JIT_DEOPT)
     }
 
     /// Specialized runtime stub for `LdaGlobal`.

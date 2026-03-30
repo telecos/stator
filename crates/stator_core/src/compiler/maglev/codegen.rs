@@ -1402,7 +1402,7 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_store(id, Reg64::R11);
             }
 
-            // ── Function calls via runtime stubs ──────────────────────────────
+            // ── Function calls — direct JIT-to-JIT with stub fallback ──────
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::Call {
                 callee,
@@ -1411,38 +1411,24 @@ impl<'a> MaglevCodegen<'a> {
                 ..
             } => {
                 // Check receiver: if it's UndefinedConstant, use the
-                // CallUndefinedReceiver stubs; otherwise use CallProperty.
+                // CallUndefinedReceiver path (with direct-call fast path);
+                // otherwise use CallProperty stubs.
                 let recv_is_undef = matches!(
                     self.graph.node(*receiver),
                     Some(ValueNode::UndefinedConstant)
                 );
                 match (recv_is_undef, args.len()) {
-                    // CallUndefinedReceiver0
+                    // CallUndefinedReceiver0 — direct call fast path
                     (true, 0) => {
-                        self.emit_stub_call_1node(
-                            id,
-                            *callee,
-                            jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize,
-                        );
+                        self.emit_direct_call_0(id, *callee);
                     }
-                    // CallUndefinedReceiver1
+                    // CallUndefinedReceiver1 — direct call fast path
                     (true, 1) => {
-                        self.emit_stub_call_2node(
-                            id,
-                            *callee,
-                            args[0],
-                            jit_runtime::jit_runtime_call_undefined_receiver1 as *const () as usize,
-                        );
+                        self.emit_direct_call_1(id, *callee, args[0]);
                     }
-                    // CallUndefinedReceiver2
+                    // CallUndefinedReceiver2 — direct call fast path
                     (true, 2) => {
-                        self.emit_stub_call_3node(
-                            id,
-                            *callee,
-                            args[0],
-                            args[1],
-                            jit_runtime::jit_runtime_call_undefined_receiver2 as *const () as usize,
-                        );
+                        self.emit_direct_call_2(id, *callee, args[0], args[1]);
                     }
                     // CallProperty0
                     (false, 0) => {
@@ -1484,28 +1470,13 @@ impl<'a> MaglevCodegen<'a> {
                 );
                 match (recv_is_undef, args.len()) {
                     (true, 0) => {
-                        self.emit_stub_call_1node(
-                            id,
-                            *callee,
-                            jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize,
-                        );
+                        self.emit_direct_call_0(id, *callee);
                     }
                     (true, 1) => {
-                        self.emit_stub_call_2node(
-                            id,
-                            *callee,
-                            args[0],
-                            jit_runtime::jit_runtime_call_undefined_receiver1 as *const () as usize,
-                        );
+                        self.emit_direct_call_1(id, *callee, args[0]);
                     }
                     (true, 2) => {
-                        self.emit_stub_call_3node(
-                            id,
-                            *callee,
-                            args[0],
-                            args[1],
-                            jit_runtime::jit_runtime_call_undefined_receiver2 as *const () as usize,
-                        );
+                        self.emit_direct_call_2(id, *callee, args[0], args[1]);
                     }
                     (false, 0) => {
                         self.emit_stub_call_2node(
@@ -2690,6 +2661,274 @@ impl<'a> MaglevCodegen<'a> {
         let addr = jit_runtime::jit_runtime_trampoline as *const () as usize;
         self.masm.mov_ri(Reg64::R11, addr as i64);
         self.masm.call_reg(Reg64::R11);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    // ── Direct JIT-to-JIT call helpers ──────────────────────────────────────
+    //
+    // When the callee already has baseline JIT code cached, these methods
+    // emit a fast path that:
+    //   1. Calls `jit_runtime_get_jit_entry` to obtain the entry point.
+    //   2. If non-null, allocates a 128-byte register file on the stack,
+    //      stores arguments, and calls the entry point directly.
+    //   3. Calls `jit_runtime_finish_direct_call` to restore TLS state.
+    //   4. Falls back to the full runtime stub on cache miss.
+
+    /// Emit a direct-call fast path for `CallUndefinedReceiver0`.
+    ///
+    /// Layout after fast-path setup (RSP-relative):
+    /// ```text
+    /// RSP +   0 .. +127  : callee's register file (16 × i64, zeroed)
+    /// RSP + 128          : saved callee handle (for slow-path reload)
+    /// RSP + 136          : alignment padding
+    /// ```
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_direct_call_0(&mut self, id: NodeId, callee: NodeId) {
+        let saved = self.emit_save_live_regs(id);
+        // After save_live_regs: RSP ≡ 0 mod 16.
+
+        self.emit_load(callee, Reg64::Rdi);
+        // Save callee + alignment pad (2 pushes → RSP still ≡ 0 mod 16).
+        self.masm.push(Reg64::Rdi);
+        self.masm.push(Reg64::Rdi); // padding (value doesn't matter)
+
+        // Call jit_runtime_get_jit_entry(callee_i64).
+        // Returns JitEntryInfo { entry_point: usize, ctx_ptr: i64 }
+        // in RAX (entry_point) and RDX (ctx_ptr) per SysV ABI.
+        let get_entry_addr = jit_runtime::jit_runtime_get_jit_entry as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, get_entry_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        // Check: entry_point == 0 → slow path.
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+        self.masm.test_rr(Reg64::Rax, Reg64::Rax);
+        self.masm.je(&mut slow_label);
+
+        // ── Fast path: direct call ──────────────────────────────────
+        // RAX = entry point, RDX = ctx_ptr.
+        // Save entry point in R11 (scratch, but we control usage).
+        self.masm.mov_rr(Reg64::R11, Reg64::Rax);
+        // Save ctx_ptr — RDX is caller-saved but not clobbered between
+        // here and the call.  Move to R10 for safety.
+        self.masm.mov_rr(Reg64::R10, Reg64::Rdx);
+
+        // Allocate 128-byte register file on the stack (16 × i64).
+        // RSP was ≡ 0 mod 16 after get_jit_entry returned.
+        // sub 128 → RSP ≡ 0 mod 16.
+        self.masm.sub_ri(Reg64::Rsp, 128);
+
+        // Zero the register file (callee expects zeroed spill slots).
+        // Use R10-save first, then zero with xor-self.
+        self.masm.push(Reg64::R10); // save ctx on stack (RSP -= 8)
+        self.masm.push(Reg64::R11); // save entry on stack (RSP -= 8)
+        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+        for i in 0..16 {
+            // Register file starts at RSP + 16 (after 2 pushes).
+            self.masm
+                .mov_store_base_disp32(Reg64::Rsp, 16 + i * 8, Reg64::Rax);
+        }
+        self.masm.pop(Reg64::R11); // restore entry
+        self.masm.pop(Reg64::R10); // restore ctx
+
+        // RDI = register file base (RSP points to it).
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
+        // RSI = context pointer.
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+
+        // CALL entry point.
+        self.masm.call_reg(Reg64::R11);
+
+        // Deallocate register file.
+        self.masm.add_ri(Reg64::Rsp, 128);
+
+        // RAX = raw result from callee.  Call finish to restore TLS.
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
+        let finish_addr = jit_runtime::jit_runtime_finish_direct_call as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, finish_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        // Pop saved callee + padding.
+        self.masm.add_ri(Reg64::Rsp, 16);
+        self.masm.jmp(&mut done_label);
+
+        // ── Slow path: full runtime stub ────────────────────────────
+        self.masm.bind_label(&mut slow_label);
+        // Pop saved callee into RDI, discard padding.
+        self.masm.pop(Reg64::R11); // padding → discard
+        self.masm.pop(Reg64::Rdi); // callee
+        let stub_addr = jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        // ── Common exit ─────────────────────────────────────────────
+        self.masm.bind_label(&mut done_label);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Emit a direct-call fast path for `CallUndefinedReceiver1`.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_direct_call_1(&mut self, id: NodeId, callee: NodeId, arg0: NodeId) {
+        let saved = self.emit_save_live_regs(id);
+
+        // Load callee and arg0 into registers, then save to stack.
+        self.emit_load(callee, Reg64::Rdi);
+        self.emit_load(arg0, Reg64::Rsi);
+        // Push arg0, callee (2 pushes → RSP ≡ 0 mod 16).
+        self.masm.push(Reg64::Rsi); // arg0
+        self.masm.push(Reg64::Rdi); // callee
+
+        // Call jit_runtime_get_jit_entry(callee_i64).
+        // RDI already has callee.
+        let get_entry_addr = jit_runtime::jit_runtime_get_jit_entry as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, get_entry_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+        self.masm.test_rr(Reg64::Rax, Reg64::Rax);
+        self.masm.je(&mut slow_label);
+
+        // ── Fast path ───────────────────────────────────────────────
+        self.masm.mov_rr(Reg64::R11, Reg64::Rax); // entry point
+        self.masm.mov_rr(Reg64::R10, Reg64::Rdx); // ctx_ptr
+
+        // Allocate register file (128 bytes).
+        self.masm.sub_ri(Reg64::Rsp, 128);
+
+        // Zero register file.
+        self.masm.push(Reg64::R10);
+        self.masm.push(Reg64::R11);
+        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+        for i in 0..16 {
+            self.masm
+                .mov_store_base_disp32(Reg64::Rsp, 16 + i * 8, Reg64::Rax);
+        }
+        self.masm.pop(Reg64::R11);
+        self.masm.pop(Reg64::R10);
+
+        // Store arg0 into register file slot 0.
+        // arg0 is on the stack at RSP + 128 + 8 (callee at +128, arg0 at +136).
+        self.masm
+            .mov_load_base_disp32(Reg64::Rax, Reg64::Rsp, 128 + 8);
+        self.masm.mov_store_base_disp32(Reg64::Rsp, 0, Reg64::Rax);
+
+        // Call entry point.
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+        self.masm.call_reg(Reg64::R11);
+
+        // Deallocate register file.
+        self.masm.add_ri(Reg64::Rsp, 128);
+
+        // Finish direct call.
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
+        let finish_addr = jit_runtime::jit_runtime_finish_direct_call as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, finish_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        // Pop saved values.
+        self.masm.add_ri(Reg64::Rsp, 16);
+        self.masm.jmp(&mut done_label);
+
+        // ── Slow path ───────────────────────────────────────────────
+        self.masm.bind_label(&mut slow_label);
+        self.masm.pop(Reg64::Rdi); // callee
+        self.masm.pop(Reg64::Rsi); // arg0
+        let stub_addr = jit_runtime::jit_runtime_call_undefined_receiver1 as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        // ── Common exit ─────────────────────────────────────────────
+        self.masm.bind_label(&mut done_label);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Emit a direct-call fast path for `CallUndefinedReceiver2`.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_direct_call_2(&mut self, id: NodeId, callee: NodeId, arg0: NodeId, arg1: NodeId) {
+        let saved = self.emit_save_live_regs(id);
+
+        // Load all three values before pushing (avoids clobbering issues).
+        self.emit_load(callee, Reg64::Rdi);
+        self.emit_load(arg0, Reg64::Rsi);
+        self.emit_load(arg1, Reg64::Rdx);
+        // 4 pushes → RSP ≡ 0 mod 16 (even count, but we started at
+        // 0 mod 16, so 4×8 = 32 → still 0 mod 16).
+        self.masm.push(Reg64::Rdx); // arg1
+        self.masm.push(Reg64::Rsi); // arg0
+        self.masm.push(Reg64::Rdi); // callee
+        self.masm.push(Reg64::Rdi); // padding
+
+        // Call jit_runtime_get_jit_entry(callee_i64).
+        let get_entry_addr = jit_runtime::jit_runtime_get_jit_entry as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, get_entry_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+        self.masm.test_rr(Reg64::Rax, Reg64::Rax);
+        self.masm.je(&mut slow_label);
+
+        // ── Fast path ───────────────────────────────────────────────
+        self.masm.mov_rr(Reg64::R11, Reg64::Rax); // entry
+        self.masm.mov_rr(Reg64::R10, Reg64::Rdx); // ctx
+
+        self.masm.sub_ri(Reg64::Rsp, 128);
+
+        // Zero register file.
+        self.masm.push(Reg64::R10);
+        self.masm.push(Reg64::R11);
+        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+        for i in 0..16 {
+            self.masm
+                .mov_store_base_disp32(Reg64::Rsp, 16 + i * 8, Reg64::Rax);
+        }
+        self.masm.pop(Reg64::R11);
+        self.masm.pop(Reg64::R10);
+
+        // Store args into register file.
+        // Stack after sub 128: [regfile(128), padding(8), callee(8), arg0(8), arg1(8)]
+        // arg0 at RSP + 128 + 16, arg1 at RSP + 128 + 24.
+        self.masm
+            .mov_load_base_disp32(Reg64::Rax, Reg64::Rsp, 128 + 16);
+        self.masm.mov_store_base_disp32(Reg64::Rsp, 0, Reg64::Rax); // slot 0 = arg0
+        self.masm
+            .mov_load_base_disp32(Reg64::Rax, Reg64::Rsp, 128 + 24);
+        self.masm.mov_store_base_disp32(Reg64::Rsp, 8, Reg64::Rax); // slot 1 = arg1
+
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+        self.masm.call_reg(Reg64::R11);
+
+        self.masm.add_ri(Reg64::Rsp, 128);
+
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
+        let finish_addr = jit_runtime::jit_runtime_finish_direct_call as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, finish_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        self.masm.add_ri(Reg64::Rsp, 32); // pop 4 saved values
+        self.masm.jmp(&mut done_label);
+
+        // ── Slow path ───────────────────────────────────────────────
+        self.masm.bind_label(&mut slow_label);
+        self.masm.pop(Reg64::R11); // padding
+        self.masm.pop(Reg64::Rdi); // callee
+        self.masm.pop(Reg64::Rsi); // arg0
+        self.masm.pop(Reg64::Rdx); // arg1
+        let stub_addr = jit_runtime::jit_runtime_call_undefined_receiver2 as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        // ── Common exit ─────────────────────────────────────────────
+        self.masm.bind_label(&mut done_label);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
         self.emit_store(id, Reg64::Rax);
