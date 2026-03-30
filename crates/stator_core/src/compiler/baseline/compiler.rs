@@ -7064,11 +7064,11 @@ mod tests {
 
     #[test]
     fn test_compile_deopt_for_unsupported_opcode() {
-        // LdaGlobal emits a deopt entry.
+        // Exp still emits a deopt entry (no runtime stub for it).
         let ba = bytecode(vec![
             Instruction::new_unchecked(
-                Opcode::LdaGlobal,
-                vec![Operand::ConstantPoolIdx(0), Operand::FeedbackSlot(0)],
+                Opcode::Exp,
+                vec![Operand::Register(0), Operand::FeedbackSlot(0)],
             ),
             Instruction::new_unchecked(Opcode::Return, vec![]),
         ]);
@@ -7504,8 +7504,8 @@ mod tests {
         let ba = BytecodeArray::new(
             encode(&[
                 Instruction::new_unchecked(
-                    Opcode::LdaGlobal,
-                    vec![Operand::ConstantPoolIdx(0), Operand::FeedbackSlot(0)],
+                    Opcode::Exp,
+                    vec![Operand::Register(0), Operand::FeedbackSlot(0)],
                 ),
                 Instruction::new_unchecked(Opcode::Return, vec![]),
             ]),

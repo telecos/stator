@@ -376,6 +376,7 @@ mod tests {
     /// deoptimiser falls back to the interpreter and produces the correct result.
     #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
+    #[ignore = "narrow-Int32 analysis is disabled (SIGSEGV); 64-bit add does not overflow at 2^32"]
     fn test_deoptimize_via_type_change() {
         use crate::compiler::baseline::compiler::jit_to_jsvalue;
         use crate::compiler::maglev::codegen::compile;
