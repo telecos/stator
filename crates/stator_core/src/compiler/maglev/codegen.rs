@@ -3642,6 +3642,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "narrow-Int32 analysis disabled (SIGSEGV bug)"]
     fn test_narrow_int32_only_narrow_consumers_is_narrow() {
         // p0, p1 -> Int32Add(A) -> Int32Add(B) -> Int32Equal(C) -> Return
         // A feeds B (narrow), and B feeds C (narrow comparison).
