@@ -163,15 +163,40 @@ pub(crate) mod jit_runtime {
     use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
     use crate::objects::value::{JsContext, JsValue};
 
+    /// One slot of the own-property inline cache for `LdaNamedProperty`.
+    #[derive(Clone, Copy)]
+    struct LdaIcEntry {
+        /// Constant-pool index of the property name.
+        name_idx: u32,
+        /// Shape id of the object at the time the IC was populated.
+        shape: u64,
+        /// Fast property offset inside the object's property storage.
+        offset: usize,
+        /// Heap-handle value for the cached result (0 if not heap).
+        cached_handle: i64,
+        /// Raw `Rc` pointer of the cached heap value (0 if not heap).
+        cached_ptr: usize,
+    }
+
+    impl LdaIcEntry {
+        /// Sentinel value used to initialise / clear the IC.
+        const EMPTY: Self = Self {
+            name_idx: u32::MAX,
+            shape: 0,
+            offset: 0,
+            cached_handle: 0,
+            cached_ptr: 0,
+        };
+    }
+
     /// Combined inline caches for named-property stubs.
     ///
     /// Merging the LDA and prototype ICs into one TLS variable saves
     /// one `thread_local!` lookup on the IC-miss path (where both
     /// caches are probed sequentially).
     struct JitPropertyIcState {
-        /// Own-property IC: `(name_idx, shape_id, offset)`.
-        /// Direct-mapped by `name_idx & 63`.
-        lda: [(u32, u64, usize); 64],
+        /// Own-property IC, indexed by `name_idx & 63`.
+        lda: [LdaIcEntry; 64],
         /// Prototype-chain IC: `(name_idx, own_shape_id, cached_value)`.
         /// Direct-mapped by `name_idx & 31`.
         proto: [(u32, u64, i64); 32],
@@ -209,7 +234,7 @@ pub(crate) mod jit_runtime {
         /// to prevent cross-function constant-pool index collisions.
         static RT_PROP_IC: RefCell<JitPropertyIcState> = const {
             RefCell::new(JitPropertyIcState {
-                lda: [(u32::MAX, 0, 0); 64],
+                lda: [LdaIcEntry::EMPTY; 64],
                 proto: [(u32::MAX, 0, 0); 32],
             })
         };
@@ -331,7 +356,7 @@ pub(crate) mod jit_runtime {
         RT_HEAP.with(|h| h.borrow_mut().clear());
         RT_PROP_IC.with(|ic| {
             let mut c = ic.borrow_mut();
-            c.lda = [(u32::MAX, 0, 0); 64];
+            c.lda = [LdaIcEntry::EMPTY; 64];
             c.proto = [(u32::MAX, 0, 0); 32];
         });
         RT_ARRAY_METHOD_IC.with(|c| c.set(ArrayMethodIcEntry::EMPTY));
@@ -372,7 +397,7 @@ pub(crate) mod jit_runtime {
         RT_HEAP.with(|h| h.borrow_mut().clear());
         RT_PROP_IC.with(|ic| {
             let mut c = ic.borrow_mut();
-            c.lda = [(u32::MAX, 0, 0); 64];
+            c.lda = [LdaIcEntry::EMPTY; 64];
             c.proto = [(u32::MAX, 0, 0); 32];
         });
         RT_ARRAY_METHOD_IC.with(|c| c.set(ArrayMethodIcEntry::EMPTY));
