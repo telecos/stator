@@ -745,6 +745,21 @@ impl PropertyMap {
         self.values.get(offset)
     }
 
+    /// Returns the value at a raw slot offset **without** bounds checking.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that `offset < self.len()`.  This is
+    /// satisfied when `offset` was obtained from [`offset_of`](Self::offset_of)
+    /// and `shape_id()` has not changed since (the shape stamp is bumped on
+    /// every structural mutation that could invalidate an offset).
+    #[inline]
+    pub unsafe fn get_by_offset_unchecked(&self, offset: usize) -> &JsValue {
+        debug_assert!(offset < self.values.len());
+        // SAFETY: caller guarantees `offset < self.values.len()`.
+        unsafe { self.values.get_unchecked(offset) }
+    }
+
     /// Returns `true` when `offset` still names `key` in the current layout.
     #[inline]
     pub fn matches_key_at_offset(&self, offset: usize, key: &str) -> bool {

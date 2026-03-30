@@ -238,6 +238,16 @@ pub(crate) mod jit_runtime {
         /// [`exec_jit_callee`] to avoid repeated `.with()` lookups in
         /// the nested-call hot path.
         static RT_PTRS: Cell<RtPtrs> = const { Cell::new(RtPtrs::EMPTY) };
+
+        /// Single-entry IC that caches the most recent array method
+        /// lookup.  Avoids recreating the fast-array-method
+        /// `PlainObject` wrapper on every iteration of a tight
+        /// `arr.push()` / `arr.pop()` loop.
+        ///
+        /// Cleared by [`jit_runtime_setup`] to avoid stale handles.
+        static RT_ARRAY_METHOD_IC: Cell<ArrayMethodIcEntry> = const {
+            Cell::new(ArrayMethodIcEntry::EMPTY)
+        };
     }
 
     /// Cached raw pointers to frequently-accessed TLS variables.
@@ -269,6 +279,26 @@ pub(crate) mod jit_runtime {
         fn is_cached(&self) -> bool {
             !self.heap.is_null()
         }
+    }
+
+    /// Single-entry cache for array method lookups to avoid recreating
+    /// fast-array-method `PlainObject` wrappers in tight loops.
+    #[derive(Clone, Copy)]
+    struct ArrayMethodIcEntry {
+        /// Heap handle of the receiver array.
+        receiver: i64,
+        /// Constant-pool index of the property name.
+        name_idx: u32,
+        /// Heap handle of the cached method `PlainObject`.
+        method: i64,
+    }
+
+    impl ArrayMethodIcEntry {
+        const EMPTY: Self = Self {
+            receiver: 0,
+            name_idx: 0,
+            method: 0,
+        };
     }
 
     /// Populate [`RT_PTRS`] so that [`exec_jit_callee`] can bypass
@@ -304,6 +334,7 @@ pub(crate) mod jit_runtime {
             c.lda = [(u32::MAX, 0, 0); 64];
             c.proto = [(u32::MAX, 0, 0); 16];
         });
+        RT_ARRAY_METHOD_IC.with(|c| c.set(ArrayMethodIcEntry::EMPTY));
     }
 
     /// Set the global environment for `LdaGlobal`/`StaGlobal` stubs.
@@ -556,9 +587,15 @@ pub(crate) mod jit_runtime {
                 if feedback_slot >= 0 {
                     let slot = feedback_slot as u32;
 
-                    // SAFETY: RT_BYTECODE is valid for the lifetime of
-                    // this JIT call.
-                    let ba = RT_BYTECODE.with(|b| b.get());
+                    // Use cached bytecode pointer to avoid a separate
+                    // RT_BYTECODE TLS lookup.
+                    let ptrs = RT_PTRS.with(|p| p.get());
+                    let ba = if ptrs.is_cached() {
+                        // SAFETY: cached pointer valid for thread lifetime.
+                        unsafe { &*ptrs.bytecode }.get()
+                    } else {
+                        RT_BYTECODE.with(|b| b.get())
+                    };
                     if !ba.is_null() {
                         // SAFETY: pointer is valid and points to a live
                         // BytecodeArray.
@@ -653,9 +690,39 @@ pub(crate) mod jit_runtime {
                 let name_idx = operand2 as u32;
                 // SAFETY: valid index (see above).
                 let obj_i64 = unsafe { *regs.add(obj_flat) };
+                let prop_name = get_rt_string_constant_ref(name_idx)?;
+
+                // Fast path: borrow object directly from heap via cached
+                // ptrs, avoiding the jit_i64_to_jsvalue Rc clone.
+                if is_heap_handle(obj_i64) {
+                    let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+                    let ptrs = RT_PTRS.with(|p| p.get());
+                    if ptrs.is_cached() {
+                        let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+                        if let Some(JsValue::PlainObject(map_rc)) = heap.get(obj_idx) {
+                            // Inline Smi decode for the value (common case
+                            // for numeric literals and loop counters).
+                            let value = if acc >= i32::MIN as i64 && acc <= i32::MAX as i64 {
+                                JsValue::Smi(acc as i32)
+                            } else {
+                                jit_i64_to_jsvalue(acc)
+                            };
+                            // SAFETY: single-threaded JIT; no concurrent borrows.
+                            let map = unsafe { &mut *map_rc.as_ptr() };
+                            match map.try_template_fill(prop_name, value) {
+                                Ok(_) => return Some(acc),
+                                Err(value) => {
+                                    map.insert(prop_name.to_string(), value);
+                                    return Some(acc);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Slow path: clone-based fallback.
                 let obj = jit_i64_to_jsvalue(obj_i64);
                 let value = jit_i64_to_jsvalue(acc);
-                let prop_name = get_rt_string_constant_ref(name_idx)?;
 
                 match &obj {
                     JsValue::PlainObject(map) => {
@@ -1337,29 +1404,51 @@ pub(crate) mod jit_runtime {
                     let shape = map.shape_id();
                     let cache = unsafe { &*ic_ref.as_ptr() };
 
-                    // Own-property IC
+                    // ── Own-property IC hit ──────────────────────────
                     let entry = &cache.lda[lda_slot];
-                    if entry.0 == name_idx && entry.1 == shape {
-                        return Some(
-                            match map
-                                .get_by_offset(entry.2)
-                                .map(encode_or_clone_ref)
-                                .unwrap_or(Ok(JIT_UNDEFINED))
-                            {
-                                Ok(val) => val,
-                                Err(obj_val) => alloc_heap_handle(obj_val),
-                            },
-                        );
+                    if entry.name_idx == name_idx && entry.shape == shape {
+                        // SAFETY: shape_id match guarantees offset is in range.
+                        let val = unsafe { map.get_by_offset_unchecked(entry.offset) };
+                        return Some(encode_ic_cached(val, entry, ic_ref, lda_slot));
                     }
 
-                    // Prototype IC (value pre-encoded as i64)
+                    // ── Prototype IC hit (pre-encoded i64) ──────────
                     let proto_slot = (name_idx & 15) as usize;
                     let pe = &cache.proto[proto_slot];
                     if pe.0 == name_idx && pe.1 == shape {
                         return Some(pe.2);
                     }
 
-                    None // IC miss
+                    // ── IC miss: full lookup without cloning ────────
+                    let prop_name = get_rt_string_constant_ref(name_idx)?;
+                    if let Some(offset) = map.offset_of(prop_name) {
+                        // SAFETY: offset was just obtained; shape unchanged.
+                        let val = unsafe { map.get_by_offset_unchecked(offset) };
+                        let result = jsvalue_ref_to_jit_i64(val);
+                        let ptr = jsvalue_rc_ptr(val);
+                        let handle = if ptr != 0 { result } else { 0 };
+                        // SAFETY: single-threaded JIT; no concurrent borrows.
+                        let cache_mut = unsafe { &mut *ic_ref.as_ptr() };
+                        cache_mut.lda[lda_slot] = LdaIcEntry {
+                            name_idx,
+                            shape,
+                            offset,
+                            cached_handle: handle,
+                            cached_ptr: ptr,
+                        };
+                        return Some(result);
+                    }
+
+                    // Prototype chain walk.
+                    let proto = map
+                        .get(INTERNAL_PROTO_PROPERTY_KEY)
+                        .or_else(|| map.get("__proto__"))
+                        .cloned();
+                    let result = jit_proto_chain_walk(proto.as_ref(), prop_name);
+                    // SAFETY: single-threaded JIT; no concurrent borrows.
+                    let cache_mut = unsafe { &mut *ic_ref.as_ptr() };
+                    cache_mut.proto[proto_slot] = (name_idx, shape, result);
+                    return Some(result);
                 }
                 JsValue::Array(arr) => {
                     let prop_name = get_rt_string_constant_ref(name_idx)?;
@@ -1402,13 +1491,14 @@ pub(crate) mod jit_runtime {
                         let map = map_rc.borrow();
                         let shape = map.shape_id();
 
-                        RT_PROP_IC.with(|ic| {
+                        // IC hit check.
+                        let ic_hit = RT_PROP_IC.with(|ic| {
                             let cache = ic.borrow();
 
                             let entry = &cache.lda[lda_slot];
-                            if entry.0 == name_idx && entry.1 == shape {
+                            if entry.name_idx == name_idx && entry.shape == shape {
                                 return Some(
-                                    map.get_by_offset(entry.2)
+                                    map.get_by_offset(entry.offset)
                                         .map(encode_or_clone_ref)
                                         .unwrap_or(Ok(JIT_UNDEFINED)),
                                 );
@@ -1421,7 +1511,41 @@ pub(crate) mod jit_runtime {
                             }
 
                             None
-                        })
+                        });
+                        if ic_hit.is_some() {
+                            return ic_hit;
+                        }
+
+                        // IC miss: full lookup (avoids cloning receiver).
+                        let prop_name = get_rt_string_constant_ref(name_idx)?;
+                        if let Some(offset) = map.offset_of(prop_name) {
+                            let result = map
+                                .get_by_offset(offset)
+                                .map(encode_or_clone_ref)
+                                .unwrap_or(Ok(JIT_UNDEFINED));
+                            RT_PROP_IC.with(|ic| {
+                                ic.borrow_mut().lda[lda_slot] = LdaIcEntry {
+                                    name_idx,
+                                    shape,
+                                    offset,
+                                    cached_handle: 0,
+                                    cached_ptr: 0,
+                                };
+                            });
+                            return Some(result);
+                        }
+
+                        // Prototype chain walk.
+                        let proto = map
+                            .get(INTERNAL_PROTO_PROPERTY_KEY)
+                            .or_else(|| map.get("__proto__"))
+                            .cloned();
+                        let result = jit_proto_chain_walk(proto.as_ref(), prop_name);
+                        let proto_slot = (name_idx & 15) as usize;
+                        RT_PROP_IC.with(|ic| {
+                            ic.borrow_mut().proto[proto_slot] = (name_idx, shape, result);
+                        });
+                        Some(Ok(result))
                     }
                     JsValue::Array(arr) => {
                         let prop_name = get_rt_string_constant_ref(name_idx)?;
@@ -1471,11 +1595,22 @@ pub(crate) mod jit_runtime {
                 if let Some(offset) = map.offset_of(prop_name) {
                     if ptrs.is_cached() {
                         // SAFETY: cached pointer valid for thread lifetime.
-                        unsafe { &*ptrs.prop_ic }.borrow_mut().lda[lda_slot] =
-                            (name_idx, shape, offset);
+                        unsafe { &*ptrs.prop_ic }.borrow_mut().lda[lda_slot] = LdaIcEntry {
+                            name_idx,
+                            shape,
+                            offset,
+                            cached_handle: 0,
+                            cached_ptr: 0,
+                        };
                     } else {
                         RT_PROP_IC.with(|ic| {
-                            ic.borrow_mut().lda[lda_slot] = (name_idx, shape, offset);
+                            ic.borrow_mut().lda[lda_slot] = LdaIcEntry {
+                                name_idx,
+                                shape,
+                                offset,
+                                cached_handle: 0,
+                                cached_ptr: 0,
+                            };
                         });
                     }
                     Some(
@@ -1563,6 +1698,62 @@ pub(crate) mod jit_runtime {
                 }
             }
             _ => Err(val.clone()),
+        }
+    }
+
+    /// Extract a raw pointer that uniquely identifies the storage behind
+    /// a heap-object `JsValue`.  Returns `0` for primitive types and for
+    /// `NativeFunction` (which wraps a fat `Rc<dyn Fn>` pointer).
+    #[inline]
+    fn jsvalue_rc_ptr(val: &JsValue) -> usize {
+        match val {
+            JsValue::PlainObject(rc) => Rc::as_ptr(rc) as usize,
+            JsValue::Array(rc) => Rc::as_ptr(rc) as usize,
+            JsValue::Function(rc) => Rc::as_ptr(rc) as usize,
+            JsValue::String(s) => (&**s).as_ptr() as usize,
+            _ => 0,
+        }
+    }
+
+    /// Encode a `&JsValue` from an IC hit with heap-handle caching.
+    ///
+    /// For primitives this is a plain encode (no allocation).  For heap
+    /// objects the `(cached_ptr, cached_handle)` pair in the [`LdaIcEntry`]
+    /// is compared with the current value's `Rc` pointer; on match the
+    /// cached handle is returned without an `Rc::clone`.
+    #[inline]
+    fn encode_ic_cached(
+        val: &JsValue,
+        entry: &LdaIcEntry,
+        ic_ref: *const RefCell<JitPropertyIcState>,
+        lda_slot: usize,
+    ) -> i64 {
+        match val {
+            JsValue::Smi(n) => i64::from(*n),
+            JsValue::Boolean(true) => JIT_TRUE,
+            JsValue::Boolean(false) => JIT_FALSE,
+            JsValue::Undefined => JIT_UNDEFINED,
+            JsValue::Null => JIT_NULL,
+            JsValue::HeapNumber(f) => {
+                let f = *f;
+                if f.fract() == 0.0 && f >= i32::MIN as f64 && f <= i32::MAX as f64 {
+                    f as i64
+                } else {
+                    alloc_heap_handle(val.clone())
+                }
+            }
+            _ => {
+                let ptr = jsvalue_rc_ptr(val);
+                if ptr != 0 && ptr == entry.cached_ptr {
+                    return entry.cached_handle;
+                }
+                let handle = alloc_heap_handle(val.clone());
+                // SAFETY: single-threaded JIT; no concurrent borrows.
+                let e = unsafe { &mut (*(*ic_ref).as_ptr()).lda[lda_slot] };
+                e.cached_handle = handle;
+                e.cached_ptr = ptr;
+                handle
+            }
         }
     }
 
@@ -2657,7 +2848,53 @@ pub(crate) mod jit_runtime {
     }
 
     /// Inner implementation for [`jit_runtime_sta_named_property`].
+    ///
+    /// Uses cached TLS pointers to borrow the target object directly
+    /// from the heap (avoiding an Rc clone) and tries the template-fill
+    /// fast path before falling back to a full `insert`.
     fn sta_named_property_inner(obj_i64: i64, name_idx: u32, value_i64: i64) -> Option<i64> {
+        if !is_heap_handle(obj_i64) {
+            return None;
+        }
+        let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+
+        // Fast path: borrow directly from heap via cached ptrs.
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if ptrs.is_cached() {
+            // SAFETY: cached pointers valid for thread lifetime;
+            // single-threaded JIT, no concurrent borrows.
+            let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+            match heap.get(obj_idx) {
+                Some(JsValue::PlainObject(map_rc)) => {
+                    let prop_name = get_rt_string_constant_ref(name_idx)?;
+                    // Inline Smi decode (common for numeric literals and
+                    // loop counters) to avoid heap-handle lookups.
+                    let value = if value_i64 >= i32::MIN as i64 && value_i64 <= i32::MAX as i64 {
+                        JsValue::Smi(value_i64 as i32)
+                    } else {
+                        jit_i64_to_jsvalue(value_i64)
+                    };
+                    // SAFETY: single-threaded JIT; no concurrent borrows.
+                    let map = unsafe { &mut *map_rc.as_ptr() };
+                    match map.try_template_fill(prop_name, value) {
+                        Ok(_) => return Some(value_i64),
+                        Err(value) => {
+                            map.insert(prop_name.to_string(), value);
+                            return Some(value_i64);
+                        }
+                    }
+                }
+                Some(JsValue::Function(ba)) => {
+                    let prop_name = get_rt_string_constant_ref(name_idx)?;
+                    let value = jit_i64_to_jsvalue(value_i64);
+                    crate::interpreter::fn_props_set(ba, prop_name.to_string(), value);
+                    return Some(value_i64);
+                }
+                _ => return None,
+            }
+        }
+
+        // Slow path: clone-based fallback.
         let obj = jit_i64_to_jsvalue(obj_i64);
         let value = jit_i64_to_jsvalue(value_i64);
 
@@ -3101,6 +3338,24 @@ pub(crate) mod jit_runtime {
     ///
     /// Returns the **old** context as JIT `i64` in `RAX`.
     pub extern "C" fn jit_runtime_push_context(new_ctx_i64: i64) -> i64 {
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if ptrs.is_cached() {
+            // SAFETY: cached pointers valid for thread lifetime;
+            // single-threaded JIT, no concurrent borrows.
+            let ctx_ref = unsafe { &*ptrs.context };
+            let ctx_opt = unsafe { &*ctx_ref.as_ptr() };
+            let old = ctx_opt
+                .as_ref()
+                .map(|c| JsValue::Context(Rc::clone(c)))
+                .unwrap_or(JsValue::Undefined);
+            let old_i64 = jsvalue_to_jit_i64(old);
+            let new_ctx_val = jit_i64_to_jsvalue(new_ctx_i64);
+            if let JsValue::Context(c) = new_ctx_val {
+                // SAFETY: single-threaded; no concurrent borrows.
+                unsafe { *ctx_ref.as_ptr() = Some(c) };
+            }
+            return old_i64;
+        }
         let old = RT_CONTEXT.with(|ctx_cell| {
             let ctx_opt = ctx_cell.borrow();
             ctx_opt
@@ -3127,6 +3382,17 @@ pub(crate) mod jit_runtime {
     /// Returns `JIT_UNDEFINED` in `RAX`.
     pub extern "C" fn jit_runtime_pop_context(saved_ctx_i64: i64) -> i64 {
         let saved = jit_i64_to_jsvalue(saved_ctx_i64);
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if ptrs.is_cached() {
+            // SAFETY: cached pointers valid for thread lifetime;
+            // single-threaded JIT, no concurrent borrows.
+            let ctx_ref = unsafe { &*ptrs.context };
+            match saved {
+                JsValue::Context(c) => unsafe { *ctx_ref.as_ptr() = Some(c) },
+                _ => unsafe { *ctx_ref.as_ptr() = None },
+            }
+            return JIT_UNDEFINED;
+        }
         match saved {
             JsValue::Context(c) => {
                 RT_CONTEXT.with(|ctx_cell| {
@@ -3147,13 +3413,22 @@ pub(crate) mod jit_runtime {
     /// Generic Add: handles Smi + Smi (with overflow), HeapNumber, and
     /// string concatenation.  Deopts on complex cases.
     pub extern "C" fn jit_runtime_generic_add(left: i64, right: i64) -> i64 {
+        // Fast path: both operands are Smi (i32 range).  Skip JsValue
+        // construction entirely and work directly on the i64 encoding.
+        if left >= i32::MIN as i64
+            && left <= i32::MAX as i64
+            && right >= i32::MIN as i64
+            && right <= i32::MAX as i64
+        {
+            let sum = left + right;
+            if sum >= i32::MIN as i64 && sum <= i32::MAX as i64 {
+                return sum;
+            }
+            return alloc_heap_handle(JsValue::HeapNumber(sum as f64));
+        }
         let l = jit_i64_to_jsvalue(left);
         let r = jit_i64_to_jsvalue(right);
         match (&l, &r) {
-            (JsValue::Smi(a), JsValue::Smi(b)) => match a.checked_add(*b) {
-                Some(sum) => jsvalue_to_jit_i64(JsValue::Smi(sum)),
-                None => jsvalue_to_jit_i64(JsValue::HeapNumber(*a as f64 + *b as f64)),
-            },
             (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a + *b))
             }
@@ -3169,13 +3444,21 @@ pub(crate) mod jit_runtime {
 
     /// Generic Subtract.
     pub extern "C" fn jit_runtime_generic_sub(left: i64, right: i64) -> i64 {
+        // Fast path: Smi - Smi.
+        if left >= i32::MIN as i64
+            && left <= i32::MAX as i64
+            && right >= i32::MIN as i64
+            && right <= i32::MAX as i64
+        {
+            let diff = left - right;
+            if diff >= i32::MIN as i64 && diff <= i32::MAX as i64 {
+                return diff;
+            }
+            return alloc_heap_handle(JsValue::HeapNumber(diff as f64));
+        }
         let l = jit_i64_to_jsvalue(left);
         let r = jit_i64_to_jsvalue(right);
         match (&l, &r) {
-            (JsValue::Smi(a), JsValue::Smi(b)) => match a.checked_sub(*b) {
-                Some(d) => jsvalue_to_jit_i64(JsValue::Smi(d)),
-                None => jsvalue_to_jit_i64(JsValue::HeapNumber(*a as f64 - *b as f64)),
-            },
             (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a - *b))
             }
@@ -3191,13 +3474,21 @@ pub(crate) mod jit_runtime {
 
     /// Generic Multiply.
     pub extern "C" fn jit_runtime_generic_mul(left: i64, right: i64) -> i64 {
+        // Fast path: Smi * Smi.
+        if left >= i32::MIN as i64
+            && left <= i32::MAX as i64
+            && right >= i32::MIN as i64
+            && right <= i32::MAX as i64
+        {
+            let product = left.wrapping_mul(right);
+            if product >= i32::MIN as i64 && product <= i32::MAX as i64 {
+                return product;
+            }
+            return alloc_heap_handle(JsValue::HeapNumber(left as f64 * right as f64));
+        }
         let l = jit_i64_to_jsvalue(left);
         let r = jit_i64_to_jsvalue(right);
         match (&l, &r) {
-            (JsValue::Smi(a), JsValue::Smi(b)) => match a.checked_mul(*b) {
-                Some(p) => jsvalue_to_jit_i64(JsValue::Smi(p)),
-                None => jsvalue_to_jit_i64(JsValue::HeapNumber(*a as f64 * *b as f64)),
-            },
             (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a * *b))
             }
@@ -3264,19 +3555,34 @@ pub(crate) mod jit_runtime {
     }
 
     pub extern "C" fn jit_runtime_generic_bitwise_and(left: i64, right: i64) -> i64 {
+        // Fast path: both Smi — do bitwise AND directly on i64 encoding.
+        if left >= i32::MIN as i64
+            && left <= i32::MAX as i64
+            && right >= i32::MIN as i64
+            && right <= i32::MAX as i64
+        {
+            return (left as i32 & right as i32) as i64;
+        }
         let l = jit_i64_to_jsvalue(left);
         let r = jit_i64_to_jsvalue(right);
         match (to_int32(&l), to_int32(&r)) {
-            (Some(a), Some(b)) => jsvalue_to_jit_i64(JsValue::Smi(a & b)),
+            (Some(a), Some(b)) => (a & b) as i64,
             _ => JIT_DEOPT,
         }
     }
 
     pub extern "C" fn jit_runtime_generic_bitwise_or(left: i64, right: i64) -> i64 {
+        if left >= i32::MIN as i64
+            && left <= i32::MAX as i64
+            && right >= i32::MIN as i64
+            && right <= i32::MAX as i64
+        {
+            return (left as i32 | right as i32) as i64;
+        }
         let l = jit_i64_to_jsvalue(left);
         let r = jit_i64_to_jsvalue(right);
         match (to_int32(&l), to_int32(&r)) {
-            (Some(a), Some(b)) => jsvalue_to_jit_i64(JsValue::Smi(a | b)),
+            (Some(a), Some(b)) => (a | b) as i64,
             _ => JIT_DEOPT,
         }
     }
@@ -3321,36 +3627,54 @@ pub(crate) mod jit_runtime {
     }
 
     pub extern "C" fn jit_runtime_generic_negate(value: i64) -> i64 {
+        // Fast path: Smi (i32 range) — negate directly.
+        if value >= i32::MIN as i64 && value <= i32::MAX as i64 {
+            if value == 0 {
+                // -0 in JS is -0.0 (negative zero), but 0 negated stays 0
+                // as Smi. JS `-0` is only produced by `-0` literal or
+                // specific fp ops. Smi 0 negated → Smi 0.
+                return 0;
+            }
+            let neg = -value;
+            if neg >= i32::MIN as i64 && neg <= i32::MAX as i64 {
+                return neg;
+            }
+            return alloc_heap_handle(JsValue::HeapNumber(-(value as f64)));
+        }
         let v = jit_i64_to_jsvalue(value);
         match &v {
-            JsValue::Smi(n) => match n.checked_neg() {
-                Some(neg) if neg != 0 || *n == 0 => jsvalue_to_jit_i64(JsValue::Smi(neg)),
-                _ => jsvalue_to_jit_i64(JsValue::HeapNumber(-(*n as f64))),
-            },
             JsValue::HeapNumber(f) => jsvalue_to_jit_i64(JsValue::HeapNumber(-*f)),
             _ => JIT_DEOPT,
         }
     }
 
     pub extern "C" fn jit_runtime_generic_increment(value: i64) -> i64 {
+        // Fast path: Smi (i32 range) — skip JsValue construction.
+        if value >= i32::MIN as i64 && value <= i32::MAX as i64 {
+            let inc = value + 1;
+            if inc <= i32::MAX as i64 {
+                return inc;
+            }
+            return alloc_heap_handle(JsValue::HeapNumber(inc as f64));
+        }
         let v = jit_i64_to_jsvalue(value);
         match &v {
-            JsValue::Smi(n) => match n.checked_add(1) {
-                Some(inc) => jsvalue_to_jit_i64(JsValue::Smi(inc)),
-                None => jsvalue_to_jit_i64(JsValue::HeapNumber(*n as f64 + 1.0)),
-            },
             JsValue::HeapNumber(f) => jsvalue_to_jit_i64(JsValue::HeapNumber(*f + 1.0)),
             _ => JIT_DEOPT,
         }
     }
 
     pub extern "C" fn jit_runtime_generic_decrement(value: i64) -> i64 {
+        // Fast path: Smi (i32 range) — skip JsValue construction.
+        if value >= i32::MIN as i64 && value <= i32::MAX as i64 {
+            let dec = value - 1;
+            if dec >= i32::MIN as i64 {
+                return dec;
+            }
+            return alloc_heap_handle(JsValue::HeapNumber(dec as f64));
+        }
         let v = jit_i64_to_jsvalue(value);
         match &v {
-            JsValue::Smi(n) => match n.checked_sub(1) {
-                Some(dec) => jsvalue_to_jit_i64(JsValue::Smi(dec)),
-                None => jsvalue_to_jit_i64(JsValue::HeapNumber(*n as f64 - 1.0)),
-            },
             JsValue::HeapNumber(f) => jsvalue_to_jit_i64(JsValue::HeapNumber(*f - 1.0)),
             _ => JIT_DEOPT,
         }
