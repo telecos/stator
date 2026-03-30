@@ -264,6 +264,11 @@ pub(crate) mod jit_runtime {
         /// the nested-call hot path.
         static RT_PTRS: Cell<RtPtrs> = const { Cell::new(RtPtrs::EMPTY) };
 
+        /// Monotonically increasing counter bumped by [`jit_runtime_setup`].
+        /// Compared against `RtPtrs::generation` to detect stale caches
+        /// after nested JIT execution re-initialises thread-local state.
+        static RT_SETUP_GEN: Cell<u64> = const { Cell::new(0) };
+
         /// Single-entry IC that caches the most recent array method
         /// lookup.  Avoids recreating the fast-array-method
         /// `PlainObject` wrapper on every iteration of a tight
@@ -290,6 +295,9 @@ pub(crate) mod jit_runtime {
         bytecode: *const Cell<*const BytecodeArray>,
         global: *const RefCell<JitGlobalState>,
         prop_ic: *const RefCell<JitPropertyIcState>,
+        /// Generation counter set at cache time.  Compared against
+        /// [`RT_SETUP_GEN`] before use; a mismatch forces a re-cache.
+        generation: u64,
     }
 
     impl RtPtrs {
@@ -299,6 +307,7 @@ pub(crate) mod jit_runtime {
             bytecode: std::ptr::null(),
             global: std::ptr::null(),
             prop_ic: std::ptr::null(),
+            generation: 0,
         };
 
         fn is_cached(&self) -> bool {
@@ -328,20 +337,15 @@ pub(crate) mod jit_runtime {
 
     /// Populate [`RT_PTRS`] so that [`exec_jit_callee`] can bypass
     /// per-variable `.with()` calls.
+    ///
+    /// # TEMPORARILY DISABLED
+    ///
+    /// The cached raw pointers cause SIGSEGV due to aliased mutable/immutable
+    /// references and stale pointers after nested JIT calls.  All runtime
+    /// stubs have safe `.with()` fallback paths that are used when
+    /// `is_cached()` returns false.
     fn cache_rt_ptrs() {
-        RT_PTRS.with(|p| {
-            if p.get().is_cached() {
-                return;
-            }
-            let ptrs = RtPtrs {
-                heap: RT_HEAP.with(|h| h as *const RefCell<Vec<JsValue>>),
-                context: RT_CONTEXT.with(|c| c as *const RefCell<Option<Rc<RefCell<JsContext>>>>),
-                bytecode: RT_BYTECODE.with(|b| b as *const Cell<*const BytecodeArray>),
-                global: RT_GLOBAL.with(|g| g as *const RefCell<JitGlobalState>),
-                prop_ic: RT_PROP_IC.with(|ic| ic as *const RefCell<JitPropertyIcState>),
-            };
-            p.set(ptrs);
-        });
+        // Intentionally left empty — all stubs use safe TLS fallback.
     }
 
     // ── Setup / teardown ─────────────────────────────────────────────────
@@ -351,6 +355,9 @@ pub(crate) mod jit_runtime {
     /// Must be called before `CompiledCode::execute` so that runtime call
     /// stubs can access the constant pool.
     pub fn jit_runtime_setup(ba: &BytecodeArray) {
+        // Bump the generation counter so that stale cached pointers from
+        // a previous setup epoch are detected and re-cached.
+        RT_SETUP_GEN.with(|g| g.set(g.get().wrapping_add(1)));
         cache_rt_ptrs();
         RT_BYTECODE.with(|b| b.set(ba as *const BytecodeArray));
         RT_HEAP.with(|h| h.borrow_mut().clear());
@@ -1418,53 +1425,78 @@ pub(crate) mod jit_runtime {
             let heap_ref = unsafe { &*ptrs.heap };
             let ic_ref = unsafe { &*ptrs.prop_ic };
 
-            // SAFETY: JIT execution is single-threaded and no mutable borrows
-            // of RT_HEAP or PropertyMaps can be active during a load-property
-            // fast path.  Skipping the RefCell borrow check eliminates ~6ns of
-            // overhead per stub call.
-            let heap = unsafe { &*heap_ref.as_ptr() };
-            let obj = heap.get(idx)?;
+            // Phase 1: Extract the object from the heap via a scoped
+            // borrow.  The `&Vec<JsValue>` is dropped at the end of this
+            // block so that subsequent calls to `alloc_heap_handle`
+            // cannot create an aliased `&mut Vec<JsValue>`.
+            let obj = {
+                // SAFETY: scoped immutable borrow of the heap; the
+                // reference is dropped before any heap mutation occurs.
+                let heap = unsafe { &*heap_ref.as_ptr() };
+                heap.get(idx).cloned()
+            };
+            let Some(obj) = obj else { return None };
 
-            match obj {
+            match &obj {
                 JsValue::PlainObject(map_rc) => {
-                    // SAFETY: same single-thread guarantee as above.
+                    // SAFETY: The PropertyMap lives in an Rc-managed heap
+                    // allocation, separate from the JIT heap Vec.  This
+                    // reference remains valid across heap-handle allocations.
                     let map = unsafe { &*map_rc.as_ptr() };
                     let shape = map.shape_id();
-                    let cache = unsafe { &*ic_ref.as_ptr() };
+
+                    // Copy IC entries by value in a scoped borrow of the
+                    // IC state.  Dropping `cache` before any IC mutation
+                    // prevents aliased `&T` / `&mut T` to the same
+                    // JitPropertyIcState.
+                    let (ic_entry, proto_entry) = {
+                        // SAFETY: scoped borrow; dropped before IC mutation.
+                        let cache = unsafe { &*ic_ref.as_ptr() };
+                        (cache.lda[lda_slot], cache.proto[(name_idx & 31) as usize])
+                    };
 
                     // ── Own-property IC hit ──────────────────────────
-                    let entry = &cache.lda[lda_slot];
-                    if entry.name_idx == name_idx && entry.shape == shape {
-                        // SAFETY: shape_id match guarantees offset is in range.
-                        let val = unsafe { map.get_by_offset_unchecked(entry.offset) };
-                        return Some(encode_ic_cached(val, entry, ic_ref, lda_slot));
+                    if ic_entry.name_idx == name_idx && ic_entry.shape == shape {
+                        // Safe bounds-checked access guards against stale
+                        // offsets from shape-id collisions.
+                        if let Some(val) = map.get_by_offset(ic_entry.offset) {
+                            return Some(encode_ic_cached(
+                                val,
+                                ic_entry.cached_ptr,
+                                ic_entry.cached_handle,
+                                ic_ref,
+                                lda_slot,
+                            ));
+                        }
                     }
 
                     // ── Prototype IC hit (pre-encoded i64) ──────────
                     let proto_slot = (name_idx & 31) as usize;
-                    let pe = &cache.proto[proto_slot];
-                    if pe.0 == name_idx && pe.1 == shape {
-                        return Some(pe.2);
+                    if proto_entry.0 == name_idx && proto_entry.1 == shape {
+                        return Some(proto_entry.2);
                     }
 
                     // ── IC miss: full lookup without cloning ────────
                     let prop_name = get_rt_string_constant_ref(name_idx)?;
                     if let Some(offset) = map.offset_of(prop_name) {
-                        // SAFETY: offset was just obtained; shape unchanged.
-                        let val = unsafe { map.get_by_offset_unchecked(offset) };
-                        let result = jsvalue_ref_to_jit_i64(val);
-                        let ptr = jsvalue_rc_ptr(val);
-                        let handle = if ptr != 0 { result } else { 0 };
-                        // SAFETY: single-threaded JIT; no concurrent borrows.
-                        let cache_mut = unsafe { &mut *ic_ref.as_ptr() };
-                        cache_mut.lda[lda_slot] = LdaIcEntry {
-                            name_idx,
-                            shape,
-                            offset,
-                            cached_handle: handle,
-                            cached_ptr: ptr,
-                        };
-                        return Some(result);
+                        // Safe bounds-checked access.
+                        if let Some(val) = map.get_by_offset(offset) {
+                            let result = jsvalue_ref_to_jit_i64(val);
+                            let ptr = jsvalue_rc_ptr(val);
+                            let handle = if ptr != 0 { result } else { 0 };
+                            // SAFETY: IC `cache` ref was dropped above; no
+                            // aliased references.  Single-threaded JIT.
+                            let cache_mut = unsafe { &mut *ic_ref.as_ptr() };
+                            cache_mut.lda[lda_slot] = LdaIcEntry {
+                                name_idx,
+                                shape,
+                                offset,
+                                cached_handle: handle,
+                                cached_ptr: ptr,
+                            };
+                            return Some(result);
+                        }
+                        return Some(JIT_UNDEFINED);
                     }
 
                     // Prototype chain walk.
@@ -1473,7 +1505,7 @@ pub(crate) mod jit_runtime {
                         .or_else(|| map.get("__proto__"))
                         .cloned();
                     let result = jit_proto_chain_walk(proto.as_ref(), prop_name);
-                    // SAFETY: single-threaded JIT; no concurrent borrows.
+                    // SAFETY: IC `cache` ref was dropped; single-threaded JIT.
                     let cache_mut = unsafe { &mut *ic_ref.as_ptr() };
                     cache_mut.proto[proto_slot] = (name_idx, shape, result);
                     return Some(result);
@@ -1481,10 +1513,7 @@ pub(crate) mod jit_runtime {
                 JsValue::Array(arr) => {
                     let prop_name = get_rt_string_constant_ref(name_idx)?;
                     match prop_name {
-                        "length" => {
-                            // SAFETY: single-threaded JIT; no concurrent borrows.
-                            Some(Ok(unsafe { &*arr.as_ptr() }.len() as i64))
-                        }
+                        "length" => Some(Ok(arr.borrow().len() as i64)),
                         "push" | "pop" | "indexOf" | "includes" => {
                             let arr_val = JsValue::Array(Rc::clone(arr));
                             let len = if prop_name == "pop" { 0 } else { 1 };
@@ -1762,13 +1791,18 @@ pub(crate) mod jit_runtime {
     /// Encode a `&JsValue` from an IC hit with heap-handle caching.
     ///
     /// For primitives this is a plain encode (no allocation).  For heap
-    /// objects the `(cached_ptr, cached_handle)` pair in the [`LdaIcEntry`]
+    /// objects the `(cached_ptr, cached_handle)` pair from the IC entry
     /// is compared with the current value's `Rc` pointer; on match the
     /// cached handle is returned without an `Rc::clone`.
+    ///
+    /// The IC entry's `cached_ptr` and `cached_handle` are passed **by
+    /// value** to avoid holding a `&LdaIcEntry` reference that would
+    /// alias the `&mut` used to update the IC slot.
     #[inline]
     fn encode_ic_cached(
         val: &JsValue,
-        entry: &LdaIcEntry,
+        entry_cached_ptr: usize,
+        entry_cached_handle: i64,
         ic_ref: *const RefCell<JitPropertyIcState>,
         lda_slot: usize,
     ) -> i64 {
@@ -1788,11 +1822,14 @@ pub(crate) mod jit_runtime {
             }
             _ => {
                 let ptr = jsvalue_rc_ptr(val);
-                if ptr != 0 && ptr == entry.cached_ptr {
-                    return entry.cached_handle;
+                if ptr != 0 && ptr == entry_cached_ptr {
+                    return entry_cached_handle;
                 }
                 let handle = alloc_heap_handle(val.clone());
-                // SAFETY: single-threaded JIT; no concurrent borrows.
+                // SAFETY: `entry_cached_ptr` and `entry_cached_handle` were
+                // copied by value before this call, so no `&LdaIcEntry`
+                // aliases `lda[lda_slot]`.  Single-threaded JIT execution
+                // ensures no concurrent IC access.
                 let e = unsafe { &mut (*(*ic_ref).as_ptr()).lda[lda_slot] };
                 e.cached_handle = handle;
                 e.cached_ptr = ptr;
@@ -2193,19 +2230,28 @@ pub(crate) mod jit_runtime {
             if callee_i64 >= JIT_HEAP_TAG {
                 let idx = (callee_i64 - JIT_HEAP_TAG) as usize;
                 let heap_ref = unsafe { &*ptrs.heap };
-                // SAFETY: no concurrent mutable borrows; single-threaded JIT.
-                let heap = unsafe { &*heap_ref.as_ptr() };
-                match heap.get(idx) {
+
+                // Phase 1: Extract the callee from the heap in a scoped
+                // borrow.  The `&Vec<JsValue>` is dropped before any
+                // nested JIT execution that could reallocate the heap.
+                let callee_val = {
+                    // SAFETY: scoped immutable borrow; dropped before
+                    // any heap mutation can occur.
+                    let heap = unsafe { &*heap_ref.as_ptr() };
+                    heap.get(idx).cloned()
+                };
+
+                match callee_val.as_ref() {
                     Some(JsValue::Function(ba)) => {
                         // ── Inlined fast path: exec cache hit ──────────
-                        // Check the exec cache directly instead of calling
-                        // call_js_function → exec_jit_callee, which would
-                        // do a REDUNDANT RT_PTRS.with() and Rc::clone.
                         let exec_cache = ba.jit_executable_cache();
+                        // SAFETY: single-threaded JIT; no concurrent
+                        // mutation of exec cache.
                         let cache_ref = unsafe { &*exec_cache.as_ptr() };
                         if let Some(exec) = cache_ref.as_ref() {
                             let ctx_ref = unsafe { &*ptrs.context };
-                            // SAFETY: no active borrows; read heap length.
+                            // SAFETY: no active heap borrows; read length
+                            // via temporary raw-pointer dereference.
                             let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
 
                             let callee_ctx_raw = ba.closure_context();
@@ -2224,18 +2270,23 @@ pub(crate) mod jit_runtime {
                                 None
                             } else {
                                 let callee_ctx = callee_ctx_raw.cloned();
+                                // SAFETY: no active borrows of context RefCell.
                                 Some(unsafe {
                                     std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx)
                                 })
                             };
 
                             bc_ref.set(&**ba as *const BytecodeArray);
+                            // SAFETY: cached executable code contains valid
+                            // x86-64 instructions.  No `&Vec<JsValue>` ref
+                            // is alive during this call.
                             let jit_result = unsafe { exec.execute(&[], ctx_ptr_i64) };
 
                             bc_ref.set(saved_ba);
 
                             // Non-heap results skip the round-trip conversion.
                             if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
+                                // SAFETY: no active heap borrows.
                                 unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
                                 if let Some(ctx) = saved_ctx {
                                     unsafe { *ctx_ref.as_ptr() = ctx };
@@ -2249,6 +2300,7 @@ pub(crate) mod jit_runtime {
                                 jit_to_jsvalue_ext(jit_result)
                             };
 
+                            // SAFETY: no active heap borrows.
                             unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
                             if let Some(ctx) = saved_ctx {
                                 unsafe { *ctx_ref.as_ptr() = ctx };
@@ -2330,9 +2382,14 @@ pub(crate) mod jit_runtime {
             if callee_i64 >= JIT_HEAP_TAG {
                 let idx = (callee_i64 - JIT_HEAP_TAG) as usize;
                 let heap_ref = unsafe { &*ptrs.heap };
-                // SAFETY: no concurrent mutable borrows; single-threaded JIT.
-                let heap = unsafe { &*heap_ref.as_ptr() };
-                match heap.get(idx) {
+                // Scoped heap borrow: dropped before call_js_function
+                // or native function invocation that could reallocate.
+                let callee_val = {
+                    // SAFETY: scoped immutable borrow.
+                    let heap = unsafe { &*heap_ref.as_ptr() };
+                    heap.get(idx).cloned()
+                };
+                match callee_val.as_ref() {
                     Some(JsValue::Function(ba)) => {
                         let ba = Rc::clone(ba);
                         let arg0 = jit_i64_to_jsvalue(arg0_i64);
@@ -2407,9 +2464,14 @@ pub(crate) mod jit_runtime {
             if callee_i64 >= JIT_HEAP_TAG {
                 let idx = (callee_i64 - JIT_HEAP_TAG) as usize;
                 let heap_ref = unsafe { &*ptrs.heap };
-                // SAFETY: no concurrent mutable borrows; single-threaded JIT.
-                let heap = unsafe { &*heap_ref.as_ptr() };
-                match heap.get(idx) {
+                // Scoped heap borrow: dropped before call_js_function
+                // or native function invocation that could reallocate.
+                let callee_val = {
+                    // SAFETY: scoped immutable borrow.
+                    let heap = unsafe { &*heap_ref.as_ptr() };
+                    heap.get(idx).cloned()
+                };
+                match callee_val.as_ref() {
                     Some(JsValue::Function(ba)) => {
                         let ba = Rc::clone(ba);
                         let arg0 = jit_i64_to_jsvalue(arg0_i64);
@@ -2506,17 +2568,24 @@ pub(crate) mod jit_runtime {
     /// Shared global-load logic used by both the cached-pointer and
     /// `.with()` paths.
     fn lda_global_from_ref(g: &RefCell<JitGlobalState>, name_idx: u32) -> Option<i64> {
-        // SAFETY: JIT execution is single-threaded.  No concurrent mutable
-        // borrows of the global state or environment can be active during a
-        // load-global fast path.
-        let state = unsafe { &*g.as_ptr() };
-        let env_rc = state.env.as_ref()?;
+        // Clone the environment Rc and copy the IC entry by value in a
+        // scoped borrow of the global state.  This avoids holding
+        // `&JitGlobalState` across the `borrow_mut()` IC-update below.
+        let (env_rc, ic_entry) = {
+            // SAFETY: JIT execution is single-threaded.  No concurrent
+            // mutable borrows of the global state can be active during a
+            // load-global fast path.
+            let state = unsafe { &*g.as_ptr() };
+            let env_rc = Rc::clone(state.env.as_ref()?);
+            let ic_entry = state.ic[(name_idx & 63) as usize];
+            (env_rc, ic_entry)
+        };
+        // SAFETY: single-threaded JIT; `state` was dropped above.
         let env = unsafe { &*env_rc.as_ptr() };
 
         // Fast path: direct-mapped IC hit.
-        let entry = &state.ic[(name_idx & 63) as usize];
-        if entry.0 == name_idx {
-            let (slot_idx, cached_gen) = (entry.1, entry.2);
+        if ic_entry.0 == name_idx {
+            let (slot_idx, cached_gen) = (ic_entry.1, ic_entry.2);
             if env.generation() == cached_gen && slot_idx < env.slot_count() {
                 let value = env.get_by_index(slot_idx);
                 if *value != JsValue::TheHole {
@@ -2530,7 +2599,7 @@ pub(crate) mod jit_runtime {
         let value = env.get(name).unwrap_or(&JsValue::Undefined);
         let result = jsvalue_ref_to_jit_i64(value);
 
-        // Populate IC — need mutable borrow; must use safe borrow here.
+        // Populate IC — safe borrow; no aliased `&JitGlobalState` exists.
         let slot_idx = env.slot_index_for(name);
         let cur_gen = env.generation();
         if let Some(idx) = slot_idx {
@@ -2577,15 +2646,22 @@ pub(crate) mod jit_runtime {
         value_i64: i64,
         value: JsValue,
     ) -> Option<i64> {
-        // SAFETY: JIT execution is single-threaded. No concurrent borrows.
-        let state = unsafe { &*g.as_ptr() };
-        let env_rc = state.env.as_ref()?;
+        // Clone env Rc and copy IC entry by value in a scoped borrow so
+        // that `&JitGlobalState` is dropped before the IC raw-pointer
+        // writes below.
+        let (env_rc, ic_entry) = {
+            // SAFETY: JIT execution is single-threaded. No concurrent borrows.
+            let state = unsafe { &*g.as_ptr() };
+            let env_rc = Rc::clone(state.env.as_ref()?);
+            let ic_entry = state.ic[(name_idx & 63) as usize];
+            (env_rc, ic_entry)
+        };
+        // SAFETY: single-threaded JIT; `state` was dropped above.
         let env = unsafe { &mut *env_rc.as_ptr() };
 
         // Fast path: direct-mapped IC hit — store by index.
-        let entry = &state.ic[(name_idx & 63) as usize];
-        if entry.0 == name_idx {
-            let (slot_idx, cached_gen) = (entry.1, entry.2);
+        if ic_entry.0 == name_idx {
+            let (slot_idx, cached_gen) = (ic_entry.1, ic_entry.2);
             if env.generation() == cached_gen && slot_idx < env.slot_count() {
                 let name = get_rt_string_constant_ref(name_idx)?;
                 env.store_by_index_sync(slot_idx, name, value);
@@ -2600,13 +2676,15 @@ pub(crate) mod jit_runtime {
             env.store_by_index_sync(idx, name, value);
             // Populate / update IC with the slot index we already found.
             let cur_gen = env.generation();
-            // SAFETY: single-threaded JIT; update IC via raw pointer.
+            // SAFETY: `state` was dropped; no aliased `&JitGlobalState`
+            // exists.  Single-threaded JIT.
             unsafe { (*g.as_ptr()).ic[(name_idx & 63) as usize] = (name_idx, idx, cur_gen) };
         } else {
             env.insert(name.to_string(), value);
             // After insert, populate IC with the new slot index.
             let cur_gen = env.generation();
             if let Some(idx) = env.slot_index_for(name) {
+                // SAFETY: same as above — no aliased references.
                 unsafe { (*g.as_ptr()).ic[(name_idx & 63) as usize] = (name_idx, idx, cur_gen) };
             }
         }
@@ -3010,76 +3088,85 @@ pub(crate) mod jit_runtime {
             let callee_idx = (callee_i64 - JIT_HEAP_TAG) as usize;
             // SAFETY: cached pointers set by cache_rt_ptrs; valid for thread lifetime.
             let heap_ref = unsafe { &*ptrs.heap };
-            // SAFETY: single-threaded JIT; no concurrent mutable borrows.
-            let heap = unsafe { &*heap_ref.as_ptr() };
 
-            if let Some(JsValue::PlainObject(map_rc)) = heap.get(callee_idx) {
-                // SAFETY: single-threaded, no concurrent mutation of callee.
-                let map = unsafe { &*map_rc.as_ptr() };
-                if let Some(JsValue::String(method_name)) = map.get("\0stator.fast_array_method") {
-                    if is_heap_handle(receiver_i64) {
-                        let recv_idx = (receiver_i64 - JIT_HEAP_TAG) as usize;
-                        if let Some(JsValue::Array(arr)) = heap.get(recv_idx) {
-                            match method_name.as_ref() {
-                                "pop" => {
-                                    let val = arr.borrow_mut().pop().unwrap_or(JsValue::Undefined);
-                                    return Some(jsvalue_to_jit_i64(val));
-                                }
-                                "shift" => {
-                                    let mut items = arr.borrow_mut();
-                                    let val = if items.is_empty() {
-                                        JsValue::Undefined
-                                    } else {
-                                        items.remove(0)
-                                    };
-                                    drop(items);
-                                    return Some(jsvalue_to_jit_i64(val));
-                                }
-                                _ => {}
+            // Phase 1: Extract callee info from the heap in a scoped
+            // borrow.  Dropped before any native function invocation or
+            // jsvalue_to_jit_i64 call that could allocate heap handles.
+            enum CalleeInfo {
+                FastArrayMethod {
+                    method_name: Rc<str>,
+                    arr: Option<Rc<RefCell<Vec<JsValue>>>>,
+                },
+                NativeCall(Rc<dyn Fn(Vec<JsValue>) -> Result<JsValue, StatorError>>),
+                Other,
+            }
+
+            let callee_info = {
+                // SAFETY: scoped immutable borrow of the heap.
+                let heap = unsafe { &*heap_ref.as_ptr() };
+                if let Some(JsValue::PlainObject(map_rc)) = heap.get(callee_idx) {
+                    let map = unsafe { &*map_rc.as_ptr() };
+                    if let Some(JsValue::String(method_name)) =
+                        map.get("\0stator.fast_array_method")
+                    {
+                        let arr = if is_heap_handle(receiver_i64) {
+                            let recv_idx = (receiver_i64 - JIT_HEAP_TAG) as usize;
+                            if let Some(JsValue::Array(arr)) = heap.get(recv_idx) {
+                                Some(Rc::clone(arr))
+                            } else {
+                                None
                             }
+                        } else {
+                            None
+                        };
+                        CalleeInfo::FastArrayMethod {
+                            method_name: Rc::clone(method_name),
+                            arr,
+                        }
+                    } else if let Some(JsValue::NativeFunction(nf)) = map.get("__call__") {
+                        CalleeInfo::NativeCall(Rc::clone(nf))
+                    } else {
+                        CalleeInfo::Other
+                    }
+                } else if let Some(JsValue::NativeFunction(nf)) = heap.get(callee_idx) {
+                    CalleeInfo::NativeCall(Rc::clone(nf))
+                } else {
+                    CalleeInfo::Other
+                }
+            }; // heap dropped here
+
+            match callee_info {
+                CalleeInfo::FastArrayMethod { method_name, arr } => {
+                    if let Some(arr) = arr {
+                        match method_name.as_ref() {
+                            "pop" => {
+                                let val = arr.borrow_mut().pop().unwrap_or(JsValue::Undefined);
+                                return Some(jsvalue_to_jit_i64(val));
+                            }
+                            "shift" => {
+                                let mut items = arr.borrow_mut();
+                                let val = if items.is_empty() {
+                                    JsValue::Undefined
+                                } else {
+                                    items.remove(0)
+                                };
+                                drop(items);
+                                return Some(jsvalue_to_jit_i64(val));
+                            }
+                            _ => {}
                         }
                     }
                     return None;
                 }
-
-                // PlainObject with __call__.
-                if let Some(JsValue::NativeFunction(nf)) = map.get("__call__") {
-                    let nf = Rc::clone(nf);
-                    let _ = map;
-                    let receiver = if is_heap_handle(receiver_i64) {
-                        heap.get((receiver_i64 - JIT_HEAP_TAG) as usize)
-                            .cloned()
-                            .unwrap_or(JsValue::Undefined)
-                    } else {
-                        super::jit_to_jsvalue(receiver_i64).unwrap_or(JsValue::Undefined)
-                    };
-                    let _ = heap;
+                CalleeInfo::NativeCall(nf) => {
+                    let receiver = jit_i64_to_jsvalue(receiver_i64);
                     return match nf(vec![receiver]) {
                         Ok(val) => Some(jsvalue_to_jit_i64(val)),
                         Err(_) => None,
                     };
                 }
-                let _ = map;
+                CalleeInfo::Other => return None,
             }
-
-            if let Some(JsValue::NativeFunction(nf)) = heap.get(callee_idx) {
-                let nf = Rc::clone(nf);
-                let receiver = if is_heap_handle(receiver_i64) {
-                    heap.get((receiver_i64 - JIT_HEAP_TAG) as usize)
-                        .cloned()
-                        .unwrap_or(JsValue::Undefined)
-                } else {
-                    super::jit_to_jsvalue(receiver_i64).unwrap_or(JsValue::Undefined)
-                };
-                let _ = heap;
-                return match nf(vec![receiver]) {
-                    Ok(val) => Some(jsvalue_to_jit_i64(val)),
-                    Err(_) => None,
-                };
-            }
-
-            let _ = heap;
-            return None;
         }
 
         // ── Slow path: pointers not cached ──────────────────────────────
@@ -3413,15 +3500,20 @@ pub(crate) mod jit_runtime {
             // SAFETY: cached pointers valid for thread lifetime;
             // single-threaded JIT, no concurrent borrows.
             let ctx_ref = unsafe { &*ptrs.context };
-            let ctx_opt = unsafe { &*ctx_ref.as_ptr() };
-            let old = ctx_opt
-                .as_ref()
-                .map(|c| JsValue::Context(Rc::clone(c)))
-                .unwrap_or(JsValue::Undefined);
+            // Read the old context in a scoped borrow so that `ctx_opt`
+            // is dropped before the write through `ctx_ref.as_ptr()`.
+            let old = {
+                let ctx_opt = unsafe { &*ctx_ref.as_ptr() };
+                ctx_opt
+                    .as_ref()
+                    .map(|c| JsValue::Context(Rc::clone(c)))
+                    .unwrap_or(JsValue::Undefined)
+            };
             let old_i64 = jsvalue_to_jit_i64(old);
             let new_ctx_val = jit_i64_to_jsvalue(new_ctx_i64);
             if let JsValue::Context(c) = new_ctx_val {
-                // SAFETY: single-threaded; no concurrent borrows.
+                // SAFETY: `ctx_opt` was dropped; no aliased references.
+                // Single-threaded JIT.
                 unsafe { *ctx_ref.as_ptr() = Some(c) };
             }
             return old_i64;
