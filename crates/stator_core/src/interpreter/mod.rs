@@ -1433,14 +1433,7 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
         let deopt_offset = (result as u64).wrapping_sub(JIT_DEOPT as u64);
         let ret = if deopt_offset <= 5 {
             MAGLEV_DIAG_DEOPTED.with(|c| c.set(c.get() + 1));
-            if deopt_offset == 4 {
-                // loop_counter deopt — allow retries with limit.
-                if ba.record_maglev_loop_deopt() {
-                    ba.mark_jit_maglev_deopted();
-                }
-            } else {
-                ba.mark_jit_maglev_deopted();
-            }
+            ba.mark_jit_maglev_deopted();
             None
         } else {
             MAGLEV_DIAG_EXECUTED.with(|c| c.set(c.get() + 1));

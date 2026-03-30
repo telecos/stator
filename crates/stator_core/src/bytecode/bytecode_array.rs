@@ -536,9 +536,6 @@ pub struct BytecodeArray {
     /// When `true`, the interpreter skips all Maglev JIT execution attempts
     /// for this function.
     jit_maglev_deopted: Cell<bool>,
-    /// Number of loop-counter deopts seen so far.  After this reaches the
-    /// retry limit (3), the function is permanently marked as deopted.
-    jit_maglev_loop_deopt_count: Cell<u8>,
     /// Captured closure context set by `CreateClosure`.
     ///
     /// When a function is created as a closure, this holds the enclosing
@@ -732,7 +729,6 @@ impl BytecodeArray {
             turbofan_compile_started: Arc::new(AtomicBool::new(false)),
             jit_baseline_deopted: Rc::new(Cell::new(false)),
             jit_maglev_deopted: Cell::new(false),
-            jit_maglev_loop_deopt_count: Cell::new(0),
             closure_context: None,
             writes_closure_vars: false,
             has_fn_props: Cell::new(false),
@@ -1485,14 +1481,6 @@ impl BytecodeArray {
     /// Mark this function's Maglev JIT code as having deopted.
     pub fn mark_jit_maglev_deopted(&self) {
         self.jit_maglev_deopted.set(true);
-    }
-
-    /// Record a loop-counter deopt and return `true` if the retry limit (3)
-    /// has been exceeded, meaning the function should be permanently marked.
-    pub fn record_maglev_loop_deopt(&self) -> bool {
-        let count = self.jit_maglev_loop_deopt_count.get().saturating_add(1);
-        self.jit_maglev_loop_deopt_count.set(count);
-        count >= 3
     }
 
     /// Returns a clone of the cached Maglev-JIT machine code and

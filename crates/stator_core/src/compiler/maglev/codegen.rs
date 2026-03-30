@@ -93,7 +93,7 @@ use crate::compiler::baseline::masm_x64::{CondCode, Label, MacroAssembler, Reg64
 use crate::compiler::maglev::ir::{ControlNode, MaglevGraph, NodeId, ValueNode};
 use crate::compiler::maglev::regalloc::{AllocationResult, Location, allocate};
 use crate::error::{StatorError, StatorResult};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants & helpers
@@ -434,7 +434,6 @@ struct MaglevCodegen<'a> {
     deopt_overflow_label: Label,
     deopt_stub_label: Label,
     deopt_global_label: Label,
-    deopt_loop_label: Label,
     deopt_divzero_label: Label,
     /// Common deopt exit (pops + ret, does NOT overwrite RAX).
     deopt_common_label: Label,
@@ -484,7 +483,6 @@ impl<'a> MaglevCodegen<'a> {
             deopt_overflow_label: Label::new(),
             deopt_stub_label: Label::new(),
             deopt_global_label: Label::new(),
-            deopt_loop_label: Label::new(),
             deopt_divzero_label: Label::new(),
             deopt_common_label: Label::new(),
             safepoints: Vec::new(),
@@ -511,7 +509,7 @@ impl<'a> MaglevCodegen<'a> {
         // Precompute the set of wrapping Int32 results that only flow into
         // other 32-bit operations, allowing us to skip the MOVSXD
         // sign-extension for those nodes.
-        self.narrow_int32 = Self::compute_narrow_int32(self.graph);
+        self.narrow_int32 = Self::compute_narrow_int32(self.graph, self.alloc);
 
         self.emit_prologue();
         self.emit_promoted_global_loads();
@@ -632,7 +630,7 @@ impl<'a> MaglevCodegen<'a> {
     /// `JIT_DEOPT` and falls through to common.
     fn emit_deopt_epilogue(&mut self) {
         use crate::compiler::baseline::compiler::{
-            JIT_DEOPT_DIVZERO, JIT_DEOPT_GLOBAL, JIT_DEOPT_LOOP, JIT_DEOPT_OVERFLOW, JIT_DEOPT_STUB,
+            JIT_DEOPT_DIVZERO, JIT_DEOPT_GLOBAL, JIT_DEOPT_OVERFLOW, JIT_DEOPT_STUB,
         };
 
         // Category-specific entry points.
@@ -646,10 +644,6 @@ impl<'a> MaglevCodegen<'a> {
 
         self.masm.bind_label(&mut self.deopt_global_label);
         self.masm.mov_ri(Reg64::Rax, JIT_DEOPT_GLOBAL);
-        self.masm.jmp(&mut self.deopt_common_label);
-
-        self.masm.bind_label(&mut self.deopt_loop_label);
-        self.masm.mov_ri(Reg64::Rax, JIT_DEOPT_LOOP);
         self.masm.jmp(&mut self.deopt_common_label);
 
         self.masm.bind_label(&mut self.deopt_divzero_label);
@@ -2777,6 +2771,7 @@ impl<'a> MaglevCodegen<'a> {
 
     /// Returns `true` when `node` is a wrapping 32-bit operation that emits a
     /// `movsxd_sign_extend` in the default codegen path.
+    #[allow(dead_code)]
     fn is_wrapping_int32_producer(node: &ValueNode) -> bool {
         matches!(
             node,
@@ -2791,34 +2786,34 @@ impl<'a> MaglevCodegen<'a> {
 
     /// Returns `true` when `node` only reads the lower 32 bits of its
     /// `NodeId` operands, meaning upstream producers can skip sign-extension.
+    ///
+    /// Only wrapping Int32 arithmetic and Int32 comparisons qualify.  Other
+    /// Int32 operations (divide, modulus, bitwise, shifts) are deliberately
+    /// excluded for safety — they may participate in address calculations or
+    /// feed into Phi / type-conversion nodes in hard-to-predict ways.
+    #[allow(dead_code)]
     fn is_narrow_int32_consumer(node: &ValueNode) -> bool {
         matches!(
             node,
+            // Wrapping Int32 arithmetic — uses 32-bit ALU ops.
             ValueNode::Int32Add { .. }
                 | ValueNode::Int32Subtract { .. }
                 | ValueNode::Int32Multiply { .. }
-                | ValueNode::Int32Divide { .. }
-                | ValueNode::Int32Modulus { .. }
                 | ValueNode::Int32Negate { .. }
                 | ValueNode::Int32Increment { .. }
                 | ValueNode::Int32Decrement { .. }
-                | ValueNode::Int32BitwiseAnd { .. }
-                | ValueNode::Int32BitwiseOr { .. }
-                | ValueNode::Int32BitwiseXor { .. }
-                | ValueNode::Int32ShiftLeft { .. }
-                | ValueNode::Int32ShiftRight { .. }
-                | ValueNode::Int32ShiftRightLogical { .. }
+                // Int32 comparisons — uses 32-bit CMP.
                 | ValueNode::Int32Equal { .. }
                 | ValueNode::Int32StrictEqual { .. }
                 | ValueNode::Int32LessThan { .. }
                 | ValueNode::Int32LessThanOrEqual { .. }
                 | ValueNode::Int32GreaterThan { .. }
                 | ValueNode::Int32GreaterThanOrEqual { .. }
-                | ValueNode::Int32Constant { .. }
         )
     }
 
     /// Collect all `NodeId` operands referenced by `node` into `out`.
+    #[allow(dead_code)]
     fn collect_node_inputs(node: &ValueNode, out: &mut HashSet<NodeId>) {
         match node {
             // ── No NodeId inputs ────────────────────────────────────────
@@ -3166,7 +3161,21 @@ impl<'a> MaglevCodegen<'a> {
 
     /// Precompute the set of wrapping Int32 nodes whose consumers all operate
     /// on 32-bit values, allowing the post-operation `movsxd` to be elided.
-    fn compute_narrow_int32(graph: &MaglevGraph) -> HashSet<NodeId> {
+    ///
+    /// The analysis is deliberately conservative: candidates are excluded when
+    /// they feed (even transitively through other candidates) into a non-32-bit
+    /// consumer such as a `Phi`, `StoreGlobal`, `Return`, or any type check.
+    /// Spilled values are also excluded because spill/reload uses 64-bit MOVs
+    /// and the upper 32 bits must therefore be well-defined.
+    #[allow(unreachable_code, unused_variables, unused_mut)]
+    fn compute_narrow_int32(graph: &MaglevGraph, alloc: &AllocationResult) -> HashSet<NodeId> {
+        // DISABLED: the narrow-Int32 analysis has a bug that leaves garbage in
+        // upper 32 bits, causing SIGSEGV when those values flow into 64-bit
+        // consumers (StoreGlobal, Return, Phi → spill).  Return empty set so
+        // every wrapping-Int32 result gets a MOVSXD sign-extension.
+        // TODO: re-enable once the analysis handles Phi back-edges correctly.
+        return HashSet::new();
+
         // Step 1: collect all wrapping Int32 producer IDs.
         let mut candidates: HashSet<NodeId> = HashSet::new();
         for block in graph.blocks() {
@@ -3203,7 +3212,49 @@ impl<'a> MaglevCodegen<'a> {
             }
         }
 
-        candidates.retain(|id| !non_narrow.contains(id));
+        // Step 3: propagate non-narrow status backwards through candidate
+        // chains.  If candidate B is excluded (e.g. feeds a Phi) and
+        // candidate A is an input to B, then A must also be excluded.
+        // Without this, A would skip MOVSXD and its garbage upper bits
+        // could propagate through spill/reload or register-move sequences
+        // at loop back-edges, causing SIGSEGV.
+        let mut candidate_inputs: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for block in graph.blocks() {
+            for (id, node) in &block.nodes {
+                if candidates.contains(id) {
+                    let mut inputs = HashSet::new();
+                    Self::collect_node_inputs(node, &mut inputs);
+                    let producer_candidates: Vec<NodeId> = inputs
+                        .into_iter()
+                        .filter(|i| candidates.contains(i))
+                        .collect();
+                    if !producer_candidates.is_empty() {
+                        candidate_inputs.insert(*id, producer_candidates);
+                    }
+                }
+            }
+        }
+
+        let mut worklist: Vec<NodeId> = candidates
+            .iter()
+            .filter(|id| non_narrow.contains(id))
+            .copied()
+            .collect();
+        while let Some(id) = worklist.pop() {
+            if let Some(inputs) = candidate_inputs.get(&id) {
+                for inp in inputs {
+                    if non_narrow.insert(*inp) {
+                        worklist.push(*inp);
+                    }
+                }
+            }
+        }
+
+        // Step 4: exclude spilled values — the spill/reload path uses
+        // 64-bit MOVs so the upper 32 bits must be well-defined.
+        candidates.retain(|id| {
+            !non_narrow.contains(id) && !matches!(alloc.location(*id), Some(Location::StackSlot(_)))
+        });
         candidates
     }
 
@@ -3522,6 +3573,148 @@ mod tests {
 
         let cc = do_compile(&graph, 2);
         assert!(cc.native_code_len > 0);
+    }
+
+    // ── Narrow-Int32 analysis tests ─────────────────────────────────────────
+
+    /// Helper: build a graph + run regalloc, then return `compute_narrow_int32`.
+    fn narrow_set(graph: &MaglevGraph) -> HashSet<NodeId> {
+        let alloc = allocate(graph, NUM_PHYS_REGS);
+        MaglevCodegen::compute_narrow_int32(graph, &alloc)
+    }
+
+    #[test]
+    fn test_narrow_int32_add_chain_all_narrow() {
+        // p0, p1 -> Int32Add(A) -> Int32Add(B) -> Int32Add(C) -> Return
+        // A and B are candidates.  C feeds Return (non-narrow), so C is
+        // excluded.  B feeds C (narrow), so B stays — but with the new
+        // transitive propagation, B is also excluded because C (excluded)
+        // consumes B.  Similarly A is excluded because B is excluded.
+        let mut graph = MaglevGraph::new(2);
+        let mut block = BasicBlock::new(0);
+        let p0 = block.push_value(ValueNode::Parameter { index: 0 });
+        let p1 = block.push_value(ValueNode::Parameter { index: 1 });
+        let a = block.push_value(ValueNode::Int32Add {
+            left: p0,
+            right: p1,
+        });
+        let b = block.push_value(ValueNode::Int32Add { left: a, right: p0 });
+        let c = block.push_value(ValueNode::Int32Add { left: b, right: p1 });
+        block.set_control(ControlNode::Return { value: c });
+        graph.add_block(block);
+
+        let set = narrow_set(&graph);
+        // C feeds Return → excluded; transitive propagation excludes B and A.
+        assert!(!set.contains(&c), "C feeds Return and must not be narrow");
+        assert!(
+            !set.contains(&b),
+            "B feeds excluded C and must not be narrow (transitive)"
+        );
+        assert!(
+            !set.contains(&a),
+            "A feeds excluded B and must not be narrow (transitive)"
+        );
+    }
+
+    #[test]
+    fn test_narrow_int32_phi_excludes_producers() {
+        // Block 0: p0 -> Int32Add(A) -> Jump(1)
+        // Block 1: Phi(A, A) -> Return
+        // A feeds a Phi (non-narrow consumer), so A must be excluded.
+        let mut graph = MaglevGraph::new(1);
+        let mut b0 = BasicBlock::new(0);
+        let p0 = b0.push_value(ValueNode::Parameter { index: 0 });
+        let a = b0.push_value(ValueNode::Int32Add {
+            left: p0,
+            right: p0,
+        });
+        b0.set_control(ControlNode::Jump { target: 1 });
+        graph.add_block(b0);
+
+        let mut b1 = BasicBlock::new(1);
+        b1.add_predecessor(0);
+        let phi = b1.push_value(ValueNode::Phi { inputs: vec![a, a] });
+        b1.set_control(ControlNode::Return { value: phi });
+        graph.add_block(b1);
+
+        let set = narrow_set(&graph);
+        assert!(!set.contains(&a), "A feeds Phi and must not be narrow");
+    }
+
+    #[test]
+    fn test_narrow_int32_only_narrow_consumers_is_narrow() {
+        // p0, p1 -> Int32Add(A) -> Int32Add(B) -> Int32Equal(C) -> Return
+        // A feeds B (narrow), and B feeds C (narrow comparison).
+        // C feeds Return (non-narrow) → C is not a candidate (it's a compare).
+        // B feeds C (narrow) — no non-narrow consumer of B.
+        // A feeds B (narrow) — no non-narrow consumer of A.
+        // Both A and B should be narrow.
+        let mut graph = MaglevGraph::new(2);
+        let mut block = BasicBlock::new(0);
+        let p0 = block.push_value(ValueNode::Parameter { index: 0 });
+        let p1 = block.push_value(ValueNode::Parameter { index: 1 });
+        let a = block.push_value(ValueNode::Int32Add {
+            left: p0,
+            right: p1,
+        });
+        let b = block.push_value(ValueNode::Int32Add { left: a, right: p0 });
+        let c = block.push_value(ValueNode::Int32Equal { left: b, right: p1 });
+        block.set_control(ControlNode::Return { value: c });
+        graph.add_block(block);
+
+        let set = narrow_set(&graph);
+        // Int32Equal is a narrow consumer of B, and Return consumes the
+        // comparison result (not a candidate).  A and B have only narrow
+        // consumers.
+        assert!(
+            set.contains(&a),
+            "A should be narrow (only consumed by narrow B)"
+        );
+        assert!(
+            set.contains(&b),
+            "B should be narrow (only consumed by narrow Int32Equal)"
+        );
+    }
+
+    #[test]
+    fn test_narrow_int32_non_int32_consumer_excludes() {
+        // p0, p1 -> Int32Add(A) -> StoreGlobal
+        // A feeds StoreGlobal (non-narrow) → A excluded.
+        let mut graph = MaglevGraph::new(2);
+        let mut block = BasicBlock::new(0);
+        let p0 = block.push_value(ValueNode::Parameter { index: 0 });
+        let p1 = block.push_value(ValueNode::Parameter { index: 1 });
+        let a = block.push_value(ValueNode::Int32Add {
+            left: p0,
+            right: p1,
+        });
+        let _sg = block.push_value(ValueNode::StoreGlobal {
+            name: 0,
+            value: a,
+            feedback_slot: 0,
+        });
+        let c = block.push_value(ValueNode::UndefinedConstant);
+        block.set_control(ControlNode::Return { value: c });
+        graph.add_block(block);
+
+        let set = narrow_set(&graph);
+        assert!(
+            !set.contains(&a),
+            "A feeds StoreGlobal and must not be narrow"
+        );
+    }
+
+    #[test]
+    fn test_narrow_int32_empty_for_no_candidates() {
+        // A graph with no wrapping Int32 producers returns empty.
+        let mut graph = MaglevGraph::new(0);
+        let mut block = BasicBlock::new(0);
+        let c = block.push_value(ValueNode::SmiConstant { value: 1 });
+        block.set_control(ControlNode::Return { value: c });
+        graph.add_block(block);
+
+        let set = narrow_set(&graph);
+        assert!(set.is_empty());
     }
 
     // ── Execution tests (x86-64 / unix only) ─────────────────────────────────

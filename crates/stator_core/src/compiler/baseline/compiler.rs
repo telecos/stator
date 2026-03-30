@@ -106,8 +106,6 @@ pub const JIT_DEOPT_OVERFLOW: i64 = i64::MIN + 1;
 pub const JIT_DEOPT_STUB: i64 = i64::MIN + 2;
 /// Deopt reason: promoted global load failed.
 pub const JIT_DEOPT_GLOBAL: i64 = i64::MIN + 3;
-/// Deopt reason: loop safety counter exhausted.
-pub const JIT_DEOPT_LOOP: i64 = i64::MIN + 4;
 /// Deopt reason: integer division by zero.
 pub const JIT_DEOPT_DIVZERO: i64 = i64::MIN + 5;
 
