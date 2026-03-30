@@ -820,7 +820,7 @@ pub(super) const OSR_LOOP_THRESHOLD: u32 = 5;
 /// count exceeds this threshold (15 back-edges), a Maglev compilation is
 /// scheduled in a background thread so the next *call* can use the optimised
 /// tier.
-pub(super) const MAGLEV_OSR_LOOP_THRESHOLD: u32 = 500;
+pub(super) const MAGLEV_OSR_LOOP_THRESHOLD: u32 = 50;
 
 /// Number of loop back-edges taken before a Turbofan background compilation is
 /// triggered via OSR.

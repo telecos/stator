@@ -364,7 +364,7 @@ pub const TIERING_THRESHOLD: u32 = 10;
 /// baseline JIT code is already present, the interpreter schedules a
 /// background Maglev compilation.  Once compilation finishes the cached
 /// Maglev code replaces the baseline tier for future calls.
-pub const MAGLEV_TIERING_THRESHOLD: u32 = 500;
+pub const MAGLEV_TIERING_THRESHOLD: u32 = 50;
 
 /// Invocation-count threshold that triggers Turbofan (Cranelift optimising)
 /// JIT compilation.
