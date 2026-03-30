@@ -3012,7 +3012,7 @@ pub(crate) mod jit_runtime {
     /// * `RSI` (`index`) – non-negative Smi-encoded integer index.
     ///
     /// Returns the element as a JIT `i64` in `RAX`, or [`JIT_DEOPT`].
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub extern "C" fn jit_runtime_fast_array_load(obj_handle: i64, index: i64) -> i64 {
         fast_array_load_inner(obj_handle, index).unwrap_or(JIT_DEOPT)
     }
@@ -3092,7 +3092,7 @@ pub(crate) mod jit_runtime {
     /// * `RDX` (`value_i64`) – JIT i64 encoding of the value to store.
     ///
     /// Returns `value_i64` in `RAX` on success, or [`JIT_DEOPT`].
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub extern "C" fn jit_runtime_fast_array_store(
         obj_handle: i64,
         index: i64,
@@ -3183,7 +3183,7 @@ pub(crate) mod jit_runtime {
     /// * `RDX` (`value_i64`) – JIT i64 encoding of the value to push.
     ///
     /// Returns the new array length as a Smi `i64`, or [`JIT_DEOPT`].
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub extern "C" fn jit_runtime_fast_array_push(
         obj_handle: i64,
         _method_handle: i64,

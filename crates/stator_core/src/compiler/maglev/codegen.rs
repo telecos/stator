@@ -1173,12 +1173,12 @@ impl<'a> MaglevCodegen<'a> {
                         }
                     }
                 } else {
-                    self.emit_save_caller_saved();
+                    let saved = self.emit_save_live_regs(id);
                     self.masm.mov_ri(Reg64::Rdi, i64::from(*name));
                     let addr = jit_runtime::jit_runtime_lda_global as *const () as usize as i64;
                     self.masm.mov_ri(Reg64::R11, addr);
                     self.masm.call_reg(Reg64::R11);
-                    self.emit_restore_caller_saved();
+                    self.emit_restore_live_regs(saved);
                     self.emit_deopt_check_rax();
                     self.emit_store(id, Reg64::Rax);
                 }
@@ -1203,13 +1203,13 @@ impl<'a> MaglevCodegen<'a> {
                         }
                     }
                 } else {
-                    self.emit_save_caller_saved();
+                    let saved = self.emit_save_live_regs(id);
                     self.masm.mov_ri(Reg64::Rdi, i64::from(*name));
                     self.emit_load(*value, Reg64::Rsi);
                     let addr = jit_runtime::jit_runtime_sta_global as *const () as usize as i64;
                     self.masm.mov_ri(Reg64::R11, addr);
                     self.masm.call_reg(Reg64::R11);
-                    self.emit_restore_caller_saved();
+                    self.emit_restore_live_regs(saved);
                     self.emit_deopt_check_rax();
                     self.emit_store(id, Reg64::Rax);
                 }
@@ -1320,14 +1320,14 @@ impl<'a> MaglevCodegen<'a> {
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::LoadCurrentContextSlot { slot } => {
                 // jit_runtime_lda_context_slot(slot_idx: i64) -> i64
-                self.emit_save_caller_saved();
+                let saved = self.emit_save_live_regs(id);
                 self.masm.mov_ri(Reg64::Rdi, i64::from(*slot));
                 self.masm.mov_ri(
                     Reg64::R11,
                     jit_runtime::jit_runtime_lda_context_slot as *const () as usize as i64,
                 );
                 self.masm.call_reg(Reg64::R11);
-                self.emit_restore_caller_saved();
+                self.emit_restore_live_regs(saved);
                 self.emit_deopt_check_rax();
                 self.masm.mov_rr(Reg64::R11, Reg64::Rax);
                 self.emit_store(id, Reg64::R11);
@@ -1335,7 +1335,7 @@ impl<'a> MaglevCodegen<'a> {
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::StoreCurrentContextSlot { slot, value } => {
                 // jit_runtime_sta_context_slot(slot_idx: i64, value: i64) -> i64
-                self.emit_save_caller_saved();
+                let saved = self.emit_save_live_regs(id);
                 self.masm.mov_ri(Reg64::Rdi, i64::from(*slot));
                 self.emit_load(*value, Reg64::Rsi);
                 self.masm.mov_ri(
@@ -1343,7 +1343,7 @@ impl<'a> MaglevCodegen<'a> {
                     jit_runtime::jit_runtime_sta_context_slot as *const () as usize as i64,
                 );
                 self.masm.call_reg(Reg64::R11);
-                self.emit_restore_caller_saved();
+                self.emit_restore_live_regs(saved);
                 self.emit_deopt_check_rax();
                 self.masm.mov_rr(Reg64::R11, Reg64::Rax);
                 self.emit_store(id, Reg64::R11);
@@ -2451,57 +2451,64 @@ impl<'a> MaglevCodegen<'a> {
 
     // ── Runtime stub call helpers ────────────────────────────────────────────
     //
-    // These helpers save all caller-saved allocatable registers, set up
-    // arguments in SysV ABI order, call the extern "C" stub, check for
-    // JIT_DEOPT, and store the result.
+    // These helpers save only the caller-saved allocatable registers that are
+    // **live across** the call (determined per-call-site by the register
+    // allocator's liveness data), set up arguments in SysV ABI order, call the
+    // extern "C" stub, check for JIT_DEOPT, and store the result.
 
-    /// Save caller-saved allocatable registers: RCX, RDX, RSI, R8, R9.
+    /// Save only the caller-saved registers that are **live across**
+    /// `at_node`.  Returns a bitmask of the saved register indices so that
+    /// [`emit_restore_live_regs`] can pop exactly the right set.
     #[cfg(all(target_arch = "x86_64", unix))]
-    fn emit_save_caller_saved(&mut self) {
-        let count = self.used_caller_saved.count_ones();
+    fn emit_save_live_regs(&mut self, at_node: NodeId) -> u8 {
+        // Intersect per-call-site liveness with the function-wide mask
+        // as a safety belt.
+        let mask = self.alloc.live_caller_saved_at(at_node) & self.used_caller_saved;
+        let count = mask.count_ones();
         // Need an odd number of pushes for 16-byte stack alignment
         // before the CALL instruction.  After prologue, RSP ≡ 8 mod 16,
         // so an odd push count brings it to 0 mod 16.
         if count.is_multiple_of(2) {
             self.masm.push(Reg64::R11); // alignment padding
         }
-        if self.used_caller_saved & (1 << 1) != 0 {
+        if mask & (1 << 1) != 0 {
             self.masm.push(Reg64::Rcx);
         }
-        if self.used_caller_saved & (1 << 2) != 0 {
+        if mask & (1 << 2) != 0 {
             self.masm.push(Reg64::Rdx);
         }
-        if self.used_caller_saved & (1 << 3) != 0 {
+        if mask & (1 << 3) != 0 {
             self.masm.push(Reg64::Rsi);
         }
-        if self.used_caller_saved & (1 << 4) != 0 {
+        if mask & (1 << 4) != 0 {
             self.masm.push(Reg64::R8);
         }
-        if self.used_caller_saved & (1 << 5) != 0 {
+        if mask & (1 << 5) != 0 {
             self.masm.push(Reg64::R9);
         }
+        mask
     }
 
-    /// Restore caller-saved allocatable registers (reverse order).
-    /// Only restores registers that were actually allocated.
+    /// Restore caller-saved registers previously saved by
+    /// [`emit_save_live_regs`] (reverse push order).
     #[cfg(all(target_arch = "x86_64", unix))]
-    fn emit_restore_caller_saved(&mut self) {
-        if self.used_caller_saved & (1 << 5) != 0 {
+    fn emit_restore_live_regs(&mut self, mask: u8) {
+        if mask & (1 << 5) != 0 {
             self.masm.pop(Reg64::R9);
         }
-        if self.used_caller_saved & (1 << 4) != 0 {
+        if mask & (1 << 4) != 0 {
             self.masm.pop(Reg64::R8);
         }
-        if self.used_caller_saved & (1 << 3) != 0 {
+        if mask & (1 << 3) != 0 {
             self.masm.pop(Reg64::Rsi);
         }
-        if self.used_caller_saved & (1 << 2) != 0 {
+        if mask & (1 << 2) != 0 {
             self.masm.pop(Reg64::Rdx);
         }
-        if self.used_caller_saved & (1 << 1) != 0 {
+        if mask & (1 << 1) != 0 {
             self.masm.pop(Reg64::Rcx);
         }
-        let count = self.used_caller_saved.count_ones();
+        let count = mask.count_ones();
         if count.is_multiple_of(2) {
             self.masm.pop(Reg64::R11); // alignment padding
         }
@@ -2522,11 +2529,11 @@ impl<'a> MaglevCodegen<'a> {
     /// Call a 1-arg stub: `stub(node_arg)`.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_stub_call_1node(&mut self, id: NodeId, arg0: NodeId, stub_addr: usize) {
-        self.emit_save_caller_saved();
+        let saved = self.emit_save_live_regs(id);
         self.emit_load(arg0, Reg64::Rdi);
         self.masm.mov_ri(Reg64::R11, stub_addr as i64);
         self.masm.call_reg(Reg64::R11);
-        self.emit_restore_caller_saved();
+        self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
         self.emit_store(id, Reg64::Rax);
     }
@@ -2534,12 +2541,12 @@ impl<'a> MaglevCodegen<'a> {
     /// Call a 2-node-arg stub: `stub(node0, node1)`.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_stub_call_2node(&mut self, id: NodeId, arg0: NodeId, arg1: NodeId, stub_addr: usize) {
-        self.emit_save_caller_saved();
+        let saved = self.emit_save_live_regs(id);
         self.emit_load(arg0, Reg64::Rdi);
         self.emit_load(arg1, Reg64::Rsi);
         self.masm.mov_ri(Reg64::R11, stub_addr as i64);
         self.masm.call_reg(Reg64::R11);
-        self.emit_restore_caller_saved();
+        self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
         self.emit_store(id, Reg64::Rax);
     }
@@ -2554,13 +2561,13 @@ impl<'a> MaglevCodegen<'a> {
         arg2: NodeId,
         stub_addr: usize,
     ) {
-        self.emit_save_caller_saved();
+        let saved = self.emit_save_live_regs(id);
         self.emit_load(arg0, Reg64::Rdi);
         self.emit_load(arg1, Reg64::Rsi);
         self.emit_load(arg2, Reg64::Rdx);
         self.masm.mov_ri(Reg64::R11, stub_addr as i64);
         self.masm.call_reg(Reg64::R11);
-        self.emit_restore_caller_saved();
+        self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
         self.emit_store(id, Reg64::Rax);
     }
@@ -2576,7 +2583,7 @@ impl<'a> MaglevCodegen<'a> {
         arg2: NodeOrImm,
         stub_addr: usize,
     ) {
-        self.emit_save_caller_saved();
+        let saved = self.emit_save_live_regs(id);
         // Load all node arguments BEFORE setting any immediates into
         // allocatable registers (RSI = phys_reg(3)).  The old order
         // clobbered RSI with arg1_imm before loading arg2, which could
@@ -2589,7 +2596,7 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.mov_ri(Reg64::Rsi, arg1_imm);
         self.masm.mov_ri(Reg64::R11, stub_addr as i64);
         self.masm.call_reg(Reg64::R11);
-        self.emit_restore_caller_saved();
+        self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
         self.emit_store(id, Reg64::Rax);
     }
@@ -2603,7 +2610,7 @@ impl<'a> MaglevCodegen<'a> {
     /// `acc`, though most creation ops only use `operand1`/`operand2` and TLS.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_trampoline_call(&mut self, id: NodeId, opcode: u8, operand1: i64, operand2: i64) {
-        self.emit_save_caller_saved();
+        let saved = self.emit_save_live_regs(id);
         // RDI = opcode
         self.masm.mov_ri(Reg64::Rdi, i64::from(opcode));
         // RSI = register-file base (R14)
@@ -2617,7 +2624,7 @@ impl<'a> MaglevCodegen<'a> {
         let addr = jit_runtime::jit_runtime_trampoline as *const () as usize;
         self.masm.mov_ri(Reg64::R11, addr as i64);
         self.masm.call_reg(Reg64::R11);
-        self.emit_restore_caller_saved();
+        self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
         self.emit_store(id, Reg64::Rax);
     }

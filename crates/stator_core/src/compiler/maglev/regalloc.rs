@@ -77,6 +77,11 @@ pub struct AllocationResult {
     /// Total number of stack slots allocated (i.e. the required stack-frame
     /// size in slots).
     spill_count: u32,
+    /// Per-node bitmask of caller-saved allocatable registers (indices 1–5:
+    /// RCX, RDX, RSI, R8, R9) that hold live values **across** that node.
+    /// A register is included only when its value is still needed *after* the
+    /// node, so stub-call arguments consumed at the call site are excluded.
+    live_caller_saved: HashMap<NodeId, u8>,
 }
 
 impl AllocationResult {
@@ -89,6 +94,13 @@ impl AllocationResult {
     /// The number of stack slots required by the function's frame.
     pub fn spill_count(&self) -> u32 {
         self.spill_count
+    }
+
+    /// Returns a bitmask of caller-saved allocatable registers (bits 1–5)
+    /// that hold values live *across* the given node.  Returns `0` when no
+    /// caller-saved register needs saving at that point.
+    pub fn live_caller_saved_at(&self, id: NodeId) -> u8 {
+        self.live_caller_saved.get(&id).copied().unwrap_or(0)
     }
 }
 
@@ -588,9 +600,58 @@ pub fn allocate(graph: &MaglevGraph, num_regs: u32) -> AllocationResult {
         }
     }
 
+    // ── Per-node caller-saved liveness ──────────────────────────────────────
+    //
+    // For each node at program point P, compute a bitmask of caller-saved
+    // register indices (1–5) whose live intervals span *across* P, i.e. the
+    // value is defined before P and still needed after P.  This lets codegen
+    // save only the registers that are truly live at each stub-call site.
+
+    // Collect intervals that ended up in caller-saved registers.
+    let cs_intervals: Vec<(u32, u32, u8)> = intervals
+        .iter()
+        .filter_map(|iv| {
+            if let Some(Location::Register(n)) = assignments.get(&iv.id)
+                && (1..=5).contains(n)
+            {
+                return Some((iv.start, iv.end, 1u8 << n));
+            }
+            None
+        })
+        .collect();
+
+    let mut live_caller_saved: HashMap<NodeId, u8> = HashMap::new();
+
+    if !cs_intervals.is_empty() {
+        // Rebuild the program-point map (same iteration order as
+        // compute_live_intervals).
+        let mut pp: u32 = 0;
+        for block in graph.blocks() {
+            for &(nid, _) in &block.nodes {
+                let mut mask: u8 = 0;
+                for &(start, end, bit) in &cs_intervals {
+                    // The value is live *across* this node when it was
+                    // defined strictly before and its last use is strictly
+                    // after this program point.
+                    if start < pp && end > pp + 1 {
+                        mask |= bit;
+                    }
+                }
+                if mask != 0 {
+                    live_caller_saved.insert(nid, mask);
+                }
+                pp += 1;
+            }
+            if block.control.is_some() {
+                pp += 1;
+            }
+        }
+    }
+
     AllocationResult {
         assignments,
         spill_count: next_spill,
+        live_caller_saved,
     }
 }
 
