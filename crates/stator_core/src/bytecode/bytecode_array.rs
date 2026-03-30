@@ -356,7 +356,7 @@ pub type TurbofanJitCodeCache = Arc<Mutex<Option<TurbofanCompiledCode>>>;
 /// When a function's `invocation_count` reaches this value (3 calls) the
 /// interpreter requests a baseline-compiled version; all subsequent calls
 /// that can be represented in the current JIT tier execute via native code.
-pub const TIERING_THRESHOLD: u32 = 3;
+pub const TIERING_THRESHOLD: u32 = 10;
 
 /// Invocation-count threshold that triggers Maglev JIT compilation.
 ///
@@ -374,7 +374,7 @@ pub const MAGLEV_TIERING_THRESHOLD: u32 = 500;
 /// Maglev graph builder followed by Cranelift CLIF lowering and
 /// optimisation, producing code that is expected to reach within 90 % of
 /// peak throughput.
-pub const TURBOFAN_TIERING_THRESHOLD: u32 = 100;
+pub const TURBOFAN_TIERING_THRESHOLD: u32 = 1_000;
 
 /// Shared, lazily-allocated megamorphic IC state persisted on a
 /// [`BytecodeArray`] across invocations.
