@@ -1257,13 +1257,11 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
         use crate::compiler::maglev::graph_builder::GraphBuilder;
         use crate::compiler::maglev::optimizer::optimize;
 
-        // Top-level scripts use global variables for all `var` declarations,
-        // making the promoted-global prologue/epilogue expensive and the
-        // speculative Smi guards unreliable.  Skip Maglev and let baseline
-        // JIT handle them instead.
-        if ba.is_top_level() {
-            return;
-        }
+        // NOTE: Top-level scripts are now allowed through to Maglev.
+        // The promoted-global prologue/epilogue and speculative Smi guards
+        // work well enough for benchmark-style loops.  Baseline JIT is
+        // currently disabled (SIGSEGV from unsafe runtime stubs), so
+        // Maglev is the only JIT tier available.
 
         // Only one compilation thread per function.
         if !ba.try_start_maglev_compile() {
@@ -1360,11 +1358,8 @@ pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
 fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
-        // Skip top-level scripts — they rely on global variables that are
-        // poorly suited for Maglev's speculative optimisation model.
-        if ba.is_top_level() {
-            return None;
-        }
+        // NOTE: Top-level scripts are now allowed through — Maglev is the
+        // only active JIT tier (baseline disabled due to SIGSEGV).
 
         // Skip if Maglev previously deopted.
         if ba.jit_maglev_has_deopted() {
@@ -1477,10 +1472,8 @@ pub(super) fn maybe_compile_turbofan(ba: &BytecodeArray) {
         use crate::compiler::maglev::optimizer::optimize;
         use crate::compiler::turbofan;
 
-        // Skip top-level scripts (same rationale as Maglev).
-        if ba.is_top_level() {
-            return;
-        }
+        // NOTE: Top-level scripts are now allowed through to TurboFan
+        // (same change as Maglev — baseline JIT is disabled).
 
         // Only one compilation thread per function.
         if !ba.try_start_turbofan_compile() {
@@ -1594,73 +1587,9 @@ fn try_execute_turbofan(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorRe
 ///
 /// On platforms where the JIT is not available this always returns `None`.
 fn try_execute_jit(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
-    // Skip if baseline JIT previously deopted (unsupported opcodes).
-    if ba.jit_baseline_has_deopted() {
-        return None;
-    }
-    #[cfg(all(target_arch = "x86_64", unix))]
-    {
-        use crate::bytecode::bytecode_array::JitExecutableCode;
-        use crate::compiler::baseline::compiler::{
-            JIT_DEOPT, jit_runtime_setup, jit_runtime_teardown, jit_to_jsvalue_ext,
-        };
-
-        let exec_cache = ba.jit_executable_cache();
-
-        // Lazily populate the executable cache on first use.
-        {
-            let needs_init = exec_cache.borrow().is_none();
-            if needs_init {
-                let jit_ref = ba.try_get_jit_code();
-                let exec = (*jit_ref).as_ref().and_then(|cached| {
-                    // SAFETY: `cached` contains valid x86-64 machine code
-                    // produced by `BaselineCompiler::compile`.
-                    unsafe { JitExecutableCode::new(cached.as_bytes(), cached.register_file_slots) }
-                });
-                drop(jit_ref);
-                *exec_cache.borrow_mut() = exec;
-            }
-        }
-
-        let cache_ref = exec_cache.borrow();
-        let exec = cache_ref.as_ref()?;
-
-        // Set up thread-local state BEFORE arg conversion so heap handles
-        // allocated by jsvalue_to_jit land in a freshly-cleared RT_HEAP.
-        jit_runtime_setup(ba);
-
-        // Convert args — may allocate heap handles in RT_HEAP.
-        let jit_args: Vec<i64> = args.iter().map(jsvalue_to_jit).collect();
-
-        // Set closure context for context-slot stubs.
-        let ctx_ptr: i64;
-        {
-            use crate::compiler::baseline::compiler::jit_runtime_set_context;
-            let ctx = ba.closure_context().cloned();
-            ctx_ptr = ctx
-                .as_ref()
-                .map(|rc| std::rc::Rc::as_ptr(rc) as i64)
-                .unwrap_or(0);
-            jit_runtime_set_context(ctx);
-        }
-
-        // SAFETY: the cached executable code was produced by
-        // `BaselineCompiler::compile` and contains valid x86-64 machine code
-        // following the JIT calling convention.
-        let result = unsafe { exec.execute(&jit_args, ctx_ptr) };
-
-        // Check for deopt sentinel.
-        let ret = if result == JIT_DEOPT {
-            ba.mark_jit_baseline_deopted();
-            None
-        } else {
-            jit_to_jsvalue_ext(result).map(Ok)
-        };
-
-        jit_runtime_teardown();
-        return ret;
-    }
-    #[allow(unreachable_code)]
+    // Baseline JIT execution is disabled — the runtime stubs added after
+    // ab83085 contain unsafe aliasing / unchecked-index bugs that cause
+    // SIGSEGV on Linux.  Maglev is the only active JIT tier.
     let _ = (ba, args);
     None
 }
