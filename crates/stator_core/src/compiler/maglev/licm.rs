@@ -313,13 +313,19 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
     // A LoadGlobal for a name that is also stored must not be hoisted.
     let mutated_globals = collect_mutated_globals(graph, &lp.body);
 
+    // Check whether the loop body contains any generic stores or calls that
+    // could modify arbitrary object properties.  When true, generic property
+    // loads (LoadNamedGeneric / LoadKeyedGeneric) must stay in the loop.
+    let has_property_side_effects = loop_has_property_side_effects(graph, &lp.body);
+
     eprintln!(
-        "LICM_DETAIL: loop header={} preheader={} body={:?} mutated_obj={} mutated_glob={:?}",
+        "LICM_DETAIL: loop header={} preheader={} body={:?} mutated_obj={} mutated_glob={:?} prop_side_effects={}",
         lp.header,
         lp.preheader,
         lp.body,
         mutated_objects.len(),
         mutated_globals,
+        has_property_side_effects,
     );
 
     // Scan loop blocks for hoistable nodes.  Include the loop header — in
@@ -341,7 +347,9 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
             let inputs_out = all_inputs_outside(node, &outside_defs);
             let alias_store = load_aliases_store(node, &mutated_objects);
             let alias_glob = global_load_aliases_store(node, &mutated_globals);
-            if pure && inputs_out && !alias_store && !alias_glob {
+            let blocked_by_side_effects =
+                is_generic_property_load(node) && has_property_side_effects;
+            if pure && inputs_out && !alias_store && !alias_glob && !blocked_by_side_effects {
                 to_hoist.push((block.id, pos, *id, node.clone()));
                 // After hoisting this node, its NodeId becomes "outside" too,
                 // so subsequent nodes that reference it may also qualify.
@@ -471,6 +479,46 @@ fn global_load_aliases_store(node: &ValueNode, mutated_globals: &HashSet<u32>) -
     } else {
         false
     }
+}
+
+/// Return `true` when `node` is a generic property load — one that invokes a
+/// runtime stub and whose result could be invalidated by arbitrary side
+/// effects from calls or generic stores elsewhere in the loop.
+fn is_generic_property_load(node: &ValueNode) -> bool {
+    matches!(
+        node,
+        ValueNode::LoadNamedGeneric { .. } | ValueNode::LoadKeyedGeneric { .. }
+    )
+}
+
+/// Return `true` if the loop body contains any nodes that could modify
+/// arbitrary object properties: generic property stores or any kind of call /
+/// construct.  When this returns `true`, [`LoadNamedGeneric`] and
+/// [`LoadKeyedGeneric`] must **not** be hoisted because a call can mutate any
+/// object reachable from its arguments or from the global scope.
+fn loop_has_property_side_effects(graph: &MaglevGraph, loop_body: &HashSet<u32>) -> bool {
+    for block in graph.blocks() {
+        if !loop_body.contains(&block.id) {
+            continue;
+        }
+        for (_, node) in &block.nodes {
+            if matches!(
+                node,
+                ValueNode::StoreNamedGeneric { .. }
+                    | ValueNode::StoreKeyedGeneric { .. }
+                    | ValueNode::Call { .. }
+                    | ValueNode::CallKnownFunction { .. }
+                    | ValueNode::CallBuiltin { .. }
+                    | ValueNode::CallRuntime { .. }
+                    | ValueNode::CallWithSpread { .. }
+                    | ValueNode::Construct { .. }
+                    | ValueNode::ConstructWithSpread { .. }
+            ) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1377,6 +1425,150 @@ mod tests {
                 .iter()
                 .any(|(_, n)| matches!(n, ValueNode::Int32Constant { value: 42 })),
             "invariant should appear in preheader"
+        );
+    }
+
+    // ── LoadNamedGeneric NOT hoisted when Call exists in loop ─────────────
+
+    #[test]
+    fn test_load_named_generic_not_hoisted_with_call_in_loop() {
+        let mut graph = loop_graph();
+
+        let param_id = graph.blocks()[0].nodes[0].0;
+
+        // LoadNamedGeneric whose object is defined outside the loop.
+        graph.blocks_mut()[2].nodes.push((
+            NodeId(700),
+            ValueNode::LoadNamedGeneric {
+                object: param_id,
+                name: 1,
+                feedback_slot: 0,
+            },
+        ));
+
+        // A Call in the same loop body — can modify any object's properties.
+        graph.blocks_mut()[2].nodes.push((
+            NodeId(701),
+            ValueNode::Call {
+                callee: param_id,
+                receiver: param_id,
+                args: vec![],
+                feedback_slot: 0,
+            },
+        ));
+
+        let body_before = graph.blocks()[2].nodes.len();
+        hoist_loop_invariants(&mut graph);
+
+        // LoadNamedGeneric must NOT be hoisted because a Call in the loop
+        // could modify the property.
+        assert!(
+            graph.blocks()[2]
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::LoadNamedGeneric { .. })),
+            "LoadNamedGeneric should NOT be hoisted when a Call exists in the loop"
+        );
+        // The Call itself is side-effecting and must remain.
+        assert!(
+            graph.blocks()[2]
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::Call { .. })),
+        );
+        assert_eq!(graph.blocks()[2].nodes.len(), body_before);
+    }
+
+    // ── LoadKeyedGeneric hoisted when loop is side-effect-free ───────────
+
+    #[test]
+    fn test_hoist_load_keyed_generic_no_side_effects() {
+        let mut graph = loop_graph();
+
+        let param_id = graph.blocks()[0].nodes[0].0;
+
+        // A key defined in the preheader.
+        let key_id = NodeId(50);
+        graph.blocks_mut()[0]
+            .nodes
+            .push((key_id, ValueNode::SmiConstant { value: 0 }));
+
+        // LoadKeyedGeneric in the loop body — no stores or calls.
+        graph.blocks_mut()[2].nodes.push((
+            NodeId(800),
+            ValueNode::LoadKeyedGeneric {
+                object: param_id,
+                key: key_id,
+                feedback_slot: 0,
+            },
+        ));
+
+        assert_eq!(graph.blocks()[2].nodes.len(), 1);
+        hoist_loop_invariants(&mut graph);
+
+        assert_eq!(
+            graph.blocks()[2].nodes.len(),
+            0,
+            "LoadKeyedGeneric should be hoisted when no side effects in loop"
+        );
+        assert!(
+            graph.blocks()[0]
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::LoadKeyedGeneric { .. })),
+            "LoadKeyedGeneric should appear in preheader"
+        );
+    }
+
+    // ── LoadNamedGeneric NOT hoisted when StoreNamedGeneric exists ───────
+
+    #[test]
+    fn test_load_named_generic_not_hoisted_with_generic_store() {
+        let mut graph = loop_graph();
+
+        let param_id = graph.blocks()[0].nodes[0].0;
+
+        // A different object for the store (the store targets a DIFFERENT
+        // object, but the blanket side-effect check still blocks the load).
+        let other_obj = NodeId(51);
+        graph.blocks_mut()[0]
+            .nodes
+            .push((other_obj, ValueNode::Parameter { index: 1 }));
+
+        // LoadNamedGeneric on param_id.
+        graph.blocks_mut()[2].nodes.push((
+            NodeId(900),
+            ValueNode::LoadNamedGeneric {
+                object: param_id,
+                name: 1,
+                feedback_slot: 0,
+            },
+        ));
+
+        // StoreNamedGeneric on a DIFFERENT object — still blocks the load
+        // because generic stores can trigger setters with arbitrary effects.
+        let val = NodeId(901);
+        graph.blocks_mut()[2]
+            .nodes
+            .push((val, ValueNode::Int32Constant { value: 0 }));
+        graph.blocks_mut()[2].nodes.push((
+            NodeId(902),
+            ValueNode::StoreNamedGeneric {
+                object: other_obj,
+                name: 2,
+                value: val,
+                feedback_slot: 0,
+            },
+        ));
+
+        hoist_loop_invariants(&mut graph);
+
+        assert!(
+            graph.blocks()[2]
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::LoadNamedGeneric { .. })),
+            "LoadNamedGeneric should NOT be hoisted when a StoreNamedGeneric exists in the loop"
         );
     }
 }

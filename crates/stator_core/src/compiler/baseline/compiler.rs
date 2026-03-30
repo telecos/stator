@@ -336,17 +336,38 @@ pub(crate) mod jit_runtime {
         };
     }
 
-    /// Populate [`RT_PTRS`] so that [`exec_jit_callee`] can bypass
-    /// per-variable `.with()` calls.
+    /// Populate [`RT_PTRS`] so that runtime stubs can bypass per-variable
+    /// `.with()` calls.
     ///
-    /// # TEMPORARILY DISABLED
+    /// # Safety
     ///
-    /// The cached raw pointers cause SIGSEGV due to aliased mutable/immutable
-    /// references and stale pointers after nested JIT calls.  All runtime
-    /// stubs have safe `.with()` fallback paths that are used when
-    /// `is_cached()` returns false.
+    /// The cached pointers reference thread-local `RefCell`s whose addresses
+    /// are stable for the thread's lifetime.  Stubs create short-lived
+    /// references from `as_ptr()` and never hold them across nested calls,
+    /// so no aliasing violations occur even when Maglev stubs invoke
+    /// `call_js_function` (which re-enters the interpreter on a fresh frame).
     fn cache_rt_ptrs() {
-        // Intentionally left empty — all stubs use safe TLS fallback.
+        RT_HEAP.with(|heap| {
+            RT_CONTEXT.with(|ctx| {
+                RT_BYTECODE.with(|bc| {
+                    RT_GLOBAL.with(|g| {
+                        RT_PROP_IC.with(|ic| {
+                            let setup_gen = RT_SETUP_GEN.with(|g| g.get());
+                            RT_PTRS.with(|p| {
+                                p.set(RtPtrs {
+                                    heap: heap as *const RefCell<Vec<JsValue>>,
+                                    context: ctx as *const RefCell<Option<Rc<RefCell<JsContext>>>>,
+                                    bytecode: bc as *const Cell<*const BytecodeArray>,
+                                    global: g as *const RefCell<JitGlobalState>,
+                                    prop_ic: ic as *const RefCell<JitPropertyIcState>,
+                                    generation: setup_gen,
+                                });
+                            });
+                        });
+                    });
+                });
+            });
+        });
     }
 
     // ── Setup / teardown ─────────────────────────────────────────────────
@@ -406,6 +427,7 @@ pub(crate) mod jit_runtime {
             c.proto = [(u32::MAX, 0, 0); 32];
         });
         RT_ARRAY_METHOD_IC.with(|c| c.set(ArrayMethodIcEntry::EMPTY));
+        RT_PTRS.with(|p| p.set(RtPtrs::EMPTY));
     }
 
     /// Set the current closure context for context-slot stubs.

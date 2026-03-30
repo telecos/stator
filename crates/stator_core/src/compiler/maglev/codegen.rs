@@ -506,12 +506,12 @@ impl<'a> MaglevCodegen<'a> {
         self.scan_and_promote_globals(base_slots);
         let register_file_slots = base_slots + self.promoted_extra_slots;
 
-        // NOTE: narrow-Int32 analysis disabled — it causes SIGSEGV on
-        // Linux CI when Maglev compiles certain patterns (Phi + spill
-        // interactions).  The empty set means every wrapping Int32
-        // result will emit MOVSXD (safe but ~1 extra instruction).
-        // TODO: re-enable once the root cause is identified.
-        // self.narrow_int32 = Self::compute_narrow_int32(self.graph, self.alloc);
+        // Narrow-Int32 analysis: identify wrapping Int32 operations whose
+        // consumers ALL only read the lower 32 bits.  These can skip the
+        // post-operation MOVSXD sign-extension, saving ~1 instruction per op.
+        // Spilled values and values feeding Phis/Returns/StoreGlobals are
+        // conservatively excluded.
+        self.narrow_int32 = Self::compute_narrow_int32(self.graph, self.alloc);
 
         self.emit_prologue();
         self.emit_promoted_global_loads();
