@@ -99,6 +99,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
 
     let truncations = propagate_int32_truncation(graph);
     simplify_identities(graph);
+    reassociate_arithmetic(graph);
     strength_reduce(graph);
     crate::compiler::maglev::range_analysis::eliminate_overflow_checks(graph);
     let licm_hoisted = crate::compiler::maglev::licm::hoist_loop_invariants(graph);
@@ -770,6 +771,260 @@ fn simplify_identities_in_block(block: &mut BasicBlock) {
     if !subst.is_empty() {
         apply_subst_to_block(block, &subst);
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass 1.35 — Arithmetic reassociation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Combine multiply-add/sub patterns into simpler multiplies.
+///
+/// Recognized patterns (all for `Int32` variants):
+///
+/// - `(x * K) + x` → `x * (K + 1)`
+/// - `x + (x * K)` → `x * (K + 1)`
+/// - `(x * K) - x` → `x * (K - 1)` when K > 1
+/// - `(a - x) + (x * K)` → `a + x * (K - 1)` when K > 1
+/// - `(a + (x * K1)) + x` → `a + x * (K1 + 1)`
+/// - `x + (a + (x * K1))` → `a + x * (K1 + 1)`
+///
+/// The pass runs iteratively until convergence so that chained patterns
+/// (e.g. `i*3 - i + i*2` → `i*4`) are fully simplified.
+fn reassociate_arithmetic(graph: &mut MaglevGraph) {
+    loop {
+        let changed = reassociate_arithmetic_once(graph);
+        if changed == 0 {
+            break;
+        }
+    }
+}
+
+fn reassociate_arithmetic_once(graph: &mut MaglevGraph) -> usize {
+    let mut next_id = graph
+        .blocks()
+        .iter()
+        .flat_map(|b| b.nodes.iter())
+        .map(|(id, _)| id.0)
+        .max()
+        .map_or(0, |m| m + 1);
+
+    let mut count = 0;
+    for block in graph.blocks_mut() {
+        count += reassociate_block(block, &mut next_id);
+    }
+    count
+}
+
+/// Describes a single reassociation replacement.
+struct Reassoc {
+    pos: usize,
+    new_node: ValueNode,
+    prefix: Vec<(NodeId, ValueNode)>,
+}
+
+/// Build helper maps and apply one reassociation pattern within one block.
+fn reassociate_block(block: &mut BasicBlock, next_id: &mut u32) -> usize {
+    let mut consts: HashMap<NodeId, i32> = HashMap::new();
+    let mut mul_info: HashMap<NodeId, (NodeId, i32)> = HashMap::new();
+    let mut node_defs: HashMap<NodeId, ValueNode> = HashMap::new();
+
+    for (id, node) in &block.nodes {
+        match node {
+            ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } => {
+                consts.insert(*id, *value);
+            }
+            _ => {}
+        }
+        if let ValueNode::Int32Multiply { left, right } = node {
+            if let Some(&k) = consts.get(right) {
+                mul_info.insert(*id, (*left, k));
+            } else if let Some(&k) = consts.get(left) {
+                mul_info.insert(*id, (*right, k));
+            }
+        }
+        node_defs.insert(*id, node.clone());
+    }
+
+    for (pos, (_id, node)) in block.nodes.iter().enumerate() {
+        if let Some(r) = try_reassociate(node, pos, &consts, &mul_info, &node_defs, next_id) {
+            return apply_reassoc(block, r);
+        }
+    }
+    0
+}
+
+/// Try to match a reassociation pattern for the node at `pos`.
+fn try_reassociate(
+    node: &ValueNode,
+    pos: usize,
+    consts: &HashMap<NodeId, i32>,
+    mul_info: &HashMap<NodeId, (NodeId, i32)>,
+    node_defs: &HashMap<NodeId, ValueNode>,
+    next_id: &mut u32,
+) -> Option<Reassoc> {
+    match node {
+        ValueNode::Int32Add { left, right } => {
+            // (x * K) + x  ->  x * (K+1)
+            if let Some(&(base, k)) = mul_info.get(left)
+                && base == *right
+            {
+                return build_multiply_reassoc(pos, base, k + 1, consts, next_id);
+            }
+            // x + (x * K)  ->  x * (K+1)
+            if let Some(&(base, k)) = mul_info.get(right)
+                && base == *left
+            {
+                return build_multiply_reassoc(pos, base, k + 1, consts, next_id);
+            }
+            // (a - x) + (x * K)  ->  a + x * (K-1)  when K > 1
+            if let Some(ValueNode::Int32Subtract {
+                left: sub_a,
+                right: sub_x,
+            }) = node_defs.get(left)
+                && let Some(&(base, k)) = mul_info.get(right)
+                && base == *sub_x
+                && k > 1
+            {
+                return build_add_mul_reassoc(pos, *sub_a, base, k - 1, consts, next_id);
+            }
+            // (a + x*K) + x  ->  a + x*(K+1)
+            if let Some(ValueNode::Int32Add {
+                left: add_a,
+                right: add_b,
+            }) = node_defs.get(left)
+            {
+                if let Some(&(base, k)) = mul_info.get(add_b)
+                    && base == *right
+                {
+                    return build_add_mul_reassoc(pos, *add_a, base, k + 1, consts, next_id);
+                }
+                if let Some(&(base, k)) = mul_info.get(add_a)
+                    && base == *right
+                {
+                    return build_add_mul_reassoc(pos, *add_b, base, k + 1, consts, next_id);
+                }
+            }
+            // x + (a + x*K)  ->  a + x*(K+1)
+            if let Some(ValueNode::Int32Add {
+                left: add_a,
+                right: add_b,
+            }) = node_defs.get(right)
+            {
+                if let Some(&(base, k)) = mul_info.get(add_b)
+                    && base == *left
+                {
+                    return build_add_mul_reassoc(pos, *add_a, base, k + 1, consts, next_id);
+                }
+                if let Some(&(base, k)) = mul_info.get(add_a)
+                    && base == *left
+                {
+                    return build_add_mul_reassoc(pos, *add_b, base, k + 1, consts, next_id);
+                }
+            }
+            None
+        }
+        ValueNode::Int32Subtract { left, right } => {
+            // (x * K) - x  ->  x * (K-1)  when K > 1
+            if let Some(&(base, k)) = mul_info.get(left)
+                && base == *right
+                && k > 1
+            {
+                return build_multiply_reassoc(pos, base, k - 1, consts, next_id);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Build a `Reassoc` that replaces the node at `pos` with `base * new_k`.
+fn build_multiply_reassoc(
+    pos: usize,
+    base: NodeId,
+    new_k: i32,
+    consts: &HashMap<NodeId, i32>,
+    next_id: &mut u32,
+) -> Option<Reassoc> {
+    if new_k <= 0 {
+        return None;
+    }
+    let (const_node_id, prefix) = find_or_create_const(new_k, consts, next_id);
+    Some(Reassoc {
+        pos,
+        new_node: ValueNode::Int32Multiply {
+            left: base,
+            right: const_node_id,
+        },
+        prefix,
+    })
+}
+
+/// Build a `Reassoc` replacing the node at `pos` with `addend + base * new_k`.
+fn build_add_mul_reassoc(
+    pos: usize,
+    addend: NodeId,
+    base: NodeId,
+    new_k: i32,
+    consts: &HashMap<NodeId, i32>,
+    next_id: &mut u32,
+) -> Option<Reassoc> {
+    if new_k <= 0 {
+        return None;
+    }
+    if new_k == 1 {
+        return Some(Reassoc {
+            pos,
+            new_node: ValueNode::Int32Add {
+                left: addend,
+                right: base,
+            },
+            prefix: Vec::new(),
+        });
+    }
+    let (const_node_id, mut prefix) = find_or_create_const(new_k, consts, next_id);
+    let mul_id = NodeId(*next_id);
+    *next_id += 1;
+    prefix.push((
+        mul_id,
+        ValueNode::Int32Multiply {
+            left: base,
+            right: const_node_id,
+        },
+    ));
+    Some(Reassoc {
+        pos,
+        new_node: ValueNode::Int32Add {
+            left: addend,
+            right: mul_id,
+        },
+        prefix,
+    })
+}
+
+/// Find an existing constant with value `k`, or allocate a new one.
+fn find_or_create_const(
+    k: i32,
+    consts: &HashMap<NodeId, i32>,
+    next_id: &mut u32,
+) -> (NodeId, Vec<(NodeId, ValueNode)>) {
+    if let Some((&id, _)) = consts.iter().find(|&(_, &v)| v == k) {
+        (id, Vec::new())
+    } else {
+        let id = NodeId(*next_id);
+        *next_id += 1;
+        (id, vec![(id, ValueNode::Int32Constant { value: k })])
+    }
+}
+
+/// Apply a single `Reassoc` to the block.
+fn apply_reassoc(block: &mut BasicBlock, r: Reassoc) -> usize {
+    let (node_id, _) = block.nodes[r.pos];
+    let prefix_len = r.prefix.len();
+    for (i, entry) in r.prefix.into_iter().enumerate() {
+        block.nodes.insert(r.pos + i, entry);
+    }
+    block.nodes[r.pos + prefix_len] = (node_id, r.new_node);
+    1
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
