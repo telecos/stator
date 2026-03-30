@@ -173,8 +173,8 @@ pub(crate) mod jit_runtime {
         /// Direct-mapped by `name_idx & 63`.
         lda: [(u32, u64, usize); 64],
         /// Prototype-chain IC: `(name_idx, own_shape_id, cached_value)`.
-        /// Direct-mapped by `name_idx & 15`.
-        proto: [(u32, u64, i64); 16],
+        /// Direct-mapped by `name_idx & 31`.
+        proto: [(u32, u64, i64); 32],
     }
 
     /// Combined global-environment + inline-cache state for
@@ -210,7 +210,7 @@ pub(crate) mod jit_runtime {
         static RT_PROP_IC: RefCell<JitPropertyIcState> = const {
             RefCell::new(JitPropertyIcState {
                 lda: [(u32::MAX, 0, 0); 64],
-                proto: [(u32::MAX, 0, 0); 16],
+                proto: [(u32::MAX, 0, 0); 32],
             })
         };
 
@@ -375,6 +375,7 @@ pub(crate) mod jit_runtime {
             c.lda = [(u32::MAX, 0, 0); 64];
             c.proto = [(u32::MAX, 0, 0); 16];
         });
+        RT_ARRAY_METHOD_IC.with(|c| c.set(ArrayMethodIcEntry::EMPTY));
     }
 
     /// Set the current closure context for context-slot stubs.
@@ -1381,6 +1382,14 @@ pub(crate) mod jit_runtime {
 
         let ptrs = RT_PTRS.with(|p| p.get());
 
+        // ── Ultra-fast path: array method IC hit ────────────────────
+        // Reuses a previously created fast-array-method PlainObject
+        // wrapper instead of recreating it on every loop iteration.
+        let ic = RT_ARRAY_METHOD_IC.with(|c| c.get());
+        if ic.receiver == obj_i64 && ic.name_idx == name_idx && ic.method != 0 {
+            return Some(ic.method);
+        }
+
         // ── Phase 1: IC hit via borrowed heap (no input clone) ──────
         // Returns Ok(i64) for a direct/primitive result, Err(JsValue)
         // for an object result that still needs a heap handle, or None
@@ -1413,7 +1422,7 @@ pub(crate) mod jit_runtime {
                     }
 
                     // ── Prototype IC hit (pre-encoded i64) ──────────
-                    let proto_slot = (name_idx & 15) as usize;
+                    let proto_slot = (name_idx & 31) as usize;
                     let pe = &cache.proto[proto_slot];
                     if pe.0 == name_idx && pe.1 == shape {
                         return Some(pe.2);
@@ -1463,7 +1472,15 @@ pub(crate) mod jit_runtime {
                             let method = crate::interpreter::make_fast_array_method(
                                 &arr_val, prop_name, len,
                             );
-                            Some(Err(method))
+                            let handle = alloc_heap_handle(method);
+                            RT_ARRAY_METHOD_IC.with(|c| {
+                                c.set(ArrayMethodIcEntry {
+                                    receiver: obj_i64,
+                                    name_idx,
+                                    method: handle,
+                                })
+                            });
+                            Some(Ok(handle))
                         }
                         _ => Some(Ok(JIT_UNDEFINED)),
                     }
@@ -1504,7 +1521,7 @@ pub(crate) mod jit_runtime {
                                 );
                             }
 
-                            let proto_slot = (name_idx & 15) as usize;
+                            let proto_slot = (name_idx & 31) as usize;
                             let pe = &cache.proto[proto_slot];
                             if pe.0 == name_idx && pe.1 == shape {
                                 return Some(Ok(pe.2));
@@ -1541,7 +1558,7 @@ pub(crate) mod jit_runtime {
                             .or_else(|| map.get("__proto__"))
                             .cloned();
                         let result = jit_proto_chain_walk(proto.as_ref(), prop_name);
-                        let proto_slot = (name_idx & 15) as usize;
+                        let proto_slot = (name_idx & 31) as usize;
                         RT_PROP_IC.with(|ic| {
                             ic.borrow_mut().proto[proto_slot] = (name_idx, shape, result);
                         });
@@ -1557,7 +1574,15 @@ pub(crate) mod jit_runtime {
                                 let method = crate::interpreter::make_fast_array_method(
                                     &arr_val, prop_name, len,
                                 );
-                                Some(Err(method))
+                                let handle = alloc_heap_handle(method);
+                                RT_ARRAY_METHOD_IC.with(|c| {
+                                    c.set(ArrayMethodIcEntry {
+                                        receiver: obj_i64,
+                                        name_idx,
+                                        method: handle,
+                                    })
+                                });
+                                Some(Ok(handle))
                             }
                             _ => Some(Ok(JIT_UNDEFINED)),
                         }
@@ -1627,7 +1652,7 @@ pub(crate) mod jit_runtime {
                     let _ = map;
                     let result = jit_proto_chain_walk(proto.as_ref(), &prop_name);
 
-                    let proto_slot = (name_idx & 15) as usize;
+                    let proto_slot = (name_idx & 31) as usize;
                     if ptrs.is_cached() {
                         unsafe { &*ptrs.prop_ic }.borrow_mut().proto[proto_slot] =
                             (name_idx, shape, result);
@@ -2587,6 +2612,21 @@ pub(crate) mod jit_runtime {
         lda_keyed_property_inner(obj_i64, key_i64).unwrap_or(JIT_DEOPT)
     }
 
+    /// Inline encode a `&JsValue` to JIT i64 for the most common element
+    /// types (Boolean, Smi, Undefined) without going through the full
+    /// `encode_or_clone_ref` match.  Returns `None` for heap types that
+    /// need a handle allocation.
+    #[inline(always)]
+    fn encode_element_fast(v: &JsValue) -> Option<i64> {
+        match v {
+            JsValue::Boolean(b) => Some(if *b { JIT_TRUE } else { JIT_FALSE }),
+            JsValue::Smi(n) => Some(i64::from(*n)),
+            JsValue::Undefined => Some(JIT_UNDEFINED),
+            JsValue::Null => Some(JIT_NULL),
+            _ => None,
+        }
+    }
+
     /// Inner implementation for [`jit_runtime_lda_keyed_property`].
     fn lda_keyed_property_inner(obj_i64: i64, key_i64: i64) -> Option<i64> {
         // Ultra-fast path: positive Smi index (0..=i32::MAX).
@@ -2607,7 +2647,14 @@ pub(crate) mod jit_runtime {
                         let borrow = unsafe { &*arr.as_ptr() };
                         match borrow.get(smi_key) {
                             Some(v) if !matches!(v, JsValue::TheHole) => {
-                                Some(encode_or_clone_ref(v))
+                                // Inline fast encode for booleans/Smis (common
+                                // in sieve-style benchmarks) before falling
+                                // back to the generic encoder.
+                                if let Some(fast_val) = encode_element_fast(v) {
+                                    Some(Ok(fast_val))
+                                } else {
+                                    Some(encode_or_clone_ref(v))
+                                }
                             }
                             _ => Some(Ok(JIT_UNDEFINED)),
                         }
@@ -2630,7 +2677,11 @@ pub(crate) mod jit_runtime {
                             let borrow = arr.borrow();
                             match borrow.get(smi_key) {
                                 Some(v) if !matches!(v, JsValue::TheHole) => {
-                                    Some(encode_or_clone_ref(v))
+                                    if let Some(fast_val) = encode_element_fast(v) {
+                                        Some(Ok(fast_val))
+                                    } else {
+                                        Some(encode_or_clone_ref(v))
+                                    }
                                 }
                                 _ => Some(Ok(JIT_UNDEFINED)),
                             }
