@@ -2866,13 +2866,13 @@ impl InterpreterFrame {
             return Ok(value);
         }
 
-        let value = self
-            .global_env
-            .borrow()
-            .get(name)
-            .cloned()
-            .unwrap_or(JsValue::Undefined);
-        self.global_cache_put(name, value.clone());
+        // Cache miss — single borrow to read value + generation together.
+        let env = self.global_env.borrow();
+        let value = env.get(name).cloned().unwrap_or(JsValue::Undefined);
+        let current_gen = env.generation();
+        drop(env);
+        self.cache_generation = current_gen;
+        self.global_cache_put_no_gen(name, value.clone());
         if name == "this" && value == JsValue::TheHole {
             return Err(StatorError::ReferenceError(
                 "Must call super constructor in derived class before accessing 'this'".into(),
@@ -2889,30 +2889,35 @@ impl InterpreterFrame {
     #[inline]
     pub(super) fn store_global(&mut self, name_idx: u32, name: &Rc<str>, value: JsValue) {
         // IC fast path: known slot, generation matches.
+        // Use a single borrow_mut to avoid double borrow overhead.
         if let Some(ref ic) = self.global_ic
             && let Some(&(slot_idx, cached_gen)) = ic.get(&name_idx)
         {
-            let current_gen = self.global_env.borrow().generation();
-            if current_gen == cached_gen {
+            let mut env = self.global_env.borrow_mut();
+            if env.generation() == cached_gen {
                 set_function_name_if_missing(&value, name);
-                self.global_env
-                    .borrow_mut()
-                    .store_by_index_sync(slot_idx, name, value.clone());
-                self.global_cache_put(name, value);
+                env.store_by_index_sync(slot_idx, name, value.clone());
+                let new_gen = env.generation();
+                drop(env);
+                self.cache_generation = new_gen;
+                self.global_cache_put_no_gen(name, value);
                 return;
             }
+            drop(env);
         }
         // Slow path: full insert + IC population.
         set_function_name_if_missing(&value, name);
         let mut env = self.global_env.borrow_mut();
         env.insert(name.to_string(), value.clone());
-        let slot_gen = env.slot_index_for(name).map(|idx| (idx, env.generation()));
+        let new_gen = env.generation();
+        let slot_gen = env.slot_index_for(name).map(|idx| (idx, new_gen));
         drop(env);
+        self.cache_generation = new_gen;
         if let Some((slot_idx, cached_gen)) = slot_gen {
             self.global_ic_mut()
                 .insert(name_idx, (slot_idx, cached_gen));
         }
-        self.global_cache_put(name, value);
+        self.global_cache_put_no_gen(name, value);
     }
 
     /// Try to read a global from the per-frame direct-mapped cache.
@@ -2922,8 +2927,12 @@ impl InterpreterFrame {
     /// caller to take the slow HashMap path.
     #[inline(always)]
     pub fn global_cache_get(&self, name: &str) -> Option<&JsValue> {
-        // Check if cache is stale (another frame modified global_env).
-        let current_gen = self.global_env.borrow().generation();
+        // SAFETY: Reading a `Copy` field (`u64`) through a raw pointer to
+        // a live `RefCell` allocation.  The single-threaded interpreter
+        // guarantees no concurrent mutation, and `generation` is a plain
+        // `u64` with no interior mutability.  This avoids a full
+        // `RefCell::borrow()` on every global-variable cache probe.
+        let current_gen = unsafe { (*self.global_env.as_ptr()).generation };
         if current_gen != self.cache_generation {
             return None;
         }
@@ -2955,6 +2964,17 @@ impl InterpreterFrame {
             return;
         }
         self.cache_generation = self.global_env.borrow().generation();
+        self.global_cache_put_no_gen(name, value);
+    }
+
+    /// Like [`global_cache_put`] but assumes `cache_generation` is already
+    /// up to date.  Avoids a redundant `RefCell::borrow()` when the caller
+    /// already holds or has just dropped a borrow.
+    #[inline(always)]
+    fn global_cache_put_no_gen(&mut self, name: &str, value: JsValue) {
+        if name == "this" {
+            return;
+        }
         let h = fxhash(name);
         let slot = (h as usize) & 7;
         let cache = self.global_cache.get_or_insert_with(|| {
