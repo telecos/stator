@@ -1673,12 +1673,24 @@ pub(super) fn try_execute_best_jit(
     ba: &BytecodeArray,
     args: &[JsValue],
 ) -> Option<StatorResult<JsValue>> {
-    // Try Maglev first — register clobbering fix + deopt check in global loads
-    // should resolve SIGSEGV on property-heavy benchmarks.
-    if let Some(r) = try_execute_maglev(ba, args) {
-        return Some(r);
+    // TEMPORARY: JIT execution disabled while runtime stub SIGSEGV bugs are
+    // fixed.  Compilation still runs so benchmarks can measure compile cost;
+    // only execution is bypassed.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        let _ = (ba, args);
+        return None;
     }
-    try_execute_jit(ba, args)
+
+    #[allow(unreachable_code)]
+    {
+        // Try Maglev first — register clobbering fix + deopt check in global loads
+        // should resolve SIGSEGV on property-heavy benchmarks.
+        if let Some(r) = try_execute_maglev(ba, args) {
+            return Some(r);
+        }
+        try_execute_jit(ba, args)
+    }
 }
 
 // ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
