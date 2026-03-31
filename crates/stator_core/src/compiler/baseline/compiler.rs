@@ -1978,7 +1978,27 @@ pub(crate) mod jit_runtime {
         // here so Maglev compilation eventually triggers.
         let inv_count = ba.increment_invocation_count();
 
-        // ── Fast path: exec cache already populated ─────────────────
+        // ── Maglev fast path (preferred over baseline JIT) ──────────
+        // Maglev produces better code than baseline.  Check its cache
+        // FIRST so closures upgraded to Maglev skip the baseline path.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            use crate::bytecode::bytecode_array::MAGLEV_TIERING_THRESHOLD;
+
+            // Kick off background Maglev compilation early.
+            if inv_count >= MAGLEV_TIERING_THRESHOLD {
+                crate::interpreter::maybe_compile_maglev(ba);
+            }
+
+            let maglev_cache = ba.maglev_executable_cache();
+            // SAFETY: single-threaded JIT; no concurrent mutation.
+            let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
+            if let Some(maglev_exec) = maglev_ref.as_ref() {
+                return exec_maglev_callee(ba, maglev_exec, jit_args, saved_ba);
+            }
+        }
+
+        // ── Baseline JIT fast path ──────────────────────────────────
         // On the second+ call, skip the compilation and init checks.
         // SAFETY: single-threaded JIT; no concurrent borrows of exec cache.
         let exec_cache = ba.jit_executable_cache();
@@ -2023,24 +2043,6 @@ pub(crate) mod jit_runtime {
             let cache_ref = exec_cache.borrow();
             if let Some(exec) = cache_ref.as_ref() {
                 return exec_jit_callee(ba, exec, jit_args, saved_ba);
-            }
-        }
-
-        // ── Maglev fallback: try Maglev cache before interpreter ─────
-        #[cfg(all(target_arch = "x86_64", unix))]
-        {
-            use crate::bytecode::bytecode_array::MAGLEV_TIERING_THRESHOLD;
-
-            let maglev_cache = ba.maglev_executable_cache();
-            let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
-            if let Some(maglev_exec) = maglev_ref.as_ref() {
-                return exec_maglev_callee(ba, maglev_exec, jit_args, saved_ba);
-            }
-
-            // Kick off Maglev compilation if threshold reached but code
-            // is not ready yet.
-            if inv_count >= MAGLEV_TIERING_THRESHOLD {
-                crate::interpreter::maybe_compile_maglev(ba);
             }
         }
 
