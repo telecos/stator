@@ -278,23 +278,25 @@ pub(crate) mod jit_runtime {
         static RT_ARRAY_METHOD_IC: Cell<ArrayMethodIcEntry> = const {
             Cell::new(ArrayMethodIcEntry::EMPTY)
         };
+    }
 
-        // ── Direct JIT-to-JIT call state ────────────────────────────────
-        //
-        // Saved by `jit_runtime_get_jit_entry`, restored by
-        // `jit_runtime_finish_direct_call`.
-        //
-        // Bundled into a single `Cell` so that save/restore is one TLS
-        // access instead of three.
+    // ── Direct JIT-to-JIT call state ────────────────────────────────
+    //
+    // Saved by `jit_runtime_get_jit_entry`, restored by
+    // `jit_runtime_finish_direct_call`.
+    //
+    // Bundled into a single `Cell` so that save/restore is one TLS
+    // access instead of three.
 
-        /// Per-call state stashed before a direct JIT-to-JIT call.
-        #[derive(Clone, Copy)]
-        struct DirectCallState {
-            saved_ba: *const BytecodeArray,
-            heap_base: usize,
-            ctx_changed: bool,
-        }
+    /// Per-call state stashed before a direct JIT-to-JIT call.
+    #[derive(Clone, Copy)]
+    struct DirectCallState {
+        saved_ba: *const BytecodeArray,
+        heap_base: usize,
+        ctx_changed: bool,
+    }
 
+    thread_local! {
         static DIRECT_CALL_STATE: Cell<DirectCallState> = const {
             Cell::new(DirectCallState {
                 saved_ba: std::ptr::null(),
