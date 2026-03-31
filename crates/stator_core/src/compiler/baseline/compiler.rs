@@ -2021,6 +2021,7 @@ pub(crate) mod jit_runtime {
         #[cfg(all(target_arch = "x86_64", unix))]
         {
             use crate::bytecode::bytecode_array::MAGLEV_TIERING_THRESHOLD;
+            use crate::compiler::maglev::codegen::CachedMaglevCode;
 
             // Kick off background Maglev compilation early.
             if inv_count >= MAGLEV_TIERING_THRESHOLD {
@@ -2029,6 +2030,23 @@ pub(crate) mod jit_runtime {
 
             let maglev_cache = ba.maglev_executable_cache();
             // SAFETY: single-threaded JIT; no concurrent mutation.
+            let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
+            if maglev_ref.is_none() {
+                // Lazy transfer: background thread writes to the Arc<Mutex>,
+                // but JIT stubs check the Rc<RefCell>.  Bridge the gap by
+                // copying compiled code from the Arc into the Rc cache.
+                let jit_cache = ba.maglev_jit_cache_arc();
+                let cached_data = jit_cache.lock().ok().and_then(|guard| {
+                    guard
+                        .as_ref()
+                        .map(|c| (c.as_bytes().to_vec(), c.register_file_slots))
+                });
+                if let Some((code, register_file_slots)) = cached_data {
+                    // SAFETY: `code` was produced by `maglev_codegen::compile`.
+                    let exec = unsafe { CachedMaglevCode::new(&code, register_file_slots) };
+                    *maglev_cache.borrow_mut() = exec;
+                }
+            }
             let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
             if let Some(maglev_exec) = maglev_ref.as_ref() {
                 return exec_maglev_callee(ba, maglev_exec, jit_args, saved_ba);
@@ -2493,8 +2511,26 @@ pub(crate) mod jit_runtime {
                 // ── Maglev fast path (preferred) ───────────────
                 #[cfg(all(target_arch = "x86_64", unix))]
                 {
+                    use crate::compiler::maglev::codegen::CachedMaglevCode;
+
                     let maglev_cache = ba.maglev_executable_cache();
                     // SAFETY: single-threaded; no concurrent mutation.
+                    let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
+                    if maglev_ref.is_none() {
+                        // Lazy transfer from Arc<Mutex> (background thread)
+                        // to Rc<RefCell> (JIT fast path).
+                        let jit_cache = ba.maglev_jit_cache_arc();
+                        let cached_data = jit_cache.lock().ok().and_then(|guard| {
+                            guard
+                                .as_ref()
+                                .map(|c| (c.as_bytes().to_vec(), c.register_file_slots))
+                        });
+                        if let Some((code, register_file_slots)) = cached_data {
+                            // SAFETY: `code` was produced by `maglev_codegen::compile`.
+                            let exec = unsafe { CachedMaglevCode::new(&code, register_file_slots) };
+                            *maglev_cache.borrow_mut() = exec;
+                        }
+                    }
                     let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
                     if let Some(maglev_exec) = maglev_ref.as_ref() {
                         let ctx_ref = unsafe { &*ptrs.context };
@@ -2920,6 +2956,24 @@ pub(crate) mod jit_runtime {
                         // so the pointer extraction in the caller works.
                         let maglev_cache = ba.maglev_executable_cache();
                         // SAFETY: single-threaded; no concurrent mutation.
+                        let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
+                        if maglev_ref.is_none() {
+                            // Lazy transfer from Arc<Mutex> (background
+                            // compilation) to Rc<RefCell> (JIT fast path).
+                            let jit_cache = ba.maglev_jit_cache_arc();
+                            let cached_data = jit_cache.lock().ok().and_then(|guard| {
+                                guard
+                                    .as_ref()
+                                    .map(|c| (c.as_bytes().to_vec(), c.register_file_slots))
+                            });
+                            if let Some((code, register_file_slots)) = cached_data {
+                                use crate::compiler::maglev::codegen::CachedMaglevCode;
+                                // SAFETY: `code` from `maglev_codegen::compile`.
+                                let exec =
+                                    unsafe { CachedMaglevCode::new(&code, register_file_slots) };
+                                *maglev_cache.borrow_mut() = exec;
+                            }
+                        }
                         let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
                         if let Some(maglev_exec) =
                             maglev_ref.as_ref().filter(|e| e.register_file_slots <= 16)
