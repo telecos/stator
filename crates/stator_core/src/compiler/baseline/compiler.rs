@@ -2862,11 +2862,10 @@ pub(crate) mod jit_runtime {
     ///
     /// # Calling convention (SysV AMD64)
     ///
-    /// * `RDI` (`callee_i64`)    – JIT i64 encoding of the callee.
-    /// * `RSI` (`ba_ptr`)        – cached raw pointer to callee's
-    ///                              [`BytecodeArray`].
-    /// * `RDX` (`cached_ctx_ptr`) – cached raw context pointer (from the
-    ///                              first call via [`jit_runtime_get_jit_entry`]).
+    /// * `RDI` (`callee_i64`) – JIT i64 encoding of the callee.
+    /// * `RSI` (`ba_ptr`) – cached raw pointer to callee's [`BytecodeArray`].
+    /// * `RDX` (`cached_ctx_ptr`) – cached raw context pointer
+    ///   (from the first call via [`jit_runtime_get_jit_entry`]).
     ///
     /// Returns `1` in `RAX` on success (caller should use its cached
     /// entry point), or `0` on failure (fall back to stub).
