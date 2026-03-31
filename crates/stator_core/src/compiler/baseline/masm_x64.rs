@@ -1030,6 +1030,19 @@ impl MacroAssembler {
         self.emit_rel32_for_label(label);
     }
 
+    /// `REP STOSQ` — repeat store quadword.
+    ///
+    /// Zeros memory starting at `[RDI]` for `RCX` qwords (8 bytes each).
+    /// Assumes `RAX = 0` and `RCX` contains the count and `RDI` points to destination.
+    /// After execution, `RDI` points past the zeroed region and `RCX = 0`.
+    ///
+    /// Encoding: `F3 48 AB` (REP prefix + REX.W + STOSQ opcode).
+    pub fn rep_stosq(&mut self) {
+        self.buf.push(0xF3); // REP prefix
+        self.buf.push(0x48); // REX.W
+        self.buf.push(0xAB); // STOSQ opcode
+    }
+
     // ── Low-level byte access (crate-internal) ────────────────────────────────
 
     /// Append a single raw byte to the code buffer.
@@ -1216,6 +1229,14 @@ mod tests {
         let mut m = MacroAssembler::new();
         m.call_reg(Reg64::Rax);
         assert_eq!(m.code(), &[0xFF, 0xD0]);
+    }
+
+    #[test]
+    fn test_rep_stosq_encoding() {
+        // rep stosq  →  F3 48 AB
+        let mut m = MacroAssembler::new();
+        m.rep_stosq();
+        assert_eq!(m.code(), &[0xF3, 0x48, 0xAB]);
     }
 
     #[test]

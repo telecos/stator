@@ -2964,8 +2964,57 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, off_callee);
         self.masm.jne(&mut cache_miss);
 
-        // ── Mono hit: lightweight prepare ───────────────────────────
-        // R11 = callee_i64.
+        // ── Mono hit: inline context comparison ──────────────────────
+        // Load cached context pointer.
+        self.masm
+            .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, off_ctx);
+
+        // Get current context pointer from runtime.
+        // Push padding to align RSP to 0 mod 16 (already after prologue saves).
+        self.masm.push(Reg64::R10);
+        self.masm.push(Reg64::R11);
+        let get_ctx_addr = jit_runtime::jit_runtime_get_current_ctx_ptr as *const () as usize;
+        self.masm.mov_ri(Reg64::R9, get_ctx_addr as i64);
+        self.masm.call_reg(Reg64::R9);
+        // RAX now contains current context pointer.
+        self.masm.pop(Reg64::R11);
+        self.masm.pop(Reg64::R10);
+
+        // Compare: cached ctx (R10) vs current ctx (RAX).
+        self.masm.cmp_rr(Reg64::R10, Reg64::Rax);
+        let mut ctx_mismatch = Label::new();
+        self.masm.jne(&mut ctx_mismatch);
+
+        // ── Context match: lightweight prepare (fast path) ────────────
+        // R11 = callee_i64, R10 = ba_ptr.
+        self.masm.mov_rr(Reg64::Rdi, Reg64::R11); // arg0 = callee
+        self.masm
+            .mov_load_base_disp32(Reg64::Rsi, Reg64::Rbp, off_ba); // arg1 = ba
+
+        // Push callee + padding (2 pushes → RSP ≡ 0 mod 16).
+        self.masm.push(Reg64::Rdi);
+        self.masm.push(Reg64::Rdi);
+
+        let same_ctx_addr =
+            jit_runtime::jit_runtime_mono_call_prepare_same_ctx as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, same_ctx_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        // Check success (RAX = 1 ok, 0 = fail).
+        self.masm.test_rr(Reg64::Rax, Reg64::Rax);
+        let mut mono_fail = Label::new();
+        self.masm.je(&mut mono_fail);
+
+        // Load cached entry + ctx for the direct call.
+        self.masm
+            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, off_entry);
+        self.masm
+            .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, off_ctx);
+        self.masm.jmp(&mut do_direct);
+
+        // ── Context mismatch: full prepare (slow path) ───────────────
+        self.masm.bind_label(&mut ctx_mismatch);
+        // R11 = callee_i64, load ba and cached ctx again.
         self.masm.mov_rr(Reg64::Rdi, Reg64::R11); // arg0 = callee
         self.masm
             .mov_load_base_disp32(Reg64::Rsi, Reg64::Rbp, off_ba); // arg1 = ba
@@ -2982,7 +3031,6 @@ impl<'a> MaglevCodegen<'a> {
 
         // Check success (RAX = 1 ok, 0 = fail).
         self.masm.test_rr(Reg64::Rax, Reg64::Rax);
-        let mut mono_fail = Label::new();
         self.masm.je(&mut mono_fail);
 
         // Load cached entry + ctx for the direct call.
@@ -3042,14 +3090,18 @@ impl<'a> MaglevCodegen<'a> {
         // Allocate 128-byte register file.
         self.masm.sub_ri(Reg64::Rsp, 128);
 
-        // Zero register file (save R10, R11 across zero loop).
+        // Zero register file using rep stosq.
+        // Save R10, R11 across the operation.
         self.masm.push(Reg64::R10);
         self.masm.push(Reg64::R11);
-        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
-        for i in 0..16 {
-            self.masm
-                .mov_store_base_disp32(Reg64::Rsp, 16 + i * 8, Reg64::Rax);
-        }
+
+        self.masm.xor_rr(Reg64::Rax, Reg64::Rax); // RAX = 0
+        self.masm.mov_ri(Reg64::Rcx, 16); // RCX = 16 (qwords)
+        // RDI points to the register file at [RSP + 16] (after two pushes)
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
+        self.masm.add_ri(Reg64::Rdi, 16);
+        self.masm.rep_stosq(); // Zero 128 bytes (~2-3 cycles)
+
         self.masm.pop(Reg64::R11);
         self.masm.pop(Reg64::R10);
 
@@ -3133,14 +3185,15 @@ impl<'a> MaglevCodegen<'a> {
         // Allocate register file (128 bytes).
         self.masm.sub_ri(Reg64::Rsp, 128);
 
-        // Zero register file.
+        // Zero register file using rep stosq.
         self.masm.push(Reg64::R10);
         self.masm.push(Reg64::R11);
-        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
-        for i in 0..16 {
-            self.masm
-                .mov_store_base_disp32(Reg64::Rsp, 16 + i * 8, Reg64::Rax);
-        }
+        self.masm.xor_rr(Reg64::Rax, Reg64::Rax); // RAX = 0
+        self.masm.mov_ri(Reg64::Rcx, 16); // RCX = 16 (qwords)
+        // RDI points to the register file at [RSP + 16] (after two pushes)
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
+        self.masm.add_ri(Reg64::Rdi, 16);
+        self.masm.rep_stosq(); // Zero 128 bytes (~2-3 cycles)
         self.masm.pop(Reg64::R11);
         self.masm.pop(Reg64::R10);
 
@@ -3215,14 +3268,15 @@ impl<'a> MaglevCodegen<'a> {
 
         self.masm.sub_ri(Reg64::Rsp, 128);
 
-        // Zero register file.
+        // Zero register file using rep stosq.
         self.masm.push(Reg64::R10);
         self.masm.push(Reg64::R11);
-        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
-        for i in 0..16 {
-            self.masm
-                .mov_store_base_disp32(Reg64::Rsp, 16 + i * 8, Reg64::Rax);
-        }
+        self.masm.xor_rr(Reg64::Rax, Reg64::Rax); // RAX = 0
+        self.masm.mov_ri(Reg64::Rcx, 16); // RCX = 16 (qwords)
+        // RDI points to the register file at [RSP + 16] (after two pushes)
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
+        self.masm.add_ri(Reg64::Rdi, 16);
+        self.masm.rep_stosq(); // Zero 128 bytes (~2-3 cycles)
         self.masm.pop(Reg64::R11);
         self.masm.pop(Reg64::R10);
 
