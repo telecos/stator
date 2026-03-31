@@ -2020,6 +2020,16 @@ pub(crate) mod jit_runtime {
             }
         }
 
+        // ── Maglev fallback: try Maglev cache before interpreter ─────
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            let maglev_cache = ba.maglev_executable_cache();
+            let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
+            if let Some(maglev_exec) = maglev_ref.as_ref() {
+                return exec_maglev_callee(ba, maglev_exec, jit_args, saved_ba);
+            }
+        }
+
         // ── Interpreter fallback ────────────────────────────────────
         interpreter_call_fallback(ba, args, saved_ba)
     }
@@ -2145,6 +2155,101 @@ pub(crate) mod jit_runtime {
         RT_HEAP.with(|h| h.borrow_mut().truncate(heap_base));
         RT_CONTEXT.with(|c| *c.borrow_mut() = saved_ctx);
 
+        result_val.map(jsvalue_to_jit_i64)
+    }
+
+    /// Execute a JS function via its cached Maglev code.
+    ///
+    /// Similar to [`exec_jit_callee`] but uses the Maglev JIT tier's
+    /// cached code.  Maglev reads context from `RT_CONTEXT` TLS rather
+    /// than receiving it as a function parameter.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn exec_maglev_callee(
+        ba: &Rc<BytecodeArray>,
+        maglev_exec: &crate::compiler::maglev::codegen::CachedMaglevCode,
+        jit_args: &[i64],
+        saved_ba: *const BytecodeArray,
+    ) -> Option<i64> {
+        let ptrs = RT_PTRS.with(|p| p.get());
+
+        if ptrs.is_cached() {
+            // SAFETY: cached pointers point to thread-local storage that
+            // outlives this call.  Single-threaded access guaranteed.
+            let heap_ref = unsafe { &*ptrs.heap };
+            let ctx_ref = unsafe { &*ptrs.context };
+            let bc_ref = unsafe { &*ptrs.bytecode };
+
+            // SAFETY: no active borrows; read length via raw pointer.
+            let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+
+            let callee_ctx_raw = ba.closure_context();
+            let callee_ctx_ptr = callee_ctx_raw.map(Rc::as_ptr).unwrap_or(std::ptr::null());
+            // SAFETY: no active borrows; read current context pointer.
+            let current_ctx_ptr = unsafe {
+                (*ctx_ref.as_ptr())
+                    .as_ref()
+                    .map(Rc::as_ptr)
+                    .unwrap_or(std::ptr::null())
+            };
+            let same_context = std::ptr::eq(callee_ctx_ptr, current_ctx_ptr);
+            let saved_ctx = if same_context {
+                None
+            } else {
+                let callee_ctx = callee_ctx_raw.cloned();
+                // SAFETY: no active borrows; swap context via raw pointer.
+                Some(unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx) })
+            };
+
+            bc_ref.set(&**ba as *const BytecodeArray);
+            // SAFETY: Maglev code is valid x86-64.  Context set in TLS.
+            let jit_result = unsafe { maglev_exec.execute(jit_args) };
+            bc_ref.set(saved_ba);
+
+            if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
+                // SAFETY: no active borrows; truncate/restore via raw ptr.
+                unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                if let Some(ctx) = saved_ctx {
+                    unsafe { *ctx_ref.as_ptr() = ctx };
+                }
+                return Some(jit_result);
+            }
+
+            let result_val = if jit_result == JIT_DEOPT {
+                None
+            } else {
+                jit_to_jsvalue_ext(jit_result)
+            };
+            // SAFETY: no active borrows; truncate/restore via raw ptr.
+            unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+            if let Some(ctx) = saved_ctx {
+                unsafe { *ctx_ref.as_ptr() = ctx };
+            }
+            return result_val.map(jsvalue_to_jit_i64);
+        }
+
+        // Fallback: pointers not cached yet — use .with() calls.
+        let heap_base = RT_HEAP.with(|h| h.borrow().len());
+        let callee_ctx = ba.closure_context().cloned();
+        let saved_ctx = RT_CONTEXT.with(|c| std::mem::replace(&mut *c.borrow_mut(), callee_ctx));
+        RT_BYTECODE.with(|b| b.set(&**ba as *const BytecodeArray));
+
+        // SAFETY: Maglev code is valid x86-64.
+        let jit_result = unsafe { maglev_exec.execute(jit_args) };
+        RT_BYTECODE.with(|b| b.set(saved_ba));
+
+        if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
+            RT_HEAP.with(|h| h.borrow_mut().truncate(heap_base));
+            RT_CONTEXT.with(|c| *c.borrow_mut() = saved_ctx);
+            return Some(jit_result);
+        }
+
+        let result_val = if jit_result == JIT_DEOPT {
+            None
+        } else {
+            jit_to_jsvalue_ext(jit_result)
+        };
+        RT_HEAP.with(|h| h.borrow_mut().truncate(heap_base));
+        RT_CONTEXT.with(|c| *c.borrow_mut() = saved_ctx);
         result_val.map(jsvalue_to_jit_i64)
     }
 
@@ -2360,7 +2465,63 @@ pub(crate) mod jit_runtime {
                             return result_val.map(jsvalue_to_jit_i64);
                         }
 
-                        // Exec cache not populated: fall through to full path.
+                        // Exec cache not populated: try Maglev cache.
+                        #[cfg(all(target_arch = "x86_64", unix))]
+                        {
+                            let maglev_cache = ba.maglev_executable_cache();
+                            // SAFETY: single-threaded; no concurrent mutation.
+                            let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
+                            if let Some(maglev_exec) = maglev_ref.as_ref() {
+                                let ctx_ref = unsafe { &*ptrs.context };
+                                let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+
+                                let callee_ctx_raw = ba.closure_context();
+                                let callee_ctx_ptr =
+                                    callee_ctx_raw.map(Rc::as_ptr).unwrap_or(std::ptr::null());
+                                let current_ctx_ptr = unsafe {
+                                    (*ctx_ref.as_ptr())
+                                        .as_ref()
+                                        .map(Rc::as_ptr)
+                                        .unwrap_or(std::ptr::null())
+                                };
+                                let same_context = std::ptr::eq(callee_ctx_ptr, current_ctx_ptr);
+                                let saved_ctx = if same_context {
+                                    None
+                                } else {
+                                    let callee_ctx = callee_ctx_raw.cloned();
+                                    Some(unsafe {
+                                        std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx)
+                                    })
+                                };
+
+                                bc_ref.set(&**ba as *const BytecodeArray);
+                                // SAFETY: Maglev code is valid x86-64.
+                                // Context is already set in RT_CONTEXT TLS.
+                                let jit_result = unsafe { maglev_exec.execute(&[]) };
+                                bc_ref.set(saved_ba);
+
+                                if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
+                                    unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                                    if let Some(ctx) = saved_ctx {
+                                        unsafe { *ctx_ref.as_ptr() = ctx };
+                                    }
+                                    return Some(jit_result);
+                                }
+
+                                let result_val = if jit_result == JIT_DEOPT {
+                                    None
+                                } else {
+                                    jit_to_jsvalue_ext(jit_result)
+                                };
+                                unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                                if let Some(ctx) = saved_ctx {
+                                    unsafe { *ctx_ref.as_ptr() = ctx };
+                                }
+                                return result_val.map(jsvalue_to_jit_i64);
+                            }
+                        }
+
+                        // No JIT code at all: fall through to full path.
                         let ba = Rc::clone(ba);
                         return call_js_function(&ba, vec![], &[], saved_ba);
                     }
