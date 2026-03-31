@@ -2654,28 +2654,40 @@ pub(crate) mod jit_runtime {
             };
             match callee {
                 JsValue::Function(ba) => {
+                    let ctx = ba
+                        .closure_context()
+                        .map(|rc| Rc::as_ptr(rc) as usize)
+                        .unwrap_or(0);
+                    let ba_raw = &**ba as *const BytecodeArray;
+
+                    // Try baseline JIT cache first.
                     let exec_cache = ba.jit_executable_cache();
                     // SAFETY: single-threaded; exec cache is not being
                     // mutated during JIT execution.
                     let cache_ref = unsafe { &*exec_cache.as_ptr() };
-                    match cache_ref.as_ref() {
-                        Some(exec) => {
-                            // Only support functions with ≤ 16 register
-                            // file slots for the stack-allocated fast path.
-                            if exec.register_file_slots > 16 {
-                                return null_info;
-                            }
-                            let ctx = ba
-                                .closure_context()
-                                .map(|rc| Rc::as_ptr(rc) as usize)
-                                .unwrap_or(0);
-                            // SAFETY: exec lives as long as the Rc<BytecodeArray>
-                            // in the heap (which outlives this call chain).
-                            let exec_raw = exec as *const JitExecutableCode;
-                            let ba_raw = &**ba as *const BytecodeArray;
-                            (exec_raw, exec.register_file_slots, ba_raw, ctx)
+                    if let Some(exec) = cache_ref.as_ref().filter(|e| e.register_file_slots <= 16) {
+                        let exec_raw = exec as *const JitExecutableCode;
+                        (exec_raw, exec.register_file_slots, ba_raw, ctx)
+                    } else {
+                        // Fallback: try Maglev executable cache.
+                        // CachedMaglevCode has identical memory layout to
+                        // JitExecutableCode (ptr, size, register_file_slots),
+                        // so the pointer extraction in the caller works.
+                        let maglev_cache = ba.maglev_executable_cache();
+                        // SAFETY: single-threaded; no concurrent mutation.
+                        let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
+                        if let Some(maglev_exec) =
+                            maglev_ref.as_ref().filter(|e| e.register_file_slots <= 16)
+                        {
+                            // SAFETY: CachedMaglevCode layout matches
+                            // JitExecutableCode (ptr, size, register_file_slots).
+                            let exec_raw = maglev_exec
+                                as *const crate::compiler::maglev::codegen::CachedMaglevCode
+                                as *const JitExecutableCode;
+                            (exec_raw, maglev_exec.register_file_slots, ba_raw, ctx)
+                        } else {
+                            return null_info;
                         }
-                        None => return null_info,
                     }
                 }
                 _ => return null_info,

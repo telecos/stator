@@ -1307,23 +1307,26 @@ impl<'a> MaglevCodegen<'a> {
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::LoadKeyedGeneric { object, key, .. } => {
-                let stub = if self.is_known_int32_key(*key) {
-                    jit_runtime::jit_runtime_fast_array_load as *const () as usize
-                } else {
-                    jit_runtime::jit_runtime_lda_keyed_property as *const () as usize
-                };
-                self.emit_stub_call_2node(id, *object, *key, stub);
+                // Always use the generic keyed-property stub — it has an
+                // ultra-fast Smi-index path that the "fast array" stubs lack.
+                self.emit_stub_call_2node(
+                    id,
+                    *object,
+                    *key,
+                    jit_runtime::jit_runtime_lda_keyed_property as *const () as usize,
+                );
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::StoreKeyedGeneric {
                 object, key, value, ..
             } => {
-                let stub = if self.is_known_int32_key(*key) {
-                    jit_runtime::jit_runtime_fast_array_store as *const () as usize
-                } else {
-                    jit_runtime::jit_runtime_sta_keyed_property as *const () as usize
-                };
-                self.emit_stub_call_3node(id, *object, *key, *value, stub);
+                self.emit_stub_call_3node(
+                    id,
+                    *object,
+                    *key,
+                    *value,
+                    jit_runtime::jit_runtime_sta_keyed_property as *const () as usize,
+                );
             }
 
             // ── FixedArray element access (routed through keyed-property stubs) ──
