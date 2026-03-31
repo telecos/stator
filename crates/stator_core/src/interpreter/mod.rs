@@ -1249,7 +1249,7 @@ struct MaglevCompileInput {
 /// The function is a no-op when:
 /// - compilation has already been started (atomic flag check), or
 /// - the platform does not support JIT.
-pub(super) fn maybe_compile_maglev(ba: &BytecodeArray) {
+pub fn maybe_compile_maglev(ba: &BytecodeArray) {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
         use crate::bytecode::feedback::FeedbackVector;

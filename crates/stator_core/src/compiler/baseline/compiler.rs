@@ -1972,6 +1972,12 @@ pub(crate) mod jit_runtime {
         jit_args: &[i64],
         saved_ba: *const BytecodeArray,
     ) -> Option<i64> {
+        // ── Increment invocation count ──────────────────────────────
+        // When called from JIT stubs, the interpreter's dispatch_call
+        // never runs, so the callee's counter would stall.  Bump it
+        // here so Maglev compilation eventually triggers.
+        let inv_count = ba.increment_invocation_count();
+
         // ── Fast path: exec cache already populated ─────────────────
         // On the second+ call, skip the compilation and init checks.
         // SAFETY: single-threaded JIT; no concurrent borrows of exec cache.
@@ -2023,10 +2029,18 @@ pub(crate) mod jit_runtime {
         // ── Maglev fallback: try Maglev cache before interpreter ─────
         #[cfg(all(target_arch = "x86_64", unix))]
         {
+            use crate::bytecode::bytecode_array::MAGLEV_TIERING_THRESHOLD;
+
             let maglev_cache = ba.maglev_executable_cache();
             let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
             if let Some(maglev_exec) = maglev_ref.as_ref() {
                 return exec_maglev_callee(ba, maglev_exec, jit_args, saved_ba);
+            }
+
+            // Kick off Maglev compilation if threshold reached but code
+            // is not ready yet.
+            if inv_count >= MAGLEV_TIERING_THRESHOLD {
+                crate::interpreter::maybe_compile_maglev(ba);
             }
         }
 
