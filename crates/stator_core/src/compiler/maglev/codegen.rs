@@ -669,6 +669,20 @@ impl<'a> MaglevCodegen<'a> {
         // RSP ≡ 8 mod 16.  Stub calls use selective save (with
         // alignment padding when needed) to align RSP to 0 mod 16
         // before the inner `call`.
+
+        // Allocate monomorphic call-cache slots (kept as a multiple of
+        // 16, so RSP alignment is preserved: still ≡ 8 mod 16).
+        if self.mono_call_cache_bytes > 0 {
+            self.masm.sub_ri(Reg64::Rsp, self.mono_call_cache_bytes);
+            // Zero all cache slots (callee field = 0 → empty).
+            self.masm.xor_rr(Reg64::R11, Reg64::R11);
+            let slots = self.mono_call_cache_bytes / 8;
+            for i in 0..slots {
+                self.masm
+                    .mov_store_base_disp32(Reg64::Rsp, i * 8, Reg64::R11);
+            }
+        }
+
         self.masm.mov_rr(Reg64::R14, Reg64::Rdi);
     }
 
@@ -686,6 +700,9 @@ impl<'a> MaglevCodegen<'a> {
     /// ret
     /// ```
     fn emit_normal_epilogue(&mut self) {
+        if self.mono_call_cache_bytes > 0 {
+            self.masm.add_ri(Reg64::Rsp, self.mono_call_cache_bytes);
+        }
         self.masm.pop(Reg64::R15);
         self.masm.pop(Reg64::R12);
         self.masm.pop(Reg64::R13);
@@ -729,6 +746,9 @@ impl<'a> MaglevCodegen<'a> {
 
         // Common exit — RAX already set, just restore and return.
         self.masm.bind_label(&mut self.deopt_common_label);
+        if self.mono_call_cache_bytes > 0 {
+            self.masm.add_ri(Reg64::Rsp, self.mono_call_cache_bytes);
+        }
         self.masm.pop(Reg64::R15);
         self.masm.pop(Reg64::R12);
         self.masm.pop(Reg64::R13);
