@@ -600,6 +600,13 @@ pub fn allocate(graph: &MaglevGraph, num_regs: u32) -> AllocationResult {
         }
     }
 
+    // ── Phi coalescing ─────────────────────────────────────────────────────
+    //
+    // After the main allocation, try to coalesce loop-carried Phi values
+    // with their back-edge inputs so that the codegen can skip the MOV at
+    // the loop back-edge.
+    coalesce_loop_phis(&mut assignments, graph, &intervals);
+
     // ── Per-node caller-saved liveness ──────────────────────────────────────
     //
     // For each node at program point P, compute a bitmask of caller-saved
@@ -652,6 +659,134 @@ pub fn allocate(graph: &MaglevGraph, num_regs: u32) -> AllocationResult {
         assignments,
         spill_count: next_spill,
         live_caller_saved,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phi coalescing
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Post-allocation pass that coalesces loop-carried Phi values with their
+/// back-edge inputs.
+///
+/// For each Phi in a loop header block, if the Phi occupies `Register(A)` and
+/// its back-edge input occupies `Register(B)` where `A ≠ B`, the pass checks
+/// two conditions:
+///
+/// 1. **No live-range conflict** — the Phi's last use must be at or before the
+///    back-edge input's definition point.  This ensures the Phi is dead (or
+///    consumed as the immediate input to the defining instruction) when the
+///    result is written, so sharing a register is safe.
+///
+/// 2. **No third-party interference** — no other value assigned to
+///    `Register(A)` has a live interval overlapping the back-edge input's
+///    interval.
+///
+/// When both conditions hold the back-edge input is reassigned to
+/// `Register(A)`, and the codegen's `emit_phi_copies_for_successor` will skip
+/// the MOV at the loop back-edge because source and destination now match.
+fn coalesce_loop_phis(
+    assignments: &mut HashMap<NodeId, Location>,
+    graph: &MaglevGraph,
+    intervals: &[LiveInterval],
+) {
+    // Build a map from NodeId to its live interval endpoints for O(1) lookup.
+    let interval_map: HashMap<NodeId, (u32, u32)> = intervals
+        .iter()
+        .map(|iv| (iv.id, (iv.start, iv.end)))
+        .collect();
+
+    for block in graph.blocks() {
+        // A loop header has at least one *back-edge*: a predecessor whose
+        // block index is ≥ the current block's index (i.e. a backward or
+        // self-referential edge in the CFG).
+        let back_edge_positions: Vec<usize> = block
+            .predecessors
+            .iter()
+            .enumerate()
+            .filter(|&(_, &pred_idx)| pred_idx >= block.id)
+            .map(|(pos, _)| pos)
+            .collect();
+
+        if back_edge_positions.is_empty() {
+            continue;
+        }
+
+        for (phi_id, node) in &block.nodes {
+            let inputs = match node {
+                ValueNode::Phi { inputs } => inputs,
+                _ => continue,
+            };
+
+            let phi_reg = match assignments.get(phi_id) {
+                Some(Location::Register(r)) => *r,
+                _ => continue,
+            };
+
+            let (_, phi_end) = match interval_map.get(phi_id) {
+                Some(&range) => range,
+                None => continue,
+            };
+
+            for &pos in &back_edge_positions {
+                let back_input = match inputs.get(pos) {
+                    Some(&id) => id,
+                    None => continue,
+                };
+
+                // Skip self-referential Phis (e.g. `phi = Phi([…, phi])`).
+                if back_input == *phi_id {
+                    continue;
+                }
+
+                let back_reg = match assignments.get(&back_input) {
+                    Some(Location::Register(r)) => *r,
+                    _ => continue,
+                };
+
+                // Already in the same register — nothing to do.
+                if back_reg == phi_reg {
+                    continue;
+                }
+
+                let (back_start, back_end) = match interval_map.get(&back_input) {
+                    Some(&range) => range,
+                    None => continue,
+                };
+
+                // Condition 1: the Phi must be dead (or at its very last use)
+                // by the time the back-edge input is defined.  An overlap of
+                // exactly one program point is acceptable — that is the point
+                // where the defining instruction reads the Phi and writes the
+                // result into the same register.
+                if phi_end > back_start + 1 {
+                    continue;
+                }
+
+                // Condition 2: no other value in Register(phi_reg) has an
+                // interval that overlaps the back-edge input's interval.  We
+                // exclude the Phi itself (already checked above) and the
+                // back-edge input (we are moving it).
+                let has_conflict = intervals.iter().any(|iv| {
+                    if iv.id == back_input || iv.id == *phi_id {
+                        return false;
+                    }
+                    // Intervals overlap when a.start < b.end && b.start < a.end.
+                    if iv.start < back_end && back_start < iv.end {
+                        matches!(
+                            assignments.get(&iv.id),
+                            Some(Location::Register(r)) if *r == phi_reg
+                        )
+                    } else {
+                        false
+                    }
+                });
+
+                if !has_conflict {
+                    assignments.insert(back_input, Location::Register(phi_reg));
+                }
+            }
+        }
     }
 }
 
@@ -885,5 +1020,197 @@ mod tests {
         let result = allocate(&graph, 4);
         assert_no_conflicts(&graph, &result, 4);
         assert!(result.location(phi).is_some(), "phi missing location");
+    }
+
+    // ── Test: Phi coalescing eliminates back-edge MOV ─────────────────────────
+
+    #[test]
+    fn test_phi_coalescing_loop() {
+        // Build a counting loop where the branch condition comes from block 0
+        // (a parameter), so no extra node in the loop body steals the Phi's
+        // register after it expires:
+        //
+        //   block 0:  param = Parameter(0)
+        //             init  = Const(0)
+        //             c1    = Const(1)
+        //             Jump → block 1
+        //
+        //   block 1:  phi = Phi([init, add])      ← loop header
+        //             add = Int32Add(phi, c1)
+        //             Branch(param) → block 1 | block 2
+        //
+        //   block 2:  Return(add)
+        //
+        // Without coalescing `phi` and `add` end up in different registers,
+        // causing a MOV at the back-edge.  The coalescing pass reassigns
+        // `add` to the same register as `phi`.
+
+        let mut graph = MaglevGraph::new(1);
+
+        // ── Block 0 ─────────────────────────────────────────────────────────
+        graph.add_block(BasicBlock::new(0));
+        let param = graph
+            .add_value_node(0, ValueNode::Parameter { index: 0 })
+            .unwrap();
+        let init = graph
+            .add_value_node(0, ValueNode::Int32Constant { value: 0 })
+            .unwrap();
+        let c1 = graph
+            .add_value_node(0, ValueNode::Int32Constant { value: 1 })
+            .unwrap();
+        graph
+            .block_mut(0)
+            .unwrap()
+            .set_control(ControlNode::Jump { target: 1 });
+
+        // ── Block 1 (loop header) ───────────────────────────────────────────
+        graph.add_block(BasicBlock::new(1));
+        graph.block_mut(1).unwrap().add_predecessor(0);
+        graph.block_mut(1).unwrap().add_predecessor(1); // back-edge
+
+        // Pre-allocate a NodeId for `add` so it can appear in the Phi.
+        let add_id = graph.alloc_node_id();
+
+        let phi = graph
+            .add_value_node(
+                1,
+                ValueNode::Phi {
+                    inputs: vec![init, add_id],
+                },
+            )
+            .unwrap();
+
+        // Insert `add` with its pre-allocated ID.
+        graph.block_mut(1).unwrap().push_with_id(
+            add_id,
+            ValueNode::Int32Add {
+                left: phi,
+                right: c1,
+            },
+        );
+
+        // Use the parameter (from block 0) as branch condition — no new
+        // value node in the loop body that could take the Phi's register.
+        graph
+            .block_mut(1)
+            .unwrap()
+            .set_control(ControlNode::Branch {
+                condition: param,
+                if_true: 1,
+                if_false: 2,
+            });
+
+        // ── Block 2 (exit) ──────────────────────────────────────────────────
+        graph.add_block(BasicBlock::new(2));
+        graph.block_mut(2).unwrap().add_predecessor(1);
+        graph
+            .block_mut(2)
+            .unwrap()
+            .set_control(ControlNode::Return { value: add_id });
+
+        let result = allocate(&graph, 4);
+
+        // Both phi and add must have locations.
+        assert!(result.location(phi).is_some(), "phi missing location");
+        assert!(result.location(add_id).is_some(), "add missing location");
+
+        // The coalescing pass should place phi and its back-edge input (add)
+        // in the same physical register, eliminating the back-edge MOV.
+        assert!(
+            matches!(result.location(phi), Some(Location::Register(_))),
+            "phi should be in a register, got {:?}",
+            result.location(phi)
+        );
+        assert_eq!(
+            result.location(phi),
+            result.location(add_id),
+            "phi and back-edge input (add) should be coalesced into the \
+             same register — phi={:?}, add={:?}",
+            result.location(phi),
+            result.location(add_id)
+        );
+
+        // Suppress unused-variable warning — `param` is used only as a
+        // branch condition, not asserted on.
+        let _ = param;
+    }
+
+    // ── Test: coalescing is skipped when a conflict exists ────────────────────
+
+    #[test]
+    fn test_phi_coalescing_skipped_on_conflict() {
+        // Same loop structure, but with a value that occupies the Phi's
+        // register during the back-edge input's live range, blocking
+        // coalescing.  The allocator must leave the original (conflict-free)
+        // assignment in place.
+
+        let mut graph = MaglevGraph::new(0);
+
+        graph.add_block(BasicBlock::new(0));
+        let init = graph
+            .add_value_node(0, ValueNode::Int32Constant { value: 0 })
+            .unwrap();
+        graph
+            .block_mut(0)
+            .unwrap()
+            .set_control(ControlNode::Jump { target: 1 });
+
+        graph.add_block(BasicBlock::new(1));
+        graph.block_mut(1).unwrap().add_predecessor(0);
+        graph.block_mut(1).unwrap().add_predecessor(1);
+
+        let add_id = graph.alloc_node_id();
+
+        let phi = graph
+            .add_value_node(
+                1,
+                ValueNode::Phi {
+                    inputs: vec![init, add_id],
+                },
+            )
+            .unwrap();
+
+        // Use phi in BOTH the add and a separate check — this keeps phi
+        // alive past add's definition, which violates the safety condition
+        // (phi_end > back_start + 1) and prevents coalescing.
+        graph.block_mut(1).unwrap().push_with_id(
+            add_id,
+            ValueNode::Int32Add {
+                left: phi,
+                right: init,
+            },
+        );
+        let extra_use = graph
+            .add_value_node(1, ValueNode::ToBoolean { value: phi })
+            .unwrap();
+        let cond = graph
+            .add_value_node(
+                1,
+                ValueNode::Int32Add {
+                    left: add_id,
+                    right: extra_use,
+                },
+            )
+            .unwrap();
+        graph
+            .block_mut(1)
+            .unwrap()
+            .set_control(ControlNode::Branch {
+                condition: cond,
+                if_true: 1,
+                if_false: 2,
+            });
+
+        graph.add_block(BasicBlock::new(2));
+        graph.block_mut(2).unwrap().add_predecessor(1);
+        graph
+            .block_mut(2)
+            .unwrap()
+            .set_control(ControlNode::Return { value: cond });
+
+        let result = allocate(&graph, 4);
+        // With enough registers the original allocation should have no
+        // conflicts (verified by the standard helper).
+        assert_no_conflicts(&graph, &result, 4);
     }
 }

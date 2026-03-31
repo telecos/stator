@@ -714,6 +714,16 @@ impl MacroAssembler {
         }
     }
 
+    /// `CMP reg, [base + disp32]` — compare a 64-bit register against a
+    /// memory operand (sets flags; result is discarded).
+    ///
+    /// Encoding: `REX.W [REX.R] [REX.B] 3B /r` with ModRM mod=10.
+    pub fn cmp_rm(&mut self, reg: Reg64, base: Reg64, disp: i32) {
+        self.emit_rex_wrb(reg, base);
+        self.buf.push(0x3B);
+        self.emit_modrm_base_disp32(reg, base, disp);
+    }
+
     /// `MOVSXD dst, src` — sign-extend the lower 32 bits of `src` into the
     /// 64-bit `dst`.
     ///

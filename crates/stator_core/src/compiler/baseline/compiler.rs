@@ -468,6 +468,16 @@ pub(crate) mod jit_runtime {
     /// Allocate a new heap handle for `val`, returning the `i64` handle.
     fn alloc_heap_handle(val: JsValue) -> i64 {
         let ptrs = RT_PTRS.with(|p| p.get());
+        alloc_heap_handle_with_ptrs(val, &ptrs)
+    }
+
+    /// Allocate a heap handle using pre-fetched [`RtPtrs`].
+    ///
+    /// Avoids a redundant `RT_PTRS.with()` call when the caller has
+    /// already obtained the cached pointers (e.g. in the hot path of
+    /// `fast_create_object_literal_inner`).
+    #[inline]
+    fn alloc_heap_handle_with_ptrs(val: JsValue, ptrs: &RtPtrs) -> i64 {
         if ptrs.is_cached() {
             // SAFETY: cached pointer valid for thread lifetime; no concurrent borrows.
             let heap = unsafe { &mut *(&*ptrs.heap).as_ptr() };
@@ -2842,6 +2852,105 @@ pub(crate) mod jit_runtime {
         result_val.map(jsvalue_to_jit_i64).unwrap_or(JIT_DEOPT)
     }
 
+    /// Lightweight TLS setup for a monomorphic JIT-to-JIT call.
+    ///
+    /// Replaces [`jit_runtime_get_jit_entry`] on the fast path when the
+    /// caller has already verified that the callee identity matches a
+    /// cached entry.  Skips the exec-cache / maglev-cache lookup and
+    /// entry-point extraction.  The caller passes the cached BA pointer
+    /// and context pointer directly.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`callee_i64`)    – JIT i64 encoding of the callee.
+    /// * `RSI` (`ba_ptr`)        – cached raw pointer to callee's
+    ///                              [`BytecodeArray`].
+    /// * `RDX` (`cached_ctx_ptr`) – cached raw context pointer (from the
+    ///                              first call via [`jit_runtime_get_jit_entry`]).
+    ///
+    /// Returns `1` in `RAX` on success (caller should use its cached
+    /// entry point), or `0` on failure (fall back to stub).
+    pub extern "C" fn jit_runtime_mono_call_prepare(
+        callee_i64: i64,
+        ba_ptr: i64,
+        cached_ctx_ptr: i64,
+    ) -> i64 {
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if !ptrs.is_cached() {
+            return 0;
+        }
+
+        // SAFETY: cached pointer set by cache_rt_ptrs; valid for thread lifetime.
+        let bc_ref = unsafe { &*ptrs.bytecode };
+        let heap_ref = unsafe { &*ptrs.heap };
+        let ctx_ref = unsafe { &*ptrs.context };
+
+        // Save current BA and set callee's BA.
+        let saved_ba = bc_ref.get();
+        bc_ref.set(ba_ptr as *const BytecodeArray);
+
+        // Save heap base for post-call truncation.
+        // SAFETY: single-threaded JIT; no concurrent heap mutation.
+        let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+
+        // Context swap: compare cached callee context against current.
+        let callee_ctx_raw = cached_ctx_ptr as *const RefCell<JsContext>;
+        // SAFETY: no active borrows of context RefCell.
+        let current_ctx = unsafe {
+            (*ctx_ref.as_ptr())
+                .as_ref()
+                .map(Rc::as_ptr)
+                .unwrap_or(std::ptr::null())
+        };
+        let same_context = std::ptr::eq(callee_ctx_raw, current_ctx);
+
+        if !same_context {
+            // Save old context.
+            DIRECT_CALL_OLD_CTX.with(|c| {
+                // SAFETY: single-threaded; no concurrent borrow.
+                *c.borrow_mut() = unsafe { (*ctx_ref.as_ptr()).clone() };
+            });
+
+            // Clone callee's context from heap.
+            let idx = (callee_i64 - JIT_HEAP_TAG) as usize;
+            let callee_ctx = {
+                // SAFETY: single-threaded.
+                let heap = unsafe { &*heap_ref.as_ptr() };
+                match heap.get(idx) {
+                    Some(JsValue::Function(ba)) => ba.closure_context().cloned(),
+                    _ => {
+                        // Callee disappeared — roll back BA and fail.
+                        bc_ref.set(saved_ba);
+                        return 0;
+                    }
+                }
+            };
+            // SAFETY: no active borrows of context RefCell.
+            unsafe { *ctx_ref.as_ptr() = callee_ctx };
+        }
+
+        // Stash saved state for jit_runtime_finish_direct_call.
+        DIRECT_CALL_SAVED_BA.with(|c| c.set(saved_ba));
+        DIRECT_CALL_HEAP_BASE.with(|c| c.set(heap_base));
+        DIRECT_CALL_CTX_CHANGED.with(|c| c.set(!same_context));
+
+        1 // success
+    }
+
+    /// Read the current `RT_BYTECODE` pointer for caching after a
+    /// successful [`jit_runtime_get_jit_entry`] call.
+    ///
+    /// Returns the raw `*const BytecodeArray` as `i64`.
+    pub extern "C" fn jit_runtime_read_current_ba() -> i64 {
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if ptrs.is_cached() {
+            let bc_ref = unsafe { &*ptrs.bytecode };
+            bc_ref.get() as i64
+        } else {
+            0
+        }
+    }
+
     /// Specialized runtime stub for `LdaGlobal`.
     ///
     /// Avoids the generic opcode dispatch overhead of
@@ -3537,6 +3646,163 @@ pub(crate) mod jit_runtime {
             })
         }
     }
+    // ── Inline-friendly keyed-property helpers for Maglev ──────────────
+
+    /// Result from inline keyed-property helpers.
+    ///
+    /// On the SysV AMD64 ABI this 16-byte `#[repr(C)]` struct is
+    /// returned in `RAX` (`value`) and `RDX` (`hit`) — no memory
+    /// indirection needed.
+    #[repr(C)]
+    pub struct InlineKeyedResult {
+        /// JIT `i64` element value (meaningful only when `hit != 0`).
+        pub value: i64,
+        /// Non-zero when the inline path succeeded; zero when the
+        /// caller must fall back to the full generic stub.
+        pub hit: i64,
+    }
+
+    impl InlineKeyedResult {
+        const MISS: Self = Self { value: 0, hit: 0 };
+    }
+
+    /// Inline-friendly array element **load** for known-integer keys.
+    ///
+    /// Handles `Array[non-negative-int]` where the element is a common
+    /// inline-encodable type (Smi, Boolean, Undefined, Null).  Returns
+    /// `hit=0` for any case needing the full generic stub (non-array
+    /// receiver, non-cached `RT_PTRS`, heap-object elements, etc.).
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_i64`) – JIT i64 encoding of the receiver.
+    /// * `RSI` (`smi_key`) – non-negative integer index.
+    ///
+    /// Returns [`InlineKeyedResult`] in `RAX:RDX`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn jit_runtime_inline_load_keyed_smi(
+        obj_i64: i64,
+        smi_key: i64,
+    ) -> InlineKeyedResult {
+        inline_load_keyed_inner(obj_i64, smi_key)
+    }
+
+    fn inline_load_keyed_inner(obj_i64: i64, smi_key: i64) -> InlineKeyedResult {
+        if !is_heap_handle(obj_i64) || smi_key < 0 {
+            return InlineKeyedResult::MISS;
+        }
+        let key = smi_key as usize;
+        let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if !ptrs.is_cached() {
+            return InlineKeyedResult::MISS;
+        }
+        // SAFETY: cached pointers set by cache_rt_ptrs; valid for
+        // thread lifetime.
+        let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+        match heap.get(obj_idx) {
+            Some(JsValue::Array(arr)) => {
+                // SAFETY: single-threaded JIT; no concurrent borrows.
+                let data = unsafe { &*arr.as_ptr() };
+                match data.get(key) {
+                    Some(JsValue::Smi(n)) => InlineKeyedResult {
+                        value: i64::from(*n),
+                        hit: 1,
+                    },
+                    Some(JsValue::Boolean(b)) => InlineKeyedResult {
+                        value: if *b { JIT_TRUE } else { JIT_FALSE },
+                        hit: 1,
+                    },
+                    Some(JsValue::Undefined) => InlineKeyedResult {
+                        value: JIT_UNDEFINED,
+                        hit: 1,
+                    },
+                    Some(JsValue::Null) => InlineKeyedResult {
+                        value: JIT_NULL,
+                        hit: 1,
+                    },
+                    Some(JsValue::TheHole) | None => InlineKeyedResult {
+                        value: JIT_UNDEFINED,
+                        hit: 1,
+                    },
+                    // Heap-object element (String, Object, …) needs the
+                    // full generic stub for heap-handle allocation.
+                    _ => InlineKeyedResult::MISS,
+                }
+            }
+            _ => InlineKeyedResult::MISS,
+        }
+    }
+
+    /// Inline-friendly array element **store** for known-integer keys.
+    ///
+    /// Handles **in-bounds** `Array[non-negative-int] = value` where the
+    /// value is a common inline-decodable type (Smi, Boolean, Undefined).
+    /// Returns `hit=0` for any case needing the full generic stub
+    /// (non-array receiver, out-of-bounds index, heap-object values).
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_i64`) – JIT i64 encoding of the receiver.
+    /// * `RSI` (`smi_key`) – non-negative integer index.
+    /// * `RDX` (`value_i64`) – JIT i64 encoding of the value.
+    ///
+    /// Returns [`InlineKeyedResult`] in `RAX:RDX`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn jit_runtime_inline_store_keyed_smi(
+        obj_i64: i64,
+        smi_key: i64,
+        value_i64: i64,
+    ) -> InlineKeyedResult {
+        inline_store_keyed_inner(obj_i64, smi_key, value_i64)
+    }
+
+    fn inline_store_keyed_inner(obj_i64: i64, smi_key: i64, value_i64: i64) -> InlineKeyedResult {
+        if !is_heap_handle(obj_i64) || smi_key < 0 {
+            return InlineKeyedResult::MISS;
+        }
+        // Decode value inline for common types only.
+        if is_heap_handle(value_i64) {
+            return InlineKeyedResult::MISS;
+        }
+        let value = if value_i64 >= i32::MIN as i64 && value_i64 <= i32::MAX as i64 {
+            JsValue::Smi(value_i64 as i32)
+        } else if value_i64 == JIT_TRUE {
+            JsValue::Boolean(true)
+        } else if value_i64 == JIT_FALSE {
+            JsValue::Boolean(false)
+        } else if value_i64 == JIT_UNDEFINED {
+            JsValue::Undefined
+        } else {
+            return InlineKeyedResult::MISS;
+        };
+
+        let key = smi_key as usize;
+        let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if !ptrs.is_cached() {
+            return InlineKeyedResult::MISS;
+        }
+        // SAFETY: cached pointers valid for thread lifetime.
+        let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+        match heap.get(obj_idx) {
+            Some(JsValue::Array(arr)) => {
+                // SAFETY: single-threaded JIT; no concurrent borrows.
+                let v = unsafe { &mut *arr.as_ptr() };
+                if key < v.len() {
+                    v[key] = value;
+                    InlineKeyedResult {
+                        value: value_i64,
+                        hit: 1,
+                    }
+                } else {
+                    // Out-of-bounds: needs full stub for Vec growth.
+                    InlineKeyedResult::MISS
+                }
+            }
+            _ => InlineKeyedResult::MISS,
+        }
+    }
 
     // ── Specialized StaNamedProperty stub ───────────────────────────────
 
@@ -3651,6 +3917,13 @@ pub(crate) mod jit_runtime {
     }
 
     /// Inner implementation for [`jit_runtime_fast_create_object_literal`].
+    ///
+    /// The hot path (cached template hit) avoids redundant TLS lookups by
+    /// reusing the [`RtPtrs`] fetched at entry for the subsequent heap
+    /// allocation.  Combined with the buffer-pool-free
+    /// [`ObjectLiteralTemplate::instantiate`] this reduces per-object
+    /// overhead to: one TLS read, one template-cache probe, one
+    /// `Rc`+`RefCell` allocation, and one heap-vec push.
     fn fast_create_object_literal_inner(feedback_slot: i64, capacity: i64) -> Option<i64> {
         let capacity = capacity.max(4) as usize;
 
@@ -3670,15 +3943,17 @@ pub(crate) mod jit_runtime {
                 let ba_ref = unsafe { &*ba };
 
                 // Fast path: clone a previously cached template.
+                // Reuse `ptrs` for heap allocation to skip a second
+                // `RT_PTRS.with()` call.
                 if let Some(map) = ba_ref.clone_object_literal_template(slot) {
                     let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
-                    return Some(jsvalue_to_jit_i64(obj));
+                    return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
                 }
 
                 // Second execution: promote pending → cached.
                 if let Some(map) = ba_ref.promote_object_literal_template(slot) {
                     let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
-                    return Some(jsvalue_to_jit_i64(obj));
+                    return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
                 }
 
                 // First execution: create fresh and register as
@@ -3687,13 +3962,13 @@ pub(crate) mod jit_runtime {
                 let rc = Rc::new(RefCell::new(map));
                 ba_ref.set_object_literal_pending(slot, Rc::clone(&rc));
                 let obj = JsValue::PlainObject(rc);
-                return Some(jsvalue_to_jit_i64(obj));
+                return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
             }
         }
 
         // Fallback: no feedback slot or no BA pointer.
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::with_capacity(capacity))));
-        Some(jsvalue_to_jit_i64(obj))
+        Some(alloc_heap_handle(obj))
     }
 
     // ── Fast StaNamedOwnProperty stub ───────────────────────────────────

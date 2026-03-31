@@ -102,6 +102,27 @@ use std::collections::{HashMap, HashSet};
 /// Number of physical registers available to the Maglev register allocator.
 pub const NUM_PHYS_REGS: u32 = 9;
 
+/// Bytes per monomorphic call-site cache slot (4 × i64 = 32 bytes).
+///
+/// ```text
+/// [RBP - base - 0]   cached callee i64 (0 = empty)
+/// [RBP - base - 8]   cached entry point
+/// [RBP - base - 16]  cached context pointer
+/// [RBP - base - 24]  cached BA pointer
+/// ```
+#[cfg(all(target_arch = "x86_64", unix))]
+const MONO_CACHE_SLOT_BYTES: i32 = 32;
+
+/// Offset from the start of a mono-cache slot to each field.
+#[cfg(all(target_arch = "x86_64", unix))]
+const MONO_OFF_CALLEE: i32 = 0;
+#[cfg(all(target_arch = "x86_64", unix))]
+const MONO_OFF_ENTRY: i32 = 8;
+#[cfg(all(target_arch = "x86_64", unix))]
+const MONO_OFF_CTX: i32 = 16;
+#[cfg(all(target_arch = "x86_64", unix))]
+const MONO_OFF_BA: i32 = 24;
+
 /// A stub call argument that is either a Maglev IR node or an immediate i64.
 #[cfg(all(target_arch = "x86_64", unix))]
 enum NodeOrImm {
@@ -462,6 +483,15 @@ struct MaglevCodegen<'a> {
     /// eliminating the 64-bit ALU + MOVSXD pattern in favour of a single
     /// 32-bit ALU instruction + `JO` deopt.
     i32_range: HashSet<NodeId>,
+    /// Total stack bytes reserved in the prologue for monomorphic call caches.
+    /// Each `CallUndefinedReceiver0` call site gets one 32-byte cache slot.
+    /// Zero if the function has no direct-call-0 sites.
+    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
+    mono_call_cache_bytes: i32,
+    /// Counter used during block emission to assign sequential cache-slot
+    /// offsets to each `CallUndefinedReceiver0` site.
+    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
+    next_mono_cache_site: i32,
 }
 
 impl<'a> MaglevCodegen<'a> {
@@ -469,6 +499,8 @@ impl<'a> MaglevCodegen<'a> {
         let num_blocks = graph.blocks().len();
         // Precompute which caller-saved registers are actually allocated.
         let mut used_caller_saved: u8 = 0;
+        // Count direct-call-0 sites for monomorphic cache allocation.
+        let mut mono_call_sites: i32 = 0;
         for block in graph.blocks() {
             for (node_id, _) in &block.nodes {
                 if let Some(Location::Register(n)) = alloc.location(*node_id) {
@@ -478,7 +510,29 @@ impl<'a> MaglevCodegen<'a> {
                     }
                 }
             }
+            for (_nid, node) in &block.nodes {
+                if let ValueNode::Call { receiver, args, .. }
+                | ValueNode::CallKnownFunction { receiver, args, .. } = node
+                {
+                    let recv_is_undef =
+                        matches!(graph.node(*receiver), Some(ValueNode::UndefinedConstant));
+                    if recv_is_undef && args.is_empty() {
+                        mono_call_sites += 1;
+                    }
+                }
+            }
         }
+        #[cfg(all(target_arch = "x86_64", unix))]
+        let mono_call_cache_bytes = mono_call_sites.saturating_mul(MONO_CACHE_SLOT_BYTES);
+        #[cfg(not(all(target_arch = "x86_64", unix)))]
+        let mono_call_cache_bytes = 0i32;
+        // Keep the total a multiple of 16 for stack alignment preservation.
+        let mono_call_cache_bytes = (mono_call_cache_bytes + 15) & !15;
+        let mono_call_cache_bytes = if mono_call_sites == 0 {
+            0
+        } else {
+            mono_call_cache_bytes
+        };
         Self {
             graph,
             alloc,
@@ -499,6 +553,8 @@ impl<'a> MaglevCodegen<'a> {
             used_caller_saved,
             narrow_int32: HashSet::new(),
             i32_range: HashSet::new(),
+            mono_call_cache_bytes,
+            next_mono_cache_site: 0,
         }
     }
 
@@ -1307,26 +1363,32 @@ impl<'a> MaglevCodegen<'a> {
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::LoadKeyedGeneric { object, key, .. } => {
-                // Always use the generic keyed-property stub — it has an
-                // ultra-fast Smi-index path that the "fast array" stubs lack.
-                self.emit_stub_call_2node(
-                    id,
-                    *object,
-                    *key,
-                    jit_runtime::jit_runtime_lda_keyed_property as *const () as usize,
-                );
+                if self.is_known_int32_key(*key) {
+                    self.emit_inline_load_keyed_smi(id, *object, *key);
+                } else {
+                    self.emit_stub_call_2node(
+                        id,
+                        *object,
+                        *key,
+                        jit_runtime::jit_runtime_lda_keyed_property as *const () as usize,
+                    );
+                }
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::StoreKeyedGeneric {
                 object, key, value, ..
             } => {
-                self.emit_stub_call_3node(
-                    id,
-                    *object,
-                    *key,
-                    *value,
-                    jit_runtime::jit_runtime_sta_keyed_property as *const () as usize,
-                );
+                if self.is_known_int32_key(*key) {
+                    self.emit_inline_store_keyed_smi(id, *object, *key, *value);
+                } else {
+                    self.emit_stub_call_3node(
+                        id,
+                        *object,
+                        *key,
+                        *value,
+                        jit_runtime::jit_runtime_sta_keyed_property as *const () as usize,
+                    );
+                }
             }
 
             // ── FixedArray element access (routed through keyed-property stubs) ──
@@ -1334,12 +1396,16 @@ impl<'a> MaglevCodegen<'a> {
             ValueNode::LoadFixedArrayElement { elements, index }
             | ValueNode::LoadFixedDoubleArrayElement { elements, index }
             | ValueNode::LoadHoleyFixedDoubleArrayElement { elements, index } => {
-                self.emit_stub_call_2node(
-                    id,
-                    *elements,
-                    *index,
-                    jit_runtime::jit_runtime_lda_keyed_property as *const () as usize,
-                );
+                if self.is_known_int32_key(*index) {
+                    self.emit_inline_load_keyed_smi(id, *elements, *index);
+                } else {
+                    self.emit_stub_call_2node(
+                        id,
+                        *elements,
+                        *index,
+                        jit_runtime::jit_runtime_lda_keyed_property as *const () as usize,
+                    );
+                }
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::StoreFixedArrayElement {
@@ -1352,13 +1418,17 @@ impl<'a> MaglevCodegen<'a> {
                 index,
                 value,
             } => {
-                self.emit_stub_call_3node(
-                    id,
-                    *elements,
-                    *index,
-                    *value,
-                    jit_runtime::jit_runtime_sta_keyed_property as *const () as usize,
-                );
+                if self.is_known_int32_key(*index) {
+                    self.emit_inline_store_keyed_smi(id, *elements, *index, *value);
+                } else {
+                    self.emit_stub_call_3node(
+                        id,
+                        *elements,
+                        *index,
+                        *value,
+                        jit_runtime::jit_runtime_sta_keyed_property as *const () as usize,
+                    );
+                }
             }
 
             // ── Guards ── pass-through when we use generic stubs ──────────────
@@ -2554,6 +2624,138 @@ impl<'a> MaglevCodegen<'a> {
         self.emit_store(id, Reg64::Rax);
     }
 
+    /// Emit an inline fast-path for keyed **load** when the key is a
+    /// known integer.
+    ///
+    /// Calls `jit_runtime_inline_load_keyed_smi` which returns
+    /// `{value, hit}` in `RAX:RDX`.  On a hit the result is used
+    /// directly; on a miss the generic `jit_runtime_lda_keyed_property`
+    /// stub is called as a fallback.
+    ///
+    /// Generated code layout:
+    /// ```text
+    ///   save live regs
+    ///   load obj → RDI, key → RSI
+    ///   push RSI; push RDI          // save args for fallback
+    ///   call inline_load_keyed_smi  // → RAX = value, RDX = hit
+    ///   test RDX, RDX
+    ///   je   slow_path
+    ///   add  RSP, 16                // discard saved args
+    ///   jmp  done
+    /// slow_path:
+    ///   pop  RDI; pop RSI           // restore args
+    ///   call lda_keyed_property
+    /// done:
+    ///   restore live regs
+    ///   deopt check
+    ///   store result
+    /// ```
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_inline_load_keyed_smi(&mut self, id: NodeId, object: NodeId, key: NodeId) {
+        let saved = self.emit_save_live_regs(id);
+
+        // Load arguments into ABI registers.
+        self.emit_load(object, Reg64::Rdi);
+        self.emit_load(key, Reg64::Rsi);
+
+        // Save args for the potential fallback (2 pushes = 16 bytes,
+        // preserves 16-byte stack alignment).
+        self.masm.push(Reg64::Rsi);
+        self.masm.push(Reg64::Rdi);
+
+        // Call the lean inline helper: returns {value, hit} in RAX:RDX.
+        let inline_addr = jit_runtime::jit_runtime_inline_load_keyed_smi as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, inline_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        // Check hit flag (RDX).
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+        self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
+        self.masm.je(&mut slow_label);
+
+        // ── Fast path: inline helper handled it ──
+        // Discard the saved args and jump to common exit.
+        self.masm.add_ri(Reg64::Rsp, 16);
+        self.masm.jmp(&mut done_label);
+
+        // ── Slow path: fall back to the generic stub ──
+        self.masm.bind_label(&mut slow_label);
+        self.masm.pop(Reg64::Rdi); // restore object
+        self.masm.pop(Reg64::Rsi); // restore key
+        let stub_addr = jit_runtime::jit_runtime_lda_keyed_property as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        // ── Common exit ──
+        self.masm.bind_label(&mut done_label);
+        self.emit_restore_live_regs(saved);
+        // Deopt check: harmless on fast path (RAX is always valid);
+        // catches JIT_DEOPT from the generic stub on the slow path.
+        self.emit_deopt_check_rax();
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Emit an inline fast-path for keyed **store** when the key is a
+    /// known integer.
+    ///
+    /// Calls `jit_runtime_inline_store_keyed_smi` which returns
+    /// `{value, hit}` in `RAX:RDX`.  On a hit the result is used
+    /// directly; on a miss the generic `jit_runtime_sta_keyed_property`
+    /// stub is called as a fallback.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_inline_store_keyed_smi(
+        &mut self,
+        id: NodeId,
+        object: NodeId,
+        key: NodeId,
+        value: NodeId,
+    ) {
+        let saved = self.emit_save_live_regs(id);
+
+        // Load all three arguments.
+        self.emit_load(object, Reg64::Rdi);
+        self.emit_load(key, Reg64::Rsi);
+        self.emit_load(value, Reg64::Rdx);
+
+        // Save args for fallback (4 pushes = 32 bytes for alignment).
+        self.masm.push(Reg64::Rdx);
+        self.masm.push(Reg64::Rsi);
+        self.masm.push(Reg64::Rdi);
+        self.masm.push(Reg64::R11); // alignment padding
+
+        // Call the lean inline helper.
+        let inline_addr = jit_runtime::jit_runtime_inline_store_keyed_smi as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, inline_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        // Check hit flag (RDX).
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+        self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
+        self.masm.je(&mut slow_label);
+
+        // ── Fast path ──
+        self.masm.add_ri(Reg64::Rsp, 32);
+        self.masm.jmp(&mut done_label);
+
+        // ── Slow path ──
+        self.masm.bind_label(&mut slow_label);
+        self.masm.pop(Reg64::R11); // discard padding
+        self.masm.pop(Reg64::Rdi); // restore object
+        self.masm.pop(Reg64::Rsi); // restore key
+        self.masm.pop(Reg64::Rdx); // restore value
+        let stub_addr = jit_runtime::jit_runtime_sta_keyed_property as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        // ── Common exit ──
+        self.masm.bind_label(&mut done_label);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+        self.emit_store(id, Reg64::Rax);
+    }
+
     /// Call a 3-node-arg stub: `stub(node0, node1, node2)`.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_stub_call_3node(
@@ -2641,67 +2843,161 @@ impl<'a> MaglevCodegen<'a> {
     //      stores arguments, and calls the entry point directly.
     //   3. Calls `jit_runtime_finish_direct_call` to restore TLS state.
     //   4. Falls back to the full runtime stub on cache miss.
+    //
+    // `CallUndefinedReceiver0` additionally implements a **monomorphic
+    // inline cache** (MIC): after the first successful call through
+    // `jit_runtime_get_jit_entry`, the callee identity, entry point,
+    // context pointer, and BA pointer are cached in per-site frame slots.
+    // On subsequent calls, if the callee identity matches, the much
+    // lighter `jit_runtime_mono_call_prepare` is used instead.
 
-    /// Emit a direct-call fast path for `CallUndefinedReceiver0`.
+    /// Emit a direct-call fast path for `CallUndefinedReceiver0` with a
+    /// monomorphic inline cache.
     ///
-    /// Layout after fast-path setup (RSP-relative):
+    /// ## Mono fast path (cache hit)
+    ///
     /// ```text
-    /// RSP +   0 .. +127  : callee's register file (16 × i64, zeroed)
-    /// RSP + 128          : saved callee handle (for slow-path reload)
-    /// RSP + 136          : alignment padding
+    ///  cmp  callee, [RBP - cache_callee_off]
+    ///  jne  cache_miss
+    ///  ; call mono_prepare(callee, cached_ba, cached_ctx)
+    ///  ; allocate register file, call cached entry_point
+    ///  ; call finish_direct_call
+    /// ```
+    ///
+    /// ## Cache miss / first call
+    ///
+    /// ```text
+    ///  call jit_runtime_get_jit_entry
+    ///  ; on success: populate cache, call entry_point, finish
+    ///  ; on failure: fall back to call_undefined_receiver0 stub
     /// ```
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_direct_call_0(&mut self, id: NodeId, callee: NodeId) {
+        // Claim a mono-cache slot from the frame.  Offsets are relative
+        // to RBP.  After the prologue pushes (40 bytes from RBP) and the
+        // cache allocation (sub rsp, mono_call_cache_bytes), the first
+        // cache slot starts at [RBP - 48].
+        //
+        // Each slot is 32 bytes:
+        //   +0  callee_i64  (0 = empty)
+        //   +8  entry_point
+        //   +16 ctx_ptr
+        //   +24 ba_ptr
+        let site = self.next_mono_cache_site;
+        self.next_mono_cache_site += 1;
+        // Base offset from RBP to the start of all cache slots.
+        const CACHE_BASE: i32 = -48; // first slot starts right after R15 push
+        let slot_base = CACHE_BASE - site * MONO_CACHE_SLOT_BYTES;
+        let off_callee = slot_base - MONO_OFF_CALLEE;
+        let off_entry = slot_base - MONO_OFF_ENTRY;
+        let off_ctx = slot_base - MONO_OFF_CTX;
+        let off_ba = slot_base - MONO_OFF_BA;
+
         let saved = self.emit_save_live_regs(id);
         // After save_live_regs: RSP ≡ 0 mod 16.
 
-        self.emit_load(callee, Reg64::Rdi);
-        // Save callee + alignment pad (2 pushes → RSP still ≡ 0 mod 16).
-        self.masm.push(Reg64::Rdi);
-        self.masm.push(Reg64::Rdi); // padding (value doesn't matter)
+        // Load callee into R11 (scratch).
+        self.emit_load(callee, Reg64::R11);
 
-        // Call jit_runtime_get_jit_entry(callee_i64).
-        // Returns JitEntryInfo { entry_point: usize, ctx_ptr: i64 }
-        // in RAX (entry_point) and RDX (ctx_ptr) per SysV ABI.
+        // ── Monomorphic cache check ─────────────────────────────────
+        let mut cache_miss = Label::new();
+        let mut do_direct = Label::new();
+        let mut done_label = Label::new();
+
+        self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, off_callee);
+        self.masm.jne(&mut cache_miss);
+
+        // ── Mono hit: lightweight prepare ───────────────────────────
+        // R11 = callee_i64.
+        self.masm.mov_rr(Reg64::Rdi, Reg64::R11); // arg0 = callee
+        self.masm
+            .mov_load_base_disp32(Reg64::Rsi, Reg64::Rbp, off_ba); // arg1 = ba
+        self.masm
+            .mov_load_base_disp32(Reg64::Rdx, Reg64::Rbp, off_ctx); // arg2 = ctx
+
+        // Push callee + padding (2 pushes → RSP ≡ 0 mod 16).
+        self.masm.push(Reg64::Rdi);
+        self.masm.push(Reg64::Rdi);
+
+        let mono_addr = jit_runtime::jit_runtime_mono_call_prepare as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, mono_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        // Check success (RAX = 1 ok, 0 = fail).
+        self.masm.test_rr(Reg64::Rax, Reg64::Rax);
+        let mut mono_fail = Label::new();
+        self.masm.je(&mut mono_fail);
+
+        // Load cached entry + ctx for the direct call.
+        self.masm
+            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, off_entry);
+        self.masm
+            .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, off_ctx);
+        self.masm.jmp(&mut do_direct);
+
+        // ── Cache miss: full jit_runtime_get_jit_entry path ─────────
+        self.masm.bind_label(&mut cache_miss);
+
+        self.masm.mov_rr(Reg64::Rdi, Reg64::R11); // callee
+        // Push callee + padding.
+        self.masm.push(Reg64::Rdi);
+        self.masm.push(Reg64::Rdi);
+
         let get_entry_addr = jit_runtime::jit_runtime_get_jit_entry as *const () as usize;
         self.masm.mov_ri(Reg64::R11, get_entry_addr as i64);
         self.masm.call_reg(Reg64::R11);
 
-        // Check: entry_point == 0 → slow path.
-        let mut slow_label = Label::new();
-        let mut done_label = Label::new();
+        // Check entry_point == 0 → stub fallback.
+        let mut stub_fallback = Label::new();
         self.masm.test_rr(Reg64::Rax, Reg64::Rax);
-        self.masm.je(&mut slow_label);
+        self.masm.je(&mut stub_fallback);
 
-        // ── Fast path: direct call ──────────────────────────────────
-        // RAX = entry point, RDX = ctx_ptr.
-        // Save entry point in R11 (scratch, but we control usage).
-        self.masm.mov_rr(Reg64::R11, Reg64::Rax);
-        // Save ctx_ptr — RDX is caller-saved but not clobbered between
-        // here and the call.  Move to R10 for safety.
-        self.masm.mov_rr(Reg64::R10, Reg64::Rdx);
+        // RAX = entry_point, RDX = ctx_ptr.
+        self.masm.mov_rr(Reg64::R11, Reg64::Rax); // entry
+        self.masm.mov_rr(Reg64::R10, Reg64::Rdx); // ctx
 
-        // Allocate 128-byte register file on the stack (16 × i64).
-        // RSP was ≡ 0 mod 16 after get_jit_entry returned.
-        // sub 128 → RSP ≡ 0 mod 16.
+        // ── Populate mono cache ─────────────────────────────────────
+        // callee is at [RSP] (both pushes have the same value).
+        self.masm.mov_load_base_disp32(Reg64::Rax, Reg64::Rsp, 0);
+        self.masm
+            .mov_store_base_disp32(Reg64::Rbp, off_callee, Reg64::Rax);
+        self.masm
+            .mov_store_base_disp32(Reg64::Rbp, off_entry, Reg64::R11);
+        self.masm
+            .mov_store_base_disp32(Reg64::Rbp, off_ctx, Reg64::R10);
+
+        // Read the current BA (set by get_jit_entry) for caching.
+        self.masm.push(Reg64::R11);
+        self.masm.push(Reg64::R10);
+        let ba_addr = jit_runtime::jit_runtime_read_current_ba as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, ba_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.masm
+            .mov_store_base_disp32(Reg64::Rbp, off_ba, Reg64::Rax);
+        self.masm.pop(Reg64::R10);
+        self.masm.pop(Reg64::R11);
+
+        // ── Common direct-call path ─────────────────────────────────
+        // R11 = entry point, R10 = ctx_ptr.
+        // Stack: [RSP] = padding, [RSP+8] = callee.
+        self.masm.bind_label(&mut do_direct);
+
+        // Allocate 128-byte register file.
         self.masm.sub_ri(Reg64::Rsp, 128);
 
-        // Zero the register file (callee expects zeroed spill slots).
-        // Use R10-save first, then zero with xor-self.
-        self.masm.push(Reg64::R10); // save ctx on stack (RSP -= 8)
-        self.masm.push(Reg64::R11); // save entry on stack (RSP -= 8)
+        // Zero register file (save R10, R11 across zero loop).
+        self.masm.push(Reg64::R10);
+        self.masm.push(Reg64::R11);
         self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
         for i in 0..16 {
-            // Register file starts at RSP + 16 (after 2 pushes).
             self.masm
                 .mov_store_base_disp32(Reg64::Rsp, 16 + i * 8, Reg64::Rax);
         }
-        self.masm.pop(Reg64::R11); // restore entry
-        self.masm.pop(Reg64::R10); // restore ctx
+        self.masm.pop(Reg64::R11);
+        self.masm.pop(Reg64::R10);
 
-        // RDI = register file base (RSP points to it).
+        // RDI = register file, RSI = ctx_ptr.
         self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
-        // RSI = context pointer.
         self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
 
         // CALL entry point.
@@ -2710,7 +3006,7 @@ impl<'a> MaglevCodegen<'a> {
         // Deallocate register file.
         self.masm.add_ri(Reg64::Rsp, 128);
 
-        // RAX = raw result from callee.  Call finish to restore TLS.
+        // Finish direct call (restores BA, context, truncates heap).
         self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
         let finish_addr = jit_runtime::jit_runtime_finish_direct_call as *const () as usize;
         self.masm.mov_ri(Reg64::R11, finish_addr as i64);
@@ -2720,13 +3016,27 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.add_ri(Reg64::Rsp, 16);
         self.masm.jmp(&mut done_label);
 
-        // ── Slow path: full runtime stub ────────────────────────────
-        self.masm.bind_label(&mut slow_label);
-        // Pop saved callee into RDI, discard padding.
-        self.masm.pop(Reg64::R11); // padding → discard
+        // ── Stub fallback (get_jit_entry returned 0) ────────────────
+        self.masm.bind_label(&mut stub_fallback);
+        self.masm.pop(Reg64::R11); // discard padding
         self.masm.pop(Reg64::Rdi); // callee
         let stub_addr = jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
         self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.masm.jmp(&mut done_label);
+
+        // ── Mono prepare failed — fall back to stub ─────────────────
+        self.masm.bind_label(&mut mono_fail);
+        // Invalidate cache so next call goes through full lookup.
+        self.masm.xor_rr(Reg64::R11, Reg64::R11);
+        self.masm
+            .mov_store_base_disp32(Reg64::Rbp, off_callee, Reg64::R11);
+        self.masm.pop(Reg64::R11); // discard padding
+        self.masm.pop(Reg64::Rdi); // callee
+        self.masm.mov_ri(
+            Reg64::R11,
+            jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize as i64,
+        );
         self.masm.call_reg(Reg64::R11);
 
         // ── Common exit ─────────────────────────────────────────────

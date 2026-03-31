@@ -312,6 +312,12 @@ pub struct PropertyMap {
 
 /// Cached object-literal layout used to instantiate repeated literals without
 /// re-observing the first instance's values.
+///
+/// On [`capture`](Self::capture) the template pre-builds a
+/// [`PropertyIndex`] so that [`instantiate`](Self::instantiate) can
+/// construct a [`PropertyMap`] directly — bypassing the thread-local
+/// buffer pool and the `build_index_from_keys` rebuild that the general
+/// `from_shape_parts` path performs on every call.
 #[derive(Debug, Clone)]
 pub(crate) struct ObjectLiteralTemplate {
     keys: Box<[Rc<str>]>,
@@ -321,6 +327,8 @@ pub(crate) struct ObjectLiteralTemplate {
     extensible: bool,
     has_accessors: bool,
     capacity_hint: usize,
+    /// Pre-built property index cloned into each instantiated map.
+    cached_index: PropertyIndex,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -334,30 +342,57 @@ struct ShapeMetadata {
 
 impl ObjectLiteralTemplate {
     pub(crate) fn capture(map: &PropertyMap) -> Option<Self> {
-        (!map.is_empty()).then(|| Self {
-            keys: map.keys.clone().into_boxed_slice(),
-            attrs: map.attrs.clone().into_boxed_slice(),
-            integer_key_count: map.integer_key_count,
-            layout_id: map.layout_id,
-            extensible: map.extensible,
-            has_accessors: map.has_accessors,
-            capacity_hint: map.capacity_hint,
+        (!map.is_empty()).then(|| {
+            let keys: Box<[Rc<str>]> = map.keys.clone().into_boxed_slice();
+            let capacity_hint = map.capacity_hint;
+            let cached_index =
+                PropertyMap::build_index_from_keys(&keys, capacity_hint.max(keys.len()));
+            Self {
+                keys,
+                attrs: map.attrs.clone().into_boxed_slice(),
+                integer_key_count: map.integer_key_count,
+                layout_id: map.layout_id,
+                extensible: map.extensible,
+                has_accessors: map.has_accessors,
+                capacity_hint,
+                cached_index,
+            }
         })
     }
 
+    /// Stamp out a fresh [`PropertyMap`] with the template's shape.
+    ///
+    /// This is the hot path for repeated object-literal creation.  It
+    /// constructs the map directly from the cached fields, avoiding:
+    ///
+    /// * the thread-local buffer-pool lookup (`acquire_storage_buffers`),
+    /// * the per-instantiation `build_index_from_keys` rebuild,
+    /// * the intermediate `from_shape_parts` indirection.
+    ///
+    /// Values are initialised to [`JsValue::Undefined`]; the caller is
+    /// expected to fill them via
+    /// [`try_template_fill`](PropertyMap::try_template_fill).
     pub(crate) fn instantiate(&self) -> PropertyMap {
-        PropertyMap::from_shape_parts(
-            &self.keys,
-            &self.attrs,
-            ShapeMetadata {
-                integer_key_count: self.integer_key_count,
-                layout_id: self.layout_id,
-                extensible: self.extensible,
-                has_accessors: self.has_accessors,
-                capacity_hint: self.capacity_hint,
-            },
-            0,
-        )
+        let cap = self.keys.len();
+        let capacity_hint = self.capacity_hint.max(cap);
+        PropertyMap {
+            keys: self.keys.to_vec(),
+            values: vec![JsValue::Undefined; cap],
+            attrs: self.attrs.to_vec(),
+            integer_key_count: self.integer_key_count,
+            index: self.cached_index.clone(),
+            inline_cache: (cap > SMALL_PROPERTY_LINEAR_SCAN_CAP)
+                .then(|| Box::new(InlinePropertyCache::new())),
+            shape_id: next_shape_id(),
+            layout_id: self.layout_id,
+            proto_generation: Cell::new(0),
+            proto_epoch: Cell::new(0),
+            proto_global_epoch: Cell::new(0),
+            extensible: self.extensible,
+            has_accessors: self.has_accessors,
+            template_next_slot: 0,
+            capacity_hint,
+        }
     }
 }
 
