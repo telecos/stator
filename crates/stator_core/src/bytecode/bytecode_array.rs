@@ -1374,6 +1374,26 @@ impl BytecodeArray {
             .unwrap_or(false)
     }
 
+    /// Returns `true` when this function **and** all nested functions in its
+    /// constant pool have Maglev JIT code compiled.
+    ///
+    /// This is useful for benchmark warmup: an outer script may have Maglev
+    /// code while a closure it defines does not yet, so checking only the
+    /// outer [`BytecodeArray`] gives a false positive.
+    pub fn has_all_maglev_jit_code(&self) -> bool {
+        if !self.has_maglev_jit_code() {
+            return false;
+        }
+        for entry in self.constant_pool() {
+            if let ConstantPoolEntry::Function(nested_ba) = entry
+                && !nested_ba.has_maglev_jit_code()
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Returns an [`Arc`] clone of the Maglev JIT code cache.
     ///
     /// The background compilation thread receives this `Arc` and writes the

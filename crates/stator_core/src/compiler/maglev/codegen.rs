@@ -338,6 +338,15 @@ impl CachedMaglevCode {
         })
     }
 
+    /// Returns the raw entry-point pointer of the compiled Maglev code.
+    ///
+    /// This is the `mmap`'d executable page that can be called as
+    /// `extern "C" fn(*mut i64) -> i64`.  Used by the mono-cache upgrade
+    /// path to patch a cached baseline entry point with the Maglev one.
+    pub fn entry_point(&self) -> *const u8 {
+        self.ptr
+    }
+
     /// Execute the cached Maglev code with the given arguments.
     ///
     /// Uses a thread-local register file pool to avoid per-call allocation.
@@ -3000,12 +3009,27 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.mov_ri(Reg64::R11, same_ctx_addr as i64);
         self.masm.call_reg(Reg64::R11);
 
-        // Check success (RAX = 1 ok, 0 = fail).
+        // Check success (RAX = 0 → fail, 1 → use cached entry,
+        // > 1 → Maglev upgrade: RAX is the new entry point).
         self.masm.test_rr(Reg64::Rax, Reg64::Rax);
         let mut mono_fail = Label::new();
         self.masm.je(&mut mono_fail);
 
-        // Load cached entry + ctx for the direct call.
+        // RAX > 1 means Maglev entry point upgrade.
+        self.masm.cmp_ri(Reg64::Rax, 1);
+        let mut same_ctx_no_upgrade = Label::new();
+        self.masm.je(&mut same_ctx_no_upgrade);
+
+        // Upgraded: store new entry point into cache slot and use it.
+        self.masm
+            .mov_store_base_disp32(Reg64::Rbp, off_entry, Reg64::Rax);
+        self.masm.mov_rr(Reg64::R11, Reg64::Rax);
+        self.masm
+            .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, off_ctx);
+        self.masm.jmp(&mut do_direct);
+
+        // No upgrade: load cached entry + ctx for the direct call.
+        self.masm.bind_label(&mut same_ctx_no_upgrade);
         self.masm
             .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, off_entry);
         self.masm
@@ -3029,11 +3053,26 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.mov_ri(Reg64::R11, mono_addr as i64);
         self.masm.call_reg(Reg64::R11);
 
-        // Check success (RAX = 1 ok, 0 = fail).
+        // Check success (RAX = 0 → fail, 1 → use cached entry,
+        // > 1 → Maglev upgrade: RAX is the new entry point).
         self.masm.test_rr(Reg64::Rax, Reg64::Rax);
         self.masm.je(&mut mono_fail);
 
-        // Load cached entry + ctx for the direct call.
+        // RAX > 1 means Maglev entry point upgrade.
+        self.masm.cmp_ri(Reg64::Rax, 1);
+        let mut full_no_upgrade = Label::new();
+        self.masm.je(&mut full_no_upgrade);
+
+        // Upgraded: store new entry point into cache slot and use it.
+        self.masm
+            .mov_store_base_disp32(Reg64::Rbp, off_entry, Reg64::Rax);
+        self.masm.mov_rr(Reg64::R11, Reg64::Rax);
+        self.masm
+            .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, off_ctx);
+        self.masm.jmp(&mut do_direct);
+
+        // No upgrade: load cached entry + ctx for the direct call.
+        self.masm.bind_label(&mut full_no_upgrade);
         self.masm
             .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, off_entry);
         self.masm

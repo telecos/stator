@@ -3234,7 +3234,122 @@ pub(crate) mod jit_runtime {
             })
         });
 
-        1 // success
+        // Check whether the callee has Maglev code available.  If so,
+        // return its entry point (> 1) so the codegen can upgrade the
+        // mono-cache slot.  Otherwise return 1 (plain success).
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            let ba = unsafe { &*(ba_ptr as *const BytecodeArray) };
+            if let Some(ep) = try_get_maglev_entry_point(ba) {
+                return ep;
+            }
+        }
+
+        1 // success, no Maglev upgrade
+    }
+
+    /// Returns the current runtime context pointer as an `i64`.
+    ///
+    /// Used by Maglev codegen to compare against the cached callee
+    /// context before deciding whether the full `mono_call_prepare` is
+    /// required.
+    pub extern "C" fn jit_runtime_get_current_ctx_ptr() -> i64 {
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if !ptrs.is_cached() {
+            return 0;
+        }
+        // SAFETY: cached pointer set by cache_rt_ptrs; valid for thread lifetime.
+        let ctx_ref = unsafe { &*ptrs.context };
+        let ctx_borrow = ctx_ref.borrow();
+        match ctx_borrow.as_ref() {
+            Some(rc) => Rc::as_ptr(rc) as i64,
+            None => 0,
+        }
+    }
+
+    /// Lightweight mono-call prepare for the **same-context** fast path.
+    ///
+    /// Called when the cached callee context pointer already matches the
+    /// current runtime context, so no context save/restore is needed.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`callee_i64`) – JIT i64 encoding of the callee.
+    /// * `RSI` (`ba_ptr`) – cached raw pointer to callee's [`BytecodeArray`].
+    ///
+    /// Returns a Maglev entry point (> 1) in `RAX` when an upgrade is
+    /// available, `1` for plain success, or `0` on failure.
+    pub extern "C" fn jit_runtime_mono_call_prepare_same_ctx(_callee_i64: i64, ba_ptr: i64) -> i64 {
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if !ptrs.is_cached() {
+            return 0;
+        }
+
+        // SAFETY: cached pointer set by cache_rt_ptrs; valid for thread lifetime.
+        let bc_ref = unsafe { &*ptrs.bytecode };
+        let heap_ref = unsafe { &*ptrs.heap };
+
+        // Save current BA and set callee's BA.
+        let saved_ba = bc_ref.get();
+        bc_ref.set(ba_ptr as *const BytecodeArray);
+
+        // Save heap base for post-call truncation.
+        // SAFETY: single-threaded JIT; no concurrent heap mutation.
+        let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+
+        // Stash saved state for jit_runtime_finish_direct_call.
+        // Context did not change (the codegen already verified the match).
+        DIRECT_CALL_STATE.with(|c| {
+            c.set(DirectCallState {
+                saved_ba,
+                heap_base,
+                ctx_changed: false,
+            })
+        });
+
+        // Check whether the callee has Maglev code available.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            let ba = unsafe { &*(ba_ptr as *const BytecodeArray) };
+            if let Some(ep) = try_get_maglev_entry_point(ba) {
+                return ep;
+            }
+        }
+
+        1 // success, no Maglev upgrade
+    }
+
+    /// Try to obtain the Maglev entry-point for `ba`, performing the lazy
+    /// Arc→Rc transfer if necessary.
+    ///
+    /// Returns `Some(entry_point_as_i64)` (always > 1) when Maglev code is
+    /// available, or `None` otherwise.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn try_get_maglev_entry_point(ba: &BytecodeArray) -> Option<i64> {
+        use crate::compiler::maglev::codegen::CachedMaglevCode;
+
+        let maglev_cache = ba.maglev_executable_cache();
+        // SAFETY: single-threaded JIT; no concurrent mutation.
+        let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
+        if maglev_ref.is_none() {
+            // Lazy transfer from Arc<Mutex> (background compilation)
+            // to Rc<RefCell> (JIT fast path).
+            let jit_cache = ba.maglev_jit_cache_arc();
+            let cached_data = jit_cache.lock().ok().and_then(|guard| {
+                guard
+                    .as_ref()
+                    .map(|c| (c.as_bytes().to_vec(), c.register_file_slots))
+            });
+            if let Some((code, register_file_slots)) = cached_data {
+                // SAFETY: `code` was produced by `maglev_codegen::compile`.
+                let exec = unsafe { CachedMaglevCode::new(&code, register_file_slots) };
+                *maglev_cache.borrow_mut() = exec;
+            }
+        }
+        let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
+        maglev_ref
+            .as_ref()
+            .map(|maglev_exec| maglev_exec.entry_point() as i64)
     }
 
     /// Read the current `RT_BYTECODE` pointer for caching after a
