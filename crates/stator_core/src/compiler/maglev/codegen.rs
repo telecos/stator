@@ -2168,6 +2168,43 @@ impl<'a> MaglevCodegen<'a> {
         }
     }
 
+    /// Returns `true` when `id` refers to an IR node that is known to
+    /// produce an integer (Smi / Int32) value.  Used by the inline
+    /// array-element emission to decide between the lean Smi fast-path
+    /// and the generic keyed-property runtime call.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn is_known_int32_key(&self, id: NodeId) -> bool {
+        matches!(
+            self.graph.node(id),
+            Some(
+                ValueNode::SmiConstant { .. }
+                    | ValueNode::Int32Constant { .. }
+                    | ValueNode::Uint32Constant { .. }
+                    | ValueNode::Int32Add { .. }
+                    | ValueNode::Int32Subtract { .. }
+                    | ValueNode::Int32Multiply { .. }
+                    | ValueNode::Int32Divide { .. }
+                    | ValueNode::Int32Modulus { .. }
+                    | ValueNode::Int32Negate { .. }
+                    | ValueNode::Int32Increment { .. }
+                    | ValueNode::Int32Decrement { .. }
+                    | ValueNode::Int32BitwiseAnd { .. }
+                    | ValueNode::Int32BitwiseOr { .. }
+                    | ValueNode::Int32BitwiseXor { .. }
+                    | ValueNode::Int32ShiftLeft { .. }
+                    | ValueNode::Int32ShiftRight { .. }
+                    | ValueNode::Int32ShiftRightLogical { .. }
+                    | ValueNode::CheckedSmiAdd { .. }
+                    | ValueNode::CheckedSmiSubtract { .. }
+                    | ValueNode::CheckedSmiMultiply { .. }
+                    | ValueNode::CheckedSmiIncrement { .. }
+                    | ValueNode::CheckedSmiDecrement { .. }
+                    | ValueNode::CheckedSmiDivide { .. }
+                    | ValueNode::CheckedSmiModulus { .. }
+            )
+        )
+    }
+
     // ── Direct-register binary operation helpers ────────────────────────────
 
     /// Emit an integer binary operation (`dst = left OP right`) using the
