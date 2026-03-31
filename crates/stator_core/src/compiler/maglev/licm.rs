@@ -28,8 +28,6 @@
 //!
 //! # Limitations
 //!
-//! - Only a single pass over each detected loop is performed (no iterative
-//!   widening).
 //! - Nested loops are handled independently; each back-edge produces its own
 //!   loop.
 //! - Guards and side-effecting nodes are never hoisted.
@@ -293,20 +291,19 @@ fn build_loop(graph: &MaglevGraph, header: u32, back_src: u32) -> Option<Natural
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Hoist invariant nodes from a single loop to its preheader.
-/// Returns the number of nodes hoisted.
+///
+/// Uses iterative fixed-point hoisting: each pass moves newly-eligible nodes
+/// to the preheader and marks their [`NodeId`]s as "outside".  This enables
+/// chained hoisting — e.g. a `LoadGlobal` hoisted in pass 1 makes a
+/// dependent `LoadNamedGeneric` eligible in pass 2 — which is critical when
+/// the graph's block ordering doesn't match the data-dependency order (common
+/// with Maglev's non-RPO block layout).
+///
+/// Returns the total number of nodes hoisted across all passes.
 fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
-    // Collect all NodeIds defined outside the loop body.
-    let mut outside_defs: HashSet<NodeId> = HashSet::new();
-    for block in graph.blocks() {
-        if !lp.body.contains(&block.id) {
-            for (id, _) in &block.nodes {
-                outside_defs.insert(*id);
-            }
-        }
-    }
-
     // Collect objects mutated inside the loop so we can avoid hoisting loads
     // that may alias those stores (soundness check).
+    // These are stable across passes (we never hoist stores).
     let mutated_objects = collect_mutated_objects(graph, &lp.body);
 
     // Collect global name indices written by StoreGlobal inside the loop.
@@ -316,6 +313,7 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
     // Check whether the loop body contains any generic stores or calls that
     // could modify arbitrary object properties.  When true, generic property
     // loads (LoadNamedGeneric / LoadKeyedGeneric) must stay in the loop.
+    // Stable across passes (we never hoist calls or stores).
     let has_property_side_effects = loop_has_property_side_effects(graph, &lp.body);
 
     eprintln!(
@@ -328,78 +326,88 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
         has_property_side_effects,
     );
 
-    // Scan loop blocks for hoistable nodes.  Include the loop header — in
-    // single-block loops the entire body lives in the header.  Nodes whose
-    // inputs are all defined outside the loop are loop-invariant regardless
-    // of which block they reside in.
-    let mut to_hoist: Vec<(u32, usize, NodeId, ValueNode)> = Vec::new();
+    let mut total_hoisted = 0;
 
-    for block in graph.blocks() {
-        if !lp.body.contains(&block.id) {
-            continue;
-        }
-        for (pos, (id, node)) in block.nodes.iter().enumerate() {
-            // Skip Phi nodes — they define loop-carried values.
-            if matches!(node, ValueNode::Phi { .. }) {
-                continue;
-            }
-            let pure = is_pure(node);
-            let inputs_out = all_inputs_outside(node, &outside_defs);
-            let alias_store = load_aliases_store(node, &mutated_objects);
-            let alias_glob = global_load_aliases_store(node, &mutated_globals);
-            let blocked_by_side_effects =
-                is_generic_property_load(node) && has_property_side_effects;
-            if pure && inputs_out && !alias_store && !alias_glob && !blocked_by_side_effects {
-                to_hoist.push((block.id, pos, *id, node.clone()));
-                // After hoisting this node, its NodeId becomes "outside" too,
-                // so subsequent nodes that reference it may also qualify.
-                outside_defs.insert(*id);
-            }
-        }
-    }
-
-    if to_hoist.is_empty() {
-        return 0;
-    }
-
-    // Mark hoisted NodeIds as outside for potential future passes.
-    for &(_, _, id, _) in &to_hoist {
-        outside_defs.insert(id);
-    }
-
-    // Remove hoisted nodes from their source blocks (iterate in reverse
-    // position order so indices remain valid).
-    // Group removals by block.
-    let mut removals_by_block: std::collections::HashMap<u32, Vec<usize>> =
-        std::collections::HashMap::new();
-    for &(blk, pos, _, _) in &to_hoist {
-        removals_by_block.entry(blk).or_default().push(pos);
-    }
-    for positions in removals_by_block.values_mut() {
-        positions.sort_unstable();
-        positions.dedup();
-    }
-
-    // Actually remove from blocks.
-    for block in graph.blocks_mut() {
-        if let Some(positions) = removals_by_block.get(&block.id) {
-            // Remove in reverse order to keep indices stable.
-            for &pos in positions.iter().rev() {
-                if pos < block.nodes.len() {
-                    block.nodes.remove(pos);
+    // Iterate until a full pass finds nothing new to hoist.
+    loop {
+        // Rebuild outside_defs each pass — freshly hoisted nodes are now in
+        // the preheader (a non-loop block) and will be included automatically.
+        let mut outside_defs: HashSet<NodeId> = HashSet::new();
+        for block in graph.blocks() {
+            if !lp.body.contains(&block.id) {
+                for (id, _) in &block.nodes {
+                    outside_defs.insert(*id);
                 }
             }
         }
+
+        // Scan loop blocks for hoistable nodes.  Include the loop header — in
+        // single-block loops the entire body lives in the header.  Nodes whose
+        // inputs are all defined outside the loop are loop-invariant regardless
+        // of which block they reside in.
+        let mut to_hoist: Vec<(u32, usize, NodeId, ValueNode)> = Vec::new();
+
+        for block in graph.blocks() {
+            if !lp.body.contains(&block.id) {
+                continue;
+            }
+            for (pos, (id, node)) in block.nodes.iter().enumerate() {
+                // Skip Phi nodes — they define loop-carried values.
+                if matches!(node, ValueNode::Phi { .. }) {
+                    continue;
+                }
+                let pure = is_pure(node);
+                let inputs_out = all_inputs_outside(node, &outside_defs);
+                let alias_store = load_aliases_store(node, &mutated_objects);
+                let alias_glob = global_load_aliases_store(node, &mutated_globals);
+                let blocked_by_side_effects =
+                    is_generic_property_load(node) && has_property_side_effects;
+                if pure && inputs_out && !alias_store && !alias_glob && !blocked_by_side_effects {
+                    to_hoist.push((block.id, pos, *id, node.clone()));
+                    // Eagerly mark as outside so later nodes in this same
+                    // block can see the dependency as satisfied.
+                    outside_defs.insert(*id);
+                }
+            }
+        }
+
+        if to_hoist.is_empty() {
+            break;
+        }
+
+        // Remove hoisted nodes from their source blocks (iterate in reverse
+        // position order so indices remain valid).
+        let mut removals_by_block: std::collections::HashMap<u32, Vec<usize>> =
+            std::collections::HashMap::new();
+        for &(blk, pos, _, _) in &to_hoist {
+            removals_by_block.entry(blk).or_default().push(pos);
+        }
+        for positions in removals_by_block.values_mut() {
+            positions.sort_unstable();
+            positions.dedup();
+        }
+
+        for block in graph.blocks_mut() {
+            if let Some(positions) = removals_by_block.get(&block.id) {
+                for &pos in positions.iter().rev() {
+                    if pos < block.nodes.len() {
+                        block.nodes.remove(pos);
+                    }
+                }
+            }
+        }
+
+        // Append hoisted nodes to the preheader (before its control node).
+        let pass_count = to_hoist.len();
+        if let Some(preheader) = graph.block_mut(lp.preheader) {
+            for (_, _, id, node) in to_hoist {
+                preheader.push_with_id(id, node);
+            }
+        }
+        total_hoisted += pass_count;
     }
 
-    // Append hoisted nodes to the preheader (before its control node).
-    let count = to_hoist.len();
-    if let Some(preheader) = graph.block_mut(lp.preheader) {
-        for (_, _, id, node) in to_hoist {
-            preheader.push_with_id(id, node);
-        }
-    }
-    count
+    total_hoisted
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1569,6 +1577,132 @@ mod tests {
                 .iter()
                 .any(|(_, n)| matches!(n, ValueNode::LoadNamedGeneric { .. })),
             "LoadNamedGeneric should NOT be hoisted when a StoreNamedGeneric exists in the loop"
+        );
+    }
+
+    // ── Cross-block chained hoisting with non-RPO ordering ──────────────
+
+    /// Regression test for the property_access benchmark pattern.  When the
+    /// graph builder emits blocks in non-RPO order (body before header), a
+    /// `LoadNamedGeneric` in the body depends on a `LoadGlobal` in the header
+    /// which is scanned LATER.  Iterative LICM fixes this: pass 1 hoists the
+    /// `LoadGlobal`, pass 2 hoists the `LoadNamedGeneric` chain.
+    #[test]
+    fn test_hoist_cross_block_property_chain_non_rpo() {
+        let mut graph = MaglevGraph::new(1);
+
+        // block 0: preheader
+        let mut b0 = BasicBlock::new(0);
+        b0.push_value(ValueNode::Parameter { index: 0 });
+        b0.set_control(ControlNode::Jump { target: 3 }); // jump to header (ID 3)
+        graph.add_block(b0);
+
+        // block 1: exit
+        let mut b1 = BasicBlock::new(1);
+        b1.add_predecessor(3);
+        let undef = b1.push_value(ValueNode::UndefinedConstant);
+        b1.set_control(ControlNode::Return { value: undef });
+        graph.add_block(b1);
+
+        // block 2: body — LoadNamedGeneric depends on LoadGlobal in block 3.
+        // Scanned BEFORE the header in graph order.
+        let obj_id = NodeId(500);
+        let x_id = NodeId(501);
+        let y_id = NodeId(502);
+        let z_id = NodeId(503);
+        let mut b2 = BasicBlock::new(2);
+        b2.add_predecessor(3);
+        b2.nodes.push((
+            x_id,
+            ValueNode::LoadNamedGeneric {
+                object: obj_id,
+                name: 10,
+                feedback_slot: 1,
+            },
+        ));
+        b2.nodes.push((
+            y_id,
+            ValueNode::LoadNamedGeneric {
+                object: obj_id,
+                name: 11,
+                feedback_slot: 2,
+            },
+        ));
+        b2.nodes.push((
+            z_id,
+            ValueNode::LoadNamedGeneric {
+                object: obj_id,
+                name: 12,
+                feedback_slot: 3,
+            },
+        ));
+        b2.set_control(ControlNode::Jump { target: 3 }); // back-edge
+        graph.add_block(b2);
+
+        // block 3: header — contains LoadGlobal("obj"), scanned AFTER block 2.
+        let mut b3 = BasicBlock::new(3);
+        b3.add_predecessor(0);
+        b3.add_predecessor(2);
+        b3.nodes.push((
+            obj_id,
+            ValueNode::LoadGlobal {
+                name: 1,
+                feedback_slot: 0,
+            },
+        ));
+        let cond = b3.push_value(ValueNode::TrueConstant);
+        b3.set_control(ControlNode::Branch {
+            condition: cond,
+            if_true: 2,
+            if_false: 1,
+        });
+        graph.add_block(b3);
+
+        // Body has 3 LoadNamedGeneric nodes; header has LoadGlobal + cond.
+        assert_eq!(graph.blocks()[2].nodes.len(), 3);
+        assert_eq!(
+            graph.blocks()[3]
+                .nodes
+                .iter()
+                .filter(|(_, n)| matches!(n, ValueNode::LoadGlobal { .. }))
+                .count(),
+            1
+        );
+
+        hoist_loop_invariants(&mut graph);
+
+        // All 3 LoadNamedGeneric should be hoisted from body.
+        assert_eq!(
+            graph.blocks()[2].nodes.len(),
+            0,
+            "all LoadNamedGeneric nodes should be hoisted from loop body"
+        );
+
+        // LoadGlobal should be hoisted from header.
+        assert!(
+            !graph.blocks()[3]
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::LoadGlobal { .. })),
+            "LoadGlobal should be hoisted from loop header"
+        );
+
+        // All 4 hoisted nodes should be in the preheader (block 0).
+        assert!(
+            graph.blocks()[0].nodes.iter().any(|(id, _)| *id == obj_id),
+            "LoadGlobal should be in preheader"
+        );
+        assert!(
+            graph.blocks()[0].nodes.iter().any(|(id, _)| *id == x_id),
+            "LoadNamedGeneric(x) should be in preheader"
+        );
+        assert!(
+            graph.blocks()[0].nodes.iter().any(|(id, _)| *id == y_id),
+            "LoadNamedGeneric(y) should be in preheader"
+        );
+        assert!(
+            graph.blocks()[0].nodes.iter().any(|(id, _)| *id == z_id),
+            "LoadNamedGeneric(z) should be in preheader"
         );
     }
 }
