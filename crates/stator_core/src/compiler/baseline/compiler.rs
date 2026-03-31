@@ -297,6 +297,22 @@ pub(crate) mod jit_runtime {
         /// Previous context saved before a direct-call context swap.
         static DIRECT_CALL_OLD_CTX: RefCell<Option<Rc<RefCell<JsContext>>>> =
             const { RefCell::new(None) };
+
+        /// Single-entry callee cache for `call_undefined_receiver0_inner`.
+        ///
+        /// When a tight loop calls the same closure repeatedly, the heap
+        /// index (`callee_i64`) is identical on every iteration.  This
+        /// cache stores `(callee_i64, *const BytecodeArray)` so that the
+        /// heap lookup + `JsValue` match can be skipped on a hit.
+        ///
+        /// # Safety
+        ///
+        /// The raw pointer is derived from an `Rc<BytecodeArray>` that
+        /// is kept alive in the heap (`RT_HEAP`) for the duration of
+        /// the JIT execution.  The cache is only read on the same
+        /// thread and is invalidated whenever `callee_i64` changes.
+        static CACHED_CALLEE: Cell<(i64, *const BytecodeArray)> =
+            const { Cell::new((0, std::ptr::null())) };
     }
 
     /// Cached raw pointers to frequently-accessed TLS variables.
@@ -1972,15 +1988,27 @@ pub(crate) mod jit_runtime {
         jit_args: &[i64],
         saved_ba: *const BytecodeArray,
     ) -> Option<i64> {
+        // ── Maglev fast path: skip invocation count when ready ──────
+        // Once Maglev code is compiled the invocation count is only
+        // used for tiering decisions that have already been made.
+        // Skipping the increment avoids a Cell read+write per call.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            let maglev_cache = ba.maglev_executable_cache();
+            // SAFETY: single-threaded JIT; no concurrent mutation.
+            let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
+            if let Some(maglev_exec) = maglev_ref.as_ref() {
+                return exec_maglev_callee(ba, maglev_exec, jit_args, saved_ba);
+            }
+        }
+
         // ── Increment invocation count ──────────────────────────────
         // When called from JIT stubs, the interpreter's dispatch_call
         // never runs, so the callee's counter would stall.  Bump it
         // here so Maglev compilation eventually triggers.
         let inv_count = ba.increment_invocation_count();
 
-        // ── Maglev fast path (preferred over baseline JIT) ──────────
-        // Maglev produces better code than baseline.  Check its cache
-        // FIRST so closures upgraded to Maglev skip the baseline path.
+        // ── Try to trigger Maglev compilation ───────────────────────
         #[cfg(all(target_arch = "x86_64", unix))]
         {
             use crate::bytecode::bytecode_array::MAGLEV_TIERING_THRESHOLD;
@@ -2401,159 +2429,181 @@ pub(crate) mod jit_runtime {
 
             // Decode the callee without an extra jit_i64_to_jsvalue TLS access.
             if callee_i64 >= JIT_HEAP_TAG {
-                let idx = (callee_i64 - JIT_HEAP_TAG) as usize;
                 let heap_ref = unsafe { &*ptrs.heap };
 
-                // Phase 1: Extract the callee from the heap in a scoped
-                // borrow.  The `&Vec<JsValue>` is dropped before any
-                // nested JIT execution that could reallocate the heap.
-                let callee_val = {
-                    // SAFETY: scoped immutable borrow; dropped before
-                    // any heap mutation can occur.
-                    let heap = unsafe { &*heap_ref.as_ptr() };
-                    heap.get(idx).cloned()
-                };
+                // ── Callee cache: skip heap lookup for repeated calls ──
+                //
+                // In a tight loop calling the same closure, `callee_i64`
+                // is identical on every iteration.  Caching the resolved
+                // `*const BytecodeArray` avoids the heap index, clone,
+                // and enum discriminant check on every call.
+                let ba_ptr: *const BytecodeArray = {
+                    let cached = CACHED_CALLEE.with(|c| c.get());
+                    if cached.0 == callee_i64 && !cached.1.is_null() {
+                        // Cache hit — skip the heap lookup entirely.
+                        cached.1
+                    } else {
+                        // Cache miss — look up the heap in a scoped borrow.
+                        let idx = (callee_i64 - JIT_HEAP_TAG) as usize;
+                        let callee_val = {
+                            // SAFETY: scoped immutable borrow; dropped before
+                            // any heap mutation can occur.
+                            let heap = unsafe { &*heap_ref.as_ptr() };
+                            heap.get(idx).cloned()
+                        };
 
-                match callee_val.as_ref() {
-                    Some(JsValue::Function(ba)) => {
-                        // ── Maglev fast path (preferred) ───────────────
-                        #[cfg(all(target_arch = "x86_64", unix))]
-                        {
-                            let maglev_cache = ba.maglev_executable_cache();
-                            // SAFETY: single-threaded; no concurrent mutation.
-                            let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
-                            if let Some(maglev_exec) = maglev_ref.as_ref() {
-                                let ctx_ref = unsafe { &*ptrs.context };
-                                let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
-
-                                let callee_ctx_raw = ba.closure_context();
-                                let callee_ctx_ptr =
-                                    callee_ctx_raw.map(Rc::as_ptr).unwrap_or(std::ptr::null());
-                                let current_ctx_ptr = unsafe {
-                                    (*ctx_ref.as_ptr())
-                                        .as_ref()
-                                        .map(Rc::as_ptr)
-                                        .unwrap_or(std::ptr::null())
-                                };
-                                let same_context = std::ptr::eq(callee_ctx_ptr, current_ctx_ptr);
-                                let saved_ctx = if same_context {
-                                    None
-                                } else {
-                                    let callee_ctx = callee_ctx_raw.cloned();
-                                    Some(unsafe {
-                                        std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx)
-                                    })
-                                };
-
-                                bc_ref.set(&**ba as *const BytecodeArray);
-                                // SAFETY: Maglev code is valid x86-64.
-                                let jit_result = unsafe { maglev_exec.execute(&[]) };
+                        match callee_val.as_ref() {
+                            Some(JsValue::Function(ba)) => {
+                                let ptr = Rc::as_ptr(ba);
+                                CACHED_CALLEE.with(|c| c.set((callee_i64, ptr)));
+                                ptr
+                            }
+                            Some(JsValue::NativeFunction(f)) => {
+                                let f = Rc::clone(f);
+                                let result = f(vec![]);
                                 bc_ref.set(saved_ba);
-
-                                if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
-                                    unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
-                                    if let Some(ctx) = saved_ctx {
-                                        unsafe { *ctx_ref.as_ptr() = ctx };
-                                    }
-                                    return Some(jit_result);
-                                }
-
-                                let result_val = if jit_result == JIT_DEOPT {
-                                    None
-                                } else {
-                                    jit_to_jsvalue_ext(jit_result)
+                                return match result {
+                                    Ok(v) => Some(jsvalue_to_jit_i64(v)),
+                                    Err(_) => None,
                                 };
-                                unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
-                                if let Some(ctx) = saved_ctx {
-                                    unsafe { *ctx_ref.as_ptr() = ctx };
-                                }
-                                return result_val.map(jsvalue_to_jit_i64);
+                            }
+                            _ => {
+                                bc_ref.set(saved_ba);
+                                return None;
                             }
                         }
+                    }
+                };
 
-                        // ── Baseline JIT fast path ─────────────────────
-                        let exec_cache = ba.jit_executable_cache();
-                        // SAFETY: single-threaded JIT; no concurrent
-                        // mutation of exec cache.
-                        let cache_ref = unsafe { &*exec_cache.as_ptr() };
-                        if let Some(exec) = cache_ref.as_ref() {
-                            let ctx_ref = unsafe { &*ptrs.context };
-                            // SAFETY: no active heap borrows; read length
-                            // via temporary raw-pointer dereference.
-                            let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+                // SAFETY: `ba_ptr` was obtained from `Rc::as_ptr` on an
+                // `Rc<BytecodeArray>` stored in the RT_HEAP.  The heap
+                // entry outlives this call because heap truncation only
+                // removes entries above `heap_base` (set after this point).
+                let ba: &BytecodeArray = unsafe { &*ba_ptr };
 
-                            let callee_ctx_raw = ba.closure_context();
-                            let callee_ctx_ptr =
-                                callee_ctx_raw.map(Rc::as_ptr).unwrap_or(std::ptr::null());
-                            let current_ctx_ptr = unsafe {
-                                (*ctx_ref.as_ptr())
-                                    .as_ref()
-                                    .map(Rc::as_ptr)
-                                    .unwrap_or(std::ptr::null())
-                            };
-                            let same_context = std::ptr::eq(callee_ctx_ptr, current_ctx_ptr);
+                // ── Maglev fast path (preferred) ───────────────
+                #[cfg(all(target_arch = "x86_64", unix))]
+                {
+                    let maglev_cache = ba.maglev_executable_cache();
+                    // SAFETY: single-threaded; no concurrent mutation.
+                    let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
+                    if let Some(maglev_exec) = maglev_ref.as_ref() {
+                        let ctx_ref = unsafe { &*ptrs.context };
+                        let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
 
-                            let ctx_ptr_i64 = callee_ctx_ptr as i64;
-                            let saved_ctx = if same_context {
-                                None
-                            } else {
-                                let callee_ctx = callee_ctx_raw.cloned();
-                                // SAFETY: no active borrows of context RefCell.
-                                Some(unsafe {
-                                    std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx)
-                                })
-                            };
+                        let callee_ctx_raw = ba.closure_context();
+                        let callee_ctx_ptr =
+                            callee_ctx_raw.map(Rc::as_ptr).unwrap_or(std::ptr::null());
+                        let current_ctx_ptr = unsafe {
+                            (*ctx_ref.as_ptr())
+                                .as_ref()
+                                .map(Rc::as_ptr)
+                                .unwrap_or(std::ptr::null())
+                        };
+                        let same_context = std::ptr::eq(callee_ctx_ptr, current_ctx_ptr);
+                        let saved_ctx = if same_context {
+                            None
+                        } else {
+                            let callee_ctx = callee_ctx_raw.cloned();
+                            Some(unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx) })
+                        };
 
-                            bc_ref.set(&**ba as *const BytecodeArray);
-                            // SAFETY: cached executable code contains valid
-                            // x86-64 instructions.  No `&Vec<JsValue>` ref
-                            // is alive during this call.
-                            let jit_result = unsafe { exec.execute(&[], ctx_ptr_i64) };
+                        bc_ref.set(ba_ptr);
+                        // SAFETY: Maglev code is valid x86-64.
+                        let jit_result = unsafe { maglev_exec.execute(&[]) };
+                        bc_ref.set(saved_ba);
 
-                            bc_ref.set(saved_ba);
-
-                            // Non-heap results skip the round-trip conversion.
-                            if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
-                                // SAFETY: no active heap borrows.
-                                unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
-                                if let Some(ctx) = saved_ctx {
-                                    unsafe { *ctx_ref.as_ptr() = ctx };
-                                }
-                                return Some(jit_result);
-                            }
-
-                            let result_val = if jit_result == JIT_DEOPT {
-                                None
-                            } else {
-                                jit_to_jsvalue_ext(jit_result)
-                            };
-
-                            // SAFETY: no active heap borrows.
+                        if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
                             unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
                             if let Some(ctx) = saved_ctx {
                                 unsafe { *ctx_ref.as_ptr() = ctx };
                             }
-                            return result_val.map(jsvalue_to_jit_i64);
+                            return Some(jit_result);
                         }
 
-                        // No JIT code at all: fall through to full path.
-                        let ba = Rc::clone(ba);
-                        return call_js_function(&ba, vec![], &[], saved_ba);
-                    }
-                    Some(JsValue::NativeFunction(f)) => {
-                        let f = Rc::clone(f);
-                        let result = f(vec![]);
-                        bc_ref.set(saved_ba);
-                        return match result {
-                            Ok(v) => Some(jsvalue_to_jit_i64(v)),
-                            Err(_) => None,
+                        let result_val = if jit_result == JIT_DEOPT {
+                            None
+                        } else {
+                            jit_to_jsvalue_ext(jit_result)
                         };
-                    }
-                    _ => {
-                        bc_ref.set(saved_ba);
-                        return None;
+                        unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                        if let Some(ctx) = saved_ctx {
+                            unsafe { *ctx_ref.as_ptr() = ctx };
+                        }
+                        return result_val.map(jsvalue_to_jit_i64);
                     }
                 }
+
+                // ── Baseline JIT fast path ─────────────────────
+                let exec_cache = ba.jit_executable_cache();
+                // SAFETY: single-threaded JIT; no concurrent
+                // mutation of exec cache.
+                let cache_ref = unsafe { &*exec_cache.as_ptr() };
+                if let Some(exec) = cache_ref.as_ref() {
+                    let ctx_ref = unsafe { &*ptrs.context };
+                    // SAFETY: no active heap borrows; read length
+                    // via temporary raw-pointer dereference.
+                    let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+
+                    let callee_ctx_raw = ba.closure_context();
+                    let callee_ctx_ptr = callee_ctx_raw.map(Rc::as_ptr).unwrap_or(std::ptr::null());
+                    let current_ctx_ptr = unsafe {
+                        (*ctx_ref.as_ptr())
+                            .as_ref()
+                            .map(Rc::as_ptr)
+                            .unwrap_or(std::ptr::null())
+                    };
+                    let same_context = std::ptr::eq(callee_ctx_ptr, current_ctx_ptr);
+
+                    let ctx_ptr_i64 = callee_ctx_ptr as i64;
+                    let saved_ctx = if same_context {
+                        None
+                    } else {
+                        let callee_ctx = callee_ctx_raw.cloned();
+                        // SAFETY: no active borrows of context RefCell.
+                        Some(unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx) })
+                    };
+
+                    bc_ref.set(ba_ptr);
+                    // SAFETY: cached executable code contains valid
+                    // x86-64 instructions.  No `&Vec<JsValue>` ref
+                    // is alive during this call.
+                    let jit_result = unsafe { exec.execute(&[], ctx_ptr_i64) };
+
+                    bc_ref.set(saved_ba);
+
+                    // Non-heap results skip the round-trip conversion.
+                    if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
+                        // SAFETY: no active heap borrows.
+                        unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                        if let Some(ctx) = saved_ctx {
+                            unsafe { *ctx_ref.as_ptr() = ctx };
+                        }
+                        return Some(jit_result);
+                    }
+
+                    let result_val = if jit_result == JIT_DEOPT {
+                        None
+                    } else {
+                        jit_to_jsvalue_ext(jit_result)
+                    };
+
+                    // SAFETY: no active heap borrows.
+                    unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                    if let Some(ctx) = saved_ctx {
+                        unsafe { *ctx_ref.as_ptr() = ctx };
+                    }
+                    return result_val.map(jsvalue_to_jit_i64);
+                }
+
+                // No JIT code at all: reconstruct Rc and use full path.
+                // SAFETY: ba_ptr was obtained from Rc::as_ptr on an Rc
+                // that is still alive in the heap.  Bumping the strong
+                // count before from_raw produces a valid owned Rc.
+                unsafe { Rc::increment_strong_count(ba_ptr) };
+                // SAFETY: pointer + refcount are valid per above.
+                let ba_rc = unsafe { Rc::from_raw(ba_ptr) };
+                return call_js_function(&ba_rc, vec![], &[], saved_ba);
             }
 
             // Non-heap callee (e.g. Smi / bool) — cannot be called.
