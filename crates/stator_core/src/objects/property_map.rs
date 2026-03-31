@@ -258,11 +258,18 @@ fn layout_hash(keys: &[Rc<str>], attrs: &[PropertyAttributes]) -> u64 {
 #[derive(Debug)]
 pub struct PropertyMap {
     /// Property names in ECMAScript enumeration order.
-    keys: Vec<Rc<str>>,
+    ///
+    /// Wrapped in [`Rc`] so that template-instantiated maps can share the
+    /// key vector with the [`ObjectLiteralTemplate`] (and with each other)
+    /// without cloning.  Copy-on-write via [`Rc::make_mut`] ensures that
+    /// any structural mutation transparently unshares the data.
+    keys: Rc<Vec<Rc<str>>>,
     /// Property values, one per key.
     values: Vec<JsValue>,
     /// Property attributes, one per key.
-    attrs: Vec<PropertyAttributes>,
+    ///
+    /// Shared via [`Rc`] with the same copy-on-write semantics as `keys`.
+    attrs: Rc<Vec<PropertyAttributes>>,
     /// Number of integer-indexed keys stored at the front of `keys`.
     integer_key_count: usize,
     /// Name → slot-index mapping, kept inline for small objects and promoted
@@ -320,8 +327,8 @@ pub struct PropertyMap {
 /// `from_shape_parts` path performs on every call.
 #[derive(Debug, Clone)]
 pub(crate) struct ObjectLiteralTemplate {
-    keys: Box<[Rc<str>]>,
-    attrs: Box<[PropertyAttributes]>,
+    keys: Rc<Vec<Rc<str>>>,
+    attrs: Rc<Vec<PropertyAttributes>>,
     integer_key_count: usize,
     layout_id: u64,
     extensible: bool,
@@ -343,13 +350,13 @@ struct ShapeMetadata {
 impl ObjectLiteralTemplate {
     pub(crate) fn capture(map: &PropertyMap) -> Option<Self> {
         (!map.is_empty()).then(|| {
-            let keys: Box<[Rc<str>]> = map.keys.clone().into_boxed_slice();
+            let keys = Rc::clone(&map.keys);
             let capacity_hint = map.capacity_hint;
             let cached_index =
                 PropertyMap::build_index_from_keys(&keys, capacity_hint.max(keys.len()));
             Self {
                 keys,
-                attrs: map.attrs.clone().into_boxed_slice(),
+                attrs: Rc::clone(&map.attrs),
                 integer_key_count: map.integer_key_count,
                 layout_id: map.layout_id,
                 extensible: map.extensible,
@@ -376,9 +383,9 @@ impl ObjectLiteralTemplate {
         let cap = self.keys.len();
         let capacity_hint = self.capacity_hint.max(cap);
         PropertyMap {
-            keys: self.keys.to_vec(),
+            keys: Rc::clone(&self.keys),
             values: vec![JsValue::Undefined; cap],
-            attrs: self.attrs.to_vec(),
+            attrs: Rc::clone(&self.attrs),
             integer_key_count: self.integer_key_count,
             index: self.cached_index.clone(),
             inline_cache: (cap > SMALL_PROPERTY_LINEAR_SCAN_CAP)
@@ -411,9 +418,9 @@ impl PartialEq for PropertyMap {
 impl Clone for PropertyMap {
     fn clone(&self) -> Self {
         Self {
-            keys: self.keys.iter().map(Rc::clone).collect(),
+            keys: Rc::clone(&self.keys),
             values: self.values.clone(),
-            attrs: self.attrs.clone(),
+            attrs: Rc::clone(&self.attrs),
             integer_key_count: self.integer_key_count,
             index: self.index.clone(),
             inline_cache: self
@@ -443,9 +450,9 @@ impl PropertyMap {
         let index = Self::build_index_from_keys(&[], capacity);
 
         Self {
-            keys: buffers.keys,
+            keys: Rc::new(buffers.keys),
             values: buffers.values,
-            attrs: buffers.attrs,
+            attrs: Rc::new(buffers.attrs),
             integer_key_count: 0,
             index,
             inline_cache: None,
@@ -498,7 +505,7 @@ impl PropertyMap {
     pub fn boilerplate_snapshot(
         &self,
     ) -> (Vec<Rc<str>>, Vec<crate::objects::map::PropertyAttributes>) {
-        (self.keys.clone(), self.attrs.clone())
+        ((*self.keys).clone(), (*self.attrs).clone())
     }
 
     /// Clones only the property-map shape for object/constructor templates.
@@ -589,9 +596,9 @@ impl PropertyMap {
         let index = Self::build_index_from_keys(&buffers.keys, capacity_hint);
 
         Self {
-            keys: buffers.keys,
+            keys: Rc::new(buffers.keys),
             values: buffers.values,
-            attrs: buffers.attrs,
+            attrs: Rc::new(buffers.attrs),
             integer_key_count: metadata.integer_key_count,
             index,
             inline_cache: (cap > SMALL_PROPERTY_LINEAR_SCAN_CAP)
@@ -865,9 +872,9 @@ impl PropertyMap {
         if let PropertyIndex::Map(index) = &mut self.index {
             index.insert(key.clone(), pos);
         }
-        self.keys.insert(pos, key);
+        Rc::make_mut(&mut self.keys).insert(pos, key);
         self.values.insert(pos, value);
-        self.attrs.insert(pos, attrs);
+        Rc::make_mut(&mut self.attrs).insert(pos, attrs);
         self.capacity_hint = self.capacity_hint.max(self.keys.len());
         if is_integer_key {
             self.integer_key_count += 1;
@@ -1065,7 +1072,7 @@ impl PropertyMap {
     pub fn insert_builtin_rc(&mut self, key: Rc<str>, value: JsValue) {
         if let Some(i) = self.lookup_slot_cached(&key) {
             self.values[i] = value;
-            self.attrs[i] = BUILTIN_ATTRS;
+            Rc::make_mut(&mut self.attrs)[i] = BUILTIN_ATTRS;
             self.touch_proto_generation();
         } else {
             let pos = self.spec_insert_pos(&key);
@@ -1083,7 +1090,7 @@ impl PropertyMap {
     /// Called after populating built-in prototype objects whose methods
     /// should not appear in `for…in` or `Object.keys()`.
     pub fn make_all_non_enumerable(&mut self) {
-        for attr in &mut self.attrs {
+        for attr in Rc::make_mut(&mut self.attrs).iter_mut() {
             attr.remove(PropertyAttributes::ENUMERABLE);
         }
         if !self.attrs.is_empty() {
@@ -1105,9 +1112,9 @@ impl PropertyMap {
                 self.integer_key_count -= 1;
             }
             let val = self.values[i].clone();
-            self.keys.remove(i);
+            Rc::make_mut(&mut self.keys).remove(i);
             self.values.remove(i);
-            self.attrs.remove(i);
+            Rc::make_mut(&mut self.attrs).remove(i);
             // Decrement indices for every slot that shifted left.
             if let PropertyIndex::Map(index) = &mut self.index {
                 for idx in index.values_mut() {
@@ -1171,7 +1178,7 @@ impl PropertyMap {
     ) {
         if let Some(i) = self.lookup_slot_cached(&key) {
             self.values[i] = value;
-            self.attrs[i] = attrs;
+            Rc::make_mut(&mut self.attrs)[i] = attrs;
             self.touch_proto_generation();
         } else {
             let pos = self.spec_insert_pos(&key);
@@ -1188,7 +1195,7 @@ impl PropertyMap {
     /// Returns `true` if the property existed and was updated.
     pub fn set_attrs(&mut self, key: &str, attrs: PropertyAttributes) -> bool {
         if let Some(i) = self.lookup_slot_cached(key) {
-            self.attrs[i] = attrs;
+            Rc::make_mut(&mut self.attrs)[i] = attrs;
             self.bump_shape_id();
             self.touch_proto_generation();
             true
@@ -1226,10 +1233,11 @@ impl PropertyMap {
     /// Set or clear the `WRITABLE` flag for an existing property.
     pub fn set_writable(&mut self, key: &str, writable: bool) {
         if let Some(i) = self.lookup_slot_cached(key) {
+            let a = &mut Rc::make_mut(&mut self.attrs)[i];
             if writable {
-                self.attrs[i].insert(PropertyAttributes::WRITABLE);
+                a.insert(PropertyAttributes::WRITABLE);
             } else {
-                self.attrs[i].remove(PropertyAttributes::WRITABLE);
+                a.remove(PropertyAttributes::WRITABLE);
             }
             self.bump_shape_id();
             self.touch_proto_generation();
@@ -1239,10 +1247,11 @@ impl PropertyMap {
     /// Set or clear the `ENUMERABLE` flag for an existing property.
     pub fn set_enumerable(&mut self, key: &str, enumerable: bool) {
         if let Some(i) = self.lookup_slot_cached(key) {
+            let a = &mut Rc::make_mut(&mut self.attrs)[i];
             if enumerable {
-                self.attrs[i].insert(PropertyAttributes::ENUMERABLE);
+                a.insert(PropertyAttributes::ENUMERABLE);
             } else {
-                self.attrs[i].remove(PropertyAttributes::ENUMERABLE);
+                a.remove(PropertyAttributes::ENUMERABLE);
             }
             self.bump_shape_id();
             self.touch_proto_generation();
@@ -1252,10 +1261,11 @@ impl PropertyMap {
     /// Set or clear the `CONFIGURABLE` flag for an existing property.
     pub fn set_configurable(&mut self, key: &str, configurable: bool) {
         if let Some(i) = self.lookup_slot_cached(key) {
+            let a = &mut Rc::make_mut(&mut self.attrs)[i];
             if configurable {
-                self.attrs[i].insert(PropertyAttributes::CONFIGURABLE);
+                a.insert(PropertyAttributes::CONFIGURABLE);
             } else {
-                self.attrs[i].remove(PropertyAttributes::CONFIGURABLE);
+                a.remove(PropertyAttributes::CONFIGURABLE);
             }
             self.bump_shape_id();
             self.touch_proto_generation();
@@ -1308,7 +1318,7 @@ impl PropertyMap {
     /// Mark all properties as non-writable and non-configurable, and prevent
     /// new properties from being added (ES §20.1.2.6).
     pub fn freeze(&mut self) {
-        for a in &mut self.attrs {
+        for a in Rc::make_mut(&mut self.attrs).iter_mut() {
             a.remove(PropertyAttributes::WRITABLE);
             a.remove(PropertyAttributes::CONFIGURABLE);
         }
@@ -1332,7 +1342,7 @@ impl PropertyMap {
     /// Mark all properties as non-configurable and prevent new properties
     /// from being added (ES §20.1.2.20).
     pub fn seal(&mut self) {
-        for a in &mut self.attrs {
+        for a in Rc::make_mut(&mut self.attrs).iter_mut() {
             a.remove(PropertyAttributes::CONFIGURABLE);
         }
         self.extensible = false;
@@ -1360,12 +1370,20 @@ impl Default for PropertyMap {
 
 impl Drop for PropertyMap {
     fn drop(&mut self) {
-        let buffers = PropertyStorageBuffers {
-            keys: std::mem::take(&mut self.keys),
-            values: std::mem::take(&mut self.values),
-            attrs: std::mem::take(&mut self.attrs),
-        };
-        release_storage_buffers(buffers);
+        // Recycle buffers only when we are the sole owner of the shared
+        // keys and attrs vectors.  When other maps (or a template) still
+        // reference them, let the Rcs drop naturally.
+        let keys_rc = std::mem::take(&mut self.keys);
+        let attrs_rc = std::mem::take(&mut self.attrs);
+        let values = std::mem::take(&mut self.values);
+
+        if let (Ok(keys), Ok(attrs)) = (Rc::try_unwrap(keys_rc), Rc::try_unwrap(attrs_rc)) {
+            release_storage_buffers(PropertyStorageBuffers {
+                keys,
+                values,
+                attrs,
+            });
+        }
     }
 }
 
