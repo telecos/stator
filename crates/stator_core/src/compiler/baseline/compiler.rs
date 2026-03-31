@@ -283,16 +283,25 @@ pub(crate) mod jit_runtime {
         //
         // Saved by `jit_runtime_get_jit_entry`, restored by
         // `jit_runtime_finish_direct_call`.
+        //
+        // Bundled into a single `Cell` so that save/restore is one TLS
+        // access instead of three.
 
-        /// Saved `RT_BYTECODE` pointer from before the direct call.
-        static DIRECT_CALL_SAVED_BA: Cell<*const BytecodeArray> =
-            const { Cell::new(std::ptr::null()) };
+        /// Per-call state stashed before a direct JIT-to-JIT call.
+        #[derive(Clone, Copy)]
+        struct DirectCallState {
+            saved_ba: *const BytecodeArray,
+            heap_base: usize,
+            ctx_changed: bool,
+        }
 
-        /// Heap length before the direct call (for truncation on return).
-        static DIRECT_CALL_HEAP_BASE: Cell<usize> = const { Cell::new(0) };
-
-        /// Whether the closure context was swapped for the direct call.
-        static DIRECT_CALL_CTX_CHANGED: Cell<bool> = const { Cell::new(false) };
+        static DIRECT_CALL_STATE: Cell<DirectCallState> = const {
+            Cell::new(DirectCallState {
+                saved_ba: std::ptr::null(),
+                heap_base: 0,
+                ctx_changed: false,
+            })
+        };
 
         /// Previous context saved before a direct-call context swap.
         static DIRECT_CALL_OLD_CTX: RefCell<Option<Rc<RefCell<JsContext>>>> =
@@ -2971,9 +2980,13 @@ pub(crate) mod jit_runtime {
         bc_ref.set(ba_ptr);
 
         // Stash saved state in TLS for the finish call.
-        DIRECT_CALL_SAVED_BA.with(|c| c.set(saved_ba));
-        DIRECT_CALL_HEAP_BASE.with(|c| c.set(heap_base));
-        DIRECT_CALL_CTX_CHANGED.with(|c| c.set(!same_context));
+        DIRECT_CALL_STATE.with(|c| {
+            c.set(DirectCallState {
+                saved_ba,
+                heap_base,
+                ctx_changed: !same_context,
+            })
+        });
 
         // Extract the raw function pointer from JitExecutableCode.
         // SAFETY: `exec_raw` points to a valid `JitExecutableCode` whose
@@ -3037,9 +3050,11 @@ pub(crate) mod jit_runtime {
         let heap_ref = unsafe { &*ptrs.heap };
         let ctx_ref = unsafe { &*ptrs.context };
 
-        let saved_ba = DIRECT_CALL_SAVED_BA.with(|c| c.get());
-        let heap_base = DIRECT_CALL_HEAP_BASE.with(|c| c.get());
-        let ctx_changed = DIRECT_CALL_CTX_CHANGED.with(|c| c.get());
+        let DirectCallState {
+            saved_ba,
+            heap_base,
+            ctx_changed,
+        } = DIRECT_CALL_STATE.with(|c| c.get());
 
         // Restore bytecode pointer.
         bc_ref.set(saved_ba);
@@ -3155,9 +3170,13 @@ pub(crate) mod jit_runtime {
         }
 
         // Stash saved state for jit_runtime_finish_direct_call.
-        DIRECT_CALL_SAVED_BA.with(|c| c.set(saved_ba));
-        DIRECT_CALL_HEAP_BASE.with(|c| c.set(heap_base));
-        DIRECT_CALL_CTX_CHANGED.with(|c| c.set(!same_context));
+        DIRECT_CALL_STATE.with(|c| {
+            c.set(DirectCallState {
+                saved_ba,
+                heap_base,
+                ctx_changed: !same_context,
+            })
+        });
 
         1 // success
     }
