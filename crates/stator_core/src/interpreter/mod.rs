@@ -1296,32 +1296,43 @@ pub fn maybe_compile_maglev(ba: &BytecodeArray) {
                 match GraphBuilder::build(&input.ba, &feedback) {
                     Ok(mut graph) => {
                         optimize(&mut graph);
-                        match maglev_codegen::compile(&graph, param_count) {
-                            Ok(cc) => {
-                                let code_len = cc.code.len();
-                                if let Ok(mut guard) = input.result_cache.lock() {
-                                    // SAFETY: `cc.code` was produced by `maglev_codegen::compile`.
-                                    if let Ok(cached) = unsafe {
-                                        crate::compiler::baseline::compiler::CachedExecutableCode::from_compiled(
+
+                        // Skip compilation of degenerate graphs (entry block
+                        // immediately deoptimises).  Registering such code would
+                        // produce JIT functions that always return JIT_DEOPT,
+                        // cascading deoptimisation to callers via Construct /
+                        // Call stubs and severely degrading performance.
+                        if graph.is_degenerate() {
+                            MAGLEV_COMPILATION_FAILED
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            match maglev_codegen::compile(&graph, param_count) {
+                                Ok(cc) => {
+                                    let code_len = cc.code.len();
+                                    if let Ok(mut guard) = input.result_cache.lock() {
+                                        // SAFETY: `cc.code` was produced by `maglev_codegen::compile`.
+                                        if let Ok(cached) = unsafe {
+                                            crate::compiler::baseline::compiler::CachedExecutableCode::from_compiled(
                                             &cc.code,
                                             cc.register_file_slots,
                                         )
-                                    } {
-                                        *guard = Some(cached);
+                                        } {
+                                            *guard = Some(cached);
+                                        }
+                                        drop(guard);
                                     }
-                                    drop(guard);
+                                    MAGLEV_COMPILATION_COUNT
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    MAGLEV_CODE_BYTES
+                                        .fetch_add(code_len, std::sync::atomic::Ordering::Relaxed);
                                 }
-                                MAGLEV_COMPILATION_COUNT
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                MAGLEV_CODE_BYTES
-                                    .fetch_add(code_len, std::sync::atomic::Ordering::Relaxed);
+                                Err(e) => {
+                                    MAGLEV_COMPILATION_FAILED
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    eprintln!("MAGLEV_COMPILE: codegen failed: {e}");
+                                }
                             }
-                            Err(e) => {
-                                MAGLEV_COMPILATION_FAILED
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                eprintln!("MAGLEV_COMPILE: codegen failed: {e}");
-                            }
-                        }
+                        } // else !is_degenerate
                     }
                     Err(e) => {
                         MAGLEV_COMPILATION_FAILED

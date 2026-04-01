@@ -1918,6 +1918,40 @@ impl MaglevGraph {
         self.blocks.first()
     }
 
+    /// Return `true` if the graph is *degenerate*: the entry block
+    /// immediately deoptimises without performing any meaningful
+    /// computation.  Compiling such a graph produces JIT code that
+    /// always returns `JIT_DEOPT`, which cascades deoptimisation to
+    /// callers and severely degrades performance.
+    ///
+    /// A graph is considered degenerate when the entry block's
+    /// terminator is [`ControlNode::Deoptimize`] and the block contains
+    /// no value nodes other than constants.
+    pub fn is_degenerate(&self) -> bool {
+        let Some(entry) = self.entry_block() else {
+            return true;
+        };
+        let Some(ctrl) = entry.control() else {
+            return false;
+        };
+        if !matches!(ctrl, ControlNode::Deoptimize { .. }) {
+            return false;
+        }
+        // Entry block immediately deoptimises — check that there are
+        // no real value nodes (constants don't count).
+        entry.nodes.iter().all(|(_, n)| {
+            matches!(
+                n,
+                ValueNode::SmiConstant { .. }
+                    | ValueNode::Float64Constant { .. }
+                    | ValueNode::UndefinedConstant
+                    | ValueNode::TrueConstant
+                    | ValueNode::FalseConstant
+                    | ValueNode::NullConstant
+            )
+        })
+    }
+
     /// Set the number of inlining candidate call sites identified by the
     /// optimizer.
     pub fn set_inline_candidates(&mut self, count: u32) {
