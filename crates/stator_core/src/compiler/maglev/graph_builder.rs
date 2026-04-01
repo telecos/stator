@@ -1219,14 +1219,35 @@ impl<'a> GraphBuilder<'a> {
             // ── Calls ─────────────────────────────────────────────────────────
             // CallAnyReceiver / CallProperty / CallProperty0/1/2 /
             // CallUndefinedReceiver0/1/2
-            Opcode::CallAnyReceiver | Opcode::CallProperty | Opcode::CallWithSpread => {
+            Opcode::CallAnyReceiver => {
+                // Layout: [callable, args_start, args_count, slot]
+                let callable_reg = self.operand_register(instr, 0)?;
+                let args_start = self.operand_register(instr, 1)?;
+                let args_count = self.operand_register_count(instr, 2)?;
+                let slot = self.operand_feedback_slot(instr, 3)?;
+                let callee = self.env_get_register(callable_reg)?;
+                let receiver = self.emit(ValueNode::UndefinedConstant)?;
+                let args = self.collect_args(args_start, args_count)?;
+                let id = self.emit(ValueNode::Call {
+                    callee,
+                    receiver,
+                    args,
+                    feedback_slot: slot,
+                })?;
+                self.env.set_accumulator(id);
+                self.known_globals.clear();
+                self.known_props.clear();
+            }
+            Opcode::CallProperty | Opcode::CallWithSpread => {
+                // Layout: [callable, receiver, args_count, slot]
                 let callable_reg = self.operand_register(instr, 0)?;
                 let receiver_reg = self.operand_register(instr, 1)?;
-                let args_start = self.operand_register(instr, 2)?;
                 let args_count = self.operand_register_count(instr, 2)?;
                 let slot = self.operand_feedback_slot(instr, 3)?;
                 let callee = self.env_get_register(callable_reg)?;
                 let receiver = self.env_get_register(receiver_reg)?;
+                // Args follow receiver in the register file.
+                let args_start = receiver_reg + 1;
                 let args = self.collect_args(args_start, args_count)?;
                 let id = self.emit(ValueNode::Call {
                     callee,
