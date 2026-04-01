@@ -477,6 +477,13 @@ impl<'a> GraphBuilder<'a> {
                 self.enter_block(new_block);
             }
 
+            // Skip instructions in blocks that are already terminated (e.g.
+            // after an unhandled opcode emitted Deoptimize, or after entering
+            // an unreachable block with no predecessor environments).
+            if self.block_is_complete(self.current_block) {
+                continue;
+            }
+
             self.translate_one(i, instr, instructions)?;
         }
 
@@ -2006,7 +2013,14 @@ impl<'a> GraphBuilder<'a> {
     fn enter_loop_header(&mut self, block_id: u32) {
         let entry_env = match self.saved_envs.get(&block_id) {
             Some(envs) if !envs.is_empty() => envs[0].1.clone(),
-            _ => return,
+            _ => {
+                // Unreachable loop header — terminate immediately.
+                self.set_control(ControlNode::Deoptimize {
+                    bytecode_offset: 0,
+                    reason: 0,
+                });
+                return;
+            }
         };
 
         let mut phis = Vec::new();
@@ -2036,7 +2050,16 @@ impl<'a> GraphBuilder<'a> {
                 self.env = e[0].1.clone();
                 return;
             }
-            _ => return,
+            _ => {
+                // No predecessor saved an environment — block is unreachable.
+                // Terminate it immediately so subsequent instructions are
+                // skipped by the `block_is_complete` check in `translate`.
+                self.set_control(ControlNode::Deoptimize {
+                    bytecode_offset: 0,
+                    reason: 0,
+                });
+                return;
+            }
         };
 
         let slot_count = self.env.slots.len();
