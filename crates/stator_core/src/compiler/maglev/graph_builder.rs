@@ -477,13 +477,6 @@ impl<'a> GraphBuilder<'a> {
                 self.enter_block(new_block);
             }
 
-            // Skip instructions in blocks that are already terminated (e.g.
-            // after an unhandled opcode emitted Deoptimize, or after entering
-            // an unreachable block with no predecessor environments).
-            if self.block_is_complete(self.current_block) {
-                continue;
-            }
-
             self.translate_one(i, instr, instructions)?;
         }
 
@@ -1896,17 +1889,29 @@ impl<'a> GraphBuilder<'a> {
     // ── Environment helpers ──────────────────────────────────────────────────
 
     /// Read the accumulator, returning an error if it has not been written.
-    fn env_get_accumulator(&self) -> StatorResult<NodeId> {
-        self.env
-            .accumulator()
-            .ok_or_else(|| StatorError::Internal("accumulator read before write".into()))
+    fn env_get_accumulator(&mut self) -> StatorResult<NodeId> {
+        if let Some(id) = self.env.accumulator() {
+            Ok(id)
+        } else {
+            // Accumulator not written — an unhandled opcode that was supposed
+            // to set the accumulator was replaced with Deoptimize.  Emit an
+            // UndefinedConstant placeholder so the rest of the block can be
+            // compiled (the deopt fires before this value is used at runtime).
+            let id = self.emit(ValueNode::UndefinedConstant)?;
+            self.env.set_accumulator(id);
+            Ok(id)
+        }
     }
 
-    /// Read a bytecode register, returning an error if it has not been written.
-    fn env_get_register(&self, reg: u32) -> StatorResult<NodeId> {
-        self.env
-            .get(reg)
-            .ok_or_else(|| StatorError::Internal(format!("register r{reg} read before write")))
+    /// Read a bytecode register, emitting a fallback if it has not been written.
+    fn env_get_register(&mut self, reg: u32) -> StatorResult<NodeId> {
+        if let Some(id) = self.env.get(reg) {
+            Ok(id)
+        } else {
+            let id = self.emit(ValueNode::UndefinedConstant)?;
+            self.env.set(reg, id);
+            Ok(id)
+        }
     }
 
     // ── Emission helpers ─────────────────────────────────────────────────────
@@ -1965,7 +1970,7 @@ impl<'a> GraphBuilder<'a> {
 
     /// Collect `count` consecutive register values starting at `start`,
     /// using the environment.
-    fn collect_args(&self, start: u32, count: u32) -> StatorResult<Vec<NodeId>> {
+    fn collect_args(&mut self, start: u32, count: u32) -> StatorResult<Vec<NodeId>> {
         (start..start + count)
             .map(|r| self.env_get_register(r))
             .collect()
@@ -2014,12 +2019,11 @@ impl<'a> GraphBuilder<'a> {
         let entry_env = match self.saved_envs.get(&block_id) {
             Some(envs) if !envs.is_empty() => envs[0].1.clone(),
             _ => {
-                // Unreachable loop header — terminate immediately.
-                self.set_control(ControlNode::Deoptimize {
-                    bytecode_offset: 0,
-                    reason: 0,
-                });
-                return;
+                // No predecessor saved an environment — use the current
+                // environment as-is.  This happens when the entry block was
+                // terminated early (e.g. unhandled opcode → Deoptimize) before
+                // reaching the jump to this loop header.
+                self.env.clone()
             }
         };
 
@@ -2051,13 +2055,8 @@ impl<'a> GraphBuilder<'a> {
                 return;
             }
             _ => {
-                // No predecessor saved an environment — block is unreachable.
-                // Terminate it immediately so subsequent instructions are
-                // skipped by the `block_is_complete` check in `translate`.
-                self.set_control(ControlNode::Deoptimize {
-                    bytecode_offset: 0,
-                    reason: 0,
-                });
+                // No predecessor saved an environment — use the current
+                // environment as-is (inherited from the previous block).
                 return;
             }
         };
