@@ -472,9 +472,21 @@ impl<'a> GraphBuilder<'a> {
                     if let Some(block) = self.graph.block_mut(new_block) {
                         block.add_predecessor(cur);
                     }
+                } else {
+                    // The current block was terminated early (e.g. Deoptimize
+                    // for an unhandled opcode) but the successor still needs
+                    // env state for its Phi nodes / loop header.
+                    self.save_env_for_successor(new_block);
                 }
                 self.current_block = new_block;
                 self.enter_block(new_block);
+            }
+
+            // Skip remaining instructions after the block's terminal control
+            // node (e.g. after Deoptimize for an unhandled opcode). This
+            // prevents emitting unreachable nodes that bloat the graph.
+            if self.block_is_complete(self.current_block) {
+                continue;
             }
 
             self.translate_one(i, instr, instructions)?;
