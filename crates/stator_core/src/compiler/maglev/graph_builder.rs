@@ -472,10 +472,12 @@ impl<'a> GraphBuilder<'a> {
                     if let Some(block) = self.graph.block_mut(new_block) {
                         block.add_predecessor(cur);
                     }
-                } else {
-                    // The current block was terminated early (e.g. Deoptimize
-                    // for an unhandled opcode) but the successor still needs
-                    // env state for its Phi nodes / loop header.
+                } else if self.block_ended_with_deoptimize(cur) {
+                    // The current block was terminated by Deoptimize (e.g. an
+                    // unhandled opcode).  The successor still needs env state
+                    // for its Phi nodes / loop header.  We only do this for
+                    // Deoptimize — not for Jump/Branch/Return which already
+                    // saved env for their explicit targets.
                     self.save_env_for_successor(new_block);
                 }
                 self.current_block = new_block;
@@ -2148,6 +2150,14 @@ impl<'a> GraphBuilder<'a> {
             .block(idx)
             .map(|b| b.is_complete())
             .unwrap_or(false)
+    }
+
+    /// Return `true` if the block was terminated specifically by Deoptimize.
+    fn block_ended_with_deoptimize(&self, idx: u32) -> bool {
+        self.graph
+            .block(idx)
+            .and_then(|b| b.control())
+            .is_some_and(|c| matches!(c, ControlNode::Deoptimize { .. }))
     }
 
     // ── Jump-target resolution ────────────────────────────────────────────────

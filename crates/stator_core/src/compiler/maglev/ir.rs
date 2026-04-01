@@ -1769,6 +1769,11 @@ impl BasicBlock {
         self.control.is_some()
     }
 
+    /// Returns the terminator control node, if set.
+    pub fn control(&self) -> Option<&ControlNode> {
+        self.control.as_ref()
+    }
+
     /// Add a predecessor block index.
     pub fn add_predecessor(&mut self, pred: u32) {
         self.predecessors.push(pred);
