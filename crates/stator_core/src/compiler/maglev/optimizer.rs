@@ -111,9 +111,12 @@ pub fn optimize(graph: &mut MaglevGraph) {
     eliminate_common_subexpressions(graph);
     let globals_promoted = promote_loop_globals_counted(graph);
     let licm_hoisted2 = crate::compiler::maglev::licm::hoist_loop_invariants(graph);
-    // Re-run truncation after global promotion: promotion replaces
-    // LoadGlobal/StoreGlobal with Phi nodes, reducing use-counts on
-    // arithmetic nodes — allowing CheckedSmi→Int32 conversion.
+    // Re-run range analysis after global promotion: promotion replaces
+    // LoadGlobal/StoreGlobal with Phi nodes, exposing induction variable
+    // and accumulator patterns that enable CheckedSmi→Int32 conversion.
+    crate::compiler::maglev::range_analysis::eliminate_overflow_checks(graph);
+    // Re-run truncation after global promotion: promotion reduces
+    // use-counts on arithmetic nodes — allowing CheckedSmi→Int32.
     let truncations2 = propagate_int32_truncation(graph);
     eliminate_identity_operations_global(graph);
     eliminate_redundant_type_guards(graph);

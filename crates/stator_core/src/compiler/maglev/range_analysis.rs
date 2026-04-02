@@ -170,8 +170,10 @@ fn seed_range(node: &ValueNode) -> Option<Range> {
             Some(Range::exact(*value as i64))
         }
         ValueNode::Uint32Constant { value } => Some(Range::exact(*value as i64)),
-        // Parameters have the full i32 range.
-        ValueNode::Parameter { .. } => Some(Range::I32_FULL),
+        // Parameters and LoadGlobal have the full i32 range.
+        // LoadGlobal returns a runtime Smi which fits i32; if the global
+        // isn't a Smi, any downstream CheckedSmi operation will deopt.
+        ValueNode::Parameter { .. } | ValueNode::LoadGlobal { .. } => Some(Range::I32_FULL),
         _ => None,
     }
 }
