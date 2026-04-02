@@ -1874,11 +1874,6 @@ fn collect_live_ids(graph: &MaglevGraph) -> HashSet<NodeId> {
     live
 }
 
-/// Public version of [`collect_live_ids`] for use by codegen.
-pub fn collect_live_node_ids(graph: &MaglevGraph) -> HashSet<NodeId> {
-    collect_live_ids(graph)
-}
-
 /// Enumerate all [`NodeId`] operands referenced by a [`ValueNode`].
 #[allow(clippy::too_many_lines)]
 fn collect_value_node_inputs(node: &ValueNode, live: &mut HashSet<NodeId>) {

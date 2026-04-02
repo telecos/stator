@@ -506,13 +506,6 @@ struct MaglevCodegen<'a> {
     /// deferred here and emitted after all main blocks.  This lets the
     /// hot loop path fall through without an extra JMP.
     deferred_branches: Vec<DeferredBranch>,
-    /// Set of `CreateMapped/UnmappedArguments` and `CreateRestParameter` node
-    /// IDs whose results are never consumed.  Codegen emits a cheap constant
-    /// load (`mov reg, JIT_UNDEFINED`) instead of the expensive trampoline
-    /// call.  Computed *after* register allocation so the allocator sees the
-    /// original call-site clobber semantics, preserving correctness.
-    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
-    dead_arguments: HashSet<NodeId>,
 }
 
 /// A deferred cold-path branch emitted out-of-line after all blocks.
@@ -565,27 +558,6 @@ impl<'a> MaglevCodegen<'a> {
         } else {
             mono_call_cache_bytes
         };
-        // Identify dead arguments nodes: CreateMapped/UnmappedArguments and
-        // CreateRestParameter whose results are never consumed by any other
-        // node.  These will emit a cheap constant instead of a trampoline call.
-        let dead_arguments = {
-            let live_refs = crate::compiler::maglev::optimizer::collect_live_node_ids(graph);
-            let mut dead = HashSet::new();
-            for block in graph.blocks() {
-                for (nid, node) in &block.nodes {
-                    if matches!(
-                        node,
-                        ValueNode::CreateMappedArguments
-                            | ValueNode::CreateUnmappedArguments
-                            | ValueNode::CreateRestParameter
-                    ) && !live_refs.contains(nid)
-                    {
-                        dead.insert(*nid);
-                    }
-                }
-            }
-            dead
-        };
         Self {
             graph,
             alloc,
@@ -609,7 +581,6 @@ impl<'a> MaglevCodegen<'a> {
             mono_call_cache_bytes,
             next_mono_cache_site: 0,
             deferred_branches: Vec::new(),
-            dead_arguments,
         }
     }
 
@@ -1789,27 +1760,15 @@ impl<'a> MaglevCodegen<'a> {
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::CreateMappedArguments => {
-                if self.dead_arguments.contains(&id) {
-                    self.emit_constant_for_node(id, JIT_UNDEFINED);
-                } else {
-                    self.emit_trampoline_call(id, Opcode::CreateMappedArguments as u8, 0, 0);
-                }
+                self.emit_trampoline_call(id, Opcode::CreateMappedArguments as u8, 0, 0);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::CreateUnmappedArguments => {
-                if self.dead_arguments.contains(&id) {
-                    self.emit_constant_for_node(id, JIT_UNDEFINED);
-                } else {
-                    self.emit_trampoline_call(id, Opcode::CreateUnmappedArguments as u8, 0, 0);
-                }
+                self.emit_trampoline_call(id, Opcode::CreateUnmappedArguments as u8, 0, 0);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::CreateRestParameter => {
-                if self.dead_arguments.contains(&id) {
-                    self.emit_constant_for_node(id, JIT_UNDEFINED);
-                } else {
-                    self.emit_trampoline_call(id, Opcode::CreateRestParameter as u8, 0, 0);
-                }
+                self.emit_trampoline_call(id, Opcode::CreateRestParameter as u8, 0, 0);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::CreateArrayLiteral { feedback_slot, .. } => {
@@ -2339,16 +2298,6 @@ impl<'a> MaglevCodegen<'a> {
                 // for side-effect-only stub calls.
             }
         }
-    }
-
-    /// Emit a constant `imm` into the location assigned to `id`.
-    ///
-    /// Used for dead arguments nodes: the register allocator already reserved
-    /// a location, so we just write the constant there without a trampoline.
-    #[cfg(all(target_arch = "x86_64", unix))]
-    fn emit_constant_for_node(&mut self, id: NodeId, imm: i64) {
-        self.masm.mov_ri(Reg64::R11, imm);
-        self.emit_store(id, Reg64::R11);
     }
 
     /// Byte offset from R14 (register-file base) for spill slot `n`.
