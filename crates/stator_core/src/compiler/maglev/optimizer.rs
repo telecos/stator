@@ -2269,6 +2269,9 @@ fn has_side_effects(node: &ValueNode) -> bool {
             | ValueNode::FastCreateClosure { .. }
             | ValueNode::CreateEmptyObjectLiteral
             | ValueNode::CreateEmptyArrayLiteral { .. }
+            | ValueNode::CreateMappedArguments
+            | ValueNode::CreateUnmappedArguments
+            | ValueNode::CreateRestParameter
             | ValueNode::CreateRegExpLiteral { .. }
             // Guards deoptimise on failure — side-effecting.
             | ValueNode::CheckSmi { .. }
