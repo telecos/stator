@@ -2069,7 +2069,21 @@ impl<'a> MaglevCodegen<'a> {
             ControlNode::Jump { target } => {
                 let target = *target as usize;
                 self.emit_phi_copies_for_successor(block_idx, target as u32);
-                self.masm.jmp(&mut self.block_labels[target]);
+
+                // Back-edge branch inversion: when jumping to a loop header
+                // whose control is a fused compare-branch, duplicate the
+                // comparison here and emit a conditional back-edge to the
+                // body.  This converts:
+                //   body: ADD + ADD + JMP header
+                //   header: CMP + JGE exit
+                // into:
+                //   header: CMP + JGE exit   (first iteration only)
+                //   body: ADD + ADD + CMP + JL body
+                // saving one unconditional JMP per iteration.
+                let rotated = self.try_rotate_back_edge(block_idx, target as u32);
+                if !rotated {
+                    self.masm.jmp(&mut self.block_labels[target]);
+                }
             }
             ControlNode::Branch {
                 condition,
@@ -3602,6 +3616,73 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.bind_label(&mut false_path);
             self.emit_phi_copies_for_successor(block_idx, if_false);
             self.masm.jmp(&mut self.block_labels[if_false_idx]);
+        }
+        true
+    }
+
+    /// Try to convert a back-edge `Jump` into a conditional branch that
+    /// skips the loop header on subsequent iterations.
+    ///
+    /// When a body block jumps to a loop header whose control is a fused
+    /// compare-branch `(CMP + Jcc)`, we duplicate the comparison at the
+    /// back-edge and emit a conditional jump directly to the body's first
+    /// block — eliminating the unconditional JMP per iteration.
+    ///
+    /// Returns `true` if the back-edge was rotated (caller must NOT emit
+    /// the unconditional JMP).
+    fn try_rotate_back_edge(&mut self, body_end_idx: u32, header_idx: u32) -> bool {
+        // Only for loop headers.
+        let header = match self.graph.block(header_idx) {
+            Some(b) if b.is_loop_header => b,
+            _ => return false,
+        };
+
+        // The header must end with a Branch.
+        let (condition, if_true, if_false) = match &header.control {
+            Some(ControlNode::Branch {
+                condition,
+                if_true,
+                if_false,
+            }) => (*condition, *if_true, *if_false),
+            _ => return false,
+        };
+
+        // The condition must be a fusible Int32 comparison.
+        let cond_node = match self.graph.node(condition) {
+            Some(n) => n.clone(),
+            None => return false,
+        };
+        let (left, right, cc) = match &cond_node {
+            ValueNode::Int32LessThan { left, right } => (*left, *right, CondCode::Less),
+            ValueNode::Int32LessThanOrEqual { left, right } => (*left, *right, CondCode::LessEq),
+            ValueNode::Int32GreaterThan { left, right } => (*left, *right, CondCode::Greater),
+            ValueNode::Int32GreaterThanOrEqual { left, right } => {
+                (*left, *right, CondCode::GreaterEq)
+            }
+            ValueNode::Int32Equal { left, right } | ValueNode::Int32StrictEqual { left, right } => {
+                (*left, *right, CondCode::Equal)
+            }
+            _ => return false,
+        };
+
+        // Don't rotate if the body end is also the header's true target
+        // (single-block loop with no separate body).
+        if body_end_idx == if_true {
+            return false;
+        }
+
+        // Emit the duplicated comparison + conditional back-edge to body.
+        self.emit_cmp32(left, right);
+        let body_target = if_true as usize;
+        self.masm.jcc(cc, &mut self.block_labels[body_target]);
+
+        // Fall through to exit.  If exit is the next block, no JMP needed;
+        // otherwise emit an unconditional JMP.
+        let next_block = body_end_idx + 1;
+        let num_blocks = self.graph.blocks().len() as u32;
+        if if_false != next_block || next_block >= num_blocks {
+            let exit_target = if_false as usize;
+            self.masm.jmp(&mut self.block_labels[exit_target]);
         }
         true
     }
