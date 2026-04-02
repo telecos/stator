@@ -4375,17 +4375,31 @@ impl<'a> MaglevCodegen<'a> {
 
         // Step 3: determine narrow-transparent Phis.
         //
-        // Start optimistic: ALL Phis are initially narrow-transparent,
-        // including those consumed by Return.  The iterative step below
-        // will remove any Phi whose non-Return, non-narrow consumer makes
-        // narrowing unsound.  For Phis consumed by Return we simply emit a
-        // single MOVSXD at the Return site (once per function exit) instead
-        // of per-iteration inside the loop.
+        // Start optimistic: Phis not consumed by control flow are initially
+        // narrow-transparent.  Phis consumed by Return are also narrow if ALL
+        // their inputs are i32-valued (candidates or i32_range) — this lets us
+        // emit a single MOVSXD at the Return site instead of per-iteration
+        // inside the loop.  Phis consumed by Return with non-i32 inputs (e.g.
+        // UndefinedConstant, heap handles) must NOT be marked narrow because
+        // MOVSXD would corrupt the sentinel/pointer value.
         let mut narrow_phi: HashSet<NodeId> = HashSet::new();
         for block in graph.blocks() {
             for (id, node) in &block.nodes {
-                if matches!(node, ValueNode::Phi { .. }) {
-                    narrow_phi.insert(*id);
+                if let ValueNode::Phi { inputs } = node {
+                    if ctrl_consumed.contains(id) {
+                        // Return-consumed Phi: only narrow if ALL inputs are
+                        // known i32-valued (wrapping int32 producers, i32
+                        // constants, or other narrow Phis that we will verify
+                        // in the iterative step).
+                        let all_i32 = inputs
+                            .iter()
+                            .all(|inp| candidates.contains(inp) || i32_range.contains(inp));
+                        if all_i32 {
+                            narrow_phi.insert(*id);
+                        }
+                    } else {
+                        narrow_phi.insert(*id);
+                    }
                 }
             }
         }
@@ -4837,9 +4851,10 @@ mod tests {
     fn test_narrow_int32_phi_excludes_producers() {
         // Block 0: p0 -> Int32Add(A) -> Jump(1)
         // Block 1: Phi(A, A) -> Return
-        // A feeds a Phi.  The Phi feeds Return which now sign-extends
-        // narrow values.  So the Phi IS narrow-transparent and A IS narrow
-        // (the single MOVSXD at Return replaces per-site sign extensions).
+        // A feeds a Phi.  The Phi feeds Return.  A is a wrapping Int32
+        // producer so it's in `candidates`.  Since ALL Phi inputs (A, A)
+        // are in candidates, the Phi IS narrow-transparent and Return
+        // sign-extends.  Therefore A IS narrow.
         let mut graph = MaglevGraph::new(1);
         let mut b0 = BasicBlock::new(0);
         let p0 = b0.push_value(ValueNode::Parameter { index: 0 });
@@ -4859,7 +4874,36 @@ mod tests {
         let set = narrow_set(&graph);
         assert!(
             set.contains(&a),
-            "A feeds Phi→Return; Phi is narrow-transparent and Return sign-extends"
+            "A is Int32Add (candidate), Phi(A,A)→Return: all inputs are candidates, so Phi is narrow-transparent"
+        );
+    }
+
+    #[test]
+    fn test_narrow_phi_return_non_i32_input_excluded() {
+        // Block 0: p0 (Parameter, NOT i32 candidate) -> Jump(1)
+        // Block 1: Phi(p0, p0) -> Return
+        // Phi feeds Return, but its inputs (Parameter) are NOT in
+        // candidates or i32_range.  The Phi must NOT be narrow because
+        // the Parameter could carry a sentinel (e.g. JIT_UNDEFINED)
+        // that would be corrupted by MOVSXD.
+        let mut graph = MaglevGraph::new(1);
+        let mut b0 = BasicBlock::new(0);
+        let p0 = b0.push_value(ValueNode::Parameter { index: 0 });
+        b0.set_control(ControlNode::Jump { target: 1 });
+        graph.add_block(b0);
+
+        let mut b1 = BasicBlock::new(1);
+        b1.add_predecessor(0);
+        let phi = b1.push_value(ValueNode::Phi {
+            inputs: vec![p0, p0],
+        });
+        b1.set_control(ControlNode::Return { value: phi });
+        graph.add_block(b1);
+
+        let set = narrow_set(&graph);
+        assert!(
+            !set.contains(&phi),
+            "Phi(Parameter,Parameter)→Return: Parameter is not i32-valued, Phi must not be narrow"
         );
     }
 
