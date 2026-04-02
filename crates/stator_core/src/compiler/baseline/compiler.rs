@@ -160,8 +160,9 @@ pub(crate) mod jit_runtime {
     use super::*;
     use crate::bytecode::bytecode_array::JitExecutableCode;
     use crate::interpreter::GlobalEnv;
+    use crate::objects::map::PropertyAttributes;
     use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
-    use crate::objects::value::{JsContext, JsValue};
+    use crate::objects::value::{JsContext, JsValue, NativeIterator};
 
     /// One slot of the own-property inline cache for `LdaNamedProperty`.
     #[derive(Clone, Copy)]
@@ -746,14 +747,107 @@ pub(crate) mod jit_runtime {
             }
 
             // ── Arguments objects ────────────────────────────────────────
-            // These opcodes create the `arguments` object for sloppy-mode
-            // functions.  Constructing a correct arguments object requires
-            // reading from the *frame* (negative register offsets) rather
-            // than the register file.  Until that layout is wired up we
-            // deopt back to the interpreter which handles it correctly.
-            Opcode::CreateMappedArguments
-            | Opcode::CreateUnmappedArguments
-            | Opcode::CreateRestParameter => None,
+            // Build arguments objects from the JIT register file which
+            // stores parameters at flat indices 0..parameter_count.
+            Opcode::CreateMappedArguments => {
+                let ba_ptr = RT_BYTECODE.with(|b| b.get());
+                if ba_ptr.is_null() {
+                    return None;
+                }
+                // SAFETY: pointer set by jit_runtime_setup and valid for
+                // the duration of JIT execution.
+                let ba = unsafe { &*ba_ptr };
+                let param_count = ba.parameter_count() as usize;
+
+                let mut args: Vec<JsValue> = Vec::with_capacity(param_count);
+                for i in 0..param_count {
+                    // SAFETY: register file is allocated with at least
+                    // parameter_count + frame_size slots.
+                    let jit_val = unsafe { *regs.add(i) };
+                    args.push(jit_i64_to_jsvalue(jit_val));
+                }
+
+                let mut map = PropertyMap::new();
+                for (i, v) in args.iter().enumerate() {
+                    map.insert(i.to_string(), v.clone());
+                }
+                map.insert_with_attrs(
+                    "length".to_string(),
+                    JsValue::Smi(args.len() as i32),
+                    PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+                );
+                // callee: reference to the executing function (sloppy mode).
+                // Reconstruct an Rc from the raw pointer — the original Rc
+                // in the interpreter frame keeps the allocation alive.
+                // SAFETY: ba_ptr came from `&*Rc<BytecodeArray>` and the Rc
+                // is alive for the entire JIT execution.
+                let callee = unsafe {
+                    Rc::increment_strong_count(ba_ptr);
+                    JsValue::Function(Rc::from_raw(ba_ptr))
+                };
+                map.insert("callee".to_string(), callee);
+                let args_for_iter = args;
+                map.insert(
+                    "@@iterator".to_string(),
+                    JsValue::NativeFunction(Rc::new(move |_args: Vec<JsValue>| {
+                        Ok(JsValue::Iterator(NativeIterator::from_items(
+                            args_for_iter.clone(),
+                        )))
+                    })),
+                );
+                let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                Some(jsvalue_to_jit_i64(obj))
+            }
+
+            Opcode::CreateUnmappedArguments => {
+                let ba_ptr = RT_BYTECODE.with(|b| b.get());
+                if ba_ptr.is_null() {
+                    return None;
+                }
+                // SAFETY: pointer set by jit_runtime_setup and valid for
+                // the duration of JIT execution.
+                let ba = unsafe { &*ba_ptr };
+                let param_count = ba.parameter_count() as usize;
+
+                let mut args: Vec<JsValue> = Vec::with_capacity(param_count);
+                for i in 0..param_count {
+                    // SAFETY: register file slots are valid.
+                    let jit_val = unsafe { *regs.add(i) };
+                    args.push(jit_i64_to_jsvalue(jit_val));
+                }
+
+                let mut map = PropertyMap::new();
+                for (i, v) in args.iter().enumerate() {
+                    map.insert(i.to_string(), v.clone());
+                }
+                map.insert_with_attrs(
+                    "length".to_string(),
+                    JsValue::Smi(args.len() as i32),
+                    PropertyAttributes::WRITABLE | PropertyAttributes::CONFIGURABLE,
+                );
+                // callee: TypeError thrower (strict mode)
+                map.insert(
+                    "callee".to_string(),
+                    JsValue::NativeFunction(Rc::new(|_args: Vec<JsValue>| {
+                        Err(StatorError::TypeError(
+                            "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them".into(),
+                        ))
+                    })),
+                );
+                let args_for_iter = args;
+                map.insert(
+                    "@@iterator".to_string(),
+                    JsValue::NativeFunction(Rc::new(move |_args: Vec<JsValue>| {
+                        Ok(JsValue::Iterator(NativeIterator::from_items(
+                            args_for_iter.clone(),
+                        )))
+                    })),
+                );
+                let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                Some(jsvalue_to_jit_i64(obj))
+            }
+
+            Opcode::CreateRestParameter => None,
 
             // ── Named property load ──────────────────────────────────────
             Opcode::LdaNamedProperty => {
