@@ -976,6 +976,10 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
         | CreateObjectLiteral { .. }
         | CreateArrayLiteral { .. }
         | CreateEmptyObjectLiteral
+        | CreateEmptyArrayLiteral { .. }
+        | CreateMappedArguments
+        | CreateUnmappedArguments
+        | CreateRestParameter
         | CreateRegExpLiteral { .. }
         | CreateClosure { .. }
         | FastCreateClosure { .. }

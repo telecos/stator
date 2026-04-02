@@ -1500,6 +1500,21 @@ pub enum ValueNode {
     /// Allocate an empty object literal (`{}`).
     CreateEmptyObjectLiteral,
 
+    /// Allocate an empty array literal (`[]`).
+    CreateEmptyArrayLiteral {
+        /// Feedback vector slot index.
+        feedback_slot: u32,
+    },
+
+    /// Create a mapped `arguments` object for sloppy-mode functions.
+    CreateMappedArguments,
+
+    /// Create an unmapped `arguments` object for strict-mode functions.
+    CreateUnmappedArguments,
+
+    /// Create the rest-parameter array from surplus arguments.
+    CreateRestParameter,
+
     /// Create a RegExp literal.
     CreateRegExpLiteral {
         /// Index of the pattern string in the constant pool.

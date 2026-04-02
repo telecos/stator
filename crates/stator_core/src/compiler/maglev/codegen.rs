@@ -1750,6 +1750,27 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_trampoline_call(id, Opcode::CreateEmptyObjectLiteral as u8, 0, 0);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::CreateEmptyArrayLiteral { feedback_slot } => {
+                self.emit_trampoline_call(
+                    id,
+                    Opcode::CreateEmptyArrayLiteral as u8,
+                    i64::from(*feedback_slot),
+                    0,
+                );
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::CreateMappedArguments => {
+                self.emit_trampoline_call(id, Opcode::CreateMappedArguments as u8, 0, 0);
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::CreateUnmappedArguments => {
+                self.emit_trampoline_call(id, Opcode::CreateUnmappedArguments as u8, 0, 0);
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::CreateRestParameter => {
+                self.emit_trampoline_call(id, Opcode::CreateRestParameter as u8, 0, 0);
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::CreateArrayLiteral { feedback_slot, .. } => {
                 self.emit_trampoline_call(
                     id,
@@ -2046,9 +2067,7 @@ impl<'a> MaglevCodegen<'a> {
 
             // ── Unsupported nodes → unconditional deopt ───────────────────────
             #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(unused_variables))]
-            other => {
-                #[cfg(all(target_arch = "x86_64", unix))]
-                eprintln!("MAGLEV_UNSUPPORTED_NODE: {other:?}");
+            _other => {
                 self.emit_deopt_unconditional(0);
                 // Satisfy the allocation invariant: write a placeholder.
                 self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
@@ -3875,6 +3894,10 @@ impl<'a> MaglevCodegen<'a> {
             | ValueNode::CreateClosure { .. }
             | ValueNode::FastCreateClosure { .. }
             | ValueNode::CreateEmptyObjectLiteral
+            | ValueNode::CreateEmptyArrayLiteral { .. }
+            | ValueNode::CreateMappedArguments
+            | ValueNode::CreateUnmappedArguments
+            | ValueNode::CreateRestParameter
             | ValueNode::CreateRegExpLiteral { .. }
             | ValueNode::ArgumentsElements { .. }
             | ValueNode::RestElements { .. }

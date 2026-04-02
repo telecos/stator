@@ -256,30 +256,6 @@ impl<'a> GraphBuilder<'a> {
         // Pass 2: translate instructions.
         builder.translate(&instructions)?;
 
-        // Diagnostic: dump block CFG for loop-detection debugging.
-        for block in builder.graph.blocks() {
-            let ctrl = match &block.control {
-                Some(crate::compiler::maglev::ir::ControlNode::Jump { target }) => {
-                    format!("Jump->{target}")
-                }
-                Some(crate::compiler::maglev::ir::ControlNode::Branch {
-                    if_true,
-                    if_false,
-                    ..
-                }) => format!("Branch->{if_true}/{if_false}"),
-                Some(crate::compiler::maglev::ir::ControlNode::Return { .. }) => "Return".into(),
-                Some(crate::compiler::maglev::ir::ControlNode::Deoptimize { .. }) => "Deopt".into(),
-                None => "NONE".into(),
-            };
-            eprintln!(
-                "MAGLEV_CFG: block {} preds={:?} nodes={} ctrl={}",
-                block.id,
-                block.predecessors,
-                block.nodes.len(),
-                ctrl,
-            );
-        }
-
         Ok(builder.graph)
     }
 
@@ -1559,6 +1535,25 @@ impl<'a> GraphBuilder<'a> {
                 let id = self.emit(ValueNode::CreateEmptyObjectLiteral)?;
                 self.env.set_accumulator(id);
             }
+            Opcode::CreateEmptyArrayLiteral => {
+                let slot = self.operand_feedback_slot(instr, 0)?;
+                let id = self.emit(ValueNode::CreateEmptyArrayLiteral {
+                    feedback_slot: slot,
+                })?;
+                self.env.set_accumulator(id);
+            }
+            Opcode::CreateMappedArguments => {
+                let id = self.emit(ValueNode::CreateMappedArguments)?;
+                self.env.set_accumulator(id);
+            }
+            Opcode::CreateUnmappedArguments => {
+                let id = self.emit(ValueNode::CreateUnmappedArguments)?;
+                self.env.set_accumulator(id);
+            }
+            Opcode::CreateRestParameter => {
+                let id = self.emit(ValueNode::CreateRestParameter)?;
+                self.env.set_accumulator(id);
+            }
             Opcode::CreateArrayLiteral => {
                 let elems = self.operand_constant_pool_idx(instr, 0)?;
                 let slot = self.operand_feedback_slot(instr, 1)?;
@@ -1740,10 +1735,6 @@ impl<'a> GraphBuilder<'a> {
             // let the interpreter execute the rest.
             _ => {
                 let offset = self.byte_offset_of(all_instructions, instr_idx) as u32;
-                eprintln!(
-                    "MAGLEV_GRAPH: unhandled opcode {:?} at bytecode offset {offset}",
-                    instr.opcode
-                );
                 if !self.block_is_complete(self.current_block) {
                     self.set_control(ControlNode::Deoptimize {
                         bytecode_offset: offset,
@@ -2923,6 +2914,102 @@ mod tests {
             deopt_blocks.is_empty(),
             "graph has Deoptimize control in blocks {deopt_blocks:?} — \
              indicates unhandled bytecodes"
+        );
+    }
+
+    /// Helper: compile JS source → graph builder → optimizer, return graph.
+    /// Panics on any failure.  Also prints all bytecodes for diagnostics.
+    fn compile_and_optimize(source: &str, label: &str) -> MaglevGraph {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::compiler::maglev::optimizer::optimize;
+        use crate::parser::recursive_descent;
+
+        let program = recursive_descent::parse(source).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+        let instructions = ba.instructions().unwrap();
+        eprintln!(
+            "{label}: {} bytecodes, {} raw bytes",
+            instructions.len(),
+            ba.bytecodes().len()
+        );
+        for (idx, instr) in instructions.iter().enumerate() {
+            eprintln!("  [{idx:3}] {:?}", instr.opcode);
+        }
+
+        let feedback = FeedbackVector::new(ba.feedback_metadata());
+        let mut graph = GraphBuilder::build(&ba, &feedback).unwrap();
+        optimize(&mut graph);
+
+        // Check degenerate
+        let degen = graph.is_degenerate();
+        eprintln!("{label}: is_degenerate={degen}");
+
+        // Print entry block control
+        if let Some(entry) = graph.entry_block() {
+            eprintln!(
+                "{label}: entry block has {} nodes, control={:?}",
+                entry.nodes.len(),
+                entry.control
+            );
+        }
+
+        graph
+    }
+
+    #[test]
+    fn test_property_access_benchmark_not_degenerate() {
+        let source = r#"
+            var obj = { a: 1, b: 2, c: 3, d: 4, e: 5 };
+            var sum = 0;
+            for (var i = 0; i < 1000; i++) {
+                sum = sum + obj.a + obj.b + obj.c + obj.d + obj.e;
+            }
+            sum;
+        "#;
+        let graph = compile_and_optimize(source, "property_access_1k");
+        assert!(
+            !graph.is_degenerate(),
+            "property_access_1k graph is degenerate — Maglev won't compile it"
+        );
+    }
+
+    #[test]
+    fn test_prototype_chain_benchmark_not_degenerate() {
+        let source = r#"
+            function Base() {}
+            Base.prototype.x = 42;
+            function Mid() {}
+            Mid.prototype = new Base();
+            function Leaf() {}
+            Leaf.prototype = new Mid();
+            var obj = new Leaf();
+            var sum = 0;
+            for (var i = 0; i < 1000; i++) {
+                sum = sum + obj.x;
+            }
+            sum;
+        "#;
+        let graph = compile_and_optimize(source, "prototype_chain_1k");
+        assert!(
+            !graph.is_degenerate(),
+            "prototype_chain_1k graph is degenerate — Maglev won't compile it"
+        );
+    }
+
+    #[test]
+    fn test_deep_object_benchmark_not_degenerate() {
+        let source = r#"
+            var root = { a: { b: { c: { d: { e: 99 } } } } };
+            var sum = 0;
+            for (var i = 0; i < 1000; i++) {
+                sum = sum + root.a.b.c.d.e;
+            }
+            sum;
+        "#;
+        let graph = compile_and_optimize(source, "deep_object_access_1k");
+        assert!(
+            !graph.is_degenerate(),
+            "deep_object_access_1k graph is degenerate — Maglev won't compile it"
         );
     }
 }

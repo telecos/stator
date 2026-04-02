@@ -98,21 +98,7 @@ pub fn hoist_loop_invariants(graph: &mut MaglevGraph) -> usize {
     let num_blocks = graph.blocks().len();
     let loops = detect_loops(graph);
 
-    if loops.is_empty() && num_blocks >= 3 {
-        // Diagnostic: show block structure when no loops found in a multi-block graph.
-        eprintln!("LICM: no loops in {num_blocks}-block graph; edges:");
-        for block in graph.blocks() {
-            let targets = control_targets(block);
-            for &t in &targets {
-                eprintln!(
-                    "  block {} -> {} (build_loop={})",
-                    block.id,
-                    t,
-                    build_loop(graph, t, block.id).is_some()
-                );
-            }
-        }
-    }
+    let _ = num_blocks;
 
     let mut total = 0;
     for lp in &loops {
@@ -121,13 +107,6 @@ pub fn hoist_loop_invariants(graph: &mut MaglevGraph) -> usize {
             header_block.is_loop_header = true;
         }
         total += hoist_one_loop(graph, lp);
-    }
-    if !loops.is_empty() {
-        eprintln!(
-            "LICM: {} loops detected, {} nodes hoisted",
-            loops.len(),
-            total
-        );
     }
     total
 }
@@ -319,16 +298,6 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
     // loads (LoadNamedGeneric / LoadKeyedGeneric) must stay in the loop.
     // Stable across passes (we never hoist calls or stores).
     let has_property_side_effects = loop_has_property_side_effects(graph, &lp.body);
-
-    eprintln!(
-        "LICM_DETAIL: loop header={} preheader={} body={:?} mutated_obj={} mutated_glob={:?} prop_side_effects={}",
-        lp.header,
-        lp.preheader,
-        lp.body,
-        mutated_objects.len(),
-        mutated_globals,
-        has_property_side_effects,
-    );
 
     let mut total_hoisted = 0;
 
@@ -570,6 +539,10 @@ fn is_pure(node: &ValueNode) -> bool {
             | ValueNode::CreateClosure { .. }
             | ValueNode::FastCreateClosure { .. }
             | ValueNode::CreateEmptyObjectLiteral
+            | ValueNode::CreateEmptyArrayLiteral { .. }
+            | ValueNode::CreateMappedArguments
+            | ValueNode::CreateUnmappedArguments
+            | ValueNode::CreateRestParameter
             | ValueNode::CreateRegExpLiteral { .. }
             | ValueNode::CheckSmi { .. }
             | ValueNode::CheckNumber { .. }
@@ -651,6 +624,10 @@ fn visit_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
         | ValueNode::CreateObjectLiteral { .. }
         | ValueNode::CreateArrayLiteral { .. }
         | ValueNode::CreateEmptyObjectLiteral
+        | ValueNode::CreateEmptyArrayLiteral { .. }
+        | ValueNode::CreateMappedArguments
+        | ValueNode::CreateUnmappedArguments
+        | ValueNode::CreateRestParameter
         | ValueNode::CreateRegExpLiteral { .. }
         | ValueNode::CreateClosure { .. }
         | ValueNode::FastCreateClosure { .. }

@@ -92,47 +92,37 @@ use crate::compiler::maglev::licm;
 /// Multiple rounds are *not* performed; a single sweep of each pass is
 /// sufficient for the patterns targeted here.
 pub fn optimize(graph: &mut MaglevGraph) {
-    let block_count = graph.blocks().len();
-    let node_count: usize = graph.blocks().iter().map(|b| b.nodes.len()).sum();
+    let _block_count = graph.blocks().len();
+    let _node_count: usize = graph.blocks().iter().map(|b| b.nodes.len()).sum();
 
     fold_constants(graph);
 
-    let truncations = propagate_int32_truncation(graph);
+    let _truncations = propagate_int32_truncation(graph);
     simplify_identities(graph);
     reassociate_arithmetic(graph);
     strength_reduce(graph);
     crate::compiler::maglev::range_analysis::eliminate_overflow_checks(graph);
-    let licm_hoisted = crate::compiler::maglev::licm::hoist_loop_invariants(graph);
+    let _licm_hoisted = crate::compiler::maglev::licm::hoist_loop_invariants(graph);
     // TODO: implement loop peeling — execute the first iteration outside the
     // loop to establish type information (e.g. from CheckSmi guards), then
     // specialise the loop body based on proven types.  This requires
     // duplicating the loop header and body, which is non-trivial with the
     // current graph structure.
     eliminate_common_subexpressions(graph);
-    let globals_promoted = promote_loop_globals_counted(graph);
-    let licm_hoisted2 = crate::compiler::maglev::licm::hoist_loop_invariants(graph);
+    let _globals_promoted = promote_loop_globals_counted(graph);
+    let _licm_hoisted2 = crate::compiler::maglev::licm::hoist_loop_invariants(graph);
     // Re-run range analysis after global promotion: promotion replaces
     // LoadGlobal/StoreGlobal with Phi nodes, exposing induction variable
     // and accumulator patterns that enable CheckedSmi→Int32 conversion.
     crate::compiler::maglev::range_analysis::eliminate_overflow_checks(graph);
     // Re-run truncation after global promotion: promotion reduces
     // use-counts on arithmetic nodes — allowing CheckedSmi→Int32.
-    let truncations2 = propagate_int32_truncation(graph);
+    let _truncations2 = propagate_int32_truncation(graph);
     eliminate_identity_operations_global(graph);
     eliminate_redundant_type_guards(graph);
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
     eliminate_dead_code(graph);
-
-    let total_truncations = truncations + truncations2;
-    let total_licm = licm_hoisted + licm_hoisted2;
-    let final_nodes: usize = graph.blocks().iter().map(|b| b.nodes.len()).sum();
-    // Always print summary so we can confirm optimizer runs at all.
-    eprintln!(
-        "MAGLEV_OPT: blocks={block_count} nodes={node_count}->{final_nodes} \
-         licm_hoisted={total_licm} globals_promoted={globals_promoted} \
-         truncated={total_truncations}"
-    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1363,7 +1353,7 @@ fn cse_in_block(block: &mut BasicBlock) {
 fn promote_loop_globals_counted(graph: &mut MaglevGraph) -> usize {
     let loops = licm::detect_loops(graph);
     if loops.is_empty() {
-        eprintln!("GLOBALS_PROMO: no loops detected, skipping");
+        return 0;
     }
     let mut count = 0;
 
@@ -1913,6 +1903,10 @@ fn collect_value_node_inputs(node: &ValueNode, live: &mut HashSet<NodeId>) {
         | ValueNode::CreateObjectLiteral { .. }
         | ValueNode::CreateArrayLiteral { .. }
         | ValueNode::CreateEmptyObjectLiteral
+        | ValueNode::CreateEmptyArrayLiteral { .. }
+        | ValueNode::CreateMappedArguments
+        | ValueNode::CreateUnmappedArguments
+        | ValueNode::CreateRestParameter
         | ValueNode::CreateRegExpLiteral { .. }
         | ValueNode::CreateClosure { .. }
         | ValueNode::FastCreateClosure { .. }
@@ -2274,6 +2268,10 @@ fn has_side_effects(node: &ValueNode) -> bool {
             | ValueNode::CreateClosure { .. }
             | ValueNode::FastCreateClosure { .. }
             | ValueNode::CreateEmptyObjectLiteral
+            | ValueNode::CreateEmptyArrayLiteral { .. }
+            | ValueNode::CreateMappedArguments
+            | ValueNode::CreateUnmappedArguments
+            | ValueNode::CreateRestParameter
             | ValueNode::CreateRegExpLiteral { .. }
             // Guards deoptimise on failure — side-effecting.
             | ValueNode::CheckSmi { .. }
@@ -2366,6 +2364,10 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
         | ValueNode::CreateObjectLiteral { .. }
         | ValueNode::CreateArrayLiteral { .. }
         | ValueNode::CreateEmptyObjectLiteral
+        | ValueNode::CreateEmptyArrayLiteral { .. }
+        | ValueNode::CreateMappedArguments
+        | ValueNode::CreateUnmappedArguments
+        | ValueNode::CreateRestParameter
         | ValueNode::CreateRegExpLiteral { .. }
         | ValueNode::CreateClosure { .. }
         | ValueNode::FastCreateClosure { .. }

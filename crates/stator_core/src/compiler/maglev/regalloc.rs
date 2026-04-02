@@ -212,6 +212,10 @@ fn collect_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
         | ValueNode::CreateObjectLiteral { .. }
         | ValueNode::CreateArrayLiteral { .. }
         | ValueNode::CreateEmptyObjectLiteral
+        | ValueNode::CreateEmptyArrayLiteral { .. }
+        | ValueNode::CreateMappedArguments
+        | ValueNode::CreateUnmappedArguments
+        | ValueNode::CreateRestParameter
         | ValueNode::CreateRegExpLiteral { .. }
         | ValueNode::CreateClosure { .. }
         | ValueNode::FastCreateClosure { .. }

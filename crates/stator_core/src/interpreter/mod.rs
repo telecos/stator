@@ -1303,21 +1303,12 @@ pub fn maybe_compile_maglev(ba: &BytecodeArray) {
                         // cascading deoptimisation to callers via Construct /
                         // Call stubs and severely degrading performance.
                         if graph.is_degenerate() {
-                            eprintln!(
-                                "MAGLEV_COMPILE: skipping degenerate graph (bc_len={})",
-                                input.ba.bytecodes().len()
-                            );
                             MAGLEV_COMPILATION_FAILED
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         } else {
                             match maglev_codegen::compile(&graph, param_count) {
                                 Ok(cc) => {
                                     let code_len = cc.code.len();
-                                    eprintln!(
-                                        "MAGLEV_COMPILE: OK bc_len={} code={code_len}B regs={}",
-                                        input.ba.bytecodes().len(),
-                                        cc.register_file_slots,
-                                    );
                                     if let Ok(mut guard) = input.result_cache.lock() {
                                         // SAFETY: `cc.code` was produced by `maglev_codegen::compile`.
                                         if let Ok(cached) = unsafe {
@@ -1335,10 +1326,9 @@ pub fn maybe_compile_maglev(ba: &BytecodeArray) {
                                     MAGLEV_CODE_BYTES
                                         .fetch_add(code_len, std::sync::atomic::Ordering::Relaxed);
                                 }
-                                Err(e) => {
+                                Err(_e) => {
                                     MAGLEV_COMPILATION_FAILED
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    eprintln!("MAGLEV_COMPILE: codegen failed: {e}");
                                 }
                             }
                         } // else !is_degenerate
