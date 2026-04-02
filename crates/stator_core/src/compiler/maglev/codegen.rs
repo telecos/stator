@@ -2082,6 +2082,12 @@ impl<'a> MaglevCodegen<'a> {
         match ctrl {
             ControlNode::Return { value } => {
                 self.emit_load(*value, Reg64::Rax);
+                // Sign-extend if the returned value has narrow (garbage upper
+                // 32 bits) — this is the single MOVSXD that replaces per-
+                // iteration sign extensions inside the loop.
+                if self.narrow_int32.contains(value) {
+                    self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+                }
                 self.emit_promoted_global_stores();
                 self.emit_normal_epilogue();
             }
@@ -4369,14 +4375,16 @@ impl<'a> MaglevCodegen<'a> {
 
         // Step 3: determine narrow-transparent Phis.
         //
-        // Start optimistic (all Phis not consumed by control flow are
-        // narrow-transparent) and iterate: if any Phi has a consumer that
-        // is neither a narrow consumer nor a narrow-transparent Phi, remove
-        // it.  Converges in O(#Phi_chains) iterations (typically 1-2).
+        // Start optimistic: ALL Phis are initially narrow-transparent,
+        // including those consumed by Return.  The iterative step below
+        // will remove any Phi whose non-Return, non-narrow consumer makes
+        // narrowing unsound.  For Phis consumed by Return we simply emit a
+        // single MOVSXD at the Return site (once per function exit) instead
+        // of per-iteration inside the loop.
         let mut narrow_phi: HashSet<NodeId> = HashSet::new();
         for block in graph.blocks() {
             for (id, node) in &block.nodes {
-                if matches!(node, ValueNode::Phi { .. }) && !ctrl_consumed.contains(id) {
+                if matches!(node, ValueNode::Phi { .. }) {
                     narrow_phi.insert(*id);
                 }
             }
@@ -4431,7 +4439,12 @@ impl<'a> MaglevCodegen<'a> {
             if let Some(ctrl) = &block.control {
                 match ctrl {
                     ControlNode::Return { value } => {
-                        non_narrow.insert(*value);
+                        // Don't mark Return values as non-narrow if they are
+                        // narrow-transparent Phis — we sign-extend once at the
+                        // Return site instead of per-iteration in the loop.
+                        if !narrow_phi.contains(value) {
+                            non_narrow.insert(*value);
+                        }
                     }
                     ControlNode::Branch { condition, .. } => {
                         non_narrow.insert(*condition);
@@ -4824,8 +4837,9 @@ mod tests {
     fn test_narrow_int32_phi_excludes_producers() {
         // Block 0: p0 -> Int32Add(A) -> Jump(1)
         // Block 1: Phi(A, A) -> Return
-        // A feeds a Phi.  The Phi feeds Return (non-narrow), so the Phi is
-        // NOT narrow-transparent.  Therefore A must be excluded.
+        // A feeds a Phi.  The Phi feeds Return which now sign-extends
+        // narrow values.  So the Phi IS narrow-transparent and A IS narrow
+        // (the single MOVSXD at Return replaces per-site sign extensions).
         let mut graph = MaglevGraph::new(1);
         let mut b0 = BasicBlock::new(0);
         let p0 = b0.push_value(ValueNode::Parameter { index: 0 });
@@ -4844,8 +4858,8 @@ mod tests {
 
         let set = narrow_set(&graph);
         assert!(
-            !set.contains(&a),
-            "A feeds Phi→Return and must not be narrow"
+            set.contains(&a),
+            "A feeds Phi→Return; Phi is narrow-transparent and Return sign-extends"
         );
     }
 
