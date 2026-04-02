@@ -2347,7 +2347,7 @@ impl<'a> MaglevCodegen<'a> {
     /// a location, so we just write the constant there without a trampoline.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_constant_for_node(&mut self, id: NodeId, imm: i64) {
-        self.masm.mov_ri(Reg64::R11, imm as u64);
+        self.masm.mov_ri(Reg64::R11, imm);
         self.emit_store(id, Reg64::R11);
     }
 
