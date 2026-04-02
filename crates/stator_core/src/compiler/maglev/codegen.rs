@@ -501,6 +501,22 @@ struct MaglevCodegen<'a> {
     /// offsets to each `CallUndefinedReceiver0` site.
     #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
     next_mono_cache_site: i32,
+    /// Deferred cold-path branch targets.  When a fused compare-branch's
+    /// true target is the very next block, the false (unlikely) path is
+    /// deferred here and emitted after all main blocks.  This lets the
+    /// hot loop path fall through without an extra JMP.
+    deferred_branches: Vec<DeferredBranch>,
+}
+
+/// A deferred cold-path branch emitted out-of-line after all blocks.
+struct DeferredBranch {
+    /// Forward-reference label jumped to by the conditional branch.
+    label: Label,
+    /// Phi copies to emit at the cold path (pred → successor).
+    pred_idx: u32,
+    successor_idx: u32,
+    /// Block label to jump to after Phi copies.
+    target_block: u32,
 }
 
 impl<'a> MaglevCodegen<'a> {
@@ -564,6 +580,7 @@ impl<'a> MaglevCodegen<'a> {
             i32_range: HashSet::new(),
             mono_call_cache_bytes,
             next_mono_cache_site: 0,
+            deferred_branches: Vec::new(),
         }
     }
 
@@ -598,6 +615,10 @@ impl<'a> MaglevCodegen<'a> {
         for block_idx in 0..self.graph.blocks().len() {
             self.emit_block(block_idx as u32);
         }
+
+        // Emit deferred cold-path branches (loop exit paths placed
+        // out-of-line so the hot loop body can fall through).
+        self.emit_deferred_branches();
 
         self.emit_deopt_epilogue();
 
@@ -719,6 +740,19 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.pop(Reg64::Rbx);
         self.masm.pop(Reg64::Rbp);
         self.masm.ret();
+    }
+
+    /// Emit all deferred cold-path branches.  These are loop-exit paths
+    /// moved out-of-line so the hot loop body can fall through from the
+    /// fused compare-branch without an extra JMP.
+    fn emit_deferred_branches(&mut self) {
+        let branches = std::mem::take(&mut self.deferred_branches);
+        for mut db in branches {
+            self.masm.bind_label(&mut db.label);
+            self.emit_phi_copies_for_successor(db.pred_idx, db.successor_idx);
+            let target = db.target_block as usize;
+            self.masm.jmp(&mut self.block_labels[target]);
+        }
     }
 
     /// Emit the shared deopt epilogue with categorised deopt labels.
@@ -2044,13 +2078,28 @@ impl<'a> MaglevCodegen<'a> {
                     self.masm.mov_ri(Reg64::R10, JIT_TRUE);
                     self.masm.cmp_rr(Reg64::R11, Reg64::R10);
 
-                    let mut false_path = Label::new();
-                    self.masm.jcc(CondCode::NotEqual, &mut false_path);
-                    self.emit_phi_copies_for_successor(block_idx, *if_true);
-                    self.masm.jmp(&mut self.block_labels[if_true_idx]);
-                    self.masm.bind_label(&mut false_path);
-                    self.emit_phi_copies_for_successor(block_idx, *if_false);
-                    self.masm.jmp(&mut self.block_labels[if_false_idx]);
+                    let next_block = block_idx + 1;
+                    let num_blocks = self.graph.blocks().len() as u32;
+                    if *if_true == next_block && next_block < num_blocks {
+                        // Hot path falls through to if_true; cold path deferred.
+                        let mut cold_label = Label::new();
+                        self.masm.jcc(CondCode::NotEqual, &mut cold_label);
+                        self.emit_phi_copies_for_successor(block_idx, *if_true);
+                        self.deferred_branches.push(DeferredBranch {
+                            label: cold_label,
+                            pred_idx: block_idx,
+                            successor_idx: *if_false,
+                            target_block: *if_false,
+                        });
+                    } else {
+                        let mut false_path = Label::new();
+                        self.masm.jcc(CondCode::NotEqual, &mut false_path);
+                        self.emit_phi_copies_for_successor(block_idx, *if_true);
+                        self.masm.jmp(&mut self.block_labels[if_true_idx]);
+                        self.masm.bind_label(&mut false_path);
+                        self.emit_phi_copies_for_successor(block_idx, *if_false);
+                        self.masm.jmp(&mut self.block_labels[if_false_idx]);
+                    }
                 }
             }
             ControlNode::Deoptimize {
@@ -3479,6 +3528,11 @@ impl<'a> MaglevCodegen<'a> {
     /// the original operands and branch directly, saving ~10 instructions per
     /// compare-and-branch versus materialising a JIT_TRUE/JIT_FALSE boolean.
     ///
+    /// When `if_true` is the very next block in emission order, the false
+    /// (unlikely) path is deferred out-of-line so the hot path can fall
+    /// through without an extra JMP — saving one instruction per loop
+    /// iteration.
+    ///
     /// Returns `true` if the fusion was emitted.
     fn try_fuse_compare_branch(
         &mut self,
@@ -3508,17 +3562,35 @@ impl<'a> MaglevCodegen<'a> {
         // registers directly when available and CMP-immediate for constants.
         self.emit_cmp32(left, right);
 
-        // Branch directly: condition-false falls through to false phi-copies.
         let if_true_idx = if_true as usize;
         let if_false_idx = if_false as usize;
         let negated = Self::negate_cc(cc);
-        let mut false_path = Label::new();
-        self.masm.jcc(negated, &mut false_path);
-        self.emit_phi_copies_for_successor(block_idx, if_true);
-        self.masm.jmp(&mut self.block_labels[if_true_idx]);
-        self.masm.bind_label(&mut false_path);
-        self.emit_phi_copies_for_successor(block_idx, if_false);
-        self.masm.jmp(&mut self.block_labels[if_false_idx]);
+
+        // Optimisation: when the true target is the next emitted block, defer
+        // the false (cold) path out-of-line so the hot path falls through
+        // without an unconditional JMP.
+        let next_block = block_idx + 1;
+        let num_blocks = self.graph.blocks().len() as u32;
+        if if_true == next_block && next_block < num_blocks {
+            let mut cold_label = Label::new();
+            self.masm.jcc(negated, &mut cold_label);
+            self.emit_phi_copies_for_successor(block_idx, if_true);
+            // Fall through to the next block (if_true) — no JMP needed.
+            self.deferred_branches.push(DeferredBranch {
+                label: cold_label,
+                pred_idx: block_idx,
+                successor_idx: if_false,
+                target_block: if_false,
+            });
+        } else {
+            let mut false_path = Label::new();
+            self.masm.jcc(negated, &mut false_path);
+            self.emit_phi_copies_for_successor(block_idx, if_true);
+            self.masm.jmp(&mut self.block_labels[if_true_idx]);
+            self.masm.bind_label(&mut false_path);
+            self.emit_phi_copies_for_successor(block_idx, if_false);
+            self.masm.jmp(&mut self.block_labels[if_false_idx]);
+        }
         true
     }
 
