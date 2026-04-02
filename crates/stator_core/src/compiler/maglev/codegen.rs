@@ -2310,18 +2310,8 @@ impl<'a> MaglevCodegen<'a> {
     /// produce an integer (Smi / Int32) value.  Used by the inline
     /// array-element emission to decide between the lean Smi fast-path
     /// and the generic keyed-property runtime call.
-    ///
-    /// Checks both the static node type and the `i32_range` set which
-    /// includes Phi nodes whose inputs are all provably i32 (e.g. loop
-    /// counters after range analysis).
     #[cfg(all(target_arch = "x86_64", unix))]
     fn is_known_int32_key(&self, id: NodeId) -> bool {
-        // The i32_range set (computed via fixed-point) includes Phi nodes
-        // that feed from Int32 producers — essential for promoted loop
-        // counters used as array indices.
-        if self.i32_range.contains(&id) {
-            return true;
-        }
         matches!(
             self.graph.node(id),
             Some(
