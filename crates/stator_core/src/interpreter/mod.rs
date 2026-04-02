@@ -1082,6 +1082,20 @@ pub fn maglev_diagnostics() -> (u64, u64, u64, u64, u32, usize, u32, u32, u32) {
     (0, 0, 0, 0, 0, 0, 0, 0, 0)
 }
 
+/// Return LICM diagnostic counters.
+///
+/// Returns `(loops_detected, nodes_hoisted, named_generic_hoisted,
+/// blocked_by_side_effects)`.
+pub fn licm_diagnostics() -> (u32, u32, u32, u32) {
+    use crate::compiler::maglev::licm;
+    (
+        licm::LICM_LOOPS_DETECTED.load(std::sync::atomic::Ordering::Relaxed),
+        licm::LICM_NODES_HOISTED.load(std::sync::atomic::Ordering::Relaxed),
+        licm::LICM_NAMED_GENERIC_HOISTED.load(std::sync::atomic::Ordering::Relaxed),
+        licm::LICM_BLOCKED_BY_SIDE_EFFECTS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Return per-tier compilation counts as `(baseline, maglev, turbofan)`.
 pub fn jit_tier_stats() -> (u64, u64, u64) {
     (

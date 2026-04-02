@@ -36,7 +36,9 @@ use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_core::error::StatorResult;
 use stator_core::gc::handle::HandleScope;
 use stator_core::gc::heap::{Heap, HeapObject};
-use stator_core::interpreter::{GlobalEnv, Interpreter, InterpreterFrame, maglev_diagnostics};
+use stator_core::interpreter::{
+    GlobalEnv, Interpreter, InterpreterFrame, licm_diagnostics, maglev_diagnostics,
+};
 use stator_core::objects::property_map::PropertyMap;
 use stator_core::objects::tagged::TaggedValue;
 use stator_core::objects::value::JsValue;
@@ -876,6 +878,10 @@ fn bench_property_access_1k_precompiled(c: &mut Criterion) {
         maglev_diagnostics();
     eprintln!(
         "MAGLEV_DIAG[property_access_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes} started={started} failed={failed} panicked={panicked}"
+    );
+    let (loops, hoisted, named_hoisted, blocked) = licm_diagnostics();
+    eprintln!(
+        "LICM_DIAG[property_access_1k]: loops={loops} hoisted={hoisted} named_generic_hoisted={named_hoisted} blocked_by_side_effects={blocked}"
     );
 }
 

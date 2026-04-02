@@ -86,8 +86,22 @@
 //! ```
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, NodeId, ValueNode};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Diagnostics — atomic counters incremented from compilation threads
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Total loops detected across all compilations.
+pub static LICM_LOOPS_DETECTED: AtomicU32 = AtomicU32::new(0);
+/// Total nodes hoisted across all compilations.
+pub static LICM_NODES_HOISTED: AtomicU32 = AtomicU32::new(0);
+/// Total LoadNamedGeneric nodes hoisted.
+pub static LICM_NAMED_GENERIC_HOISTED: AtomicU32 = AtomicU32::new(0);
+/// Loops where property side-effects blocked hoisting of LoadNamedGeneric.
+pub static LICM_BLOCKED_BY_SIDE_EFFECTS: AtomicU32 = AtomicU32::new(0);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry-point
@@ -99,6 +113,8 @@ pub fn hoist_loop_invariants(graph: &mut MaglevGraph) -> usize {
     let loops = detect_loops(graph);
 
     let _ = num_blocks;
+
+    LICM_LOOPS_DETECTED.fetch_add(loops.len() as u32, Ordering::Relaxed);
 
     let mut total = 0;
     for lp in &loops {
@@ -299,7 +315,53 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
     // Stable across passes (we never hoist calls or stores).
     let has_property_side_effects = loop_has_property_side_effects(graph, &lp.body);
 
+    // Count LoadNamedGeneric nodes inside the loop for diagnostics.
+    let mut load_named_in_loop = 0u32;
+    for block in graph.blocks() {
+        if !lp.body.contains(&block.id) {
+            continue;
+        }
+        for (_, node) in &block.nodes {
+            if matches!(node, ValueNode::LoadNamedGeneric { .. }) {
+                load_named_in_loop += 1;
+            }
+        }
+    }
+    if has_property_side_effects && load_named_in_loop > 0 {
+        LICM_BLOCKED_BY_SIDE_EFFECTS.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "LICM: loop header={} has {load_named_in_loop} LoadNamedGeneric BLOCKED by side-effects",
+            lp.header
+        );
+        // Log which node caused the side-effect flag.
+        for block in graph.blocks() {
+            if !lp.body.contains(&block.id) {
+                continue;
+            }
+            for (id, node) in &block.nodes {
+                if matches!(
+                    node,
+                    ValueNode::StoreNamedGeneric { .. }
+                        | ValueNode::StoreKeyedGeneric { .. }
+                        | ValueNode::Call { .. }
+                        | ValueNode::CallKnownFunction { .. }
+                        | ValueNode::CallBuiltin { .. }
+                        | ValueNode::CallRuntime { .. }
+                        | ValueNode::CallWithSpread { .. }
+                        | ValueNode::Construct { .. }
+                        | ValueNode::ConstructWithSpread { .. }
+                ) {
+                    eprintln!(
+                        "  LICM: side-effect node {id:?} in block {}: {node:?}",
+                        block.id
+                    );
+                }
+            }
+        }
+    }
+
     let mut total_hoisted = 0;
+    let mut named_generic_hoisted = 0u32;
 
     // Iterate until a full pass finds nothing new to hoist.
     loop {
@@ -333,19 +395,38 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
                 let inputs_out = all_inputs_outside(node, &outside_defs);
                 let alias_store = load_aliases_store(node, &mutated_objects);
                 let alias_glob = global_load_aliases_store(node, &mutated_globals);
-                let blocked_by_side_effects =
+                let blocked_by_side_effects_flag =
                     is_generic_property_load(node) && has_property_side_effects;
-                if pure && inputs_out && !alias_store && !alias_glob && !blocked_by_side_effects {
+                if pure
+                    && inputs_out
+                    && !alias_store
+                    && !alias_glob
+                    && !blocked_by_side_effects_flag
+                {
                     to_hoist.push((block.id, pos, *id, node.clone()));
                     // Eagerly mark as outside so later nodes in this same
                     // block can see the dependency as satisfied.
                     outside_defs.insert(*id);
+                } else if matches!(node, ValueNode::LoadNamedGeneric { .. }) {
+                    // Diagnostic: why wasn't this LoadNamedGeneric hoisted?
+                    eprintln!(
+                        "LICM: LoadNamedGeneric {id:?} NOT hoisted: pure={pure} inputs_out={inputs_out} \
+                         alias_store={alias_store} alias_glob={alias_glob} \
+                         blocked_side_effects={blocked_by_side_effects_flag}"
+                    );
                 }
             }
         }
 
         if to_hoist.is_empty() {
             break;
+        }
+
+        // Count LoadNamedGeneric among hoisted nodes.
+        for (_, _, _, node) in &to_hoist {
+            if matches!(node, ValueNode::LoadNamedGeneric { .. }) {
+                named_generic_hoisted += 1;
+            }
         }
 
         // Remove hoisted nodes from their source blocks (iterate in reverse
@@ -378,6 +459,19 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
             }
         }
         total_hoisted += pass_count;
+    }
+
+    // Update global counters.
+    LICM_NODES_HOISTED.fetch_add(total_hoisted as u32, Ordering::Relaxed);
+    LICM_NAMED_GENERIC_HOISTED.fetch_add(named_generic_hoisted, Ordering::Relaxed);
+
+    if load_named_in_loop > 0 {
+        eprintln!(
+            "LICM: loop header={} body_blocks={} total_hoisted={total_hoisted} \
+             named_generic_hoisted={named_generic_hoisted}/{load_named_in_loop}",
+            lp.header,
+            lp.body.len()
+        );
     }
 
     total_hoisted
