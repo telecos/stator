@@ -116,6 +116,10 @@ pub fn hoist_loop_invariants(graph: &mut MaglevGraph) -> usize {
 
     let mut total = 0;
     for lp in &loops {
+        // Mark the loop header so codegen can align it.
+        if let Some(header_block) = graph.block_mut(lp.header) {
+            header_block.is_loop_header = true;
+        }
         total += hoist_one_loop(graph, lp);
     }
     if !loops.is_empty() {

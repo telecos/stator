@@ -312,6 +312,52 @@ impl MacroAssembler {
         self.buf.len()
     }
 
+    /// Emit multi-byte NOP padding to align the current position to
+    /// `boundary` bytes.  Uses Intel-recommended NOP sequences (1–9 bytes)
+    /// for best decode throughput.
+    pub fn align_to(&mut self, boundary: usize) {
+        debug_assert!(boundary.is_power_of_two());
+        let pos = self.buf.len();
+        let remainder = pos & (boundary - 1);
+        if remainder == 0 {
+            return;
+        }
+        let pad = boundary - remainder;
+        self.emit_nop_sequence(pad);
+    }
+
+    /// Emit `n` bytes of NOP padding using Intel-recommended multi-byte
+    /// NOP encodings for best decode throughput.
+    fn emit_nop_sequence(&mut self, mut n: usize) {
+        // Intel multi-byte NOPs (Vol 2, Table 4-12):
+        // 1: 90
+        // 2: 66 90
+        // 3: 0F 1F 00
+        // 4: 0F 1F 40 00
+        // 5: 0F 1F 44 00 00
+        // 6: 66 0F 1F 44 00 00
+        // 7: 0F 1F 80 00 00 00 00
+        // 8: 0F 1F 84 00 00 00 00 00
+        // 9: 66 0F 1F 84 00 00 00 00 00
+        static NOPS: [&[u8]; 10] = [
+            &[],
+            &[0x90],
+            &[0x66, 0x90],
+            &[0x0F, 0x1F, 0x00],
+            &[0x0F, 0x1F, 0x40, 0x00],
+            &[0x0F, 0x1F, 0x44, 0x00, 0x00],
+            &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],
+            &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],
+            &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+            &[0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        ];
+        while n > 0 {
+            let chunk = n.min(9);
+            self.buf.extend_from_slice(NOPS[chunk]);
+            n -= chunk;
+        }
+    }
+
     // ── Label support ────────────────────────────────────────────────────────
 
     /// Bind `label` to the current position in the code buffer.

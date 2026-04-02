@@ -775,6 +775,13 @@ impl<'a> MaglevCodegen<'a> {
             None => return,
         };
 
+        // Align loop headers to 16-byte boundaries for better instruction
+        // fetch throughput.  The NOP padding cost is paid once at loop entry;
+        // every back-edge iteration benefits from aligned fetch.
+        if block.is_loop_header {
+            self.masm.align_to(16);
+        }
+
         // Bind this block's label to the current code position.
         self.masm
             .bind_label(&mut self.block_labels[block_idx as usize]);

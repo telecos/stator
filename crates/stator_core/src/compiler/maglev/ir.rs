@@ -1714,6 +1714,10 @@ pub struct BasicBlock {
 
     /// Predecessor block indices (filled in during CFG construction).
     pub predecessors: Vec<u32>,
+
+    /// Whether this block is a loop header (has at least one back-edge
+    /// predecessor).  Set by the optimizer so codegen can align it.
+    pub is_loop_header: bool,
 }
 
 impl BasicBlock {
@@ -1724,6 +1728,7 @@ impl BasicBlock {
             nodes: Vec::new(),
             control: None,
             predecessors: Vec::new(),
+            is_loop_header: false,
         }
     }
 
