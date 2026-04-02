@@ -1417,14 +1417,22 @@ impl<'a> MaglevCodegen<'a> {
             } => {
                 let _ = feedback_slot;
                 if let Some(off) = self.promoted_global_offset(*name) {
-                    // Store directly from the allocated register when possible.
+                    // Sign-extend narrow values before storing to the
+                    // promoted slot — the exit-path sta_global needs full
+                    // 64-bit values.  This is on the cold exit path only.
                     match self.alloc.location(*value) {
                         Some(Location::Register(n)) => {
                             let src = phys_reg(n);
+                            if self.narrow_int32.contains(value) {
+                                self.masm.movsxd_sign_extend(src, src);
+                            }
                             self.masm.mov_store_base_disp32(Reg64::R14, off, src);
                         }
                         _ => {
                             self.emit_load(*value, Reg64::R11);
+                            if self.narrow_int32.contains(value) {
+                                self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
+                            }
                             self.masm.mov_store_base_disp32(Reg64::R14, off, Reg64::R11);
                         }
                     }
@@ -1432,6 +1440,10 @@ impl<'a> MaglevCodegen<'a> {
                     let saved = self.emit_save_live_regs(id);
                     self.masm.mov_ri(Reg64::Rdi, i64::from(*name));
                     self.emit_load(*value, Reg64::Rsi);
+                    // Sign-extend narrow values for the runtime stub.
+                    if self.narrow_int32.contains(value) {
+                        self.masm.movsxd_sign_extend(Reg64::Rsi, Reg64::Rsi);
+                    }
                     let addr = jit_runtime::jit_runtime_sta_global as *const () as usize as i64;
                     self.masm.mov_ri(Reg64::R11, addr);
                     self.masm.call_reg(Reg64::R11);
@@ -4268,6 +4280,11 @@ impl<'a> MaglevCodegen<'a> {
                                 .get(c)
                                 .is_some_and(|n| Self::is_i32_range_checked_producer(n, i32_range))
                             || narrow_phi.contains(c)
+                            // StoreGlobal is narrow-compatible for Phis:
+                            // codegen sign-extends on the cold exit path.
+                            || node_lookup
+                                .get(c)
+                                .is_some_and(|n| matches!(n, ValueNode::StoreGlobal { .. }))
                     })
                 });
                 if !ok {
@@ -4281,15 +4298,19 @@ impl<'a> MaglevCodegen<'a> {
         }
 
         // Step 4: build the non-narrow set.  Narrow consumers, i32-range
-        // checked ops, AND narrow-transparent Phis are skipped — their
+        // checked ops, and narrow-transparent Phis are skipped — their
         // inputs can have garbage upper bits without affecting correctness.
+        // StoreGlobal whose value is a narrow-transparent Phi is also
+        // skipped: codegen sign-extends on the cold exit path.
         let mut non_narrow: HashSet<NodeId> = HashSet::new();
         for block in graph.blocks() {
             for (id, node) in &block.nodes {
-                if !Self::is_narrow_int32_consumer(node)
-                    && !Self::is_i32_range_checked_producer(node, i32_range)
-                    && !narrow_phi.contains(id)
-                {
+                let skip = Self::is_narrow_int32_consumer(node)
+                    || Self::is_i32_range_checked_producer(node, i32_range)
+                    || narrow_phi.contains(id)
+                    || matches!(node, ValueNode::StoreGlobal { value, .. }
+                        if narrow_phi.contains(value));
+                if !skip {
                     Self::collect_node_inputs(node, &mut non_narrow);
                 }
             }
@@ -4311,6 +4332,16 @@ impl<'a> MaglevCodegen<'a> {
         candidates.retain(|id| {
             !non_narrow.contains(id) && !matches!(alloc.location(*id), Some(Location::StackSlot(_)))
         });
+
+        // Step 6: add narrow-transparent Phis to the result set.
+        // These Phis pass through narrow values (garbage upper 32 bits)
+        // so consumers like StoreGlobal can detect them and sign-extend.
+        for id in &narrow_phi {
+            if !matches!(alloc.location(*id), Some(Location::StackSlot(_))) {
+                candidates.insert(*id);
+            }
+        }
+
         candidates
     }
 
