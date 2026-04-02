@@ -746,40 +746,14 @@ pub(crate) mod jit_runtime {
             }
 
             // ── Arguments objects ────────────────────────────────────────
-            Opcode::CreateMappedArguments | Opcode::CreateUnmappedArguments => {
-                // Read parameter count from the BytecodeArray to determine
-                // how many register-file slots hold the arguments.
-                let ptrs = RT_PTRS.with(|p| p.get());
-                let ba_ptr = if ptrs.is_cached() {
-                    // SAFETY: cached pointer valid for thread lifetime.
-                    unsafe { &*ptrs.bytecode }.get()
-                } else {
-                    RT_BYTECODE.with(|b| b.get())
-                };
-                let param_count = if !ba_ptr.is_null() {
-                    // SAFETY: pointer is valid and points to a live BytecodeArray.
-                    unsafe { &*ba_ptr }.parameter_count() as usize
-                } else {
-                    0
-                };
-
-                let mut map = PropertyMap::new();
-                for i in 0..param_count {
-                    // SAFETY: regs[0..param_count] hold the function arguments.
-                    let arg_i64 = unsafe { *regs.add(i) };
-                    let arg = jit_i64_to_jsvalue(arg_i64);
-                    map.insert(i.to_string(), arg);
-                }
-                map.insert("length".to_string(), JsValue::Smi(param_count as i32));
-                let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
-                Some(jsvalue_to_jit_i64(obj))
-            }
-
-            Opcode::CreateRestParameter => {
-                // Rest parameters: collect args beyond the formal parameter count.
-                let arr = JsValue::Array(Rc::new(RefCell::new(Vec::new())));
-                Some(jsvalue_to_jit_i64(arr))
-            }
+            // These opcodes create the `arguments` object for sloppy-mode
+            // functions.  Constructing a correct arguments object requires
+            // reading from the *frame* (negative register offsets) rather
+            // than the register file.  Until that layout is wired up we
+            // deopt back to the interpreter which handles it correctly.
+            Opcode::CreateMappedArguments
+            | Opcode::CreateUnmappedArguments
+            | Opcode::CreateRestParameter => None,
 
             // ── Named property load ──────────────────────────────────────
             Opcode::LdaNamedProperty => {
