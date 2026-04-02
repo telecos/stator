@@ -329,35 +329,6 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
     }
     if has_property_side_effects && load_named_in_loop > 0 {
         LICM_BLOCKED_BY_SIDE_EFFECTS.fetch_add(1, Ordering::Relaxed);
-        eprintln!(
-            "LICM: loop header={} has {load_named_in_loop} LoadNamedGeneric BLOCKED by side-effects",
-            lp.header
-        );
-        // Log which node caused the side-effect flag.
-        for block in graph.blocks() {
-            if !lp.body.contains(&block.id) {
-                continue;
-            }
-            for (id, node) in &block.nodes {
-                if matches!(
-                    node,
-                    ValueNode::StoreNamedGeneric { .. }
-                        | ValueNode::StoreKeyedGeneric { .. }
-                        | ValueNode::Call { .. }
-                        | ValueNode::CallKnownFunction { .. }
-                        | ValueNode::CallBuiltin { .. }
-                        | ValueNode::CallRuntime { .. }
-                        | ValueNode::CallWithSpread { .. }
-                        | ValueNode::Construct { .. }
-                        | ValueNode::ConstructWithSpread { .. }
-                ) {
-                    eprintln!(
-                        "  LICM: side-effect node {id:?} in block {}: {node:?}",
-                        block.id
-                    );
-                }
-            }
-        }
     }
 
     let mut total_hoisted = 0;
@@ -408,12 +379,7 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
                     // block can see the dependency as satisfied.
                     outside_defs.insert(*id);
                 } else if matches!(node, ValueNode::LoadNamedGeneric { .. }) {
-                    // Diagnostic: why wasn't this LoadNamedGeneric hoisted?
-                    eprintln!(
-                        "LICM: LoadNamedGeneric {id:?} NOT hoisted: pure={pure} inputs_out={inputs_out} \
-                         alias_store={alias_store} alias_glob={alias_glob} \
-                         blocked_side_effects={blocked_by_side_effects_flag}"
-                    );
+                    // Could not hoist this LoadNamedGeneric.
                 }
             }
         }
@@ -466,12 +432,7 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
     LICM_NAMED_GENERIC_HOISTED.fetch_add(named_generic_hoisted, Ordering::Relaxed);
 
     if load_named_in_loop > 0 {
-        eprintln!(
-            "LICM: loop header={} body_blocks={} total_hoisted={total_hoisted} \
-             named_generic_hoisted={named_generic_hoisted}/{load_named_in_loop}",
-            lp.header,
-            lp.body.len()
-        );
+        // Counters updated above; no verbose logging.
     }
 
     total_hoisted
