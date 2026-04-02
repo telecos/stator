@@ -790,12 +790,59 @@ impl<'a> MaglevCodegen<'a> {
         let nodes: Vec<(NodeId, ValueNode)> = block.nodes.clone();
         let control = block.control.clone();
 
+        // Dead comparison elimination: when the block ends with a Branch
+        // whose condition is a fusible Int32 comparison AND that comparison
+        // is the last value node, skip emitting the 6-instruction boolean
+        // materialization.  The Branch's try_fuse_compare_branch will emit
+        // just CMP + JCC directly.
+        let fused_cmp_id = Self::detect_fusible_branch_comparison(&nodes, &control);
+
         for (id, node) in &nodes {
+            if Some(*id) == fused_cmp_id {
+                continue;
+            }
             self.emit_value_node(*id, node);
         }
 
         if let Some(ctrl) = control {
             self.emit_control_node(block_idx, &ctrl);
+        }
+    }
+
+    /// Detect when a block's [`ControlNode::Branch`] condition is a fusible
+    /// Int32 comparison that is the **last** value node in the block.
+    ///
+    /// In SSA order, no node after the comparison can exist (it *is* the last),
+    /// and no node before it can reference a forward definition.  Therefore the
+    /// comparison's only consumer is the Branch itself, making the 6-instruction
+    /// boolean materialisation dead code — the Branch's
+    /// [`try_fuse_compare_branch`] will emit just CMP + JCC.
+    fn detect_fusible_branch_comparison(
+        nodes: &[(NodeId, ValueNode)],
+        control: &Option<ControlNode>,
+    ) -> Option<NodeId> {
+        let condition = match control {
+            Some(ControlNode::Branch { condition, .. }) => *condition,
+            _ => return None,
+        };
+
+        let (last_id, last_node) = nodes.last()?;
+        if *last_id != condition {
+            return None;
+        }
+
+        if matches!(
+            last_node,
+            ValueNode::Int32LessThan { .. }
+                | ValueNode::Int32LessThanOrEqual { .. }
+                | ValueNode::Int32GreaterThan { .. }
+                | ValueNode::Int32GreaterThanOrEqual { .. }
+                | ValueNode::Int32Equal { .. }
+                | ValueNode::Int32StrictEqual { .. }
+        ) {
+            Some(condition)
+        } else {
+            None
         }
     }
 
