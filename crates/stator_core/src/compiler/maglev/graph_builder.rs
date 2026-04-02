@@ -1740,6 +1740,10 @@ impl<'a> GraphBuilder<'a> {
             // let the interpreter execute the rest.
             _ => {
                 let offset = self.byte_offset_of(all_instructions, instr_idx) as u32;
+                eprintln!(
+                    "MAGLEV_GRAPH: unhandled opcode {:?} at bytecode offset {offset}",
+                    instr.opcode
+                );
                 if !self.block_is_complete(self.current_block) {
                     self.set_control(ControlNode::Deoptimize {
                         bytecode_offset: offset,
