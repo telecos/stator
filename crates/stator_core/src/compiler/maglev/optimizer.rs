@@ -1251,6 +1251,9 @@ enum CseKey {
     Binary(u16, NodeId, NodeId),
     /// A unary pure operation: (operation kind, input operand).
     Unary(u16, NodeId),
+    /// A nullary operation keyed only by kind and a u32 index (e.g. LoadGlobal
+    /// keyed by its name index).
+    Nullary(u16, u32),
 }
 
 /// Extract a CSE key from a pure [`ValueNode`], or `None` if the node is not
@@ -1292,6 +1295,8 @@ fn make_cse_key(node: &ValueNode) -> Option<CseKey> {
         ValueNode::Int32Decrement { value } => Some(CseKey::Unary(3, *value)),
         ValueNode::Float64Negate { value } => Some(CseKey::Unary(4, *value)),
         ValueNode::ToBoolean { value } => Some(CseKey::Unary(5, *value)),
+        // Nullary: keyed only by name index.
+        ValueNode::LoadGlobal { name, .. } => Some(CseKey::Nullary(1, *name)),
         _ => None,
     }
 }
