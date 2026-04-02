@@ -139,6 +139,7 @@ pub fn eliminate_overflow_checks(graph: &mut MaglevGraph) {
     rewrite_loop_induction_steps(graph, &mut ranges);
 
     // Phase 2 — forward propagation and rewriting.
+    let mut rewrites = 0u32;
     for block in graph.blocks_mut() {
         for (id, node) in &mut block.nodes {
             // Seed any nodes missed in Phase 0 (shouldn't happen, but
@@ -153,9 +154,13 @@ pub fn eliminate_overflow_checks(graph: &mut MaglevGraph) {
                 ranges.insert(*id, out_range);
                 if let Some(new_node) = replacement {
                     *node = new_node;
+                    rewrites += 1;
                 }
             }
         }
+    }
+    if rewrites > 0 {
+        eprintln!("RANGE_ANALYSIS: {rewrites} checked→unchecked rewrites");
     }
 }
 

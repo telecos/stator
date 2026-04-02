@@ -1468,22 +1468,46 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
         return 0;
     }
 
+    // Scan the preheader for StoreGlobal nodes that set known initial values.
+    // When a promotable global was stored in the preheader (e.g. `var i = 0`),
+    // we can use the stored value directly as the Phi's entry input instead of
+    // inserting a LoadGlobal.  This gives exact range information (e.g. [0,0]
+    // for a SmiConstant) which enables overflow-check elimination downstream.
+    let preheader_stores: HashMap<u32, NodeId> = {
+        let mut stores = HashMap::new();
+        if let Some(pb) = graph.blocks().iter().find(|b| b.id == lp.preheader) {
+            for (_, node) in &pb.nodes {
+                if let ValueNode::StoreGlobal { name, value, .. } = node {
+                    // Last writer wins (insert overwrites earlier entries).
+                    stores.insert(*name, *value);
+                }
+            }
+        }
+        stores
+    };
+
     // Build PromotedGlobal entries: allocate preheader loads and Phi IDs.
     let mut promoted: Vec<PromotedGlobal> = Vec::new();
     for &name in &promotable {
         let (feedback_slot, ref load_ids) = load_info[&name];
         let (store_value, ref store_ids) = store_info[&name];
 
-        // Insert LoadGlobal into the preheader block.
-        let preheader_load_id = graph
-            .add_value_node(
-                lp.preheader,
-                ValueNode::LoadGlobal {
-                    name,
-                    feedback_slot,
-                },
-            )
-            .expect("preheader block must exist");
+        // If the preheader stores a known value to this global, use that
+        // value directly (gives exact range).  Otherwise fall back to a
+        // LoadGlobal which will be seeded with I32_FULL.
+        let preheader_load_id = if let Some(&init_value) = preheader_stores.get(&name) {
+            init_value
+        } else {
+            graph
+                .add_value_node(
+                    lp.preheader,
+                    ValueNode::LoadGlobal {
+                        name,
+                        feedback_slot,
+                    },
+                )
+                .expect("preheader block must exist")
+        };
 
         // Allocate a NodeId for the Phi (we'll insert it manually at the front).
         let phi_id = graph.alloc_node_id();
