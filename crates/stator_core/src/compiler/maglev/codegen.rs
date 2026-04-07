@@ -1822,33 +1822,44 @@ impl<'a> MaglevCodegen<'a> {
                 shared_function_info,
                 ..
             } => {
-                self.emit_trampoline_call(
-                    id,
-                    Opcode::CreateClosure as u8,
-                    i64::from(*shared_function_info),
-                    0,
-                );
+                // Direct stub call — avoids trampoline dispatch overhead.
+                let saved = self.emit_save_live_regs(id);
+                self.masm
+                    .mov_ri(Reg64::Rdi, i64::from(*shared_function_info));
+                let addr = jit_runtime::jit_runtime_create_closure as *const () as usize;
+                self.masm.mov_ri(Reg64::R11, addr as i64);
+                self.masm.call_reg(Reg64::R11);
+                self.emit_restore_live_regs(saved);
+                self.emit_deopt_check_rax();
+                self.emit_store(id, Reg64::Rax);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::FastCreateClosure {
                 shared_function_info,
                 ..
             } => {
-                self.emit_trampoline_call(
-                    id,
-                    Opcode::CreateClosure as u8,
-                    i64::from(*shared_function_info),
-                    0,
-                );
+                // Direct stub call — avoids trampoline dispatch overhead.
+                let saved = self.emit_save_live_regs(id);
+                self.masm
+                    .mov_ri(Reg64::Rdi, i64::from(*shared_function_info));
+                let addr = jit_runtime::jit_runtime_create_closure as *const () as usize;
+                self.masm.mov_ri(Reg64::R11, addr as i64);
+                self.masm.call_reg(Reg64::R11);
+                self.emit_restore_live_regs(saved);
+                self.emit_deopt_check_rax();
+                self.emit_store(id, Reg64::Rax);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::CreateFunctionContext { slot_count, .. } => {
-                self.emit_trampoline_call(
-                    id,
-                    Opcode::CreateFunctionContext as u8,
-                    i64::from(*slot_count),
-                    0,
-                );
+                // Direct stub call — avoids trampoline dispatch overhead.
+                let saved = self.emit_save_live_regs(id);
+                self.masm.mov_ri(Reg64::Rdi, i64::from(*slot_count));
+                let addr = jit_runtime::jit_runtime_create_function_context as *const () as usize;
+                self.masm.mov_ri(Reg64::R11, addr as i64);
+                self.masm.call_reg(Reg64::R11);
+                self.emit_restore_live_regs(saved);
+                self.emit_deopt_check_rax();
+                self.emit_store(id, Reg64::Rax);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::PushContext { context } => {

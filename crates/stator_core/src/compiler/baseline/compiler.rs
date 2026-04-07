@@ -5052,6 +5052,62 @@ pub(crate) mod jit_runtime {
         }
     }
 
+    // ── CreateFunctionContext / CreateClosure stubs ────────────────────────
+
+    /// Create a new function context with `slot_count` slots.
+    ///
+    /// This replaces the trampoline dispatch for `CreateFunctionContext` in
+    /// Maglev, saving ~30 instructions of trampoline overhead.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`slot_count`) – number of context slots.
+    ///
+    /// Returns the new context as JIT `i64` in `RAX`.
+    pub extern "C" fn jit_runtime_create_function_context(slot_count: i64) -> i64 {
+        let parent = RT_CONTEXT.with(|ctx_cell| {
+            let ctx_opt = ctx_cell.borrow();
+            ctx_opt.as_ref().map(Rc::clone)
+        });
+        let js_ctx = JsContext::new(slot_count as usize, parent);
+        let val = JsValue::Context(js_ctx);
+        jsvalue_to_jit_i64(val)
+    }
+
+    /// Create a closure from a constant-pool entry.
+    ///
+    /// This replaces the trampoline dispatch for `CreateClosure` /
+    /// `FastCreateClosure` in Maglev.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`cp_idx`) – constant pool index of the inner function.
+    ///
+    /// Returns the new closure as JIT `i64` in `RAX`, or [`JIT_DEOPT`].
+    pub extern "C" fn jit_runtime_create_closure(cp_idx: i64) -> i64 {
+        // SAFETY: RT_BYTECODE is always set by jit_runtime_setup
+        // before any JIT code runs, and points at a live
+        // BytecodeArray for the duration of the JIT execution.
+        let ba_ptr = RT_BYTECODE.with(|b| b.get());
+        if ba_ptr.is_null() {
+            return JIT_DEOPT;
+        }
+        let ba = unsafe { &*ba_ptr };
+        let Some(entry) = ba.get_constant(cp_idx as u32) else {
+            return JIT_DEOPT;
+        };
+        let ConstantPoolEntry::Function(inner_ba) = entry else {
+            return JIT_DEOPT;
+        };
+        let closure_ctx = RT_CONTEXT.with(|ctx_cell| {
+            let ctx_opt = ctx_cell.borrow();
+            ctx_opt.as_ref().map(Rc::clone)
+        });
+        let func = Rc::new(inner_ba.clone_for_closure(closure_ctx));
+        let val = JsValue::Function(func);
+        jsvalue_to_jit_i64(val)
+    }
+
     // ── Context push/pop stubs for Maglev ──────────────────────────────────
 
     /// Push a new context as the active closure context, returning the old
