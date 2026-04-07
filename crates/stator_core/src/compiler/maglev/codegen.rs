@@ -1519,34 +1519,18 @@ impl<'a> MaglevCodegen<'a> {
                     jit_runtime::jit_runtime_sta_named_property as *const () as usize,
                 );
             }
+            // Always use the inline keyed path — it has a built-in
+            // fallback to the full stub on miss, so the only extra cost
+            // for non-Smi keys is a fast inline check (~5 cycles).
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::LoadKeyedGeneric { object, key, .. } => {
-                if self.is_known_int32_key(*key) {
-                    self.emit_inline_load_keyed_smi(id, *object, *key);
-                } else {
-                    self.emit_stub_call_2node(
-                        id,
-                        *object,
-                        *key,
-                        jit_runtime::jit_runtime_lda_keyed_property as *const () as usize,
-                    );
-                }
+                self.emit_inline_load_keyed_smi(id, *object, *key);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::StoreKeyedGeneric {
                 object, key, value, ..
             } => {
-                if self.is_known_int32_key(*key) {
-                    self.emit_inline_store_keyed_smi(id, *object, *key, *value);
-                } else {
-                    self.emit_stub_call_3node(
-                        id,
-                        *object,
-                        *key,
-                        *value,
-                        jit_runtime::jit_runtime_sta_keyed_property as *const () as usize,
-                    );
-                }
+                self.emit_inline_store_keyed_smi(id, *object, *key, *value);
             }
 
             // ── FixedArray element access (routed through keyed-property stubs) ──
@@ -1554,16 +1538,7 @@ impl<'a> MaglevCodegen<'a> {
             ValueNode::LoadFixedArrayElement { elements, index }
             | ValueNode::LoadFixedDoubleArrayElement { elements, index }
             | ValueNode::LoadHoleyFixedDoubleArrayElement { elements, index } => {
-                if self.is_known_int32_key(*index) {
-                    self.emit_inline_load_keyed_smi(id, *elements, *index);
-                } else {
-                    self.emit_stub_call_2node(
-                        id,
-                        *elements,
-                        *index,
-                        jit_runtime::jit_runtime_lda_keyed_property as *const () as usize,
-                    );
-                }
+                self.emit_inline_load_keyed_smi(id, *elements, *index);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::StoreFixedArrayElement {
@@ -1576,17 +1551,7 @@ impl<'a> MaglevCodegen<'a> {
                 index,
                 value,
             } => {
-                if self.is_known_int32_key(*index) {
-                    self.emit_inline_store_keyed_smi(id, *elements, *index, *value);
-                } else {
-                    self.emit_stub_call_3node(
-                        id,
-                        *elements,
-                        *index,
-                        *value,
-                        jit_runtime::jit_runtime_sta_keyed_property as *const () as usize,
-                    );
-                }
+                self.emit_inline_store_keyed_smi(id, *elements, *index, *value);
             }
 
             // ── Guards ── pass-through when we use generic stubs ──────────────
@@ -1917,30 +1882,15 @@ impl<'a> MaglevCodegen<'a> {
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::GenericBitwiseAnd { left, right, .. } => {
-                self.emit_stub_call_2node(
-                    id,
-                    *left,
-                    *right,
-                    jit_runtime::jit_runtime_generic_bitwise_and as *const () as usize,
-                );
+                self.emit_inline_generic_bitand(id, *left, *right);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::GenericBitwiseOr { left, right, .. } => {
-                self.emit_stub_call_2node(
-                    id,
-                    *left,
-                    *right,
-                    jit_runtime::jit_runtime_generic_bitwise_or as *const () as usize,
-                );
+                self.emit_inline_generic_bitor(id, *left, *right);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::GenericBitwiseXor { left, right, .. } => {
-                self.emit_stub_call_2node(
-                    id,
-                    *left,
-                    *right,
-                    jit_runtime::jit_runtime_generic_bitwise_xor as *const () as usize,
-                );
+                self.emit_inline_generic_bitxor(id, *left, *right);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::GenericShiftLeft { left, right, .. } => {
@@ -3070,8 +3020,108 @@ impl<'a> MaglevCodegen<'a> {
         self.emit_store(id, Reg64::Rax);
     }
 
-    /// Emit an inline fast-path for keyed **load** when the key is a
-    /// known integer.
+    /// Inline Smi fast path for `GenericBitwiseOr`.
+    ///
+    /// Bitwise OR of two i32 values always fits in i32, so no overflow
+    /// check is needed — just Smi-check both operands and emit `OR`.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_inline_generic_bitor(&mut self, id: NodeId, left: NodeId, right: NodeId) {
+        let saved = self.emit_save_live_regs(id);
+        self.emit_load(left, Reg64::Rdi);
+        self.emit_load(right, Reg64::Rsi);
+
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
+
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rsi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rsi);
+        self.masm.jne(&mut slow_label);
+
+        // i32 | i32 always fits in i32 — no overflow check needed.
+        self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.or_rr(Reg64::Rax, Reg64::Rsi);
+        self.masm.jmp(&mut done_label);
+
+        self.masm.bind_label(&mut slow_label);
+        let addr = jit_runtime::jit_runtime_generic_bitwise_or as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        self.masm.bind_label(&mut done_label);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Inline Smi fast path for `GenericBitwiseAnd`.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_inline_generic_bitand(&mut self, id: NodeId, left: NodeId, right: NodeId) {
+        let saved = self.emit_save_live_regs(id);
+        self.emit_load(left, Reg64::Rdi);
+        self.emit_load(right, Reg64::Rsi);
+
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
+
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rsi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rsi);
+        self.masm.jne(&mut slow_label);
+
+        self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.and_rr(Reg64::Rax, Reg64::Rsi);
+        self.masm.jmp(&mut done_label);
+
+        self.masm.bind_label(&mut slow_label);
+        let addr = jit_runtime::jit_runtime_generic_bitwise_and as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        self.masm.bind_label(&mut done_label);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Inline Smi fast path for `GenericBitwiseXor`.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_inline_generic_bitxor(&mut self, id: NodeId, left: NodeId, right: NodeId) {
+        let saved = self.emit_save_live_regs(id);
+        self.emit_load(left, Reg64::Rdi);
+        self.emit_load(right, Reg64::Rsi);
+
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
+
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rsi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rsi);
+        self.masm.jne(&mut slow_label);
+
+        self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.xor_rr(Reg64::Rax, Reg64::Rsi);
+        self.masm.jmp(&mut done_label);
+
+        self.masm.bind_label(&mut slow_label);
+        let addr = jit_runtime::jit_runtime_generic_bitwise_xor as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        self.masm.bind_label(&mut done_label);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+        self.emit_store(id, Reg64::Rax);
+    }
     ///
     /// Calls `jit_runtime_inline_load_keyed_smi` which returns
     /// `{value, hit}` in `RAX:RDX`.  On a hit the result is used
