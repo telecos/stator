@@ -342,6 +342,9 @@ pub(crate) mod jit_runtime {
         bytecode: *const Cell<*const BytecodeArray>,
         global: *const RefCell<JitGlobalState>,
         prop_ic: *const RefCell<JitPropertyIcState>,
+        /// Pointer to the `Cell<DirectCallState>` thread-local, cached
+        /// so that `prepare` and `finish` avoid a second TLS lookup.
+        direct_call: *const Cell<DirectCallState>,
         /// Generation counter set at cache time.  Compared against
         /// [`RT_SETUP_GEN`] before use; a mismatch forces a re-cache.
         #[allow(dead_code)]
@@ -355,11 +358,33 @@ pub(crate) mod jit_runtime {
             bytecode: std::ptr::null(),
             global: std::ptr::null(),
             prop_ic: std::ptr::null(),
+            direct_call: std::ptr::null(),
             generation: 0,
         };
 
         fn is_cached(&self) -> bool {
             !self.heap.is_null()
+        }
+
+        /// Store [`DirectCallState`] via the cached pointer, avoiding a
+        /// separate `DIRECT_CALL_STATE.with()` TLS lookup.
+        fn set_direct_call(&self, state: DirectCallState) {
+            if !self.direct_call.is_null() {
+                // SAFETY: pointer set by cache_rt_ptrs; valid for thread lifetime.
+                unsafe { &*self.direct_call }.set(state);
+            } else {
+                DIRECT_CALL_STATE.with(|c| c.set(state));
+            }
+        }
+
+        /// Read [`DirectCallState`] via the cached pointer.
+        fn get_direct_call(&self) -> DirectCallState {
+            if !self.direct_call.is_null() {
+                // SAFETY: pointer set by cache_rt_ptrs; valid for thread lifetime.
+                unsafe { &*self.direct_call }.get()
+            } else {
+                DIRECT_CALL_STATE.with(|c| c.get())
+            }
         }
     }
 
@@ -399,15 +424,20 @@ pub(crate) mod jit_runtime {
                 RT_BYTECODE.with(|bc| {
                     RT_GLOBAL.with(|g| {
                         RT_PROP_IC.with(|ic| {
-                            let setup_gen = RT_SETUP_GEN.with(|g| g.get());
-                            RT_PTRS.with(|p| {
-                                p.set(RtPtrs {
-                                    heap: heap as *const RefCell<Vec<JsValue>>,
-                                    context: ctx as *const RefCell<Option<Rc<RefCell<JsContext>>>>,
-                                    bytecode: bc as *const Cell<*const BytecodeArray>,
-                                    global: g as *const RefCell<JitGlobalState>,
-                                    prop_ic: ic as *const RefCell<JitPropertyIcState>,
-                                    generation: setup_gen,
+                            DIRECT_CALL_STATE.with(|dc| {
+                                let setup_gen = RT_SETUP_GEN.with(|g| g.get());
+                                RT_PTRS.with(|p| {
+                                    p.set(RtPtrs {
+                                        heap: heap as *const RefCell<Vec<JsValue>>,
+                                        context: ctx as *const RefCell<
+                                            Option<Rc<RefCell<JsContext>>>,
+                                        >,
+                                        bytecode: bc as *const Cell<*const BytecodeArray>,
+                                        global: g as *const RefCell<JitGlobalState>,
+                                        prop_ic: ic as *const RefCell<JitPropertyIcState>,
+                                        direct_call: dc as *const Cell<DirectCallState>,
+                                        generation: setup_gen,
+                                    });
                                 });
                             });
                         });
@@ -3136,13 +3166,11 @@ pub(crate) mod jit_runtime {
         // Set RT_BYTECODE to callee.
         bc_ref.set(ba_ptr);
 
-        // Stash saved state in TLS for the finish call.
-        DIRECT_CALL_STATE.with(|c| {
-            c.set(DirectCallState {
-                saved_ba,
-                heap_base,
-                ctx_changed: !same_context,
-            })
+        // Stash saved state via cached pointer (avoids TLS lookup).
+        ptrs.set_direct_call(DirectCallState {
+            saved_ba,
+            heap_base,
+            ctx_changed: !same_context,
         });
 
         // Extract the raw function pointer from JitExecutableCode.
@@ -3211,7 +3239,7 @@ pub(crate) mod jit_runtime {
             saved_ba,
             heap_base,
             ctx_changed,
-        } = DIRECT_CALL_STATE.with(|c| c.get());
+        } = ptrs.get_direct_call();
 
         // Restore bytecode pointer.
         bc_ref.set(saved_ba);
@@ -3326,13 +3354,11 @@ pub(crate) mod jit_runtime {
             unsafe { *ctx_ref.as_ptr() = callee_ctx };
         }
 
-        // Stash saved state for jit_runtime_finish_direct_call.
-        DIRECT_CALL_STATE.with(|c| {
-            c.set(DirectCallState {
-                saved_ba,
-                heap_base,
-                ctx_changed: !same_context,
-            })
+        // Stash saved state via cached pointer.
+        ptrs.set_direct_call(DirectCallState {
+            saved_ba,
+            heap_base,
+            ctx_changed: !same_context,
         });
 
         // Check whether the callee has Maglev code available.  If so,
@@ -3420,12 +3446,10 @@ pub(crate) mod jit_runtime {
         // SAFETY: single-threaded JIT; no concurrent heap mutation.
         let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
 
-        DIRECT_CALL_STATE.with(|c| {
-            c.set(DirectCallState {
-                saved_ba,
-                heap_base,
-                ctx_changed: false,
-            })
+        ptrs.set_direct_call(DirectCallState {
+            saved_ba,
+            heap_base,
+            ctx_changed: false,
         });
 
         #[cfg(all(target_arch = "x86_64", unix))]
@@ -3471,12 +3495,10 @@ pub(crate) mod jit_runtime {
 
         // Stash saved state for jit_runtime_finish_direct_call.
         // Context did not change (the codegen already verified the match).
-        DIRECT_CALL_STATE.with(|c| {
-            c.set(DirectCallState {
-                saved_ba,
-                heap_base,
-                ctx_changed: false,
-            })
+        ptrs.set_direct_call(DirectCallState {
+            saved_ba,
+            heap_base,
+            ctx_changed: false,
         });
 
         // Check whether the callee has Maglev code available.
