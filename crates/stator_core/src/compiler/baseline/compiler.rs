@@ -1608,56 +1608,53 @@ pub(crate) mod jit_runtime {
             let heap_ref = unsafe { &*ptrs.heap };
             let ic_ref = unsafe { &*ptrs.prop_ic };
 
-            // Phase 1: Extract the object from the heap via a scoped
-            // borrow.  The `&Vec<JsValue>` is dropped at the end of this
-            // block so that subsequent calls to `alloc_heap_handle`
-            // cannot create an aliased `&mut Vec<JsValue>`.
-            let obj = {
-                // SAFETY: scoped immutable borrow of the heap; the
-                // reference is dropped before any heap mutation occurs.
-                let heap = unsafe { &*heap_ref.as_ptr() };
-                heap.get(idx).cloned()
-            };
-            let obj = obj?;
+            // Pre-check: peek at the heap object via raw pointer to
+            // extract the shape_id WITHOUT cloning.  This allows the
+            // proto IC (which only needs name_idx + shape) to short-
+            // circuit before any Rc clone.
+            let heap = unsafe { &*heap_ref.as_ptr() };
+            let heap_val = heap.get(idx)?;
+            if let JsValue::PlainObject(map_rc) = heap_val {
+                // SAFETY: PropertyMap lives in Rc, separate from heap Vec.
+                let map = unsafe { &*map_rc.as_ptr() };
+                let shape = map.shape_id();
+
+                let (ic_entry, proto_entry) = {
+                    // SAFETY: scoped borrow; dropped before IC mutation.
+                    let cache = unsafe { &*ic_ref.as_ptr() };
+                    (cache.lda[lda_slot], cache.proto[(name_idx & 31) as usize])
+                };
+
+                // ── Own-property IC hit (zero clone) ────────────
+                if ic_entry.name_idx == name_idx && ic_entry.shape == shape {
+                    if let Some(val) = map.get_by_offset(ic_entry.offset) {
+                        return Some(encode_ic_cached(
+                            val,
+                            ic_entry.cached_ptr,
+                            ic_entry.cached_handle,
+                            ic_ref,
+                            lda_slot,
+                        ));
+                    }
+                }
+
+                // ── Prototype IC hit (pre-encoded i64, zero clone) ──
+                let proto_slot = (name_idx & 31) as usize;
+                if proto_entry.0 == name_idx && proto_entry.1 == shape {
+                    return Some(proto_entry.2);
+                }
+            }
+
+            // IC miss or non-PlainObject — need a proper clone for the
+            // slow path (heap ref must be dropped before any mutation).
+            let obj = heap_val.clone();
+            drop(heap);
 
             match &obj {
                 JsValue::PlainObject(map_rc) => {
-                    // SAFETY: The PropertyMap lives in an Rc-managed heap
-                    // allocation, separate from the JIT heap Vec.  This
-                    // reference remains valid across heap-handle allocations.
                     let map = unsafe { &*map_rc.as_ptr() };
                     let shape = map.shape_id();
-
-                    // Copy IC entries by value in a scoped borrow of the
-                    // IC state.  Dropping `cache` before any IC mutation
-                    // prevents aliased `&T` / `&mut T` to the same
-                    // JitPropertyIcState.
-                    let (ic_entry, proto_entry) = {
-                        // SAFETY: scoped borrow; dropped before IC mutation.
-                        let cache = unsafe { &*ic_ref.as_ptr() };
-                        (cache.lda[lda_slot], cache.proto[(name_idx & 31) as usize])
-                    };
-
-                    // ── Own-property IC hit ──────────────────────────
-                    if ic_entry.name_idx == name_idx && ic_entry.shape == shape {
-                        // Safe bounds-checked access guards against stale
-                        // offsets from shape-id collisions.
-                        if let Some(val) = map.get_by_offset(ic_entry.offset) {
-                            return Some(encode_ic_cached(
-                                val,
-                                ic_entry.cached_ptr,
-                                ic_entry.cached_handle,
-                                ic_ref,
-                                lda_slot,
-                            ));
-                        }
-                    }
-
-                    // ── Prototype IC hit (pre-encoded i64) ──────────
                     let proto_slot = (name_idx & 31) as usize;
-                    if proto_entry.0 == name_idx && proto_entry.1 == shape {
-                        return Some(proto_entry.2);
-                    }
 
                     // ── IC miss: full lookup without cloning ────────
                     let prop_name = get_rt_string_constant_ref(name_idx)?;
