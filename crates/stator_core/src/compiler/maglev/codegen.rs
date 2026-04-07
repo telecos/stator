@@ -1641,10 +1641,6 @@ impl<'a> MaglevCodegen<'a> {
                 args,
                 ..
             } => {
-                // Flush promoted globals so the callee sees up-to-date
-                // values, then reload after the call to pick up any
-                // modifications the callee made.
-                self.emit_flush_promoted_globals_for_call();
                 // Check receiver: if it's UndefinedConstant, use the
                 // CallUndefinedReceiver path (with direct-call fast path);
                 // otherwise use CallProperty stubs.
@@ -1691,7 +1687,6 @@ impl<'a> MaglevCodegen<'a> {
                         self.emit_store(id, Reg64::R11);
                     }
                 }
-                self.emit_reload_promoted_globals_after_call();
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::CallKnownFunction {
@@ -1700,7 +1695,6 @@ impl<'a> MaglevCodegen<'a> {
                 args,
                 ..
             } => {
-                self.emit_flush_promoted_globals_for_call();
                 let recv_is_undef = matches!(
                     self.graph.node(*receiver),
                     Some(ValueNode::UndefinedConstant)
@@ -1738,7 +1732,6 @@ impl<'a> MaglevCodegen<'a> {
                         self.emit_store(id, Reg64::R11);
                     }
                 }
-                self.emit_reload_promoted_globals_after_call();
             }
 
             // ── Object / array / closure creation ─────────────────────────────
@@ -1879,7 +1872,6 @@ impl<'a> MaglevCodegen<'a> {
             ValueNode::Construct {
                 constructor, args, ..
             } => {
-                self.emit_flush_promoted_globals_for_call();
                 // Simplified: only handle 0-arg construct.
                 if args.is_empty() {
                     self.emit_stub_call_1node(
@@ -1892,7 +1884,6 @@ impl<'a> MaglevCodegen<'a> {
                     self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
                     self.emit_store(id, Reg64::R11);
                 }
-                self.emit_reload_promoted_globals_after_call();
             }
 
             // ── Generic arithmetic via dedicated stubs ────────────────────────
@@ -2697,6 +2688,25 @@ impl<'a> MaglevCodegen<'a> {
     /// and assign each one a dedicated register-file slot beyond the
     /// allocator's spill area.
     fn scan_and_promote_globals(&mut self, base_slots: usize) {
+        // If the function contains any user-callable call nodes, skip
+        // promotion entirely.  A callee may modify the same globals,
+        // and the caller's promoted copies would become stale.
+        let has_user_call = self.graph.blocks().iter().any(|block| {
+            block.nodes.iter().any(|(_, node)| {
+                matches!(
+                    node,
+                    ValueNode::Call { .. }
+                        | ValueNode::CallKnownFunction { .. }
+                        | ValueNode::Construct { .. }
+                        | ValueNode::ConstructWithSpread { .. }
+                        | ValueNode::CallWithSpread { .. }
+                )
+            })
+        });
+        if has_user_call {
+            return;
+        }
+
         let mut seen = HashSet::new();
         for block in self.graph.blocks() {
             for (_, node) in &block.nodes {
@@ -2787,56 +2797,6 @@ impl<'a> MaglevCodegen<'a> {
             }
             // Restore the return value.
             self.masm.pop(Reg64::Rax);
-        }
-    }
-
-    /// Flush promoted globals to `GlobalEnv` before a call that may modify
-    /// them.  Unlike [`emit_promoted_global_stores`] this does **not**
-    /// save/restore RAX — it runs in a context where RAX is free.
-    ///
-    /// Handles its own RSP alignment since it may be called outside the
-    /// save/restore-live-regs bracket.
-    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
-    fn emit_flush_promoted_globals_for_call(&mut self) {
-        #[cfg(all(target_arch = "x86_64", unix))]
-        {
-            if self.promoted_globals.is_empty() {
-                return;
-            }
-            let addr = jit_runtime::jit_runtime_sta_global as *const () as usize as i64;
-            // RSP ≡ 8 mod 16 at block body.  Push a dummy to align.
-            self.masm.push(Reg64::R11);
-            for &(name_idx, slot) in &self.promoted_globals.clone() {
-                let off = (slot * 8) as i32;
-                self.masm.mov_ri(Reg64::Rdi, i64::from(name_idx));
-                self.masm.mov_load_base_disp32(Reg64::Rsi, Reg64::R14, off);
-                self.masm.mov_ri(Reg64::R11, addr);
-                self.masm.call_reg(Reg64::R11);
-            }
-            self.masm.pop(Reg64::R11);
-        }
-    }
-
-    /// Reload promoted globals from `GlobalEnv` after a call that may have
-    /// modified them.  Handles its own RSP alignment.
-    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
-    fn emit_reload_promoted_globals_after_call(&mut self) {
-        #[cfg(all(target_arch = "x86_64", unix))]
-        {
-            if self.promoted_globals.is_empty() {
-                return;
-            }
-            let addr = jit_runtime::jit_runtime_lda_global as *const () as usize as i64;
-            // RSP ≡ 8 mod 16 at block body.  Push a dummy to align.
-            self.masm.push(Reg64::R11);
-            for &(name_idx, slot) in &self.promoted_globals.clone() {
-                let off = (slot * 8) as i32;
-                self.masm.mov_ri(Reg64::Rdi, i64::from(name_idx));
-                self.masm.mov_ri(Reg64::R11, addr);
-                self.masm.call_reg(Reg64::R11);
-                self.masm.mov_store_base_disp32(Reg64::R14, off, Reg64::Rax);
-            }
-            self.masm.pop(Reg64::R11);
         }
     }
 
