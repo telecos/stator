@@ -2049,29 +2049,73 @@ impl<'a> MaglevCodegen<'a> {
                 );
             }
 
-            // ── Deep context slot access via trampoline ───────────────────────
+            // ── Deep context slot access ─────────────────────────────────────
+            //
+            // For depth == 0 we bypass the generic trampoline and call a
+            // dedicated stub that decodes the JIT-encoded context value
+            // directly, saving the 5-register setup + big match dispatch.
+            // Depth > 0 still falls back to the trampoline which can walk
+            // the scope chain via the register file.
             #[cfg(all(target_arch = "x86_64", unix))]
-            ValueNode::LoadContextSlot { depth, slot, .. } => {
-                self.emit_trampoline_call(
-                    id,
-                    Opcode::LdaContextSlot as u8,
-                    i64::from(*slot),
-                    i64::from(*depth),
-                );
+            ValueNode::LoadContextSlot {
+                context,
+                depth,
+                slot,
+                ..
+            } => {
+                if *depth == 0 {
+                    let saved = self.emit_save_live_regs(id);
+                    self.emit_load(*context, Reg64::Rdi);
+                    self.masm.mov_ri(Reg64::Rsi, i64::from(*slot));
+                    let addr =
+                        jit_runtime::jit_runtime_load_context_slot_direct as *const () as usize;
+                    self.masm.mov_ri(Reg64::R11, addr as i64);
+                    self.masm.call_reg(Reg64::R11);
+                    self.emit_restore_live_regs(saved);
+                    self.emit_deopt_check_rax();
+                    self.emit_store(id, Reg64::Rax);
+                } else {
+                    self.emit_trampoline_call(
+                        id,
+                        Opcode::LdaContextSlot as u8,
+                        i64::from(*slot),
+                        i64::from(*depth),
+                    );
+                }
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::StoreContextSlot {
-                depth, slot, value, ..
+                context,
+                depth,
+                slot,
+                value,
+                ..
             } => {
-                // Store the value into the accumulator (R12) before the
-                // trampoline call, since it reads the value from `acc`.
-                self.emit_load(*value, Reg64::R12);
-                self.emit_trampoline_call(
-                    id,
-                    Opcode::StaContextSlot as u8,
-                    i64::from(*slot),
-                    i64::from(*depth),
-                );
+                if *depth == 0 {
+                    let saved = self.emit_save_live_regs(id);
+                    // Load all node arguments before setting immediates
+                    // to avoid clobbering (RSI is allocatable).
+                    self.emit_load(*context, Reg64::Rdi);
+                    self.emit_load(*value, Reg64::Rdx);
+                    self.masm.mov_ri(Reg64::Rsi, i64::from(*slot));
+                    let addr =
+                        jit_runtime::jit_runtime_store_context_slot_direct as *const () as usize;
+                    self.masm.mov_ri(Reg64::R11, addr as i64);
+                    self.masm.call_reg(Reg64::R11);
+                    self.emit_restore_live_regs(saved);
+                    self.emit_deopt_check_rax();
+                    self.emit_store(id, Reg64::Rax);
+                } else {
+                    // Fall back to trampoline for depth > 0 (needs
+                    // chain walking via the register file).
+                    self.emit_load(*value, Reg64::R12);
+                    self.emit_trampoline_call(
+                        id,
+                        Opcode::StaContextSlot as u8,
+                        i64::from(*slot),
+                        i64::from(*depth),
+                    );
+                }
             }
 
             // ── Tagged equality ───────────────────────────────────────────────

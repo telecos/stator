@@ -4990,6 +4990,68 @@ pub(crate) mod jit_runtime {
         value_i64
     }
 
+    /// Load a value from a context slot using a JIT-encoded context value.
+    ///
+    /// Unlike [`jit_runtime_lda_context_slot_direct`] (which takes a raw
+    /// pointer), this function accepts the same heap-handle encoding that
+    /// the Maglev register allocator produces, avoiding the trampoline
+    /// overhead for depth-0 `LoadContextSlot` nodes.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`ctx_i64`) – JIT i64 encoding of the context value.
+    /// * `RSI` (`slot_idx`) – context slot index.
+    ///
+    /// Returns the slot value as `i64` in `RAX`, or [`JIT_DEOPT`].
+    pub extern "C" fn jit_runtime_load_context_slot_direct(ctx_i64: i64, slot_idx: i64) -> i64 {
+        let ctx_val = jit_i64_to_jsvalue(ctx_i64);
+        match ctx_val {
+            JsValue::Context(ctx_rc) => {
+                let ctx = ctx_rc.borrow();
+                ctx.slots
+                    .get(slot_idx as usize)
+                    .map(jsvalue_ref_to_jit_i64)
+                    .unwrap_or(JIT_UNDEFINED)
+            }
+            _ => JIT_DEOPT,
+        }
+    }
+
+    /// Store a value into a context slot using a JIT-encoded context value.
+    ///
+    /// Unlike [`jit_runtime_sta_context_slot_direct`] (which takes a raw
+    /// pointer), this function accepts the same heap-handle encoding that
+    /// the Maglev register allocator produces, avoiding the trampoline
+    /// overhead for depth-0 `StoreContextSlot` nodes.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`ctx_i64`) – JIT i64 encoding of the context value.
+    /// * `RSI` (`slot_idx`) – context slot index.
+    /// * `RDX` (`value_i64`) – JIT i64 encoding of the value to store.
+    ///
+    /// Returns `value_i64` in `RAX` on success, or [`JIT_DEOPT`].
+    pub extern "C" fn jit_runtime_store_context_slot_direct(
+        ctx_i64: i64,
+        slot_idx: i64,
+        value_i64: i64,
+    ) -> i64 {
+        let value = jit_i64_to_jsvalue(value_i64);
+        let ctx_val = jit_i64_to_jsvalue(ctx_i64);
+        match ctx_val {
+            JsValue::Context(ctx_rc) => {
+                let mut ctx = ctx_rc.borrow_mut();
+                let slot = slot_idx as usize;
+                if slot >= ctx.slots.len() {
+                    ctx.slots.resize(slot + 1, JsValue::Undefined);
+                }
+                ctx.slots[slot] = value;
+                value_i64
+            }
+            _ => JIT_DEOPT,
+        }
+    }
+
     // ── Context push/pop stubs for Maglev ──────────────────────────────────
 
     /// Push a new context as the active closure context, returning the old
