@@ -1776,46 +1776,33 @@ impl<'a> MaglevCodegen<'a> {
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::CreateEmptyObjectLiteral => {
-                self.emit_trampoline_call(id, Opcode::CreateEmptyObjectLiteral as u8, 0, 0);
+                let saved = self.emit_save_live_regs(id);
+                let addr = jit_runtime::jit_runtime_create_empty_object as *const () as usize;
+                self.masm.mov_ri(Reg64::R11, addr as i64);
+                self.masm.call_reg(Reg64::R11);
+                self.emit_restore_live_regs(saved);
+                self.emit_deopt_check_rax();
+                self.emit_store(id, Reg64::Rax);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
-            ValueNode::CreateEmptyArrayLiteral { feedback_slot } => {
-                self.emit_trampoline_call(
-                    id,
-                    Opcode::CreateEmptyArrayLiteral as u8,
-                    i64::from(*feedback_slot),
-                    0,
-                );
+            ValueNode::CreateEmptyArrayLiteral { .. } => {
+                let saved = self.emit_save_live_regs(id);
+                let addr = jit_runtime::jit_runtime_create_empty_array as *const () as usize;
+                self.masm.mov_ri(Reg64::R11, addr as i64);
+                self.masm.call_reg(Reg64::R11);
+                self.emit_restore_live_regs(saved);
+                self.emit_deopt_check_rax();
+                self.emit_store(id, Reg64::Rax);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
-            ValueNode::CreateMappedArguments => {
-                self.emit_trampoline_call(id, Opcode::CreateMappedArguments as u8, 0, 0);
-            }
-            #[cfg(all(target_arch = "x86_64", unix))]
-            ValueNode::CreateUnmappedArguments => {
-                self.emit_trampoline_call(id, Opcode::CreateUnmappedArguments as u8, 0, 0);
-            }
-            #[cfg(all(target_arch = "x86_64", unix))]
-            ValueNode::CreateRestParameter => {
-                self.emit_trampoline_call(id, Opcode::CreateRestParameter as u8, 0, 0);
-            }
-            #[cfg(all(target_arch = "x86_64", unix))]
-            ValueNode::CreateArrayLiteral { feedback_slot, .. } => {
-                self.emit_trampoline_call(
-                    id,
-                    Opcode::CreateArrayLiteral as u8,
-                    i64::from(*feedback_slot),
-                    0,
-                );
-            }
-            #[cfg(all(target_arch = "x86_64", unix))]
-            ValueNode::CreateShallowArrayLiteral { feedback_slot, .. } => {
-                self.emit_trampoline_call(
-                    id,
-                    Opcode::CreateArrayLiteral as u8,
-                    i64::from(*feedback_slot),
-                    0,
-                );
+            ValueNode::CreateArrayLiteral { .. } | ValueNode::CreateShallowArrayLiteral { .. } => {
+                let saved = self.emit_save_live_regs(id);
+                let addr = jit_runtime::jit_runtime_create_empty_array as *const () as usize;
+                self.masm.mov_ri(Reg64::R11, addr as i64);
+                self.masm.call_reg(Reg64::R11);
+                self.emit_restore_live_regs(saved);
+                self.emit_deopt_check_rax();
+                self.emit_store(id, Reg64::Rax);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::CreateClosure {

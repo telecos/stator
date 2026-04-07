@@ -5052,7 +5052,25 @@ pub(crate) mod jit_runtime {
         }
     }
 
-    // ── CreateFunctionContext / CreateClosure stubs ────────────────────────
+    // ── CreateFunctionContext / CreateClosure / Object & Array stubs ────────
+
+    /// Create an empty plain object.
+    ///
+    /// Replaces the trampoline dispatch for `CreateEmptyObjectLiteral` in
+    /// Maglev — a zero-argument operation.
+    pub extern "C" fn jit_runtime_create_empty_object() -> i64 {
+        let obj = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
+        alloc_heap_handle(obj)
+    }
+
+    /// Create an empty array.
+    ///
+    /// Replaces the trampoline dispatch for `CreateEmptyArrayLiteral` and
+    /// `CreateArrayLiteral` in Maglev.
+    pub extern "C" fn jit_runtime_create_empty_array() -> i64 {
+        let arr = JsValue::Array(Rc::new(RefCell::new(Vec::new())));
+        alloc_heap_handle(arr)
+    }
 
     /// Create a new function context with `slot_count` slots.
     ///
