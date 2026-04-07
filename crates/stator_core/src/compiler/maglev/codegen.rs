@@ -4429,7 +4429,7 @@ impl<'a> MaglevCodegen<'a> {
     /// only read the lower 32 bits, so the `MOVSXD` can be elided.
     fn compute_narrow_int32(
         graph: &MaglevGraph,
-        alloc: &AllocationResult,
+        _alloc: &AllocationResult,
         i32_range: &HashSet<NodeId>,
     ) -> HashSet<NodeId> {
         // Step 1: collect all wrapping Int32 producer IDs AND i32-range
@@ -4572,19 +4572,17 @@ impl<'a> MaglevCodegen<'a> {
             }
         }
 
-        // Step 5: exclude spilled values — the spill/reload path uses
-        // 64-bit MOVs so the upper 32 bits must be well-defined.
-        candidates.retain(|id| {
-            !non_narrow.contains(id) && !matches!(alloc.location(*id), Some(Location::StackSlot(_)))
-        });
+        // Step 5: exclude values consumed by wide (64-bit) operations.
+        // Spilled values are safe to include: the spill/reload path uses
+        // 64-bit MOVs which preserve the lower 32 bits unchanged, and all
+        // consumers of narrow values use only those lower 32 bits.
+        candidates.retain(|id| !non_narrow.contains(id));
 
         // Step 6: add narrow-transparent Phis to the result set.
         // These Phis pass through narrow values (garbage upper 32 bits)
         // so consumers like StoreGlobal can detect them and sign-extend.
         for id in &narrow_phi {
-            if !matches!(alloc.location(*id), Some(Location::StackSlot(_))) {
-                candidates.insert(*id);
-            }
+            candidates.insert(*id);
         }
 
         candidates
