@@ -1921,35 +1921,19 @@ impl<'a> MaglevCodegen<'a> {
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::GenericNegate { value, .. } => {
-                self.emit_stub_call_1node(
-                    id,
-                    *value,
-                    jit_runtime::jit_runtime_generic_negate as *const () as usize,
-                );
+                self.emit_inline_generic_negate(id, *value);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::GenericIncrement { value, .. } => {
-                self.emit_stub_call_1node(
-                    id,
-                    *value,
-                    jit_runtime::jit_runtime_generic_increment as *const () as usize,
-                );
+                self.emit_inline_generic_inc(id, *value);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::GenericDecrement { value, .. } => {
-                self.emit_stub_call_1node(
-                    id,
-                    *value,
-                    jit_runtime::jit_runtime_generic_decrement as *const () as usize,
-                );
+                self.emit_inline_generic_dec(id, *value);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::GenericBitwiseNot { value, .. } => {
-                self.emit_stub_call_1node(
-                    id,
-                    *value,
-                    jit_runtime::jit_runtime_generic_bitwise_not as *const () as usize,
-                );
+                self.emit_inline_generic_bitnot(id, *value);
             }
 
             // ── Type checks and conversions via trampoline ────────────────────
@@ -3122,13 +3106,141 @@ impl<'a> MaglevCodegen<'a> {
         self.emit_deopt_check_rax();
         self.emit_store(id, Reg64::Rax);
     }
+
+    /// Inline Smi fast path for `GenericIncrement` (`value + 1`).
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_inline_generic_inc(&mut self, id: NodeId, value: NodeId) {
+        let saved = self.emit_save_live_regs(id);
+        self.emit_load(value, Reg64::Rdi);
+
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
+
+        self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.add_ri(Reg64::Rax, 1);
+
+        // Overflow check: result must fit in i32.
+        self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+        self.masm.je(&mut done_label);
+
+        self.masm.bind_label(&mut slow_label);
+        let addr = jit_runtime::jit_runtime_generic_increment as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        self.masm.bind_label(&mut done_label);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Inline Smi fast path for `GenericDecrement` (`value - 1`).
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_inline_generic_dec(&mut self, id: NodeId, value: NodeId) {
+        let saved = self.emit_save_live_regs(id);
+        self.emit_load(value, Reg64::Rdi);
+
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
+
+        self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.sub_ri(Reg64::Rax, 1);
+
+        self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+        self.masm.je(&mut done_label);
+
+        self.masm.bind_label(&mut slow_label);
+        let addr = jit_runtime::jit_runtime_generic_decrement as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        self.masm.bind_label(&mut done_label);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Inline Smi fast path for `GenericNegate` (`-value`).
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_inline_generic_negate(&mut self, id: NodeId, value: NodeId) {
+        let saved = self.emit_save_live_regs(id);
+        self.emit_load(value, Reg64::Rdi);
+
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
+
+        // 0 - value
+        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+        self.masm.sub_rr(Reg64::Rax, Reg64::Rdi);
+
+        self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+        self.masm.je(&mut done_label);
+
+        self.masm.bind_label(&mut slow_label);
+        let addr = jit_runtime::jit_runtime_generic_negate as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        self.masm.bind_label(&mut done_label);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Inline Smi fast path for `GenericBitwiseNot` (`~value`).
     ///
-    /// Calls `jit_runtime_inline_load_keyed_smi` which returns
-    /// `{value, hit}` in `RAX:RDX`.  On a hit the result is used
-    /// directly; on a miss the generic `jit_runtime_lda_keyed_property`
-    /// stub is called as a fallback.
-    ///
-    /// Generated code layout:
+    /// `~x` for i32 always produces an i32, so no overflow check needed.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_inline_generic_bitnot(&mut self, id: NodeId, value: NodeId) {
+        let saved = self.emit_save_live_regs(id);
+        self.emit_load(value, Reg64::Rdi);
+
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
+
+        // ~x = x XOR -1. -1 in 64-bit is 0xFFFFFFFFFFFFFFFF,
+        // but we only care about the lower 32 bits for Smi.
+        // However, result of XOR with 0xFFFF_FFFF_FFFF_FFFF will have
+        // garbage upper bits, so sign-extend after.
+        self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.mov_ri(Reg64::R11, -1);
+        self.masm.xor_rr(Reg64::Rax, Reg64::R11);
+        // Sign-extend result to fit in Smi range.
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rax);
+        self.masm.jmp(&mut done_label);
+
+        self.masm.bind_label(&mut slow_label);
+        let addr = jit_runtime::jit_runtime_generic_bitwise_not as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        self.masm.bind_label(&mut done_label);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Emit an inline fast-path for keyed **load** when the key is a
+    /// known integer.
     /// ```text
     ///   save live regs
     ///   load obj → RDI, key → RSI
