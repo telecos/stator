@@ -1904,21 +1904,11 @@ impl<'a> MaglevCodegen<'a> {
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::GenericSubtract { left, right, .. } => {
-                self.emit_stub_call_2node(
-                    id,
-                    *left,
-                    *right,
-                    jit_runtime::jit_runtime_generic_sub as *const () as usize,
-                );
+                self.emit_inline_generic_sub(id, *left, *right);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::GenericMultiply { left, right, .. } => {
-                self.emit_stub_call_2node(
-                    id,
-                    *left,
-                    *right,
-                    jit_runtime::jit_runtime_generic_mul as *const () as usize,
-                );
+                self.emit_inline_generic_mul(id, *left, *right);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::GenericDivide { left, right, .. } => {
@@ -3014,6 +3004,87 @@ impl<'a> MaglevCodegen<'a> {
         self.emit_deopt_check_rax();
         self.emit_store(id, Reg64::Rax);
     }
+
+    /// Inline Smi fast path for `GenericSubtract`.  Same pattern as
+    /// [`emit_inline_generic_add`](Self::emit_inline_generic_add) but
+    /// emits `SUB` instead of `ADD`.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_inline_generic_sub(&mut self, id: NodeId, left: NodeId, right: NodeId) {
+        let saved = self.emit_save_live_regs(id);
+        self.emit_load(left, Reg64::Rdi);
+        self.emit_load(right, Reg64::Rsi);
+
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
+
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rsi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rsi);
+        self.masm.jne(&mut slow_label);
+
+        self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.sub_rr(Reg64::Rax, Reg64::Rsi);
+
+        self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+        self.masm.je(&mut done_label);
+
+        self.masm.bind_label(&mut slow_label);
+        let addr = jit_runtime::jit_runtime_generic_sub as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        self.masm.bind_label(&mut done_label);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Inline Smi fast path for `GenericMultiply`.  Uses 64-bit `IMUL` so
+    /// the product of two i32 values fits in i64; the result is then
+    /// range-checked back to i32.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_inline_generic_mul(&mut self, id: NodeId, left: NodeId, right: NodeId) {
+        let saved = self.emit_save_live_regs(id);
+        self.emit_load(left, Reg64::Rdi);
+        self.emit_load(right, Reg64::Rsi);
+
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
+
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rsi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rsi);
+        self.masm.jne(&mut slow_label);
+
+        // 64-bit multiply: product of two i32 values always fits in i64.
+        self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.imul_rr(Reg64::Rax, Reg64::Rsi);
+
+        // Check result fits in i32.
+        self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+        self.masm.je(&mut done_label);
+
+        self.masm.bind_label(&mut slow_label);
+        let addr = jit_runtime::jit_runtime_generic_mul as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        self.masm.bind_label(&mut done_label);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Emit an inline fast-path for keyed **load** when the key is a
+    /// known integer.
     ///
     /// Calls `jit_runtime_inline_load_keyed_smi` which returns
     /// `{value, hit}` in `RAX:RDX`.  On a hit the result is used
