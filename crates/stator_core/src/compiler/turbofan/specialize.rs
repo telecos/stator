@@ -1022,6 +1022,7 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
         | TypeOf { value }
         | NumberToString { value, .. }
         | TestUndetectable { value }
+        | TestNullOrUndefined { value }
         | TestTypeOf { value, .. } => *value = resolve(*value),
 
         CheckSmi { receiver }

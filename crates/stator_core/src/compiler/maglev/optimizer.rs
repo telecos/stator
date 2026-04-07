@@ -1947,6 +1947,7 @@ fn collect_value_node_inputs(node: &ValueNode, live: &mut HashSet<NodeId>) {
         | ValueNode::CheckedTaggedToInt32 { input: value }
         | ValueNode::CheckedTaggedToFloat64 { input: value }
         | ValueNode::ToBoolean { value }
+        | ValueNode::TestNullOrUndefined { value }
         | ValueNode::ToString { value, .. }
         | ValueNode::ToObject { value, .. }
         | ValueNode::ToName { value, .. }
@@ -2414,6 +2415,7 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
         | ValueNode::TypeOf { value }
         | ValueNode::NumberToString { value, .. }
         | ValueNode::TestUndetectable { value }
+        | ValueNode::TestNullOrUndefined { value }
         | ValueNode::TestTypeOf { value, .. } => *value = resolve(*value),
 
         ValueNode::CheckSmi { receiver }

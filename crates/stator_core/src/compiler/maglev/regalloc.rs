@@ -258,6 +258,7 @@ fn collect_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
         | ValueNode::TypeOf { value }
         | ValueNode::NumberToString { value, .. }
         | ValueNode::TestUndetectable { value }
+        | ValueNode::TestNullOrUndefined { value }
         | ValueNode::TestTypeOf { value, .. } => f(*value),
 
         ValueNode::CheckSmi { receiver }

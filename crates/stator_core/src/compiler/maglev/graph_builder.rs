@@ -1651,12 +1651,41 @@ impl<'a> GraphBuilder<'a> {
             | Opcode::JumpIfNotNull
             | Opcode::JumpIfNotNullConstant
             | Opcode::JumpIfNotUndefined
-            | Opcode::JumpIfNotUndefinedConstant
-            | Opcode::JumpIfJSReceiver
-            | Opcode::JumpIfJSReceiverConstant => {
-                // For null/undefined/receiver checks we emit a ToBoolean of the
-                // accumulator and branch on that — a conservative lowering that
-                // preserves correctness without requiring dedicated check nodes.
+            | Opcode::JumpIfNotUndefinedConstant => {
+                // Exact null/undefined check — must NOT use ToBoolean because
+                // values like 0, false, "" are falsy but not nullish.
+                let val = self.env_get_accumulator()?;
+                let cond = self.emit(ValueNode::TestNullOrUndefined { value: val })?;
+                let target = self
+                    .resolve_jump_target(instr_idx, all_instructions)
+                    .unwrap_or(self.current_block + 1);
+                let fall = self
+                    .block_at
+                    .get(&(instr_idx + 1))
+                    .copied()
+                    .unwrap_or(self.current_block + 1);
+                // TestNullOrUndefined returns true when the value IS
+                // null/undefined.  "JumpIfUndefinedOrNull" jumps when true.
+                // "JumpIfNotNull/NotUndefined" jumps when false.
+                let (if_true, if_false) = match instr.opcode {
+                    Opcode::JumpIfNotNull
+                    | Opcode::JumpIfNotNullConstant
+                    | Opcode::JumpIfNotUndefined
+                    | Opcode::JumpIfNotUndefinedConstant => (fall, target),
+                    _ => (target, fall),
+                };
+                self.save_env_for_successor(if_true);
+                self.save_env_for_successor(if_false);
+                self.add_branch_predecessors(if_true, if_false);
+                self.set_control(ControlNode::Branch {
+                    condition: cond,
+                    if_true,
+                    if_false,
+                });
+            }
+            Opcode::JumpIfJSReceiver | Opcode::JumpIfJSReceiverConstant => {
+                // For receiver checks we emit a ToBoolean of the
+                // accumulator and branch on that.
                 let val = self.env_get_accumulator()?;
                 let cond = self.emit(ValueNode::ToBoolean { value: val })?;
                 let target = self
@@ -1667,17 +1696,7 @@ impl<'a> GraphBuilder<'a> {
                     .get(&(instr_idx + 1))
                     .copied()
                     .unwrap_or(self.current_block + 1);
-                // "JumpIf<condition>" means "if condition, jump"; for "NotNull" etc.
-                // the truthiness of ToBoolean matches "is not null/undefined".
-                let (if_true, if_false) = match instr.opcode {
-                    Opcode::JumpIfNotNull
-                    | Opcode::JumpIfNotNullConstant
-                    | Opcode::JumpIfNotUndefined
-                    | Opcode::JumpIfNotUndefinedConstant
-                    | Opcode::JumpIfJSReceiver
-                    | Opcode::JumpIfJSReceiverConstant => (target, fall),
-                    _ => (fall, target),
-                };
+                let (if_true, if_false) = (target, fall);
                 self.save_env_for_successor(if_true);
                 self.save_env_for_successor(if_false);
                 self.add_branch_predecessors(if_true, if_false);

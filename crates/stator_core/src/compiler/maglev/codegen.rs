@@ -1272,6 +1272,35 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_store(id, Reg64::R11);
             }
 
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::TestNullOrUndefined { value } => {
+                // Returns JIT_TRUE if value is null or undefined,
+                // JIT_FALSE otherwise.
+                self.emit_load(*value, Reg64::R11);
+                let mut is_nullish = Label::new();
+                let mut done = Label::new();
+                // cmp r11, JIT_UNDEFINED
+                self.masm.mov_ri(Reg64::R10, JIT_UNDEFINED);
+                self.masm.cmp_rr(Reg64::R11, Reg64::R10);
+                self.masm.jcc(CondCode::Equal, &mut is_nullish);
+                // cmp r11, JIT_NULL
+                self.masm.mov_ri(Reg64::R10, JIT_NULL);
+                self.masm.cmp_rr(Reg64::R11, Reg64::R10);
+                self.masm.jcc(CondCode::Equal, &mut is_nullish);
+                // Not nullish → false
+                self.masm.mov_ri(Reg64::R11, JIT_FALSE);
+                self.masm.jmp(&mut done);
+                // Nullish → true
+                self.masm.bind(&mut is_nullish);
+                self.masm.mov_ri(Reg64::R11, JIT_TRUE);
+                self.masm.bind(&mut done);
+                self.emit_store(id, Reg64::R11);
+            }
+            #[cfg(not(all(target_arch = "x86_64", unix)))]
+            ValueNode::TestNullOrUndefined { .. } => {
+                self.emit_store(id, Reg64::R11);
+            }
+
             // ── Phi ──────────────────────────────────────────────────────────
             //
             // Phi-resolution copies are emitted at predecessor jump/branch
@@ -3979,6 +4008,7 @@ impl<'a> MaglevCodegen<'a> {
             | ValueNode::Int32Decrement { value }
             | ValueNode::Float64Negate { value }
             | ValueNode::TestUndetectable { value }
+            | ValueNode::TestNullOrUndefined { value }
             | ValueNode::ToBoolean { value }
             | ValueNode::TypeOf { value }
             | ValueNode::CheckedSmiIncrement { value }

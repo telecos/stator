@@ -717,6 +717,7 @@ fn visit_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
         | ValueNode::CheckedTaggedToInt32 { input: value }
         | ValueNode::CheckedTaggedToFloat64 { input: value }
         | ValueNode::ToBoolean { value }
+        | ValueNode::TestNullOrUndefined { value }
         | ValueNode::ToString { value, .. }
         | ValueNode::ToObject { value, .. }
         | ValueNode::ToName { value, .. }

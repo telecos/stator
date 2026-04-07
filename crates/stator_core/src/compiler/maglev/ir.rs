@@ -899,6 +899,16 @@ pub enum ValueNode {
         value: NodeId,
     },
 
+    /// Tests whether a value is `null` or `undefined`.
+    ///
+    /// Returns a JIT boolean (`JIT_TRUE` / `JIT_FALSE`).  Used by the
+    /// nullish coalescing (`??`) and optional chaining (`?.`) operators
+    /// which must distinguish null/undefined from other falsy values.
+    TestNullOrUndefined {
+        /// The value to test.
+        value: NodeId,
+    },
+
     /// Tests the typeof result against a literal type string.
     TestTypeOf {
         /// The value to test.
