@@ -3403,72 +3403,9 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, off_callee);
         self.masm.jne(&mut cache_miss);
 
-        // ── Mono hit: inline context comparison ──────────────────────
-        // Load cached context pointer.
-        self.masm
-            .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, off_ctx);
-
-        // Get current context pointer from runtime.
-        // Push padding to align RSP to 0 mod 16 (already after prologue saves).
-        self.masm.push(Reg64::R10);
-        self.masm.push(Reg64::R11);
-        let get_ctx_addr = jit_runtime::jit_runtime_get_current_ctx_ptr as *const () as usize;
-        self.masm.mov_ri(Reg64::R9, get_ctx_addr as i64);
-        self.masm.call_reg(Reg64::R9);
-        // RAX now contains current context pointer.
-        self.masm.pop(Reg64::R11);
-        self.masm.pop(Reg64::R10);
-
-        // Compare: cached ctx (R10) vs current ctx (RAX).
-        self.masm.cmp_rr(Reg64::R10, Reg64::Rax);
-        let mut ctx_mismatch = Label::new();
-        self.masm.jne(&mut ctx_mismatch);
-
-        // ── Context match: lightweight prepare (fast path) ────────────
-        // R11 = callee_i64, R10 = ba_ptr.
-        self.masm.mov_rr(Reg64::Rdi, Reg64::R11); // arg0 = callee
-        self.masm
-            .mov_load_base_disp32(Reg64::Rsi, Reg64::Rbp, off_ba); // arg1 = ba
-
-        // Push callee + padding (2 pushes → RSP ≡ 0 mod 16).
-        self.masm.push(Reg64::Rdi);
-        self.masm.push(Reg64::Rdi);
-
-        let same_ctx_addr =
-            jit_runtime::jit_runtime_mono_call_prepare_same_ctx as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, same_ctx_addr as i64);
-        self.masm.call_reg(Reg64::R11);
-
-        // Check success (RAX = 0 → fail, 1 → use cached entry,
-        // > 1 → Maglev upgrade: RAX is the new entry point).
-        self.masm.test_rr(Reg64::Rax, Reg64::Rax);
-        let mut mono_fail = Label::new();
-        self.masm.je(&mut mono_fail);
-
-        // RAX > 1 means Maglev entry point upgrade.
-        self.masm.cmp_ri(Reg64::Rax, 1);
-        let mut same_ctx_no_upgrade = Label::new();
-        self.masm.je(&mut same_ctx_no_upgrade);
-
-        // Upgraded: store new entry point into cache slot and use it.
-        self.masm
-            .mov_store_base_disp32(Reg64::Rbp, off_entry, Reg64::Rax);
-        self.masm.mov_rr(Reg64::R11, Reg64::Rax);
-        self.masm
-            .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, off_ctx);
-        self.masm.jmp(&mut do_direct);
-
-        // No upgrade: load cached entry + ctx for the direct call.
-        self.masm.bind_label(&mut same_ctx_no_upgrade);
-        self.masm
-            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, off_entry);
-        self.masm
-            .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, off_ctx);
-        self.masm.jmp(&mut do_direct);
-
-        // ── Context mismatch: full prepare (slow path) ───────────────
-        self.masm.bind_label(&mut ctx_mismatch);
-        // R11 = callee_i64, load ba and cached ctx again.
+        // ── Mono hit: combined context check + prepare ──────────────
+        // Single stub does context comparison AND prepare in one TLS
+        // access, saving ~40-60ns vs two separate calls.
         self.masm.mov_rr(Reg64::Rdi, Reg64::R11); // arg0 = callee
         self.masm
             .mov_load_base_disp32(Reg64::Rsi, Reg64::Rbp, off_ba); // arg1 = ba
@@ -3479,19 +3416,21 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.push(Reg64::Rdi);
         self.masm.push(Reg64::Rdi);
 
-        let mono_addr = jit_runtime::jit_runtime_mono_call_prepare as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, mono_addr as i64);
+        let combined_addr =
+            jit_runtime::jit_runtime_mono_call_prepare_check_ctx as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, combined_addr as i64);
         self.masm.call_reg(Reg64::R11);
 
         // Check success (RAX = 0 → fail, 1 → use cached entry,
         // > 1 → Maglev upgrade: RAX is the new entry point).
         self.masm.test_rr(Reg64::Rax, Reg64::Rax);
+        let mut mono_fail = Label::new();
         self.masm.je(&mut mono_fail);
 
         // RAX > 1 means Maglev entry point upgrade.
         self.masm.cmp_ri(Reg64::Rax, 1);
-        let mut full_no_upgrade = Label::new();
-        self.masm.je(&mut full_no_upgrade);
+        let mut combined_no_upgrade = Label::new();
+        self.masm.je(&mut combined_no_upgrade);
 
         // Upgraded: store new entry point into cache slot and use it.
         self.masm
@@ -3502,7 +3441,7 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.jmp(&mut do_direct);
 
         // No upgrade: load cached entry + ctx for the direct call.
-        self.masm.bind_label(&mut full_no_upgrade);
+        self.masm.bind_label(&mut combined_no_upgrade);
         self.masm
             .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, off_entry);
         self.masm

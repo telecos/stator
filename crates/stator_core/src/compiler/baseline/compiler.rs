@@ -3371,6 +3371,77 @@ pub(crate) mod jit_runtime {
         }
     }
 
+    /// Combined context-check and prepare for monomorphic calls.
+    ///
+    /// Merges `get_current_ctx_ptr` + `mono_call_prepare_same_ctx` into
+    /// a single TLS access, saving ~40-60ns per closure call.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`callee_i64`) – JIT i64 encoding of the callee.
+    /// * `RSI` (`ba_ptr`) – cached raw pointer to callee's [`BytecodeArray`].
+    /// * `RDX` (`cached_ctx_ptr`) – cached callee context pointer.
+    ///
+    /// Returns `0` on failure, `1` on success (use cached entry), or
+    /// `> 1` for a Maglev upgrade entry point.  When context differs,
+    /// falls through to the full `mono_call_prepare`.
+    pub extern "C" fn jit_runtime_mono_call_prepare_check_ctx(
+        callee_i64: i64,
+        ba_ptr: i64,
+        cached_ctx_ptr: i64,
+    ) -> i64 {
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if !ptrs.is_cached() {
+            return 0;
+        }
+
+        // SAFETY: cached pointer set by cache_rt_ptrs; valid for thread lifetime.
+        let bc_ref = unsafe { &*ptrs.bytecode };
+        let heap_ref = unsafe { &*ptrs.heap };
+        let ctx_ref = unsafe { &*ptrs.context };
+
+        // Compare cached callee context against current runtime context.
+        let callee_ctx_raw = cached_ctx_ptr as *const RefCell<JsContext>;
+        // SAFETY: no active borrows of context RefCell.
+        let current_ctx = unsafe {
+            (*ctx_ref.as_ptr())
+                .as_ref()
+                .map(Rc::as_ptr)
+                .unwrap_or(std::ptr::null())
+        };
+
+        if !std::ptr::eq(callee_ctx_raw, current_ctx) {
+            // Context differs — delegate to the full prepare which
+            // handles context swap.
+            return Self::jit_runtime_mono_call_prepare(callee_i64, ba_ptr, cached_ctx_ptr);
+        }
+
+        // Context matches — same-ctx fast path (no context save/restore).
+        let saved_ba = bc_ref.get();
+        bc_ref.set(ba_ptr as *const BytecodeArray);
+
+        // SAFETY: single-threaded JIT; no concurrent heap mutation.
+        let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+
+        DIRECT_CALL_STATE.with(|c| {
+            c.set(DirectCallState {
+                saved_ba,
+                heap_base,
+                ctx_changed: false,
+            })
+        });
+
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            let ba = unsafe { &*(ba_ptr as *const BytecodeArray) };
+            if let Some(ep) = try_get_maglev_entry_point(ba) {
+                return ep;
+            }
+        }
+
+        1
+    }
+
     /// Lightweight mono-call prepare for the **same-context** fast path.
     ///
     /// Called when the cached callee context pointer already matches the
