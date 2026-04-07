@@ -1900,12 +1900,7 @@ impl<'a> MaglevCodegen<'a> {
             // ── Generic arithmetic via dedicated stubs ────────────────────────
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::GenericAdd { left, right, .. } => {
-                self.emit_stub_call_2node(
-                    id,
-                    *left,
-                    *right,
-                    jit_runtime::jit_runtime_generic_add as *const () as usize,
-                );
+                self.emit_inline_generic_add(id, *left, *right);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::GenericSubtract { left, right, .. } => {
@@ -2957,8 +2952,68 @@ impl<'a> MaglevCodegen<'a> {
         self.emit_store(id, Reg64::Rax);
     }
 
-    /// Emit an inline fast-path for keyed **load** when the key is a
-    /// known integer.
+    /// Emit an inline Smi+Smi fast path for `GenericAdd`.
+    ///
+    /// The generated code checks if both operands fit in i32 (the JIT Smi
+    /// encoding), performs a direct `ADD`, and checks the result also fits
+    /// in i32.  Only on any check failure does it fall back to the full
+    /// `jit_runtime_generic_add` stub.
+    ///
+    /// Fast path (~8 instructions, no function call):
+    /// ```text
+    ///   movsxd rax, edi      ; sign-extend left lower 32 bits
+    ///   cmp    rax, rdi       ; same as full 64-bit → left is Smi
+    ///   jne    slow
+    ///   movsxd rax, esi      ; sign-extend right lower 32 bits
+    ///   cmp    rax, rsi       ; same as full 64-bit → right is Smi
+    ///   jne    slow
+    ///   lea    rax, [rdi+rsi] ; add without clobbering inputs
+    ///   movsxd r11, eax       ; check result fits in i32
+    ///   cmp    r11, rax
+    ///   je     done
+    /// slow:
+    ///   call   jit_runtime_generic_add
+    /// done:
+    /// ```
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_inline_generic_add(&mut self, id: NodeId, left: NodeId, right: NodeId) {
+        let saved = self.emit_save_live_regs(id);
+        self.emit_load(left, Reg64::Rdi);
+        self.emit_load(right, Reg64::Rsi);
+
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+
+        // Check left is Smi: movsxd rax, edi; cmp rax, rdi
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
+
+        // Check right is Smi: movsxd rax, esi; cmp rax, rsi
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rsi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rsi);
+        self.masm.jne(&mut slow_label);
+
+        // Fast add: mov rax, rdi; add rax, rsi
+        self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.add_rr(Reg64::Rax, Reg64::Rsi);
+
+        // Check result fits in i32
+        self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+        self.masm.je(&mut done_label);
+
+        // Slow path: call the generic stub
+        self.masm.bind_label(&mut slow_label);
+        let addr = jit_runtime::jit_runtime_generic_add as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        self.masm.bind_label(&mut done_label);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+        self.emit_store(id, Reg64::Rax);
+    }
     ///
     /// Calls `jit_runtime_inline_load_keyed_smi` which returns
     /// `{value, hit}` in `RAX:RDX`.  On a hit the result is used
