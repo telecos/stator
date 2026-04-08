@@ -2152,11 +2152,20 @@ pub(crate) mod jit_runtime {
         // Skipping the increment avoids a Cell read+write per call.
         #[cfg(all(target_arch = "x86_64", unix))]
         {
-            let maglev_cache = ba.maglev_executable_cache();
-            // SAFETY: single-threaded JIT; no concurrent mutation.
-            let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
-            if let Some(maglev_exec) = maglev_ref.as_ref() {
-                return exec_maglev_callee(ba, maglev_exec, jit_args, saved_ba);
+            if !ba.jit_maglev_has_deopted() {
+                let maglev_cache = ba.maglev_executable_cache();
+                // SAFETY: single-threaded JIT; no concurrent mutation.
+                let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
+                if let Some(maglev_exec) = maglev_ref.as_ref() {
+                    if let Some(result) = exec_maglev_callee(ba, maglev_exec, jit_args, saved_ba) {
+                        return Some(result);
+                    }
+                    // Callee Maglev deopted — increment counter and
+                    // invalidate cache.  Fall through to interpreter so
+                    // the CALLER is not forced to deopt.
+                    ba.mark_jit_maglev_deopted();
+                    *maglev_cache.borrow_mut() = None;
+                }
             }
         }
 
@@ -2196,9 +2205,15 @@ pub(crate) mod jit_runtime {
                     *maglev_cache.borrow_mut() = exec;
                 }
             }
-            let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
-            if let Some(maglev_exec) = maglev_ref.as_ref() {
-                return exec_maglev_callee(ba, maglev_exec, jit_args, saved_ba);
+            if !ba.jit_maglev_has_deopted() {
+                let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
+                if let Some(maglev_exec) = maglev_ref.as_ref() {
+                    if let Some(result) = exec_maglev_callee(ba, maglev_exec, jit_args, saved_ba) {
+                        return Some(result);
+                    }
+                    ba.mark_jit_maglev_deopted();
+                    *maglev_cache.borrow_mut() = None;
+                }
             }
         }
 
@@ -2209,7 +2224,11 @@ pub(crate) mod jit_runtime {
         {
             let cache_ref = unsafe { &*exec_cache.as_ptr() };
             if let Some(exec) = cache_ref.as_ref() {
-                return exec_jit_callee(ba, exec, jit_args, saved_ba);
+                if let Some(result) = exec_jit_callee(ba, exec, jit_args, saved_ba) {
+                    return Some(result);
+                }
+                // Callee baseline JIT deopted — fall through to interpreter.
+                ba.mark_jit_baseline_deopted();
             }
         }
 
@@ -2245,9 +2264,12 @@ pub(crate) mod jit_runtime {
 
         {
             let cache_ref = exec_cache.borrow();
-            if let Some(exec) = cache_ref.as_ref() {
-                return exec_jit_callee(ba, exec, jit_args, saved_ba);
+            if let Some(exec) = cache_ref.as_ref()
+                && let Some(result) = exec_jit_callee(ba, exec, jit_args, saved_ba)
+            {
+                return Some(result);
             }
+            // fall through to interpreter
         }
 
         // ── Interpreter fallback ────────────────────────────────────

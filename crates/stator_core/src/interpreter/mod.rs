@@ -1434,8 +1434,19 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
             }
         }
 
-        let guard = cache.borrow();
-        let cached = guard.as_ref()?;
+        // Borrow the cache to get a pointer to the executable, then
+        // drop the borrow before execution so we can invalidate on deopt.
+        let exec_ptr: *const CachedMaglevCode = {
+            let guard = cache.borrow();
+            match guard.as_ref() {
+                Some(cached) => cached as *const CachedMaglevCode,
+                None => return None,
+            }
+        };
+        // SAFETY: The Rc<RefCell> keeps the CachedMaglevCode alive for the
+        // duration of this function.  We dropped the borrow guard above but
+        // the data is still valid because we only invalidate AFTER execution.
+        let cached = unsafe { &*exec_ptr };
 
         // Set up thread-local state so runtime stubs can access the
         // constant pool, heap-object table, and property IC.
