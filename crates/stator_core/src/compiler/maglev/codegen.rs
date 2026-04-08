@@ -2332,6 +2332,7 @@ impl<'a> MaglevCodegen<'a> {
     /// includes Phi nodes whose inputs are all provably i32 (e.g. loop
     /// counters after range analysis).
     #[cfg(all(target_arch = "x86_64", unix))]
+    #[allow(dead_code)] // May be used in future keyed access codegen.
     fn is_known_int32_key(&self, id: NodeId) -> bool {
         // The i32_range set (computed via fixed-point) includes Phi nodes
         // that feed from Int32 producers — essential for promoted loop

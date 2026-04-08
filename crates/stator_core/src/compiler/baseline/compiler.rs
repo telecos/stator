@@ -1656,16 +1656,17 @@ pub(crate) mod jit_runtime {
                 };
 
                 // ── Own-property IC hit (zero clone) ────────────
-                if ic_entry.name_idx == name_idx && ic_entry.shape == shape {
-                    if let Some(val) = map.get_by_offset(ic_entry.offset) {
-                        return Some(encode_ic_cached(
-                            val,
-                            ic_entry.cached_ptr,
-                            ic_entry.cached_handle,
-                            ic_ref,
-                            lda_slot,
-                        ));
-                    }
+                if ic_entry.name_idx == name_idx
+                    && ic_entry.shape == shape
+                    && let Some(val) = map.get_by_offset(ic_entry.offset)
+                {
+                    return Some(encode_ic_cached(
+                        val,
+                        ic_entry.cached_ptr,
+                        ic_entry.cached_handle,
+                        ic_ref,
+                        lda_slot,
+                    ));
                 }
 
                 // ── Prototype IC hit (pre-encoded i64, zero clone) ──
@@ -1677,7 +1678,7 @@ pub(crate) mod jit_runtime {
             // IC miss or non-PlainObject — need a proper clone for the
             // slow path (heap ref must be dropped before any mutation).
             let obj = heap_val.clone();
-            drop(heap);
+            let _ = heap;
 
             match &obj {
                 JsValue::PlainObject(map_rc) => {
@@ -3379,6 +3380,7 @@ pub(crate) mod jit_runtime {
     /// Used by Maglev codegen to compare against the cached callee
     /// context before deciding whether the full `mono_call_prepare` is
     /// required.
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
     pub extern "C" fn jit_runtime_get_current_ctx_ptr() -> i64 {
         let ptrs = RT_PTRS.with(|p| p.get());
         if !ptrs.is_cached() {
@@ -3474,6 +3476,7 @@ pub(crate) mod jit_runtime {
     ///
     /// Returns a Maglev entry point (> 1) in `RAX` when an upgrade is
     /// available, `1` for plain success, or `0` on failure.
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
     pub extern "C" fn jit_runtime_mono_call_prepare_same_ctx(_callee_i64: i64, ba_ptr: i64) -> i64 {
         let ptrs = RT_PTRS.with(|p| p.get());
         if !ptrs.is_cached() {
