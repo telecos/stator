@@ -4895,6 +4895,22 @@ pub(crate) mod jit_runtime {
         inline_store_keyed_with_ptrs(obj_i64, smi_key, value_i64, ptrs)
     }
 
+    /// Combined inline store + growth + IC update.  Handles both in-bounds
+    /// stores and out-of-bounds sequential appends in a single FFI call,
+    /// eliminating the need for the generic stub fallback on array growth.
+    pub extern "C" fn jit_runtime_inline_store_keyed_grow_ic_r15(
+        obj_i64: i64,
+        smi_key: i64,
+        value_i64: i64,
+        ic_ptr: i64,
+        rt_ptrs_cell: i64,
+    ) -> InlineKeyedResult {
+        // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
+        // TLS slot lives for the thread's entire lifetime.
+        let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
+        inline_store_keyed_grow_ic_with_ptrs(obj_i64, smi_key, value_i64, ic_ptr, ptrs)
+    }
+
     fn inline_store_keyed_with_ptrs(
         obj_i64: i64,
         smi_key: i64,
@@ -4940,6 +4956,73 @@ pub(crate) mod jit_runtime {
                 } else {
                     // Out-of-bounds: needs full stub for Vec growth.
                     InlineKeyedResult::MISS
+                }
+            }
+            _ => InlineKeyedResult::MISS,
+        }
+    }
+
+    /// Inline store with array growth and IC update.  Handles both
+    /// in-bounds and out-of-bounds stores in one call.
+    fn inline_store_keyed_grow_ic_with_ptrs(
+        obj_i64: i64,
+        smi_key: i64,
+        value_i64: i64,
+        ic_ptr: i64,
+        ptrs: RtPtrs,
+    ) -> InlineKeyedResult {
+        if !is_heap_handle(obj_i64) || smi_key < 0 {
+            return InlineKeyedResult::MISS;
+        }
+        if is_heap_handle(value_i64) {
+            return InlineKeyedResult::MISS;
+        }
+        let value = if value_i64 >= i32::MIN as i64 && value_i64 <= i32::MAX as i64 {
+            JsValue::Smi(value_i64 as i32)
+        } else if value_i64 == JIT_TRUE {
+            JsValue::Boolean(true)
+        } else if value_i64 == JIT_FALSE {
+            JsValue::Boolean(false)
+        } else if value_i64 == JIT_UNDEFINED {
+            JsValue::Undefined
+        } else {
+            return InlineKeyedResult::MISS;
+        };
+
+        let key = smi_key as usize;
+        let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+        if !ptrs.is_cached() {
+            return InlineKeyedResult::MISS;
+        }
+        // SAFETY: cached pointers valid for thread lifetime.
+        let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+        match heap.get(obj_idx) {
+            Some(JsValue::Array(arr)) => {
+                // SAFETY: single-threaded JIT; no concurrent borrows.
+                let v = unsafe { &mut *arr.as_ptr() };
+                if key >= v.len() {
+                    // Grow the array with power-of-2 capacity.
+                    let new_cap = (key + 1).next_power_of_two();
+                    v.reserve(new_cap.saturating_sub(v.len()));
+                    v.resize(key + 1, JsValue::TheHole);
+                }
+                v[key] = value;
+
+                // Update caller's IC slots so subsequent x86 inline
+                // checks can succeed with the new data pointer and length.
+                if ic_ptr != 0 {
+                    // SAFETY: ic_ptr points to 3 writable i64s on the
+                    // caller's stack frame (Maglev-generated code).
+                    let ic_slots = ic_ptr as *mut i64;
+                    unsafe {
+                        *ic_slots = obj_i64;
+                        *ic_slots.add(1) = v.as_ptr() as i64;
+                        *ic_slots.add(2) = v.len() as i64;
+                    }
+                }
+                InlineKeyedResult {
+                    value: value_i64,
+                    hit: 1,
                 }
             }
             _ => InlineKeyedResult::MISS,

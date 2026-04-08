@@ -4572,59 +4572,100 @@ impl<'a> MaglevCodegen<'a> {
         self.emit_load(key, Reg64::Rsi);
         self.emit_load(value, Reg64::Rdx);
 
-        // Save args for fallback (4 pushes = 32 bytes for alignment).
-        self.masm.push(Reg64::Rdx);
-        self.masm.push(Reg64::Rsi);
-        self.masm.push(Reg64::Rdi);
-        self.masm.push(Reg64::R11); // alignment padding
-
-        // Call the lean inline helper.
         if self.needs_r15 {
-            self.masm.mov_rr(Reg64::Rcx, Reg64::R15);
-            let inline_addr =
-                jit_runtime::jit_runtime_inline_store_keyed_smi_r15 as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, inline_addr as i64);
+            // Fast path: merged grow + IC update in a single FFI call.
+            // Saves args for rare generic fallback (non-array objects).
+            self.masm.push(Reg64::Rdx);
+            self.masm.push(Reg64::Rsi);
+            self.masm.push(Reg64::Rdi);
+            self.masm.push(Reg64::R11); // alignment padding
+
+            // Pass IC pointer in RCX and RT_PTRS cell in R8.
+            if self.array_ic_base != 0 {
+                self.masm
+                    .lea_base_disp32(Reg64::Rcx, Reg64::Rbp, self.array_ic_base);
+            } else {
+                self.masm.xor_rr(Reg64::Rcx, Reg64::Rcx);
+            }
+            self.masm.mov_rr(Reg64::R8, Reg64::R15);
+            let grow_addr =
+                jit_runtime::jit_runtime_inline_store_keyed_grow_ic_r15 as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, grow_addr as i64);
+            self.masm.call_reg(Reg64::R11);
+
+            // Check hit flag (RDX).
+            let mut generic_label = Label::new();
+            self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
+            self.masm.je(&mut generic_label);
+
+            // HIT: both in-bounds and growth handled, IC updated.
+            self.masm.add_ri(Reg64::Rsp, 32);
+            self.emit_restore_live_regs(saved);
+            self.emit_deopt_check_rax();
+            self.masm.jmp(&mut done_label);
+
+            // Generic fallback (rare: non-array or error).
+            self.masm.bind_label(&mut generic_label);
+            self.masm.pop(Reg64::R11);
+            self.masm.pop(Reg64::Rdi);
+            self.masm.pop(Reg64::Rsi);
+            self.masm.pop(Reg64::Rdx);
+
+            if self.array_ic_base != 0 {
+                self.masm
+                    .lea_base_disp32(Reg64::Rcx, Reg64::Rbp, self.array_ic_base);
+                let stub_addr =
+                    jit_runtime::jit_runtime_sta_keyed_property_with_ic as *const () as usize;
+                self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+            } else {
+                let stub_addr = jit_runtime::jit_runtime_sta_keyed_property as *const () as usize;
+                self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+            }
+            self.masm.call_reg(Reg64::R11);
+
+            self.emit_restore_live_regs(saved);
+            self.emit_deopt_check_rax();
         } else {
+            // Legacy 2-call path (no cached RT_PTRS).
+            self.masm.push(Reg64::Rdx);
+            self.masm.push(Reg64::Rsi);
+            self.masm.push(Reg64::Rdi);
+            self.masm.push(Reg64::R11); // alignment padding
+
             let inline_addr = jit_runtime::jit_runtime_inline_store_keyed_smi as *const () as usize;
             self.masm.mov_ri(Reg64::R11, inline_addr as i64);
+            self.masm.call_reg(Reg64::R11);
+
+            let mut generic_label = Label::new();
+            self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
+            self.masm.je(&mut generic_label);
+
+            self.masm.add_ri(Reg64::Rsp, 32);
+            self.emit_restore_live_regs(saved);
+            self.emit_deopt_check_rax();
+            self.masm.jmp(&mut done_label);
+
+            self.masm.bind_label(&mut generic_label);
+            self.masm.pop(Reg64::R11);
+            self.masm.pop(Reg64::Rdi);
+            self.masm.pop(Reg64::Rsi);
+            self.masm.pop(Reg64::Rdx);
+
+            if self.array_ic_base != 0 {
+                self.masm
+                    .lea_base_disp32(Reg64::Rcx, Reg64::Rbp, self.array_ic_base);
+                let stub_addr =
+                    jit_runtime::jit_runtime_sta_keyed_property_with_ic as *const () as usize;
+                self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+            } else {
+                let stub_addr = jit_runtime::jit_runtime_sta_keyed_property as *const () as usize;
+                self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+            }
+            self.masm.call_reg(Reg64::R11);
+
+            self.emit_restore_live_regs(saved);
+            self.emit_deopt_check_rax();
         }
-        self.masm.call_reg(Reg64::R11);
-
-        // Check hit flag (RDX).
-        let mut generic_label = Label::new();
-        self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
-        self.masm.je(&mut generic_label);
-
-        // ── Inline stub hit (in-bounds store done by Rust) ──
-        // In-bounds stores do not resize the array, skip IC invalidation.
-        self.masm.add_ri(Reg64::Rsp, 32);
-        self.emit_restore_live_regs(saved);
-        self.emit_deopt_check_rax();
-        self.masm.jmp(&mut done_label);
-
-        // ── Generic fallback (out-of-bounds or non-inlineable) ──
-        self.masm.bind_label(&mut generic_label);
-        self.masm.pop(Reg64::R11); // discard padding
-        self.masm.pop(Reg64::Rdi); // restore object
-        self.masm.pop(Reg64::Rsi); // restore key
-        self.masm.pop(Reg64::Rdx); // restore value
-
-        // Pass IC slot pointer so the stub can refresh the cache after
-        // a successful store (which may have grown the backing Vec).
-        if self.array_ic_base != 0 {
-            self.masm
-                .lea_base_disp32(Reg64::Rcx, Reg64::Rbp, self.array_ic_base);
-            let stub_addr =
-                jit_runtime::jit_runtime_sta_keyed_property_with_ic as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, stub_addr as i64);
-        } else {
-            let stub_addr = jit_runtime::jit_runtime_sta_keyed_property as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, stub_addr as i64);
-        }
-        self.masm.call_reg(Reg64::R11);
-
-        self.emit_restore_live_regs(saved);
-        self.emit_deopt_check_rax();
 
         // ── Common exit ─────────────────────────────────────────────
         self.masm.bind_label(&mut done_label);
