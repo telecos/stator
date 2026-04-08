@@ -2252,19 +2252,63 @@ impl<'a> MaglevCodegen<'a> {
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::PushContext { context } => {
-                self.emit_stub_call_1node(
-                    id,
-                    *context,
-                    jit_runtime::jit_runtime_push_context as *const () as usize,
-                );
+                // PushContext sets a new TLS context.  We must also update
+                // the register-file ctx cache so that subsequent
+                // LoadCurrentContextSlot / StoreCurrentContextSlot stubs
+                // find the correct pointer (they read from [R14+ctx_off]).
+                let saved = self.emit_save_live_regs(id);
+                self.emit_load(*context, Reg64::Rdi);
+                let push_addr = jit_runtime::jit_runtime_push_context as *const () as usize as i64;
+                self.masm.mov_ri(Reg64::R11, push_addr);
+                self.masm.call_reg(Reg64::R11);
+                // RAX = old context (PushContext node result).
+
+                if let Some(ctx_off) = self.ctx_regfile_offset {
+                    // Save the old-context result while we fetch the new
+                    // context's raw pointer.  Two pushes keep RSP aligned.
+                    self.masm.push(Reg64::Rax);
+                    self.masm.sub_ri(Reg64::Rsp, 8);
+                    let get_raw_addr = jit_runtime::jit_runtime_get_current_ctx_raw_ptr as *const ()
+                        as usize as i64;
+                    self.masm.mov_ri(Reg64::R11, get_raw_addr);
+                    self.masm.call_reg(Reg64::R11);
+                    // RAX = new context raw pointer.
+                    self.masm
+                        .mov_store_base_disp32(Reg64::R14, ctx_off, Reg64::Rax);
+                    self.masm.add_ri(Reg64::Rsp, 8);
+                    self.masm.pop(Reg64::Rax);
+                }
+
+                self.emit_restore_live_regs(saved);
+                self.emit_deopt_check_rax();
+                self.emit_store(id, Reg64::Rax);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::PopContext { context } => {
-                self.emit_stub_call_1node(
-                    id,
-                    *context,
-                    jit_runtime::jit_runtime_pop_context as *const () as usize,
-                );
+                // PopContext restores a previously saved context.  Like
+                // PushContext, we update the register-file ctx cache.
+                let saved = self.emit_save_live_regs(id);
+                self.emit_load(*context, Reg64::Rdi);
+                let pop_addr = jit_runtime::jit_runtime_pop_context as *const () as usize as i64;
+                self.masm.mov_ri(Reg64::R11, pop_addr);
+                self.masm.call_reg(Reg64::R11);
+                // RAX = JIT_UNDEFINED.
+
+                if let Some(ctx_off) = self.ctx_regfile_offset {
+                    self.masm.push(Reg64::Rax);
+                    self.masm.sub_ri(Reg64::Rsp, 8);
+                    let get_raw_addr = jit_runtime::jit_runtime_get_current_ctx_raw_ptr as *const ()
+                        as usize as i64;
+                    self.masm.mov_ri(Reg64::R11, get_raw_addr);
+                    self.masm.call_reg(Reg64::R11);
+                    self.masm
+                        .mov_store_base_disp32(Reg64::R14, ctx_off, Reg64::Rax);
+                    self.masm.add_ri(Reg64::Rsp, 8);
+                    self.masm.pop(Reg64::Rax);
+                }
+
+                self.emit_restore_live_regs(saved);
+                self.emit_store(id, Reg64::Rax);
             }
 
             // ── Construct via dedicated stub ──────────────────────────────────
@@ -5770,7 +5814,7 @@ impl<'a> MaglevCodegen<'a> {
                         ValueNode::Phi { inputs } => inputs.iter().all(|inp| set.contains(inp)),
                         _ => false,
                     };
-                    if derived {
+                    if derived && !ctrl_consumed.contains(id) {
                         set.insert(*id);
                         changed = true;
                     }

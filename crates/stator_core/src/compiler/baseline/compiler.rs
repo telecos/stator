@@ -6168,6 +6168,31 @@ pub(crate) mod jit_runtime {
         JIT_UNDEFINED
     }
 
+    /// Return the raw pointer of the current TLS closure context.
+    ///
+    /// This is used by the Maglev codegen after `PushContext` / `PopContext`
+    /// stub calls to update the register-file context cache so that
+    /// subsequent `LoadCurrentContextSlot` / `StoreCurrentContextSlot`
+    /// operations find the correct context pointer.
+    ///
+    /// Returns `Rc::as_ptr()` cast to `i64`, or `0` when no context is set.
+    pub extern "C" fn jit_runtime_get_current_ctx_raw_ptr() -> i64 {
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if ptrs.is_cached() {
+            // SAFETY: cached pointers valid for thread lifetime.
+            let ctx_ref = unsafe { &*ptrs.context };
+            let ctx_opt = unsafe { &*ctx_ref.as_ptr() };
+            return ctx_opt.as_ref().map(|c| Rc::as_ptr(c) as i64).unwrap_or(0);
+        }
+        RT_CONTEXT.with(|ctx_cell| {
+            ctx_cell
+                .borrow()
+                .as_ref()
+                .map(|c| Rc::as_ptr(c) as i64)
+                .unwrap_or(0)
+        })
+    }
+
     // ── Generic arithmetic stubs for Maglev ─────────────────────────────────
 
     /// Generic Add: handles Smi + Smi (with overflow), HeapNumber, and
