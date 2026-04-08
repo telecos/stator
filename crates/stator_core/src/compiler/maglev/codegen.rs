@@ -3360,6 +3360,17 @@ impl<'a> MaglevCodegen<'a> {
     /// ```
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_add(&mut self, id: NodeId, left: NodeId, right: NodeId) {
+        // When both inputs are provably i32, the 64-bit ADD can never
+        // overflow (i32 + i32 fits in i64) — emit bare ADD with no
+        // Smi checks, overflow guard, or slow path.
+        if self.i32_range.contains(&left) && self.i32_range.contains(&right) {
+            self.emit_load(left, Reg64::Rax);
+            self.emit_load(right, Reg64::R10);
+            self.masm.add_rr(Reg64::Rax, Reg64::R10);
+            self.emit_store(id, Reg64::Rax);
+            return;
+        }
+
         // Load into non-allocated registers — no save needed on fast path.
         self.emit_load(left, Reg64::Rdi);
         self.emit_load(right, Reg64::R10);
@@ -3367,32 +3378,20 @@ impl<'a> MaglevCodegen<'a> {
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
 
-        // When both inputs are provably i32 (promoted Phis, Smi constants),
-        // skip the expensive MOVSXD+CMP Smi checks — just ADD + JO.
-        let both_i32 = self.i32_range.contains(&left) && self.i32_range.contains(&right);
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
 
-        if !both_i32 {
-            self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
-            self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
-            self.masm.jne(&mut slow_label);
-
-            self.masm.movsxd_rr(Reg64::Rax, Reg64::R10);
-            self.masm.cmp_rr(Reg64::Rax, Reg64::R10);
-            self.masm.jne(&mut slow_label);
-        }
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::R10);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::R10);
+        self.masm.jne(&mut slow_label);
 
         self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
         self.masm.add_rr(Reg64::Rax, Reg64::R10);
 
-        if both_i32 {
-            // Overflow check via flags — no MOVSXD needed.
-            self.masm.jcc(CondCode::Overflow, &mut slow_label);
-            self.masm.jmp(&mut done_label);
-        } else {
-            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
-            self.masm.je(&mut done_label);
-        }
+        self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+        self.masm.je(&mut done_label);
 
         // Slow path: save live regs, call stub, restore.
         self.masm.bind_label(&mut slow_label);
@@ -3413,38 +3412,35 @@ impl<'a> MaglevCodegen<'a> {
     /// emits `SUB` instead of `ADD`.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_sub(&mut self, id: NodeId, left: NodeId, right: NodeId) {
+        if self.i32_range.contains(&left) && self.i32_range.contains(&right) {
+            self.emit_load(left, Reg64::Rax);
+            self.emit_load(right, Reg64::R10);
+            self.masm.sub_rr(Reg64::Rax, Reg64::R10);
+            self.emit_store(id, Reg64::Rax);
+            return;
+        }
+
         self.emit_load(left, Reg64::Rdi);
         self.emit_load(right, Reg64::R10);
 
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
 
-        let both_i32 = self.i32_range.contains(&left) && self.i32_range.contains(&right);
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
 
-        if !both_i32 {
-            self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
-            self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
-            self.masm.jne(&mut slow_label);
-
-            self.masm.movsxd_rr(Reg64::Rax, Reg64::R10);
-            self.masm.cmp_rr(Reg64::Rax, Reg64::R10);
-            self.masm.jne(&mut slow_label);
-        }
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::R10);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::R10);
+        self.masm.jne(&mut slow_label);
 
         self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
         self.masm.sub_rr(Reg64::Rax, Reg64::R10);
 
-        if both_i32 {
-            self.masm.jcc(CondCode::Overflow, &mut slow_label);
-        } else {
-            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
-            self.masm.je(&mut done_label);
-        }
+        self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+        self.masm.je(&mut done_label);
 
-        if both_i32 {
-            self.masm.jmp(&mut done_label);
-        }
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
         self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
@@ -3463,39 +3459,36 @@ impl<'a> MaglevCodegen<'a> {
     /// range-checked back to i32.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_mul(&mut self, id: NodeId, left: NodeId, right: NodeId) {
+        if self.i32_range.contains(&left) && self.i32_range.contains(&right) {
+            self.emit_load(left, Reg64::Rax);
+            self.emit_load(right, Reg64::R10);
+            self.masm.imul_rr(Reg64::Rax, Reg64::R10);
+            self.emit_store(id, Reg64::Rax);
+            return;
+        }
+
         self.emit_load(left, Reg64::Rdi);
         self.emit_load(right, Reg64::R10);
 
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
 
-        let both_i32 = self.i32_range.contains(&left) && self.i32_range.contains(&right);
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
 
-        if !both_i32 {
-            self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
-            self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
-            self.masm.jne(&mut slow_label);
-
-            self.masm.movsxd_rr(Reg64::Rax, Reg64::R10);
-            self.masm.cmp_rr(Reg64::Rax, Reg64::R10);
-            self.masm.jne(&mut slow_label);
-        }
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::R10);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::R10);
+        self.masm.jne(&mut slow_label);
 
         self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
         self.masm.imul_rr(Reg64::Rax, Reg64::R10);
 
         // IMUL sets OF on overflow, so use JO for both paths.
-        if both_i32 {
-            self.masm.jcc(CondCode::Overflow, &mut slow_label);
-        } else {
-            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
-            self.masm.je(&mut done_label);
-        }
+        self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+        self.masm.je(&mut done_label);
 
-        if both_i32 {
-            self.masm.jmp(&mut done_label);
-        }
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
         self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
@@ -3515,40 +3508,40 @@ impl<'a> MaglevCodegen<'a> {
     /// check is needed — just Smi-check both operands and emit `OR`.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_bitor(&mut self, id: NodeId, left: NodeId, right: NodeId) {
+        if self.i32_range.contains(&left) && self.i32_range.contains(&right) {
+            self.emit_load(left, Reg64::Rax);
+            self.emit_load(right, Reg64::R10);
+            self.masm.or_rr(Reg64::Rax, Reg64::R10);
+            self.emit_store(id, Reg64::Rax);
+            return;
+        }
+
         self.emit_load(left, Reg64::Rdi);
         self.emit_load(right, Reg64::R10);
 
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
 
-        let both_i32 = self.i32_range.contains(&left) && self.i32_range.contains(&right);
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
 
-        if !both_i32 {
-            self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
-            self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
-            self.masm.jne(&mut slow_label);
-
-            self.masm.movsxd_rr(Reg64::Rax, Reg64::R10);
-            self.masm.cmp_rr(Reg64::Rax, Reg64::R10);
-            self.masm.jne(&mut slow_label);
-        }
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::R10);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::R10);
+        self.masm.jne(&mut slow_label);
 
         self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
         self.masm.or_rr(Reg64::Rax, Reg64::R10);
-        if !both_i32 {
-            self.masm.jmp(&mut done_label);
-        }
+        self.masm.jmp(&mut done_label);
 
-        if !both_i32 {
-            self.masm.bind_label(&mut slow_label);
-            let saved = self.emit_save_live_regs(id);
-            self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
-            let addr = jit_runtime::jit_runtime_generic_bitwise_or as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, addr as i64);
-            self.masm.call_reg(Reg64::R11);
-            self.emit_restore_live_regs(saved);
-            self.emit_deopt_check_rax();
-        }
+        self.masm.bind_label(&mut slow_label);
+        let saved = self.emit_save_live_regs(id);
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+        let addr = jit_runtime::jit_runtime_generic_bitwise_or as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
 
         self.masm.bind_label(&mut done_label);
         self.emit_store(id, Reg64::Rax);
@@ -3557,40 +3550,40 @@ impl<'a> MaglevCodegen<'a> {
     /// Inline Smi fast path for `GenericBitwiseAnd`.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_bitand(&mut self, id: NodeId, left: NodeId, right: NodeId) {
+        if self.i32_range.contains(&left) && self.i32_range.contains(&right) {
+            self.emit_load(left, Reg64::Rax);
+            self.emit_load(right, Reg64::R10);
+            self.masm.and_rr(Reg64::Rax, Reg64::R10);
+            self.emit_store(id, Reg64::Rax);
+            return;
+        }
+
         self.emit_load(left, Reg64::Rdi);
         self.emit_load(right, Reg64::R10);
 
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
 
-        let both_i32 = self.i32_range.contains(&left) && self.i32_range.contains(&right);
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
 
-        if !both_i32 {
-            self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
-            self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
-            self.masm.jne(&mut slow_label);
-
-            self.masm.movsxd_rr(Reg64::Rax, Reg64::R10);
-            self.masm.cmp_rr(Reg64::Rax, Reg64::R10);
-            self.masm.jne(&mut slow_label);
-        }
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::R10);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::R10);
+        self.masm.jne(&mut slow_label);
 
         self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
         self.masm.and_rr(Reg64::Rax, Reg64::R10);
-        if !both_i32 {
-            self.masm.jmp(&mut done_label);
-        }
+        self.masm.jmp(&mut done_label);
 
-        if !both_i32 {
-            self.masm.bind_label(&mut slow_label);
-            let saved = self.emit_save_live_regs(id);
-            self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
-            let addr = jit_runtime::jit_runtime_generic_bitwise_and as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, addr as i64);
-            self.masm.call_reg(Reg64::R11);
-            self.emit_restore_live_regs(saved);
-            self.emit_deopt_check_rax();
-        }
+        self.masm.bind_label(&mut slow_label);
+        let saved = self.emit_save_live_regs(id);
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+        let addr = jit_runtime::jit_runtime_generic_bitwise_and as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
 
         self.masm.bind_label(&mut done_label);
         self.emit_store(id, Reg64::Rax);
@@ -3599,40 +3592,40 @@ impl<'a> MaglevCodegen<'a> {
     /// Inline Smi fast path for `GenericBitwiseXor`.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_bitxor(&mut self, id: NodeId, left: NodeId, right: NodeId) {
+        if self.i32_range.contains(&left) && self.i32_range.contains(&right) {
+            self.emit_load(left, Reg64::Rax);
+            self.emit_load(right, Reg64::R10);
+            self.masm.xor_rr(Reg64::Rax, Reg64::R10);
+            self.emit_store(id, Reg64::Rax);
+            return;
+        }
+
         self.emit_load(left, Reg64::Rdi);
         self.emit_load(right, Reg64::R10);
 
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
 
-        let both_i32 = self.i32_range.contains(&left) && self.i32_range.contains(&right);
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
 
-        if !both_i32 {
-            self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
-            self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
-            self.masm.jne(&mut slow_label);
-
-            self.masm.movsxd_rr(Reg64::Rax, Reg64::R10);
-            self.masm.cmp_rr(Reg64::Rax, Reg64::R10);
-            self.masm.jne(&mut slow_label);
-        }
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::R10);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::R10);
+        self.masm.jne(&mut slow_label);
 
         self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
         self.masm.xor_rr(Reg64::Rax, Reg64::R10);
-        if !both_i32 {
-            self.masm.jmp(&mut done_label);
-        }
+        self.masm.jmp(&mut done_label);
 
-        if !both_i32 {
-            self.masm.bind_label(&mut slow_label);
-            let saved = self.emit_save_live_regs(id);
-            self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
-            let addr = jit_runtime::jit_runtime_generic_bitwise_xor as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, addr as i64);
-            self.masm.call_reg(Reg64::R11);
-            self.emit_restore_live_regs(saved);
-            self.emit_deopt_check_rax();
-        }
+        self.masm.bind_label(&mut slow_label);
+        let saved = self.emit_save_live_regs(id);
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+        let addr = jit_runtime::jit_runtime_generic_bitwise_xor as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
 
         self.masm.bind_label(&mut done_label);
         self.emit_store(id, Reg64::Rax);
@@ -3641,33 +3634,29 @@ impl<'a> MaglevCodegen<'a> {
     /// Inline Smi fast path for `GenericIncrement` (`value + 1`).
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_inc(&mut self, id: NodeId, value: NodeId) {
+        if self.i32_range.contains(&value) {
+            self.emit_load(value, Reg64::Rax);
+            self.masm.add_ri(Reg64::Rax, 1);
+            self.emit_store(id, Reg64::Rax);
+            return;
+        }
+
         self.emit_load(value, Reg64::Rdi);
 
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
 
-        let is_i32 = self.i32_range.contains(&value);
-
-        if !is_i32 {
-            self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
-            self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
-            self.masm.jne(&mut slow_label);
-        }
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
 
         self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
         self.masm.add_ri(Reg64::Rax, 1);
 
-        if is_i32 {
-            self.masm.jcc(CondCode::Overflow, &mut slow_label);
-        } else {
-            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
-            self.masm.je(&mut done_label);
-        }
+        self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+        self.masm.je(&mut done_label);
 
-        if is_i32 {
-            self.masm.jmp(&mut done_label);
-        }
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
         let addr = jit_runtime::jit_runtime_generic_increment as *const () as usize;
@@ -3683,33 +3672,29 @@ impl<'a> MaglevCodegen<'a> {
     /// Inline Smi fast path for `GenericDecrement` (`value - 1`).
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_dec(&mut self, id: NodeId, value: NodeId) {
+        if self.i32_range.contains(&value) {
+            self.emit_load(value, Reg64::Rax);
+            self.masm.sub_ri(Reg64::Rax, 1);
+            self.emit_store(id, Reg64::Rax);
+            return;
+        }
+
         self.emit_load(value, Reg64::Rdi);
 
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
 
-        let is_i32 = self.i32_range.contains(&value);
-
-        if !is_i32 {
-            self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
-            self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
-            self.masm.jne(&mut slow_label);
-        }
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
 
         self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
         self.masm.sub_ri(Reg64::Rax, 1);
 
-        if is_i32 {
-            self.masm.jcc(CondCode::Overflow, &mut slow_label);
-        } else {
-            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
-            self.masm.je(&mut done_label);
-        }
+        self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+        self.masm.je(&mut done_label);
 
-        if is_i32 {
-            self.masm.jmp(&mut done_label);
-        }
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
         let addr = jit_runtime::jit_runtime_generic_decrement as *const () as usize;
@@ -3725,33 +3710,30 @@ impl<'a> MaglevCodegen<'a> {
     /// Inline Smi fast path for `GenericNegate` (`-value`).
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_negate(&mut self, id: NodeId, value: NodeId) {
+        if self.i32_range.contains(&value) {
+            self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+            self.emit_load(value, Reg64::Rdi);
+            self.masm.sub_rr(Reg64::Rax, Reg64::Rdi);
+            self.emit_store(id, Reg64::Rax);
+            return;
+        }
+
         self.emit_load(value, Reg64::Rdi);
 
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
 
-        let is_i32 = self.i32_range.contains(&value);
-
-        if !is_i32 {
-            self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
-            self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
-            self.masm.jne(&mut slow_label);
-        }
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
 
         self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
         self.masm.sub_rr(Reg64::Rax, Reg64::Rdi);
 
-        if is_i32 {
-            self.masm.jcc(CondCode::Overflow, &mut slow_label);
-        } else {
-            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
-            self.masm.je(&mut done_label);
-        }
+        self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+        self.masm.je(&mut done_label);
 
-        if is_i32 {
-            self.masm.jmp(&mut done_label);
-        }
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
         let addr = jit_runtime::jit_runtime_generic_negate as *const () as usize;
@@ -3769,6 +3751,15 @@ impl<'a> MaglevCodegen<'a> {
     /// `~x` for i32 always produces an i32, so no overflow check needed.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_bitnot(&mut self, id: NodeId, value: NodeId) {
+        if self.i32_range.contains(&value) {
+            self.emit_load(value, Reg64::Rax);
+            self.masm.mov_ri(Reg64::R11, -1);
+            self.masm.xor_rr(Reg64::Rax, Reg64::R11);
+            self.masm.movsxd_rr(Reg64::Rax, Reg64::Rax);
+            self.emit_store(id, Reg64::Rax);
+            return;
+        }
+
         self.emit_load(value, Reg64::Rdi);
 
         let mut slow_label = Label::new();
