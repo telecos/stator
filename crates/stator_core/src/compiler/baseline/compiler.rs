@@ -1621,18 +1621,16 @@ pub(crate) mod jit_runtime {
 
         let ptrs = RT_PTRS.with(|p| p.get());
 
-        // ── Ultra-fast path: array method IC hit ────────────────────
-        // Reuses a previously created fast-array-method PlainObject
-        // wrapper instead of recreating it on every loop iteration.
-        let ic = RT_ARRAY_METHOD_IC.with(|c| c.get());
-        if ic.receiver == obj_i64 && ic.name_idx == name_idx && ic.method != 0 {
-            return Some(ic.method);
-        }
-
         // ── Phase 1: IC hit via borrowed heap (no input clone) ──────
         // Returns Ok(i64) for a direct/primitive result, Err(JsValue)
         // for an object result that still needs a heap handle, or None
         // on IC miss.
+        //
+        // The property ICs (own + prototype) are checked FIRST, before
+        // the array-method IC, because the property ICs are accessed
+        // via the already-cached `RT_PTRS` pointer.  Deferring the
+        // `RT_ARRAY_METHOD_IC` thread-local lookup saves one TLS
+        // access (~5-10 ns) on every property IC hit.
         let fast: Option<Result<i64, JsValue>> = if ptrs.is_cached() {
             // SAFETY: cached pointers set by cache_rt_ptrs; valid for thread lifetime.
             let heap_ref = unsafe { &*ptrs.heap };
@@ -1673,6 +1671,14 @@ pub(crate) mod jit_runtime {
                 if proto_entry.0 == name_idx && proto_entry.1 == shape {
                     return Some(proto_entry.2);
                 }
+            }
+
+            // ── Deferred array method IC check ──────────────────
+            // Checked after property ICs: saves one TLS access on every
+            // own-property or prototype IC hit for plain objects.
+            let arr_ic = RT_ARRAY_METHOD_IC.with(|c| c.get());
+            if arr_ic.receiver == obj_i64 && arr_ic.name_idx == name_idx && arr_ic.method != 0 {
+                return Some(Ok(arr_ic.method));
             }
 
             // IC miss or non-PlainObject — need a proper clone for the
@@ -1757,6 +1763,12 @@ pub(crate) mod jit_runtime {
                 _ => None,
             }
         } else {
+            // Deferred array method IC check for the non-cached path.
+            let arr_ic = RT_ARRAY_METHOD_IC.with(|c| c.get());
+            if arr_ic.receiver == obj_i64 && arr_ic.name_idx == name_idx && arr_ic.method != 0 {
+                return Some(arr_ic.method);
+            }
+
             RT_HEAP.with(|heap| {
                 let heap = heap.borrow();
                 let obj = heap.get(idx)?;

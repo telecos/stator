@@ -455,7 +455,8 @@ fn collect_mutated_objects(graph: &MaglevGraph, loop_body: &HashSet<u32>) -> Has
             match node {
                 ValueNode::StoreField { object, .. }
                 | ValueNode::StoreNamedGeneric { object, .. }
-                | ValueNode::StoreKeyedGeneric { object, .. } => {
+                | ValueNode::StoreKeyedGeneric { object, .. }
+                | ValueNode::DeleteProperty { object, .. } => {
                     mutated.insert(*object);
                 }
                 ValueNode::StoreFixedArrayElement { elements, .. }
@@ -528,10 +529,11 @@ fn is_generic_property_load(node: &ValueNode) -> bool {
 }
 
 /// Return `true` if the loop body contains any nodes that could modify
-/// arbitrary object properties: generic property stores or any kind of call /
-/// construct.  When this returns `true`, [`LoadNamedGeneric`] and
-/// [`LoadKeyedGeneric`] must **not** be hoisted because a call can mutate any
-/// object reachable from its arguments or from the global scope.
+/// arbitrary object properties: generic property stores, property deletion,
+/// or any kind of call / construct.  When this returns `true`,
+/// [`LoadNamedGeneric`] and [`LoadKeyedGeneric`] must **not** be hoisted
+/// because the operation can mutate objects reachable from its arguments or
+/// from the global scope.
 fn loop_has_property_side_effects(graph: &MaglevGraph, loop_body: &HashSet<u32>) -> bool {
     for block in graph.blocks() {
         if !loop_body.contains(&block.id) {
@@ -542,6 +544,7 @@ fn loop_has_property_side_effects(graph: &MaglevGraph, loop_body: &HashSet<u32>)
                 node,
                 ValueNode::StoreNamedGeneric { .. }
                     | ValueNode::StoreKeyedGeneric { .. }
+                    | ValueNode::DeleteProperty { .. }
                     | ValueNode::Call { .. }
                     | ValueNode::CallKnownFunction { .. }
                     | ValueNode::CallBuiltin { .. }
@@ -1746,6 +1749,56 @@ mod tests {
         assert!(
             graph.blocks()[0].nodes.iter().any(|(id, _)| *id == z_id),
             "LoadNamedGeneric(z) should be in preheader"
+        );
+    }
+
+    // ── LoadNamedGeneric NOT hoisted when DeleteProperty exists ──────────
+
+    #[test]
+    fn test_load_named_generic_not_hoisted_with_delete_property() {
+        let mut graph = loop_graph();
+
+        let param_id = graph.blocks()[0].nodes[0].0;
+
+        // A key for the delete.
+        let key_id = NodeId(52);
+        graph.blocks_mut()[0]
+            .nodes
+            .push((key_id, ValueNode::SmiConstant { value: 0 }));
+
+        // LoadNamedGeneric on param_id.
+        graph.blocks_mut()[2].nodes.push((
+            NodeId(950),
+            ValueNode::LoadNamedGeneric {
+                object: param_id,
+                name: 1,
+                feedback_slot: 0,
+            },
+        ));
+
+        // DeleteProperty on a different object — still blocks the load
+        // because deletion can change prototype chain resolution.
+        let other_obj = NodeId(51);
+        graph.blocks_mut()[0]
+            .nodes
+            .push((other_obj, ValueNode::Parameter { index: 1 }));
+        graph.blocks_mut()[2].nodes.push((
+            NodeId(951),
+            ValueNode::DeleteProperty {
+                object: other_obj,
+                key: key_id,
+                feedback_slot: 0,
+            },
+        ));
+
+        hoist_loop_invariants(&mut graph);
+
+        assert!(
+            graph.blocks()[2]
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::LoadNamedGeneric { .. })),
+            "LoadNamedGeneric should NOT be hoisted when DeleteProperty exists in the loop"
         );
     }
 }
