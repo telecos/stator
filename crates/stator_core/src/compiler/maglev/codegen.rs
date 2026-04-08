@@ -3387,6 +3387,7 @@ impl<'a> MaglevCodegen<'a> {
         if both_i32 {
             // Overflow check via flags — no MOVSXD needed.
             self.masm.jcc(CondCode::Overflow, &mut slow_label);
+            self.masm.jmp(&mut done_label);
         } else {
             self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
             self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
@@ -3441,6 +3442,9 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.je(&mut done_label);
         }
 
+        if both_i32 {
+            self.masm.jmp(&mut done_label);
+        }
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
         self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
@@ -3489,6 +3493,9 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.je(&mut done_label);
         }
 
+        if both_i32 {
+            self.masm.jmp(&mut done_label);
+        }
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
         self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
@@ -3658,6 +3665,9 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.je(&mut done_label);
         }
 
+        if is_i32 {
+            self.masm.jmp(&mut done_label);
+        }
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
         let addr = jit_runtime::jit_runtime_generic_increment as *const () as usize;
@@ -3697,6 +3707,9 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.je(&mut done_label);
         }
 
+        if is_i32 {
+            self.masm.jmp(&mut done_label);
+        }
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
         let addr = jit_runtime::jit_runtime_generic_decrement as *const () as usize;
@@ -3736,6 +3749,9 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.je(&mut done_label);
         }
 
+        if is_i32 {
+            self.masm.jmp(&mut done_label);
+        }
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
         let addr = jit_runtime::jit_runtime_generic_negate as *const () as usize;
