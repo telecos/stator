@@ -365,8 +365,8 @@ pub(crate) mod jit_runtime {
         fn is_cached(&self) -> bool {
             !self.heap.is_null()
                 && !self.bytecode.is_null()
-                && (self.bytecode as usize) % std::mem::align_of::<Cell<*const BytecodeArray>>()
-                    == 0
+                && (self.bytecode as usize)
+                    .is_multiple_of(std::mem::align_of::<Cell<*const BytecodeArray>>())
         }
 
         /// Store [`DirectCallState`] via the cached pointer, avoiding a
@@ -3665,6 +3665,143 @@ pub(crate) mod jit_runtime {
         1
     }
 
+    /// Combined prepare + call + finish for monomorphic 0-arg direct calls.
+    ///
+    /// Fuses the entire call sequence into a single Rust function, saving:
+    ///
+    /// * 2 extra Rust function call prologues/epilogues
+    /// * 2 `Cell<RtPtrs>::get()` reads (shared across prepare + finish)
+    /// * 1 `DirectCallState` TLS write + read (kept on Rust stack)
+    /// * 1 Maglev upgrade check per call
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`entry_point`) — cached entry point of the callee
+    /// * `RSI` (`ba_ptr`) — cached BA pointer for callee
+    /// * `RDX` (`cached_ctx_ptr`) — cached context pointer
+    /// * `RCX` (`rt_ptrs_cell`) — raw pointer to `Cell<RtPtrs>` (from R15)
+    /// * `R8`  (`reg_slots`) — cached `register_file_slots`
+    /// * `R9`  (`callee_i64`) — JIT i64 encoding of the callee
+    ///
+    /// Returns callee result in `RAX`, or [`JIT_DEOPT`].
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    pub extern "C" fn jit_runtime_mono_dispatch_call_0_r15(
+        entry_point: i64,
+        ba_ptr: i64,
+        cached_ctx_ptr: i64,
+        rt_ptrs_cell: i64,
+        _reg_slots: i64,
+        callee_i64: i64,
+    ) -> i64 {
+        // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
+        // TLS slot lives for the thread's entire lifetime.
+        let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
+        if !ptrs.is_cached() {
+            return JIT_DEOPT;
+        }
+        mono_dispatch_call_0_inner(entry_point, ba_ptr, cached_ctx_ptr, ptrs, callee_i64)
+    }
+
+    /// Inner implementation for [`jit_runtime_mono_dispatch_call_0_r15`].
+    fn mono_dispatch_call_0_inner(
+        entry_point: i64,
+        ba_ptr: i64,
+        cached_ctx_ptr: i64,
+        ptrs: RtPtrs,
+        callee_i64: i64,
+    ) -> i64 {
+        // SAFETY: cached pointers set by cache_rt_ptrs; valid for thread
+        // lifetime.  Single-threaded access guaranteed.
+        let bc_ref = unsafe { &*ptrs.bytecode };
+        let heap_ref = unsafe { &*ptrs.heap };
+        let ctx_ref = unsafe { &*ptrs.context };
+
+        // ── Prepare ─────────────────────────────────────────────
+        let saved_ba = bc_ref.get();
+        bc_ref.set(ba_ptr as *const BytecodeArray);
+
+        // SAFETY: single-threaded JIT; no concurrent heap mutation.
+        let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+
+        // Context swap using std::mem::replace (same pattern as
+        // exec_jit_callee).  Keeps the old context on the Rust stack
+        // instead of in a TLS slot, eliminating DIRECT_CALL_OLD_CTX
+        // accesses.
+        let callee_ctx_raw = cached_ctx_ptr as *const RefCell<JsContext>;
+        // SAFETY: no active borrows of context RefCell.
+        let current_ctx = unsafe {
+            (*ctx_ref.as_ptr())
+                .as_ref()
+                .map(Rc::as_ptr)
+                .unwrap_or(std::ptr::null())
+        };
+        let same_context = std::ptr::eq(callee_ctx_raw, current_ctx);
+
+        let saved_ctx = if same_context {
+            None
+        } else {
+            let idx = (callee_i64 - JIT_HEAP_TAG) as usize;
+            let callee_ctx = {
+                // SAFETY: single-threaded.
+                let heap = unsafe { &*heap_ref.as_ptr() };
+                match heap.get(idx) {
+                    Some(JsValue::Function(ba)) => ba.closure_context().cloned(),
+                    _ => {
+                        bc_ref.set(saved_ba);
+                        return JIT_DEOPT;
+                    }
+                }
+            };
+            // SAFETY: no active borrows; swap context via raw pointer.
+            Some(unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx) })
+        };
+
+        // Stash DirectCallState for any nested calls the callee makes.
+        ptrs.set_direct_call(DirectCallState {
+            saved_ba,
+            heap_base,
+            ctx_changed: !same_context,
+        });
+
+        // ── Call ─────────────────────────────────────────────────
+        // Allocate a zeroed register file on the Rust stack.  The
+        // callee receives a pointer in RDI and context in RSI.
+        let mut reg_file = [0i64; 16];
+        // SAFETY: entry_point is a valid JIT code pointer produced by
+        // the baseline or Maglev compiler.
+        let f: extern "C" fn(*mut i64, i64) -> i64 =
+            unsafe { std::mem::transmute(entry_point as usize as *const ()) };
+        let result = f(reg_file.as_mut_ptr(), cached_ctx_ptr);
+
+        // ── Finish ──────────────────────────────────────────────
+        bc_ref.set(saved_ba);
+
+        if result != JIT_DEOPT && result < JIT_HEAP_TAG {
+            // SAFETY: no active borrows; truncate via raw pointer.
+            unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+            if let Some(ctx) = saved_ctx {
+                // SAFETY: no active borrows; restore context.
+                unsafe { *ctx_ref.as_ptr() = ctx };
+            }
+            return result;
+        }
+
+        // Heap handle or deopt: resolve before truncation.
+        let result_val = if result == JIT_DEOPT {
+            None
+        } else {
+            jit_to_jsvalue_ext(result)
+        };
+
+        // SAFETY: no active borrows; truncate/restore via raw pointer.
+        unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+        if let Some(ctx) = saved_ctx {
+            unsafe { *ctx_ref.as_ptr() = ctx };
+        }
+
+        result_val.map(jsvalue_to_jit_i64).unwrap_or(JIT_DEOPT)
+    }
+
     /// Specialized runtime stub for `LdaGlobal`.
     ///
     /// Avoids the generic opcode dispatch overhead of
@@ -4920,6 +5057,7 @@ pub(crate) mod jit_runtime {
     ///
     /// Returns [`InlineKeyedResult`] in `RAX:RDX`.
     #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // FFI entry point; caller guarantees valid pointer.
     pub extern "C" fn jit_runtime_inline_load_keyed_smi_ic_r15(
         obj_i64: i64,
         smi_key: i64,

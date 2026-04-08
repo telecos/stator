@@ -571,6 +571,7 @@ struct MaglevCodegen<'a> {
     /// Each `CallUndefinedReceiver0` call site gets one 32-byte cache slot.
     /// Zero if the function has no direct-call-0 sites.
     #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
+    #[allow(dead_code)] // used only to compute total_cache_bytes and array_ic_base
     mono_call_cache_bytes: i32,
     /// Counter used during block emission to assign sequential cache-slot
     /// offsets to each `CallUndefinedReceiver0` site.
@@ -4118,68 +4119,43 @@ impl<'a> MaglevCodegen<'a> {
 
         // ── Monomorphic cache check ─────────────────────────────────
         let mut cache_miss = Label::new();
-        let mut do_direct = Label::new();
         let mut done_label = Label::new();
 
         self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, off_callee);
         self.masm.jne(&mut cache_miss);
 
-        // ── Mono hit: combined context check + prepare ──────────────
-        // Single stub does context comparison AND prepare in one TLS
-        // access, saving ~40-60ns vs two separate calls.
-        self.masm.mov_rr(Reg64::Rdi, Reg64::R11); // arg0 = callee
+        // ── Mono HIT: fused prepare + call + finish ─────────────────
+        // A single Rust function call does context swap, callee
+        // invocation, and state restoration — eliminating 2 extra
+        // function calls and the Maglev-upgrade check on the hot path.
+        //
+        // Args (SysV AMD64):
+        //   RDI = entry_point   (from cache)
+        //   RSI = ba_ptr        (from cache)
+        //   RDX = cached_ctx_ptr(from cache)
+        //   RCX = rt_ptrs_cell  (R15)
+        //   R8  = reg_slots     (from cache)
+        //   R9  = callee_i64    (R11)
+        self.masm.mov_rr(Reg64::R9, Reg64::R11); // arg5 = callee (before R11 is clobbered)
         self.masm
-            .mov_load_base_disp32(Reg64::Rsi, Reg64::Rbp, off_ba); // arg1 = ba
+            .mov_load_base_disp32(Reg64::Rdi, Reg64::Rbp, off_entry);
         self.masm
-            .mov_load_base_disp32(Reg64::Rdx, Reg64::Rbp, off_ctx); // arg2 = ctx
-
-        // Push callee + padding (2 pushes → RSP ≡ 0 mod 16).
-        self.masm.push(Reg64::Rdi);
-        self.masm.push(Reg64::Rdi);
-
-        // Pass R15 (RT_PTRS cell addr) as RCX (4th arg) to skip TLS lookup.
+            .mov_load_base_disp32(Reg64::Rsi, Reg64::Rbp, off_ba);
+        self.masm
+            .mov_load_base_disp32(Reg64::Rdx, Reg64::Rbp, off_ctx);
         self.masm.mov_rr(Reg64::Rcx, Reg64::R15);
-        let combined_addr =
-            jit_runtime::jit_runtime_mono_call_prepare_check_ctx_r15 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, combined_addr as i64);
+        self.masm
+            .mov_load_base_disp32(Reg64::R8, Reg64::Rbp, off_regslots);
+        let dispatch_addr = jit_runtime::jit_runtime_mono_dispatch_call_0_r15 as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, dispatch_addr as i64);
         self.masm.call_reg(Reg64::R11);
-
-        // Check success (RAX = 0 → fail, 1 → use cached entry,
-        // > 1 → Maglev upgrade: RAX is the new entry point).
-        self.masm.test_rr(Reg64::Rax, Reg64::Rax);
-        let mut mono_fail = Label::new();
-        self.masm.je(&mut mono_fail);
-
-        // RAX > 1 means Maglev entry point upgrade.
-        self.masm.cmp_ri(Reg64::Rax, 1);
-        let mut combined_no_upgrade = Label::new();
-        self.masm.je(&mut combined_no_upgrade);
-
-        // Upgraded: store new entry point into cache slot and use it.
-        self.masm
-            .mov_store_base_disp32(Reg64::Rbp, off_entry, Reg64::Rax);
-        self.masm.mov_rr(Reg64::R11, Reg64::Rax);
-        self.masm
-            .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, off_ctx);
-        self.masm
-            .mov_load_base_disp32(Reg64::R8, Reg64::Rbp, off_regslots);
-        self.masm.jmp(&mut do_direct);
-
-        // No upgrade: load cached entry + ctx for the direct call.
-        self.masm.bind_label(&mut combined_no_upgrade);
-        self.masm
-            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, off_entry);
-        self.masm
-            .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, off_ctx);
-        self.masm
-            .mov_load_base_disp32(Reg64::R8, Reg64::Rbp, off_regslots);
-        self.masm.jmp(&mut do_direct);
+        self.masm.jmp(&mut done_label);
 
         // ── Cache miss: full jit_runtime_get_jit_entry path ─────────
         self.masm.bind_label(&mut cache_miss);
 
         self.masm.mov_rr(Reg64::Rdi, Reg64::R11); // callee
-        // Push callee + padding.
+        // Push callee + padding (2 pushes → RSP ≡ 0 mod 16).
         self.masm.push(Reg64::Rdi);
         self.masm.push(Reg64::Rdi);
 
@@ -4227,10 +4203,9 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.pop(Reg64::R10);
         self.masm.pop(Reg64::R11);
 
-        // ── Common direct-call path ─────────────────────────────────
+        // ── Direct-call path (cache miss only) ──────────────────────
         // R11 = entry point, R10 = ctx_ptr, R8 = reg_slots (1-16).
         // Stack: [RSP] = padding, [RSP+8] = callee.
-        self.masm.bind_label(&mut do_direct);
 
         // Allocate 128-byte register file (fixed size for ABI compat).
         self.masm.sub_ri(Reg64::Rsp, 128);
@@ -4285,21 +4260,6 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.pop(Reg64::Rdi); // callee
         let stub_addr = jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
         self.masm.mov_ri(Reg64::R11, stub_addr as i64);
-        self.masm.call_reg(Reg64::R11);
-        self.masm.jmp(&mut done_label);
-
-        // ── Mono prepare failed — fall back to stub ─────────────────
-        self.masm.bind_label(&mut mono_fail);
-        // Invalidate cache so next call goes through full lookup.
-        self.masm.xor_rr(Reg64::R11, Reg64::R11);
-        self.masm
-            .mov_store_base_disp32(Reg64::Rbp, off_callee, Reg64::R11);
-        self.masm.pop(Reg64::R11); // discard padding
-        self.masm.pop(Reg64::Rdi); // callee
-        self.masm.mov_ri(
-            Reg64::R11,
-            jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize as i64,
-        );
         self.masm.call_reg(Reg64::R11);
 
         // ── Common exit ─────────────────────────────────────────────
