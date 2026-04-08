@@ -372,6 +372,13 @@ pub(crate) struct ObjectLiteralTemplate {
     capacity_hint: usize,
     /// Pre-built property index cloned into each instantiated map.
     cached_index: PropertyIndex,
+    /// Shared shape identifier for all instances from this template.
+    ///
+    /// Template instances have identical structure (same keys at same
+    /// offsets), so they can share a single shape ID — matching the
+    /// semantics of [`Clone`] for [`PropertyMap`] which also preserves
+    /// `shape_id`.  This eliminates one TLS access per instantiation.
+    cached_shape_id: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -399,6 +406,7 @@ impl ObjectLiteralTemplate {
                 has_accessors: map.has_accessors,
                 capacity_hint,
                 cached_index,
+                cached_shape_id: map.shape_id,
             }
         })
     }
@@ -426,7 +434,7 @@ impl ObjectLiteralTemplate {
             index: self.cached_index.clone(),
             inline_cache: (cap > SMALL_PROPERTY_LINEAR_SCAN_CAP)
                 .then(|| Box::new(InlinePropertyCache::new())),
-            shape_id: next_shape_id(),
+            shape_id: self.cached_shape_id,
             layout_id: self.layout_id,
             proto_generation: Cell::new(0),
             proto_epoch: Cell::new(0),
@@ -463,7 +471,7 @@ impl ObjectLiteralTemplate {
             index: self.cached_index.clone(),
             inline_cache: (cap > SMALL_PROPERTY_LINEAR_SCAN_CAP)
                 .then(|| Box::new(InlinePropertyCache::new())),
-            shape_id: next_shape_id(),
+            shape_id: self.cached_shape_id,
             layout_id: self.layout_id,
             proto_generation: Cell::new(0),
             proto_epoch: Cell::new(0),
