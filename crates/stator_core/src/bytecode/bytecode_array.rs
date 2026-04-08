@@ -535,8 +535,10 @@ pub struct BytecodeArray {
     jit_baseline_deopted: Rc<Cell<bool>>,
     /// Number of times Maglev JIT execution has deopted.  After
     /// [`MAX_MAGLEV_DEOPT_RETRIES`] deopts the interpreter permanently
-    /// skips Maglev for this function.
-    jit_maglev_deopt_count: Cell<u32>,
+    /// skips Maglev for this function.  Wrapped in [`Rc`] so that
+    /// [`clone_for_closure`] shares the counter across all clones — a
+    /// deopt in one clone counts toward the limit for all of them.
+    jit_maglev_deopt_count: Rc<Cell<u32>>,
     /// Captured closure context set by `CreateClosure`.
     ///
     /// When a function is created as a closure, this holds the enclosing
@@ -729,7 +731,7 @@ impl BytecodeArray {
             has_turbofan_jit_code_flag: Arc::new(AtomicBool::new(false)),
             turbofan_compile_started: Arc::new(AtomicBool::new(false)),
             jit_baseline_deopted: Rc::new(Cell::new(false)),
-            jit_maglev_deopt_count: Cell::new(0),
+            jit_maglev_deopt_count: Rc::new(Cell::new(0)),
             closure_context: None,
             writes_closure_vars: false,
             has_fn_props: Cell::new(false),

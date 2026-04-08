@@ -3858,7 +3858,9 @@ impl<'a> MaglevCodegen<'a> {
         self.masm
             .movzx_byte_base_disp32(Reg64::Rax, Reg64::R11, layout.bool_payload_offset as i32);
         self.masm.and_ri(Reg64::Rax, 1);
-        self.masm.add_ri(Reg64::Rax, JIT_FALSE as i32);
+        // JIT_FALSE is a 33-bit value (0x1_0000_0000); can't use add_ri.
+        self.masm.mov_ri(Reg64::R11, JIT_FALSE);
+        self.masm.add_rr(Reg64::Rax, Reg64::R11);
         self.masm.jmp(&mut done_label);
 
         // ── load_undef ──────────────────────────────────────────────
@@ -3969,10 +3971,12 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
         self.masm.je(&mut store_smi);
 
-        // Check for JIT_TRUE / JIT_FALSE.
-        self.masm.cmp_ri(Reg64::Rax, JIT_TRUE as i32);
+        // Check for JIT_TRUE / JIT_FALSE (33-bit values, can't use cmp_ri).
+        self.masm.mov_ri(Reg64::R11, JIT_TRUE);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
         self.masm.je(&mut store_bool);
-        self.masm.cmp_ri(Reg64::Rax, JIT_FALSE as i32);
+        self.masm.mov_ri(Reg64::R11, JIT_FALSE);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
         self.masm.je(&mut store_bool);
 
         // Not a Smi or Bool → fall through to slow path.
@@ -4020,8 +4024,10 @@ impl<'a> MaglevCodegen<'a> {
         );
         // Write bool payload: JIT_TRUE → 1, JIT_FALSE → 0.
         // payload = value - JIT_FALSE (where JIT_FALSE < JIT_TRUE and differ by 1).
+        // JIT_FALSE is 33-bit (0x1_0000_0000); can't use sub_ri.
         self.emit_load(value, Reg64::Rax);
-        self.masm.sub_ri(Reg64::Rax, JIT_FALSE as i32);
+        self.masm.mov_ri(Reg64::R11, JIT_FALSE);
+        self.masm.sub_rr(Reg64::Rax, Reg64::R11);
         // Store bool payload (0 or 1) as a dword — the upper bytes are
         // irrelevant padding in the Boolean variant, so overwriting is safe.
         self.masm.mov_store_dword_base_disp32(
