@@ -52,7 +52,7 @@ use crate::bytecode::{
 use crate::compiler::turbofan::TurbofanCompiledCode;
 use crate::error::{StatorError, StatorResult};
 use crate::objects::property_map::{ObjectLiteralTemplate, PropertyMap};
-use crate::objects::value::JsContext;
+use crate::objects::value::{JsContext, JsValue};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HandlerTableEntry
@@ -970,6 +970,55 @@ impl BytecodeArray {
         let first_borrow = first_rc.borrow();
         let template = ObjectLiteralTemplate::capture(&first_borrow)?;
         let cloned = template.instantiate();
+        drop(first_borrow);
+        self.object_literal_templates
+            .borrow_mut()
+            .insert(slot, ObjectLiteralCacheEntry::Cached(Box::new(template)));
+        Some(cloned)
+    }
+
+    /// Like [`clone_object_literal_template`](Self::clone_object_literal_template)
+    /// but fills the new map with `values` directly instead of
+    /// [`JsValue::Undefined`].
+    ///
+    /// This is the hot path for the fused
+    /// `CreateObjectLiteralWithProperties` stub: because the caller
+    /// already has all property values in template order, it skips the
+    /// values-vec pool probe, the `Undefined` initialisation, and the
+    /// per-property key comparison in
+    /// [`try_template_fill`](PropertyMap::try_template_fill).
+    pub fn clone_object_literal_template_with_values(
+        &self,
+        slot: u32,
+        values: Vec<JsValue>,
+    ) -> Option<PropertyMap> {
+        let borrow = self.object_literal_templates.borrow();
+        match borrow.get(&slot) {
+            Some(ObjectLiteralCacheEntry::Cached(template)) => {
+                Some(template.instantiate_with_values(values))
+            }
+            _ => None,
+        }
+    }
+
+    /// Like [`promote_object_literal_template`](Self::promote_object_literal_template)
+    /// but fills the promoted map with `values` directly.
+    pub fn promote_object_literal_template_with_values(
+        &self,
+        slot: u32,
+        values: Vec<JsValue>,
+    ) -> Option<PropertyMap> {
+        let pending_rc = {
+            let borrow = self.object_literal_templates.borrow();
+            match borrow.get(&slot) {
+                Some(ObjectLiteralCacheEntry::Pending(rc)) => Some(Rc::clone(rc)),
+                _ => None,
+            }
+        };
+        let first_rc = pending_rc?;
+        let first_borrow = first_rc.borrow();
+        let template = ObjectLiteralTemplate::capture(&first_borrow)?;
+        let cloned = template.instantiate_with_values(values);
         drop(first_borrow);
         self.object_literal_templates
             .borrow_mut()

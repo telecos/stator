@@ -437,6 +437,43 @@ impl ObjectLiteralTemplate {
             capacity_hint,
         }
     }
+
+    /// Stamp out a fresh [`PropertyMap`] with the template's shape and
+    /// the given values pre-filled.
+    ///
+    /// This is faster than [`instantiate`](Self::instantiate) followed
+    /// by [`try_template_fill`](PropertyMap::try_template_fill) because
+    /// it:
+    ///
+    /// * skips the thread-local values-vec pool probe,
+    /// * avoids the `Undefined` initialisation + overwrite cycle,
+    /// * eliminates per-property key comparisons in `try_template_fill`.
+    ///
+    /// `values` must contain exactly `self.keys.len()` elements in
+    /// template order.
+    pub(crate) fn instantiate_with_values(&self, values: Vec<JsValue>) -> PropertyMap {
+        let cap = self.keys.len();
+        debug_assert_eq!(values.len(), cap);
+        let capacity_hint = self.capacity_hint.max(cap);
+        PropertyMap {
+            keys: Rc::clone(&self.keys),
+            values,
+            attrs: Rc::clone(&self.attrs),
+            integer_key_count: self.integer_key_count,
+            index: self.cached_index.clone(),
+            inline_cache: (cap > SMALL_PROPERTY_LINEAR_SCAN_CAP)
+                .then(|| Box::new(InlinePropertyCache::new())),
+            shape_id: next_shape_id(),
+            layout_id: self.layout_id,
+            proto_generation: Cell::new(0),
+            proto_epoch: Cell::new(0),
+            proto_global_epoch: Cell::new(0),
+            extensible: self.extensible,
+            has_accessors: self.has_accessors,
+            template_next_slot: cap,
+            capacity_hint,
+        }
+    }
 }
 
 impl PartialEq for PropertyMap {

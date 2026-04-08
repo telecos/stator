@@ -5293,10 +5293,12 @@ pub(crate) mod jit_runtime {
 
     /// Inner implementation for [`jit_runtime_create_object_with_props`].
     ///
-    /// The hot path converts the register-encoded values to a
-    /// `Vec<JsValue>` and creates the object via template fill,
-    /// avoiding the per-property name lookups and hash map insertions
-    /// that the old path paid on every iteration.
+    /// The hot path (template cache hit) converts the register-encoded
+    /// values to a `Vec<JsValue>` and hands them to
+    /// [`BytecodeArray::clone_object_literal_template_with_values`] which
+    /// constructs the [`PropertyMap`] with values pre-filled — avoiding
+    /// the per-property name lookups and `try_template_fill` comparisons
+    /// that the first-execution path pays.
     fn create_object_with_props_inner(
         feedback_slot: i64,
         names_packed: i64,
@@ -5323,7 +5325,24 @@ pub(crate) mod jit_runtime {
                 // SAFETY: pointer is valid and points to a live BytecodeArray.
                 let ba_ref = unsafe { &*ba };
 
-                // ── Create object and fill via property stores ──
+                // ── Hot path: template cached, values pre-filled ──
+                let js_values = decode_jit_values(count, &vals);
+                if let Some(map) = ba_ref.clone_object_literal_template_with_values(slot, js_values)
+                {
+                    let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                    return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
+                }
+
+                // ── Promote path (second execution) ──
+                let js_values = decode_jit_values(count, &vals);
+                if let Some(map) =
+                    ba_ref.promote_object_literal_template_with_values(slot, js_values)
+                {
+                    let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                    return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
+                }
+
+                // ── First execution: create fresh and fill via property stores ──
                 let names = unpack_names(names_packed_u64);
                 let capacity = 4i64.max(count as i64) as usize;
                 let map = PropertyMap::with_capacity(capacity);
@@ -5378,6 +5397,16 @@ pub(crate) mod jit_runtime {
         } else {
             jit_i64_to_jsvalue(v)
         }
+    }
+
+    /// Decode up to 3 JIT `i64` register values into a pre-sized `Vec`.
+    #[inline]
+    fn decode_jit_values(count: usize, vals: &[i64; 3]) -> Vec<JsValue> {
+        let mut out = Vec::with_capacity(count);
+        for &v in &vals[..count] {
+            out.push(decode_one_jit_value(v));
+        }
+        out
     }
 
     /// Unpack up to 3 constant-pool name indices from the packed `u64`.
