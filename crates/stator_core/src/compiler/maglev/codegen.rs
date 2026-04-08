@@ -580,6 +580,14 @@ struct MaglevCodegen<'a> {
     /// eliminating the 64-bit ALU + MOVSXD pattern in favour of a single
     /// 32-bit ALU instruction + `JO` deopt.
     i32_range: HashSet<NodeId>,
+    /// Speculative Smi set: nodes whose values are guaranteed to be within
+    /// i32 range **or** the program deopts.  A superset of `i32_range` that
+    /// also includes `LoadNamedGeneric` results (with Smi deopt guards) and
+    /// `GenericAdd/Sub/Mul` results (with overflow deopt guards) when all
+    /// inputs are themselves `smi_guarded`.  Enables the elimination of
+    /// per-operation Smi checks in favour of a single guard at the
+    /// definition site.
+    smi_guarded: HashSet<NodeId>,
     /// Total stack bytes reserved in the prologue for monomorphic call caches.
     /// Each `CallUndefinedReceiver0` call site gets one 32-byte cache slot.
     /// Zero if the function has no direct-call-0 sites.
@@ -729,6 +737,7 @@ impl<'a> MaglevCodegen<'a> {
             used_caller_saved,
             narrow_int32: HashSet::new(),
             i32_range: HashSet::new(),
+            smi_guarded: HashSet::new(),
             mono_call_cache_bytes,
             next_mono_cache_site: 0,
             needs_r15,
@@ -781,6 +790,7 @@ impl<'a> MaglevCodegen<'a> {
         // narrow candidate so it can be emitted with a 32-bit ALU instruction
         // + JO, eliminating the extra MOVSXD.
         self.i32_range = Self::compute_i32_range(self.graph);
+        self.smi_guarded = Self::compute_smi_guarded(self.graph, &self.i32_range);
         self.narrow_int32 = Self::compute_narrow_int32(self.graph, self.alloc, &self.i32_range);
 
         self.emit_prologue();
@@ -3371,6 +3381,22 @@ impl<'a> MaglevCodegen<'a> {
             return;
         }
 
+        // Speculative Smi: both inputs were guarded upstream (by
+        // LoadNamedGeneric Smi guard or a prior smi_guarded op).
+        // Skip input Smi checks; emit bare ADD + result overflow deopt.
+        if self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right) {
+            self.emit_load(left, Reg64::Rax);
+            self.emit_load(right, Reg64::R10);
+            self.masm.add_rr(Reg64::Rax, Reg64::R10);
+            // Deopt if result exceeds i32 range.
+            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm
+                .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
+            self.emit_store(id, Reg64::Rax);
+            return;
+        }
+
         // Load into non-allocated registers — no save needed on fast path.
         self.emit_load(left, Reg64::Rdi);
         self.emit_load(right, Reg64::R10);
@@ -3416,6 +3442,18 @@ impl<'a> MaglevCodegen<'a> {
             self.emit_load(left, Reg64::Rax);
             self.emit_load(right, Reg64::R10);
             self.masm.sub_rr(Reg64::Rax, Reg64::R10);
+            self.emit_store(id, Reg64::Rax);
+            return;
+        }
+
+        if self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right) {
+            self.emit_load(left, Reg64::Rax);
+            self.emit_load(right, Reg64::R10);
+            self.masm.sub_rr(Reg64::Rax, Reg64::R10);
+            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm
+                .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
             self.emit_store(id, Reg64::Rax);
             return;
         }
@@ -3467,6 +3505,18 @@ impl<'a> MaglevCodegen<'a> {
             return;
         }
 
+        if self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right) {
+            self.emit_load(left, Reg64::Rax);
+            self.emit_load(right, Reg64::R10);
+            self.masm.imul_rr(Reg64::Rax, Reg64::R10);
+            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm
+                .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
+            self.emit_store(id, Reg64::Rax);
+            return;
+        }
+
         self.emit_load(left, Reg64::Rdi);
         self.emit_load(right, Reg64::R10);
 
@@ -3508,7 +3558,10 @@ impl<'a> MaglevCodegen<'a> {
     /// check is needed — just Smi-check both operands and emit `OR`.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_bitor(&mut self, id: NodeId, left: NodeId, right: NodeId) {
-        if self.i32_range.contains(&left) && self.i32_range.contains(&right) {
+        // Bitwise OR of two Smi/i32 values always fits in i32.
+        if (self.i32_range.contains(&left) && self.i32_range.contains(&right))
+            || (self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right))
+        {
             self.emit_load(left, Reg64::Rax);
             self.emit_load(right, Reg64::R10);
             self.masm.or_rr(Reg64::Rax, Reg64::R10);
@@ -3550,7 +3603,9 @@ impl<'a> MaglevCodegen<'a> {
     /// Inline Smi fast path for `GenericBitwiseAnd`.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_bitand(&mut self, id: NodeId, left: NodeId, right: NodeId) {
-        if self.i32_range.contains(&left) && self.i32_range.contains(&right) {
+        if (self.i32_range.contains(&left) && self.i32_range.contains(&right))
+            || (self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right))
+        {
             self.emit_load(left, Reg64::Rax);
             self.emit_load(right, Reg64::R10);
             self.masm.and_rr(Reg64::Rax, Reg64::R10);
@@ -3592,7 +3647,9 @@ impl<'a> MaglevCodegen<'a> {
     /// Inline Smi fast path for `GenericBitwiseXor`.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_bitxor(&mut self, id: NodeId, left: NodeId, right: NodeId) {
-        if self.i32_range.contains(&left) && self.i32_range.contains(&right) {
+        if (self.i32_range.contains(&left) && self.i32_range.contains(&right))
+            || (self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right))
+        {
             self.emit_load(left, Reg64::Rax);
             self.emit_load(right, Reg64::R10);
             self.masm.xor_rr(Reg64::Rax, Reg64::R10);
@@ -3641,6 +3698,17 @@ impl<'a> MaglevCodegen<'a> {
             return;
         }
 
+        if self.smi_guarded.contains(&value) {
+            self.emit_load(value, Reg64::Rax);
+            self.masm.add_ri(Reg64::Rax, 1);
+            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm
+                .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
+            self.emit_store(id, Reg64::Rax);
+            return;
+        }
+
         self.emit_load(value, Reg64::Rdi);
 
         let mut slow_label = Label::new();
@@ -3675,6 +3743,17 @@ impl<'a> MaglevCodegen<'a> {
         if self.i32_range.contains(&value) {
             self.emit_load(value, Reg64::Rax);
             self.masm.sub_ri(Reg64::Rax, 1);
+            self.emit_store(id, Reg64::Rax);
+            return;
+        }
+
+        if self.smi_guarded.contains(&value) {
+            self.emit_load(value, Reg64::Rax);
+            self.masm.sub_ri(Reg64::Rax, 1);
+            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm
+                .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
             self.emit_store(id, Reg64::Rax);
             return;
         }
@@ -3718,6 +3797,18 @@ impl<'a> MaglevCodegen<'a> {
             return;
         }
 
+        if self.smi_guarded.contains(&value) {
+            self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+            self.emit_load(value, Reg64::R10);
+            self.masm.sub_rr(Reg64::Rax, Reg64::R10);
+            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm
+                .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
+            self.emit_store(id, Reg64::Rax);
+            return;
+        }
+
         self.emit_load(value, Reg64::Rdi);
 
         let mut slow_label = Label::new();
@@ -3751,7 +3842,8 @@ impl<'a> MaglevCodegen<'a> {
     /// `~x` for i32 always produces an i32, so no overflow check needed.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_bitnot(&mut self, id: NodeId, value: NodeId) {
-        if self.i32_range.contains(&value) {
+        // ~x for i32 always produces i32 — no overflow check needed.
+        if self.i32_range.contains(&value) || self.smi_guarded.contains(&value) {
             self.emit_load(value, Reg64::Rax);
             self.masm.mov_ri(Reg64::R11, -1);
             self.masm.xor_rr(Reg64::Rax, Reg64::R11);
@@ -3872,6 +3964,15 @@ impl<'a> MaglevCodegen<'a> {
         // Deopt check: harmless on fast path (RAX is always valid);
         // catches JIT_DEOPT from the generic stub on the slow path.
         self.emit_deopt_check_rax();
+        // Speculative Smi guard: if this LoadNamedGeneric is in the
+        // smi_guarded set (feeds only into arithmetic), verify the result
+        // is actually a Smi.  Non-Smi → deopt to interpreter.
+        if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
+            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm
+                .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
+        }
         self.emit_store(id, Reg64::Rax);
     }
 
@@ -5488,6 +5589,140 @@ impl<'a> MaglevCodegen<'a> {
         }
 
         i32_range
+    }
+
+    /// Compute the *speculative* Smi set — a superset of `i32_range` that
+    /// additionally includes `LoadNamedGeneric` results that feed exclusively
+    /// into arithmetic operations, and `GenericAdd/Sub/Mul/Inc/Dec/Negate`
+    /// results when all their inputs are smi-guarded.
+    ///
+    /// At code-emission time, each newly-added node gets a Smi deopt guard
+    /// (MOVSXD + CMP + JNE deopt), so the speculation is always safe: if the
+    /// runtime value is not Smi the program deopts to the interpreter.
+    ///
+    /// The payoff is large: downstream `GenericAdd` with two smi-guarded
+    /// inputs can skip both input Smi checks (6 instructions) and emit a
+    /// bare ADD + single result guard (7 instructions total, down from 13).
+    fn compute_smi_guarded(graph: &MaglevGraph, i32_range: &HashSet<NodeId>) -> HashSet<NodeId> {
+        // Start as a clone of i32_range (everything provably i32 is
+        // trivially smi-guarded).
+        let mut set: HashSet<NodeId> = i32_range.clone();
+
+        // Build a consumer map: for each NodeId, which other NodeIds use it?
+        let mut consumers_of: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        let mut node_lookup: HashMap<NodeId, &ValueNode> = HashMap::new();
+        let mut ctrl_consumed: HashSet<NodeId> = HashSet::new();
+
+        for block in graph.blocks() {
+            for (id, node) in &block.nodes {
+                node_lookup.insert(*id, node);
+                let mut inputs = HashSet::new();
+                Self::collect_node_inputs(node, &mut inputs);
+                for inp in inputs {
+                    consumers_of.entry(inp).or_default().push(*id);
+                }
+            }
+            if let Some(ctrl) = &block.control {
+                match ctrl {
+                    ControlNode::Return { value } => {
+                        ctrl_consumed.insert(*value);
+                    }
+                    ControlNode::Branch { condition, .. } => {
+                        ctrl_consumed.insert(*condition);
+                    }
+                    ControlNode::Jump { .. } | ControlNode::Deoptimize { .. } => {}
+                }
+            }
+        }
+
+        // Seed: add LoadNamedGeneric nodes whose consumers are ALL
+        // arithmetic-compatible (GenericAdd/Sub/Mul/bitwise/Inc/Dec/Negate,
+        // comparisons, or Phi).  This avoids deopting on non-Smi loads
+        // that feed into non-arithmetic paths (e.g. Return, ToString).
+        for block in graph.blocks() {
+            for (id, node) in &block.nodes {
+                if !matches!(node, ValueNode::LoadNamedGeneric { .. }) {
+                    continue;
+                }
+                let all_arithmetic = consumers_of.get(id).is_some_and(|cs| {
+                    !cs.is_empty()
+                        && cs.iter().all(|c| {
+                            node_lookup
+                                .get(c)
+                                .is_some_and(|n| Self::is_arithmetic_compatible_consumer(n))
+                        })
+                }) && !ctrl_consumed.contains(id);
+                if all_arithmetic {
+                    set.insert(*id);
+                }
+            }
+        }
+
+        // Fixed-point propagation through GenericAdd/Sub/Mul/Inc/Dec/Negate
+        // and Phi.
+        loop {
+            let mut changed = false;
+            for block in graph.blocks() {
+                for (id, node) in &block.nodes {
+                    if set.contains(id) {
+                        continue;
+                    }
+                    let derived = match node {
+                        ValueNode::GenericAdd { left, right, .. }
+                        | ValueNode::GenericSubtract { left, right, .. }
+                        | ValueNode::GenericMultiply { left, right, .. }
+                        | ValueNode::GenericBitwiseOr { left, right, .. }
+                        | ValueNode::GenericBitwiseAnd { left, right, .. }
+                        | ValueNode::GenericBitwiseXor { left, right, .. } => {
+                            set.contains(left) && set.contains(right)
+                        }
+                        ValueNode::GenericIncrement { value, .. }
+                        | ValueNode::GenericDecrement { value, .. }
+                        | ValueNode::GenericNegate { value, .. }
+                        | ValueNode::GenericBitwiseNot { value, .. } => set.contains(value),
+                        ValueNode::Phi { inputs } => inputs.iter().all(|inp| set.contains(inp)),
+                        _ => false,
+                    };
+                    if derived {
+                        set.insert(*id);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        set
+    }
+
+    /// Returns `true` if a consumer node is arithmetic-compatible for the
+    /// purposes of `compute_smi_guarded`.  These are operations that
+    /// naturally operate on Smi/i32 values.
+    fn is_arithmetic_compatible_consumer(node: &ValueNode) -> bool {
+        matches!(
+            node,
+            ValueNode::GenericAdd { .. }
+                | ValueNode::GenericSubtract { .. }
+                | ValueNode::GenericMultiply { .. }
+                | ValueNode::GenericBitwiseOr { .. }
+                | ValueNode::GenericBitwiseAnd { .. }
+                | ValueNode::GenericBitwiseXor { .. }
+                | ValueNode::GenericIncrement { .. }
+                | ValueNode::GenericDecrement { .. }
+                | ValueNode::GenericNegate { .. }
+                | ValueNode::GenericBitwiseNot { .. }
+                | ValueNode::Int32LessThan { .. }
+                | ValueNode::Int32LessThanOrEqual { .. }
+                | ValueNode::Int32GreaterThan { .. }
+                | ValueNode::Int32GreaterThanOrEqual { .. }
+                | ValueNode::Int32Equal { .. }
+                | ValueNode::Int32StrictEqual { .. }
+                | ValueNode::TaggedEqual { .. }
+                | ValueNode::TaggedNotEqual { .. }
+                | ValueNode::Phi { .. }
+        )
     }
 
     /// Precompute the set of wrapping Int32 nodes whose consumers all operate
