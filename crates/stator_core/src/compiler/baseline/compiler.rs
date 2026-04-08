@@ -1669,7 +1669,6 @@ pub(crate) mod jit_runtime {
                 }
 
                 // ── Prototype IC hit (pre-encoded i64, zero clone) ──
-                let proto_slot = (name_idx & 31) as usize;
                 if proto_entry.0 == name_idx && proto_entry.1 == shape {
                     return Some(proto_entry.2);
                 }
@@ -3436,7 +3435,7 @@ pub(crate) mod jit_runtime {
         if !std::ptr::eq(callee_ctx_raw, current_ctx) {
             // Context differs — delegate to the full prepare which
             // handles context swap.
-            return Self::jit_runtime_mono_call_prepare(callee_i64, ba_ptr, cached_ctx_ptr);
+            return jit_runtime_mono_call_prepare(callee_i64, ba_ptr, cached_ctx_ptr);
         }
 
         // Context matches — same-ctx fast path (no context save/restore).

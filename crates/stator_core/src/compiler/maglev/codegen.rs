@@ -1291,9 +1291,9 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.mov_ri(Reg64::R11, JIT_FALSE);
                 self.masm.jmp(&mut done);
                 // Nullish → true
-                self.masm.bind(&mut is_nullish);
+                self.masm.bind_label(&mut is_nullish);
                 self.masm.mov_ri(Reg64::R11, JIT_TRUE);
-                self.masm.bind(&mut done);
+                self.masm.bind_label(&mut done);
                 self.emit_store(id, Reg64::R11);
             }
             #[cfg(not(all(target_arch = "x86_64", unix)))]
