@@ -3717,7 +3717,7 @@ pub(crate) mod jit_runtime {
         ba_ptr: i64,
         cached_ctx_ptr: i64,
         rt_ptrs_cell: i64,
-        _reg_slots: i64,
+        reg_slots: i64,
         callee_i64: i64,
     ) -> i64 {
         // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
@@ -3726,7 +3726,14 @@ pub(crate) mod jit_runtime {
         if !ptrs.is_cached() {
             return JIT_DEOPT;
         }
-        mono_dispatch_call_0_inner(entry_point, ba_ptr, cached_ctx_ptr, ptrs, callee_i64)
+        mono_dispatch_call_0_inner(
+            entry_point,
+            ba_ptr,
+            cached_ctx_ptr,
+            ptrs,
+            callee_i64,
+            reg_slots as usize,
+        )
     }
 
     /// Inner implementation for [`jit_runtime_mono_dispatch_call_0_r15`].
@@ -3736,6 +3743,7 @@ pub(crate) mod jit_runtime {
         cached_ctx_ptr: i64,
         ptrs: RtPtrs,
         callee_i64: i64,
+        reg_slots: usize,
     ) -> i64 {
         // SAFETY: cached pointers set by cache_rt_ptrs; valid for thread
         // lifetime.  Single-threaded access guaranteed.
@@ -3791,14 +3799,18 @@ pub(crate) mod jit_runtime {
         });
 
         // ── Call ─────────────────────────────────────────────────
-        // Allocate a zeroed register file on the Rust stack.  The
-        // callee receives a pointer in RDI and context in RSI.
-        let mut reg_file = [0i64; 16];
+        // Allocate a register file on the Rust stack.  For small
+        // frames (≤ 2 slots, e.g. closures), skip zeroing — the
+        // callee overwrites all slots before reading.
+        let mut reg_file = std::mem::MaybeUninit::<[i64; 16]>::uninit();
+        if reg_slots > 2 {
+            reg_file = std::mem::MaybeUninit::new([0i64; 16]);
+        }
         // SAFETY: entry_point is a valid JIT code pointer produced by
         // the baseline or Maglev compiler.
         let f: extern "C" fn(*mut i64, i64) -> i64 =
             unsafe { std::mem::transmute(entry_point as usize as *const ()) };
-        let result = f(reg_file.as_mut_ptr(), cached_ctx_ptr);
+        let result = f(reg_file.as_mut_ptr() as *mut i64, cached_ctx_ptr);
 
         // ── Finish ──────────────────────────────────────────────
         bc_ref.set(saved_ba);
