@@ -4621,17 +4621,20 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.pop(Reg64::Rdi); // restore object
         self.masm.pop(Reg64::Rsi); // restore key
         self.masm.pop(Reg64::Rdx); // restore value
-        let stub_addr = jit_runtime::jit_runtime_sta_keyed_property as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, stub_addr as i64);
-        self.masm.call_reg(Reg64::R11);
 
-        // Invalidate the array IC: the generic path may have caused a Vec
-        // reallocation (growth), making the cached data_ptr stale.
+        // Pass IC slot pointer so the stub can refresh the cache after
+        // a successful store (which may have grown the backing Vec).
         if self.array_ic_base != 0 {
-            self.masm.xor_rr(Reg64::R11, Reg64::R11);
             self.masm
-                .mov_store_base_disp32(Reg64::Rbp, self.array_ic_base, Reg64::R11);
+                .lea_base_disp32(Reg64::Rcx, Reg64::Rbp, self.array_ic_base);
+            let stub_addr =
+                jit_runtime::jit_runtime_sta_keyed_property_with_ic as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        } else {
+            let stub_addr = jit_runtime::jit_runtime_sta_keyed_property as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, stub_addr as i64);
         }
+        self.masm.call_reg(Reg64::R11);
 
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();

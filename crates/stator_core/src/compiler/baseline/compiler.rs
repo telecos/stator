@@ -4271,6 +4271,52 @@ pub(crate) mod jit_runtime {
         Some(value_i64)
     }
 
+    /// Keyed store with IC update: performs the store AND writes the
+    /// array's current `(handle, data_ptr, len)` back to the caller's IC
+    /// slots.  This avoids the "invalidate + miss next time" pattern that
+    /// hurts growing arrays (e.g. the sieve fill loop).
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_i64`)   – JIT i64 heap handle for the receiver.
+    /// * `RSI` (`key_i64`)   – non-negative Smi key.
+    /// * `RDX` (`value_i64`) – JIT i64 encoding of the value to store.
+    /// * `RCX` (`ic_slots`)  – pointer to 3 consecutive `i64` IC slots
+    ///   `[handle, data_ptr, len]`.
+    ///
+    /// Returns `value_i64` on success, or [`JIT_DEOPT`].
+    pub extern "C" fn jit_runtime_sta_keyed_property_with_ic(
+        obj_i64: i64,
+        key_i64: i64,
+        value_i64: i64,
+        ic_slots: *mut i64,
+    ) -> i64 {
+        let result = sta_keyed_property_inner(obj_i64, key_i64, value_i64);
+        if result.is_some() && is_heap_handle(obj_i64) {
+            // After a successful store (which may have grown the Vec),
+            // update the caller's IC slots so the next inline fast-path
+            // check can succeed.
+            let ptrs = RT_PTRS.with(|p| p.get());
+            if ptrs.is_cached() {
+                let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+                // SAFETY: cached pointers valid for thread lifetime.
+                let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+                if let Some(JsValue::Array(arr)) = heap.get(obj_idx) {
+                    // SAFETY: single-threaded JIT; no concurrent borrows.
+                    let data = unsafe { &*arr.as_ptr() };
+                    // SAFETY: ic_slots points to 3 writable i64s on the
+                    // caller's stack frame (Maglev-generated code).
+                    unsafe {
+                        *ic_slots = obj_i64;
+                        *ic_slots.add(1) = data.as_ptr() as i64;
+                        *ic_slots.add(2) = data.len() as i64;
+                    }
+                }
+            }
+        }
+        result.unwrap_or(JIT_DEOPT)
+    }
+
     // ── Specialized fast-path array element stubs ────────────────────────
 
     /// Fast-path array element load: `array[integer_index]`.
