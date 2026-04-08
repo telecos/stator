@@ -262,12 +262,12 @@ impl MaglevCompiledCode {
 
         // SAFETY:
         // - `mem` holds valid x86-64 machine code produced by MaglevCodegen.
-        // - Signature `extern "C" fn(*mut i64) -> i64` matches the JIT
-        //   calling convention (SysV AMD64 ABI).
+        // - Signature `extern "C" fn(*mut i64, i64) -> i64` matches the JIT
+        //   calling convention (SysV AMD64 ABI): RDI=reg_file, RSI=ctx_ptr.
         // - `regs` remains live for the duration of the call.
         let result = unsafe {
-            let f: extern "C" fn(*mut i64) -> i64 = std::mem::transmute(mem);
-            f(regs.as_mut_ptr())
+            let f: extern "C" fn(*mut i64, i64) -> i64 = std::mem::transmute(mem);
+            f(regs.as_mut_ptr(), 0)
         };
 
         // SAFETY: `mem` is a valid mapping of `code_size` bytes.
@@ -370,12 +370,17 @@ impl CachedMaglevCode {
 
     /// Execute the cached Maglev code with the given arguments.
     ///
+    /// `ctx_ptr` is the raw pointer to the closure's `RefCell<JsContext>`
+    /// (or 0 for top-level scripts).  It is passed to the Maglev entry
+    /// point in `RSI` so the prologue can cache it for direct context-slot
+    /// stubs.
+    ///
     /// Uses a thread-local register file pool to avoid per-call allocation.
     ///
     /// # Safety
     ///
     /// The cached code must be valid x86-64 machine code.
-    pub unsafe fn execute(&self, args: &[i64]) -> i64 {
+    pub unsafe fn execute(&self, args: &[i64], ctx_ptr: i64) -> i64 {
         let n = self.register_file_slots;
 
         // Fast path: stack-allocated register file avoids TLS.
@@ -385,8 +390,8 @@ impl CachedMaglevCode {
                 regs[i] = v;
             }
             // SAFETY: `self.ptr` holds valid x86-64 machine code.
-            let f: extern "C" fn(*mut i64) -> i64 = unsafe { std::mem::transmute(self.ptr) };
-            return f(regs.as_mut_ptr());
+            let f: extern "C" fn(*mut i64, i64) -> i64 = unsafe { std::mem::transmute(self.ptr) };
+            return f(regs.as_mut_ptr(), ctx_ptr);
         }
 
         // Large register files: pooled Vec via TLS.
@@ -405,8 +410,8 @@ impl CachedMaglevCode {
             }
 
             // SAFETY: `self.ptr` holds valid x86-64 machine code.
-            let f: extern "C" fn(*mut i64) -> i64 = unsafe { std::mem::transmute(self.ptr) };
-            f(regs.as_mut_ptr())
+            let f: extern "C" fn(*mut i64, i64) -> i64 = unsafe { std::mem::transmute(self.ptr) };
+            f(regs.as_mut_ptr(), ctx_ptr)
         })
     }
 }
@@ -1751,9 +1756,25 @@ impl<'a> MaglevCodegen<'a> {
                         Some(Location::Register(n)) => {
                             let dst = phys_reg(n);
                             self.masm.mov_load_base_disp32(dst, Reg64::R14, off);
+                            // Speculative Smi guard for promoted globals that
+                            // feed only into arithmetic.
+                            if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
+                                self.masm.movsxd_rr(Reg64::R11, dst);
+                                self.masm.cmp_rr(Reg64::R11, dst);
+                                self.masm
+                                    .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
+                            }
                         }
                         _ => {
                             self.masm.mov_load_base_disp32(Reg64::R11, Reg64::R14, off);
+                            // Speculative Smi guard for promoted globals that
+                            // feed only into arithmetic.
+                            if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
+                                self.masm.movsxd_rr(Reg64::R10, Reg64::R11);
+                                self.masm.cmp_rr(Reg64::R10, Reg64::R11);
+                                self.masm
+                                    .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
+                            }
                             self.emit_store(id, Reg64::R11);
                         }
                     }
@@ -1765,6 +1786,14 @@ impl<'a> MaglevCodegen<'a> {
                     self.masm.call_reg(Reg64::R11);
                     self.emit_restore_live_regs(saved);
                     self.emit_deopt_check_rax();
+                    // Speculative Smi guard for globals that feed only
+                    // into arithmetic.
+                    if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
+                        self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+                        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+                        self.masm
+                            .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
+                    }
                     self.emit_store(id, Reg64::Rax);
                 }
             }
@@ -1850,6 +1879,16 @@ impl<'a> MaglevCodegen<'a> {
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::LoadKeyedGeneric { object, key, .. } => {
                 self.emit_inline_load_keyed_smi(id, *object, *key);
+                // Speculative Smi guard for keyed loads that feed only
+                // into arithmetic (e.g. array element used in addition).
+                if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
+                    self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+                    self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+                    self.masm
+                        .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
+                    // Re-store the validated result (emit_inline_load_keyed_smi
+                    // already stored RAX; the guard does not clobber it).
+                }
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::StoreKeyedGeneric {
@@ -5675,13 +5714,21 @@ impl<'a> MaglevCodegen<'a> {
             }
         }
 
-        // Seed: add LoadNamedGeneric nodes whose consumers are ALL
-        // arithmetic-compatible (GenericAdd/Sub/Mul/bitwise/Inc/Dec/Negate,
-        // comparisons, or Phi).  This avoids deopting on non-Smi loads
-        // that feed into non-arithmetic paths (e.g. Return, ToString).
+        // Seed: add LoadNamedGeneric, LoadGlobal and LoadKeyedGeneric
+        // nodes whose consumers are ALL arithmetic-compatible
+        // (GenericAdd/Sub/Mul/bitwise/Inc/Dec/Negate, comparisons, or
+        // Phi).  This enables the inline Smi fast-path for arithmetic
+        // that consumes these loads, with a speculative movsxd+cmp
+        // guard at the load site.  Non-Smi results deopt safely.
         for block in graph.blocks() {
             for (id, node) in &block.nodes {
-                if !matches!(node, ValueNode::LoadNamedGeneric { .. }) {
+                let is_seedable = matches!(
+                    node,
+                    ValueNode::LoadNamedGeneric { .. }
+                        | ValueNode::LoadGlobal { .. }
+                        | ValueNode::LoadKeyedGeneric { .. }
+                );
+                if !is_seedable {
                     continue;
                 }
                 let all_arithmetic = consumers_of.get(id).is_some_and(|cs| {

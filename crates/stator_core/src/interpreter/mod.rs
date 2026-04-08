@@ -1456,16 +1456,18 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
         let jit_args: Vec<i64> = args.iter().map(jsvalue_to_jit).collect();
 
         // Set closure context for context-slot stubs.
-        {
-            let ctx = ba.closure_context().cloned();
-            jit_runtime_set_context(ctx);
-        }
+        let ctx_raw = {
+            let ctx = ba.closure_context();
+            let ptr = ctx.map(Rc::as_ptr).unwrap_or(std::ptr::null()) as i64;
+            jit_runtime_set_context(ctx.cloned());
+            ptr
+        };
 
         // Mark that we are executing Maglev code so stubs can track deopts.
         MAGLEV_EXECUTING.with(|f| f.set(true));
 
         // SAFETY: The cached code was produced by `maglev_codegen::compile`.
-        let result = unsafe { cached.execute(&jit_args) };
+        let result = unsafe { cached.execute(&jit_args, ctx_raw) };
 
         MAGLEV_EXECUTING.with(|f| f.set(false));
 

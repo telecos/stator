@@ -2443,8 +2443,9 @@ pub(crate) mod jit_runtime {
             };
 
             bc_ref.set(&**ba as *const BytecodeArray);
+            let ctx_raw = callee_ctx_ptr as i64;
             // SAFETY: Maglev code is valid x86-64.  Context set in TLS.
-            let jit_result = unsafe { maglev_exec.execute(jit_args) };
+            let jit_result = unsafe { maglev_exec.execute(jit_args, ctx_raw) };
             bc_ref.set(saved_ba);
 
             if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
@@ -2471,12 +2472,15 @@ pub(crate) mod jit_runtime {
 
         // Fallback: pointers not cached yet — use .with() calls.
         let heap_base = RT_HEAP.with(|h| h.borrow().len());
-        let callee_ctx = ba.closure_context().cloned();
-        let saved_ctx = RT_CONTEXT.with(|c| std::mem::replace(&mut *c.borrow_mut(), callee_ctx));
+        let callee_ctx = ba.closure_context();
+        let ctx_raw = callee_ctx.map(Rc::as_ptr).unwrap_or(std::ptr::null()) as i64;
+        let callee_ctx_owned = callee_ctx.cloned();
+        let saved_ctx =
+            RT_CONTEXT.with(|c| std::mem::replace(&mut *c.borrow_mut(), callee_ctx_owned));
         RT_BYTECODE.with(|b| b.set(&**ba as *const BytecodeArray));
 
         // SAFETY: Maglev code is valid x86-64.
-        let jit_result = unsafe { maglev_exec.execute(jit_args) };
+        let jit_result = unsafe { maglev_exec.execute(jit_args, ctx_raw) };
         RT_BYTECODE.with(|b| b.set(saved_ba));
 
         if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
@@ -2725,8 +2729,9 @@ pub(crate) mod jit_runtime {
                         };
 
                         bc_ref.set(ba_ptr);
+                        let ctx_raw = callee_ctx_ptr as i64;
                         // SAFETY: Maglev code is valid x86-64.
-                        let jit_result = unsafe { maglev_exec.execute(&[]) };
+                        let jit_result = unsafe { maglev_exec.execute(&[], ctx_raw) };
                         bc_ref.set(saved_ba);
 
                         if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
