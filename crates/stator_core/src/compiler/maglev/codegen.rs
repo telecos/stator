@@ -5899,7 +5899,10 @@ impl<'a> MaglevCodegen<'a> {
         // Build a consumer map: for each NodeId, which other NodeIds use it?
         let mut consumers_of: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
         let mut node_lookup: HashMap<NodeId, &ValueNode> = HashMap::new();
-        let mut ctrl_consumed: HashSet<NodeId> = HashSet::new();
+        // Track nodes used as Branch conditions — these are booleans
+        // (JIT_TRUE/JIT_FALSE) and must NOT be smi_guarded because the
+        // movsxd Smi guard would fail.  Return values are fine.
+        let mut branch_conditions: HashSet<NodeId> = HashSet::new();
 
         for block in graph.blocks() {
             for (id, node) in &block.nodes {
@@ -5912,13 +5915,12 @@ impl<'a> MaglevCodegen<'a> {
             }
             if let Some(ctrl) = &block.control {
                 match ctrl {
-                    ControlNode::Return { value } => {
-                        ctrl_consumed.insert(*value);
-                    }
                     ControlNode::Branch { condition, .. } => {
-                        ctrl_consumed.insert(*condition);
+                        branch_conditions.insert(*condition);
                     }
-                    ControlNode::Jump { .. } | ControlNode::Deoptimize { .. } => {}
+                    ControlNode::Return { .. }
+                    | ControlNode::Jump { .. }
+                    | ControlNode::Deoptimize { .. } => {}
                 }
             }
         }
@@ -5929,6 +5931,7 @@ impl<'a> MaglevCodegen<'a> {
         // Phi).  This enables the inline Smi fast-path for arithmetic
         // that consumes these loads, with a speculative movsxd+cmp
         // guard at the load site.  Non-Smi results deopt safely.
+        // Exclude nodes used as branch conditions (boolean values).
         for block in graph.blocks() {
             for (id, node) in &block.nodes {
                 let is_seedable = matches!(
@@ -5947,7 +5950,7 @@ impl<'a> MaglevCodegen<'a> {
                                 .get(c)
                                 .is_some_and(|n| Self::is_arithmetic_compatible_consumer(n))
                         })
-                }) && !ctrl_consumed.contains(id);
+                }) && !branch_conditions.contains(id);
                 if all_arithmetic {
                     set.insert(*id);
                 }
@@ -5979,7 +5982,7 @@ impl<'a> MaglevCodegen<'a> {
                         ValueNode::Phi { inputs } => inputs.iter().all(|inp| set.contains(inp)),
                         _ => false,
                     };
-                    if derived && !ctrl_consumed.contains(id) {
+                    if derived && !branch_conditions.contains(id) {
                         set.insert(*id);
                         changed = true;
                     }
