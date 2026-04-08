@@ -946,6 +946,14 @@ impl<'a> MaglevCodegen<'a> {
     /// `R10` scratch registers.
     #[allow(clippy::too_many_lines)]
     fn emit_value_node(&mut self, id: NodeId, node: &ValueNode) {
+        // Flush promoted globals to GlobalEnv before user calls so that
+        // callees see up-to-date values, and reload afterwards in case
+        // the callee modified them.
+        let needs_global_sync = !self.promoted_globals.is_empty() && Self::is_user_call_node(node);
+        if needs_global_sync {
+            self.emit_flush_promoted_for_call(id);
+        }
+
         match node {
             // ── Constants ────────────────────────────────────────────────────
             ValueNode::SmiConstant { value } => match self.alloc.location(id) {
@@ -2114,6 +2122,10 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_store(id, Reg64::R11);
             }
         }
+
+        if needs_global_sync {
+            self.emit_reload_promoted_after_call();
+        }
     }
 
     // ── Control node emission ────────────────────────────────────────────────
@@ -2700,24 +2712,11 @@ impl<'a> MaglevCodegen<'a> {
     /// and assign each one a dedicated register-file slot beyond the
     /// allocator's spill area.
     fn scan_and_promote_globals(&mut self, base_slots: usize) {
-        // If the function contains any user-callable call nodes, skip
-        // promotion entirely.  A callee may modify the same globals,
-        // and the caller's promoted copies would become stale.
-        let has_user_call = self.graph.blocks().iter().any(|block| {
-            block.nodes.iter().any(|(_, node)| {
-                matches!(
-                    node,
-                    ValueNode::Call { .. }
-                        | ValueNode::CallKnownFunction { .. }
-                        | ValueNode::Construct { .. }
-                        | ValueNode::ConstructWithSpread { .. }
-                        | ValueNode::CallWithSpread { .. }
-                )
-            })
-        });
-        if has_user_call {
-            return;
-        }
+        // Promotion is now safe even when user calls exist: the codegen
+        // emits flush/reload of promoted globals around every Call,
+        // CallKnownFunction, Construct, ConstructWithSpread and
+        // CallWithSpread node so callees always see up-to-date values
+        // and any callee mutations are reloaded afterwards.
 
         let mut seen = HashSet::new();
         for block in self.graph.blocks() {
@@ -2811,6 +2810,91 @@ impl<'a> MaglevCodegen<'a> {
             // Restore the return value.
             self.masm.pop(Reg64::Rax);
         }
+    }
+
+    /// Flush all promoted globals back to `GlobalEnv` before a user call.
+    ///
+    /// This ensures the callee sees up-to-date values for any globals
+    /// that the caller has promoted into register-file slots.  Called from
+    /// [`emit_value_node`] around Call / Construct nodes.
+    #[allow(unused_variables)]
+    fn emit_flush_promoted_for_call(&mut self, at_node: NodeId) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            if self.promoted_globals.is_empty() {
+                return;
+            }
+            // Save live caller-saved registers so the sta_global calls
+            // don't clobber them.
+            let saved = self.emit_save_live_regs(at_node);
+            let addr = jit_runtime::jit_runtime_sta_global as *const () as usize as i64;
+            for &(name_idx, slot) in &self.promoted_globals.clone() {
+                let off = (slot * 8) as i32;
+                self.masm.mov_ri(Reg64::Rdi, i64::from(name_idx));
+                self.masm.mov_load_base_disp32(Reg64::Rsi, Reg64::R14, off);
+                self.masm.mov_ri(Reg64::R11, addr);
+                self.masm.call_reg(Reg64::R11);
+            }
+            self.emit_restore_live_regs(saved);
+        }
+    }
+
+    /// Reload all promoted globals from `GlobalEnv` after a user call.
+    ///
+    /// The callee may have modified globals; this brings the promoted
+    /// register-file copies back in sync.  Saves/restores ALL caller-saved
+    /// registers (including potential call result) unconditionally because
+    /// the precise post-call liveness is not easily available.
+    #[allow(unused_variables)]
+    fn emit_reload_promoted_after_call(&mut self) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            if self.promoted_globals.is_empty() {
+                return;
+            }
+            // Save all caller-saved allocatable regs + RAX (call result)
+            // + alignment padding = 7 pushes (odd) → RSP ≡ 0 mod 16.
+            self.masm.push(Reg64::R11); // alignment
+            self.masm.push(Reg64::Rax);
+            self.masm.push(Reg64::Rcx);
+            self.masm.push(Reg64::Rdx);
+            self.masm.push(Reg64::Rsi);
+            self.masm.push(Reg64::R8);
+            self.masm.push(Reg64::R9);
+
+            let addr = jit_runtime::jit_runtime_lda_global as *const () as usize as i64;
+            for &(name_idx, slot) in &self.promoted_globals.clone() {
+                let off = (slot * 8) as i32;
+                self.masm.mov_ri(Reg64::Rdi, i64::from(name_idx));
+                self.masm.mov_ri(Reg64::R11, addr);
+                self.masm.call_reg(Reg64::R11);
+                // Deopt if global load failed.
+                self.masm.cmp_ri(Reg64::Rax, i32::MIN);
+                self.masm.jcc(CondCode::Less, &mut self.deopt_global_label);
+                self.masm.mov_store_base_disp32(Reg64::R14, off, Reg64::Rax);
+            }
+
+            self.masm.pop(Reg64::R9);
+            self.masm.pop(Reg64::R8);
+            self.masm.pop(Reg64::Rsi);
+            self.masm.pop(Reg64::Rdx);
+            self.masm.pop(Reg64::Rcx);
+            self.masm.pop(Reg64::Rax);
+            self.masm.pop(Reg64::R11);
+        }
+    }
+
+    /// Returns `true` if the node is a user-callable call that may observe
+    /// or modify promoted globals.
+    fn is_user_call_node(node: &ValueNode) -> bool {
+        matches!(
+            node,
+            ValueNode::Call { .. }
+                | ValueNode::CallKnownFunction { .. }
+                | ValueNode::Construct { .. }
+                | ValueNode::ConstructWithSpread { .. }
+                | ValueNode::CallWithSpread { .. }
+        )
     }
 
     // ── Runtime stub call helpers ────────────────────────────────────────────
