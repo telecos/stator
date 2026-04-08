@@ -466,10 +466,11 @@ pub fn compile(graph: &MaglevGraph, param_count: u32) -> StatorResult<MaglevComp
     // Count direct-call-0 sites to decide whether to reserve R15.
     let mono_call_sites: i32 = count_mono_call_sites(graph);
     let has_keyed = has_keyed_access_sites(graph);
+    let has_named = has_named_property_sites(graph);
     // Reserve R15 for RT_PTRS caching when the function has direct
-    // calls or inline keyed array accesses (8 physical registers
-    // instead of 9).
-    let num_regs = if mono_call_sites > 0 || has_keyed {
+    // calls, keyed array accesses, or named property accesses (8
+    // physical registers instead of 9).
+    let num_regs = if mono_call_sites > 0 || has_keyed || has_named {
         NUM_PHYS_REGS - 1
     } else {
         NUM_PHYS_REGS
@@ -497,9 +498,8 @@ fn count_mono_call_sites(graph: &MaglevGraph) -> i32 {
     count
 }
 
-/// Check whether the graph contains any keyed array access or named
-/// property access nodes that benefit from having the `RT_PTRS` TLS
-/// cell address cached in R15.
+/// Check whether the graph contains any keyed array access nodes that
+/// need the monomorphic array IC cache on the stack.
 fn has_keyed_access_sites(graph: &MaglevGraph) -> bool {
     for block in graph.blocks() {
         for (_nid, node) in &block.nodes {
@@ -512,8 +512,21 @@ fn has_keyed_access_sites(graph: &MaglevGraph) -> bool {
                     | ValueNode::LoadHoleyFixedDoubleArrayElement { .. }
                     | ValueNode::StoreFixedArrayElement { .. }
                     | ValueNode::StoreFixedDoubleArrayElement { .. }
-                    | ValueNode::LoadNamedGeneric { .. }
             ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Check whether the graph contains any `LoadNamedGeneric` nodes that
+/// benefit from having the `RT_PTRS` TLS cell address cached in R15
+/// for the inline named-property IC fast path.
+fn has_named_property_sites(graph: &MaglevGraph) -> bool {
+    for block in graph.blocks() {
+        for (_nid, node) in &block.nodes {
+            if matches!(node, ValueNode::LoadNamedGeneric { .. }) {
                 return true;
             }
         }
@@ -619,6 +632,8 @@ impl<'a> MaglevCodegen<'a> {
         let mut mono_call_sites: i32 = 0;
         // Track whether any keyed array access nodes exist.
         let mut has_keyed_sites = false;
+        // Track whether any named property access nodes exist.
+        let mut has_named_sites = false;
         for block in graph.blocks() {
             for (node_id, _) in &block.nodes {
                 if let Some(Location::Register(n)) = alloc.location(*node_id) {
@@ -648,8 +663,10 @@ impl<'a> MaglevCodegen<'a> {
                             | ValueNode::LoadHoleyFixedDoubleArrayElement { .. }
                             | ValueNode::StoreFixedArrayElement { .. }
                             | ValueNode::StoreFixedDoubleArrayElement { .. }
-                            | ValueNode::LoadNamedGeneric { .. }
                     );
+                }
+                if !has_named_sites {
+                    has_named_sites = matches!(node, ValueNode::LoadNamedGeneric { .. });
                 }
             }
         }
@@ -664,7 +681,7 @@ impl<'a> MaglevCodegen<'a> {
         } else {
             mono_call_cache_bytes
         };
-        let needs_r15 = mono_call_sites > 0 || has_keyed_sites;
+        let needs_r15 = mono_call_sites > 0 || has_keyed_sites || has_named_sites;
         // Array IC: 24 bytes (3 × i64).  Place it after the mono cache
         // area on the stack.  Rounded up so the combined reservation
         // stays a multiple of 16.
