@@ -4722,6 +4722,116 @@ pub(crate) mod jit_runtime {
         Some(alloc_heap_handle(obj))
     }
 
+    // ── Fused CreateObjectLiteral + StoreNamedGeneric stub ──────────────
+
+    /// Create an object literal and fill up to 3 own properties in a
+    /// single call.
+    ///
+    /// This is the runtime half of the `CreateObjectLiteralWithProperties`
+    /// Maglev IR node produced by the optimizer's store-fusion pass.
+    /// Performing both creation and property initialisation in one stub
+    /// call eliminates N separate `StoreNamedGeneric` calls (and their
+    /// per-call TLS lookups).
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`feedback_slot`) – feedback vector slot index (−1 = none).
+    /// * `RSI` (`names_packed`)  – up to 3 constant-pool name indices
+    ///   packed as `u16` values: `name0 | (name1 << 16) | (name2 << 32)`,
+    ///   with the property count in bits 48–51.
+    /// * `RDX` (`val0`) – first property value (JIT i64).
+    /// * `RCX` (`val1`) – second property value (JIT i64), or 0 if fewer.
+    /// * `R8`  (`val2`) – third property value (JIT i64), or 0 if fewer.
+    ///
+    /// Returns a JIT i64 heap handle for the new `PlainObject`, or
+    /// [`JIT_DEOPT`].
+    #[unsafe(no_mangle)]
+    pub extern "C" fn jit_runtime_create_object_with_props(
+        feedback_slot: i64,
+        names_packed: i64,
+        val0: i64,
+        val1: i64,
+        val2: i64,
+    ) -> i64 {
+        create_object_with_props_inner(feedback_slot, names_packed, val0, val1, val2)
+            .unwrap_or(JIT_DEOPT)
+    }
+
+    /// Inner implementation for [`jit_runtime_create_object_with_props`].
+    fn create_object_with_props_inner(
+        feedback_slot: i64,
+        names_packed: i64,
+        val0: i64,
+        val1: i64,
+        val2: i64,
+    ) -> Option<i64> {
+        let names_packed = names_packed as u64;
+        let count = ((names_packed >> 48) & 0xF) as usize;
+        let names = [
+            (names_packed & 0xFFFF) as u32,
+            ((names_packed >> 16) & 0xFFFF) as u32,
+            ((names_packed >> 32) & 0xFFFF) as u32,
+        ];
+        let vals = [val0, val1, val2];
+
+        // ── Step 1: Create the object (same logic as fast_create_object_literal_inner) ──
+        let ptrs = RT_PTRS.with(|p| p.get());
+        let capacity = 4i64.max(count as i64) as usize;
+
+        let map_rc = if feedback_slot >= 0 {
+            let slot = feedback_slot as u32;
+            let ba = if ptrs.is_cached() {
+                // SAFETY: cached pointer valid for thread lifetime.
+                unsafe { &*ptrs.bytecode }.get()
+            } else {
+                RT_BYTECODE.with(|b| b.get())
+            };
+            if !ba.is_null() {
+                // SAFETY: pointer is valid and points to a live BytecodeArray.
+                let ba_ref = unsafe { &*ba };
+
+                if let Some(map) = ba_ref.clone_object_literal_template(slot) {
+                    Rc::new(RefCell::new(map))
+                } else if let Some(map) = ba_ref.promote_object_literal_template(slot) {
+                    Rc::new(RefCell::new(map))
+                } else {
+                    let map = PropertyMap::with_capacity(capacity);
+                    let rc = Rc::new(RefCell::new(map));
+                    ba_ref.set_object_literal_pending(slot, Rc::clone(&rc));
+                    rc
+                }
+            } else {
+                Rc::new(RefCell::new(PropertyMap::with_capacity(capacity)))
+            }
+        } else {
+            Rc::new(RefCell::new(PropertyMap::with_capacity(capacity)))
+        };
+
+        // ── Step 2: Fill properties inline ──
+        {
+            // SAFETY: single-threaded JIT; no concurrent borrows.
+            let map = unsafe { &mut *map_rc.as_ptr() };
+            for i in 0..count {
+                let prop_name = get_rt_string_constant_ref(names[i])?;
+                let value = if vals[i] >= i32::MIN as i64 && vals[i] <= i32::MAX as i64 {
+                    JsValue::Smi(vals[i] as i32)
+                } else {
+                    jit_i64_to_jsvalue(vals[i])
+                };
+                match map.try_template_fill(prop_name, value) {
+                    Ok(_) => {}
+                    Err(value) => {
+                        map.insert(prop_name.to_string(), value);
+                    }
+                }
+            }
+        }
+
+        // ── Step 3: Allocate heap handle ──
+        let obj = JsValue::PlainObject(map_rc);
+        Some(alloc_heap_handle_with_ptrs(obj, &ptrs))
+    }
+
     // ── Fast StaNamedOwnProperty stub ───────────────────────────────────
 
     /// Specialized runtime stub for `StaNamedOwnProperty` /

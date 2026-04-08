@@ -582,6 +582,7 @@ fn is_pure(node: &ValueNode) -> bool {
             | ValueNode::Construct { .. }
             | ValueNode::ConstructWithSpread { .. }
             | ValueNode::CreateObjectLiteral { .. }
+            | ValueNode::CreateObjectLiteralWithProperties { .. }
             | ValueNode::CreateArrayLiteral { .. }
             | ValueNode::CreateShallowObjectLiteral { .. }
             | ValueNode::CreateShallowArrayLiteral { .. }
@@ -969,6 +970,11 @@ fn visit_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
         ValueNode::Phi { inputs } => {
             for &inp in inputs.iter() {
                 f(inp);
+            }
+        }
+        ValueNode::CreateObjectLiteralWithProperties { values, .. } => {
+            for &v in values.iter() {
+                f(v);
             }
         }
     }

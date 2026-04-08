@@ -216,6 +216,7 @@ pub struct NodeId(pub u32);
 ///
 /// ## Object / array creation
 /// [`CreateObjectLiteral`](ValueNode::CreateObjectLiteral),
+/// [`CreateObjectLiteralWithProperties`](ValueNode::CreateObjectLiteralWithProperties),
 /// [`CreateArrayLiteral`](ValueNode::CreateArrayLiteral),
 /// [`CreateShallowObjectLiteral`](ValueNode::CreateShallowObjectLiteral),
 /// [`CreateShallowArrayLiteral`](ValueNode::CreateShallowArrayLiteral),
@@ -1410,6 +1411,29 @@ pub enum ValueNode {
         feedback_slot: u32,
         /// Creation flags (e.g. `SHALLOW_PROPERTIES`).
         flags: u32,
+    },
+
+    /// Create an object literal and fill its properties in a single call.
+    ///
+    /// Produced by the optimizer when a [`CreateObjectLiteral`] is
+    /// immediately followed by sequential [`StoreNamedGeneric`] stores
+    /// whose `object` operand is the literal just created.  Fusing these
+    /// into one node eliminates N separate stub calls (and N TLS lookups)
+    /// on the hot path.
+    ///
+    /// At most [`MAX_FUSED_OBJECT_PROPS`] properties are supported; longer
+    /// sequences keep the trailing stores as individual nodes.
+    ///
+    /// [`MAX_FUSED_OBJECT_PROPS`]: crate::compiler::maglev::optimizer::MAX_FUSED_OBJECT_PROPS
+    CreateObjectLiteralWithProperties {
+        /// Feedback vector slot index.
+        feedback_slot: u32,
+        /// Creation flags.
+        flags: u32,
+        /// Constant-pool indices of property names, in template order.
+        names: Vec<u32>,
+        /// The values to store, in template order.
+        values: Vec<NodeId>,
     },
 
     /// Create an array literal from a boilerplate.

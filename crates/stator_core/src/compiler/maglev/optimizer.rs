@@ -138,6 +138,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     eliminate_redundant_type_guards(graph);
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
+    fuse_object_literal_stores(graph);
     eliminate_dead_code(graph);
 }
 
@@ -615,6 +616,11 @@ fn visit_value_node_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
         ValueNode::StoreNamedGeneric { object, value, .. } => {
             f(*object);
             f(*value);
+        }
+        ValueNode::CreateObjectLiteralWithProperties { values, .. } => {
+            for &v in values {
+                f(v);
+            }
         }
         ValueNode::LoadKeyedGeneric { object, key, .. } => {
             f(*object);
@@ -1850,6 +1856,123 @@ fn mark_inlining_candidates(graph: &mut MaglevGraph) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Object-literal + StoreNamedGeneric fusion
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Maximum number of property stores that can be fused into a single
+/// [`CreateObjectLiteralWithProperties`] node.  Limited by the SysV AMD64
+/// calling convention: with 6 register arguments we use 2 for
+/// `feedback_slot` and packed `names`, leaving 4 for values (but we
+/// currently only pass up to 3 values in RDX/RCX/R8).
+pub const MAX_FUSED_OBJECT_PROPS: usize = 3;
+
+/// Fuse `CreateObjectLiteral` + consecutive `StoreNamedGeneric` into a
+/// single [`CreateObjectLiteralWithProperties`] node.
+///
+/// The pattern detected is:
+///
+/// ```text
+/// %obj = CreateObjectLiteral { feedback_slot, flags, .. }
+/// StoreNamedGeneric { object: %obj, name: n0, value: v0, .. }
+/// StoreNamedGeneric { object: %obj, name: n1, value: v1, .. }
+/// …
+/// ```
+///
+/// The fused stores are removed and the `CreateObjectLiteral` is replaced
+/// in-place with a `CreateObjectLiteralWithProperties` that carries the
+/// property names and values.  The runtime stub creates the object and
+/// fills all properties in a single call, eliminating per-store TLS
+/// accesses and function-call overhead.
+fn fuse_object_literal_stores(graph: &mut MaglevGraph) {
+    for block in graph.blocks_mut() {
+        fuse_object_literal_stores_in_block(block);
+    }
+}
+
+/// Per-block implementation of object-literal store fusion.
+fn fuse_object_literal_stores_in_block(block: &mut BasicBlock) {
+    // Indices of StoreNamedGeneric nodes consumed by fusion (to remove).
+    let mut remove_indices: Vec<usize> = Vec::new();
+    // Replacements: (index, new_node).
+    let mut replacements: Vec<(usize, ValueNode)> = Vec::new();
+
+    let nodes = &block.nodes;
+    let len = nodes.len();
+    let mut i = 0;
+    while i < len {
+        let (create_id, create_node) = &nodes[i];
+
+        let (feedback_slot, flags) = match create_node {
+            ValueNode::CreateObjectLiteral {
+                feedback_slot,
+                flags,
+                ..
+            } => (*feedback_slot, *flags),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        // Scan consecutive StoreNamedGeneric nodes that target this object.
+        let create_node_id = *create_id;
+        let mut names: Vec<u32> = Vec::new();
+        let mut values: Vec<NodeId> = Vec::new();
+        let mut j = i + 1;
+
+        while j < len && names.len() < MAX_FUSED_OBJECT_PROPS {
+            match &nodes[j].1 {
+                ValueNode::StoreNamedGeneric {
+                    object,
+                    name,
+                    value,
+                    ..
+                } if *object == create_node_id => {
+                    names.push(*name);
+                    values.push(*value);
+                    j += 1;
+                }
+                _ => break,
+            }
+        }
+
+        if names.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // Record indices of consumed StoreNamedGeneric nodes for removal.
+        for k in (i + 1)..(i + 1 + names.len()) {
+            remove_indices.push(k);
+        }
+
+        // Replace CreateObjectLiteral with the fused node.
+        replacements.push((
+            i,
+            ValueNode::CreateObjectLiteralWithProperties {
+                feedback_slot,
+                flags,
+                names,
+                values,
+            },
+        ));
+
+        // Skip past the fused stores.
+        i = j;
+    }
+
+    // Apply replacements (non-overlapping with removals).
+    for (idx, new_node) in replacements {
+        block.nodes[idx].1 = new_node;
+    }
+    // Remove consumed stores in reverse order to keep indices valid.
+    remove_indices.sort_unstable();
+    for &idx in remove_indices.iter().rev() {
+        block.nodes.remove(idx);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Pass 3 — Dead-code elimination
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2074,6 +2197,12 @@ fn collect_value_node_inputs(node: &ValueNode, live: &mut HashSet<NodeId>) {
             live.insert(*value);
         }
 
+        ValueNode::CreateObjectLiteralWithProperties { values, .. } => {
+            for &v in values {
+                live.insert(v);
+            }
+        }
+
         ValueNode::StoreKeyedGeneric {
             object, key, value, ..
         } => {
@@ -2280,6 +2409,7 @@ fn has_side_effects(node: &ValueNode) -> bool {
             | ValueNode::ConstructWithSpread { .. }
             // Allocations have side-effects (GC pressure / observable identity).
             | ValueNode::CreateObjectLiteral { .. }
+            | ValueNode::CreateObjectLiteralWithProperties { .. }
             | ValueNode::CreateArrayLiteral { .. }
             | ValueNode::CreateShallowObjectLiteral { .. }
             | ValueNode::CreateShallowArrayLiteral { .. }
@@ -2517,6 +2647,12 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
         ValueNode::StoreNamedGeneric { object, value, .. } => {
             *object = resolve(*object);
             *value = resolve(*value);
+        }
+
+        ValueNode::CreateObjectLiteralWithProperties { values, .. } => {
+            for v in values {
+                *v = resolve(*v);
+            }
         }
 
         ValueNode::StoreKeyedGeneric {

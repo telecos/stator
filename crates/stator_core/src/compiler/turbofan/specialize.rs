@@ -1271,6 +1271,11 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
                 *inp = resolve(*inp);
             }
         }
+        CreateObjectLiteralWithProperties { values, .. } => {
+            for v in values.iter_mut() {
+                *v = resolve(*v);
+            }
+        }
     }
 }
 

@@ -347,6 +347,12 @@ fn collect_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
             f(*value);
         }
 
+        ValueNode::CreateObjectLiteralWithProperties { values, .. } => {
+            for &v in values {
+                f(v);
+            }
+        }
+
         ValueNode::StoreKeyedGeneric {
             object, key, value, ..
         } => {
@@ -557,6 +563,43 @@ pub fn allocate(graph: &MaglevGraph, num_regs: u32) -> AllocationResult {
     // Free-register pool (lower-numbered registers are preferred).
     let mut free_regs: Vec<u32> = (0..num_regs).rev().collect();
 
+    // Build Phi affinity hints: back-edge input → Phi's NodeId.
+    // After allocating Phis, we populate a second map from
+    // back-edge input → preferred register (the Phi's register).
+    let mut phi_affinity_phi: HashMap<NodeId, NodeId> = HashMap::new();
+    for block in graph.blocks() {
+        let back_edge_positions: Vec<usize> = block
+            .predecessors
+            .iter()
+            .enumerate()
+            .filter(|&(_, &pred_idx)| pred_idx >= block.id)
+            .map(|(pos, _)| pos)
+            .collect();
+        if back_edge_positions.is_empty() {
+            continue;
+        }
+        for (phi_id, node) in &block.nodes {
+            if let ValueNode::Phi { inputs } = node {
+                for &pos in &back_edge_positions {
+                    if let Some(&back_input) = inputs.get(pos)
+                        && back_input != *phi_id
+                    {
+                        phi_affinity_phi.insert(back_input, *phi_id);
+                    }
+                }
+            }
+        }
+    }
+
+    // Filled lazily: back-edge input → preferred register number.
+    let mut phi_affinity_reg: HashMap<NodeId, u32> = HashMap::new();
+
+    // Reverse map: Phi → list of back-edge inputs that want its register.
+    let mut phi_back_inputs: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for (&back_input, &phi_id) in &phi_affinity_phi {
+        phi_back_inputs.entry(phi_id).or_default().push(back_input);
+    }
+
     for iv in &intervals {
         // Expire intervals whose live range ends at or before this start point,
         // reclaiming their registers.
@@ -570,10 +613,29 @@ pub fn allocate(graph: &MaglevGraph, num_regs: u32) -> AllocationResult {
         }
         active = still_active;
 
-        if let Some(reg) = free_regs.pop() {
+        if let Some(reg) = {
+            // Prefer the Phi-affinity register if available.
+            let preferred = phi_affinity_reg.get(&iv.id).copied();
+            if let Some(pref) = preferred {
+                if let Some(pos) = free_regs.iter().position(|&r| r == pref) {
+                    Some(free_regs.remove(pos))
+                } else {
+                    free_regs.pop()
+                }
+            } else {
+                free_regs.pop()
+            }
+        } {
             // A free register is available — assign it.
             assignments.insert(iv.id, Location::Register(reg));
             active.push((reg, *iv));
+
+            // If this value is a Phi, record affinity for its back-edge inputs.
+            if let Some(back_inputs) = phi_back_inputs.get(&iv.id) {
+                for &back_input in back_inputs {
+                    phi_affinity_reg.insert(back_input, reg);
+                }
+            }
         } else {
             // All registers occupied — spill the interval with the farthest
             // endpoint.  If that interval ends later than the current one,

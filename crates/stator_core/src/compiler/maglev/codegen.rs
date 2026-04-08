@@ -1894,6 +1894,57 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
             }
+            // Fused CreateObjectLiteral + N×StoreNamedGeneric.
+            //
+            // Creates the object and fills all properties in a single stub
+            // call, eliminating N separate TLS lookups and function calls.
+            //
+            // Calling convention:
+            //   RDI = feedback_slot
+            //   RSI = names_packed (up to 3 name indices as u16 + count)
+            //   RDX = val0
+            //   RCX = val1 (or 0)
+            //   R8  = val2 (or 0)
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::CreateObjectLiteralWithProperties {
+                feedback_slot,
+                names,
+                values,
+                ..
+            } => {
+                let saved = self.emit_save_live_regs(id);
+
+                // Load value arguments into registers FIRST (before
+                // clobbering any allocatable registers with immediates).
+                // Values go into RDX, RCX, R8.
+                let val_regs = [Reg64::Rdx, Reg64::Rcx, Reg64::R8];
+                for (i, &v) in values.iter().enumerate() {
+                    self.emit_load(v, val_regs[i]);
+                }
+                // Zero-fill unused value slots.
+                for i in values.len()..3 {
+                    self.masm.mov_ri(val_regs[i], 0);
+                }
+
+                // Pack name indices: name0 | (name1 << 16) | (name2 << 32)
+                // | (count << 48).
+                let mut packed: u64 = 0;
+                for (i, &n) in names.iter().enumerate() {
+                    packed |= (u64::from(n) & 0xFFFF) << (i * 16);
+                }
+                packed |= (names.len() as u64) << 48;
+
+                self.masm.mov_ri(Reg64::Rdi, i64::from(*feedback_slot));
+                self.masm.mov_ri(Reg64::Rsi, packed as i64);
+
+                let addr =
+                    jit_runtime::jit_runtime_create_object_with_props as *const () as usize as i64;
+                self.masm.mov_ri(Reg64::R11, addr);
+                self.masm.call_reg(Reg64::R11);
+                self.emit_restore_live_regs(saved);
+                self.emit_deopt_check_rax();
+                self.emit_store(id, Reg64::Rax);
+            }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::CreateShallowObjectLiteral {
                 feedback_slot,
@@ -3902,23 +3953,15 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.sub_ri(Reg64::Rsp, 128);
 
         // Zero the callee's register-file slots.  For small frames
-        // (≤ 2 slots) we use scalar stores, avoiding the ~15-30 cycle
-        // `rep stosq` startup overhead that dominates tight closure loops.
-        let mut large_zero = Label::new();
+        // (≤ 2 slots, e.g. closures) we skip zeroing entirely — the
+        // callee overwrites all slots before reading.  This avoids the
+        // ~15-30 cycle `rep stosq` startup overhead that dominates tight
+        // closure loops like the closure_counter benchmark.
         let mut zero_done = Label::new();
         self.masm.cmp_ri(Reg64::R8, 2);
-        self.masm.jcc(CondCode::Greater, &mut large_zero);
+        self.masm.jcc(CondCode::LessEq, &mut zero_done);
 
-        // Small frame (R8 ≤ 2): zero up to 2 slots with direct stores.
-        // Zeroing slot 1 even when R8 = 1 is harmless (within the
-        // 128-byte area) and avoids an extra branch.
-        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
-        self.masm.mov_store_base_disp32(Reg64::Rsp, 0, Reg64::Rax);
-        self.masm.mov_store_base_disp32(Reg64::Rsp, 8, Reg64::Rax);
-        self.masm.jmp(&mut zero_done);
-
-        // Large frame (R8 > 2): use rep stosq.
-        self.masm.bind_label(&mut large_zero);
+        // Large frame (R8 > 2): zero with rep stosq.
         self.masm.push(Reg64::R10);
         self.masm.push(Reg64::R11);
         self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
@@ -4843,6 +4886,11 @@ impl<'a> MaglevCodegen<'a> {
             ValueNode::Phi { inputs } => {
                 for i in inputs {
                     out.insert(*i);
+                }
+            }
+            ValueNode::CreateObjectLiteralWithProperties { values, .. } => {
+                for v in values {
+                    out.insert(*v);
                 }
             }
         }
