@@ -455,9 +455,11 @@ fn phys_reg(n: u32) -> Reg64 {
 pub fn compile(graph: &MaglevGraph, param_count: u32) -> StatorResult<MaglevCompiledCode> {
     // Count direct-call-0 sites to decide whether to reserve R15.
     let mono_call_sites: i32 = count_mono_call_sites(graph);
-    // When the function has direct calls, reserve R15 for RT_PTRS
-    // caching (8 physical registers instead of 9).
-    let num_regs = if mono_call_sites > 0 {
+    let has_keyed = has_keyed_access_sites(graph);
+    // Reserve R15 for RT_PTRS caching when the function has direct
+    // calls or inline keyed array accesses (8 physical registers
+    // instead of 9).
+    let num_regs = if mono_call_sites > 0 || has_keyed {
         NUM_PHYS_REGS - 1
     } else {
         NUM_PHYS_REGS
@@ -483,6 +485,28 @@ fn count_mono_call_sites(graph: &MaglevGraph) -> i32 {
         }
     }
     count
+}
+
+/// Check whether the graph contains any keyed array access nodes that
+/// benefit from having the `RT_PTRS` TLS cell address cached in R15.
+fn has_keyed_access_sites(graph: &MaglevGraph) -> bool {
+    for block in graph.blocks() {
+        for (_nid, node) in &block.nodes {
+            if matches!(
+                node,
+                ValueNode::LoadKeyedGeneric { .. }
+                    | ValueNode::StoreKeyedGeneric { .. }
+                    | ValueNode::LoadFixedArrayElement { .. }
+                    | ValueNode::LoadFixedDoubleArrayElement { .. }
+                    | ValueNode::LoadHoleyFixedDoubleArrayElement { .. }
+                    | ValueNode::StoreFixedArrayElement { .. }
+                    | ValueNode::StoreFixedDoubleArrayElement { .. }
+            ) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -540,6 +564,11 @@ struct MaglevCodegen<'a> {
     /// offsets to each `CallUndefinedReceiver0` site.
     #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
     next_mono_cache_site: i32,
+    /// Whether R15 is reserved and loaded with the `RT_PTRS` TLS cell
+    /// address in the prologue.  True when the function has direct calls
+    /// **or** inline keyed array accesses.
+    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
+    needs_r15: bool,
     /// Deferred cold-path branch targets.  When a fused compare-branch's
     /// true target is the very next block, the false (unlikely) path is
     /// deferred here and emitted after all main blocks.  This lets the
@@ -565,6 +594,8 @@ impl<'a> MaglevCodegen<'a> {
         let mut used_caller_saved: u8 = 0;
         // Count direct-call-0 sites for monomorphic cache allocation.
         let mut mono_call_sites: i32 = 0;
+        // Track whether any keyed array access nodes exist.
+        let mut has_keyed_sites = false;
         for block in graph.blocks() {
             for (node_id, _) in &block.nodes {
                 if let Some(Location::Register(n)) = alloc.location(*node_id) {
@@ -584,6 +615,18 @@ impl<'a> MaglevCodegen<'a> {
                         mono_call_sites += 1;
                     }
                 }
+                if !has_keyed_sites {
+                    has_keyed_sites = matches!(
+                        node,
+                        ValueNode::LoadKeyedGeneric { .. }
+                            | ValueNode::StoreKeyedGeneric { .. }
+                            | ValueNode::LoadFixedArrayElement { .. }
+                            | ValueNode::LoadFixedDoubleArrayElement { .. }
+                            | ValueNode::LoadHoleyFixedDoubleArrayElement { .. }
+                            | ValueNode::StoreFixedArrayElement { .. }
+                            | ValueNode::StoreFixedDoubleArrayElement { .. }
+                    );
+                }
             }
         }
         #[cfg(all(target_arch = "x86_64", unix))]
@@ -597,6 +640,7 @@ impl<'a> MaglevCodegen<'a> {
         } else {
             mono_call_cache_bytes
         };
+        let needs_r15 = mono_call_sites > 0 || has_keyed_sites;
         Self {
             graph,
             alloc,
@@ -619,6 +663,7 @@ impl<'a> MaglevCodegen<'a> {
             i32_range: HashSet::new(),
             mono_call_cache_bytes,
             next_mono_cache_site: 0,
+            needs_r15,
             deferred_branches: Vec::new(),
         }
     }
@@ -739,11 +784,12 @@ impl<'a> MaglevCodegen<'a> {
         // alignment padding when needed) to align RSP to 0 mod 16
         // before the inner `call`.
 
-        // When the function has direct calls, cache the RT_PTRS TLS
-        // Cell address in R15 to avoid per-call TLS lookups.
+        // When the function has direct calls or keyed array accesses,
+        // cache the RT_PTRS TLS Cell address in R15 to avoid per-call
+        // TLS lookups.
         // RSP ≡ 8 mod 16 here → call pushes 8 → callee sees 0 mod 16. ✓
         #[cfg(all(target_arch = "x86_64", unix))]
-        if self.mono_call_cache_bytes > 0 {
+        if self.needs_r15 {
             let addr = jit_runtime::jit_runtime_get_rt_ptrs_cell_addr as *const () as i64;
             self.masm.mov_ri(Reg64::R11, addr);
             self.masm.call_reg(Reg64::R11);
@@ -946,14 +992,6 @@ impl<'a> MaglevCodegen<'a> {
     /// `R10` scratch registers.
     #[allow(clippy::too_many_lines)]
     fn emit_value_node(&mut self, id: NodeId, node: &ValueNode) {
-        // Flush promoted globals to GlobalEnv before user calls so that
-        // callees see up-to-date values, and reload afterwards in case
-        // the callee modified them.
-        let needs_global_sync = !self.promoted_globals.is_empty() && Self::is_user_call_node(node);
-        if needs_global_sync {
-            self.emit_flush_promoted_for_call(id);
-        }
-
         match node {
             // ── Constants ────────────────────────────────────────────────────
             ValueNode::SmiConstant { value } => match self.alloc.location(id) {
@@ -1209,21 +1247,97 @@ impl<'a> MaglevCodegen<'a> {
             // (identical to the previous code) to correctly handle the
             // full Smi range.
             ValueNode::CheckedSmiAdd { left, right } => {
-                if self.narrow_int32.contains(&id) {
+                // Constant-right fast path: use ADD-immediate instead of
+                // loading the constant into a separate register.
+                if let Some(imm) = self.try_get_i32_constant(*right) {
+                    let narrow = self.narrow_int32.contains(&id);
+                    match self.alloc.location(id) {
+                        Some(Location::Register(n)) => {
+                            let dst = phys_reg(n);
+                            self.emit_load(*left, dst);
+                            if narrow {
+                                self.masm.add32_ri(dst, imm);
+                            } else {
+                                self.masm.add_ri(dst, imm);
+                            }
+                            self.emit_deopt_on_i64_overflow(0);
+                        }
+                        _ => {
+                            self.emit_load(*left, Reg64::R11);
+                            if narrow {
+                                self.masm.add32_ri(Reg64::R11, imm);
+                            } else {
+                                self.masm.add_ri(Reg64::R11, imm);
+                            }
+                            self.emit_deopt_on_i64_overflow(0);
+                            self.emit_store(id, Reg64::R11);
+                        }
+                    }
+                } else if self.narrow_int32.contains(&id) {
                     self.emit_checked_smi_binop(*left, *right, id, MacroAssembler::add32_rr);
                 } else {
                     self.emit_checked_smi_binop(*left, *right, id, MacroAssembler::add_rr);
                 }
             }
             ValueNode::CheckedSmiSubtract { left, right } => {
-                if self.narrow_int32.contains(&id) {
+                if let Some(imm) = self.try_get_i32_constant(*right) {
+                    let narrow = self.narrow_int32.contains(&id);
+                    match self.alloc.location(id) {
+                        Some(Location::Register(n)) => {
+                            let dst = phys_reg(n);
+                            self.emit_load(*left, dst);
+                            if narrow {
+                                self.masm.sub32_ri(dst, imm);
+                            } else {
+                                self.masm.sub_ri(dst, imm);
+                            }
+                            self.emit_deopt_on_i64_overflow(0);
+                        }
+                        _ => {
+                            self.emit_load(*left, Reg64::R11);
+                            if narrow {
+                                self.masm.sub32_ri(Reg64::R11, imm);
+                            } else {
+                                self.masm.sub_ri(Reg64::R11, imm);
+                            }
+                            self.emit_deopt_on_i64_overflow(0);
+                            self.emit_store(id, Reg64::R11);
+                        }
+                    }
+                } else if self.narrow_int32.contains(&id) {
                     self.emit_checked_smi_binop(*left, *right, id, MacroAssembler::sub32_rr);
                 } else {
                     self.emit_checked_smi_binop(*left, *right, id, MacroAssembler::sub_rr);
                 }
             }
             ValueNode::CheckedSmiMultiply { left, right } => {
-                if self.narrow_int32.contains(&id) {
+                // Constant-right fast path: use 3-operand IMUL to avoid
+                // loading the constant into a separate register.
+                if let Some(imm) = self.try_get_i32_constant(*right) {
+                    let narrow = self.narrow_int32.contains(&id);
+                    match self.alloc.location(id) {
+                        Some(Location::Register(n)) => {
+                            let dst = phys_reg(n);
+                            self.emit_load(*left, dst);
+                            if narrow {
+                                self.masm.imul32_rri(dst, dst, imm);
+                            } else {
+                                self.masm.imul_rri(dst, dst, imm);
+                            }
+                            self.emit_deopt_on_i64_overflow(0);
+                        }
+                        _ => {
+                            self.emit_load(*left, Reg64::R11);
+                            if narrow {
+                                self.masm.imul32_rri(Reg64::R11, Reg64::R11, imm);
+                            } else {
+                                self.masm.imul_rri(Reg64::R11, Reg64::R11, imm);
+                            }
+                            self.emit_deopt_on_i64_overflow(0);
+                            self.emit_store(id, Reg64::R11);
+                        }
+                    }
+                } else if self.narrow_int32.contains(&id) {
                     self.emit_checked_smi_binop(*left, *right, id, MacroAssembler::imul32_rr);
                 } else {
                     self.emit_checked_smi_binop(*left, *right, id, MacroAssembler::imul_rr);
@@ -2122,10 +2236,6 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_store(id, Reg64::R11);
             }
         }
-
-        if needs_global_sync {
-            self.emit_reload_promoted_after_call();
-        }
     }
 
     // ── Control node emission ────────────────────────────────────────────────
@@ -2712,11 +2822,20 @@ impl<'a> MaglevCodegen<'a> {
     /// and assign each one a dedicated register-file slot beyond the
     /// allocator's spill area.
     fn scan_and_promote_globals(&mut self, base_slots: usize) {
-        // Promotion is now safe even when user calls exist: the codegen
-        // emits flush/reload of promoted globals around every Call,
-        // CallKnownFunction, Construct, ConstructWithSpread and
-        // CallWithSpread node so callees always see up-to-date values
-        // and any callee mutations are reloaded afterwards.
+        // When any user call (Call, Construct, etc.) exists in the function
+        // we conservatively skip promotion.  Flush/reload around calls was
+        // attempted (commit a258517c) but caused SIGSEGV on Linux CI due to
+        // stack-alignment or register-clobber issues in the lda_global /
+        // sta_global calls.  Revisit once the root cause is fixed.
+        let has_user_call = self.graph.blocks().iter().any(|block| {
+            block
+                .nodes
+                .iter()
+                .any(|(_, node)| Self::is_user_call_node(node))
+        });
+        if has_user_call {
+            return;
+        }
 
         let mut seen = HashSet::new();
         for block in self.graph.blocks() {
@@ -2817,7 +2936,7 @@ impl<'a> MaglevCodegen<'a> {
     /// This ensures the callee sees up-to-date values for any globals
     /// that the caller has promoted into register-file slots.  Called from
     /// [`emit_value_node`] around Call / Construct nodes.
-    #[allow(unused_variables)]
+    #[allow(dead_code, unused_variables)]
     fn emit_flush_promoted_for_call(&mut self, at_node: NodeId) {
         #[cfg(all(target_arch = "x86_64", unix))]
         {
@@ -2845,7 +2964,7 @@ impl<'a> MaglevCodegen<'a> {
     /// register-file copies back in sync.  Saves/restores ALL caller-saved
     /// registers (including potential call result) unconditionally because
     /// the precise post-call liveness is not easily available.
-    #[allow(unused_variables)]
+    #[allow(dead_code, unused_variables)]
     fn emit_reload_promoted_after_call(&mut self) {
         #[cfg(all(target_arch = "x86_64", unix))]
         {
@@ -3408,8 +3527,17 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.push(Reg64::Rdi);
 
         // Call the lean inline helper: returns {value, hit} in RAX:RDX.
-        let inline_addr = jit_runtime::jit_runtime_inline_load_keyed_smi as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, inline_addr as i64);
+        // When R15 holds the RT_PTRS cell address, pass it as the 3rd
+        // argument (RDX) to skip the TLS lookup in the inline helper.
+        if self.needs_r15 {
+            self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
+            let inline_addr =
+                jit_runtime::jit_runtime_inline_load_keyed_smi_r15 as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, inline_addr as i64);
+        } else {
+            let inline_addr = jit_runtime::jit_runtime_inline_load_keyed_smi as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, inline_addr as i64);
+        }
         self.masm.call_reg(Reg64::R11);
 
         // Check hit flag (RDX).
@@ -3469,8 +3597,17 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.push(Reg64::R11); // alignment padding
 
         // Call the lean inline helper.
-        let inline_addr = jit_runtime::jit_runtime_inline_store_keyed_smi as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, inline_addr as i64);
+        // When R15 holds the RT_PTRS cell address, pass it as the 4th
+        // argument (RCX) to skip the TLS lookup in the inline helper.
+        if self.needs_r15 {
+            self.masm.mov_rr(Reg64::Rcx, Reg64::R15);
+            let inline_addr =
+                jit_runtime::jit_runtime_inline_store_keyed_smi_r15 as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, inline_addr as i64);
+        } else {
+            let inline_addr = jit_runtime::jit_runtime_inline_store_keyed_smi as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, inline_addr as i64);
+        }
         self.masm.call_reg(Reg64::R11);
 
         // Check hit flag (RDX).

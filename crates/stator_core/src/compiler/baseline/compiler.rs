@@ -3224,6 +3224,7 @@ pub(crate) mod jit_runtime {
     /// * `RDI` (`result`) – raw `i64` result from the callee JIT code.
     ///
     /// Returns the final result as `i64` in `RAX`, or [`JIT_DEOPT`].
+    #[allow(dead_code)]
     pub extern "C" fn jit_runtime_finish_direct_call(result: i64) -> i64 {
         let ptrs = RT_PTRS.with(|p| p.get());
         if !ptrs.is_cached() {
@@ -3433,6 +3434,7 @@ pub(crate) mod jit_runtime {
     /// Returns `0` on failure, `1` on success (use cached entry), or
     /// `> 1` for a Maglev upgrade entry point.  When context differs,
     /// falls through to the full `mono_call_prepare`.
+    #[allow(dead_code)]
     pub extern "C" fn jit_runtime_mono_call_prepare_check_ctx(
         callee_i64: i64,
         ba_ptr: i64,
@@ -4380,16 +4382,39 @@ pub(crate) mod jit_runtime {
         obj_i64: i64,
         smi_key: i64,
     ) -> InlineKeyedResult {
-        inline_load_keyed_inner(obj_i64, smi_key)
+        let ptrs = RT_PTRS.with(|p| p.get());
+        inline_load_keyed_with_ptrs(obj_i64, smi_key, ptrs)
     }
 
-    fn inline_load_keyed_inner(obj_i64: i64, smi_key: i64) -> InlineKeyedResult {
+    /// Like [`jit_runtime_inline_load_keyed_smi`] but accepts a
+    /// pre-cached pointer to the `RT_PTRS` TLS cell in the 3rd argument,
+    /// eliminating one TLS lookup per array load.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_i64`) – JIT i64 encoding of the receiver.
+    /// * `RSI` (`smi_key`) – non-negative integer index.
+    /// * `RDX` (`rt_ptrs_cell`) – pointer to `Cell<RtPtrs>` TLS slot.
+    ///
+    /// Returns [`InlineKeyedResult`] in `RAX:RDX`.
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    pub extern "C" fn jit_runtime_inline_load_keyed_smi_r15(
+        obj_i64: i64,
+        smi_key: i64,
+        rt_ptrs_cell: i64,
+    ) -> InlineKeyedResult {
+        // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
+        // TLS slot lives for the thread's entire lifetime.
+        let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
+        inline_load_keyed_with_ptrs(obj_i64, smi_key, ptrs)
+    }
+
+    fn inline_load_keyed_with_ptrs(obj_i64: i64, smi_key: i64, ptrs: RtPtrs) -> InlineKeyedResult {
         if !is_heap_handle(obj_i64) || smi_key < 0 {
             return InlineKeyedResult::MISS;
         }
         let key = smi_key as usize;
         let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
-        let ptrs = RT_PTRS.with(|p| p.get());
         if !ptrs.is_cached() {
             return InlineKeyedResult::MISS;
         }
@@ -4450,10 +4475,41 @@ pub(crate) mod jit_runtime {
         smi_key: i64,
         value_i64: i64,
     ) -> InlineKeyedResult {
-        inline_store_keyed_inner(obj_i64, smi_key, value_i64)
+        let ptrs = RT_PTRS.with(|p| p.get());
+        inline_store_keyed_with_ptrs(obj_i64, smi_key, value_i64, ptrs)
     }
 
-    fn inline_store_keyed_inner(obj_i64: i64, smi_key: i64, value_i64: i64) -> InlineKeyedResult {
+    /// Like [`jit_runtime_inline_store_keyed_smi`] but accepts a
+    /// pre-cached pointer to the `RT_PTRS` TLS cell in the 4th argument,
+    /// eliminating one TLS lookup per array store.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_i64`) – JIT i64 encoding of the receiver.
+    /// * `RSI` (`smi_key`) – non-negative integer index.
+    /// * `RDX` (`value_i64`) – JIT i64 encoding of the value.
+    /// * `RCX` (`rt_ptrs_cell`) – pointer to `Cell<RtPtrs>` TLS slot.
+    ///
+    /// Returns [`InlineKeyedResult`] in `RAX:RDX`.
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    pub extern "C" fn jit_runtime_inline_store_keyed_smi_r15(
+        obj_i64: i64,
+        smi_key: i64,
+        value_i64: i64,
+        rt_ptrs_cell: i64,
+    ) -> InlineKeyedResult {
+        // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
+        // TLS slot lives for the thread's entire lifetime.
+        let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
+        inline_store_keyed_with_ptrs(obj_i64, smi_key, value_i64, ptrs)
+    }
+
+    fn inline_store_keyed_with_ptrs(
+        obj_i64: i64,
+        smi_key: i64,
+        value_i64: i64,
+        ptrs: RtPtrs,
+    ) -> InlineKeyedResult {
         if !is_heap_handle(obj_i64) || smi_key < 0 {
             return InlineKeyedResult::MISS;
         }
@@ -4475,7 +4531,6 @@ pub(crate) mod jit_runtime {
 
         let key = smi_key as usize;
         let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
-        let ptrs = RT_PTRS.with(|p| p.get());
         if !ptrs.is_cached() {
             return InlineKeyedResult::MISS;
         }
