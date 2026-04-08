@@ -478,7 +478,7 @@ fn count_mono_call_sites(graph: &MaglevGraph) -> i32 {
             {
                 let recv_is_undef =
                     matches!(graph.node(*receiver), Some(ValueNode::UndefinedConstant));
-                if recv_is_undef && args.is_empty() {
+                if recv_is_undef && args.len() <= 2 {
                     count += 1;
                 }
             }
@@ -611,7 +611,7 @@ impl<'a> MaglevCodegen<'a> {
                 {
                     let recv_is_undef =
                         matches!(graph.node(*receiver), Some(ValueNode::UndefinedConstant));
-                    if recv_is_undef && args.is_empty() {
+                    if recv_is_undef && args.len() <= 2 {
                         mono_call_sites += 1;
                     }
                 }
@@ -3901,19 +3901,35 @@ impl<'a> MaglevCodegen<'a> {
         // Allocate 128-byte register file (fixed size for ABI compat).
         self.masm.sub_ri(Reg64::Rsp, 128);
 
-        // Zero only the used register slots via rep stosq.
-        // R8 = number of qwords to zero (1-16).
+        // Zero the callee's register-file slots.  For small frames
+        // (≤ 2 slots) we use scalar stores, avoiding the ~15-30 cycle
+        // `rep stosq` startup overhead that dominates tight closure loops.
+        let mut large_zero = Label::new();
+        let mut zero_done = Label::new();
+        self.masm.cmp_ri(Reg64::R8, 2);
+        self.masm.jcc(CondCode::Greater, &mut large_zero);
+
+        // Small frame (R8 ≤ 2): zero up to 2 slots with direct stores.
+        // Zeroing slot 1 even when R8 = 1 is harmless (within the
+        // 128-byte area) and avoids an extra branch.
+        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+        self.masm.mov_store_base_disp32(Reg64::Rsp, 0, Reg64::Rax);
+        self.masm.mov_store_base_disp32(Reg64::Rsp, 8, Reg64::Rax);
+        self.masm.jmp(&mut zero_done);
+
+        // Large frame (R8 > 2): use rep stosq.
+        self.masm.bind_label(&mut large_zero);
         self.masm.push(Reg64::R10);
         self.masm.push(Reg64::R11);
-
         self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
         self.masm.mov_rr(Reg64::Rcx, Reg64::R8); // RCX = reg_slots
         self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
         self.masm.add_ri(Reg64::Rdi, 16);
         self.masm.rep_stosq();
-
         self.masm.pop(Reg64::R11);
         self.masm.pop(Reg64::R10);
+
+        self.masm.bind_label(&mut zero_done);
 
         // RDI = register file, RSI = ctx_ptr.
         self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
