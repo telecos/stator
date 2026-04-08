@@ -5560,6 +5560,7 @@ pub(crate) mod jit_runtime {
                     arr: Option<Rc<RefCell<Vec<JsValue>>>>,
                 },
                 NativeCall(Rc<dyn Fn(Vec<JsValue>) -> Result<JsValue, StatorError>>),
+                JsFunction(*const BytecodeArray),
                 Other,
             }
 
@@ -5592,6 +5593,8 @@ pub(crate) mod jit_runtime {
                     }
                 } else if let Some(JsValue::NativeFunction(nf)) = heap.get(callee_idx) {
                     CalleeInfo::NativeCall(Rc::clone(nf))
+                } else if let Some(JsValue::Function(ba)) = heap.get(callee_idx) {
+                    CalleeInfo::JsFunction(Rc::as_ptr(ba))
                 } else {
                     CalleeInfo::Other
                 }
@@ -5627,6 +5630,91 @@ pub(crate) mod jit_runtime {
                         Err(_) => None,
                     };
                 }
+                #[cfg(all(target_arch = "x86_64", unix))]
+                CalleeInfo::JsFunction(ba_ptr) => {
+                    // User-defined JS function (e.g. obj.getX()).
+                    // Execute via Maglev if available, passing receiver
+                    // as args[0] (the `this` binding).
+                    // SAFETY: ba_ptr from Rc::as_ptr; heap entry outlives call.
+                    let ba: &BytecodeArray = unsafe { &*ba_ptr };
+                    let bc_ref = unsafe { &*ptrs.bytecode };
+                    let saved_ba = bc_ref.get();
+
+                    // ── Maglev fast path ──
+                    {
+                        use crate::compiler::maglev::codegen::CachedMaglevCode;
+                        let maglev_cache = ba.maglev_executable_cache();
+                        let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
+                        if maglev_ref.is_none() {
+                            let jit_cache = ba.maglev_jit_cache_arc();
+                            let cached_data = jit_cache.lock().ok().and_then(|guard| {
+                                guard
+                                    .as_ref()
+                                    .map(|c| (c.as_bytes().to_vec(), c.register_file_slots))
+                            });
+                            if let Some((code, register_file_slots)) = cached_data {
+                                let exec =
+                                    unsafe { CachedMaglevCode::new(&code, register_file_slots) };
+                                *maglev_cache.borrow_mut() = exec;
+                            }
+                        }
+                        let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
+                        if let Some(maglev_exec) = maglev_ref.as_ref() {
+                            let ctx_ref = unsafe { &*ptrs.context };
+                            let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+
+                            let callee_ctx_raw = ba.closure_context();
+                            let callee_ctx_ptr =
+                                callee_ctx_raw.map(Rc::as_ptr).unwrap_or(std::ptr::null());
+                            let current_ctx_ptr = unsafe {
+                                (*ctx_ref.as_ptr())
+                                    .as_ref()
+                                    .map(Rc::as_ptr)
+                                    .unwrap_or(std::ptr::null())
+                            };
+                            let same_context = std::ptr::eq(callee_ctx_ptr, current_ctx_ptr);
+                            let saved_ctx = if same_context {
+                                None
+                            } else {
+                                let callee_ctx = callee_ctx_raw.cloned();
+                                Some(unsafe {
+                                    std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx)
+                                })
+                            };
+
+                            bc_ref.set(ba_ptr);
+                            let ctx_raw = callee_ctx_ptr as i64;
+                            // Pass receiver as args[0] (the `this` binding).
+                            let jit_result =
+                                unsafe { maglev_exec.execute(&[receiver_i64], ctx_raw) };
+                            bc_ref.set(saved_ba);
+
+                            if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
+                                unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                                if let Some(ctx) = saved_ctx {
+                                    unsafe { *ctx_ref.as_ptr() = ctx };
+                                }
+                                return Some(jit_result);
+                            }
+
+                            let result_val = if jit_result == JIT_DEOPT {
+                                None
+                            } else {
+                                jit_to_jsvalue_ext(jit_result)
+                            };
+                            unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                            if let Some(ctx) = saved_ctx {
+                                unsafe { *ctx_ref.as_ptr() = ctx };
+                            }
+                            return result_val.map(jsvalue_to_jit_i64);
+                        }
+                    }
+
+                    // No Maglev code — deopt to interpreter.
+                    return None;
+                }
+                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                CalleeInfo::JsFunction(_) => return None,
                 CalleeInfo::Other => return None,
             }
         }
@@ -5770,6 +5858,86 @@ pub(crate) mod jit_runtime {
                     Ok(val) => Some(jsvalue_to_jit_i64(val)),
                     Err(_) => None,
                 };
+            }
+
+            // User-defined JS function (e.g. Base.call(this) in constructors).
+            #[cfg(all(target_arch = "x86_64", unix))]
+            if let Some(JsValue::Function(ba_rc)) = heap.get(callee_idx) {
+                let ba_ptr: *const BytecodeArray = Rc::as_ptr(ba_rc);
+                // SAFETY: ba_ptr from Rc::as_ptr; heap entry outlives call.
+                let ba: &BytecodeArray = unsafe { &*ba_ptr };
+                let bc_ref = unsafe { &*ptrs.bytecode };
+                let saved_ba = bc_ref.get();
+
+                // ── Maglev fast path ──
+                {
+                    use crate::compiler::maglev::codegen::CachedMaglevCode;
+                    let maglev_cache = ba.maglev_executable_cache();
+                    let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
+                    if maglev_ref.is_none() {
+                        let jit_cache = ba.maglev_jit_cache_arc();
+                        let cached_data = jit_cache.lock().ok().and_then(|guard| {
+                            guard
+                                .as_ref()
+                                .map(|c| (c.as_bytes().to_vec(), c.register_file_slots))
+                        });
+                        if let Some((code, register_file_slots)) = cached_data {
+                            let exec = unsafe { CachedMaglevCode::new(&code, register_file_slots) };
+                            *maglev_cache.borrow_mut() = exec;
+                        }
+                    }
+                    let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
+                    if let Some(maglev_exec) = maglev_ref.as_ref() {
+                        let ctx_ref = unsafe { &*ptrs.context };
+                        let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+
+                        let callee_ctx_raw = ba.closure_context();
+                        let callee_ctx_ptr =
+                            callee_ctx_raw.map(Rc::as_ptr).unwrap_or(std::ptr::null());
+                        let current_ctx_ptr = unsafe {
+                            (*ctx_ref.as_ptr())
+                                .as_ref()
+                                .map(Rc::as_ptr)
+                                .unwrap_or(std::ptr::null())
+                        };
+                        let same_context = std::ptr::eq(callee_ctx_ptr, current_ctx_ptr);
+                        let saved_ctx = if same_context {
+                            None
+                        } else {
+                            let callee_ctx = callee_ctx_raw.cloned();
+                            Some(unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx) })
+                        };
+
+                        bc_ref.set(ba_ptr);
+                        let ctx_raw = callee_ctx_ptr as i64;
+                        // Pass receiver as args[0] and arg0 as args[1].
+                        let jit_result =
+                            unsafe { maglev_exec.execute(&[receiver_i64, arg0_i64], ctx_raw) };
+                        bc_ref.set(saved_ba);
+
+                        if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
+                            unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                            if let Some(ctx) = saved_ctx {
+                                unsafe { *ctx_ref.as_ptr() = ctx };
+                            }
+                            return Some(jit_result);
+                        }
+
+                        let result_val = if jit_result == JIT_DEOPT {
+                            None
+                        } else {
+                            jit_to_jsvalue_ext(jit_result)
+                        };
+                        unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                        if let Some(ctx) = saved_ctx {
+                            unsafe { *ctx_ref.as_ptr() = ctx };
+                        }
+                        return result_val.map(jsvalue_to_jit_i64);
+                    }
+                }
+
+                // No Maglev code — deopt to interpreter.
+                return None;
             }
 
             let _ = heap;
