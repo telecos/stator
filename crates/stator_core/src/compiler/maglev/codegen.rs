@@ -3383,16 +3383,14 @@ impl<'a> MaglevCodegen<'a> {
 
         // Speculative Smi: both inputs were guarded upstream (by
         // LoadNamedGeneric Smi guard or a prior smi_guarded op).
-        // Skip input Smi checks; emit bare ADD + result overflow deopt.
+        // Skip input Smi checks; emit 32-bit ADD + JO overflow deopt.
         if self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right) {
             self.emit_load(left, Reg64::Rax);
             self.emit_load(right, Reg64::R10);
-            self.masm.add_rr(Reg64::Rax, Reg64::R10);
-            // Deopt if result exceeds i32 range.
-            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm.add32_rr(Reg64::Rax, Reg64::R10);
             self.masm
-                .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
+                .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
+            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
             self.emit_store(id, Reg64::Rax);
             return;
         }
@@ -3449,11 +3447,10 @@ impl<'a> MaglevCodegen<'a> {
         if self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right) {
             self.emit_load(left, Reg64::Rax);
             self.emit_load(right, Reg64::R10);
-            self.masm.sub_rr(Reg64::Rax, Reg64::R10);
-            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm.sub32_rr(Reg64::Rax, Reg64::R10);
             self.masm
-                .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
+                .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
+            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
             self.emit_store(id, Reg64::Rax);
             return;
         }
@@ -3508,11 +3505,10 @@ impl<'a> MaglevCodegen<'a> {
         if self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right) {
             self.emit_load(left, Reg64::Rax);
             self.emit_load(right, Reg64::R10);
-            self.masm.imul_rr(Reg64::Rax, Reg64::R10);
-            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm.imul32_rr(Reg64::Rax, Reg64::R10);
             self.masm
-                .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
+                .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
+            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
             self.emit_store(id, Reg64::Rax);
             return;
         }
@@ -3700,11 +3696,10 @@ impl<'a> MaglevCodegen<'a> {
 
         if self.smi_guarded.contains(&value) {
             self.emit_load(value, Reg64::Rax);
-            self.masm.add_ri(Reg64::Rax, 1);
-            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm.add32_ri(Reg64::Rax, 1);
             self.masm
-                .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
+                .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
+            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
             self.emit_store(id, Reg64::Rax);
             return;
         }
@@ -3749,11 +3744,10 @@ impl<'a> MaglevCodegen<'a> {
 
         if self.smi_guarded.contains(&value) {
             self.emit_load(value, Reg64::Rax);
-            self.masm.sub_ri(Reg64::Rax, 1);
-            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm.sub32_ri(Reg64::Rax, 1);
             self.masm
-                .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
+                .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
+            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
             self.emit_store(id, Reg64::Rax);
             return;
         }
@@ -3800,11 +3794,10 @@ impl<'a> MaglevCodegen<'a> {
         if self.smi_guarded.contains(&value) {
             self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
             self.emit_load(value, Reg64::R10);
-            self.masm.sub_rr(Reg64::Rax, Reg64::R10);
-            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm.sub32_rr(Reg64::Rax, Reg64::R10);
             self.masm
-                .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
+                .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
+            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
             self.emit_store(id, Reg64::Rax);
             return;
         }
