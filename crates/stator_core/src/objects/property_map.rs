@@ -81,6 +81,11 @@ const MAX_POOLED_PROPERTY_CAPACITY: usize = SMALL_PROPERTY_LINEAR_SCAN_CAP * 4;
 thread_local! {
     static PROPERTY_STORAGE_POOL: RefCell<Vec<PropertyStorageBuffers>> =
         RefCell::new(Vec::with_capacity(PROPERTY_STORAGE_POOL_CAP));
+
+    /// Pool for recycling values `Vec`s from template-instantiated objects
+    /// whose shared keys/attrs prevent full-buffer recycling.
+    static VALUES_VEC_POOL: RefCell<Vec<Vec<JsValue>>> =
+        RefCell::new(Vec::with_capacity(PROPERTY_STORAGE_POOL_CAP));
 }
 
 #[derive(Debug)]
@@ -187,6 +192,37 @@ fn release_storage_buffers(mut buffers: PropertyStorageBuffers) {
         let mut pool = pool.borrow_mut();
         if pool.len() < PROPERTY_STORAGE_POOL_CAP {
             pool.push(buffers);
+        }
+    });
+}
+
+/// Acquire a pre-allocated values `Vec` from the thread-local pool,
+/// sized to hold at least `cap` elements initialised to `Undefined`.
+fn acquire_values_vec(cap: usize) -> Vec<JsValue> {
+    VALUES_VEC_POOL
+        .try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if let Some(idx) = pool.iter().position(|v| v.capacity() >= cap) {
+                let mut v = pool.swap_remove(idx);
+                v.clear();
+                v.resize(cap, JsValue::Undefined);
+                v
+            } else {
+                vec![JsValue::Undefined; cap]
+            }
+        })
+        .unwrap_or_else(|_| vec![JsValue::Undefined; cap])
+}
+
+/// Return a values `Vec` to the thread-local pool for reuse.
+fn release_values_vec(v: Vec<JsValue>) {
+    if v.capacity() > MAX_POOLED_PROPERTY_CAPACITY {
+        return;
+    }
+    let _ = VALUES_VEC_POOL.try_with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < PROPERTY_STORAGE_POOL_CAP {
+            pool.push(v);
         }
     });
 }
@@ -384,7 +420,7 @@ impl ObjectLiteralTemplate {
         let capacity_hint = self.capacity_hint.max(cap);
         PropertyMap {
             keys: Rc::clone(&self.keys),
-            values: vec![JsValue::Undefined; cap],
+            values: acquire_values_vec(cap),
             attrs: Rc::clone(&self.attrs),
             integer_key_count: self.integer_key_count,
             index: self.cached_index.clone(),
@@ -1383,6 +1419,10 @@ impl Drop for PropertyMap {
                 values,
                 attrs,
             });
+        } else {
+            // Template-instantiated: keys/attrs are shared, but
+            // the values Vec can still be recycled independently.
+            release_values_vec(values);
         }
     }
 }
