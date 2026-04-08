@@ -444,8 +444,36 @@ fn phys_reg(n: u32) -> Reg64 {
 /// Returns [`StatorError::Internal`] when the code buffer would exceed 4 GiB
 /// (which cannot occur in practice with well-formed graphs).
 pub fn compile(graph: &MaglevGraph, param_count: u32) -> StatorResult<MaglevCompiledCode> {
-    let alloc = allocate(graph, NUM_PHYS_REGS);
+    // Count direct-call-0 sites to decide whether to reserve R15.
+    let mono_call_sites: i32 = count_mono_call_sites(graph);
+    // When the function has direct calls, reserve R15 for RT_PTRS
+    // caching (8 physical registers instead of 9).
+    let num_regs = if mono_call_sites > 0 {
+        NUM_PHYS_REGS - 1
+    } else {
+        NUM_PHYS_REGS
+    };
+    let alloc = allocate(graph, num_regs);
     MaglevCodegen::new(graph, &alloc, param_count).compile()
+}
+
+/// Count the number of direct-call-0 sites (CallUndefinedReceiver0) in the graph.
+fn count_mono_call_sites(graph: &MaglevGraph) -> i32 {
+    let mut count: i32 = 0;
+    for block in graph.blocks() {
+        for (_nid, node) in &block.nodes {
+            if let ValueNode::Call { receiver, args, .. }
+            | ValueNode::CallKnownFunction { receiver, args, .. } = node
+            {
+                let recv_is_undef =
+                    matches!(graph.node(*receiver), Some(ValueNode::UndefinedConstant));
+                if recv_is_undef && args.is_empty() {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -701,6 +729,17 @@ impl<'a> MaglevCodegen<'a> {
         // RSP ≡ 8 mod 16.  Stub calls use selective save (with
         // alignment padding when needed) to align RSP to 0 mod 16
         // before the inner `call`.
+
+        // When the function has direct calls, cache the RT_PTRS TLS
+        // Cell address in R15 to avoid per-call TLS lookups.
+        // RSP ≡ 8 mod 16 here → call pushes 8 → callee sees 0 mod 16. ✓
+        #[cfg(all(target_arch = "x86_64", unix))]
+        if self.mono_call_cache_bytes > 0 {
+            let addr = jit_runtime::jit_runtime_get_rt_ptrs_cell_addr as *const () as i64;
+            self.masm.mov_ri(Reg64::R11, addr);
+            self.masm.call_reg(Reg64::R11);
+            self.masm.mov_rr(Reg64::R15, Reg64::Rax);
+        }
 
         // Allocate monomorphic call-cache slots (kept as a multiple of
         // 16, so RSP alignment is preserved: still ≡ 8 mod 16).
@@ -3533,8 +3572,10 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.push(Reg64::Rdi);
         self.masm.push(Reg64::Rdi);
 
+        // Pass R15 (RT_PTRS cell addr) as RCX (4th arg) to skip TLS lookup.
+        self.masm.mov_rr(Reg64::Rcx, Reg64::R15);
         let combined_addr =
-            jit_runtime::jit_runtime_mono_call_prepare_check_ctx as *const () as usize;
+            jit_runtime::jit_runtime_mono_call_prepare_check_ctx_r15 as *const () as usize;
         self.masm.mov_ri(Reg64::R11, combined_addr as i64);
         self.masm.call_reg(Reg64::R11);
 
@@ -3654,8 +3695,10 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.add_ri(Reg64::Rsp, 128);
 
         // Finish direct call (restores BA, context, truncates heap).
+        // Pass R15 (RT_PTRS cell addr) as RSI (2nd arg) to skip TLS lookup.
         self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
-        let finish_addr = jit_runtime::jit_runtime_finish_direct_call as *const () as usize;
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R15);
+        let finish_addr = jit_runtime::jit_runtime_finish_direct_call_r15 as *const () as usize;
         self.masm.mov_ri(Reg64::R11, finish_addr as i64);
         self.masm.call_reg(Reg64::R11);
 
@@ -3749,9 +3792,10 @@ impl<'a> MaglevCodegen<'a> {
         // Deallocate register file.
         self.masm.add_ri(Reg64::Rsp, 128);
 
-        // Finish direct call.
+        // Finish direct call (R15 = RT_PTRS cell addr).
         self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
-        let finish_addr = jit_runtime::jit_runtime_finish_direct_call as *const () as usize;
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R15);
+        let finish_addr = jit_runtime::jit_runtime_finish_direct_call_r15 as *const () as usize;
         self.masm.mov_ri(Reg64::R11, finish_addr as i64);
         self.masm.call_reg(Reg64::R11);
 
@@ -3835,7 +3879,8 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.add_ri(Reg64::Rsp, 128);
 
         self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
-        let finish_addr = jit_runtime::jit_runtime_finish_direct_call as *const () as usize;
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R15);
+        let finish_addr = jit_runtime::jit_runtime_finish_direct_call_r15 as *const () as usize;
         self.masm.mov_ri(Reg64::R11, finish_addr as i64);
         self.masm.call_reg(Reg64::R11);
 

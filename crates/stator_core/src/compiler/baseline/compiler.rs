@@ -3229,7 +3229,12 @@ pub(crate) mod jit_runtime {
         if !ptrs.is_cached() {
             return JIT_DEOPT;
         }
+        finish_direct_call_inner(result, ptrs)
+    }
 
+    /// Shared implementation for [`jit_runtime_finish_direct_call`] and
+    /// its `_r15` variant.
+    fn finish_direct_call_inner(result: i64, ptrs: RtPtrs) -> i64 {
         // SAFETY: cached pointer set by cache_rt_ptrs; valid for thread lifetime.
         let bc_ref = unsafe { &*ptrs.bytecode };
         let heap_ref = unsafe { &*ptrs.heap };
@@ -3276,6 +3281,25 @@ pub(crate) mod jit_runtime {
         }
 
         result_val.map(jsvalue_to_jit_i64).unwrap_or(JIT_DEOPT)
+    }
+
+    /// Like [`jit_runtime_finish_direct_call`] but accepts a pre-cached
+    /// pointer to the `RT_PTRS` TLS cell, eliminating one TLS lookup.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`result`) – the callee's return value.
+    /// * `RSI` (`rt_ptrs_cell`) – raw pointer to the `Cell<RtPtrs>` TLS
+    ///   slot, previously obtained via [`jit_runtime_get_rt_ptrs_cell_addr`].
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    pub extern "C" fn jit_runtime_finish_direct_call_r15(result: i64, rt_ptrs_cell: i64) -> i64 {
+        // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
+        // TLS slot lives for the thread's entire lifetime.
+        let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
+        if !ptrs.is_cached() {
+            return JIT_DEOPT;
+        }
+        finish_direct_call_inner(result, ptrs)
     }
 
     /// Lightweight TLS setup for a monomorphic JIT-to-JIT call.
@@ -3418,50 +3442,7 @@ pub(crate) mod jit_runtime {
         if !ptrs.is_cached() {
             return 0;
         }
-
-        // SAFETY: cached pointer set by cache_rt_ptrs; valid for thread lifetime.
-        let bc_ref = unsafe { &*ptrs.bytecode };
-        let heap_ref = unsafe { &*ptrs.heap };
-        let ctx_ref = unsafe { &*ptrs.context };
-
-        // Compare cached callee context against current runtime context.
-        let callee_ctx_raw = cached_ctx_ptr as *const RefCell<JsContext>;
-        // SAFETY: no active borrows of context RefCell.
-        let current_ctx = unsafe {
-            (*ctx_ref.as_ptr())
-                .as_ref()
-                .map(Rc::as_ptr)
-                .unwrap_or(std::ptr::null())
-        };
-
-        if !std::ptr::eq(callee_ctx_raw, current_ctx) {
-            // Context differs — delegate to the full prepare which
-            // handles context swap.
-            return jit_runtime_mono_call_prepare(callee_i64, ba_ptr, cached_ctx_ptr);
-        }
-
-        // Context matches — same-ctx fast path (no context save/restore).
-        let saved_ba = bc_ref.get();
-        bc_ref.set(ba_ptr as *const BytecodeArray);
-
-        // SAFETY: single-threaded JIT; no concurrent heap mutation.
-        let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
-
-        ptrs.set_direct_call(DirectCallState {
-            saved_ba,
-            heap_base,
-            ctx_changed: false,
-        });
-
-        #[cfg(all(target_arch = "x86_64", unix))]
-        {
-            let ba = unsafe { &*(ba_ptr as *const BytecodeArray) };
-            if let Some(ep) = try_get_maglev_entry_point(ba) {
-                return ep;
-            }
-        }
-
-        1
+        prepare_check_ctx_inner(callee_i64, ba_ptr, cached_ctx_ptr, ptrs)
     }
 
     /// Lightweight mono-call prepare for the **same-context** fast path.
@@ -3573,6 +3554,97 @@ pub(crate) mod jit_runtime {
         let ba = unsafe { &*(ba_ptr as *const BytecodeArray) };
         let slots = (ba.parameter_count() + ba.frame_size()) as i64;
         slots.clamp(1, 16)
+    }
+
+    /// Returns the address of the `RT_PTRS` TLS `Cell` so Maglev-compiled
+    /// code can cache it in a callee-saved register (R15) and pass it to
+    /// `_r15` variants of prepare/finish, eliminating per-call TLS lookups.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer is valid for the entire lifetime of the
+    /// current thread.  It must only be used on the same thread.
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    pub extern "C" fn jit_runtime_get_rt_ptrs_cell_addr() -> i64 {
+        RT_PTRS.with(|p| p as *const Cell<RtPtrs> as i64)
+    }
+
+    /// Like [`jit_runtime_mono_call_prepare_check_ctx`] but accepts a
+    /// pre-cached pointer to the `RT_PTRS` TLS cell in the 4th argument,
+    /// eliminating one TLS lookup per call.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`callee_i64`) – JIT i64 encoding of the callee.
+    /// * `RSI` (`ba_ptr`) – cached BA pointer.
+    /// * `RDX` (`cached_ctx_ptr`) – cached callee context pointer.
+    /// * `RCX` (`rt_ptrs_cell`) – pointer to `Cell<RtPtrs>` TLS slot.
+    ///
+    /// Returns `0` on failure, `1` on success, or `> 1` for Maglev upgrade.
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    pub extern "C" fn jit_runtime_mono_call_prepare_check_ctx_r15(
+        callee_i64: i64,
+        ba_ptr: i64,
+        cached_ctx_ptr: i64,
+        rt_ptrs_cell: i64,
+    ) -> i64 {
+        // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
+        // TLS slot lives for the thread's entire lifetime.
+        let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
+        if !ptrs.is_cached() {
+            return 0;
+        }
+        prepare_check_ctx_inner(callee_i64, ba_ptr, cached_ctx_ptr, ptrs)
+    }
+
+    /// Shared implementation for the context-check + prepare fast path.
+    fn prepare_check_ctx_inner(
+        callee_i64: i64,
+        ba_ptr: i64,
+        cached_ctx_ptr: i64,
+        ptrs: RtPtrs,
+    ) -> i64 {
+        // SAFETY: cached pointer set by cache_rt_ptrs; valid for thread lifetime.
+        let bc_ref = unsafe { &*ptrs.bytecode };
+        let heap_ref = unsafe { &*ptrs.heap };
+        let ctx_ref = unsafe { &*ptrs.context };
+
+        // Compare cached callee context against current runtime context.
+        let callee_ctx_raw = cached_ctx_ptr as *const RefCell<JsContext>;
+        // SAFETY: no active borrows of context RefCell.
+        let current_ctx = unsafe {
+            (*ctx_ref.as_ptr())
+                .as_ref()
+                .map(Rc::as_ptr)
+                .unwrap_or(std::ptr::null())
+        };
+
+        if !std::ptr::eq(callee_ctx_raw, current_ctx) {
+            return jit_runtime_mono_call_prepare(callee_i64, ba_ptr, cached_ctx_ptr);
+        }
+
+        // Context matches — same-ctx fast path (no context save/restore).
+        let saved_ba = bc_ref.get();
+        bc_ref.set(ba_ptr as *const BytecodeArray);
+
+        // SAFETY: single-threaded JIT; no concurrent heap mutation.
+        let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+
+        ptrs.set_direct_call(DirectCallState {
+            saved_ba,
+            heap_base,
+            ctx_changed: false,
+        });
+
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            let ba = unsafe { &*(ba_ptr as *const BytecodeArray) };
+            if let Some(ep) = try_get_maglev_entry_point(ba) {
+                return ep;
+            }
+        }
+
+        1
     }
 
     /// Specialized runtime stub for `LdaGlobal`.
