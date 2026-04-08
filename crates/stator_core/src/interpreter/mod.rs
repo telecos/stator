@@ -1462,6 +1462,10 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
         let ret = if deopt_offset <= 5 {
             MAGLEV_DIAG_DEOPTED.with(|c| c.set(c.get() + 1));
             ba.mark_jit_maglev_deopted();
+            // Invalidate the cached executable so the next attempt
+            // re-loads from the shared Arc (which may have been
+            // recompiled with better type feedback).
+            *cache.borrow_mut() = None;
             None
         } else {
             MAGLEV_DIAG_EXECUTED.with(|c| c.set(c.get() + 1));

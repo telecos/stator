@@ -533,9 +533,10 @@ pub struct BytecodeArray {
     /// and immediately exiting JIT code that contains unsupported opcodes
     /// (e.g. `LdaCurrentContextSlot` in closures).
     jit_baseline_deopted: Rc<Cell<bool>>,
-    /// When `true`, the interpreter skips all Maglev JIT execution attempts
-    /// for this function.
-    jit_maglev_deopted: Cell<bool>,
+    /// Number of times Maglev JIT execution has deopted.  After
+    /// [`MAX_MAGLEV_DEOPT_RETRIES`] deopts the interpreter permanently
+    /// skips Maglev for this function.
+    jit_maglev_deopt_count: Cell<u32>,
     /// Captured closure context set by `CreateClosure`.
     ///
     /// When a function is created as a closure, this holds the enclosing
@@ -728,7 +729,7 @@ impl BytecodeArray {
             has_turbofan_jit_code_flag: Arc::new(AtomicBool::new(false)),
             turbofan_compile_started: Arc::new(AtomicBool::new(false)),
             jit_baseline_deopted: Rc::new(Cell::new(false)),
-            jit_maglev_deopted: Cell::new(false),
+            jit_maglev_deopt_count: Cell::new(0),
             closure_context: None,
             writes_closure_vars: false,
             has_fn_props: Cell::new(false),
@@ -1554,14 +1555,30 @@ impl BytecodeArray {
         self.jit_baseline_deopted.set(true);
     }
 
-    /// Returns `true` if Maglev JIT code has deopted at least once.
+    /// Maximum number of Maglev deopt retries before permanently falling
+    /// back to the interpreter.
+    const MAX_MAGLEV_DEOPT_RETRIES: u32 = 5;
+
+    /// Returns `true` if Maglev JIT code has deopted too many times and
+    /// should no longer be attempted.
     pub fn jit_maglev_has_deopted(&self) -> bool {
-        self.jit_maglev_deopted.get()
+        self.jit_maglev_deopt_count.get() >= Self::MAX_MAGLEV_DEOPT_RETRIES
     }
 
-    /// Mark this function's Maglev JIT code as having deopted.
+    /// Increment the Maglev deopt counter.  After
+    /// [`MAX_MAGLEV_DEOPT_RETRIES`] the interpreter will permanently
+    /// skip Maglev for this function.
     pub fn mark_jit_maglev_deopted(&self) {
-        self.jit_maglev_deopted.set(true);
+        let count = self.jit_maglev_deopt_count.get();
+        self.jit_maglev_deopt_count.set(count.saturating_add(1));
+    }
+
+    /// Reset the Maglev deopt counter, allowing re-optimization.
+    ///
+    /// Called when the Maglev executable cache is re-initialised (e.g.,
+    /// after recompilation with better type feedback).
+    pub fn reset_maglev_deopt_count(&self) {
+        self.jit_maglev_deopt_count.set(0);
     }
 
     /// Returns a clone of the cached Maglev-JIT machine code and
