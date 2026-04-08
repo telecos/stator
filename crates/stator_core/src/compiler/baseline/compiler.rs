@@ -5292,6 +5292,15 @@ pub(crate) mod jit_runtime {
     }
 
     /// Inner implementation for [`jit_runtime_create_object_with_props`].
+    ///
+    /// The hot path (template cache hit) converts the register-encoded
+    /// values to a `Vec<JsValue>` and hands them to
+    /// [`clone_object_literal_template_with_values`] which constructs
+    /// the [`PropertyMap`] with values pre-filled — avoiding the
+    /// values-vec pool probe, the `Undefined` initialisation, the
+    /// per-property name lookups (`get_rt_string_constant_ref`), and
+    /// the `try_template_fill` key comparisons that the old path paid
+    /// on every iteration.
     fn create_object_with_props_inner(
         feedback_slot: i64,
         names_packed: i64,
@@ -5299,20 +5308,13 @@ pub(crate) mod jit_runtime {
         val1: i64,
         val2: i64,
     ) -> Option<i64> {
-        let names_packed = names_packed as u64;
-        let count = ((names_packed >> 48) & 0xF) as usize;
-        let names = [
-            (names_packed & 0xFFFF) as u32,
-            ((names_packed >> 16) & 0xFFFF) as u32,
-            ((names_packed >> 32) & 0xFFFF) as u32,
-        ];
+        let names_packed_u64 = names_packed as u64;
+        let count = ((names_packed_u64 >> 48) & 0xF) as usize;
         let vals = [val0, val1, val2];
 
-        // ── Step 1: Create the object (same logic as fast_create_object_literal_inner) ──
         let ptrs = RT_PTRS.with(|p| p.get());
-        let capacity = 4i64.max(count as i64) as usize;
 
-        let map_rc = if feedback_slot >= 0 {
+        if feedback_slot >= 0 {
             let slot = feedback_slot as u32;
             let ba = if ptrs.is_cached() {
                 // SAFETY: cached pointer valid for thread lifetime; alignment
@@ -5325,34 +5327,61 @@ pub(crate) mod jit_runtime {
                 // SAFETY: pointer is valid and points to a live BytecodeArray.
                 let ba_ref = unsafe { &*ba };
 
-                if let Some(map) = ba_ref.clone_object_literal_template(slot) {
-                    Rc::new(RefCell::new(map))
-                } else if let Some(map) = ba_ref.promote_object_literal_template(slot) {
-                    Rc::new(RefCell::new(map))
-                } else {
-                    let map = PropertyMap::with_capacity(capacity);
-                    let rc = Rc::new(RefCell::new(map));
-                    ba_ref.set_object_literal_pending(slot, Rc::clone(&rc));
-                    rc
+                // ── Hot path: template cached ──
+                // Convert register values to JsValue, then instantiate
+                // the template directly with values — no name lookups,
+                // no try_template_fill, no values-vec pool probe.
+                let js_values = decode_jit_values(count, &vals);
+                if let Some(map) = ba_ref.clone_object_literal_template_with_values(slot, js_values)
+                {
+                    let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                    return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
                 }
-            } else {
-                Rc::new(RefCell::new(PropertyMap::with_capacity(capacity)))
-            }
-        } else {
-            Rc::new(RefCell::new(PropertyMap::with_capacity(capacity)))
-        };
 
-        // ── Step 2: Fill properties inline ──
+                // ── Promote path (second execution) ──
+                let js_values = decode_jit_values(count, &vals);
+                if let Some(map) =
+                    ba_ref.promote_object_literal_template_with_values(slot, js_values)
+                {
+                    let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                    return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
+                }
+
+                // ── First execution: create fresh and fill via property stores ──
+                let names = unpack_names(names_packed_u64);
+                let capacity = 4i64.max(count as i64) as usize;
+                let map = PropertyMap::with_capacity(capacity);
+                let rc = Rc::new(RefCell::new(map));
+                ba_ref.set_object_literal_pending(slot, Rc::clone(&rc));
+                {
+                    // SAFETY: single-threaded JIT; no concurrent borrows.
+                    let map = unsafe { &mut *rc.as_ptr() };
+                    for i in 0..count {
+                        let prop_name = get_rt_string_constant_ref(names[i])?;
+                        let value = decode_one_jit_value(vals[i]);
+                        match map.try_template_fill(prop_name, value) {
+                            Ok(_) => {}
+                            Err(value) => {
+                                map.insert(prop_name.to_string(), value);
+                            }
+                        }
+                    }
+                }
+                let obj = JsValue::PlainObject(rc);
+                return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
+            }
+        }
+
+        // Fallback: no feedback slot or no BA pointer.
+        let names = unpack_names(names_packed_u64);
+        let capacity = 4i64.max(count as i64) as usize;
+        let map_rc = Rc::new(RefCell::new(PropertyMap::with_capacity(capacity)));
         {
             // SAFETY: single-threaded JIT; no concurrent borrows.
             let map = unsafe { &mut *map_rc.as_ptr() };
             for i in 0..count {
                 let prop_name = get_rt_string_constant_ref(names[i])?;
-                let value = if vals[i] >= i32::MIN as i64 && vals[i] <= i32::MAX as i64 {
-                    JsValue::Smi(vals[i] as i32)
-                } else {
-                    jit_i64_to_jsvalue(vals[i])
-                };
+                let value = decode_one_jit_value(vals[i]);
                 match map.try_template_fill(prop_name, value) {
                     Ok(_) => {}
                     Err(value) => {
@@ -5361,10 +5390,38 @@ pub(crate) mod jit_runtime {
                 }
             }
         }
-
-        // ── Step 3: Allocate heap handle ──
         let obj = JsValue::PlainObject(map_rc);
         Some(alloc_heap_handle_with_ptrs(obj, &ptrs))
+    }
+
+    /// Decode a single JIT `i64` register value into a [`JsValue`].
+    #[inline]
+    fn decode_one_jit_value(v: i64) -> JsValue {
+        if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
+            JsValue::Smi(v as i32)
+        } else {
+            jit_i64_to_jsvalue(v)
+        }
+    }
+
+    /// Decode up to 3 JIT `i64` register values into a pre-sized `Vec`.
+    #[inline]
+    fn decode_jit_values(count: usize, vals: &[i64; 3]) -> Vec<JsValue> {
+        let mut out = Vec::with_capacity(count);
+        for &v in &vals[..count] {
+            out.push(decode_one_jit_value(v));
+        }
+        out
+    }
+
+    /// Unpack up to 3 constant-pool name indices from the packed `u64`.
+    #[inline]
+    fn unpack_names(packed: u64) -> [u32; 3] {
+        [
+            (packed & 0xFFFF) as u32,
+            ((packed >> 16) & 0xFFFF) as u32,
+            ((packed >> 32) & 0xFFFF) as u32,
+        ]
     }
 
     // ── Fast StaNamedOwnProperty stub ───────────────────────────────────

@@ -1070,6 +1070,31 @@ impl MacroAssembler {
         self.emit_modrm_base_disp32(src, base, disp);
     }
 
+    /// `MOV DWORD PTR [base + disp32], src` — store low 32 bits of a
+    /// register to memory (no REX.W → 32-bit operand size).
+    ///
+    /// Encoding: `[REX] 89 /r` with ModRM mod=10, operand-size 32-bit.
+    pub fn mov_store_dword_base_disp32(&mut self, base: Reg64, disp: i32, src: Reg64) {
+        self.emit_rex_rb_if_needed(src, base);
+        self.buf.push(0x89);
+        self.emit_modrm_base_disp32(src, base, disp);
+    }
+
+    /// `MOV BYTE PTR [base + disp32], imm8` — store an immediate byte
+    /// to memory.
+    ///
+    /// Encoding: `[REX] C6 /0` with ModRM mod=10, reg=0, then imm8.
+    pub fn mov_store_byte_imm_base_disp32(&mut self, base: Reg64, disp: i32, imm: u8) {
+        // REX prefix only needed when base is R8–R15.
+        if base.needs_rex() {
+            self.buf.push(0x41); // REX.B
+        }
+        self.buf.push(0xC6); // MOV r/m8, imm8
+        // ModRM: mod=10, reg=0 (opcode extension), r/m=base.enc()
+        self.emit_modrm_base_disp32(Reg64::Rax, base, disp); // Rax.enc()=0 for /0
+        self.buf.push(imm);
+    }
+
     // ── Conditional instructions ─────────────────────────────────────────────
 
     /// `SETCC AL` — set `AL` to `1` if the condition is satisfied, `0`
