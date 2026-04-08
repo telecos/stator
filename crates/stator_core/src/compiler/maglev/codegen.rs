@@ -2344,22 +2344,12 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_inline_generic_mul(id, *left, *right);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
-            ValueNode::GenericDivide { left, right, .. } => {
-                self.emit_stub_call_2node(
-                    id,
-                    *left,
-                    *right,
-                    jit_runtime::jit_runtime_generic_div as *const () as usize,
-                );
+            ValueNode::GenericModulus { left, right, .. } => {
+                self.emit_inline_generic_mod(id, *left, *right);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
-            ValueNode::GenericModulus { left, right, .. } => {
-                self.emit_stub_call_2node(
-                    id,
-                    *left,
-                    *right,
-                    jit_runtime::jit_runtime_generic_mod as *const () as usize,
-                );
+            ValueNode::GenericDivide { left, right, .. } => {
+                self.emit_inline_generic_div(id, *left, *right);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::GenericBitwiseAnd { left, right, .. } => {
@@ -3629,6 +3619,181 @@ impl<'a> MaglevCodegen<'a> {
         let saved = self.emit_save_live_regs(id);
         self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
         let addr = jit_runtime::jit_runtime_generic_mul as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+
+        self.masm.bind_label(&mut done_label);
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Inline Smi fast path for `GenericModulus`.
+    ///
+    /// Uses `CDQ` + `IDIV` for 32-bit signed remainder.  Deopts on
+    /// divisor == 0 (division by zero) and falls back to the stub for
+    /// non-Smi operands.
+    ///
+    /// ```text
+    ///   mov  eax, <left>     ; dividend (32-bit)
+    ///   mov  r10d, <right>   ; divisor (32-bit)
+    ///   test r10d, r10d
+    ///   jz   slow            ; divisor == 0 → stub
+    ///   cdq                  ; sign-extend EAX → EDX:EAX
+    ///   idiv r10d            ; EAX = quotient, EDX = remainder
+    ///   movsxd rax, edx      ; result = remainder (sign-extended)
+    /// ```
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_inline_generic_mod(&mut self, id: NodeId, left: NodeId, right: NodeId) {
+        // When both inputs are smi_guarded, skip Smi checks but guard
+        // against division by zero.
+        if self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right) {
+            self.emit_load(left, Reg64::Rax);
+            self.emit_load(right, Reg64::R10);
+
+            let mut slow_label = Label::new();
+            let mut done_label = Label::new();
+
+            // Divisor == 0 → fall back to stub (returns NaN/Infinity).
+            self.masm.test_rr(Reg64::R10, Reg64::R10);
+            self.masm.jcc(CondCode::Equal, &mut slow_label);
+
+            // CDQ sign-extends EAX → EDX:EAX, then IDIV r10d.
+            self.masm.cdq();
+            self.masm.idiv32_r(Reg64::R10);
+            // Remainder is in EDX; move to RAX.
+            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rdx);
+            self.masm.jmp(&mut done_label);
+
+            self.masm.bind_label(&mut slow_label);
+            let saved = self.emit_save_live_regs(id);
+            self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
+            self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+            let addr = jit_runtime::jit_runtime_generic_mod as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, addr as i64);
+            self.masm.call_reg(Reg64::R11);
+            self.emit_restore_live_regs(saved);
+            self.emit_deopt_check_rax();
+
+            self.masm.bind_label(&mut done_label);
+            self.emit_store(id, Reg64::Rax);
+            return;
+        }
+
+        // General path: Smi-check both operands, then inline IDIV.
+        self.emit_load(left, Reg64::Rdi);
+        self.emit_load(right, Reg64::R10);
+
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+
+        // Left Smi check.
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
+
+        // Right Smi check.
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::R10);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::R10);
+        self.masm.jne(&mut slow_label);
+
+        // Divisor == 0 → slow path.
+        self.masm.test_rr(Reg64::R10, Reg64::R10);
+        self.masm.jcc(CondCode::Equal, &mut slow_label);
+
+        // CDQ + IDIV: EAX = dividend (from left), IDIV by R10d.
+        self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cdq();
+        self.masm.idiv32_r(Reg64::R10);
+        self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rdx);
+        self.masm.jmp(&mut done_label);
+
+        self.masm.bind_label(&mut slow_label);
+        let saved = self.emit_save_live_regs(id);
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+        let addr = jit_runtime::jit_runtime_generic_mod as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+
+        self.masm.bind_label(&mut done_label);
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Inline Smi fast path for `GenericDivide`.
+    ///
+    /// Same structure as [`emit_inline_generic_mod`] but returns the
+    /// quotient (EAX) instead of the remainder (EDX).  Falls back to
+    /// the stub for non-integer results (when remainder != 0, JS `/`
+    /// must return a float).
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_inline_generic_div(&mut self, id: NodeId, left: NodeId, right: NodeId) {
+        if self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right) {
+            self.emit_load(left, Reg64::Rax);
+            self.emit_load(right, Reg64::R10);
+
+            let mut slow_label = Label::new();
+            let mut done_label = Label::new();
+
+            // Divisor == 0 → stub (Infinity/-Infinity).
+            self.masm.test_rr(Reg64::R10, Reg64::R10);
+            self.masm.jcc(CondCode::Equal, &mut slow_label);
+
+            self.masm.cdq();
+            self.masm.idiv32_r(Reg64::R10);
+            // If remainder (EDX) != 0, result is a float → fall back.
+            self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
+            self.masm.jcc(CondCode::NotEqual, &mut slow_label);
+            // Quotient in EAX → sign-extend to i64.
+            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+            self.masm.jmp(&mut done_label);
+
+            self.masm.bind_label(&mut slow_label);
+            let saved = self.emit_save_live_regs(id);
+            self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
+            self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+            let addr = jit_runtime::jit_runtime_generic_div as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, addr as i64);
+            self.masm.call_reg(Reg64::R11);
+            self.emit_restore_live_regs(saved);
+            self.emit_deopt_check_rax();
+
+            self.masm.bind_label(&mut done_label);
+            self.emit_store(id, Reg64::Rax);
+            return;
+        }
+
+        // General path with Smi checks.
+        self.emit_load(left, Reg64::Rdi);
+        self.emit_load(right, Reg64::R10);
+
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.jne(&mut slow_label);
+
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::R10);
+        self.masm.cmp_rr(Reg64::Rax, Reg64::R10);
+        self.masm.jne(&mut slow_label);
+
+        self.masm.test_rr(Reg64::R10, Reg64::R10);
+        self.masm.jcc(CondCode::Equal, &mut slow_label);
+
+        self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.cdq();
+        self.masm.idiv32_r(Reg64::R10);
+        self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
+        self.masm.jcc(CondCode::NotEqual, &mut slow_label);
+        self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+        self.masm.jmp(&mut done_label);
+
+        self.masm.bind_label(&mut slow_label);
+        let saved = self.emit_save_live_regs(id);
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+        let addr = jit_runtime::jit_runtime_generic_div as *const () as usize;
         self.masm.mov_ri(Reg64::R11, addr as i64);
         self.masm.call_reg(Reg64::R11);
         self.emit_restore_live_regs(saved);

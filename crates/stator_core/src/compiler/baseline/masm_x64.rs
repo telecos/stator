@@ -1015,6 +1015,25 @@ impl MacroAssembler {
         self.emit_modrm_digit(3, dst);
     }
 
+    /// `CDQ` — sign-extend EAX into EDX:EAX (32-bit).
+    ///
+    /// Used before `IDIV r32` to prepare the dividend.
+    /// Encoding: `99`.
+    pub fn cdq(&mut self) {
+        self.buf.push(0x99);
+    }
+
+    /// `IDIV r32` — signed 32-bit divide EDX:EAX by `src`.
+    ///
+    /// After execution: EAX = quotient, EDX = remainder.
+    /// Faults on division by zero or overflow (INT_MIN / -1).
+    /// Encoding: `[REX] F7 /7`.
+    pub fn idiv32_r(&mut self, src: Reg64) {
+        self.emit_rex_rb_if_needed(Reg64::Rax, src);
+        self.buf.push(0xF7);
+        self.emit_modrm_digit(7, src);
+    }
+
     /// `TEST lhs, rhs` — set CPU flags for `lhs & rhs` without storing the
     /// result.
     ///
