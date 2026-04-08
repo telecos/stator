@@ -5137,6 +5137,66 @@ pub(crate) mod jit_runtime {
         }
     }
 
+    // ── JsContext layout probing for inline context-slot access ────────
+
+    /// Compile-time-discovered byte layout of `RefCell<JsContext>` used
+    /// by Maglev codegen to emit inline x86 loads/stores of closure
+    /// context slots without calling into Rust.
+    #[derive(Debug, Clone, Copy)]
+    pub struct JsContextLayout {
+        /// Byte offset from a `*const RefCell<JsContext>` to the
+        /// `Vec<JsValue>` data-pointer field inside `JsContext::slots`.
+        pub slots_data_ptr_offset: usize,
+        /// Byte offset to the `Vec<JsValue>` len field.
+        pub slots_len_offset: usize,
+    }
+
+    /// Probe the in-memory byte layout of `RefCell<JsContext>` to find
+    /// the offsets of the slots `Vec` fields (data pointer and length).
+    pub fn probe_jscontext_layout() -> JsContextLayout {
+        use std::cell::RefCell;
+
+        // Create a JsContext with 3 slots so the Vec has a non-null data ptr.
+        let ctx = JsContext {
+            slots: vec![JsValue::Smi(0); 3],
+            parent: None,
+        };
+        let data_ptr = ctx.slots.as_ptr() as usize;
+        let data_len = ctx.slots.len();
+
+        let rc = RefCell::new(ctx);
+        let rc_ptr = &rc as *const RefCell<JsContext> as *const u8;
+        let rc_size = std::mem::size_of::<RefCell<JsContext>>();
+
+        // Scan for the data pointer (as a usize / 8-byte value).
+        let ptr_bytes = data_ptr.to_ne_bytes();
+        let mut slots_data_ptr_offset = None;
+        for i in 0..=(rc_size.saturating_sub(8)) {
+            // SAFETY: we only read bytes of the RefCell on the stack.
+            let found = (0..8).all(|j| unsafe { *rc_ptr.add(i + j) } == ptr_bytes[j]);
+            if found {
+                slots_data_ptr_offset = Some(i);
+                break;
+            }
+        }
+        let slots_data_ptr_offset = slots_data_ptr_offset
+            .expect("JsContext: cannot find Vec data pointer in RefCell layout");
+
+        // The Vec len field is at the next usize slot after data pointer.
+        let len_offset = slots_data_ptr_offset + std::mem::size_of::<usize>();
+        // SAFETY: read the len field and verify it matches.
+        let probed_len = unsafe { *(rc_ptr.add(len_offset) as *const usize) };
+        assert_eq!(
+            probed_len, data_len,
+            "JsContext: Vec len field not at expected offset"
+        );
+
+        JsContextLayout {
+            slots_data_ptr_offset,
+            slots_len_offset: len_offset,
+        }
+    }
+
     // ── Array inline-cache fill + load ──────────────────────────────────
 
     /// Result returned by [`jit_runtime_fill_array_ic_r15`].

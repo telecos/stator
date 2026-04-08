@@ -143,6 +143,15 @@ fn cached_jsvalue_layout() -> &'static jit_runtime::JsValueLayout {
     LAYOUT.get_or_init(jit_runtime::probe_jsvalue_layout)
 }
 
+/// Cache the `RefCell<JsContext>` byte layout for inline context-slot
+/// access in the Maglev codegen.
+#[cfg(all(target_arch = "x86_64", unix))]
+fn cached_jscontext_layout() -> &'static jit_runtime::JsContextLayout {
+    use std::sync::OnceLock;
+    static LAYOUT: OnceLock<jit_runtime::JsContextLayout> = OnceLock::new();
+    LAYOUT.get_or_init(jit_runtime::probe_jscontext_layout)
+}
+
 /// A stub call argument that is either a Maglev IR node or an immediate i64.
 #[cfg(all(target_arch = "x86_64", unix))]
 enum NodeOrImm {
@@ -1942,39 +1951,124 @@ impl<'a> MaglevCodegen<'a> {
                 }
             }
 
-            // ── Context slot access via runtime stubs ─────────────────────────
+            // ── Context slot access — inline x86 with FFI fallback ────────────
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::LoadCurrentContextSlot { slot } => {
-                let saved = self.emit_save_live_regs(id);
                 if let Some(ctx_off) = self.ctx_regfile_offset {
-                    // Fast path: load cached context pointer from register file,
-                    // call the direct stub (no TLS lookup).
-                    // jit_runtime_lda_context_slot_direct(ctx_raw, slot_idx)
+                    let ctx_layout = cached_jscontext_layout();
+                    let jv_layout = cached_jsvalue_layout();
+                    let slot_idx = *slot as usize;
+                    let elem_byte_offset =
+                        (slot_idx * jv_layout.jsvalue_size + jv_layout.smi_payload_offset) as i32;
+                    let disc_byte_offset =
+                        (slot_idx * jv_layout.jsvalue_size + jv_layout.disc_offset) as i32;
+
+                    // Load the cached ctx_raw pointer from register file.
+                    // R11 = ctx_raw (ptr to RefCell<JsContext>).
+                    self.masm
+                        .mov_load_base_disp32(Reg64::R11, Reg64::R14, ctx_off);
+
+                    // Null-check: if ctx_raw == 0, fall through to FFI stub.
+                    let mut slow_label = Label::new();
+                    let mut done_label = Label::new();
+                    self.masm.test_rr(Reg64::R11, Reg64::R11);
+                    self.masm.je(&mut slow_label);
+
+                    // R11 = Vec<JsValue> data pointer.
+                    self.masm.mov_load_base_disp32(
+                        Reg64::R11,
+                        Reg64::R11,
+                        ctx_layout.slots_data_ptr_offset as i32,
+                    );
+
+                    // Check discriminant: is it Smi?
+                    self.masm
+                        .movzx_byte_base_disp32(Reg64::Rax, Reg64::R11, disc_byte_offset);
+                    self.masm.cmp_ri(Reg64::Rax, jv_layout.smi_disc as i32);
+                    self.masm.jne(&mut slow_label);
+
+                    // Load Smi i32 payload, sign-extend to i64.
+                    self.masm
+                        .movsxd_base_disp32(Reg64::Rax, Reg64::R11, elem_byte_offset);
+                    self.masm.jmp(&mut done_label);
+
+                    // Slow path: FFI call for non-Smi or null context.
+                    self.masm.bind_label(&mut slow_label);
+                    let saved = self.emit_save_live_regs(id);
                     self.masm
                         .mov_load_base_disp32(Reg64::Rdi, Reg64::R14, ctx_off);
                     self.masm.mov_ri(Reg64::Rsi, i64::from(*slot));
                     let addr = jit_runtime::jit_runtime_lda_context_slot_direct as *const ()
                         as usize as i64;
                     self.masm.mov_ri(Reg64::R11, addr);
+                    self.masm.call_reg(Reg64::R11);
+                    self.emit_restore_live_regs(saved);
+                    self.emit_deopt_check_rax();
+
+                    self.masm.bind_label(&mut done_label);
+                    self.masm.mov_rr(Reg64::R11, Reg64::Rax);
+                    self.emit_store(id, Reg64::R11);
                 } else {
-                    // Fallback: TLS-based stub.
+                    // No cached context pointer: use TLS-based stub.
+                    let saved = self.emit_save_live_regs(id);
                     self.masm.mov_ri(Reg64::Rdi, i64::from(*slot));
                     let addr =
                         jit_runtime::jit_runtime_lda_context_slot as *const () as usize as i64;
                     self.masm.mov_ri(Reg64::R11, addr);
+                    self.masm.call_reg(Reg64::R11);
+                    self.emit_restore_live_regs(saved);
+                    self.emit_deopt_check_rax();
+                    self.masm.mov_rr(Reg64::R11, Reg64::Rax);
+                    self.emit_store(id, Reg64::R11);
                 }
-                self.masm.call_reg(Reg64::R11);
-                self.emit_restore_live_regs(saved);
-                self.emit_deopt_check_rax();
-                self.masm.mov_rr(Reg64::R11, Reg64::Rax);
-                self.emit_store(id, Reg64::R11);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::StoreCurrentContextSlot { slot, value } => {
-                let saved = self.emit_save_live_regs(id);
                 if let Some(ctx_off) = self.ctx_regfile_offset {
-                    // Fast path: direct stub with cached context pointer.
-                    // jit_runtime_sta_context_slot_direct(ctx_raw, slot_idx, value)
+                    let ctx_layout = cached_jscontext_layout();
+                    let jv_layout = cached_jsvalue_layout();
+                    let slot_idx = *slot as usize;
+                    let elem_byte_offset =
+                        (slot_idx * jv_layout.jsvalue_size + jv_layout.smi_payload_offset) as i32;
+                    let disc_byte_offset =
+                        (slot_idx * jv_layout.jsvalue_size + jv_layout.disc_offset) as i32;
+
+                    // Load value into RAX.
+                    self.emit_load(*value, Reg64::Rax);
+
+                    // Check if the value is a Smi (fits in i32).
+                    let mut slow_label = Label::new();
+                    let mut done_label = Label::new();
+                    self.masm.movsxd_sign_extend(Reg64::R11, Reg64::Rax);
+                    self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+                    self.masm.jne(&mut slow_label);
+
+                    // Load ctx_raw from register file.
+                    self.masm
+                        .mov_load_base_disp32(Reg64::R11, Reg64::R14, ctx_off);
+                    self.masm.test_rr(Reg64::R11, Reg64::R11);
+                    self.masm.je(&mut slow_label);
+
+                    // R11 = Vec<JsValue> data pointer.
+                    self.masm.mov_load_base_disp32(
+                        Reg64::R11,
+                        Reg64::R11,
+                        ctx_layout.slots_data_ptr_offset as i32,
+                    );
+
+                    // Write Smi discriminant + i32 payload.
+                    self.masm.mov_store_byte_imm_base_disp32(
+                        Reg64::R11,
+                        disc_byte_offset,
+                        jv_layout.smi_disc,
+                    );
+                    self.masm
+                        .mov_store_dword_base_disp32(Reg64::R11, elem_byte_offset, Reg64::Rax);
+                    self.masm.jmp(&mut done_label);
+
+                    // Slow path: FFI call for non-Smi value or null ctx.
+                    self.masm.bind_label(&mut slow_label);
+                    let saved = self.emit_save_live_regs(id);
                     self.masm
                         .mov_load_base_disp32(Reg64::Rdi, Reg64::R14, ctx_off);
                     self.masm.mov_ri(Reg64::Rsi, i64::from(*slot));
@@ -1982,19 +2076,27 @@ impl<'a> MaglevCodegen<'a> {
                     let addr = jit_runtime::jit_runtime_sta_context_slot_direct as *const ()
                         as usize as i64;
                     self.masm.mov_ri(Reg64::R11, addr);
+                    self.masm.call_reg(Reg64::R11);
+                    self.emit_restore_live_regs(saved);
+                    self.emit_deopt_check_rax();
+
+                    self.masm.bind_label(&mut done_label);
+                    self.masm.mov_rr(Reg64::R11, Reg64::Rax);
+                    self.emit_store(id, Reg64::R11);
                 } else {
-                    // Fallback: TLS-based stub.
+                    // No cached context pointer: use TLS-based stub.
+                    let saved = self.emit_save_live_regs(id);
                     self.masm.mov_ri(Reg64::Rdi, i64::from(*slot));
                     self.emit_load(*value, Reg64::Rsi);
                     let addr =
                         jit_runtime::jit_runtime_sta_context_slot as *const () as usize as i64;
                     self.masm.mov_ri(Reg64::R11, addr);
+                    self.masm.call_reg(Reg64::R11);
+                    self.emit_restore_live_regs(saved);
+                    self.emit_deopt_check_rax();
+                    self.masm.mov_rr(Reg64::R11, Reg64::Rax);
+                    self.emit_store(id, Reg64::R11);
                 }
-                self.masm.call_reg(Reg64::R11);
-                self.emit_restore_live_regs(saved);
-                self.emit_deopt_check_rax();
-                self.masm.mov_rr(Reg64::R11, Reg64::Rax);
-                self.emit_store(id, Reg64::R11);
             }
 
             // ── Function calls — direct JIT-to-JIT with stub fallback ──────
