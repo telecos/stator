@@ -4502,14 +4502,22 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.cmp_rm(Reg64::R10, Reg64::Rbp, ic_off_len);
         self.masm.jcc(CondCode::AboveEq, &mut slow_label);
 
+        // Hoist element address computation: R10 = data_ptr + key * 24.
+        // After this, R10 holds the element address (raw key is no
+        // longer needed — bounds check already passed).
+        self.masm
+            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_data);
+        self.masm
+            .imul_rri(Reg64::R10, Reg64::R10, layout.jsvalue_size as i32);
+        self.masm.add_rr(Reg64::R10, Reg64::R11);
+
         // Decode the JIT value encoding → determine what to store.
         // Smi range: i32::MIN..=i32::MAX (sign-extended to i64).
-        // Check if value is Smi by sign-extending its 32-bit form.
         self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
         self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
         self.masm.je(&mut store_smi);
 
-        // Check for JIT_TRUE / JIT_FALSE (33-bit values, can't use cmp_ri).
+        // Check for JIT_TRUE / JIT_FALSE (33-bit values).
         self.masm.mov_ri(Reg64::R11, JIT_TRUE);
         self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
         self.masm.je(&mut store_bool);
@@ -4521,59 +4529,38 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.jmp(&mut slow_label);
 
         // ── store_smi: write JsValue::Smi(v) directly ───────────────
+        // R10 = element addr, RAX = Smi value.
         self.masm.bind_label(&mut store_smi);
-        // Reload data ptr and compute element address.
-        self.emit_load(key, Reg64::R10);
-        self.masm
-            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_data);
-        self.masm
-            .imul_rri(Reg64::R10, Reg64::R10, layout.jsvalue_size as i32);
-        self.masm.add_rr(Reg64::R11, Reg64::R10);
-        // Write discriminant byte.
         self.masm.mov_store_byte_imm_base_disp32(
-            Reg64::R11,
+            Reg64::R10,
             layout.disc_offset as i32,
             layout.smi_disc,
         );
-        // Write Smi payload (32-bit).
         self.masm.mov_store_dword_base_disp32(
-            Reg64::R11,
+            Reg64::R10,
             layout.smi_payload_offset as i32,
             Reg64::Rax,
         );
-        // Result: store the original JIT Smi encoding.
-        self.emit_load(value, Reg64::Rax);
         self.masm.jmp(&mut done_label);
 
         // ── store_bool: write JsValue::Boolean(v) directly ──────────
+        // R10 = element addr, RAX = JIT_TRUE or JIT_FALSE.
         self.masm.bind_label(&mut store_bool);
-        // RAX = JIT_TRUE or JIT_FALSE.  Compute bool payload: 1 or 0.
-        self.emit_load(key, Reg64::R10);
-        self.masm
-            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_data);
-        self.masm
-            .imul_rri(Reg64::R10, Reg64::R10, layout.jsvalue_size as i32);
-        self.masm.add_rr(Reg64::R11, Reg64::R10);
-        // Write discriminant byte.
         self.masm.mov_store_byte_imm_base_disp32(
-            Reg64::R11,
+            Reg64::R10,
             layout.disc_offset as i32,
             layout.bool_disc,
         );
-        // Write bool payload: JIT_TRUE → 1, JIT_FALSE → 0.
-        // payload = value - JIT_FALSE (where JIT_FALSE < JIT_TRUE and differ by 1).
-        // JIT_FALSE is 33-bit (0x1_0000_0000); can't use sub_ri.
-        self.emit_load(value, Reg64::Rax);
+        // Compute bool payload: value - JIT_FALSE (0 or 1).
+        // Use R11 for JIT_FALSE so R10 (element addr) is preserved.
         self.masm.mov_ri(Reg64::R11, JIT_FALSE);
         self.masm.sub_rr(Reg64::Rax, Reg64::R11);
-        // Store bool payload (0 or 1) as a dword — the upper bytes are
-        // irrelevant padding in the Boolean variant, so overwriting is safe.
         self.masm.mov_store_dword_base_disp32(
-            Reg64::R11,
+            Reg64::R10,
             layout.bool_payload_offset as i32,
             Reg64::Rax,
         );
-        // Result: restore the original JIT encoding.
+        // Restore the original JIT encoding in RAX for emit_store.
         self.emit_load(value, Reg64::Rax);
         self.masm.jmp(&mut done_label);
 
