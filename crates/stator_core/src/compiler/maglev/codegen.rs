@@ -629,6 +629,14 @@ struct MaglevCodegen<'a> {
     /// parameter) at `[RDI + offset]` before any calls that might clobber it.
     #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
     ctx_regfile_offset: Option<i32>,
+    /// RAX register forwarding: when the last emitted smi_guarded arithmetic
+    /// instruction stored its result to RAX, we track the node ID here.  If
+    /// the *next* instruction loads the same node into RAX, the load is
+    /// elided because RAX already holds the value.  This eliminates one
+    /// `MOV` per chained add in patterns like `sum + a + b + c + d + e`.
+    /// Cleared at block boundaries, stub calls, and any RAX-clobbering op.
+    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
+    rax_holds: Option<NodeId>,
 }
 
 /// A deferred cold-path branch emitted out-of-line after all blocks.
@@ -750,6 +758,7 @@ impl<'a> MaglevCodegen<'a> {
             array_ic_base,
             total_cache_bytes,
             ctx_regfile_offset: None,
+            rax_holds: None,
         }
     }
 
@@ -1031,6 +1040,10 @@ impl<'a> MaglevCodegen<'a> {
         // Bind this block's label to the current code position.
         self.masm
             .bind_label(&mut self.block_labels[block_idx as usize]);
+
+        // Entering a new block invalidates RAX forwarding — control flow
+        // from multiple predecessors may leave different values in RAX.
+        self.rax_holds = None;
 
         // Record one safepoint per block (conservative GC point).
         self.safepoints.push(SafepointEntry {
@@ -2723,6 +2736,15 @@ impl<'a> MaglevCodegen<'a> {
     /// Load the value produced by node `id` from its allocated location into
     /// `dst`.
     fn emit_load(&mut self, id: NodeId, dst: Reg64) {
+        // RAX forwarding: if RAX already holds `id`'s value (set by a
+        // previous smi_guarded arithmetic store), skip the load entirely.
+        if dst == Reg64::Rax {
+            if self.rax_holds == Some(id) {
+                return;
+            }
+            // Loading a different node into RAX invalidates the cache.
+            self.rax_holds = None;
+        }
         match self.alloc.location(id) {
             Some(Location::Register(n)) => {
                 let src = phys_reg(n);
@@ -3327,6 +3349,8 @@ impl<'a> MaglevCodegen<'a> {
     /// [`emit_restore_live_regs`] can pop exactly the right set.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_save_live_regs(&mut self, at_node: NodeId) -> u8 {
+        // A stub call clobbers RAX (return value), so invalidate forwarding.
+        self.rax_holds = None;
         // Intersect per-call-site liveness with the function-wide mask
         // as a safety belt.
         let mask = self.alloc.live_caller_saved_at(at_node) & self.used_caller_saved;
@@ -3452,6 +3476,7 @@ impl<'a> MaglevCodegen<'a> {
             self.emit_load(right, Reg64::R10);
             self.masm.add_rr(Reg64::Rax, Reg64::R10);
             self.emit_store(id, Reg64::Rax);
+            self.rax_holds = Some(id);
             return;
         }
 
@@ -3468,10 +3493,14 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
             }
             self.emit_store(id, Reg64::Rax);
+            self.rax_holds = Some(id);
             return;
         }
 
         // Load into non-allocated registers — no save needed on fast path.
+        // Generic path clobbers RAX in both fast + slow branches, so
+        // invalidate the forwarding cache.
+        self.rax_holds = None;
         self.emit_load(left, Reg64::Rdi);
         self.emit_load(right, Reg64::R10);
 
@@ -3517,6 +3546,7 @@ impl<'a> MaglevCodegen<'a> {
             self.emit_load(right, Reg64::R10);
             self.masm.sub_rr(Reg64::Rax, Reg64::R10);
             self.emit_store(id, Reg64::Rax);
+            self.rax_holds = Some(id);
             return;
         }
 
@@ -3530,9 +3560,11 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
             }
             self.emit_store(id, Reg64::Rax);
+            self.rax_holds = Some(id);
             return;
         }
 
+        self.rax_holds = None;
         self.emit_load(left, Reg64::Rdi);
         self.emit_load(right, Reg64::R10);
 
@@ -3577,6 +3609,7 @@ impl<'a> MaglevCodegen<'a> {
             self.emit_load(right, Reg64::R10);
             self.masm.imul_rr(Reg64::Rax, Reg64::R10);
             self.emit_store(id, Reg64::Rax);
+            self.rax_holds = Some(id);
             return;
         }
 
@@ -3590,9 +3623,11 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
             }
             self.emit_store(id, Reg64::Rax);
+            self.rax_holds = Some(id);
             return;
         }
 
+        self.rax_holds = None;
         self.emit_load(left, Reg64::Rdi);
         self.emit_load(right, Reg64::R10);
 
@@ -3817,9 +3852,11 @@ impl<'a> MaglevCodegen<'a> {
             self.emit_load(right, Reg64::R10);
             self.masm.or_rr(Reg64::Rax, Reg64::R10);
             self.emit_store(id, Reg64::Rax);
+            self.rax_holds = Some(id);
             return;
         }
 
+        self.rax_holds = None;
         self.emit_load(left, Reg64::Rdi);
         self.emit_load(right, Reg64::R10);
 
@@ -3861,9 +3898,11 @@ impl<'a> MaglevCodegen<'a> {
             self.emit_load(right, Reg64::R10);
             self.masm.and_rr(Reg64::Rax, Reg64::R10);
             self.emit_store(id, Reg64::Rax);
+            self.rax_holds = Some(id);
             return;
         }
 
+        self.rax_holds = None;
         self.emit_load(left, Reg64::Rdi);
         self.emit_load(right, Reg64::R10);
 
@@ -3905,9 +3944,11 @@ impl<'a> MaglevCodegen<'a> {
             self.emit_load(right, Reg64::R10);
             self.masm.xor_rr(Reg64::Rax, Reg64::R10);
             self.emit_store(id, Reg64::Rax);
+            self.rax_holds = Some(id);
             return;
         }
 
+        self.rax_holds = None;
         self.emit_load(left, Reg64::Rdi);
         self.emit_load(right, Reg64::R10);
 
@@ -3946,6 +3987,7 @@ impl<'a> MaglevCodegen<'a> {
             self.emit_load(value, Reg64::Rax);
             self.masm.add_ri(Reg64::Rax, 1);
             self.emit_store(id, Reg64::Rax);
+            self.rax_holds = Some(id);
             return;
         }
 
@@ -3958,9 +4000,11 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
             }
             self.emit_store(id, Reg64::Rax);
+            self.rax_holds = Some(id);
             return;
         }
 
+        self.rax_holds = None;
         self.emit_load(value, Reg64::Rdi);
 
         let mut slow_label = Label::new();
@@ -3996,6 +4040,7 @@ impl<'a> MaglevCodegen<'a> {
             self.emit_load(value, Reg64::Rax);
             self.masm.sub_ri(Reg64::Rax, 1);
             self.emit_store(id, Reg64::Rax);
+            self.rax_holds = Some(id);
             return;
         }
 
@@ -4008,9 +4053,11 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
             }
             self.emit_store(id, Reg64::Rax);
+            self.rax_holds = Some(id);
             return;
         }
 
+        self.rax_holds = None;
         self.emit_load(value, Reg64::Rdi);
 
         let mut slow_label = Label::new();
