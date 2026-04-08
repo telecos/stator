@@ -4467,6 +4467,177 @@ pub(crate) mod jit_runtime {
         }
     }
 
+    // ── Inline named-property IC helpers ────────────────────────────────────
+
+    /// Result from inline named-property helpers.
+    ///
+    /// On the SysV AMD64 ABI this 16-byte `#[repr(C)]` struct is
+    /// returned in `RAX` (`value`) and `RDX` (`hit`) — no memory
+    /// indirection needed.
+    #[repr(C)]
+    pub struct InlineNamedResult {
+        /// JIT `i64` property value (meaningful only when `hit != 0`).
+        pub value: i64,
+        /// Non-zero when the inline path succeeded; zero when the
+        /// caller must fall back to the full generic stub.
+        pub hit: i64,
+    }
+
+    impl InlineNamedResult {
+        const MISS: Self = Self { value: 0, hit: 0 };
+    }
+
+    /// Inline-friendly **named property load** using the IC fast path.
+    ///
+    /// Probes both the own-property and prototype inline caches
+    /// without allocating or cloning.  Returns `hit=0` when the caller
+    /// must fall back to the full [`jit_runtime_lda_named_property`]
+    /// stub (IC miss, non-PlainObject receiver, heap-object result
+    /// that needs a new handle, etc.).
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_i64`) – JIT i64 encoding of the receiver.
+    /// * `RSI` (`name_idx`) – constant-pool index of the property name.
+    ///
+    /// Returns [`InlineNamedResult`] in `RAX:RDX`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn jit_runtime_inline_lda_named_property(
+        obj_i64: i64,
+        name_idx: u32,
+    ) -> InlineNamedResult {
+        let ptrs = RT_PTRS.with(|p| p.get());
+        inline_lda_named_with_ptrs(obj_i64, name_idx, ptrs)
+    }
+
+    /// Like [`jit_runtime_inline_lda_named_property`] but accepts a
+    /// pre-cached pointer to the `RT_PTRS` TLS cell in the 3rd argument,
+    /// eliminating one TLS lookup per property load.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_i64`) – JIT i64 encoding of the receiver.
+    /// * `RSI` (`name_idx`) – constant-pool index of the property name.
+    /// * `RDX` (`rt_ptrs_cell`) – pointer to `Cell<RtPtrs>` TLS slot.
+    ///
+    /// Returns [`InlineNamedResult`] in `RAX:RDX`.
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    pub extern "C" fn jit_runtime_inline_lda_named_property_r15(
+        obj_i64: i64,
+        name_idx: u32,
+        rt_ptrs_cell: i64,
+    ) -> InlineNamedResult {
+        // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
+        // TLS slot lives for the thread's entire lifetime.
+        let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
+        inline_lda_named_with_ptrs(obj_i64, name_idx, ptrs)
+    }
+
+    /// Shared implementation for inline named-property load.
+    ///
+    /// Probes the own-property IC and prototype IC.  Returns a hit only
+    /// when the result can be encoded without allocating a new heap
+    /// handle (primitives, or heap objects whose cached handle is still
+    /// valid).
+    fn inline_lda_named_with_ptrs(
+        obj_i64: i64,
+        name_idx: u32,
+        ptrs: RtPtrs,
+    ) -> InlineNamedResult {
+        if !is_heap_handle(obj_i64) || !ptrs.is_cached() {
+            return InlineNamedResult::MISS;
+        }
+        let idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+        let lda_slot = (name_idx & 63) as usize;
+
+        // SAFETY: cached pointers set by cache_rt_ptrs; valid for thread lifetime.
+        let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+        let ic_ref = unsafe { &*ptrs.prop_ic };
+
+        let heap_val = match heap.get(idx) {
+            Some(v) => v,
+            None => return InlineNamedResult::MISS,
+        };
+
+        if let JsValue::PlainObject(map_rc) = heap_val {
+            // SAFETY: PropertyMap lives in Rc, separate from heap Vec.
+            let map = unsafe { &*map_rc.as_ptr() };
+            let shape = map.shape_id();
+
+            let (ic_entry, proto_entry) = {
+                // SAFETY: scoped borrow; dropped before IC mutation.
+                let cache = unsafe { &*ic_ref.as_ptr() };
+                (cache.lda[lda_slot], cache.proto[(name_idx & 31) as usize])
+            };
+
+            // ── Own-property IC hit ────────────────────────────────
+            if ic_entry.name_idx == name_idx
+                && ic_entry.shape == shape
+                && let Some(val) = map.get_by_offset(ic_entry.offset)
+            {
+                // Only return a hit for inline-encodable values
+                // (primitives and heap objects with a valid cached
+                // handle).  Anything else needs the full stub for
+                // heap-handle allocation.
+                if let Some(result) = try_encode_ic_inline(
+                    val,
+                    ic_entry.cached_ptr,
+                    ic_entry.cached_handle,
+                ) {
+                    return InlineNamedResult {
+                        value: result,
+                        hit: 1,
+                    };
+                }
+            }
+
+            // ── Prototype IC hit (pre-encoded i64, zero clone) ─────
+            if proto_entry.0 == name_idx && proto_entry.1 == shape {
+                return InlineNamedResult {
+                    value: proto_entry.2,
+                    hit: 1,
+                };
+            }
+        }
+
+        InlineNamedResult::MISS
+    }
+
+    /// Try to encode a property value as an `i64` without allocating a
+    /// new heap handle.  Returns `None` when the value requires a fresh
+    /// heap-handle allocation (which the full stub handles).
+    #[inline]
+    fn try_encode_ic_inline(
+        val: &JsValue,
+        entry_cached_ptr: usize,
+        entry_cached_handle: i64,
+    ) -> Option<i64> {
+        match val {
+            JsValue::Smi(n) => Some(i64::from(*n)),
+            JsValue::Boolean(true) => Some(JIT_TRUE),
+            JsValue::Boolean(false) => Some(JIT_FALSE),
+            JsValue::Undefined => Some(JIT_UNDEFINED),
+            JsValue::Null => Some(JIT_NULL),
+            JsValue::HeapNumber(f) => {
+                let f = *f;
+                if f.fract() == 0.0 && f >= i32::MIN as f64 && f <= i32::MAX as f64 {
+                    Some(f as i64)
+                } else {
+                    None // needs heap handle
+                }
+            }
+            _ => {
+                // For heap objects, check if the cached handle is still valid.
+                let ptr = jsvalue_rc_ptr(val);
+                if ptr != 0 && ptr == entry_cached_ptr && entry_cached_handle != 0 {
+                    Some(entry_cached_handle)
+                } else {
+                    None // needs fresh heap handle → full stub
+                }
+            }
+        }
+    }
+
     /// Inline-friendly array element **store** for known-integer keys.
     ///
     /// Handles **in-bounds** `Array[non-negative-int] = value` where the

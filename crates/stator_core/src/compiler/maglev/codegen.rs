@@ -1315,26 +1315,73 @@ impl<'a> MaglevCodegen<'a> {
                 // loading the constant into a separate register.
                 if let Some(imm) = self.try_get_i32_constant(*right) {
                     let narrow = self.narrow_int32.contains(&id);
-                    match self.alloc.location(id) {
-                        Some(Location::Register(n)) => {
-                            let dst = phys_reg(n);
-                            self.emit_load(*left, dst);
-                            if narrow {
-                                self.masm.imul32_rri(dst, dst, imm);
-                            } else {
-                                self.masm.imul_rri(dst, dst, imm);
-                            }
-                            self.emit_deopt_on_i64_overflow(0);
+                    // LEA fast path: when the left operand is provably i32 and
+                    // the multiplier is (scale+1) for scale ∈ {2,4,8}, emit
+                    //   LEA dst, [src + src*scale]
+                    // instead of IMUL.  This is 1-cycle vs 3-cycle, and since
+                    // i32 × 9 < i64::MAX the 64-bit LEA cannot overflow.
+                    let lea_scale: Option<u8> = if self.i32_range.contains(left) {
+                        match imm {
+                            3 => Some(2),
+                            5 => Some(4),
+                            9 => Some(8),
+                            _ => None,
                         }
-                        _ => {
-                            self.emit_load(*left, Reg64::R11);
-                            if narrow {
-                                self.masm.imul32_rri(Reg64::R11, Reg64::R11, imm);
-                            } else {
-                                self.masm.imul_rri(Reg64::R11, Reg64::R11, imm);
+                    } else {
+                        None
+                    };
+                    if let Some(scale) = lea_scale {
+                        // Pick a source register for the LEA base+index.
+                        // SIB encoding forbids RSP as index (enc=4) and
+                        // mod=00 + base=RBP/R13 (enc=5) means "no base",
+                        // so load into R10 (enc=2, always safe) unless the
+                        // source is already in a usable register.
+                        let src = match self.alloc.location(*left) {
+                            Some(Location::Register(ln)) => {
+                                let r = phys_reg(ln);
+                                if r.enc() != 4 && r.enc() != 5 {
+                                    r
+                                } else {
+                                    self.emit_load(*left, Reg64::R10);
+                                    Reg64::R10
+                                }
                             }
-                            self.emit_deopt_on_i64_overflow(0);
-                            self.emit_store(id, Reg64::R11);
+                            _ => {
+                                self.emit_load(*left, Reg64::R10);
+                                Reg64::R10
+                            }
+                        };
+                        match self.alloc.location(id) {
+                            Some(Location::Register(n)) => {
+                                self.masm.lea_scaled(phys_reg(n), src, src, scale);
+                            }
+                            _ => {
+                                self.masm.lea_scaled(Reg64::R11, src, src, scale);
+                                self.emit_store(id, Reg64::R11);
+                            }
+                        }
+                    } else {
+                        match self.alloc.location(id) {
+                            Some(Location::Register(n)) => {
+                                let dst = phys_reg(n);
+                                self.emit_load(*left, dst);
+                                if narrow {
+                                    self.masm.imul32_rri(dst, dst, imm);
+                                } else {
+                                    self.masm.imul_rri(dst, dst, imm);
+                                }
+                                self.emit_deopt_on_i64_overflow(0);
+                            }
+                            _ => {
+                                self.emit_load(*left, Reg64::R11);
+                                if narrow {
+                                    self.masm.imul32_rri(Reg64::R11, Reg64::R11, imm);
+                                } else {
+                                    self.masm.imul_rri(Reg64::R11, Reg64::R11, imm);
+                                }
+                                self.emit_deopt_on_i64_overflow(0);
+                                self.emit_store(id, Reg64::R11);
+                            }
                         }
                     }
                 } else if self.narrow_int32.contains(&id) {
