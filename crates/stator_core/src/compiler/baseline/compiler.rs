@@ -6550,6 +6550,16 @@ pub(crate) mod jit_runtime {
                 let ctor_proto = resolve_construct_proto(&JsValue::Function(Rc::clone(ba)), ba);
                 let this_val = make_construct_this(ba, &ctor_proto);
 
+                // Fast path: if the constructor body is trivial (only
+                // LdaUndefined + Return, or CreateMappedArguments +
+                // LdaUndefined + Return), skip interpreter re-entry entirely
+                // and return `this` directly.  Empty constructors like
+                // `function Base() {}` hit this path.
+                if ba.has_trivial_body() {
+                    maybe_cache_construct_boilerplate(ba, &this_val);
+                    return Some(jsvalue_to_jit_i64(this_val));
+                }
+
                 let saved_ba = RT_BYTECODE.with(|b| b.get());
                 let env_opt = RT_GLOBAL.with(|g| g.borrow().env.as_ref().cloned());
                 let env = env_opt?;

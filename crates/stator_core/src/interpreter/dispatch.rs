@@ -3152,29 +3152,37 @@ fn handle_construct(
             // [[Construct]]: create `this` using the boilerplate shape
             // cache when available, then run the constructor body.
             let this_val = make_construct_this(&ba, &ctor_proto);
-            let mut callee_frame =
-                acquire_frame(Rc::clone(&ba), args, Rc::clone(&ctx.frame.global_env));
-            restore_closure_context(&mut callee_frame, &ba);
-            callee_frame.new_target = JsValue::Function(Rc::clone(&ba));
-            callee_frame
-                .global_env
-                .borrow_mut()
-                .set_this(this_val.clone());
-            push_call_frame("<anonymous>")?;
-            let result = run_callee_pooled(callee_frame);
-            pop_call_frame();
-            ctx.frame.global_cache_invalidate();
-            let val = result?;
-            // If the constructor explicitly returns an object,
-            // use it; otherwise return the `this` object and
-            // cache its shape for future constructions.
-            ctx.frame.accumulator = match val {
-                JsValue::PlainObject(_) | JsValue::Object(_) => val,
-                _ => {
-                    maybe_cache_construct_boilerplate(&ba, &this_val);
-                    this_val
-                }
-            };
+
+            // Fast path: empty constructor body — skip interpreter
+            // re-entry entirely and return the freshly allocated `this`.
+            if args.is_empty() && ba.has_trivial_body() {
+                maybe_cache_construct_boilerplate(&ba, &this_val);
+                ctx.frame.accumulator = this_val;
+            } else {
+                let mut callee_frame =
+                    acquire_frame(Rc::clone(&ba), args, Rc::clone(&ctx.frame.global_env));
+                restore_closure_context(&mut callee_frame, &ba);
+                callee_frame.new_target = JsValue::Function(Rc::clone(&ba));
+                callee_frame
+                    .global_env
+                    .borrow_mut()
+                    .set_this(this_val.clone());
+                push_call_frame("<anonymous>")?;
+                let result = run_callee_pooled(callee_frame);
+                pop_call_frame();
+                ctx.frame.global_cache_invalidate();
+                let val = result?;
+                // If the constructor explicitly returns an object,
+                // use it; otherwise return the `this` object and
+                // cache its shape for future constructions.
+                ctx.frame.accumulator = match val {
+                    JsValue::PlainObject(_) | JsValue::Object(_) => val,
+                    _ => {
+                        maybe_cache_construct_boilerplate(&ba, &this_val);
+                        this_val
+                    }
+                };
+            }
         }
         JsValue::NativeFunction(f) => {
             let args = collect_args(ctx.frame, args_start_v, arg_count)?;

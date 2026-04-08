@@ -842,6 +842,36 @@ impl BytecodeArray {
         self.is_arrow
     }
 
+    /// Returns `true` when the function body is trivial — it only sets up
+    /// the `arguments` binding and immediately returns `undefined`.
+    ///
+    /// Empty constructors like `function Base() {}` match this pattern.
+    /// The construct fast-path uses this to skip interpreter re-entry.
+    pub fn has_trivial_body(&self) -> bool {
+        use super::bytecodes::{Opcode, decode};
+        let instrs = match decode(&self.bytecodes) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        for instr in &instrs {
+            match instr.opcode {
+                // These are harmless preamble / epilogue instructions
+                // that an empty constructor emits.
+                Opcode::CreateMappedArguments
+                | Opcode::CreateUnmappedArguments
+                | Opcode::Star
+                | Opcode::Mov
+                | Opcode::LdaUndefined
+                | Opcode::LdaTheHole
+                | Opcode::Return => {}
+                // Anything else means the body has real work.
+                _ => return false,
+            }
+        }
+        // Must end with Return (and have at least one instruction).
+        instrs.last().is_some_and(|i| i.opcode == Opcode::Return)
+    }
+
     /// Mark this bytecode as a top-level script.
     pub fn set_top_level(&mut self, flag: bool) {
         self.is_top_level = flag;
