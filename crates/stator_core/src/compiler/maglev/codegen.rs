@@ -111,7 +111,7 @@ pub const NUM_PHYS_REGS: u32 = 9;
 /// [RBP - base - 24]  cached BA pointer
 /// ```
 #[cfg(all(target_arch = "x86_64", unix))]
-const MONO_CACHE_SLOT_BYTES: i32 = 32;
+const MONO_CACHE_SLOT_BYTES: i32 = 40;
 
 /// Offset from the start of a mono-cache slot to each field.
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -122,6 +122,8 @@ const MONO_OFF_ENTRY: i32 = 8;
 const MONO_OFF_CTX: i32 = 16;
 #[cfg(all(target_arch = "x86_64", unix))]
 const MONO_OFF_BA: i32 = 24;
+#[cfg(all(target_arch = "x86_64", unix))]
+const MONO_OFF_REGSLOTS: i32 = 32;
 
 /// A stub call argument that is either a Maglev IR node or an immediate i64.
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -3486,11 +3488,12 @@ impl<'a> MaglevCodegen<'a> {
         // cache allocation (sub rsp, mono_call_cache_bytes), the first
         // cache slot starts at [RBP - 48].
         //
-        // Each slot is 32 bytes:
+        // Each slot is 40 bytes:
         //   +0  callee_i64  (0 = empty)
         //   +8  entry_point
         //   +16 ctx_ptr
         //   +24 ba_ptr
+        //   +32 reg_slots
         let site = self.next_mono_cache_site;
         self.next_mono_cache_site += 1;
         // Base offset from RBP to the start of all cache slots.
@@ -3500,6 +3503,7 @@ impl<'a> MaglevCodegen<'a> {
         let off_entry = slot_base - MONO_OFF_ENTRY;
         let off_ctx = slot_base - MONO_OFF_CTX;
         let off_ba = slot_base - MONO_OFF_BA;
+        let off_regslots = slot_base - MONO_OFF_REGSLOTS;
 
         let saved = self.emit_save_live_regs(id);
         // After save_live_regs: RSP ≡ 0 mod 16.
@@ -3550,6 +3554,8 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.mov_rr(Reg64::R11, Reg64::Rax);
         self.masm
             .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, off_ctx);
+        self.masm
+            .mov_load_base_disp32(Reg64::R8, Reg64::Rbp, off_regslots);
         self.masm.jmp(&mut do_direct);
 
         // No upgrade: load cached entry + ctx for the direct call.
@@ -3558,6 +3564,8 @@ impl<'a> MaglevCodegen<'a> {
             .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, off_entry);
         self.masm
             .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, off_ctx);
+        self.masm
+            .mov_load_base_disp32(Reg64::R8, Reg64::Rbp, off_regslots);
         self.masm.jmp(&mut do_direct);
 
         // ── Cache miss: full jit_runtime_get_jit_entry path ─────────
@@ -3599,28 +3607,37 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.call_reg(Reg64::R11);
         self.masm
             .mov_store_base_disp32(Reg64::Rbp, off_ba, Reg64::Rax);
+
+        // Read register_file_slots from BA and cache it.
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
+        let rs_addr = jit_runtime::jit_runtime_read_reg_slots as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, rs_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.masm
+            .mov_store_base_disp32(Reg64::Rbp, off_regslots, Reg64::Rax);
+        self.masm.mov_rr(Reg64::R8, Reg64::Rax); // R8 = reg_slots
+
         self.masm.pop(Reg64::R10);
         self.masm.pop(Reg64::R11);
 
         // ── Common direct-call path ─────────────────────────────────
-        // R11 = entry point, R10 = ctx_ptr.
+        // R11 = entry point, R10 = ctx_ptr, R8 = reg_slots (1-16).
         // Stack: [RSP] = padding, [RSP+8] = callee.
         self.masm.bind_label(&mut do_direct);
 
-        // Allocate 128-byte register file.
+        // Allocate 128-byte register file (fixed size for ABI compat).
         self.masm.sub_ri(Reg64::Rsp, 128);
 
-        // Zero register file using rep stosq.
-        // Save R10, R11 across the operation.
+        // Zero only the used register slots via rep stosq.
+        // R8 = number of qwords to zero (1-16).
         self.masm.push(Reg64::R10);
         self.masm.push(Reg64::R11);
 
-        self.masm.xor_rr(Reg64::Rax, Reg64::Rax); // RAX = 0
-        self.masm.mov_ri(Reg64::Rcx, 16); // RCX = 16 (qwords)
-        // RDI points to the register file at [RSP + 16] (after two pushes)
+        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+        self.masm.mov_rr(Reg64::Rcx, Reg64::R8); // RCX = reg_slots
         self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
         self.masm.add_ri(Reg64::Rdi, 16);
-        self.masm.rep_stosq(); // Zero 128 bytes (~2-3 cycles)
+        self.masm.rep_stosq();
 
         self.masm.pop(Reg64::R11);
         self.masm.pop(Reg64::R10);
