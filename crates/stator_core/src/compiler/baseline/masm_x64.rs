@@ -1114,6 +1114,19 @@ impl MacroAssembler {
         self.buf.push(imm);
     }
 
+    /// `INC QWORD PTR [base + disp32]` — increment a 64-bit memory
+    /// location.
+    ///
+    /// Encoding: `REX.W FF /0` with ModRM mod=10.
+    pub fn inc_mem_base_disp32(&mut self, base: Reg64, disp: i32) {
+        // REX.W prefix (bit 3 = W; bit 0 = B if base needs it).
+        let rex = 0x48 | if base.needs_rex() { 1u8 } else { 0 };
+        self.buf.push(rex);
+        self.buf.push(0xFF); // INC r/m64
+        // ModRM: mod=10, reg=0 (opcode extension /0), r/m=base.enc()
+        self.emit_modrm_base_disp32(Reg64::Rax, base, disp);
+    }
+
     // ── Conditional instructions ─────────────────────────────────────────────
 
     /// `SETCC AL` — set `AL` to `1` if the condition is satisfied, `0`

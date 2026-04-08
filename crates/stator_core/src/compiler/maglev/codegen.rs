@@ -152,6 +152,15 @@ fn cached_jscontext_layout() -> &'static jit_runtime::JsContextLayout {
     LAYOUT.get_or_init(jit_runtime::probe_jscontext_layout)
 }
 
+/// Cache the `Vec<JsValue>` byte layout for inline array append
+/// in the Maglev codegen.
+#[cfg(all(target_arch = "x86_64", unix))]
+fn cached_vec_jsvalue_layout() -> &'static jit_runtime::VecJsValueLayout {
+    use std::sync::OnceLock;
+    static LAYOUT: OnceLock<jit_runtime::VecJsValueLayout> = OnceLock::new();
+    LAYOUT.get_or_init(jit_runtime::probe_vec_jsvalue_layout)
+}
+
 /// A stub call argument that is either a Maglev IR node or an immediate i64.
 #[cfg(all(target_arch = "x86_64", unix))]
 enum NodeOrImm {
@@ -718,10 +727,10 @@ impl<'a> MaglevCodegen<'a> {
             mono_call_cache_bytes
         };
         let needs_r15 = mono_call_sites > 0 || has_keyed_sites || has_named_sites;
-        // Array IC: 24 bytes (3 × i64).  Place it after the mono cache
-        // area on the stack.  Rounded up so the combined reservation
-        // stays a multiple of 16.
-        let array_ic_bytes: i32 = if has_keyed_sites { 24 } else { 0 };
+        // Array IC: 32 bytes (4 × i64: handle, data_ptr, len, vec_ptr).
+        // Place it after the mono cache area on the stack.  Rounded up
+        // so the combined reservation stays a multiple of 16.
+        let array_ic_bytes: i32 = if has_keyed_sites { 32 } else { 0 };
         let total_cache_bytes = {
             let raw = mono_call_cache_bytes + array_ic_bytes;
             if raw == 0 { 0 } else { (raw + 15) & !15 }
@@ -730,10 +739,9 @@ impl<'a> MaglevCodegen<'a> {
         // pushes, RSP = RBP − 40.  The cache area starts at RSP after
         // `sub rsp, total_cache_bytes`, i.e. at RBP − 40 − total_cache_bytes.
         // The array IC sits at the *end* of the cache reservation, right
-        // after the mono call cache.  Since the total is padded to 16,
-        // the 24-byte IC may have up to 8 bytes of padding after it.
+        // after the mono call cache.
         //
-        // From RBP:  -(48 + mono_call_cache_bytes)  …  -(48 + mono_call_cache_bytes + 24)
+        // From RBP:  -(48 + mono_call_cache_bytes)  …  -(48 + mono_call_cache_bytes + 32)
         let array_ic_base: i32 = if has_keyed_sites {
             -(48 + mono_call_cache_bytes)
         } else {
@@ -4579,15 +4587,18 @@ impl<'a> MaglevCodegen<'a> {
         value: NodeId,
     ) {
         let layout = cached_jsvalue_layout();
+        let vec_layout = cached_vec_jsvalue_layout();
         let ic_base = self.array_ic_base;
         let ic_off_handle = ic_base;
         let ic_off_data = ic_base + 8;
         let ic_off_len = ic_base + 16;
+        let ic_off_vec_ptr = ic_base + 24;
 
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
         let mut store_smi = Label::new();
         let mut store_bool = Label::new();
+        let mut check_grow = Label::new();
 
         // ── Fast path (scratch regs only: R11, R10, RAX) ────────────
 
@@ -4602,7 +4613,7 @@ impl<'a> MaglevCodegen<'a> {
 
         // Unsigned bounds check: key < cached length.
         self.masm.cmp_rm(Reg64::R10, Reg64::Rbp, ic_off_len);
-        self.masm.jcc(CondCode::AboveEq, &mut slow_label);
+        self.masm.jcc(CondCode::AboveEq, &mut check_grow);
 
         // Hoist element address computation: R10 = data_ptr + key * 24.
         // After this, R10 holds the element address (raw key is no
@@ -4665,6 +4676,108 @@ impl<'a> MaglevCodegen<'a> {
         // Restore the original JIT encoding in RAX for emit_store.
         self.emit_load(value, Reg64::Rax);
         self.masm.jmp(&mut done_label);
+
+        // ── Inline grow: key == len && len < capacity ───────────────
+        // For sequential array growth (e.g. `sieve[i] = true` in a
+        // loop), this avoids the FFI slow path entirely.  We write the
+        // value directly into the Vec buffer and increment Vec::len
+        // using the probed layout offsets.  Only capacity overflows
+        // (≈10 per 1000 appends) fall through to the FFI slow path.
+        self.masm.bind_label(&mut check_grow);
+        {
+            // At this point: R10 = key, RAX = value (JIT encoding).
+            // Bounds check already determined key >= IC.len.
+            // Check key == IC.len (sequential append).
+            self.masm.jne(&mut slow_label); // key != len → sparse, slow
+
+            // Load vec_ptr from IC.  If 0, the IC hasn't been filled
+            // with a vec_ptr yet → fall through to slow path.
+            self.masm
+                .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_vec_ptr);
+            self.masm.test_rr(Reg64::R11, Reg64::R11);
+            self.masm.je(&mut slow_label);
+
+            // Load capacity from Vec struct: [vec_ptr + cap_offset].
+            self.masm
+                .mov_load_base_disp32(Reg64::R11, Reg64::R11, vec_layout.cap_offset as i32);
+            // Check key < capacity (unsigned: negative keys already
+            // handled by the IC handle check).
+            self.masm.cmp_rr(Reg64::R10, Reg64::R11);
+            self.masm.jcc(CondCode::AboveEq, &mut slow_label); // need realloc
+
+            // ── Capacity available: inline append ────────────────
+            // Compute element address: data_ptr + key * sizeof(JsValue).
+            // Save key in R11 (we need it for len increment).
+            self.masm.mov_rr(Reg64::R11, Reg64::R10);
+            self.masm
+                .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, ic_off_data);
+            self.masm
+                .imul_rri(Reg64::R11, Reg64::R11, layout.jsvalue_size as i32);
+            self.masm.add_rr(Reg64::R10, Reg64::R11);
+
+            // Decode value type and write.
+            let mut grow_store_smi = Label::new();
+            let mut grow_store_bool = Label::new();
+            let mut grow_update_len = Label::new();
+
+            // Check if Smi (sign-extends to same value).
+            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm.je(&mut grow_store_smi);
+
+            // Check Bool.
+            self.masm.mov_ri(Reg64::R11, JIT_TRUE);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+            self.masm.je(&mut grow_store_bool);
+            self.masm.mov_ri(Reg64::R11, JIT_FALSE);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+            self.masm.je(&mut grow_store_bool);
+
+            // Not Smi or Bool → fall through to slow path.
+            self.masm.jmp(&mut slow_label);
+
+            // Write Smi.
+            self.masm.bind_label(&mut grow_store_smi);
+            self.masm.mov_store_byte_imm_base_disp32(
+                Reg64::R10,
+                layout.disc_offset as i32,
+                layout.smi_disc,
+            );
+            self.masm.mov_store_dword_base_disp32(
+                Reg64::R10,
+                layout.smi_payload_offset as i32,
+                Reg64::Rax,
+            );
+            self.masm.jmp(&mut grow_update_len);
+
+            // Write Bool.
+            self.masm.bind_label(&mut grow_store_bool);
+            self.masm.mov_store_byte_imm_base_disp32(
+                Reg64::R10,
+                layout.disc_offset as i32,
+                layout.bool_disc,
+            );
+            self.masm.mov_ri(Reg64::R11, JIT_FALSE);
+            self.masm.sub_rr(Reg64::Rax, Reg64::R11);
+            self.masm.mov_store_dword_base_disp32(
+                Reg64::R10,
+                layout.bool_payload_offset as i32,
+                Reg64::Rax,
+            );
+            // Restore RAX for emit_store.
+            self.emit_load(value, Reg64::Rax);
+
+            // Increment Vec::len and IC cached len.
+            self.masm.bind_label(&mut grow_update_len);
+            // Increment the real Vec::len via probed offset.
+            self.masm
+                .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_vec_ptr);
+            self.masm
+                .inc_mem_base_disp32(Reg64::R11, vec_layout.len_offset as i32);
+            // Increment the IC cached len.
+            self.masm.inc_mem_base_disp32(Reg64::Rbp, ic_off_len);
+            self.masm.jmp(&mut done_label);
+        }
 
         // ── Slow path: IC miss / non-inlineable type ────────────────
         self.masm.bind_label(&mut slow_label);
@@ -4934,14 +5047,18 @@ impl<'a> MaglevCodegen<'a> {
         // avoids the `[0i64; 16]` Rust-stack alloc + the ≤2-slot
         // skip applies to the hot path too.
         //
-        // Step 1: prepare (BA save, heap base, context swap)
+        // Step 1: prepare (BA save, heap base, context check+swap)
+        // Use the _r15 variant to avoid TLS lookup — R15 holds
+        // the RT_PTRS cell pointer.
         self.masm.mov_rr(Reg64::R9, Reg64::R11); // save callee in R9
         self.masm.mov_rr(Reg64::Rdi, Reg64::R11); // arg0 = callee
         self.masm
             .mov_load_base_disp32(Reg64::Rsi, Reg64::Rbp, off_ba);
         self.masm
             .mov_load_base_disp32(Reg64::Rdx, Reg64::Rbp, off_ctx);
-        let prepare_addr = jit_runtime::jit_runtime_mono_call_prepare as *const () as usize;
+        self.masm.mov_rr(Reg64::Rcx, Reg64::R15); // arg3 = RT_PTRS cell
+        let prepare_addr =
+            jit_runtime::jit_runtime_mono_call_prepare_check_ctx_r15 as *const () as usize;
         self.masm.mov_ri(Reg64::R11, prepare_addr as i64);
         self.masm.call_reg(Reg64::R11);
 

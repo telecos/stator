@@ -4304,12 +4304,13 @@ pub(crate) mod jit_runtime {
                 if let Some(JsValue::Array(arr)) = heap.get(obj_idx) {
                     // SAFETY: single-threaded JIT; no concurrent borrows.
                     let data = unsafe { &*arr.as_ptr() };
-                    // SAFETY: ic_slots points to 3 writable i64s on the
+                    // SAFETY: ic_slots points to 4 writable i64s on the
                     // caller's stack frame (Maglev-generated code).
                     unsafe {
                         *ic_slots = obj_i64;
                         *ic_slots.add(1) = data.as_ptr() as i64;
                         *ic_slots.add(2) = data.len() as i64;
+                        *ic_slots.add(3) = arr.as_ptr() as *const Vec<JsValue> as i64;
                     }
                 }
             }
@@ -5011,13 +5012,14 @@ pub(crate) mod jit_runtime {
                 // Update caller's IC slots so subsequent x86 inline
                 // checks can succeed with the new data pointer and length.
                 if ic_ptr != 0 {
-                    // SAFETY: ic_ptr points to 3 writable i64s on the
+                    // SAFETY: ic_ptr points to 4 writable i64s on the
                     // caller's stack frame (Maglev-generated code).
                     let ic_slots = ic_ptr as *mut i64;
                     unsafe {
                         *ic_slots = obj_i64;
                         *ic_slots.add(1) = v.as_ptr() as i64;
                         *ic_slots.add(2) = v.len() as i64;
+                        *ic_slots.add(3) = v as *mut Vec<JsValue> as i64;
                     }
                 }
                 InlineKeyedResult {
@@ -5143,6 +5145,7 @@ pub(crate) mod jit_runtime {
     /// by Maglev codegen to emit inline x86 loads/stores of closure
     /// context slots without calling into Rust.
     #[derive(Debug, Clone, Copy)]
+    #[allow(dead_code)]
     pub struct JsContextLayout {
         /// Byte offset from a `*const RefCell<JsContext>` to the
         /// `Vec<JsValue>` data-pointer field inside `JsContext::slots`.
@@ -5194,6 +5197,81 @@ pub(crate) mod jit_runtime {
         JsContextLayout {
             slots_data_ptr_offset,
             slots_len_offset: len_offset,
+        }
+    }
+
+    // ── Vec<JsValue> layout probing for inline array append ────────────
+
+    /// Compile-time-discovered byte layout of `Vec<JsValue>`.
+    ///
+    /// Used by Maglev codegen to read `len` and `capacity` fields and to
+    /// increment `len` directly from x86 during inline array append,
+    /// bypassing any FFI call.
+    #[derive(Debug, Clone, Copy)]
+    pub struct VecJsValueLayout {
+        /// Byte offset of the `len` field within `Vec<JsValue>`.
+        pub len_offset: usize,
+        /// Byte offset of the `capacity` field within `Vec<JsValue>`.
+        pub cap_offset: usize,
+    }
+
+    /// Probe the in-memory byte layout of `Vec<JsValue>` to find
+    /// the offsets of `len` and `capacity` fields.
+    ///
+    /// Uses distinctive element counts to locate each field by scanning
+    /// the raw bytes of a stack-allocated Vec.
+    pub fn probe_vec_jsvalue_layout() -> VecJsValueLayout {
+        // Use distinctive values unlikely to appear as pointer bytes.
+        let mut v: Vec<JsValue> = Vec::with_capacity(97);
+        for _ in 0..37 {
+            v.push(JsValue::Undefined);
+        }
+        assert_eq!(v.len(), 37);
+        assert_eq!(v.capacity(), 97);
+
+        let vec_ptr = &v as *const Vec<JsValue> as *const u8;
+        let vec_size = std::mem::size_of::<Vec<JsValue>>();
+
+        let len_bytes = 37usize.to_ne_bytes();
+        let cap_bytes = 97usize.to_ne_bytes();
+
+        let mut len_offset = None;
+        let mut cap_offset = None;
+
+        for i in 0..=(vec_size.saturating_sub(8)) {
+            // SAFETY: reading bytes of a stack-allocated Vec.
+            let matches_len = (0..8).all(|j| unsafe { *vec_ptr.add(i + j) } == len_bytes[j]);
+            let matches_cap = (0..8).all(|j| unsafe { *vec_ptr.add(i + j) } == cap_bytes[j]);
+
+            if matches_len && len_offset.is_none() {
+                len_offset = Some(i);
+            }
+            if matches_cap && cap_offset.is_none() {
+                cap_offset = Some(i);
+            }
+        }
+
+        let len_offset =
+            len_offset.expect("Vec<JsValue>: cannot find len field in byte representation");
+        let cap_offset =
+            cap_offset.expect("Vec<JsValue>: cannot find capacity field in byte representation");
+
+        // Cross-check: push one more element and verify len changed.
+        v.push(JsValue::Undefined);
+        let probed_len = unsafe { *(vec_ptr.add(len_offset) as *const usize) };
+        assert_eq!(
+            probed_len, 38,
+            "Vec<JsValue>: len field not at expected offset"
+        );
+        let probed_cap = unsafe { *(vec_ptr.add(cap_offset) as *const usize) };
+        assert_eq!(
+            probed_cap, 97,
+            "Vec<JsValue>: capacity field not at expected offset"
+        );
+
+        VecJsValueLayout {
+            len_offset,
+            cap_offset,
         }
     }
 
@@ -5278,7 +5356,7 @@ pub(crate) mod jit_runtime {
         obj_i64: i64,
         smi_key: i64,
         rt_ptrs_cell: i64,
-        ic_slots: *mut [i64; 3],
+        ic_slots: *mut [i64; 4],
     ) -> InlineKeyedResult {
         // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
         // TLS slot lives for the thread's entire lifetime.
@@ -5297,6 +5375,7 @@ pub(crate) mod jit_runtime {
                     (*ic_slots)[0] = obj_i64;
                     (*ic_slots)[1] = data.as_ptr() as i64;
                     (*ic_slots)[2] = data.len() as i64;
+                    (*ic_slots)[3] = arr.as_ptr() as *const Vec<JsValue> as i64;
                 }
             }
         }
@@ -6987,8 +7066,9 @@ pub use jit_runtime::{
 
 #[cfg(all(target_arch = "x86_64", unix))]
 pub use jit_runtime::{
-    ArrayIcInfo, JsValueLayout, jit_runtime_fill_array_ic_r15,
-    jit_runtime_inline_load_keyed_smi_ic_r15, probe_jsvalue_layout,
+    ArrayIcInfo, JsContextLayout, JsValueLayout, VecJsValueLayout, jit_runtime_fill_array_ic_r15,
+    jit_runtime_inline_load_keyed_smi_ic_r15, probe_jscontext_layout, probe_jsvalue_layout,
+    probe_vec_jsvalue_layout,
 };
 
 /// A single entry in the safepoint table.
