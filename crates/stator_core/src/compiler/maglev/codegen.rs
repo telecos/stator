@@ -5387,7 +5387,10 @@ impl<'a> MaglevCodegen<'a> {
         match node {
             ValueNode::GenericAdd { left, right, .. }
             | ValueNode::GenericSubtract { left, right, .. }
-            | ValueNode::GenericMultiply { left, right, .. } => {
+            | ValueNode::GenericMultiply { left, right, .. }
+            | ValueNode::GenericBitwiseOr { left, right, .. }
+            | ValueNode::GenericBitwiseAnd { left, right, .. }
+            | ValueNode::GenericBitwiseXor { left, right, .. } => {
                 smi_guarded.contains(left) && smi_guarded.contains(right)
             }
             ValueNode::GenericIncrement { value, .. }
@@ -5404,7 +5407,10 @@ impl<'a> MaglevCodegen<'a> {
         match node {
             ValueNode::GenericAdd { left, right, .. }
             | ValueNode::GenericSubtract { left, right, .. }
-            | ValueNode::GenericMultiply { left, right, .. } => {
+            | ValueNode::GenericMultiply { left, right, .. }
+            | ValueNode::GenericBitwiseOr { left, right, .. }
+            | ValueNode::GenericBitwiseAnd { left, right, .. }
+            | ValueNode::GenericBitwiseXor { left, right, .. } => {
                 smi_guarded.contains(left) && smi_guarded.contains(right)
             }
             ValueNode::GenericIncrement { value, .. }
@@ -5417,10 +5423,10 @@ impl<'a> MaglevCodegen<'a> {
     /// Returns `true` when `node` only reads the lower 32 bits of its
     /// `NodeId` operands, meaning upstream producers can skip sign-extension.
     ///
-    /// Only wrapping Int32 arithmetic and Int32 comparisons qualify.  Other
-    /// Int32 operations (divide, modulus, bitwise, shifts) are deliberately
-    /// excluded because they use 64-bit ALU instructions (`REX.W`); garbage
-    /// upper bits in their operands would produce incorrect results.
+    /// Wrapping Int32 arithmetic, Int32 comparisons, and Generic bitwise
+    /// ops (smi_guarded path) qualify.  Bitwise OR/AND/XOR are bit-parallel:
+    /// garbage upper bits in inputs only affect upper bits of the result,
+    /// so the lower 32 bits remain correct.
     fn is_narrow_int32_consumer(node: &ValueNode) -> bool {
         matches!(
             node,
@@ -5438,6 +5444,11 @@ impl<'a> MaglevCodegen<'a> {
                 | ValueNode::Int32LessThanOrEqual { .. }
                 | ValueNode::Int32GreaterThan { .. }
                 | ValueNode::Int32GreaterThanOrEqual { .. }
+                // Generic bitwise — smi_guarded path uses 64-bit OR/AND/XOR
+                // which are bit-parallel (lower 32 bits independent of upper).
+                | ValueNode::GenericBitwiseOr { .. }
+                | ValueNode::GenericBitwiseAnd { .. }
+                | ValueNode::GenericBitwiseXor { .. }
         )
     }
 
