@@ -75,9 +75,25 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, NodeId, ValueNode};
 use crate::compiler::maglev::licm;
+
+// ── Global promotion diagnostics ─────────────────────────────────────────────
+
+/// Total globals promoted by the optimizer (LoadGlobal/StoreGlobal → Phi).
+static OPT_GLOBALS_PROMOTED: AtomicU32 = AtomicU32::new(0);
+/// Loops where promotion was skipped because of user calls.
+static OPT_GLOBALS_SKIPPED: AtomicU32 = AtomicU32::new(0);
+
+/// Return (promoted, skipped) diagnostic counters for global promotion.
+pub fn globals_promoted_diagnostics() -> (u32, u32) {
+    (
+        OPT_GLOBALS_PROMOTED.load(Ordering::Relaxed),
+        OPT_GLOBALS_SKIPPED.load(Ordering::Relaxed),
+    )
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry-point
@@ -1412,6 +1428,7 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
         }
         for (_, node) in &block.nodes {
             if is_user_call(node) {
+                OPT_GLOBALS_SKIPPED.fetch_add(1, Ordering::Relaxed);
                 return 0;
             }
         }
@@ -1627,6 +1644,7 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
             }
         }
     }
+    OPT_GLOBALS_PROMOTED.fetch_add(promotable.len() as u32, Ordering::Relaxed);
     promotable.len()
 }
 

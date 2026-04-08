@@ -94,6 +94,15 @@ use crate::compiler::maglev::ir::{ControlNode, MaglevGraph, NodeId, ValueNode};
 use crate::compiler::maglev::regalloc::{AllocationResult, Location, allocate};
 use crate::error::{StatorError, StatorResult};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Total globals promoted at the codegen level (cached in R14 register-file slots).
+static CODEGEN_GLOBALS_PROMOTED: AtomicU32 = AtomicU32::new(0);
+
+/// Return the codegen-level global promotion count.
+pub fn codegen_globals_promoted_count() -> u32 {
+    CODEGEN_GLOBALS_PROMOTED.load(Ordering::Relaxed)
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants & helpers
@@ -2729,6 +2738,7 @@ impl<'a> MaglevCodegen<'a> {
             .map(|(i, &name_idx)| (name_idx, base_slots + i))
             .collect();
         self.promoted_extra_slots = sorted.len();
+        CODEGEN_GLOBALS_PROMOTED.fetch_add(sorted.len() as u32, Ordering::Relaxed);
     }
 
     /// Byte offset from R14 for the promoted global with `name_idx`.

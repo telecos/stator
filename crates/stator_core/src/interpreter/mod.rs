@@ -1096,6 +1096,15 @@ pub fn licm_diagnostics() -> (u32, u32, u32, u32) {
     )
 }
 
+/// Return global promotion diagnostic counters:
+/// `(opt_promoted, opt_skipped, codegen_promoted)`.
+pub fn globals_promotion_diagnostics() -> (u32, u32, u32) {
+    use crate::compiler::maglev::{codegen, optimizer};
+    let (promoted, skipped) = optimizer::globals_promoted_diagnostics();
+    let cg = codegen::codegen_globals_promoted_count();
+    (promoted, skipped, cg)
+}
+
 /// Return per-tier compilation counts as `(baseline, maglev, turbofan)`.
 pub fn jit_tier_stats() -> (u64, u64, u64) {
     (
