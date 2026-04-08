@@ -364,6 +364,9 @@ pub(crate) mod jit_runtime {
 
         fn is_cached(&self) -> bool {
             !self.heap.is_null()
+                && !self.bytecode.is_null()
+                && (self.bytecode as usize) % std::mem::align_of::<Cell<*const BytecodeArray>>()
+                    == 0
         }
 
         /// Store [`DirectCallState`] via the cached pointer, avoiding a
@@ -654,7 +657,8 @@ pub(crate) mod jit_runtime {
     fn get_rt_string_constant_ref(idx: u32) -> Option<&'static str> {
         let ptrs = RT_PTRS.with(|p| p.get());
         let ptr = if ptrs.is_cached() {
-            // SAFETY: cached pointer valid for thread lifetime.
+            // SAFETY: cached pointer valid for thread lifetime; alignment
+            // verified by is_cached().
             unsafe { &*ptrs.bytecode }.get()
         } else {
             RT_BYTECODE.with(|ba_ptr| ba_ptr.get())
@@ -4732,6 +4736,221 @@ pub(crate) mod jit_runtime {
         }
     }
 
+    // ── JsValue layout probing for true-inline array access ────────────
+
+    /// Compile-time-discovered byte layout of [`JsValue`] for the Smi and
+    /// Boolean variants.  Used by the Maglev codegen to emit inline x86
+    /// loads/stores without calling into Rust.
+    #[derive(Debug, Clone, Copy)]
+    pub struct JsValueLayout {
+        /// `std::mem::size_of::<JsValue>()`.
+        pub jsvalue_size: usize,
+        /// Byte offset of the enum discriminant within a `JsValue`.
+        pub disc_offset: usize,
+        /// Discriminant byte value for `JsValue::Smi(_)`.
+        pub smi_disc: u8,
+        /// Byte offset of the `i32` payload inside `JsValue::Smi(_)`.
+        pub smi_payload_offset: usize,
+        /// Discriminant byte value for `JsValue::Boolean(_)`.
+        pub bool_disc: u8,
+        /// Byte offset of the `bool` payload inside `JsValue::Boolean(_)`.
+        pub bool_payload_offset: usize,
+        /// Discriminant byte value for `JsValue::Undefined`.
+        pub undef_disc: u8,
+        /// Discriminant byte value for `JsValue::Null`.
+        pub null_disc: u8,
+        /// Discriminant byte value for `JsValue::TheHole`.
+        pub hole_disc: u8,
+    }
+
+    /// Probe the in-memory byte layout of [`JsValue`] for discriminant
+    /// and payload offsets.  Panics if the layout cannot be determined
+    /// (i.e. niche optimisation has made the layout non-trivial).
+    pub fn probe_jsvalue_layout() -> JsValueLayout {
+        let size = std::mem::size_of::<JsValue>();
+        // Transmute trick: read the raw bytes of known JsValue instances.
+        // SAFETY: we only read; the values are never used as JsValue again.
+        fn raw(v: &JsValue, size: usize) -> Vec<u8> {
+            let ptr = v as *const JsValue as *const u8;
+            (0..size).map(|i| unsafe { *ptr.add(i) }).collect()
+        }
+
+        let undef = JsValue::Undefined;
+        let null = JsValue::Null;
+        let hole = JsValue::TheHole;
+        let bool_false = JsValue::Boolean(false);
+        let bool_true = JsValue::Boolean(true);
+        let smi_probe = JsValue::Smi(0x12345678_i32);
+        let smi_zero = JsValue::Smi(0);
+
+        let b_undef = raw(&undef, size);
+        let b_null = raw(&null, size);
+        let b_hole = raw(&hole, size);
+        let b_false = raw(&bool_false, size);
+        let b_true = raw(&bool_true, size);
+        let b_smi = raw(&smi_probe, size);
+        let b_smi0 = raw(&smi_zero, size);
+
+        // ── Find the discriminant offset ──
+        // All field-less / small variants differ only in the discriminant
+        // byte.  We find the first byte position where Undefined, Null,
+        // Boolean(false), and Smi(0) all differ pairwise.
+        let disc_offset = (0..size)
+            .find(|&i| {
+                let vals = [b_undef[i], b_null[i], b_false[i], b_smi0[i]];
+                // All four must be distinct.
+                vals[0] != vals[1]
+                    && vals[0] != vals[2]
+                    && vals[0] != vals[3]
+                    && vals[1] != vals[2]
+                    && vals[1] != vals[3]
+                    && vals[2] != vals[3]
+            })
+            .expect("JsValue: cannot find discriminant byte — layout may use niche optimisation");
+
+        let undef_disc = b_undef[disc_offset];
+        let null_disc = b_null[disc_offset];
+        let hole_disc = b_hole[disc_offset];
+        let bool_disc = b_false[disc_offset];
+        let smi_disc = b_smi[disc_offset];
+
+        // ── Find the Smi i32 payload offset ──
+        // Look for 0x78 0x56 0x34 0x12 (LE bytes of 0x12345678).
+        let smi_payload_offset = b_smi
+            .windows(4)
+            .position(|w| w == [0x78, 0x56, 0x34, 0x12])
+            .expect("JsValue: cannot find Smi i32 payload in byte representation");
+
+        // ── Find the Boolean payload offset ──
+        // Boolean(false) and Boolean(true) share the same discriminant;
+        // the first byte that differs is the bool payload.
+        let bool_payload_offset = (0..size)
+            .find(|&i| b_false[i] != b_true[i])
+            .expect("JsValue: cannot find Boolean payload");
+
+        // Sanity: the bool discriminant byte must NOT be the payload byte.
+        assert_ne!(disc_offset, bool_payload_offset);
+
+        JsValueLayout {
+            jsvalue_size: size,
+            disc_offset,
+            smi_disc,
+            smi_payload_offset,
+            bool_disc,
+            bool_payload_offset,
+            undef_disc,
+            null_disc,
+            hole_disc,
+        }
+    }
+
+    // ── Array inline-cache fill + load ──────────────────────────────────
+
+    /// Result returned by [`jit_runtime_fill_array_ic_r15`].
+    ///
+    /// Returned in `RAX:RDX` via SysV AMD64 ABI.
+    #[repr(C)]
+    pub struct ArrayIcInfo {
+        /// Raw pointer to the `Vec<JsValue>` data buffer, or 0 on failure.
+        pub data_ptr: i64,
+        /// Current length of the `Vec`, or 0 on failure.
+        pub len: i64,
+    }
+
+    impl ArrayIcInfo {
+        const MISS: Self = Self {
+            data_ptr: 0,
+            len: 0,
+        };
+    }
+
+    /// Resolve a heap handle to its underlying array element buffer and
+    /// fill the caller-provided inline-cache slots.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_i64`) – JIT i64 encoding of the receiver.
+    /// * `RSI` (`rt_ptrs_cell`) – pointer to `Cell<RtPtrs>` TLS slot.
+    ///
+    /// Returns [`ArrayIcInfo`] in `RAX:RDX` (`data_ptr`, `len`).
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    pub extern "C" fn jit_runtime_fill_array_ic_r15(
+        obj_i64: i64,
+        rt_ptrs_cell: i64,
+    ) -> ArrayIcInfo {
+        if !is_heap_handle(obj_i64) {
+            return ArrayIcInfo::MISS;
+        }
+        let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+        // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
+        // TLS slot lives for the thread's entire lifetime.
+        let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
+        if !ptrs.is_cached() {
+            return ArrayIcInfo::MISS;
+        }
+        // SAFETY: cached pointers set by cache_rt_ptrs; valid for thread
+        // lifetime.
+        let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+        match heap.get(obj_idx) {
+            Some(JsValue::Array(arr)) => {
+                // SAFETY: single-threaded JIT; no concurrent borrows.
+                let data = unsafe { &*arr.as_ptr() };
+                ArrayIcInfo {
+                    data_ptr: data.as_ptr() as i64,
+                    len: data.len() as i64,
+                }
+            }
+            _ => ArrayIcInfo::MISS,
+        }
+    }
+
+    /// Combined array IC fill **and** keyed load.
+    ///
+    /// Resolves the heap handle, fills the 3-slot inline cache at
+    /// `ic_slots` (`[handle, data_ptr, len]`), and performs the element
+    /// load — all in a single call.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_i64`) – JIT i64 encoding of the receiver.
+    /// * `RSI` (`smi_key`) – non-negative integer index.
+    /// * `RDX` (`rt_ptrs_cell`) – pointer to `Cell<RtPtrs>` TLS slot.
+    /// * `RCX` (`ic_slots`) – pointer to 3 consecutive `i64` on the
+    ///   stack: `[handle, data_ptr, len]`.
+    ///
+    /// Returns [`InlineKeyedResult`] in `RAX:RDX`.
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    pub extern "C" fn jit_runtime_inline_load_keyed_smi_ic_r15(
+        obj_i64: i64,
+        smi_key: i64,
+        rt_ptrs_cell: i64,
+        ic_slots: *mut [i64; 3],
+    ) -> InlineKeyedResult {
+        // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
+        // TLS slot lives for the thread's entire lifetime.
+        let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
+
+        // Fill the IC opportunistically (even when the element itself
+        // cannot be inlined — the IC is for subsequent fast-path hits).
+        if is_heap_handle(obj_i64) && ptrs.is_cached() {
+            let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+            // SAFETY: cached pointers valid for thread lifetime.
+            let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+            if let Some(JsValue::Array(arr)) = heap.get(obj_idx) {
+                // SAFETY: single-threaded JIT; no concurrent borrows.
+                let data = unsafe { &*arr.as_ptr() };
+                unsafe {
+                    (*ic_slots)[0] = obj_i64;
+                    (*ic_slots)[1] = data.as_ptr() as i64;
+                    (*ic_slots)[2] = data.len() as i64;
+                }
+            }
+        }
+
+        // Perform the actual element load.
+        inline_load_keyed_with_ptrs(obj_i64, smi_key, ptrs)
+    }
+
     // ── Specialized StaNamedProperty stub ───────────────────────────────
 
     /// Specialized runtime stub for `StaNamedProperty`.
@@ -4958,7 +5177,8 @@ pub(crate) mod jit_runtime {
         let map_rc = if feedback_slot >= 0 {
             let slot = feedback_slot as u32;
             let ba = if ptrs.is_cached() {
-                // SAFETY: cached pointer valid for thread lifetime.
+                // SAFETY: cached pointer valid for thread lifetime; alignment
+                // verified by is_cached().
                 unsafe { &*ptrs.bytecode }.get()
             } else {
                 RT_BYTECODE.with(|b| b.get())
@@ -6154,6 +6374,12 @@ pub(crate) mod jit_runtime {
 pub use jit_runtime::{
     alloc_jit_heap_handle, jit_runtime_set_context, jit_runtime_set_global_env, jit_runtime_setup,
     jit_runtime_teardown, jit_to_jsvalue_ext,
+};
+
+#[cfg(all(target_arch = "x86_64", unix))]
+pub use jit_runtime::{
+    jit_runtime_fill_array_ic_r15, jit_runtime_inline_load_keyed_smi_ic_r15, probe_jsvalue_layout,
+    ArrayIcInfo, JsValueLayout,
 };
 
 /// A single entry in the safepoint table.

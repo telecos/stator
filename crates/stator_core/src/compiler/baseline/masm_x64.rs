@@ -1033,6 +1033,15 @@ impl MacroAssembler {
         self.emit_modrm_base_disp32(dst, base, disp);
     }
 
+    /// `LEA dst, [base + disp32]` — compute effective address.
+    ///
+    /// Encoding: `REX.W [REX.R] [REX.B] 8D /r` with ModRM mod=10.
+    pub fn lea_base_disp32(&mut self, dst: Reg64, base: Reg64, disp: i32) {
+        self.emit_rex_wrb(dst, base);
+        self.buf.push(0x8D);
+        self.emit_modrm_base_disp32(dst, base, disp);
+    }
+
     /// `MOV [base + disp32], src` — store a 64-bit register to memory.
     ///
     /// Encoding: `REX.W [REX.R] [REX.B] 89 /r` with ModRM mod=10.

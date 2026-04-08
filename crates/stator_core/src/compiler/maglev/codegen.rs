@@ -138,6 +138,7 @@ const MONO_OFF_REGSLOTS: i32 = 32;
 #[cfg(all(target_arch = "x86_64", unix))]
 enum NodeOrImm {
     Node(NodeId),
+    #[allow(dead_code)]
     Imm(i64),
 }
 
@@ -576,6 +577,16 @@ struct MaglevCodegen<'a> {
     /// deferred here and emitted after all main blocks.  This lets the
     /// hot loop path fall through without an extra JMP.
     deferred_branches: Vec<DeferredBranch>,
+    /// Byte offset from RBP of the 3-slot (24-byte) array inline cache.
+    /// Layout: `[handle: i64, data_ptr: i64, len: i64]`.
+    /// Zero when the function has no keyed array access sites.
+    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
+    array_ic_base: i32,
+    /// Total extra stack bytes reserved for caches (mono call cache +
+    /// array IC + alignment padding).  Used for the single `sub rsp, N`
+    /// in the prologue and `add rsp, N` in epilogue.
+    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
+    total_cache_bytes: i32,
 }
 
 /// A deferred cold-path branch emitted out-of-line after all blocks.
@@ -1967,8 +1978,8 @@ impl<'a> MaglevCodegen<'a> {
                     self.emit_load(v, val_regs[i]);
                 }
                 // Zero-fill unused value slots.
-                for i in values.len()..3 {
-                    self.masm.mov_ri(val_regs[i], 0);
+                for reg in &val_regs[values.len()..3] {
+                    self.masm.mov_ri(*reg, 0);
                 }
 
                 // Pack name indices: name0 | (name1 << 16) | (name2 << 32)
