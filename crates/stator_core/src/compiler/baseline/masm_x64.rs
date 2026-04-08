@@ -39,8 +39,7 @@ use std::fmt;
 
 /// A condition code for [`MacroAssembler::jcc`] and [`MacroAssembler::setcc_al`].
 ///
-/// All conditions are **signed** comparisons, consistent with the use-case of
-/// comparing JavaScript integer (Smi) values.
+/// Includes both **signed** and **unsigned** comparison conditions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CondCode {
     /// Equal (`ZF = 1`).
@@ -57,6 +56,10 @@ pub enum CondCode {
     GreaterEq,
     /// Overflow (`OF = 1`).
     Overflow,
+    /// Above-or-equal, unsigned (`CF = 0`).  Also known as JNB/JNC.
+    AboveEq,
+    /// Below, unsigned (`CF = 1`).  Also known as JC.
+    Below,
 }
 
 impl CondCode {
@@ -70,6 +73,8 @@ impl CondCode {
             Self::Greater => 0x9F,
             Self::GreaterEq => 0x9D,
             Self::Overflow => 0x90,
+            Self::AboveEq => 0x93,
+            Self::Below => 0x92,
         }
     }
 
@@ -83,6 +88,8 @@ impl CondCode {
             Self::Greater => 0x8F,
             Self::GreaterEq => 0x8D,
             Self::Overflow => 0x80,
+            Self::AboveEq => 0x83,
+            Self::Below => 0x82,
         }
     }
 
@@ -100,6 +107,8 @@ impl CondCode {
             Self::Greater => Self::LessEq,
             Self::GreaterEq => Self::Less,
             Self::Overflow => Self::Overflow, // no logical inverse for OF
+            Self::AboveEq => Self::Below,
+            Self::Below => Self::AboveEq,
         }
     }
 }
@@ -780,6 +789,16 @@ impl MacroAssembler {
         self.emit_modrm_rr(dst, src);
     }
 
+    /// `MOVSXD dst, DWORD PTR [base + disp32]` — load a 32-bit memory value
+    /// and sign-extend it to 64 bits.
+    ///
+    /// Encoding: `REX.W [REX.R] [REX.B] 63 /r` with ModRM mod=10.
+    pub fn movsxd_base_disp32(&mut self, dst: Reg64, base: Reg64, disp: i32) {
+        self.emit_rex_wrb(dst, base);
+        self.buf.push(0x63);
+        self.emit_modrm_base_disp32(dst, base, disp);
+    }
+
     // ── Control flow ─────────────────────────────────────────────────────────
 
     /// `JMP label` — unconditional near jump to a label.
@@ -1074,6 +1093,17 @@ impl MacroAssembler {
         self.buf.push(0xB6);
         // ModRM: mod=11, reg=dst.enc(), r/m=0 (AL).
         self.buf.push(0xC0 | (dst.enc() << 3));
+    }
+
+    /// `MOVZX dst, BYTE PTR [base + disp32]` — zero-extend a memory byte
+    /// into a 64-bit register.
+    ///
+    /// Encoding: `REX.W [REX.R] [REX.B] 0F B6 /r` with ModRM mod=10.
+    pub fn movzx_byte_base_disp32(&mut self, dst: Reg64, base: Reg64, disp: i32) {
+        self.emit_rex_wrb(dst, base);
+        self.buf.push(0x0F);
+        self.buf.push(0xB6);
+        self.emit_modrm_base_disp32(dst, base, disp);
     }
 
     /// `Jcc label` — conditional near jump (32-bit displacement).

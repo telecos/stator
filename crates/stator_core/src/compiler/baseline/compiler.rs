@@ -6378,8 +6378,8 @@ pub use jit_runtime::{
 
 #[cfg(all(target_arch = "x86_64", unix))]
 pub use jit_runtime::{
-    jit_runtime_fill_array_ic_r15, jit_runtime_inline_load_keyed_smi_ic_r15, probe_jsvalue_layout,
-    ArrayIcInfo, JsValueLayout,
+    ArrayIcInfo, JsValueLayout, jit_runtime_fill_array_ic_r15,
+    jit_runtime_inline_load_keyed_smi_ic_r15, probe_jsvalue_layout,
 };
 
 /// A single entry in the safepoint table.
@@ -9476,6 +9476,8 @@ fn negate_cc(cc: CondCode) -> CondCode {
         CondCode::NotEqual => CondCode::Equal,
         // Overflow is never used in compare-branch fusion.
         CondCode::Overflow => CondCode::Overflow,
+        CondCode::AboveEq => CondCode::Below,
+        CondCode::Below => CondCode::AboveEq,
     }
 }
 

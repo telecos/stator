@@ -134,6 +134,15 @@ const MONO_OFF_BA: i32 = 24;
 #[cfg(all(target_arch = "x86_64", unix))]
 const MONO_OFF_REGSLOTS: i32 = 32;
 
+/// Lazily probed [`JsValue`] byte layout, cached for the lifetime of the
+/// process.  Used by the inline array-access fast path.
+#[cfg(all(target_arch = "x86_64", unix))]
+fn cached_jsvalue_layout() -> &'static jit_runtime::JsValueLayout {
+    use std::sync::OnceLock;
+    static LAYOUT: OnceLock<jit_runtime::JsValueLayout> = OnceLock::new();
+    LAYOUT.get_or_init(jit_runtime::probe_jsvalue_layout)
+}
+
 /// A stub call argument that is either a Maglev IR node or an immediate i64.
 #[cfg(all(target_arch = "x86_64", unix))]
 enum NodeOrImm {
@@ -655,6 +664,27 @@ impl<'a> MaglevCodegen<'a> {
             mono_call_cache_bytes
         };
         let needs_r15 = mono_call_sites > 0 || has_keyed_sites;
+        // Array IC: 24 bytes (3 × i64).  Place it after the mono cache
+        // area on the stack.  Rounded up so the combined reservation
+        // stays a multiple of 16.
+        let array_ic_bytes: i32 = if has_keyed_sites { 24 } else { 0 };
+        let total_cache_bytes = {
+            let raw = mono_call_cache_bytes + array_ic_bytes;
+            if raw == 0 { 0 } else { (raw + 15) & !15 }
+        };
+        // IC base is addressed relative to RBP.  After callee-saved
+        // pushes, RSP = RBP − 40.  The cache area starts at RSP after
+        // `sub rsp, total_cache_bytes`, i.e. at RBP − 40 − total_cache_bytes.
+        // The array IC sits at the *end* of the cache reservation, right
+        // after the mono call cache.  Since the total is padded to 16,
+        // the 24-byte IC may have up to 8 bytes of padding after it.
+        //
+        // From RBP:  -(48 + mono_call_cache_bytes)  …  -(48 + mono_call_cache_bytes + 24)
+        let array_ic_base: i32 = if has_keyed_sites {
+            -(48 + mono_call_cache_bytes)
+        } else {
+            0
+        };
         Self {
             graph,
             alloc,
@@ -679,6 +709,8 @@ impl<'a> MaglevCodegen<'a> {
             next_mono_cache_site: 0,
             needs_r15,
             deferred_branches: Vec::new(),
+            array_ic_base,
+            total_cache_bytes,
         }
     }
 
@@ -810,13 +842,14 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.mov_rr(Reg64::R15, Reg64::Rax);
         }
 
-        // Allocate monomorphic call-cache slots (kept as a multiple of
-        // 16, so RSP alignment is preserved: still ≡ 8 mod 16).
-        if self.mono_call_cache_bytes > 0 {
-            self.masm.sub_ri(Reg64::Rsp, self.mono_call_cache_bytes);
-            // Zero all cache slots (callee field = 0 → empty).
+        // Allocate cache slots on the stack: monomorphic call caches +
+        // array IC.  The total is kept a multiple of 16, so RSP alignment
+        // is preserved (still ≡ 8 mod 16).
+        if self.total_cache_bytes > 0 {
+            self.masm.sub_ri(Reg64::Rsp, self.total_cache_bytes);
+            // Zero all slots (callee field = 0 → empty, IC handle = 0 → miss).
             self.masm.xor_rr(Reg64::R11, Reg64::R11);
-            let slots = self.mono_call_cache_bytes / 8;
+            let slots = self.total_cache_bytes / 8;
             for i in 0..slots {
                 self.masm
                     .mov_store_base_disp32(Reg64::Rsp, i * 8, Reg64::R11);
@@ -840,8 +873,8 @@ impl<'a> MaglevCodegen<'a> {
     /// ret
     /// ```
     fn emit_normal_epilogue(&mut self) {
-        if self.mono_call_cache_bytes > 0 {
-            self.masm.add_ri(Reg64::Rsp, self.mono_call_cache_bytes);
+        if self.total_cache_bytes > 0 {
+            self.masm.add_ri(Reg64::Rsp, self.total_cache_bytes);
         }
         self.masm.pop(Reg64::R15);
         self.masm.pop(Reg64::R12);
@@ -899,8 +932,8 @@ impl<'a> MaglevCodegen<'a> {
 
         // Common exit — RAX already set, just restore and return.
         self.masm.bind_label(&mut self.deopt_common_label);
-        if self.mono_call_cache_bytes > 0 {
-            self.masm.add_ri(Reg64::Rsp, self.mono_call_cache_bytes);
+        if self.total_cache_bytes > 0 {
+            self.masm.add_ri(Reg64::Rsp, self.total_cache_bytes);
         }
         self.masm.pop(Reg64::R15);
         self.masm.pop(Reg64::R12);
@@ -3688,77 +3721,176 @@ impl<'a> MaglevCodegen<'a> {
         self.emit_store(id, Reg64::Rax);
     }
 
-    /// Emit an inline fast-path for keyed **load** when the key is a
-    /// known integer.
+    /// Emit a **true-inline** fast path for keyed array load when the key
+    /// is a non-negative Smi integer.
+    ///
+    /// ## Fast path (≈15 x86 instructions, ZERO function calls)
+    ///
+    /// Uses a 3-slot monomorphic inline cache on the JIT stack
+    /// (`[handle, data_ptr, len]` at `array_ic_base` from RBP).
+    ///
     /// ```text
-    ///   save live regs
-    ///   load obj → RDI, key → RSI
-    ///   push RSI; push RDI          // save args for fallback
-    ///   call inline_load_keyed_smi  // → RAX = value, RDX = hit
-    ///   test RDX, RDX
-    ///   je   slow_path
-    ///   add  RSP, 16                // discard saved args
+    ///   mov  R11, <object>           ; load heap handle
+    ///   mov  R10, <key>              ; load Smi index
+    ///   cmp  R11, [RBP + ic_handle]  ; IC check: same array?
+    ///   jne  slow_path
+    ///   cmp  R10, [RBP + ic_len]     ; unsigned bounds check
+    ///   jae  slow_path
+    ///   mov  R11, [RBP + ic_data]    ; cached Vec data pointer
+    ///   imul R10, R10, 24            ; index × sizeof(JsValue)
+    ///   add  R11, R10                ; element address
+    ///   movzx RAX, byte [R11+disc]   ; load discriminant
+    ///   cmp  AL, smi_disc            ; → Smi?
+    ///   je   load_smi
+    ///   cmp  AL, bool_disc           ; → Boolean?
+    ///   je   load_bool
+    ///   cmp  AL, undef_disc          ; → undefined?
+    ///   je   load_undef
+    ///   cmp  AL, null_disc           ; → null?
+    ///   je   load_null
+    ///   jmp  slow_path               ; other type (String, Object, …)
+    /// load_smi:
+    ///   movsxd RAX, dword [R11+pay]  ; sign-extend i32 payload
+    ///   jmp  done
+    /// load_bool:
+    ///   movzx RAX, byte [R11+pay]    ; zero-extend bool payload
+    ///   and   RAX, 1
+    ///   add   RAX, JIT_FALSE         ; 0→JIT_FALSE, 1→JIT_TRUE
+    ///   jmp  done
+    /// load_undef:
+    ///   mov  RAX, JIT_UNDEFINED
+    ///   jmp  done
+    /// load_null:
+    ///   mov  RAX, JIT_NULL
     ///   jmp  done
     /// slow_path:
-    ///   pop  RDI; pop RSI           // restore args
-    ///   call lda_keyed_property
+    ///   <save live regs>
+    ///   call jit_runtime_inline_load_keyed_smi_ic_r15  (fills IC + loads)
+    ///   <check hit → on miss call generic stub>
+    ///   <restore live regs>
+    ///   <deopt check>
     /// done:
-    ///   restore live regs
-    ///   deopt check
     ///   store result
     /// ```
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_load_keyed_smi(&mut self, id: NodeId, object: NodeId, key: NodeId) {
-        let saved = self.emit_save_live_regs(id);
+        let layout = cached_jsvalue_layout();
+        let ic_base = self.array_ic_base;
+        let ic_off_handle = ic_base;
+        let ic_off_data = ic_base + 8;
+        let ic_off_len = ic_base + 16;
 
-        // Load arguments into ABI registers.
-        self.emit_load(object, Reg64::Rdi);
-        self.emit_load(key, Reg64::Rsi);
-
-        // Save args for the potential fallback (2 pushes = 16 bytes,
-        // preserves 16-byte stack alignment).
-        self.masm.push(Reg64::Rsi);
-        self.masm.push(Reg64::Rdi);
-
-        // Call the lean inline helper: returns {value, hit} in RAX:RDX.
-        // When R15 holds the RT_PTRS cell address, pass it as the 3rd
-        // argument (RDX) to skip the TLS lookup in the inline helper.
-        if self.needs_r15 {
-            self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
-            let inline_addr =
-                jit_runtime::jit_runtime_inline_load_keyed_smi_r15 as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, inline_addr as i64);
-        } else {
-            let inline_addr = jit_runtime::jit_runtime_inline_load_keyed_smi as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, inline_addr as i64);
-        }
-        self.masm.call_reg(Reg64::R11);
-
-        // Check hit flag (RDX).
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
-        self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
-        self.masm.je(&mut slow_label);
+        let mut load_smi = Label::new();
+        let mut load_bool = Label::new();
+        let mut load_undef = Label::new();
+        let mut load_null = Label::new();
 
-        // ── Fast path: inline helper handled it ──
-        // Discard the saved args and jump to common exit.
-        self.masm.add_ri(Reg64::Rsp, 16);
+        // ── Fast path (scratch regs only: R11, R10, RAX) ────────────
+
+        // Load object and key into scratch registers.
+        // R10/R11 are never allocated by regalloc, so no conflict.
+        self.emit_load(object, Reg64::R11);
+        self.emit_load(key, Reg64::R10);
+
+        // IC hit check: is this the same array handle?
+        self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, ic_off_handle);
+        self.masm.jne(&mut slow_label);
+
+        // Unsigned bounds check: key < cached length.
+        // Since key is a sign-extended Smi, negative values appear as
+        // very large unsigned numbers → caught by JAE.
+        self.masm.cmp_rm(Reg64::R10, Reg64::Rbp, ic_off_len);
+        self.masm.jcc(CondCode::AboveEq, &mut slow_label);
+
+        // Load cached data pointer.
+        self.masm
+            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_data);
+
+        // Compute element address: R11 + R10 * sizeof(JsValue).
+        self.masm
+            .imul_rri(Reg64::R10, Reg64::R10, layout.jsvalue_size as i32);
+        self.masm.add_rr(Reg64::R11, Reg64::R10);
+
+        // Load discriminant byte.
+        self.masm
+            .movzx_byte_base_disp32(Reg64::Rax, Reg64::R11, layout.disc_offset as i32);
+
+        // Dispatch on discriminant.
+        self.masm.cmp_ri(Reg64::Rax, layout.smi_disc as i32);
+        self.masm.je(&mut load_smi);
+        self.masm.cmp_ri(Reg64::Rax, layout.bool_disc as i32);
+        self.masm.je(&mut load_bool);
+        self.masm.cmp_ri(Reg64::Rax, layout.undef_disc as i32);
+        self.masm.je(&mut load_undef);
+        self.masm.cmp_ri(Reg64::Rax, layout.null_disc as i32);
+        self.masm.je(&mut load_null);
+        // Unknown discriminant (String, Object, …) → slow path.
+        self.masm.jmp(&mut slow_label);
+
+        // ── load_smi: sign-extend i32 payload ───────────────────────
+        self.masm.bind_label(&mut load_smi);
+        self.masm
+            .movsxd_base_disp32(Reg64::Rax, Reg64::R11, layout.smi_payload_offset as i32);
         self.masm.jmp(&mut done_label);
 
-        // ── Slow path: fall back to the generic stub ──
+        // ── load_bool: zero-extend bool, encode as JIT_FALSE/JIT_TRUE ─
+        self.masm.bind_label(&mut load_bool);
+        self.masm
+            .movzx_byte_base_disp32(Reg64::Rax, Reg64::R11, layout.bool_payload_offset as i32);
+        self.masm.and_ri(Reg64::Rax, 1);
+        self.masm.add_ri(Reg64::Rax, JIT_FALSE as i32);
+        self.masm.jmp(&mut done_label);
+
+        // ── load_undef ──────────────────────────────────────────────
+        self.masm.bind_label(&mut load_undef);
+        self.masm.mov_ri(Reg64::Rax, JIT_UNDEFINED);
+        self.masm.jmp(&mut done_label);
+
+        // ── load_null ───────────────────────────────────────────────
+        self.masm.bind_label(&mut load_null);
+        self.masm.mov_ri(Reg64::Rax, JIT_NULL);
+        self.masm.jmp(&mut done_label);
+
+        // ── Slow path: IC miss / non-inlineable type ────────────────
         self.masm.bind_label(&mut slow_label);
-        self.masm.pop(Reg64::Rdi); // restore object
-        self.masm.pop(Reg64::Rsi); // restore key
+        let saved = self.emit_save_live_regs(id);
+
+        // Set up ABI args for jit_runtime_inline_load_keyed_smi_ic_r15:
+        //   RDI = obj, RSI = key, RDX = rt_ptrs (R15), RCX = &ic_slots
+        self.emit_load(object, Reg64::Rdi);
+        self.emit_load(key, Reg64::Rsi);
+        self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
+        self.masm.lea_base_disp32(Reg64::Rcx, Reg64::Rbp, ic_base);
+
+        let ic_fill_addr =
+            jit_runtime::jit_runtime_inline_load_keyed_smi_ic_r15 as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, ic_fill_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        // Result: RAX = value, RDX = hit flag.
+        let mut generic_label = Label::new();
+        self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
+        self.masm.je(&mut generic_label);
+        // IC-fill hit: RAX has the encoded value, jump to exit.
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+        self.masm.jmp(&mut done_label);
+
+        // ── Generic fallback ────────────────────────────────────────
+        self.masm.bind_label(&mut generic_label);
+        self.emit_load(object, Reg64::Rdi);
+        self.emit_load(key, Reg64::Rsi);
         let stub_addr = jit_runtime::jit_runtime_lda_keyed_property as *const () as usize;
         self.masm.mov_ri(Reg64::R11, stub_addr as i64);
         self.masm.call_reg(Reg64::R11);
 
-        // ── Common exit ──
-        self.masm.bind_label(&mut done_label);
         self.emit_restore_live_regs(saved);
-        // Deopt check: harmless on fast path (RAX is always valid);
-        // catches JIT_DEOPT from the generic stub on the slow path.
         self.emit_deopt_check_rax();
+
+        // ── Common exit ─────────────────────────────────────────────
+        self.masm.bind_label(&mut done_label);
         self.emit_store(id, Reg64::Rax);
     }
 
@@ -3826,6 +3958,14 @@ impl<'a> MaglevCodegen<'a> {
 
         // ── Common exit ──
         self.masm.bind_label(&mut done_label);
+        // Invalidate the array IC: a store may have caused a Vec
+        // reallocation (push/splice), making the cached data_ptr stale.
+        // Zeroing the handle slot forces a re-fill on the next load.
+        if self.array_ic_base != 0 {
+            self.masm.xor_rr(Reg64::R11, Reg64::R11);
+            self.masm
+                .mov_store_base_disp32(Reg64::Rbp, self.array_ic_base, Reg64::R11);
+        }
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
         self.emit_store(id, Reg64::Rax);
@@ -4547,6 +4687,8 @@ impl<'a> MaglevCodegen<'a> {
             CondCode::Greater => CondCode::LessEq,
             // Overflow is never used in compare-branch fusion.
             CondCode::Overflow => CondCode::Overflow,
+            CondCode::AboveEq => CondCode::Below,
+            CondCode::Below => CondCode::AboveEq,
         }
     }
 
