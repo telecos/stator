@@ -791,7 +791,8 @@ impl<'a> MaglevCodegen<'a> {
         // + JO, eliminating the extra MOVSXD.
         self.i32_range = Self::compute_i32_range(self.graph);
         self.smi_guarded = Self::compute_smi_guarded(self.graph, &self.i32_range);
-        self.narrow_int32 = Self::compute_narrow_int32(self.graph, self.alloc, &self.i32_range);
+        self.narrow_int32 =
+            Self::compute_narrow_int32(self.graph, self.alloc, &self.i32_range, &self.smi_guarded);
 
         self.emit_prologue();
         self.emit_promoted_global_loads();
@@ -3390,7 +3391,9 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.add32_rr(Reg64::Rax, Reg64::R10);
             self.masm
                 .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+            if !self.narrow_int32.contains(&id) {
+                self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+            }
             self.emit_store(id, Reg64::Rax);
             return;
         }
@@ -3450,7 +3453,9 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.sub32_rr(Reg64::Rax, Reg64::R10);
             self.masm
                 .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+            if !self.narrow_int32.contains(&id) {
+                self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+            }
             self.emit_store(id, Reg64::Rax);
             return;
         }
@@ -3508,7 +3513,9 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.imul32_rr(Reg64::Rax, Reg64::R10);
             self.masm
                 .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+            if !self.narrow_int32.contains(&id) {
+                self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+            }
             self.emit_store(id, Reg64::Rax);
             return;
         }
@@ -3699,7 +3706,9 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.add32_ri(Reg64::Rax, 1);
             self.masm
                 .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+            if !self.narrow_int32.contains(&id) {
+                self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+            }
             self.emit_store(id, Reg64::Rax);
             return;
         }
@@ -3747,7 +3756,9 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.sub32_ri(Reg64::Rax, 1);
             self.masm
                 .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+            if !self.narrow_int32.contains(&id) {
+                self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+            }
             self.emit_store(id, Reg64::Rax);
             return;
         }
@@ -3797,7 +3808,9 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.sub32_rr(Reg64::Rax, Reg64::R10);
             self.masm
                 .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+            if !self.narrow_int32.contains(&id) {
+                self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+            }
             self.emit_store(id, Reg64::Rax);
             return;
         }
@@ -5119,6 +5132,40 @@ impl<'a> MaglevCodegen<'a> {
         }
     }
 
+    /// Returns `true` when `node` is a smi_guarded Generic arithmetic op
+    /// that will be emitted with 32-bit ALU instructions + JO, producing
+    /// a zero-extended 32-bit result.
+    fn is_smi_guarded_producer(node: &ValueNode, smi_guarded: &HashSet<NodeId>) -> bool {
+        match node {
+            ValueNode::GenericAdd { left, right, .. }
+            | ValueNode::GenericSubtract { left, right, .. }
+            | ValueNode::GenericMultiply { left, right, .. } => {
+                smi_guarded.contains(left) && smi_guarded.contains(right)
+            }
+            ValueNode::GenericIncrement { value, .. }
+            | ValueNode::GenericDecrement { value, .. }
+            | ValueNode::GenericNegate { value, .. } => smi_guarded.contains(value),
+            _ => false,
+        }
+    }
+
+    /// Returns `true` when `node` is a smi_guarded Generic arithmetic op
+    /// that only reads the lower 32 bits of its operands (because it uses
+    /// 32-bit ALU instructions in its smi_guarded path).
+    fn is_smi_guarded_consumer(node: &ValueNode, smi_guarded: &HashSet<NodeId>) -> bool {
+        match node {
+            ValueNode::GenericAdd { left, right, .. }
+            | ValueNode::GenericSubtract { left, right, .. }
+            | ValueNode::GenericMultiply { left, right, .. } => {
+                smi_guarded.contains(left) && smi_guarded.contains(right)
+            }
+            ValueNode::GenericIncrement { value, .. }
+            | ValueNode::GenericDecrement { value, .. }
+            | ValueNode::GenericNegate { value, .. } => smi_guarded.contains(value),
+            _ => false,
+        }
+    }
+
     /// Returns `true` when `node` only reads the lower 32 bits of its
     /// `NodeId` operands, meaning upstream producers can skip sign-extension.
     ///
@@ -5743,14 +5790,17 @@ impl<'a> MaglevCodegen<'a> {
         graph: &MaglevGraph,
         _alloc: &AllocationResult,
         i32_range: &HashSet<NodeId>,
+        smi_guarded: &HashSet<NodeId>,
     ) -> HashSet<NodeId> {
         // Step 1: collect all wrapping Int32 producer IDs AND i32-range
-        // CheckedSmi operations (they produce 32-bit results when narrowed).
+        // CheckedSmi operations AND smi_guarded Generic ops (they all
+        // produce 32-bit results when narrowed).
         let mut candidates: HashSet<NodeId> = HashSet::new();
         for block in graph.blocks() {
             for (id, node) in &block.nodes {
                 if Self::is_wrapping_int32_producer(node)
                     || Self::is_i32_range_checked_producer(node, i32_range)
+                    || Self::is_smi_guarded_producer(node, smi_guarded)
                 {
                     candidates.insert(*id);
                 }
@@ -5807,9 +5857,11 @@ impl<'a> MaglevCodegen<'a> {
                         // known i32-valued (wrapping int32 producers, i32
                         // constants, or other narrow Phis that we will verify
                         // in the iterative step).
-                        let all_i32 = inputs
-                            .iter()
-                            .all(|inp| candidates.contains(inp) || i32_range.contains(inp));
+                        let all_i32 = inputs.iter().all(|inp| {
+                            candidates.contains(inp)
+                                || i32_range.contains(inp)
+                                || smi_guarded.contains(inp)
+                        });
                         if all_i32 {
                             narrow_phi.insert(*id);
                         }
@@ -5831,6 +5883,9 @@ impl<'a> MaglevCodegen<'a> {
                             || node_lookup
                                 .get(c)
                                 .is_some_and(|n| Self::is_i32_range_checked_producer(n, i32_range))
+                            || node_lookup
+                                .get(c)
+                                .is_some_and(|n| Self::is_smi_guarded_consumer(n, smi_guarded))
                             || narrow_phi.contains(c)
                             // StoreGlobal is narrow-compatible for Phis:
                             // codegen sign-extends on the cold exit path.
@@ -5859,6 +5914,7 @@ impl<'a> MaglevCodegen<'a> {
             for (id, node) in &block.nodes {
                 let skip = Self::is_narrow_int32_consumer(node)
                     || Self::is_i32_range_checked_producer(node, i32_range)
+                    || Self::is_smi_guarded_consumer(node, smi_guarded)
                     || narrow_phi.contains(id)
                     || matches!(node, ValueNode::StoreGlobal { value, .. }
                         if narrow_phi.contains(value));
@@ -6223,7 +6279,8 @@ mod tests {
     fn narrow_set(graph: &MaglevGraph) -> HashSet<NodeId> {
         let alloc = allocate(graph, NUM_PHYS_REGS);
         let i32_range = MaglevCodegen::compute_i32_range(graph);
-        MaglevCodegen::compute_narrow_int32(graph, &alloc, &i32_range)
+        let smi_guarded = MaglevCodegen::compute_smi_guarded(graph, &i32_range);
+        MaglevCodegen::compute_narrow_int32(graph, &alloc, &i32_range, &smi_guarded)
     }
 
     #[test]
