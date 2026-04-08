@@ -753,7 +753,7 @@ fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_secs(5)
+        && warmup_start.elapsed() < std::time::Duration::from_millis(500)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -820,7 +820,7 @@ fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_secs(5)
+        && warmup_start.elapsed() < std::time::Duration::from_millis(500)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -864,7 +864,7 @@ fn bench_property_access_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_secs(5)
+        && warmup_start.elapsed() < std::time::Duration::from_millis(500)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -915,7 +915,7 @@ fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_secs(5)
+        && warmup_start.elapsed() < std::time::Duration::from_millis(500)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -962,7 +962,7 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_secs(5)
+        && warmup_start.elapsed() < std::time::Duration::from_millis(500)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -1010,7 +1010,7 @@ fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_secs(5)
+        && warmup_start.elapsed() < std::time::Duration::from_millis(500)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -1060,7 +1060,7 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_secs(5)
+        && warmup_start.elapsed() < std::time::Duration::from_millis(500)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -1115,7 +1115,7 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_secs(5)
+        && warmup_start.elapsed() < std::time::Duration::from_millis(500)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -1159,7 +1159,7 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_secs(5)
+        && warmup_start.elapsed() < std::time::Duration::from_millis(500)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
