@@ -4796,30 +4796,85 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, off_callee);
         self.masm.jne(&mut cache_miss);
 
-        // ── Mono HIT: fused prepare + call + finish ─────────────────
-        // A single Rust function call does context swap, callee
-        // invocation, and state restoration — eliminating 2 extra
-        // function calls and the Maglev-upgrade check on the hot path.
+        // ── Mono HIT: prepare + direct x86 call + finish ────────────
+        // Instead of routing through a single Rust trampoline that
+        // internally calls the entry point (extra FFI boundary), we
+        // call a lightweight prepare function, then jump directly to
+        // the callee's entry point from x86, then finish.  This
+        // avoids the `[0i64; 16]` Rust-stack alloc + the ≤2-slot
+        // skip applies to the hot path too.
         //
-        // Args (SysV AMD64):
-        //   RDI = entry_point   (from cache)
-        //   RSI = ba_ptr        (from cache)
-        //   RDX = cached_ctx_ptr(from cache)
-        //   RCX = rt_ptrs_cell  (R15)
-        //   R8  = reg_slots     (from cache)
-        //   R9  = callee_i64    (R11)
-        self.masm.mov_rr(Reg64::R9, Reg64::R11); // arg5 = callee (before R11 is clobbered)
-        self.masm
-            .mov_load_base_disp32(Reg64::Rdi, Reg64::Rbp, off_entry);
+        // Step 1: prepare (BA save, heap base, context swap)
+        self.masm.mov_rr(Reg64::R9, Reg64::R11); // save callee in R9
+        self.masm.mov_rr(Reg64::Rdi, Reg64::R11); // arg0 = callee
         self.masm
             .mov_load_base_disp32(Reg64::Rsi, Reg64::Rbp, off_ba);
         self.masm
             .mov_load_base_disp32(Reg64::Rdx, Reg64::Rbp, off_ctx);
-        self.masm.mov_rr(Reg64::Rcx, Reg64::R15);
+        let prepare_addr = jit_runtime::jit_runtime_mono_call_prepare as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, prepare_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        // Check success (RAX != 0).
+        let mut hit_fallback = Label::new();
+        self.masm.test_rr(Reg64::Rax, Reg64::Rax);
+        self.masm.je(&mut hit_fallback);
+
+        // Step 2: Allocate register file on x86 stack + direct call.
+        // Load cached values into scratch regs.
         self.masm
-            .mov_load_base_disp32(Reg64::R8, Reg64::Rbp, off_regslots);
-        let dispatch_addr = jit_runtime::jit_runtime_mono_dispatch_call_0_r15 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, dispatch_addr as i64);
+            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, off_entry); // entry point
+        self.masm
+            .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, off_ctx); // ctx ptr
+        self.masm
+            .mov_load_base_disp32(Reg64::R8, Reg64::Rbp, off_regslots); // reg_slots
+
+        // Allocate 128-byte register file (fixed size for ABI compat).
+        self.masm.sub_ri(Reg64::Rsp, 128);
+
+        // Zero callee's register-file slots.  For small frames (≤ 2
+        // slots, e.g. closures) skip zeroing — the callee overwrites
+        // all slots before reading.
+        let mut hit_zero_done = Label::new();
+        self.masm.cmp_ri(Reg64::R8, 2);
+        self.masm.jcc(CondCode::LessEq, &mut hit_zero_done);
+
+        // Large frame: zero with rep stosq.
+        self.masm.push(Reg64::R10);
+        self.masm.push(Reg64::R11);
+        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+        self.masm.mov_rr(Reg64::Rcx, Reg64::R8);
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
+        self.masm.add_ri(Reg64::Rdi, 16);
+        self.masm.rep_stosq();
+        self.masm.pop(Reg64::R11);
+        self.masm.pop(Reg64::R10);
+
+        self.masm.bind_label(&mut hit_zero_done);
+
+        // RDI = register file, RSI = ctx_ptr.
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+
+        // CALL entry point directly — no Rust intermediary!
+        self.masm.call_reg(Reg64::R11);
+
+        // Deallocate register file.
+        self.masm.add_ri(Reg64::Rsp, 128);
+
+        // Step 3: finish (restore BA, truncate heap, restore context).
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R15);
+        let finish_addr = jit_runtime::jit_runtime_finish_direct_call_r15 as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, finish_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.masm.jmp(&mut done_label);
+
+        // prepare returned 0 → fall through to stub fallback.
+        self.masm.bind_label(&mut hit_fallback);
+        self.masm.mov_rr(Reg64::Rdi, Reg64::R9); // callee
+        let stub_addr2 = jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, stub_addr2 as i64);
         self.masm.call_reg(Reg64::R11);
         self.masm.jmp(&mut done_label);
 
