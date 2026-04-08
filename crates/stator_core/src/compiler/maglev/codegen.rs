@@ -487,8 +487,9 @@ fn count_mono_call_sites(graph: &MaglevGraph) -> i32 {
     count
 }
 
-/// Check whether the graph contains any keyed array access nodes that
-/// benefit from having the `RT_PTRS` TLS cell address cached in R15.
+/// Check whether the graph contains any keyed array access or named
+/// property access nodes that benefit from having the `RT_PTRS` TLS
+/// cell address cached in R15.
 fn has_keyed_access_sites(graph: &MaglevGraph) -> bool {
     for block in graph.blocks() {
         for (_nid, node) in &block.nodes {
@@ -501,6 +502,7 @@ fn has_keyed_access_sites(graph: &MaglevGraph) -> bool {
                     | ValueNode::LoadHoleyFixedDoubleArrayElement { .. }
                     | ValueNode::StoreFixedArrayElement { .. }
                     | ValueNode::StoreFixedDoubleArrayElement { .. }
+                    | ValueNode::LoadNamedGeneric { .. }
             ) {
                 return true;
             }
@@ -625,6 +627,7 @@ impl<'a> MaglevCodegen<'a> {
                             | ValueNode::LoadHoleyFixedDoubleArrayElement { .. }
                             | ValueNode::StoreFixedArrayElement { .. }
                             | ValueNode::StoreFixedDoubleArrayElement { .. }
+                            | ValueNode::LoadNamedGeneric { .. }
                     );
                 }
             }
@@ -1707,21 +1710,16 @@ impl<'a> MaglevCodegen<'a> {
 
             // ── Property access via runtime stubs ─────────────────────────────
             //
-            // These delegate to the baseline JIT's runtime stubs.  We save and
-            // restore all caller-saved allocatable registers around the call.
+            // LoadNamedGeneric uses an inline IC fast path: a lean helper
+            // probes the own-property and prototype ICs without a full stub
+            // call.  On miss, falls back to the generic stub.
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::LoadNamedGeneric {
                 object,
                 name,
                 feedback_slot,
             } => {
-                self.emit_stub_call_3arg(
-                    id,
-                    *object,
-                    i64::from(*name),
-                    NodeOrImm::Imm(i64::from(*feedback_slot)),
-                    jit_runtime::jit_runtime_lda_named_property as *const () as usize,
-                );
+                self.emit_inline_load_named(id, *object, *name, *feedback_slot);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::StoreNamedGeneric {
@@ -3588,6 +3586,93 @@ impl<'a> MaglevCodegen<'a> {
 
         self.masm.bind_label(&mut done_label);
         self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Emit an inline fast-path for **named property load** using the
+    /// IC fast path.
+    ///
+    /// ```text
+    ///   save live regs
+    ///   load obj → RDI; mov name_idx → RSI
+    ///   push R11; push RDX; push RSI; push RDI  // save args + padding
+    ///   call inline_lda_named_property           // → RAX = value, RDX = hit
+    ///   test RDX, RDX
+    ///   je   slow_path
+    ///   add  RSP, 32                             // discard saved args + padding
+    ///   jmp  done
+    /// slow_path:
+    ///   pop  RDI; pop RSI; pop RDX; pop R11      // restore args + discard padding
+    ///   call jit_runtime_lda_named_property
+    /// done:
+    ///   restore live regs; deopt check; store result
+    /// ```
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_inline_load_named(
+        &mut self,
+        id: NodeId,
+        object: NodeId,
+        name: u32,
+        feedback_slot: u32,
+    ) {
+        let saved = self.emit_save_live_regs(id);
+
+        // Load arguments into ABI registers.
+        self.emit_load(object, Reg64::Rdi);
+        self.masm.mov_ri(Reg64::Rsi, i64::from(name));
+
+        // Save args for the potential fallback.  Four pushes (32 bytes)
+        // preserves 16-byte stack alignment (RSP ≡ 0 mod 16 after
+        // emit_save_live_regs).  We save feedback_slot since the generic
+        // stub needs it in RDX.
+        self.masm.mov_ri(Reg64::Rdx, i64::from(feedback_slot));
+        self.masm.push(Reg64::R11); // alignment padding
+        self.masm.push(Reg64::Rdx); // feedback_slot
+        self.masm.push(Reg64::Rsi); // name_idx
+        self.masm.push(Reg64::Rdi); // object
+
+        // Call the lean inline helper: returns {value, hit} in RAX:RDX.
+        // When R15 holds the RT_PTRS cell address, pass it as the 3rd
+        // argument (RDX) to skip the TLS lookup in the inline helper.
+        if self.needs_r15 {
+            self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
+            let inline_addr =
+                jit_runtime::jit_runtime_inline_lda_named_property_r15 as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, inline_addr as i64);
+        } else {
+            let inline_addr =
+                jit_runtime::jit_runtime_inline_lda_named_property as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, inline_addr as i64);
+        }
+        self.masm.call_reg(Reg64::R11);
+
+        // Check hit flag (RDX).
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+        self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
+        self.masm.je(&mut slow_label);
+
+        // ── Fast path: inline helper handled it ──
+        // Discard the saved args (4 × 8 = 32 bytes) and jump to common exit.
+        self.masm.add_ri(Reg64::Rsp, 32);
+        self.masm.jmp(&mut done_label);
+
+        // ── Slow path: fall back to the full generic stub ──
+        self.masm.bind_label(&mut slow_label);
+        self.masm.pop(Reg64::Rdi); // restore object
+        self.masm.pop(Reg64::Rsi); // restore name_idx
+        self.masm.pop(Reg64::Rdx); // restore feedback_slot
+        self.masm.pop(Reg64::R11); // discard alignment padding
+        let stub_addr = jit_runtime::jit_runtime_lda_named_property as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        // ── Common exit ──
+        self.masm.bind_label(&mut done_label);
+        self.emit_restore_live_regs(saved);
+        // Deopt check: harmless on fast path (RAX is always valid);
+        // catches JIT_DEOPT from the generic stub on the slow path.
         self.emit_deopt_check_rax();
         self.emit_store(id, Reg64::Rax);
     }

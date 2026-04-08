@@ -1678,7 +1678,7 @@ pub(crate) mod jit_runtime {
             // own-property or prototype IC hit for plain objects.
             let arr_ic = RT_ARRAY_METHOD_IC.with(|c| c.get());
             if arr_ic.receiver == obj_i64 && arr_ic.name_idx == name_idx && arr_ic.method != 0 {
-                return Some(Ok(arr_ic.method));
+                return Some(arr_ic.method);
             }
 
             // IC miss or non-PlainObject — need a proper clone for the
@@ -4539,11 +4539,7 @@ pub(crate) mod jit_runtime {
     /// when the result can be encoded without allocating a new heap
     /// handle (primitives, or heap objects whose cached handle is still
     /// valid).
-    fn inline_lda_named_with_ptrs(
-        obj_i64: i64,
-        name_idx: u32,
-        ptrs: RtPtrs,
-    ) -> InlineNamedResult {
+    fn inline_lda_named_with_ptrs(obj_i64: i64, name_idx: u32, ptrs: RtPtrs) -> InlineNamedResult {
         if !is_heap_handle(obj_i64) || !ptrs.is_cached() {
             return InlineNamedResult::MISS;
         }
@@ -4579,11 +4575,9 @@ pub(crate) mod jit_runtime {
                 // (primitives and heap objects with a valid cached
                 // handle).  Anything else needs the full stub for
                 // heap-handle allocation.
-                if let Some(result) = try_encode_ic_inline(
-                    val,
-                    ic_entry.cached_ptr,
-                    ic_entry.cached_handle,
-                ) {
+                if let Some(result) =
+                    try_encode_ic_inline(val, ic_entry.cached_ptr, ic_entry.cached_handle)
+                {
                     return InlineNamedResult {
                         value: result,
                         hit: 1,
