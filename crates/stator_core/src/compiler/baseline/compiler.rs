@@ -5171,15 +5171,18 @@ pub(crate) mod jit_runtime {
             return InlineKeyedResult::MISS;
         }
         // Decode value inline for common types only.
+        // Check booleans first — hot path for sieve-like patterns where
+        // every element is `true`/`false`, avoiding the wider Smi range
+        // comparison on each store.
         if is_heap_handle(value_i64) {
             return InlineKeyedResult::MISS;
         }
-        let value = if value_i64 >= i32::MIN as i64 && value_i64 <= i32::MAX as i64 {
-            JsValue::Smi(value_i64 as i32)
-        } else if value_i64 == JIT_TRUE {
+        let value = if value_i64 == JIT_TRUE {
             JsValue::Boolean(true)
         } else if value_i64 == JIT_FALSE {
             JsValue::Boolean(false)
+        } else if value_i64 >= i32::MIN as i64 && value_i64 <= i32::MAX as i64 {
+            JsValue::Smi(value_i64 as i32)
         } else if value_i64 == JIT_UNDEFINED {
             JsValue::Undefined
         } else {
@@ -5213,7 +5216,13 @@ pub(crate) mod jit_runtime {
     }
 
     /// Inline store with array growth and IC update.  Handles both
-    /// in-bounds and out-of-bounds stores in one call.
+    /// in-bounds and out-of-bounds stores in a single call.
+    ///
+    /// When growth is needed the Vec is pre-extended to its full
+    /// capacity (filled with `TheHole`) so that subsequent Maglev
+    /// inline IC checks (`key < cached_len`) succeed without calling
+    /// back into Rust.  This turns O(n) IC misses during sequential
+    /// fills (e.g. `for (i=0;i<=n;i++) arr[i]=v`) into O(log n).
     fn inline_store_keyed_grow_ic_with_ptrs(
         obj_i64: i64,
         smi_key: i64,
@@ -5227,12 +5236,14 @@ pub(crate) mod jit_runtime {
         if is_heap_handle(value_i64) {
             return InlineKeyedResult::MISS;
         }
-        let value = if value_i64 >= i32::MIN as i64 && value_i64 <= i32::MAX as i64 {
-            JsValue::Smi(value_i64 as i32)
-        } else if value_i64 == JIT_TRUE {
+        // Decode value — check booleans first (hot for sieve-like
+        // patterns) to avoid the wider Smi range comparison.
+        let value = if value_i64 == JIT_TRUE {
             JsValue::Boolean(true)
         } else if value_i64 == JIT_FALSE {
             JsValue::Boolean(false)
+        } else if value_i64 >= i32::MIN as i64 && value_i64 <= i32::MAX as i64 {
+            JsValue::Smi(value_i64 as i32)
         } else if value_i64 == JIT_UNDEFINED {
             JsValue::Undefined
         } else {
@@ -5250,16 +5261,30 @@ pub(crate) mod jit_runtime {
             Some(JsValue::Array(arr)) => {
                 // SAFETY: single-threaded JIT; no concurrent borrows.
                 let v = unsafe { &mut *arr.as_ptr() };
-                if key >= v.len() {
-                    // Grow the array with power-of-2 capacity.
-                    let new_cap = (key + 1).next_power_of_two();
-                    v.reserve(new_cap.saturating_sub(v.len()));
-                    v.resize(key + 1, JsValue::TheHole);
+                if key < v.len() {
+                    // Fast in-bounds store.
+                    v[key] = value;
+                } else {
+                    // Out-of-bounds — grow allocation if needed.
+                    if key >= v.capacity() {
+                        let new_cap = (key + 1).next_power_of_two();
+                        v.reserve(new_cap.saturating_sub(v.len()));
+                    }
+                    // Pre-extend to full capacity with TheHole so that
+                    // the Maglev inline IC can service all subsequent
+                    // stores up to this capacity without another FFI
+                    // call.  The cost is O(cap) TheHole writes, but it
+                    // happens only O(log n) times (at each power-of-2
+                    // boundary).
+                    let cap = v.capacity();
+                    v.resize(cap, JsValue::TheHole);
+                    v[key] = value;
                 }
-                v[key] = value;
 
                 // Update caller's IC slots so subsequent x86 inline
-                // checks can succeed with the new data pointer and length.
+                // checks can succeed with the new data pointer and
+                // length.  After pre-extend, len == capacity, so the
+                // inline IC will accept every key < capacity.
                 if ic_ptr != 0 {
                     // SAFETY: ic_ptr points to 4 writable i64s on the
                     // caller's stack frame (Maglev-generated code).
@@ -5611,25 +5636,52 @@ pub(crate) mod jit_runtime {
         // TLS slot lives for the thread's entire lifetime.
         let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
 
-        // Fill the IC opportunistically (even when the element itself
-        // cannot be inlined — the IC is for subsequent fast-path hits).
-        if is_heap_handle(obj_i64) && ptrs.is_cached() {
+        // Combined IC fill + element load: resolve the heap handle once
+        // and reuse the array reference for both the IC update and the
+        // element access, avoiding a redundant second heap resolution.
+        if is_heap_handle(obj_i64) && smi_key >= 0 && ptrs.is_cached() {
             let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
             // SAFETY: cached pointers valid for thread lifetime.
             let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
             if let Some(JsValue::Array(arr)) = heap.get(obj_idx) {
                 // SAFETY: single-threaded JIT; no concurrent borrows.
                 let data = unsafe { &*arr.as_ptr() };
+                // Fill IC for subsequent fast-path hits.
                 unsafe {
                     (*ic_slots)[0] = obj_i64;
                     (*ic_slots)[1] = data.as_ptr() as i64;
                     (*ic_slots)[2] = data.len() as i64;
                     (*ic_slots)[3] = arr.as_ptr() as *const Vec<JsValue> as i64;
                 }
+                // Element load — reuse the already-resolved `data` ref.
+                let key = smi_key as usize;
+                return match data.get(key) {
+                    Some(JsValue::Boolean(b)) => InlineKeyedResult {
+                        value: if *b { JIT_TRUE } else { JIT_FALSE },
+                        hit: 1,
+                    },
+                    Some(JsValue::Smi(n)) => InlineKeyedResult {
+                        value: i64::from(*n),
+                        hit: 1,
+                    },
+                    Some(JsValue::Undefined) => InlineKeyedResult {
+                        value: JIT_UNDEFINED,
+                        hit: 1,
+                    },
+                    Some(JsValue::Null) => InlineKeyedResult {
+                        value: JIT_NULL,
+                        hit: 1,
+                    },
+                    Some(JsValue::TheHole) | None => InlineKeyedResult {
+                        value: JIT_UNDEFINED,
+                        hit: 1,
+                    },
+                    _ => InlineKeyedResult::MISS,
+                };
             }
         }
 
-        // Perform the actual element load.
+        // Fallback for non-array receiver or uncached pointers.
         inline_load_keyed_with_ptrs(obj_i64, smi_key, ptrs)
     }
 
