@@ -161,7 +161,9 @@ pub(crate) mod jit_runtime {
     use crate::bytecode::bytecode_array::JitExecutableCode;
     use crate::interpreter::GlobalEnv;
     use crate::objects::map::PropertyAttributes;
-    use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
+    use crate::objects::property_map::{
+        INTERNAL_PROTO_PROPERTY_KEY, PropertyMap, recycle_object_rc,
+    };
     use crate::objects::value::{JsContext, JsValue, NativeIterator};
 
     /// One slot of the own-property inline cache for `LdaNamedProperty`.
@@ -476,7 +478,7 @@ pub(crate) mod jit_runtime {
         cache_rt_ptrs();
         let ba_ptr = ba as *const BytecodeArray;
         RT_BYTECODE.with(|b| b.set(ba_ptr));
-        RT_HEAP.with(|h| h.borrow_mut().clear());
+        recycle_and_clear_heap();
         // Only reset the property and array-method ICs when the function
         // changes.  Re-entrant calls to the same BytecodeArray (e.g.
         // criterion iterations) keep warm IC state, saving ~190ns per
@@ -532,7 +534,7 @@ pub(crate) mod jit_runtime {
     /// benefit from warm IC state.
     pub fn jit_runtime_teardown() {
         RT_BYTECODE.with(|b| b.set(std::ptr::null()));
-        RT_HEAP.with(|h| h.borrow_mut().clear());
+        recycle_and_clear_heap();
         // Property IC and array-method IC deliberately kept warm —
         // cleared only when the BytecodeArray changes in jit_runtime_setup.
         RT_PTRS.with(|p| p.set(RtPtrs::EMPTY));
@@ -547,6 +549,32 @@ pub(crate) mod jit_runtime {
     }
 
     // ── Heap-handle helpers ──────────────────────────────────────────────
+
+    /// Drain the JIT heap, recycling `PlainObject` `Rc` wrappers into the
+    /// thread-local object pool for reuse by future allocations.
+    fn recycle_and_clear_heap() {
+        RT_HEAP.with(|h| {
+            let mut heap = h.borrow_mut();
+            for val in heap.drain(..) {
+                if let JsValue::PlainObject(rc) = val {
+                    recycle_object_rc(rc);
+                }
+            }
+        });
+    }
+
+    /// Truncate the JIT heap back to `base`, recycling `PlainObject` `Rc`
+    /// wrappers from the truncated region.
+    fn recycle_and_truncate_heap(base: usize) {
+        RT_HEAP.with(|h| {
+            let mut heap = h.borrow_mut();
+            for val in heap.drain(base..) {
+                if let JsValue::PlainObject(rc) = val {
+                    recycle_object_rc(rc);
+                }
+            }
+        });
+    }
 
     /// Returns `true` if `v` is a heap-object handle.
     #[inline]
@@ -2411,7 +2439,7 @@ pub(crate) mod jit_runtime {
 
         // Fast path: non-heap results survive truncation unchanged.
         if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
-            RT_HEAP.with(|h| h.borrow_mut().truncate(heap_base));
+            recycle_and_truncate_heap(heap_base);
             RT_CONTEXT.with(|c| *c.borrow_mut() = saved_ctx);
             return Some(jit_result);
         }
@@ -2422,7 +2450,7 @@ pub(crate) mod jit_runtime {
             jit_to_jsvalue_ext(jit_result)
         };
 
-        RT_HEAP.with(|h| h.borrow_mut().truncate(heap_base));
+        recycle_and_truncate_heap(heap_base);
         RT_CONTEXT.with(|c| *c.borrow_mut() = saved_ctx);
 
         result_val.map(jsvalue_to_jit_i64)
@@ -2512,7 +2540,7 @@ pub(crate) mod jit_runtime {
         RT_BYTECODE.with(|b| b.set(saved_ba));
 
         if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
-            RT_HEAP.with(|h| h.borrow_mut().truncate(heap_base));
+            recycle_and_truncate_heap(heap_base);
             RT_CONTEXT.with(|c| *c.borrow_mut() = saved_ctx);
             return Some(jit_result);
         }
@@ -2522,7 +2550,7 @@ pub(crate) mod jit_runtime {
         } else {
             jit_to_jsvalue_ext(jit_result)
         };
-        RT_HEAP.with(|h| h.borrow_mut().truncate(heap_base));
+        recycle_and_truncate_heap(heap_base);
         RT_CONTEXT.with(|c| *c.borrow_mut() = saved_ctx);
         result_val.map(jsvalue_to_jit_i64)
     }
@@ -2770,16 +2798,26 @@ pub(crate) mod jit_runtime {
                             return Some(jit_result);
                         }
 
-                        let result_val = if jit_result == JIT_DEOPT {
-                            None
+                        if jit_result == JIT_DEOPT {
+                            // Callee Maglev deopted — mark + invalidate,
+                            // then fall through to baseline/interpreter so
+                            // the CALLER is not forced to deopt.
+                            ba.mark_jit_maglev_deopted();
+                            *maglev_cache.borrow_mut() = None;
+                            unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                            if let Some(ctx) = saved_ctx {
+                                // SAFETY: no active borrows; restore context.
+                                unsafe { *ctx_ref.as_ptr() = ctx };
+                            }
+                            // Fall through to baseline JIT / interpreter.
                         } else {
-                            jit_to_jsvalue_ext(jit_result)
-                        };
-                        unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
-                        if let Some(ctx) = saved_ctx {
-                            unsafe { *ctx_ref.as_ptr() = ctx };
+                            let result_val = jit_to_jsvalue_ext(jit_result);
+                            unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                            if let Some(ctx) = saved_ctx {
+                                unsafe { *ctx_ref.as_ptr() = ctx };
+                            }
+                            return result_val.map(jsvalue_to_jit_i64);
                         }
-                        return result_val.map(jsvalue_to_jit_i64);
                     }
                 }
 
@@ -2831,18 +2869,26 @@ pub(crate) mod jit_runtime {
                         return Some(jit_result);
                     }
 
-                    let result_val = if jit_result == JIT_DEOPT {
-                        None
+                    if jit_result == JIT_DEOPT {
+                        // Callee baseline JIT deopted — mark it and
+                        // fall through to interpreter so the CALLER
+                        // is not forced to deopt.
+                        ba.mark_jit_baseline_deopted();
+                        // SAFETY: no active heap borrows.
+                        unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                        if let Some(ctx) = saved_ctx {
+                            unsafe { *ctx_ref.as_ptr() = ctx };
+                        }
+                        // Fall through to interpreter below.
                     } else {
-                        jit_to_jsvalue_ext(jit_result)
-                    };
-
-                    // SAFETY: no active heap borrows.
-                    unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
-                    if let Some(ctx) = saved_ctx {
-                        unsafe { *ctx_ref.as_ptr() = ctx };
+                        let result_val = jit_to_jsvalue_ext(jit_result);
+                        // SAFETY: no active heap borrows.
+                        unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                        if let Some(ctx) = saved_ctx {
+                            unsafe { *ctx_ref.as_ptr() = ctx };
+                        }
+                        return result_val.map(jsvalue_to_jit_i64);
                     }
-                    return result_val.map(jsvalue_to_jit_i64);
                 }
 
                 // No JIT code at all: reconstruct Rc and use full path.
@@ -5540,10 +5586,10 @@ pub(crate) mod jit_runtime {
     ///
     /// The hot path (cached template hit) avoids redundant TLS lookups by
     /// reusing the [`RtPtrs`] fetched at entry for the subsequent heap
-    /// allocation.  Combined with the buffer-pool-free
-    /// [`ObjectLiteralTemplate::instantiate`] this reduces per-object
-    /// overhead to: one TLS read, one template-cache probe, one
-    /// `Rc`+`RefCell` allocation, and one heap-vec push.
+    /// allocation.  Combined with the pooled `Rc<RefCell<PropertyMap>>`
+    /// recycling this achieves **zero** per-object heap allocations on
+    /// repeated calls: one TLS read, one template-cache probe, one pool
+    /// pop + in-place reinitialise, and one heap-vec push.
     fn fast_create_object_literal_inner(feedback_slot: i64, capacity: i64) -> Option<i64> {
         let capacity = capacity.max(4) as usize;
 
@@ -5562,17 +5608,16 @@ pub(crate) mod jit_runtime {
                 // BytecodeArray.
                 let ba_ref = unsafe { &*ba };
 
-                // Fast path: clone a previously cached template.
-                // Reuse `ptrs` for heap allocation to skip a second
-                // `RT_PTRS.with()` call.
-                if let Some(map) = ba_ref.clone_object_literal_template(slot) {
-                    let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                // Fast path: clone a previously cached template,
+                // reusing a pooled Rc<RefCell<PropertyMap>> wrapper.
+                if let Some(rc) = ba_ref.clone_object_literal_template_pooled(slot) {
+                    let obj = JsValue::PlainObject(rc);
                     return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
                 }
 
                 // Second execution: promote pending → cached.
-                if let Some(map) = ba_ref.promote_object_literal_template(slot) {
-                    let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                if let Some(rc) = ba_ref.promote_object_literal_template_pooled(slot) {
+                    let obj = JsValue::PlainObject(rc);
                     return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
                 }
 
@@ -5661,19 +5706,20 @@ pub(crate) mod jit_runtime {
                 let ba_ref = unsafe { &*ba };
 
                 // ── Hot path: template cached, values pre-filled ──
-                let js_values = decode_jit_values(count, &vals);
-                if let Some(map) = ba_ref.clone_object_literal_template_with_values(slot, js_values)
+                // Decode to a stack array to avoid a Vec allocation.
+                let js_values = decode_jit_values_array(count, &vals);
+                if let Some(rc) = ba_ref
+                    .clone_object_literal_template_with_values_pooled(slot, &js_values[..count])
                 {
-                    let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                    let obj = JsValue::PlainObject(rc);
                     return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
                 }
 
                 // ── Promote path (second execution) ──
-                let js_values = decode_jit_values(count, &vals);
-                if let Some(map) =
-                    ba_ref.promote_object_literal_template_with_values(slot, js_values)
+                if let Some(rc) = ba_ref
+                    .promote_object_literal_template_with_values_pooled(slot, &js_values[..count])
                 {
-                    let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                    let obj = JsValue::PlainObject(rc);
                     return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
                 }
 
@@ -5740,6 +5786,17 @@ pub(crate) mod jit_runtime {
         let mut out = Vec::with_capacity(count);
         for &v in &vals[..count] {
             out.push(decode_one_jit_value(v));
+        }
+        out
+    }
+
+    /// Decode up to 3 JIT `i64` register values into a stack-allocated
+    /// array, avoiding a `Vec` heap allocation on the fused hot path.
+    #[inline]
+    fn decode_jit_values_array(count: usize, vals: &[i64; 3]) -> [JsValue; 3] {
+        let mut out = [JsValue::Undefined, JsValue::Undefined, JsValue::Undefined];
+        for i in 0..count.min(3) {
+            out[i] = decode_one_jit_value(vals[i]);
         }
         out
     }

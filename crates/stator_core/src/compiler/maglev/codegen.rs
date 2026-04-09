@@ -5095,8 +5095,18 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.mov_ri(Reg64::R11, dispatch_addr as i64);
         self.masm.call_reg(Reg64::R11);
 
-        // RAX = callee result or JIT_DEOPT.  Jump to done (deopt
-        // check happens in the common tail after `done_label`).
+        // If callee JIT returned JIT_DEOPT, fall back to the runtime
+        // stub (which runs the interpreter) instead of deopting the
+        // CALLER.
+        self.masm.cmp_ri(Reg64::Rax, i32::MIN);
+        self.masm.jcc(CondCode::GreaterEq, &mut done_label);
+        // Callee deopt: reload callee from mono cache and call stub.
+        self.masm
+            .mov_load_base_disp32(Reg64::Rdi, Reg64::Rbp, off_callee);
+        let mono_retry_addr =
+            jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, mono_retry_addr as i64);
+        self.masm.call_reg(Reg64::R11);
         self.masm.jmp(&mut done_label);
 
         // ── Cache miss: full jit_runtime_get_jit_entry path ─────────
@@ -5198,6 +5208,21 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.mov_ri(Reg64::R11, finish_addr as i64);
         self.masm.call_reg(Reg64::R11);
 
+        // If callee JIT returned JIT_DEOPT, fall back to runtime stub
+        // instead of deopting the CALLER.
+        self.masm.cmp_ri(Reg64::Rax, i32::MIN);
+        let mut miss_ok = Label::new();
+        self.masm.jcc(CondCode::GreaterEq, &mut miss_ok);
+        // Callee deopt: callee_i64 is still on the stack.
+        self.masm.pop(Reg64::Rdi); // callee
+        self.masm.add_ri(Reg64::Rsp, 8); // discard padding
+        let miss_retry_addr =
+            jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, miss_retry_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.masm.jmp(&mut done_label);
+
+        self.masm.bind_label(&mut miss_ok);
         // Pop saved callee + padding.
         self.masm.add_ri(Reg64::Rsp, 16);
         self.masm.jmp(&mut done_label);
@@ -5280,6 +5305,21 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.mov_ri(Reg64::R11, finish_addr as i64);
         self.masm.call_reg(Reg64::R11);
 
+        // If callee JIT returned JIT_DEOPT, fall back to runtime stub
+        // instead of deopting the CALLER.
+        self.masm.cmp_ri(Reg64::Rax, i32::MIN);
+        let mut fast_ok = Label::new();
+        self.masm.jcc(CondCode::GreaterEq, &mut fast_ok);
+        // Callee deopt: callee + arg0 still on stack.
+        self.masm.pop(Reg64::Rdi); // callee
+        self.masm.pop(Reg64::Rsi); // arg0
+        let fast_retry_addr =
+            jit_runtime::jit_runtime_call_undefined_receiver1 as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, fast_retry_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.masm.jmp(&mut done_label);
+
+        self.masm.bind_label(&mut fast_ok);
         // Pop saved values.
         self.masm.add_ri(Reg64::Rsp, 16);
         self.masm.jmp(&mut done_label);
@@ -5365,6 +5405,23 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.mov_ri(Reg64::R11, finish_addr as i64);
         self.masm.call_reg(Reg64::R11);
 
+        // If callee JIT returned JIT_DEOPT, fall back to runtime stub
+        // instead of deopting the CALLER.
+        self.masm.cmp_ri(Reg64::Rax, i32::MIN);
+        let mut fast_ok2 = Label::new();
+        self.masm.jcc(CondCode::GreaterEq, &mut fast_ok2);
+        // Callee deopt: stack still has [padding, callee, arg0, arg1].
+        self.masm.pop(Reg64::R11); // padding
+        self.masm.pop(Reg64::Rdi); // callee
+        self.masm.pop(Reg64::Rsi); // arg0
+        self.masm.pop(Reg64::Rdx); // arg1
+        let fast2_retry_addr =
+            jit_runtime::jit_runtime_call_undefined_receiver2 as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, fast2_retry_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.masm.jmp(&mut done_label);
+
+        self.masm.bind_label(&mut fast_ok2);
         self.masm.add_ri(Reg64::Rsp, 32); // pop 4 saved values
         self.masm.jmp(&mut done_label);
 
