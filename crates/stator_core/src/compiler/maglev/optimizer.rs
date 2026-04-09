@@ -2428,9 +2428,12 @@ fn has_side_effects(node: &ValueNode) -> bool {
             | ValueNode::FastCreateClosure { .. }
             | ValueNode::CreateEmptyObjectLiteral
             | ValueNode::CreateEmptyArrayLiteral { .. }
-            | ValueNode::CreateMappedArguments
-            | ValueNode::CreateUnmappedArguments
-            | ValueNode::CreateRestParameter
+            // NOTE: CreateMappedArguments, CreateUnmappedArguments, and
+            // CreateRestParameter are intentionally NOT listed here.
+            // They are pure allocations: if nothing consumes the result
+            // (i.e. the function never references `arguments`), DCE can
+            // safely eliminate them.  This avoids an unconditional deopt
+            // in codegen for closures that don't use `arguments`.
             | ValueNode::CreateRegExpLiteral { .. }
             // Guards deoptimise on failure — side-effecting.
             | ValueNode::CheckSmi { .. }
