@@ -1124,6 +1124,29 @@ impl PropertyMap {
         generation
     }
 
+    /// Like [`proto_generation`] but accepts a pre-read global epoch so that
+    /// callers that already obtained the epoch (e.g. after a failed
+    /// `probe_epoch`) do not redundantly read the thread-local a second time.
+    #[inline]
+    pub fn proto_generation_with_epoch(&self, global_epoch: u64) -> u32 {
+        if self.proto_global_epoch.get() == global_epoch {
+            return self.proto_generation.get();
+        }
+
+        let inherited_generation = self
+            .get(INTERNAL_PROTO_PROPERTY_KEY)
+            .or_else(|| self.get(USER_VISIBLE_PROTO_PROPERTY_KEY))
+            .and_then(|value| match value {
+                JsValue::PlainObject(proto) => Some(proto.borrow().proto_generation()),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let generation = self.proto_epoch.get().wrapping_add(inherited_generation);
+        self.proto_generation.set(generation);
+        self.proto_global_epoch.set(global_epoch);
+        generation
+    }
+
     /// Returns the global epoch used to invalidate prototype-dependent caches.
     #[inline]
     pub fn global_proto_mutation_epoch() -> u64 {

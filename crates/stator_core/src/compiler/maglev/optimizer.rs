@@ -139,6 +139,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
     fuse_object_literal_stores(graph);
+    replace_dead_arguments(graph);
     eliminate_dead_code(graph);
 }
 
@@ -1991,6 +1992,32 @@ fn fuse_object_literal_stores_in_block(block: &mut BasicBlock) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Pass 3 — Dead-code elimination
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Replace dead `CreateMapped/UnmappedArguments` and `CreateRestParameter`
+/// nodes with cheap [`ValueNode::UndefinedConstant`] placeholders.
+///
+/// Unlike full DCE (which **removes** nodes), this pass **replaces** the node
+/// in-place, preserving graph structure (node count, positions, register
+/// allocation).  This avoids a known issue where node removal changes
+/// interference patterns in the register allocator, triggering latent bugs
+/// on Linux in release mode.
+fn replace_dead_arguments(graph: &mut MaglevGraph) {
+    let live = collect_live_ids(graph);
+
+    for block in graph.blocks_mut() {
+        for (id, node) in &mut block.nodes {
+            if matches!(
+                node,
+                ValueNode::CreateMappedArguments
+                    | ValueNode::CreateUnmappedArguments
+                    | ValueNode::CreateRestParameter
+            ) && !live.contains(id)
+            {
+                *node = ValueNode::UndefinedConstant;
+            }
+        }
+    }
+}
 
 /// Remove `ValueNode`s that are never used and have no observable side-effects.
 ///
