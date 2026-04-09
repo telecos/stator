@@ -15,7 +15,7 @@ use smallvec::{SmallVec, smallvec};
 
 use crate::builtins::string::{string_char_at, utf16_len};
 use crate::objects::map::PropertyAttributes;
-use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
+use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap, recycle_object_rc};
 
 use super::{
     ACTIVE_DEBUGGER, CallArgs, GlobalEnv, INLINE_BYTECODE_THRESHOLD, Interpreter, InterpreterFrame,
@@ -603,7 +603,11 @@ fn handle_star(ctx: &mut DispatchContext, instr: &Instruction) -> StatorResult<D
         return Err(err_bad_operand("Star", 0));
     };
     let val = ctx.frame.accumulator.cheap_clone();
-    ctx.frame.write_reg(v, val)?;
+    let idx = ctx.frame.reg_index(v)?;
+    let old = std::mem::replace(&mut ctx.frame.registers[idx], val);
+    if let JsValue::PlainObject(rc) = old {
+        recycle_object_rc(rc);
+    }
     Ok(DispatchAction::Continue)
 }
 
@@ -3462,7 +3466,13 @@ fn handle_sta_current_context_slot(
     if slot >= borrowed.slots.len() {
         borrowed.slots.resize(slot + 1, JsValue::Undefined);
     }
-    borrowed.slots[slot] = ctx.frame.accumulator.cheap_clone();
+    let old = std::mem::replace(
+        &mut borrowed.slots[slot],
+        ctx.frame.accumulator.cheap_clone(),
+    );
+    if let JsValue::PlainObject(rc) = old {
+        recycle_object_rc(rc);
+    }
     Ok(DispatchAction::Continue)
 }
 
@@ -5676,17 +5686,21 @@ fn handle_create_object_literal(
 
     if let Some(slot) = slot {
         // Fast path: clone a previously cached template.
-        if let Some(map) = ctx.frame.bytecode_array.clone_object_literal_template(slot) {
-            ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+        if let Some(rc) = ctx
+            .frame
+            .bytecode_array
+            .clone_object_literal_template_pooled(slot)
+        {
+            ctx.frame.accumulator = JsValue::PlainObject(rc);
             return Ok(DispatchAction::Continue);
         }
         // Second execution: promote pending first-instance to cached template.
-        if let Some(map) = ctx
+        if let Some(rc) = ctx
             .frame
             .bytecode_array
-            .promote_object_literal_template(slot)
+            .promote_object_literal_template_pooled(slot)
         {
-            ctx.frame.accumulator = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+            ctx.frame.accumulator = JsValue::PlainObject(rc);
             return Ok(DispatchAction::Continue);
         }
         // First execution: create normally and record as pending.

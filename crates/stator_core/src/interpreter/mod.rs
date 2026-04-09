@@ -199,7 +199,7 @@ use crate::error::{StatorError, StatorResult};
 use crate::inspector::debugger::Debugger;
 use crate::objects::map::PropertyAttributes;
 use crate::objects::nanbox::NanBoxedValue;
-use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap};
+use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap, recycle_object_rc};
 use crate::objects::string_intern::intern;
 use crate::objects::value::{JsContext, JsValue};
 
@@ -2764,6 +2764,28 @@ impl InterpreterFrame {
         *unsafe { self.registers.get_unchecked_mut(idx) } = value;
     }
 
+    /// Replace the register value and return the old one, without bounds
+    /// checks.
+    ///
+    /// Used by the `Star` hot path to capture the outgoing value for
+    /// object-pool recycling.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`write_reg_unchecked`](Self::write_reg_unchecked).
+    #[inline(always)]
+    unsafe fn swap_reg_unchecked(&mut self, reg: u32, value: JsValue) -> JsValue {
+        let signed = reg as i32;
+        let idx = if signed >= 0 {
+            self.bytecode_array.parameter_count() as usize + signed as usize
+        } else {
+            (-(signed + 1)) as usize
+        };
+        debug_assert!(idx < self.registers.len());
+        // SAFETY: The caller guarantees `reg` maps to an in-bounds register.
+        std::mem::replace(unsafe { self.registers.get_unchecked_mut(idx) }, value)
+    }
+
     /// Copy a value from register `src` to register `dst` directly,
     /// avoiding the intermediate borrow that `read_reg` + `write_reg`
     /// would require.
@@ -3404,7 +3426,12 @@ impl Interpreter {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
                                 let idx = frame.reg_flat_index_unchecked(reg);
                                 let val = materialize_acc!();
-                                unsafe { frame.write_reg_unchecked(reg, val) };
+                                // Swap out old value so we can recycle its Rc
+                                // if it was a sole-owner PlainObject.
+                                let old = unsafe { frame.swap_reg_unchecked(reg, val) };
+                                if let JsValue::PlainObject(rc) = old {
+                                    recycle_object_rc(rc);
+                                }
                                 if let Some(nb) = hot_acc
                                     && let Some(ref mut hr) = frame.hot_registers
                                 {
@@ -4973,7 +5000,13 @@ impl Interpreter {
                                     if slot >= borrow.slots.len() {
                                         borrow.slots.resize(slot + 1, JsValue::Undefined);
                                     }
-                                    borrow.slots[slot] = materialize_acc!();
+                                    let old_val = std::mem::replace(
+                                        &mut borrow.slots[slot],
+                                        materialize_acc!(),
+                                    );
+                                    if let JsValue::PlainObject(rc) = old_val {
+                                        recycle_object_rc(rc);
+                                    }
                                     continue 'smi;
                                 }
                                 acc = materialize_acc!();
@@ -7023,7 +7056,11 @@ impl Interpreter {
                             if slot >= borrowed.slots.len() {
                                 borrowed.slots.resize(slot + 1, JsValue::Undefined);
                             }
-                            borrowed.slots[slot] = acc.cheap_clone();
+                            let old_val =
+                                std::mem::replace(&mut borrowed.slots[slot], acc.cheap_clone());
+                            if let JsValue::PlainObject(rc) = old_val {
+                                recycle_object_rc(rc);
+                            }
                             continue 'dispatch;
                         }
                         // Fall through to table dispatch.

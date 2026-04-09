@@ -81,7 +81,6 @@ const MAX_POOLED_PROPERTY_CAPACITY: usize = SMALL_PROPERTY_LINEAR_SCAN_CAP * 4;
 /// Maximum number of `Rc<RefCell<PropertyMap>>` wrappers kept in the
 /// per-thread object pool.  Sized to accommodate hot loops that create
 /// many short-lived objects (e.g. 1000-iteration benchmarks).
-#[cfg(all(target_arch = "x86_64", unix))]
 const OBJECT_RC_POOL_CAP: usize = 1024;
 
 thread_local! {
@@ -398,7 +397,6 @@ pub(crate) fn acquire_object_rc_from_template_cached(
 /// calls can reuse the `Rc` control-block and `PropertyMap` allocations.
 /// The `Rc` is pooled only if it is the **sole owner**
 /// (`strong_count == 1`) and the pool has capacity.
-#[cfg(all(target_arch = "x86_64", unix))]
 pub(crate) fn recycle_object_rc(rc: Rc<RefCell<PropertyMap>>) {
     if Rc::strong_count(&rc) != 1 {
         return;
