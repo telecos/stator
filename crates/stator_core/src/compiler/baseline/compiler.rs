@@ -5515,8 +5515,6 @@ pub(crate) mod jit_runtime {
     }
 
     impl InlineKeyedResult {
-        const MISS: Self = Self { value: 0, hit: 0 };
-
         /// Wraps an `Option<i64>` from a full generic stub into a result.
         /// `Some(v)` → hit, `None` → `JIT_DEOPT`.
         #[inline(always)]
