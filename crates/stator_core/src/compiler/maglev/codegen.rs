@@ -3804,25 +3804,90 @@ impl<'a> MaglevCodegen<'a> {
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_sub(&mut self, id: NodeId, left: NodeId, right: NodeId) {
         if self.i32_range.contains(&left) && self.i32_range.contains(&right) {
-            self.emit_load(left, Reg64::Rax);
-            self.emit_load(right, Reg64::R10);
-            self.masm.sub_rr(Reg64::Rax, Reg64::R10);
-            self.emit_store(id, Reg64::Rax);
-            self.rax_holds = Some(id);
+            match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    let dst = phys_reg(n);
+                    let right_in_dst = left != right
+                        && matches!(
+                            self.alloc.location(right),
+                            Some(Location::Register(rn)) if phys_reg(rn) == dst
+                        );
+                    if right_in_dst {
+                        self.emit_load(right, Reg64::R10);
+                        self.emit_load(left, dst);
+                        self.masm.sub_rr(dst, Reg64::R10);
+                    } else {
+                        self.emit_load(left, dst);
+                        match self.alloc.location(right) {
+                            Some(Location::Register(rn)) if phys_reg(rn) != dst => {
+                                self.masm.sub_rr(dst, phys_reg(rn));
+                            }
+                            _ => {
+                                self.emit_load(right, Reg64::R10);
+                                self.masm.sub_rr(dst, Reg64::R10);
+                            }
+                        }
+                    }
+                    self.rax_holds = None;
+                }
+                _ => {
+                    self.emit_load(left, Reg64::Rax);
+                    self.emit_load(right, Reg64::R10);
+                    self.masm.sub_rr(Reg64::Rax, Reg64::R10);
+                    self.emit_store(id, Reg64::Rax);
+                    self.rax_holds = Some(id);
+                }
+            }
             return;
         }
 
         if self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right) {
-            self.emit_load(left, Reg64::Rax);
-            self.emit_load(right, Reg64::R10);
-            self.masm.sub32_rr(Reg64::Rax, Reg64::R10);
-            self.masm
-                .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-            if !self.narrow_int32.contains(&id) {
-                self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+            let narrow = self.narrow_int32.contains(&id);
+            match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    let dst = phys_reg(n);
+                    // SUB is not commutative — right must not clobber dst.
+                    let right_in_dst = left != right
+                        && matches!(
+                            self.alloc.location(right),
+                            Some(Location::Register(rn)) if phys_reg(rn) == dst
+                        );
+                    if right_in_dst {
+                        self.emit_load(right, Reg64::R10);
+                        self.emit_load(left, dst);
+                        self.masm.sub32_rr(dst, Reg64::R10);
+                    } else {
+                        self.emit_load(left, dst);
+                        match self.alloc.location(right) {
+                            Some(Location::Register(rn)) if phys_reg(rn) != dst => {
+                                self.masm.sub32_rr(dst, phys_reg(rn));
+                            }
+                            _ => {
+                                self.emit_load(right, Reg64::R10);
+                                self.masm.sub32_rr(dst, Reg64::R10);
+                            }
+                        }
+                    }
+                    self.masm
+                        .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
+                    if !narrow {
+                        self.masm.movsxd_sign_extend(dst, dst);
+                    }
+                    self.rax_holds = None;
+                }
+                _ => {
+                    self.emit_load(left, Reg64::Rax);
+                    self.emit_load(right, Reg64::R10);
+                    self.masm.sub32_rr(Reg64::Rax, Reg64::R10);
+                    self.masm
+                        .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
+                    if !narrow {
+                        self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+                    }
+                    self.emit_store(id, Reg64::Rax);
+                    self.rax_holds = Some(id);
+                }
             }
-            self.emit_store(id, Reg64::Rax);
-            self.rax_holds = Some(id);
             return;
         }
 
@@ -3867,25 +3932,90 @@ impl<'a> MaglevCodegen<'a> {
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_mul(&mut self, id: NodeId, left: NodeId, right: NodeId) {
         if self.i32_range.contains(&left) && self.i32_range.contains(&right) {
-            self.emit_load(left, Reg64::Rax);
-            self.emit_load(right, Reg64::R10);
-            self.masm.imul_rr(Reg64::Rax, Reg64::R10);
-            self.emit_store(id, Reg64::Rax);
-            self.rax_holds = Some(id);
+            match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    let dst = phys_reg(n);
+                    // IMUL dst, src — result in dst (commutative).
+                    let right_in_dst = left != right
+                        && matches!(
+                            self.alloc.location(right),
+                            Some(Location::Register(rn)) if phys_reg(rn) == dst
+                        );
+                    if right_in_dst {
+                        self.emit_load(right, Reg64::R10);
+                        self.emit_load(left, dst);
+                        self.masm.imul_rr(dst, Reg64::R10);
+                    } else {
+                        self.emit_load(left, dst);
+                        match self.alloc.location(right) {
+                            Some(Location::Register(rn)) if phys_reg(rn) != dst => {
+                                self.masm.imul_rr(dst, phys_reg(rn));
+                            }
+                            _ => {
+                                self.emit_load(right, Reg64::R10);
+                                self.masm.imul_rr(dst, Reg64::R10);
+                            }
+                        }
+                    }
+                    self.rax_holds = None;
+                }
+                _ => {
+                    self.emit_load(left, Reg64::Rax);
+                    self.emit_load(right, Reg64::R10);
+                    self.masm.imul_rr(Reg64::Rax, Reg64::R10);
+                    self.emit_store(id, Reg64::Rax);
+                    self.rax_holds = Some(id);
+                }
+            }
             return;
         }
 
         if self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right) {
-            self.emit_load(left, Reg64::Rax);
-            self.emit_load(right, Reg64::R10);
-            self.masm.imul32_rr(Reg64::Rax, Reg64::R10);
-            self.masm
-                .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-            if !self.narrow_int32.contains(&id) {
-                self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+            let narrow = self.narrow_int32.contains(&id);
+            match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    let dst = phys_reg(n);
+                    let right_in_dst = left != right
+                        && matches!(
+                            self.alloc.location(right),
+                            Some(Location::Register(rn)) if phys_reg(rn) == dst
+                        );
+                    if right_in_dst {
+                        self.emit_load(right, Reg64::R10);
+                        self.emit_load(left, dst);
+                        self.masm.imul32_rr(dst, Reg64::R10);
+                    } else {
+                        self.emit_load(left, dst);
+                        match self.alloc.location(right) {
+                            Some(Location::Register(rn)) if phys_reg(rn) != dst => {
+                                self.masm.imul32_rr(dst, phys_reg(rn));
+                            }
+                            _ => {
+                                self.emit_load(right, Reg64::R10);
+                                self.masm.imul32_rr(dst, Reg64::R10);
+                            }
+                        }
+                    }
+                    self.masm
+                        .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
+                    if !narrow {
+                        self.masm.movsxd_sign_extend(dst, dst);
+                    }
+                    self.rax_holds = None;
+                }
+                _ => {
+                    self.emit_load(left, Reg64::Rax);
+                    self.emit_load(right, Reg64::R10);
+                    self.masm.imul32_rr(Reg64::Rax, Reg64::R10);
+                    self.masm
+                        .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
+                    if !narrow {
+                        self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+                    }
+                    self.emit_store(id, Reg64::Rax);
+                    self.rax_holds = Some(id);
+                }
             }
-            self.emit_store(id, Reg64::Rax);
-            self.rax_holds = Some(id);
             return;
         }
 
@@ -4110,11 +4240,40 @@ impl<'a> MaglevCodegen<'a> {
         if (self.i32_range.contains(&left) && self.i32_range.contains(&right))
             || (self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right))
         {
-            self.emit_load(left, Reg64::Rax);
-            self.emit_load(right, Reg64::R10);
-            self.masm.or_rr(Reg64::Rax, Reg64::R10);
-            self.emit_store(id, Reg64::Rax);
-            self.rax_holds = Some(id);
+            match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    let dst = phys_reg(n);
+                    let right_in_dst = left != right
+                        && matches!(
+                            self.alloc.location(right),
+                            Some(Location::Register(rn)) if phys_reg(rn) == dst
+                        );
+                    if right_in_dst {
+                        self.emit_load(right, Reg64::R10);
+                        self.emit_load(left, dst);
+                        self.masm.or_rr(dst, Reg64::R10);
+                    } else {
+                        self.emit_load(left, dst);
+                        match self.alloc.location(right) {
+                            Some(Location::Register(rn)) if phys_reg(rn) != dst => {
+                                self.masm.or_rr(dst, phys_reg(rn));
+                            }
+                            _ => {
+                                self.emit_load(right, Reg64::R10);
+                                self.masm.or_rr(dst, Reg64::R10);
+                            }
+                        }
+                    }
+                    self.rax_holds = None;
+                }
+                _ => {
+                    self.emit_load(left, Reg64::Rax);
+                    self.emit_load(right, Reg64::R10);
+                    self.masm.or_rr(Reg64::Rax, Reg64::R10);
+                    self.emit_store(id, Reg64::Rax);
+                    self.rax_holds = Some(id);
+                }
+            }
             return;
         }
 
@@ -4156,11 +4315,40 @@ impl<'a> MaglevCodegen<'a> {
         if (self.i32_range.contains(&left) && self.i32_range.contains(&right))
             || (self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right))
         {
-            self.emit_load(left, Reg64::Rax);
-            self.emit_load(right, Reg64::R10);
-            self.masm.and_rr(Reg64::Rax, Reg64::R10);
-            self.emit_store(id, Reg64::Rax);
-            self.rax_holds = Some(id);
+            match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    let dst = phys_reg(n);
+                    let right_in_dst = left != right
+                        && matches!(
+                            self.alloc.location(right),
+                            Some(Location::Register(rn)) if phys_reg(rn) == dst
+                        );
+                    if right_in_dst {
+                        self.emit_load(right, Reg64::R10);
+                        self.emit_load(left, dst);
+                        self.masm.and_rr(dst, Reg64::R10);
+                    } else {
+                        self.emit_load(left, dst);
+                        match self.alloc.location(right) {
+                            Some(Location::Register(rn)) if phys_reg(rn) != dst => {
+                                self.masm.and_rr(dst, phys_reg(rn));
+                            }
+                            _ => {
+                                self.emit_load(right, Reg64::R10);
+                                self.masm.and_rr(dst, Reg64::R10);
+                            }
+                        }
+                    }
+                    self.rax_holds = None;
+                }
+                _ => {
+                    self.emit_load(left, Reg64::Rax);
+                    self.emit_load(right, Reg64::R10);
+                    self.masm.and_rr(Reg64::Rax, Reg64::R10);
+                    self.emit_store(id, Reg64::Rax);
+                    self.rax_holds = Some(id);
+                }
+            }
             return;
         }
 
@@ -4202,11 +4390,40 @@ impl<'a> MaglevCodegen<'a> {
         if (self.i32_range.contains(&left) && self.i32_range.contains(&right))
             || (self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right))
         {
-            self.emit_load(left, Reg64::Rax);
-            self.emit_load(right, Reg64::R10);
-            self.masm.xor_rr(Reg64::Rax, Reg64::R10);
-            self.emit_store(id, Reg64::Rax);
-            self.rax_holds = Some(id);
+            match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    let dst = phys_reg(n);
+                    let right_in_dst = left != right
+                        && matches!(
+                            self.alloc.location(right),
+                            Some(Location::Register(rn)) if phys_reg(rn) == dst
+                        );
+                    if right_in_dst {
+                        self.emit_load(right, Reg64::R10);
+                        self.emit_load(left, dst);
+                        self.masm.xor_rr(dst, Reg64::R10);
+                    } else {
+                        self.emit_load(left, dst);
+                        match self.alloc.location(right) {
+                            Some(Location::Register(rn)) if phys_reg(rn) != dst => {
+                                self.masm.xor_rr(dst, phys_reg(rn));
+                            }
+                            _ => {
+                                self.emit_load(right, Reg64::R10);
+                                self.masm.xor_rr(dst, Reg64::R10);
+                            }
+                        }
+                    }
+                    self.rax_holds = None;
+                }
+                _ => {
+                    self.emit_load(left, Reg64::Rax);
+                    self.emit_load(right, Reg64::R10);
+                    self.masm.xor_rr(Reg64::Rax, Reg64::R10);
+                    self.emit_store(id, Reg64::Rax);
+                    self.rax_holds = Some(id);
+                }
+            }
             return;
         }
 
@@ -4246,23 +4463,49 @@ impl<'a> MaglevCodegen<'a> {
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_inc(&mut self, id: NodeId, value: NodeId) {
         if self.i32_range.contains(&value) {
-            self.emit_load(value, Reg64::Rax);
-            self.masm.add_ri(Reg64::Rax, 1);
-            self.emit_store(id, Reg64::Rax);
-            self.rax_holds = Some(id);
+            match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    let dst = phys_reg(n);
+                    self.emit_load(value, dst);
+                    self.masm.add_ri(dst, 1);
+                    self.rax_holds = None;
+                }
+                _ => {
+                    self.emit_load(value, Reg64::Rax);
+                    self.masm.add_ri(Reg64::Rax, 1);
+                    self.emit_store(id, Reg64::Rax);
+                    self.rax_holds = Some(id);
+                }
+            }
             return;
         }
 
         if self.smi_guarded.contains(&value) {
-            self.emit_load(value, Reg64::Rax);
-            self.masm.add32_ri(Reg64::Rax, 1);
-            self.masm
-                .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-            if !self.narrow_int32.contains(&id) {
-                self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+            let narrow = self.narrow_int32.contains(&id);
+            match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    let dst = phys_reg(n);
+                    self.emit_load(value, dst);
+                    self.masm.add32_ri(dst, 1);
+                    self.masm
+                        .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
+                    if !narrow {
+                        self.masm.movsxd_sign_extend(dst, dst);
+                    }
+                    self.rax_holds = None;
+                }
+                _ => {
+                    self.emit_load(value, Reg64::Rax);
+                    self.masm.add32_ri(Reg64::Rax, 1);
+                    self.masm
+                        .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
+                    if !narrow {
+                        self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+                    }
+                    self.emit_store(id, Reg64::Rax);
+                    self.rax_holds = Some(id);
+                }
             }
-            self.emit_store(id, Reg64::Rax);
-            self.rax_holds = Some(id);
             return;
         }
 
@@ -4299,23 +4542,49 @@ impl<'a> MaglevCodegen<'a> {
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_dec(&mut self, id: NodeId, value: NodeId) {
         if self.i32_range.contains(&value) {
-            self.emit_load(value, Reg64::Rax);
-            self.masm.sub_ri(Reg64::Rax, 1);
-            self.emit_store(id, Reg64::Rax);
-            self.rax_holds = Some(id);
+            match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    let dst = phys_reg(n);
+                    self.emit_load(value, dst);
+                    self.masm.sub_ri(dst, 1);
+                    self.rax_holds = None;
+                }
+                _ => {
+                    self.emit_load(value, Reg64::Rax);
+                    self.masm.sub_ri(Reg64::Rax, 1);
+                    self.emit_store(id, Reg64::Rax);
+                    self.rax_holds = Some(id);
+                }
+            }
             return;
         }
 
         if self.smi_guarded.contains(&value) {
-            self.emit_load(value, Reg64::Rax);
-            self.masm.sub32_ri(Reg64::Rax, 1);
-            self.masm
-                .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-            if !self.narrow_int32.contains(&id) {
-                self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+            let narrow = self.narrow_int32.contains(&id);
+            match self.alloc.location(id) {
+                Some(Location::Register(n)) => {
+                    let dst = phys_reg(n);
+                    self.emit_load(value, dst);
+                    self.masm.sub32_ri(dst, 1);
+                    self.masm
+                        .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
+                    if !narrow {
+                        self.masm.movsxd_sign_extend(dst, dst);
+                    }
+                    self.rax_holds = None;
+                }
+                _ => {
+                    self.emit_load(value, Reg64::Rax);
+                    self.masm.sub32_ri(Reg64::Rax, 1);
+                    self.masm
+                        .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
+                    if !narrow {
+                        self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+                    }
+                    self.emit_store(id, Reg64::Rax);
+                    self.rax_holds = Some(id);
+                }
             }
-            self.emit_store(id, Reg64::Rax);
-            self.rax_holds = Some(id);
             return;
         }
 
