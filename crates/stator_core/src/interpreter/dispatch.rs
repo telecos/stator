@@ -2175,7 +2175,12 @@ fn handle_tail_call(
     instr: &Instruction,
 ) -> StatorResult<DispatchAction> {
     if !ctx.frame.bytecode_array.is_strict() {
-        return handle_call_any_receiver(ctx, instr);
+        // TailCall is terminal — the callee's result must be returned to
+        // our caller, not continued past the (non-existent) next bytecode.
+        // handle_call_any_receiver sets the accumulator and returns Continue;
+        // convert that into Return so the frame unwinds correctly.
+        handle_call_any_receiver(ctx, instr)?;
+        return Ok(DispatchAction::Return(ctx.frame.accumulator.cheap_clone()));
     }
     let Operand::Register(callee_v) = *instr.operand(0) else {
         return Err(err_bad_operand("TailCall", 0));
