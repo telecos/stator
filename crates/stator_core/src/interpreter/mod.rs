@@ -1432,7 +1432,9 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
                     // SAFETY: `code` was produced by `maglev_codegen::compile`.
                     let exec = unsafe { CachedMaglevCode::new(&code, register_file_slots) };
                     *cache.borrow_mut() = exec;
-                } else {
+                } else if ba.invocation_count()
+                    >= crate::bytecode::bytecode_array::MAGLEV_TIERING_THRESHOLD
+                {
                     maybe_compile_maglev(ba);
                     MAGLEV_DIAG_NOT_READY.with(|c| c.set(c.get() + 1));
                 }

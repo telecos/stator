@@ -2599,14 +2599,12 @@ pub(crate) mod jit_runtime {
                     if let Some(result) = exec_maglev_callee(ba, maglev_exec, jit_args, saved_ba) {
                         return Some(result);
                     }
-                    // Callee Maglev deopted — increment counter and
-                    // invalidate cache.  Fall through to interpreter so
-                    // the CALLER is not forced to deopt.
+                    // Callee Maglev deopted — mark the flag so future
+                    // invocations skip JIT.  Do NOT clear the cache here:
+                    // a parent frame may still be executing the same JIT
+                    // code (recursive calls).  borrow_mut() would panic
+                    // if try_execute_maglev holds an immutable borrow.
                     ba.mark_jit_maglev_deopted();
-                    *maglev_cache.borrow_mut() = None;
-                    // NOTE: Arc is intentionally NOT cleared — the deopt
-                    // guard around lazy transfer prevents reload.  Clearing
-                    // the Arc caused SIGSEGV on process exit.
                 }
             }
         }
