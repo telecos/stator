@@ -2443,8 +2443,8 @@ fn has_side_effects(node: &ValueNode) -> bool {
             // MUST be treated as side-effecting.  Removing them via DCE changes
             // the Maglev graph shape, which alters register allocation and
             // exposes latent regalloc bugs on Linux release builds (SIGSEGV /
-            // wrong results).  Codegen already handles them as cheap no-ops
-            // when they appear in the graph.
+            // wrong results).  Codegen routes them through the runtime
+            // trampoline which creates the arguments object successfully.
             | ValueNode::CreateMappedArguments
             | ValueNode::CreateUnmappedArguments
             | ValueNode::CreateRestParameter

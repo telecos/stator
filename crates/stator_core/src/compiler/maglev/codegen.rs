@@ -2693,6 +2693,28 @@ impl<'a> MaglevCodegen<'a> {
                 );
             }
 
+            // ── Arguments objects → trampoline call ────────────────────────────
+            //
+            // Sloppy-mode functions always emit CreateMappedArguments even
+            // when `arguments` is never read.  DCE cannot remove these
+            // nodes (it exposes latent regalloc bugs), so we route them
+            // through the runtime trampoline which creates the arguments
+            // object and returns a valid heap handle.  This avoids the
+            // catch-all unconditional deopt that previously prevented ALL
+            // sloppy-mode functions from executing in Maglev.
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::CreateMappedArguments => {
+                self.emit_trampoline_call(id, Opcode::CreateMappedArguments as u8, 0, 0);
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::CreateUnmappedArguments => {
+                self.emit_trampoline_call(id, Opcode::CreateUnmappedArguments as u8, 0, 0);
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::CreateRestParameter => {
+                self.emit_trampoline_call(id, Opcode::CreateRestParameter as u8, 0, 0);
+            }
+
             // ── Unsupported nodes → unconditional deopt ───────────────────────
             #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(unused_variables))]
             _other => {

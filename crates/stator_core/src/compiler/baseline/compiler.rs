@@ -363,8 +363,35 @@ pub(crate) mod jit_runtime {
         /// is kept alive in the heap (`RT_HEAP`) for the duration of
         /// the JIT execution.  The cache is only read on the same
         /// thread and is invalidated whenever `callee_i64` changes.
-        static CACHED_CALLEE: Cell<(i64, *const BytecodeArray)> =
-            const { Cell::new((0, std::ptr::null())) };
+        static CACHED_CALLEE: Cell<CachedCalleeEntry> =
+            const { Cell::new(CachedCalleeEntry::EMPTY) };
+    }
+
+    /// Extended single-entry callee cache entry.
+    ///
+    /// Beyond the `(callee_i64, ba_ptr)` pair, this also caches the
+    /// closure context pointer, JIT entry function pointer, and
+    /// register-file slot count.  On a full cache hit with `entry_fn != 0`,
+    /// the dispatch path can bypass `ba.jit_executable_cache()`,
+    /// `ba.closure_context()`, and `exec.execute()` entirely — calling
+    /// the JIT code pointer directly.
+    #[derive(Clone, Copy)]
+    struct CachedCalleeEntry {
+        callee_i64: i64,
+        ba_ptr: *const BytecodeArray,
+        ctx_ptr: i64,
+        entry_fn: usize,
+        reg_slots: usize,
+    }
+
+    impl CachedCalleeEntry {
+        const EMPTY: Self = Self {
+            callee_i64: 0,
+            ba_ptr: std::ptr::null(),
+            ctx_ptr: 0,
+            entry_fn: 0,
+            reg_slots: 0,
+        };
     }
 
     /// Cached raw pointers to frequently-accessed TLS variables.
@@ -385,6 +412,8 @@ pub(crate) mod jit_runtime {
         /// Pointer to the `Cell<DirectCallState>` thread-local, cached
         /// so that `prepare` and `finish` avoid a second TLS lookup.
         direct_call: *const Cell<DirectCallState>,
+        /// Pointer to the `Cell<CachedCalleeEntry>` thread-local.
+        cached_callee: *const Cell<CachedCalleeEntry>,
         /// Generation counter set at cache time.  Compared against
         /// [`RT_SETUP_GEN`] before use; a mismatch forces a re-cache.
         #[allow(dead_code)]
@@ -399,6 +428,7 @@ pub(crate) mod jit_runtime {
             global: std::ptr::null(),
             prop_ic: std::ptr::null(),
             direct_call: std::ptr::null(),
+            cached_callee: std::ptr::null(),
             generation: 0,
         };
 
@@ -427,6 +457,24 @@ pub(crate) mod jit_runtime {
                 unsafe { &*self.direct_call }.get()
             } else {
                 DIRECT_CALL_STATE.with(|c| c.get())
+            }
+        }
+
+        /// Read [`CachedCalleeEntry`] via the cached pointer.
+        fn get_cached_callee(&self) -> CachedCalleeEntry {
+            if !self.cached_callee.is_null() {
+                unsafe { &*self.cached_callee }.get()
+            } else {
+                CACHED_CALLEE.with(|c| c.get())
+            }
+        }
+
+        /// Store [`CachedCalleeEntry`] via the cached pointer.
+        fn set_cached_callee(&self, entry: CachedCalleeEntry) {
+            if !self.cached_callee.is_null() {
+                unsafe { &*self.cached_callee }.set(entry);
+            } else {
+                CACHED_CALLEE.with(|c| c.set(entry));
             }
         }
     }
@@ -521,18 +569,25 @@ pub(crate) mod jit_runtime {
                     RT_GLOBAL.with(|g| {
                         RT_PROP_IC.with(|ic| {
                             DIRECT_CALL_STATE.with(|dc| {
-                                let setup_gen = RT_SETUP_GEN.with(|g| g.get());
-                                RT_PTRS.with(|p| {
-                                    p.set(RtPtrs {
-                                        heap: heap as *const RefCell<Vec<JsValue>>,
-                                        context: ctx as *const RefCell<
-                                            Option<Rc<RefCell<JsContext>>>,
-                                        >,
-                                        bytecode: bc as *const Cell<*const BytecodeArray>,
-                                        global: g as *const RefCell<JitGlobalState>,
-                                        prop_ic: ic as *const RefCell<JitPropertyIcState>,
-                                        direct_call: dc as *const Cell<DirectCallState>,
-                                        generation: setup_gen,
+                                CACHED_CALLEE.with(|cc| {
+                                    let setup_gen = RT_SETUP_GEN.with(|g| g.get());
+                                    RT_PTRS.with(|p| {
+                                        p.set(RtPtrs {
+                                            heap: heap as *const RefCell<Vec<JsValue>>,
+                                            context: ctx as *const RefCell<
+                                                Option<Rc<RefCell<JsContext>>>,
+                                            >,
+                                            bytecode: bc
+                                                as *const Cell<*const BytecodeArray>,
+                                            global: g as *const RefCell<JitGlobalState>,
+                                            prop_ic: ic
+                                                as *const RefCell<JitPropertyIcState>,
+                                            direct_call: dc
+                                                as *const Cell<DirectCallState>,
+                                            cached_callee: cc
+                                                as *const Cell<CachedCalleeEntry>,
+                                            generation: setup_gen,
+                                        });
                                     });
                                 });
                             });
@@ -2785,6 +2840,24 @@ pub(crate) mod jit_runtime {
         }
     }
 
+    /// Extract the raw JIT entry point and register-file slot count from
+    /// a `BytecodeArray`'s executable cache, if available.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn extract_exec_entry(ba: &BytecodeArray) -> (usize, usize) {
+        let exec_cache = ba.jit_executable_cache();
+        // SAFETY: single-threaded JIT; no concurrent mutation.
+        let cache_ref = unsafe { &*exec_cache.as_ptr() };
+        if let Some(exec) = cache_ref.as_ref() {
+            let base = exec as *const JitExecutableCode as *const u8;
+            // SAFETY: first field (ptr) is at offset 0.
+            let entry = unsafe { *(base as *const usize) };
+            let slots = exec.register_file_slots;
+            (entry, slots)
+        } else {
+            (0, 0)
+        }
+    }
+
     /// Inner implementation for [`jit_runtime_call_undefined_receiver0`].
     ///
     /// Uses cached TLS pointers for the entire call path so only one
@@ -2807,11 +2880,10 @@ pub(crate) mod jit_runtime {
                 // is identical on every iteration.  Caching the resolved
                 // `*const BytecodeArray` avoids the heap index, clone,
                 // and enum discriminant check on every call.
-                let ba_ptr: *const BytecodeArray = {
-                    let cached = CACHED_CALLEE.with(|c| c.get());
-                    if cached.0 == callee_i64 && !cached.1.is_null() {
-                        // Cache hit — skip the heap lookup entirely.
-                        cached.1
+                let (ba_ptr, cached_entry): (*const BytecodeArray, CachedCalleeEntry) = {
+                    let cached = ptrs.get_cached_callee();
+                    if cached.callee_i64 == callee_i64 && !cached.ba_ptr.is_null() {
+                        (cached.ba_ptr, cached)
                     } else {
                         // Cache miss — look up the heap in a scoped borrow.
                         let idx = (callee_i64 - JIT_HEAP_TAG) as usize;
@@ -2825,8 +2897,25 @@ pub(crate) mod jit_runtime {
                         match callee_val.as_ref() {
                             Some(JsValue::Function(ba)) => {
                                 let ptr = Rc::as_ptr(ba);
-                                CACHED_CALLEE.with(|c| c.set((callee_i64, ptr)));
-                                ptr
+                                let ba_ref: &BytecodeArray = unsafe { &*ptr };
+                                let ctx_ptr = ba_ref
+                                    .closure_context()
+                                    .map(Rc::as_ptr)
+                                    .unwrap_or(std::ptr::null())
+                                    as i64;
+                                #[cfg(all(target_arch = "x86_64", unix))]
+                                let (entry_fn, reg_slots) = extract_exec_entry(ba_ref);
+                                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                                let (entry_fn, reg_slots) = (0usize, 0usize);
+                                let entry = CachedCalleeEntry {
+                                    callee_i64,
+                                    ba_ptr: ptr,
+                                    ctx_ptr,
+                                    entry_fn,
+                                    reg_slots,
+                                };
+                                ptrs.set_cached_callee(entry);
+                                (ptr, entry)
                             }
                             Some(JsValue::NativeFunction(f)) => {
                                 let f = Rc::clone(f);
@@ -2932,6 +3021,99 @@ pub(crate) mod jit_runtime {
                                 unsafe { *ctx_ref.as_ptr() = ctx };
                             }
                             // Fall through to baseline JIT / interpreter.
+                        } else {
+                            let result_val = jit_to_jsvalue_ext(jit_result);
+                            unsafe {
+                                if (*heap_ref.as_ptr()).len() != heap_base {
+                                    (*heap_ref.as_ptr()).truncate(heap_base);
+                                }
+                            }
+                            if let Some(ctx) = saved_ctx {
+                                unsafe { *ctx_ref.as_ptr() = ctx };
+                            }
+                            return result_val.map(jsvalue_to_jit_i64);
+                        }
+                    }
+                }
+
+                // ── Cached baseline fast path ───────────────────
+                #[cfg(all(target_arch = "x86_64", unix))]
+                {
+                    let mut entry = cached_entry;
+                    if entry.entry_fn == 0 {
+                        let (ef, rs) = extract_exec_entry(ba);
+                        if ef != 0 {
+                            entry.entry_fn = ef;
+                            entry.reg_slots = rs;
+                            entry.ctx_ptr = ba
+                                .closure_context()
+                                .map(Rc::as_ptr)
+                                .unwrap_or(std::ptr::null())
+                                as i64;
+                            ptrs.set_cached_callee(entry);
+                        }
+                    }
+
+                    if entry.entry_fn != 0 {
+                        let ctx_ref = unsafe { &*ptrs.context };
+                        let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+
+                        let callee_ctx_ptr = entry.ctx_ptr as *const RefCell<JsContext>;
+                        let current_ctx_ptr = unsafe {
+                            (*ctx_ref.as_ptr())
+                                .as_ref()
+                                .map(Rc::as_ptr)
+                                .unwrap_or(std::ptr::null())
+                        };
+                        let same_context = std::ptr::eq(callee_ctx_ptr, current_ctx_ptr);
+                        let saved_ctx = if same_context {
+                            None
+                        } else {
+                            let callee_ctx = ba.closure_context().cloned();
+                            Some(unsafe {
+                                std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx)
+                            })
+                        };
+
+                        bc_ref.set(ba_ptr);
+                        let mut reg_file = std::mem::MaybeUninit::<[i64; 16]>::uninit();
+                        if entry.reg_slots > 4 {
+                            unsafe {
+                                std::ptr::write_bytes(
+                                    reg_file.as_mut_ptr() as *mut i64,
+                                    0,
+                                    entry.reg_slots.min(16),
+                                );
+                            }
+                        }
+                        let f: extern "C" fn(*mut i64, i64) -> i64 =
+                            unsafe { std::mem::transmute(entry.entry_fn as *const ()) };
+                        let jit_result = f(reg_file.as_mut_ptr() as *mut i64, entry.ctx_ptr);
+                        bc_ref.set(saved_ba);
+
+                        if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
+                            unsafe {
+                                if (*heap_ref.as_ptr()).len() != heap_base {
+                                    (*heap_ref.as_ptr()).truncate(heap_base);
+                                }
+                            }
+                            if let Some(ctx) = saved_ctx {
+                                unsafe { *ctx_ref.as_ptr() = ctx };
+                            }
+                            return Some(jit_result);
+                        }
+
+                        if is_jit_deopt(jit_result) {
+                            ba.mark_jit_baseline_deopted();
+                            ptrs.set_cached_callee(CachedCalleeEntry::EMPTY);
+                            unsafe {
+                                if (*heap_ref.as_ptr()).len() != heap_base {
+                                    (*heap_ref.as_ptr()).truncate(heap_base);
+                                }
+                            }
+                            if let Some(ctx) = saved_ctx {
+                                unsafe { *ctx_ref.as_ptr() = ctx };
+                            }
                         } else {
                             let result_val = jit_to_jsvalue_ext(jit_result);
                             unsafe {
@@ -4014,21 +4196,14 @@ pub(crate) mod jit_runtime {
             Some(unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx) })
         };
 
-        // Stash DirectCallState for any nested calls the callee makes.
-        ptrs.set_direct_call(DirectCallState {
-            saved_ba,
-            heap_base,
-            ctx_changed: !same_context,
-        });
-
         // ── Call ─────────────────────────────────────────────────
         // Allocate a register file on the Rust stack.  For small
-        // frames (≤ 2 slots, e.g. closures), skip zeroing — the
+        // frames (≤ 4 slots, e.g. closures), skip zeroing — the
         // callee overwrites all slots before reading.  For larger
         // frames, zero only the slots the callee actually uses
         // instead of the full 16-slot array.
         let mut reg_file = std::mem::MaybeUninit::<[i64; 16]>::uninit();
-        if reg_slots > 2 {
+        if reg_slots > 4 {
             // SAFETY: writing zeroes into MaybeUninit memory is valid.
             unsafe {
                 std::ptr::write_bytes(reg_file.as_mut_ptr() as *mut i64, 0, reg_slots.min(16));
