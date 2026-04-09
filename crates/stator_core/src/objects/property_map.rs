@@ -317,6 +317,81 @@ pub(crate) fn acquire_object_rc_from_template_with_values(
         })
 }
 
+/// Returns a raw pointer to the `OBJECT_RC_POOL` thread-local so it can
+/// be cached in [`RtPtrs`] and reused across multiple object-creation
+/// calls without repeating a TLS lookup each time.
+///
+/// # Safety
+///
+/// The returned pointer is valid for the current thread's lifetime.
+/// The caller must ensure single-threaded access (no concurrent borrows).
+#[cfg(all(target_arch = "x86_64", unix))]
+pub(crate) fn object_rc_pool_ptr() -> *const RefCell<Vec<Rc<RefCell<PropertyMap>>>> {
+    OBJECT_RC_POOL.with(|pool| pool as *const _)
+}
+
+/// Like [`acquire_object_rc_from_template_with_values`] but uses a
+/// pre-cached raw pointer to the `OBJECT_RC_POOL`, eliminating a TLS
+/// lookup on the hot path.
+///
+/// # Safety
+///
+/// `pool_ptr` must point to a live `RefCell<Vec<…>>` on the current
+/// thread (as returned by [`object_rc_pool_ptr`]).
+#[cfg(all(target_arch = "x86_64", unix))]
+#[inline(always)]
+pub(crate) fn acquire_object_rc_from_template_with_values_cached(
+    template: &ObjectLiteralTemplate,
+    values: &[JsValue],
+    pool_ptr: *const RefCell<Vec<Rc<RefCell<PropertyMap>>>>,
+) -> Rc<RefCell<PropertyMap>> {
+    if !pool_ptr.is_null() {
+        // SAFETY: caller guarantees the pointer is valid and we are on
+        // the owning thread.  Bypass the RefCell borrow check (single-
+        // threaded JIT, no concurrent borrows).
+        let pool = unsafe { &mut *(&*pool_ptr).as_ptr() };
+        if let Some(rc) = pool.pop() {
+            // SAFETY: Rc exclusively owned (just popped, strong_count == 1).
+            let map = unsafe { &mut *rc.as_ptr() };
+            if Rc::ptr_eq(&map.keys, &template.keys) && map.values.len() == values.len() {
+                map.reinitialize_values_inplace(values);
+            } else {
+                map.reinitialize_from_template_with_values(template, values);
+            }
+            return rc;
+        }
+    }
+    Rc::new(RefCell::new(
+        template.instantiate_with_values(values.to_vec()),
+    ))
+}
+
+/// Like [`acquire_object_rc_from_template`] but uses a pre-cached raw
+/// pointer to the `OBJECT_RC_POOL`, eliminating a TLS lookup.
+///
+/// # Safety
+///
+/// Same as [`acquire_object_rc_from_template_with_values_cached`].
+#[cfg(all(target_arch = "x86_64", unix))]
+#[inline(always)]
+pub(crate) fn acquire_object_rc_from_template_cached(
+    template: &ObjectLiteralTemplate,
+    pool_ptr: *const RefCell<Vec<Rc<RefCell<PropertyMap>>>>,
+) -> Rc<RefCell<PropertyMap>> {
+    if !pool_ptr.is_null() {
+        // SAFETY: same single-threaded guarantee as the _with_values
+        // variant.
+        let pool = unsafe { &mut *(&*pool_ptr).as_ptr() };
+        if let Some(rc) = pool.pop() {
+            // SAFETY: Rc exclusively owned (just popped, strong_count == 1).
+            let map = unsafe { &mut *rc.as_ptr() };
+            map.reinitialize_from_template(template);
+            return rc;
+        }
+    }
+    Rc::new(RefCell::new(template.instantiate()))
+}
+
 /// Return an `Rc<RefCell<PropertyMap>>` to the thread-local object pool.
 ///
 /// Called when the JIT heap is cleared so that future object-creation
@@ -763,15 +838,48 @@ impl PropertyMap {
         let count = values.len();
         debug_assert_eq!(self.values.len(), count);
 
-        // Direct indexed overwrite: each assignment drops the old value
-        // (a no-op for Smi) and bitwise-copies the new one.
-        self.values[..count].clone_from_slice(&values[..count]);
+        // Fast path: when all old and new values are "flat" (no heap
+        // resources — Smi, HeapNumber, Boolean, Undefined, Null, etc.),
+        // skip the per-element Clone/Drop dispatch and memcpy instead.
+        // This is the common case in hot object-creation loops like
+        //   `{ x: i, y: i+1, z: i*2 }` where every value is a Smi.
+        if count <= 3 && Self::all_flat(&self.values[..count]) && Self::all_flat(values) {
+            // SAFETY: flat variants contain no heap resources (no Rc, Box,
+            // Vec, etc.).  Overwriting them raw is equivalent to a series
+            // of trivial drops + trivial clones.
+            unsafe {
+                std::ptr::copy_nonoverlapping(values.as_ptr(), self.values.as_mut_ptr(), count);
+            }
+        } else {
+            // General path: element-wise clone_from_slice handles all
+            // variant types including Rc-bearing ones.
+            self.values[..count].clone_from_slice(&values[..count]);
+        }
         self.template_next_slot = count;
         // Proto caches must be reset for a fresh object identity.
         self.proto_generation.set(0);
         self.proto_epoch.set(0);
         self.proto_global_epoch.set(0);
         // inline_cache is already None for short-lived template objects.
+    }
+
+    /// Returns `true` when every value in `slice` is a "flat" variant
+    /// that contains no heap resources and needs no `Drop`.
+    #[inline(always)]
+    fn all_flat(slice: &[JsValue]) -> bool {
+        slice.iter().all(|v| {
+            matches!(
+                v,
+                JsValue::Undefined
+                    | JsValue::Null
+                    | JsValue::TheHole
+                    | JsValue::Boolean(_)
+                    | JsValue::Smi(_)
+                    | JsValue::HeapNumber(_)
+                    | JsValue::Symbol(_)
+                    | JsValue::Object(_)
+            )
+        })
     }
 
     /// Creates a property map pre-populated with the given boilerplate

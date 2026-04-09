@@ -1860,13 +1860,13 @@ impl<'a> MaglevCodegen<'a> {
                     self.masm.call_reg(Reg64::R11);
                     self.emit_restore_live_regs(saved);
                     self.emit_deopt_check_rax();
-                    // Speculative Smi guard for globals that feed only
-                    // into arithmetic.
+                    // Speculative Smi-or-Boolean guard for globals that
+                    // feed only into arithmetic.
                     if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
-                        self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-                        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+                        self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
+                        self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
                         self.masm
-                            .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
+                            .jcc(CondCode::GreaterEq, &mut self.deopt_stub_label);
                     }
                     self.emit_store(id, Reg64::Rax);
                 }
@@ -1953,13 +1953,14 @@ impl<'a> MaglevCodegen<'a> {
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::LoadKeyedGeneric { object, key, .. } => {
                 self.emit_inline_load_keyed_smi(id, *object, *key);
-                // Speculative Smi guard for keyed loads that feed only
-                // into arithmetic (e.g. array element used in addition).
+                // Speculative Smi-or-Boolean guard for keyed loads that
+                // feed only into arithmetic.  Booleans coerce to 0/1
+                // in the lower 32 bits, which is correct for i32 ops.
                 if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
-                    self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-                    self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+                    self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
+                    self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
                     self.masm
-                        .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
+                        .jcc(CondCode::GreaterEq, &mut self.deopt_stub_label);
                     // Re-store the validated result (emit_inline_load_keyed_smi
                     // already stored RAX; the guard does not clobber it).
                 }
@@ -4826,14 +4827,14 @@ impl<'a> MaglevCodegen<'a> {
         // Deopt check: harmless on fast path (RAX is always valid);
         // catches JIT_DEOPT from the generic stub on the slow path.
         self.emit_deopt_check_rax();
-        // Speculative Smi guard: if this LoadNamedGeneric is in the
-        // smi_guarded set (feeds only into arithmetic), verify the result
-        // is actually a Smi.  Non-Smi → deopt to interpreter.
+        // Speculative Smi-or-Boolean guard: if this LoadNamedGeneric is in
+        // the smi_guarded set (feeds only into arithmetic), verify the
+        // result is Smi or Boolean.  Undefined / null / heap → deopt.
         if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
-            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
             self.masm
-                .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
+                .jcc(CondCode::GreaterEq, &mut self.deopt_stub_label);
         }
         self.emit_store(id, Reg64::Rax);
     }
@@ -6823,11 +6824,14 @@ impl<'a> MaglevCodegen<'a> {
         // Exclude nodes used as branch conditions (boolean values).
         for block in graph.blocks() {
             for (id, node) in &block.nodes {
+                // LoadKeyedGeneric is intentionally excluded: array
+                // elements can be any JS type (booleans, objects, …),
+                // so speculating Smi is too aggressive and causes
+                // 100 % deopt on benchmarks like sieve_primes where
+                // every element is a boolean.
                 let is_seedable = matches!(
                     node,
-                    ValueNode::LoadNamedGeneric { .. }
-                        | ValueNode::LoadGlobal { .. }
-                        | ValueNode::LoadKeyedGeneric { .. }
+                    ValueNode::LoadNamedGeneric { .. } | ValueNode::LoadGlobal { .. }
                 );
                 if !is_seedable {
                     continue;

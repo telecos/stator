@@ -163,8 +163,9 @@ pub(crate) mod jit_runtime {
     use crate::objects::map::PropertyAttributes;
     use crate::objects::property_map::{
         INTERNAL_PROTO_PROPERTY_KEY, ObjectLiteralTemplate, PropertyMap,
-        acquire_object_rc_from_template, acquire_object_rc_from_template_with_values,
-        recycle_object_rc,
+        acquire_object_rc_from_template, acquire_object_rc_from_template_cached,
+        acquire_object_rc_from_template_with_values,
+        acquire_object_rc_from_template_with_values_cached, recycle_object_rc,
     };
     use crate::objects::value::{JsContext, JsValue, NativeIterator};
 
@@ -465,6 +466,12 @@ pub(crate) mod jit_runtime {
         generation: u64,
         /// Pointer to the `Cell<bool>` for `SKIP_MAPPED_ARGS`.
         skip_mapped_args: *const Cell<bool>,
+        /// Cached pointer to the `Cell<ObjectLiteralIcEntry>` thread-
+        /// local, eliminating a TLS lookup on every object creation.
+        object_ic: *const Cell<ObjectLiteralIcEntry>,
+        /// Cached pointer to the `OBJECT_RC_POOL` thread-local, so that
+        /// `acquire_object_rc_from_template*` variants can skip TLS.
+        object_rc_pool: *const RefCell<Vec<Rc<RefCell<PropertyMap>>>>,
     }
 
     impl RtPtrs {
@@ -478,6 +485,8 @@ pub(crate) mod jit_runtime {
             cached_callee: std::ptr::null(),
             generation: 0,
             skip_mapped_args: std::ptr::null(),
+            object_ic: std::ptr::null(),
+            object_rc_pool: std::ptr::null(),
         };
 
         fn is_cached(&self) -> bool {
@@ -543,6 +552,28 @@ pub(crate) mod jit_runtime {
                 unsafe { &*self.skip_mapped_args }.set(val);
             } else {
                 SKIP_MAPPED_ARGS.with(|c| c.set(val));
+            }
+        }
+
+        /// Read the object-literal IC entry via the cached pointer.
+        #[inline(always)]
+        fn get_object_ic(&self) -> ObjectLiteralIcEntry {
+            if !self.object_ic.is_null() {
+                // SAFETY: pointer set by cache_rt_ptrs; valid for thread lifetime.
+                unsafe { &*self.object_ic }.get()
+            } else {
+                RT_OBJECT_IC.with(|c| c.get())
+            }
+        }
+
+        /// Store the object-literal IC entry via the cached pointer.
+        #[inline(always)]
+        fn set_object_ic(&self, entry: ObjectLiteralIcEntry) {
+            if !self.object_ic.is_null() {
+                // SAFETY: pointer set by cache_rt_ptrs; valid for thread lifetime.
+                unsafe { &*self.object_ic }.set(entry);
+            } else {
+                RT_OBJECT_IC.with(|c| c.set(entry));
             }
         }
     }
@@ -647,20 +678,34 @@ pub(crate) mod jit_runtime {
                             DIRECT_CALL_STATE.with(|dc| {
                                 CACHED_CALLEE.with(|cc| {
                                     SKIP_MAPPED_ARGS.with(|sma| {
-                                        let setup_gen = RT_SETUP_GEN.with(|g| g.get());
-                                        RT_PTRS.with(|p| {
-                                            p.set(RtPtrs {
-                                                heap: heap as *const RefCell<Vec<JsValue>>,
-                                                context: ctx as *const RefCell<
-                                                    Option<Rc<RefCell<JsContext>>>,
-                                                >,
-                                                bytecode: bc as *const Cell<*const BytecodeArray>,
-                                                global: g as *const RefCell<JitGlobalState>,
-                                                prop_ic: ic as *const RefCell<JitPropertyIcState>,
-                                                direct_call: dc as *const Cell<DirectCallState>,
-                                                cached_callee: cc as *const Cell<CachedCalleeEntry>,
-                                                generation: setup_gen,
-                                                skip_mapped_args: sma as *const Cell<bool>,
+                                        RT_OBJECT_IC.with(|oic| {
+                                            let pool_ptr =
+                                                crate::objects::property_map::object_rc_pool_ptr();
+                                            let setup_gen = RT_SETUP_GEN.with(|g| g.get());
+                                            RT_PTRS.with(|p| {
+                                                p.set(RtPtrs {
+                                                    heap: heap as *const RefCell<Vec<JsValue>>,
+                                                    context: ctx as *const RefCell<
+                                                        Option<Rc<RefCell<JsContext>>>,
+                                                    >,
+                                                    bytecode: bc as *const Cell<
+                                                        *const BytecodeArray,
+                                                    >,
+                                                    global: g as *const RefCell<JitGlobalState>,
+                                                    prop_ic: ic as *const RefCell<
+                                                        JitPropertyIcState,
+                                                    >,
+                                                    direct_call: dc as *const Cell<DirectCallState>,
+                                                    cached_callee: cc as *const Cell<
+                                                        CachedCalleeEntry,
+                                                    >,
+                                                    generation: setup_gen,
+                                                    skip_mapped_args: sma as *const Cell<bool>,
+                                                    object_ic: oic as *const Cell<
+                                                        ObjectLiteralIcEntry,
+                                                    >,
+                                                    object_rc_pool: pool_ptr,
+                                                });
                                             });
                                         });
                                     });
@@ -771,6 +816,12 @@ pub(crate) mod jit_runtime {
                 if let JsValue::PlainObject(rc) = val {
                     recycle_object_rc(rc);
                 }
+            }
+            // Pre-reserve capacity on first use so that object-heavy
+            // loops (e.g. 1000 iterations) avoid repeated Vec
+            // reallocations on their first execution.
+            if heap.capacity() < 256 {
+                heap.reserve(256);
             }
         });
     }
@@ -2949,6 +3000,59 @@ pub(crate) mod jit_runtime {
         }
     }
 
+    /// Fast interpreter call for cached 0-arg closures.
+    ///
+    /// Skips `call_js_function`'s JIT cache checks, invocation count
+    /// increment, and compilation attempts — all of which have already
+    /// been performed or are unavailable.  Uses the pre-cached
+    /// [`RtPtrs::global`] pointer to read the global environment without
+    /// an extra TLS lookup.
+    fn fast_interpreter_call_0(
+        ba: &Rc<BytecodeArray>,
+        saved_ba: *const BytecodeArray,
+        ptrs: &RtPtrs,
+    ) -> Option<i64> {
+        use crate::interpreter::{Interpreter, InterpreterFrame};
+
+        // Read global env through the cached pointer when possible,
+        // saving a TLS lookup + RefCell borrow on the hot path.
+        let env_opt = if !ptrs.global.is_null() {
+            // SAFETY: pointer set by cache_rt_ptrs; valid for thread
+            // lifetime.  Single-threaded access; no concurrent borrows.
+            let g = unsafe { &*(*ptrs.global).as_ptr() };
+            g.env.as_ref().cloned()
+        } else {
+            RT_GLOBAL.with(|g| g.borrow().env.as_ref().cloned())
+        };
+
+        // Bump invocation count so Maglev tiering still triggers for
+        // callees that graduate from the interpreter path.
+        ba.increment_invocation_count();
+        #[cfg(all(target_arch = "x86_64", unix))]
+        crate::interpreter::maybe_compile_maglev(ba);
+
+        let result = if let Some(env) = env_opt {
+            let mut frame = InterpreterFrame::new_with_globals(Rc::clone(ba), vec![], env);
+            Interpreter::run(&mut frame)
+        } else {
+            let mut frame = InterpreterFrame::new(Rc::clone(ba), vec![]);
+            Interpreter::run(&mut frame)
+        };
+
+        // Restore RT_BYTECODE via cached pointer (avoids TLS lookup).
+        if !ptrs.bytecode.is_null() {
+            // SAFETY: pointer set by cache_rt_ptrs; valid for thread lifetime.
+            unsafe { &*ptrs.bytecode }.set(saved_ba);
+        } else {
+            RT_BYTECODE.with(|b| b.set(saved_ba));
+        }
+
+        match result {
+            Ok(val) => Some(jsvalue_to_jit_i64(val)),
+            Err(_) => None,
+        }
+    }
+
     /// Inner implementation for the `Construct` runtime stub.
     ///
     /// Handles `new Ctor(args...)` by creating the `this` object, running the
@@ -3168,7 +3272,16 @@ pub(crate) mod jit_runtime {
                 #[cfg(all(target_arch = "x86_64", unix))]
                 if cached_entry.maglev_fn != 0 && !ba.jit_maglev_has_deopted() {
                     let ctx_ref = unsafe { &*ptrs.context };
-                    let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+
+                    // For 0-param closures whose body never heap-allocates
+                    // (common: `count = count + 1; return count`), defer
+                    // the heap-length snapshot until we actually need it.
+                    // On the Smi fast path this read is skipped entirely.
+                    let heap_base = if skip_args {
+                        0usize // sentinel — unused on the fast path
+                    } else {
+                        unsafe { (*heap_ref.as_ptr()).len() }
+                    };
 
                     let callee_ctx_ptr = cached_entry.ctx_ptr as *const RefCell<JsContext>;
                     let current_ctx_ptr = unsafe {
@@ -3210,8 +3323,8 @@ pub(crate) mod jit_runtime {
                     }
 
                     if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
-                        // Smi result from a 0-param closure: skip heap
-                        // truncation when no allocations occurred.
+                        // Smi result — skip heap truncation entirely for
+                        // 0-param closures (heap_base was never read).
                         if !skip_args {
                             unsafe {
                                 if (*heap_ref.as_ptr()).len() != heap_base {
@@ -3224,6 +3337,13 @@ pub(crate) mod jit_runtime {
                         }
                         return Some(jit_result);
                     }
+
+                    // Slow paths need the real heap_base.
+                    let heap_base = if skip_args {
+                        unsafe { (*heap_ref.as_ptr()).len() }
+                    } else {
+                        heap_base
+                    };
 
                     if is_jit_deopt(jit_result) {
                         ba.mark_jit_maglev_deopted();
@@ -3289,7 +3409,12 @@ pub(crate) mod jit_runtime {
                         ptrs.set_cached_callee(entry);
 
                         let ctx_ref = unsafe { &*ptrs.context };
-                        let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+                        // Defer heap_base read for 0-param closures.
+                        let heap_base = if skip_args {
+                            0usize
+                        } else {
+                            unsafe { (*heap_ref.as_ptr()).len() }
+                        };
 
                         let callee_ctx_raw = ba.closure_context();
                         let callee_ctx_ptr =
@@ -3333,6 +3458,13 @@ pub(crate) mod jit_runtime {
                             }
                             return Some(jit_result);
                         }
+
+                        // Slow paths need the real heap_base.
+                        let heap_base = if skip_args {
+                            unsafe { (*heap_ref.as_ptr()).len() }
+                        } else {
+                            heap_base
+                        };
 
                         if is_jit_deopt(jit_result) {
                             // Callee Maglev deopted — mark + invalidate,
@@ -3387,7 +3519,12 @@ pub(crate) mod jit_runtime {
 
                     if entry.entry_fn != 0 {
                         let ctx_ref = unsafe { &*ptrs.context };
-                        let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+                        // Defer heap_base for 0-param closures.
+                        let heap_base = if skip_args {
+                            0usize
+                        } else {
+                            unsafe { (*heap_ref.as_ptr()).len() }
+                        };
 
                         let callee_ctx_ptr = entry.ctx_ptr as *const RefCell<JsContext>;
                         let current_ctx_ptr = unsafe {
@@ -3427,9 +3564,11 @@ pub(crate) mod jit_runtime {
                         }
 
                         if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
-                            unsafe {
-                                if (*heap_ref.as_ptr()).len() != heap_base {
-                                    (*heap_ref.as_ptr()).truncate(heap_base);
+                            if !skip_args {
+                                unsafe {
+                                    if (*heap_ref.as_ptr()).len() != heap_base {
+                                        (*heap_ref.as_ptr()).truncate(heap_base);
+                                    }
                                 }
                             }
                             if let Some(ctx) = saved_ctx {
@@ -3437,6 +3576,13 @@ pub(crate) mod jit_runtime {
                             }
                             return Some(jit_result);
                         }
+
+                        // Slow paths need the real heap_base.
+                        let heap_base = if skip_args {
+                            unsafe { (*heap_ref.as_ptr()).len() }
+                        } else {
+                            heap_base
+                        };
 
                         if is_jit_deopt(jit_result) {
                             ba.mark_jit_baseline_deopted();
@@ -3471,9 +3617,15 @@ pub(crate) mod jit_runtime {
                 let cache_ref = unsafe { &*exec_cache.as_ptr() };
                 if let Some(exec) = cache_ref.as_ref() {
                     let ctx_ref = unsafe { &*ptrs.context };
-                    // SAFETY: no active heap borrows; read length
-                    // via temporary raw-pointer dereference.
-                    let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+                    // Defer heap_base for 0-param closures — on the Smi
+                    // fast path the read and truncation are both skipped.
+                    let heap_base = if skip_args {
+                        0usize
+                    } else {
+                        // SAFETY: no active heap borrows; read length
+                        // via temporary raw-pointer dereference.
+                        unsafe { (*heap_ref.as_ptr()).len() }
+                    };
 
                     let callee_ctx_raw = ba.closure_context();
                     let callee_ctx_ptr = callee_ctx_raw.map(Rc::as_ptr).unwrap_or(std::ptr::null());
@@ -3525,6 +3677,13 @@ pub(crate) mod jit_runtime {
                         return Some(jit_result);
                     }
 
+                    // Slow paths need the real heap_base.
+                    let heap_base = if skip_args {
+                        unsafe { (*heap_ref.as_ptr()).len() }
+                    } else {
+                        heap_base
+                    };
+
                     if is_jit_deopt(jit_result) {
                         // Callee baseline JIT deopted — mark it and
                         // fall through to interpreter so the CALLER
@@ -3555,14 +3714,16 @@ pub(crate) mod jit_runtime {
                     }
                 }
 
-                // No JIT code at all: reconstruct Rc and use full path.
+                // No JIT code at all: direct interpreter call, bypassing
+                // call_js_function's JIT cache checks and compilation
+                // attempts which have already been tried on cache fill.
                 // SAFETY: ba_ptr was obtained from Rc::as_ptr on an Rc
                 // that is still alive in the heap.  Bumping the strong
                 // count before from_raw produces a valid owned Rc.
                 unsafe { Rc::increment_strong_count(ba_ptr) };
                 // SAFETY: pointer + refcount are valid per above.
                 let ba_rc = unsafe { Rc::from_raw(ba_ptr) };
-                return call_js_function(&ba_rc, vec![], &[], saved_ba);
+                return fast_interpreter_call_0(&ba_rc, saved_ba, &ptrs);
             }
 
             // Non-heap callee (e.g. Smi / bool) — cannot be called.
@@ -6366,10 +6527,9 @@ pub(crate) mod jit_runtime {
                 // BytecodeArray.
                 let ba_ref = unsafe { &*ba };
 
-                // Ultra-fast path: single-entry IC hit.
-                // Skips the RefCell borrow + HashMap lookup on the
-                // BytecodeArray's template map.
-                let ic = RT_OBJECT_IC.with(|c| c.get());
+                // Ultra-fast path: single-entry IC hit via cached
+                // pointer — no extra TLS lookup.
+                let ic = ptrs.get_object_ic();
                 if ic.slot == slot && ic.ba == ba {
                     // SAFETY: template pointer is valid — it points to
                     // Box heap memory owned by the BytecodeArray's
@@ -6377,7 +6537,7 @@ pub(crate) mod jit_runtime {
                     // execution.  Cached entries are never removed or
                     // replaced.
                     let template = unsafe { &*ic.template };
-                    let rc = acquire_object_rc_from_template(template);
+                    let rc = acquire_object_rc_from_template_cached(template, ptrs.object_rc_pool);
                     let obj = JsValue::PlainObject(rc);
                     return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
                 }
@@ -6386,12 +6546,10 @@ pub(crate) mod jit_runtime {
                 if let Some(rc) = ba_ref.clone_object_literal_template_pooled(slot) {
                     let tmpl_ptr = ba_ref.get_cached_template_ptr(slot);
                     if !tmpl_ptr.is_null() {
-                        RT_OBJECT_IC.with(|c| {
-                            c.set(ObjectLiteralIcEntry {
-                                slot,
-                                ba,
-                                template: tmpl_ptr,
-                            })
+                        ptrs.set_object_ic(ObjectLiteralIcEntry {
+                            slot,
+                            ba,
+                            template: tmpl_ptr,
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
@@ -6403,12 +6561,10 @@ pub(crate) mod jit_runtime {
                 if let Some(rc) = ba_ref.promote_object_literal_template_pooled(slot) {
                     let tmpl_ptr = ba_ref.get_cached_template_ptr(slot);
                     if !tmpl_ptr.is_null() {
-                        RT_OBJECT_IC.with(|c| {
-                            c.set(ObjectLiteralIcEntry {
-                                slot,
-                                ba,
-                                template: tmpl_ptr,
-                            })
+                        ptrs.set_object_ic(ObjectLiteralIcEntry {
+                            slot,
+                            ba,
+                            template: tmpl_ptr,
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
@@ -6502,14 +6658,17 @@ pub(crate) mod jit_runtime {
                 // Decode to a stack array to avoid a Vec allocation.
                 let js_values = decode_jit_values_array(count, &vals);
 
-                // ── Ultra-fast path: IC hit ──
-                let ic = RT_OBJECT_IC.with(|c| c.get());
+                // ── Ultra-fast path: IC hit via cached pointer ──
+                let ic = ptrs.get_object_ic();
                 if ic.slot == slot && ic.ba == ba {
                     // SAFETY: template pointer valid — see IC safety
                     // comment on ObjectLiteralIcEntry.
                     let template = unsafe { &*ic.template };
-                    let rc =
-                        acquire_object_rc_from_template_with_values(template, &js_values[..count]);
+                    let rc = acquire_object_rc_from_template_with_values_cached(
+                        template,
+                        &js_values[..count],
+                        ptrs.object_rc_pool,
+                    );
                     let obj = JsValue::PlainObject(rc);
                     return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
                 }
@@ -6520,12 +6679,10 @@ pub(crate) mod jit_runtime {
                 {
                     let tmpl_ptr = ba_ref.get_cached_template_ptr(slot);
                     if !tmpl_ptr.is_null() {
-                        RT_OBJECT_IC.with(|c| {
-                            c.set(ObjectLiteralIcEntry {
-                                slot,
-                                ba,
-                                template: tmpl_ptr,
-                            })
+                        ptrs.set_object_ic(ObjectLiteralIcEntry {
+                            slot,
+                            ba,
+                            template: tmpl_ptr,
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
@@ -6538,12 +6695,10 @@ pub(crate) mod jit_runtime {
                 {
                     let tmpl_ptr = ba_ref.get_cached_template_ptr(slot);
                     if !tmpl_ptr.is_null() {
-                        RT_OBJECT_IC.with(|c| {
-                            c.set(ObjectLiteralIcEntry {
-                                slot,
-                                ba,
-                                template: tmpl_ptr,
-                            })
+                        ptrs.set_object_ic(ObjectLiteralIcEntry {
+                            slot,
+                            ba,
+                            template: tmpl_ptr,
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
