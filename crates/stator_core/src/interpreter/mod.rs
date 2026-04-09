@@ -1606,43 +1606,11 @@ pub(super) fn maybe_compile_turbofan(ba: &BytecodeArray) {
 /// On platforms where the JIT is not available this always returns `None`.
 #[allow(dead_code)]
 fn try_execute_turbofan(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
-    #[cfg(all(target_arch = "x86_64", unix))]
-    {
-        use crate::compiler::baseline::compiler::{
-            jit_runtime_set_context, jit_runtime_setup, jit_runtime_teardown, jit_to_jsvalue_ext,
-        };
-
-        // Lock the Turbofan cache and execute if compiled code is available.
-        let cache = ba.turbofan_jit_cache_arc();
-        let guard = cache.lock().ok()?;
-        let tc = guard.as_ref()?;
-
-        // Set up thread-local state so runtime stubs can access the
-        // constant pool, heap-object table, and property IC.
-        jit_runtime_setup(ba);
-
-        // Convert args — may allocate heap handles in RT_HEAP.
-        let jit_args: Vec<i64> = args.iter().map(jsvalue_to_jit).collect();
-
-        // Set closure context for context-slot stubs.
-        {
-            let ctx = ba.closure_context().cloned();
-            jit_runtime_set_context(ctx);
-        }
-
-        // SAFETY: `tc` was produced by `turbofan::compile_with_feedback` from
-        // a well-formed Maglev graph.  We hold the mutex lock for the duration
-        // of the call, ensuring exclusive access.
-        let result = match unsafe { tc.execute(&jit_args) } {
-            Ok(v) => jit_to_jsvalue_ext(v).map(Ok),
-            // JIT_DEOPT or unrecognised sentinel → fall back to lower tier.
-            Err(_) => None,
-        };
-
-        jit_runtime_teardown();
-        return result;
-    }
-    #[allow(unreachable_code)]
+    // Turbofan (Cranelift) execution is disabled — the codegen has bugs in
+    // context-slot access and string operations that produce wrong results
+    // (e.g. HeapNumber instead of String, wrong Boolean values).
+    // Compilation still runs in the background so the code is ready when
+    // codegen is fixed.
     let _ = (ba, args);
     None
 }
