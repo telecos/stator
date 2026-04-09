@@ -5170,6 +5170,67 @@ impl Interpreter {
                                 frame.loop_end_pc = 0;
                                 break 'smi;
                             }
+                            Opcode::CreateObjectLiteral => {
+                                let slot =
+                                    unsafe { operand_flag_unchecked(instr, 1) } as u32;
+                                if let Some(rc) = frame
+                                    .bytecode_array
+                                    .clone_object_literal_template_pooled(slot)
+                                {
+                                    acc = JsValue::PlainObject(rc);
+                                    smi_acc_spilled = true;
+                                    smi_acc_bool = false;
+                                    hot_acc = None;
+                                    continue 'smi;
+                                }
+                                acc = materialize_acc!();
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                pc -= 1;
+                                break 'smi;
+                            }
+                            Opcode::DefineNamedOwnProperty => {
+                                let obj_v =
+                                    unsafe { operand_reg_unchecked(instr, 0) };
+                                let name_idx =
+                                    unsafe { operand_constant_pool_idx_unchecked(instr, 1) };
+                                let obj_ptr = unsafe { frame.read_reg_unchecked(obj_v) }
+                                    as *const JsValue;
+                                // SAFETY: register borrow is released before
+                                // any mutable access to the property map.
+                                let obj = unsafe { &*obj_ptr };
+                                if let JsValue::PlainObject(map) = obj
+                                    && let Some(ConstantPoolEntry::String(prop_name_ref)) =
+                                        frame.bytecode_array.get_constant(name_idx)
+                                {
+                                    let val = materialize_acc!();
+                                    // Function values need metadata set by the
+                                    // full handler; private fields need special
+                                    // attribute flags.  Fall back for both.
+                                    if matches!(val, JsValue::Function(_))
+                                        || prop_name_ref.starts_with(".private.")
+                                    {
+                                        acc = val;
+                                        frame.smi_mode = false;
+                                        frame.loop_end_pc = 0;
+                                        pc -= 1;
+                                        break 'smi;
+                                    }
+                                    let fill_result =
+                                        map.borrow_mut()
+                                            .try_template_fill(prop_name_ref, val);
+                                    if let Err(val) = fill_result {
+                                        map.borrow_mut()
+                                            .insert(prop_name_ref.to_string(), val);
+                                    }
+                                    continue 'smi;
+                                }
+                                acc = materialize_acc!();
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                pc -= 1;
+                                break 'smi;
+                            }
                             _ => {
                                 // Unsupported opcode ΓÇö exit SMI loop and let
                                 // the regular dispatch handle it.
@@ -5274,6 +5335,113 @@ impl Interpreter {
                             PropertyMap::with_capacity(4),
                         )));
                         continue 'dispatch;
+                    }
+                    Opcode::CreateObjectLiteral => {
+                        if let Operand::FeedbackSlot(s) = *instr.operand(1) {
+                            if let Some(rc) = frame
+                                .bytecode_array
+                                .clone_object_literal_template_pooled(s)
+                            {
+                                acc = JsValue::PlainObject(rc);
+                                continue 'dispatch;
+                            }
+                        }
+                        frame.pc = pc;
+                        frame.accumulator = acc;
+                        match dispatch_via_table(
+                            frame,
+                            instructions,
+                            byte_offsets,
+                            jump_targets,
+                            handler_table.as_slice(),
+                            instr,
+                        ) {
+                            Ok(dispatch::DispatchAction::Continue) => {
+                                pc = frame.pc;
+                                acc = std::mem::replace(
+                                    &mut frame.accumulator,
+                                    JsValue::Undefined,
+                                );
+                                continue 'dispatch;
+                            }
+                            Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                            Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                            Err(e) => {
+                                if let Some(resume_pc) = handle_dispatch_error(
+                                    &e,
+                                    frame,
+                                    handler_table.as_slice(),
+                                ) {
+                                    pc = resume_pc;
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
+                                    continue 'dispatch;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+                    Opcode::DefineNamedOwnProperty => {
+                        if let Operand::Register(obj_v) = *instr.operand(0)
+                            && let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1)
+                        {
+                            // SAFETY: register operands are validated by the
+                            // bytecode verifier.
+                            let obj = unsafe { frame.read_reg_unchecked(obj_v) };
+                            if let JsValue::PlainObject(map) = obj
+                                && let Some(ConstantPoolEntry::String(prop_name_ref)) =
+                                    frame.bytecode_array.get_constant(name_idx)
+                                && !matches!(acc, JsValue::Function(_))
+                                && !prop_name_ref.starts_with(".private.")
+                            {
+                                let fill_result =
+                                    map.borrow_mut()
+                                        .try_template_fill(prop_name_ref, acc.cheap_clone());
+                                if let Err(val) = fill_result {
+                                    map.borrow_mut()
+                                        .insert(prop_name_ref.to_string(), val);
+                                }
+                                continue 'dispatch;
+                            }
+                        }
+                        frame.pc = pc;
+                        frame.accumulator = acc;
+                        match dispatch_via_table(
+                            frame,
+                            instructions,
+                            byte_offsets,
+                            jump_targets,
+                            handler_table.as_slice(),
+                            instr,
+                        ) {
+                            Ok(dispatch::DispatchAction::Continue) => {
+                                pc = frame.pc;
+                                acc = std::mem::replace(
+                                    &mut frame.accumulator,
+                                    JsValue::Undefined,
+                                );
+                                continue 'dispatch;
+                            }
+                            Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                            Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                            Err(e) => {
+                                if let Some(resume_pc) = handle_dispatch_error(
+                                    &e,
+                                    frame,
+                                    handler_table.as_slice(),
+                                ) {
+                                    pc = resume_pc;
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
+                                    continue 'dispatch;
+                                }
+                                return Err(e);
+                            }
+                        }
                     }
                     Opcode::Mov => {
                         // SAFETY: Bytecode generator guarantees operand[0]
