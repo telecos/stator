@@ -763,33 +763,9 @@ fn coalesce_loop_phis(
         .map(|iv| (iv.id, (iv.start, iv.end)))
         .collect();
 
-    // Build per-NodeId use locations: (program_point, block_id).
-    // Also build a global use-count map for accumulator chain detection.
-    let mut uses_of: HashMap<NodeId, Vec<(u32, u32)>> = HashMap::new();
-    let mut use_count: HashMap<NodeId, usize> = HashMap::new();
-    let mut node_lookup: HashMap<NodeId, ValueNode> = HashMap::new();
-    let mut pp: u32 = 0;
-    for block in graph.blocks() {
-        for (id, node) in &block.nodes {
-            node_lookup.insert(*id, node.clone());
-            collect_inputs(node, &mut |inp| {
-                uses_of.entry(inp).or_default().push((pp, block.id));
-                *use_count.entry(inp).or_insert(0) += 1;
-            });
-            pp += 1;
-        }
-        if let Some(ctrl) = &block.control {
-            collect_control_inputs(ctrl, &mut |inp| {
-                uses_of.entry(inp).or_default().push((pp, block.id));
-                *use_count.entry(inp).or_insert(0) += 1;
-            });
-            pp += 1;
-        }
-    }
-
     for block in graph.blocks() {
         // A loop header has at least one *back-edge*: a predecessor whose
-        // block index is ≥ the current block’s index (i.e. a backward or
+        // block index is ≥ the current block's index (i.e. a backward or
         // self-referential edge in the CFG).
         let back_edge_positions: Vec<usize> = block
             .predecessors
@@ -845,45 +821,17 @@ fn coalesce_loop_phis(
                     None => continue,
                 };
 
-                // ── Condition 1 (relaxed) ────────────────────────────────────────────────
-                //
-                // Standard check: the Phi must be dead by the time the
-                // back-edge input is defined.
-                //
-                // Relaxed check: when the Phi’s live range extends past the
-                // back-edge input only because of uses in *exit blocks*
-                // (outside the loop), coalescing is still safe.  Exit blocks
-                // are reached from the loop header’s Branch *before* the body
-                // modifies the Phi’s register, so the value is correct.
-                //
-                // We compute the Phi’s last use within the loop (blocks
-                // [header .. body_end]) and use that as the effective end.
-                let effective_phi_end = if phi_end > back_start + 1
-                    && matches!(&block.control, Some(ControlNode::Branch { .. }))
-                {
-                    let back_edge_source = block.predecessors[pos];
-                    let loop_start = block.id;
-                    let loop_end = back_edge_source;
-                    uses_of
-                        .get(phi_id)
-                        .map(|uses| {
-                            uses.iter()
-                                .filter(|(_, bid)| *bid >= loop_start && *bid <= loop_end)
-                                .map(|(p, _)| p + 1)
-                                .max()
-                                .unwrap_or(0)
-                        })
-                        .unwrap_or(0)
-                } else {
-                    phi_end
-                };
-
-                if effective_phi_end > back_start + 1 {
+                // Condition 1: the Phi must be dead (or at its very last use)
+                // by the time the back-edge input is defined.  An overlap of
+                // exactly one program point is acceptable — that is the point
+                // where the defining instruction reads the Phi and writes the
+                // result into the same register.
+                if phi_end > back_start + 1 {
                     continue;
                 }
 
                 // Condition 2: no other value in Register(phi_reg) has an
-                // interval that overlaps the back-edge input’s interval.  We
+                // interval that overlaps the back-edge input's interval.  We
                 // exclude the Phi itself (already checked above) and the
                 // back-edge input (we are moving it).
                 let has_conflict = intervals.iter().any(|iv| {
@@ -901,58 +849,8 @@ fn coalesce_loop_phis(
                     }
                 });
 
-                if has_conflict {
-                    continue;
-                }
-
-                assignments.insert(back_input, Location::Register(phi_reg));
-
-                // ── Accumulator chain extension ────────────────────────────────────────
-                //
-                // Walk backward from back_input through single-use binary
-                // arithmetic ops whose left operand is the previous link (or
-                // the Phi itself).  Reassigning each intermediate to phi_reg
-                // lets the codegen emit destructive in-place updates,
-                // eliminating MOVs in the hot loop body.
-                let back_edge_source = block.predecessors[pos];
-                let chain_loop_start = block.id;
-                let chain_loop_end = back_edge_source;
-                let mut chain_cur = back_input;
-                while let Some(chain_node) = node_lookup.get(&chain_cur) {
-                    let left = match chain_node {
-                        ValueNode::Int32Add { left, .. }
-                        | ValueNode::Int32Subtract { left, .. }
-                        | ValueNode::Int32Multiply { left, .. } => *left,
-                        _ => break,
-                    };
-
-                    if left == *phi_id {
-                        // Verify the Phi has at most one use in the body.
-                        let phi_body_uses = uses_of
-                            .get(phi_id)
-                            .map(|uses| {
-                                uses.iter()
-                                    .filter(|(_, bid)| {
-                                        *bid > chain_loop_start && *bid <= chain_loop_end
-                                    })
-                                    .count()
-                            })
-                            .unwrap_or(0);
-                        if phi_body_uses > 1 {
-                            break;
-                        }
-                        break;
-                    }
-
-                    if use_count.get(&left).copied().unwrap_or(0) != 1 {
-                        break;
-                    }
-                    if !matches!(assignments.get(&left), Some(Location::Register(_))) {
-                        break;
-                    }
-
-                    assignments.insert(left, Location::Register(phi_reg));
-                    chain_cur = left;
+                if !has_conflict {
+                    assignments.insert(back_input, Location::Register(phi_reg));
                 }
             }
         }
