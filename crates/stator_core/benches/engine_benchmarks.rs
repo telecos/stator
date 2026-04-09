@@ -757,6 +757,9 @@ fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    // Snapshot before measurement
+    let diag_before = maglev_diagnostics();
+    let cats_before = maglev_deopt_categories();
     c.bench_function("arithmetic_loop_10k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -766,8 +769,27 @@ fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
     });
     let (tried, executed, deopted, not_ready, compilations, code_bytes, started, failed, panicked) =
         maglev_diagnostics();
+    let cats_after = maglev_deopt_categories();
     eprintln!(
-        "MAGLEV_DIAG[arithmetic_loop_10k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes} started={started} failed={failed} panicked={panicked}"
+        "MAGLEV_DIAG[arithmetic_loop_10k]: tried={} executed={} deopted={} not_ready={} compilations={} code_bytes={} started={} failed={} panicked={}",
+        tried - diag_before.0,
+        executed - diag_before.1,
+        deopted - diag_before.2,
+        not_ready - diag_before.3,
+        compilations - diag_before.4,
+        code_bytes - diag_before.5,
+        started - diag_before.6,
+        failed - diag_before.7,
+        panicked - diag_before.8
+    );
+    eprintln!(
+        "  deopt_cats_delta: generic={} overflow={} stub={} global={} divzero={} unknown={}",
+        cats_after[0] - cats_before[0],
+        cats_after[1] - cats_before[1],
+        cats_after[2] - cats_before[2],
+        cats_after[3] - cats_before[3],
+        cats_after[4] - cats_before[4],
+        cats_after[5] - cats_before[5]
     );
 }
 
@@ -824,6 +846,9 @@ fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    // Snapshot before measurement
+    let diag_before = maglev_diagnostics();
+    let cats_before = maglev_deopt_categories();
     c.bench_function("fib_40_iterative_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -833,8 +858,27 @@ fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
     });
     let (tried, executed, deopted, not_ready, compilations, code_bytes, started, failed, panicked) =
         maglev_diagnostics();
+    let cats_after = maglev_deopt_categories();
     eprintln!(
-        "MAGLEV_DIAG[fib_40_iterative]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes} started={started} failed={failed} panicked={panicked}"
+        "MAGLEV_DIAG[fib_40_iterative]: tried={} executed={} deopted={} not_ready={} compilations={} code_bytes={} started={} failed={} panicked={}",
+        tried - diag_before.0,
+        executed - diag_before.1,
+        deopted - diag_before.2,
+        not_ready - diag_before.3,
+        compilations - diag_before.4,
+        code_bytes - diag_before.5,
+        started - diag_before.6,
+        failed - diag_before.7,
+        panicked - diag_before.8
+    );
+    eprintln!(
+        "  deopt_cats_delta: generic={} overflow={} stub={} global={} divzero={} unknown={}",
+        cats_after[0] - cats_before[0],
+        cats_after[1] - cats_before[1],
+        cats_after[2] - cats_before[2],
+        cats_after[3] - cats_before[3],
+        cats_after[4] - cats_before[4],
+        cats_after[5] - cats_before[5]
     );
 }
 
@@ -868,6 +912,9 @@ fn bench_property_access_1k_precompiled(c: &mut Criterion) {
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    // Snapshot before measurement
+    let diag_before = maglev_diagnostics();
+    let cats_before = maglev_deopt_categories();
     c.bench_function("property_access_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -877,8 +924,27 @@ fn bench_property_access_1k_precompiled(c: &mut Criterion) {
     });
     let (tried, executed, deopted, not_ready, compilations, code_bytes, started, failed, panicked) =
         maglev_diagnostics();
+    let cats_after = maglev_deopt_categories();
     eprintln!(
-        "MAGLEV_DIAG[property_access_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes} started={started} failed={failed} panicked={panicked}"
+        "MAGLEV_DIAG[property_access_1k]: tried={} executed={} deopted={} not_ready={} compilations={} code_bytes={} started={} failed={} panicked={}",
+        tried - diag_before.0,
+        executed - diag_before.1,
+        deopted - diag_before.2,
+        not_ready - diag_before.3,
+        compilations - diag_before.4,
+        code_bytes - diag_before.5,
+        started - diag_before.6,
+        failed - diag_before.7,
+        panicked - diag_before.8
+    );
+    eprintln!(
+        "  deopt_cats_delta: generic={} overflow={} stub={} global={} divzero={} unknown={}",
+        cats_after[0] - cats_before[0],
+        cats_after[1] - cats_before[1],
+        cats_after[2] - cats_before[2],
+        cats_after[3] - cats_before[3],
+        cats_after[4] - cats_before[4],
+        cats_after[5] - cats_before[5]
     );
     let (loops, hoisted, named_hoisted, blocked) = licm_diagnostics();
     eprintln!(
@@ -919,6 +985,9 @@ fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    // Snapshot before measurement
+    let diag_before = maglev_diagnostics();
+    let cats_before = maglev_deopt_categories();
     c.bench_function("object_creation_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -928,8 +997,27 @@ fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
     });
     let (tried, executed, deopted, not_ready, compilations, code_bytes, started, failed, panicked) =
         maglev_diagnostics();
+    let cats_after = maglev_deopt_categories();
     eprintln!(
-        "MAGLEV_DIAG[object_creation_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes} started={started} failed={failed} panicked={panicked}"
+        "MAGLEV_DIAG[object_creation_1k]: tried={} executed={} deopted={} not_ready={} compilations={} code_bytes={} started={} failed={} panicked={}",
+        tried - diag_before.0,
+        executed - diag_before.1,
+        deopted - diag_before.2,
+        not_ready - diag_before.3,
+        compilations - diag_before.4,
+        code_bytes - diag_before.5,
+        started - diag_before.6,
+        failed - diag_before.7,
+        panicked - diag_before.8
+    );
+    eprintln!(
+        "  deopt_cats_delta: generic={} overflow={} stub={} global={} divzero={} unknown={}",
+        cats_after[0] - cats_before[0],
+        cats_after[1] - cats_before[1],
+        cats_after[2] - cats_before[2],
+        cats_after[3] - cats_before[3],
+        cats_after[4] - cats_before[4],
+        cats_after[5] - cats_before[5]
     );
 }
 
@@ -966,6 +1054,9 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    // Snapshot before measurement
+    let diag_before = maglev_diagnostics();
+    let cats_before = maglev_deopt_categories();
     c.bench_function("array_push_sum_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -975,8 +1066,27 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
     });
     let (tried, executed, deopted, not_ready, compilations, code_bytes, started, failed, panicked) =
         maglev_diagnostics();
+    let cats_after = maglev_deopt_categories();
     eprintln!(
-        "MAGLEV_DIAG[array_push_sum_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes} started={started} failed={failed} panicked={panicked}"
+        "MAGLEV_DIAG[array_push_sum_1k]: tried={} executed={} deopted={} not_ready={} compilations={} code_bytes={} started={} failed={} panicked={}",
+        tried - diag_before.0,
+        executed - diag_before.1,
+        deopted - diag_before.2,
+        not_ready - diag_before.3,
+        compilations - diag_before.4,
+        code_bytes - diag_before.5,
+        started - diag_before.6,
+        failed - diag_before.7,
+        panicked - diag_before.8
+    );
+    eprintln!(
+        "  deopt_cats_delta: generic={} overflow={} stub={} global={} divzero={} unknown={}",
+        cats_after[0] - cats_before[0],
+        cats_after[1] - cats_before[1],
+        cats_after[2] - cats_before[2],
+        cats_after[3] - cats_before[3],
+        cats_after[4] - cats_before[4],
+        cats_after[5] - cats_before[5]
     );
 }
 
@@ -1014,6 +1124,9 @@ fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    // Snapshot before measurement
+    let diag_before = maglev_diagnostics();
+    let cats_before = maglev_deopt_categories();
     c.bench_function("closure_counter_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -1023,8 +1136,27 @@ fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
     });
     let (tried, executed, deopted, not_ready, compilations, code_bytes, started, failed, panicked) =
         maglev_diagnostics();
+    let cats_after = maglev_deopt_categories();
     eprintln!(
-        "MAGLEV_DIAG[closure_counter_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes} started={started} failed={failed} panicked={panicked}"
+        "MAGLEV_DIAG[closure_counter_1k]: tried={} executed={} deopted={} not_ready={} compilations={} code_bytes={} started={} failed={} panicked={}",
+        tried - diag_before.0,
+        executed - diag_before.1,
+        deopted - diag_before.2,
+        not_ready - diag_before.3,
+        compilations - diag_before.4,
+        code_bytes - diag_before.5,
+        started - diag_before.6,
+        failed - diag_before.7,
+        panicked - diag_before.8
+    );
+    eprintln!(
+        "  deopt_cats_delta: generic={} overflow={} stub={} global={} divzero={} unknown={}",
+        cats_after[0] - cats_before[0],
+        cats_after[1] - cats_before[1],
+        cats_after[2] - cats_before[2],
+        cats_after[3] - cats_before[3],
+        cats_after[4] - cats_before[4],
+        cats_after[5] - cats_before[5]
     );
 }
 
@@ -1064,6 +1196,9 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    // Snapshot before measurement
+    let diag_before = maglev_diagnostics();
+    let cats_before = maglev_deopt_categories();
     c.bench_function("prototype_chain_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -1073,8 +1208,27 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
     });
     let (tried, executed, deopted, not_ready, compilations, code_bytes, started, failed, panicked) =
         maglev_diagnostics();
+    let cats_after = maglev_deopt_categories();
     eprintln!(
-        "MAGLEV_DIAG[prototype_chain_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes} started={started} failed={failed} panicked={panicked}"
+        "MAGLEV_DIAG[prototype_chain_1k]: tried={} executed={} deopted={} not_ready={} compilations={} code_bytes={} started={} failed={} panicked={}",
+        tried - diag_before.0,
+        executed - diag_before.1,
+        deopted - diag_before.2,
+        not_ready - diag_before.3,
+        compilations - diag_before.4,
+        code_bytes - diag_before.5,
+        started - diag_before.6,
+        failed - diag_before.7,
+        panicked - diag_before.8
+    );
+    eprintln!(
+        "  deopt_cats_delta: generic={} overflow={} stub={} global={} divzero={} unknown={}",
+        cats_after[0] - cats_before[0],
+        cats_after[1] - cats_before[1],
+        cats_after[2] - cats_before[2],
+        cats_after[3] - cats_before[3],
+        cats_after[4] - cats_before[4],
+        cats_after[5] - cats_before[5]
     );
 }
 
@@ -1119,6 +1273,9 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    // Snapshot before measurement
+    let diag_before = maglev_diagnostics();
+    let cats_before = maglev_deopt_categories();
     c.bench_function("sieve_primes_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -1128,13 +1285,27 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
     });
     let (tried, executed, deopted, not_ready, compilations, code_bytes, started, failed, panicked) =
         maglev_diagnostics();
-    let cats = maglev_deopt_categories();
+    let cats_after = maglev_deopt_categories();
     eprintln!(
-        "MAGLEV_DIAG[sieve_primes_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes} started={started} failed={failed} panicked={panicked}"
+        "MAGLEV_DIAG[sieve_primes_1k]: tried={} executed={} deopted={} not_ready={} compilations={} code_bytes={} started={} failed={} panicked={}",
+        tried - diag_before.0,
+        executed - diag_before.1,
+        deopted - diag_before.2,
+        not_ready - diag_before.3,
+        compilations - diag_before.4,
+        code_bytes - diag_before.5,
+        started - diag_before.6,
+        failed - diag_before.7,
+        panicked - diag_before.8
     );
     eprintln!(
-        "  deopt_cats: generic={} overflow={} stub={} global={} divzero={} unknown={}",
-        cats[0], cats[1], cats[2], cats[3], cats[4], cats[5]
+        "  deopt_cats_delta: generic={} overflow={} stub={} global={} divzero={} unknown={}",
+        cats_after[0] - cats_before[0],
+        cats_after[1] - cats_before[1],
+        cats_after[2] - cats_before[2],
+        cats_after[3] - cats_before[3],
+        cats_after[4] - cats_before[4],
+        cats_after[5] - cats_before[5]
     );
 }
 
@@ -1168,6 +1339,9 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    // Snapshot before measurement
+    let diag_before = maglev_diagnostics();
+    let cats_before = maglev_deopt_categories();
     c.bench_function("deep_object_access_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -1177,8 +1351,27 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
     });
     let (tried, executed, deopted, not_ready, compilations, code_bytes, started, failed, panicked) =
         maglev_diagnostics();
+    let cats_after = maglev_deopt_categories();
     eprintln!(
-        "MAGLEV_DIAG[deep_object_access_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes} started={started} failed={failed} panicked={panicked}"
+        "MAGLEV_DIAG[deep_object_access_1k]: tried={} executed={} deopted={} not_ready={} compilations={} code_bytes={} started={} failed={} panicked={}",
+        tried - diag_before.0,
+        executed - diag_before.1,
+        deopted - diag_before.2,
+        not_ready - diag_before.3,
+        compilations - diag_before.4,
+        code_bytes - diag_before.5,
+        started - diag_before.6,
+        failed - diag_before.7,
+        panicked - diag_before.8
+    );
+    eprintln!(
+        "  deopt_cats_delta: generic={} overflow={} stub={} global={} divzero={} unknown={}",
+        cats_after[0] - cats_before[0],
+        cats_after[1] - cats_before[1],
+        cats_after[2] - cats_before[2],
+        cats_after[3] - cats_before[3],
+        cats_after[4] - cats_before[4],
+        cats_after[5] - cats_before[5]
     );
 }
 

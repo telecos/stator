@@ -270,10 +270,18 @@ pub(crate) mod jit_runtime {
         /// after nested JIT execution re-initialises thread-local state.
         static RT_SETUP_GEN: Cell<u64> = const { Cell::new(0) };
 
-        /// Last [`BytecodeArray`] pointer passed to [`jit_runtime_setup`].
-        /// Used to skip IC reset when the same function re-enters (e.g.
-        /// criterion iterations measuring the same benchmark).
-        static RT_LAST_BA: Cell<*const BytecodeArray> = const { Cell::new(std::ptr::null()) };
+        /// Last [`BytecodeArray`] pointer **and bytecodes length** passed
+        /// to [`jit_runtime_setup`].  Used to skip IC reset when the same
+        /// function re-enters (e.g. criterion iterations measuring the
+        /// same benchmark).
+        ///
+        /// Storing the length alongside the pointer detects allocator
+        /// address reuse: when a `BytecodeArray` is dropped and a new one
+        /// is allocated at the same address, the lengths will almost
+        /// certainly differ, forcing an IC reset.
+        static RT_LAST_BA: Cell<(*const BytecodeArray, usize)> = const {
+            Cell::new((std::ptr::null(), 0))
+        };
 
         /// Single-entry IC that caches the most recent array method
         /// lookup.  Avoids recreating the fast-array-method
@@ -473,10 +481,16 @@ pub(crate) mod jit_runtime {
         // changes.  Re-entrant calls to the same BytecodeArray (e.g.
         // criterion iterations) keep warm IC state, saving ~190ns per
         // named property access on IC-miss paths.
+        //
+        // We compare both the pointer AND the bytecodes length to detect
+        // allocator address reuse: when a BytecodeArray is dropped and a
+        // new one is allocated at the same address, the bytecodes length
+        // will almost certainly differ, forcing an IC reset.
+        let ba_len = ba.bytecodes().len();
         let same_ba = RT_LAST_BA.with(|prev| {
-            let was = prev.get();
-            prev.set(ba_ptr);
-            was == ba_ptr
+            let (was_ptr, was_len) = prev.get();
+            prev.set((ba_ptr, ba_len));
+            was_ptr == ba_ptr && was_len == ba_len
         });
         if !same_ba {
             RT_PROP_IC.with(|ic| {
