@@ -2221,6 +2221,10 @@ pub(crate) mod jit_runtime {
                     // the CALLER is not forced to deopt.
                     ba.mark_jit_maglev_deopted();
                     *maglev_cache.borrow_mut() = None;
+                    // Clear Arc so lazy transfer won't reload deopted code.
+                    if let Ok(mut guard) = ba.maglev_jit_cache_arc().lock() {
+                        *guard = None;
+                    }
                 }
             }
         }
@@ -2242,26 +2246,26 @@ pub(crate) mod jit_runtime {
                 crate::interpreter::maybe_compile_maglev(ba);
             }
 
-            let maglev_cache = ba.maglev_executable_cache();
-            // SAFETY: single-threaded JIT; no concurrent mutation.
-            let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
-            if maglev_ref.is_none() {
-                // Lazy transfer: background thread writes to the Arc<Mutex>,
-                // but JIT stubs check the Rc<RefCell>.  Bridge the gap by
-                // copying compiled code from the Arc into the Rc cache.
-                let jit_cache = ba.maglev_jit_cache_arc();
-                let cached_data = jit_cache.lock().ok().and_then(|guard| {
-                    guard
-                        .as_ref()
-                        .map(|c| (c.as_bytes().to_vec(), c.register_file_slots))
-                });
-                if let Some((code, register_file_slots)) = cached_data {
-                    // SAFETY: `code` was produced by `maglev_codegen::compile`.
-                    let exec = unsafe { CachedMaglevCode::new(&code, register_file_slots) };
-                    *maglev_cache.borrow_mut() = exec;
-                }
-            }
             if !ba.jit_maglev_has_deopted() {
+                let maglev_cache = ba.maglev_executable_cache();
+                // SAFETY: single-threaded JIT; no concurrent mutation.
+                let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
+                if maglev_ref.is_none() {
+                    // Lazy transfer: background thread writes to the Arc<Mutex>,
+                    // but JIT stubs check the Rc<RefCell>.  Bridge the gap by
+                    // copying compiled code from the Arc into the Rc cache.
+                    let jit_cache = ba.maglev_jit_cache_arc();
+                    let cached_data = jit_cache.lock().ok().and_then(|guard| {
+                        guard
+                            .as_ref()
+                            .map(|c| (c.as_bytes().to_vec(), c.register_file_slots))
+                    });
+                    if let Some((code, register_file_slots)) = cached_data {
+                        // SAFETY: `code` was produced by `maglev_codegen::compile`.
+                        let exec = unsafe { CachedMaglevCode::new(&code, register_file_slots) };
+                        *maglev_cache.borrow_mut() = exec;
+                    }
+                }
                 let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
                 if let Some(maglev_exec) = maglev_ref.as_ref() {
                     if let Some(result) = exec_maglev_callee(ba, maglev_exec, jit_args, saved_ba) {
@@ -2269,6 +2273,10 @@ pub(crate) mod jit_runtime {
                     }
                     ba.mark_jit_maglev_deopted();
                     *maglev_cache.borrow_mut() = None;
+                    // Clear Arc so lazy transfer won't reload deopted code.
+                    if let Ok(mut guard) = ba.maglev_jit_cache_arc().lock() {
+                        *guard = None;
+                    }
                 }
             }
         }
@@ -2741,7 +2749,7 @@ pub(crate) mod jit_runtime {
 
                 // ── Maglev fast path (preferred) ───────────────
                 #[cfg(all(target_arch = "x86_64", unix))]
-                {
+                if !ba.jit_maglev_has_deopted() {
                     use crate::compiler::maglev::codegen::CachedMaglevCode;
 
                     let maglev_cache = ba.maglev_executable_cache();
@@ -2804,6 +2812,11 @@ pub(crate) mod jit_runtime {
                             // the CALLER is not forced to deopt.
                             ba.mark_jit_maglev_deopted();
                             *maglev_cache.borrow_mut() = None;
+                            // Clear Arc storage so lazy transfer won't
+                            // reload deopted code on subsequent calls.
+                            if let Ok(mut guard) = ba.maglev_jit_cache_arc().lock() {
+                                *guard = None;
+                            }
                             unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
                             if let Some(ctx) = saved_ctx {
                                 // SAFETY: no active borrows; restore context.
