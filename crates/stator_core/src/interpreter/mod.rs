@@ -217,7 +217,7 @@ pub use crate::objects::value::{
 type FnPropMap = Rc<RefCell<HashMap<String, JsValue>>>;
 type MonoLoadCache = HashMap<u32, (usize, JsValue)>;
 type PolyLoadCache = HashMap<u32, Vec<(usize, JsValue)>>;
-type ProtoLoadIcCache = HashMap<u32, ProtoLoadIc>;
+type ProtoLoadIcCache = ProtoIcCache;
 type StringCache = HashMap<u32, Rc<str>>;
 type GlobalIcCache = HashMap<u32, (usize, u64)>;
 
@@ -1752,16 +1752,77 @@ impl MegamorphicIc {
 /// match, the cached value can be returned without re-walking the chain.
 #[derive(Debug, Clone)]
 pub struct ProtoLoadIc {
+    /// Feedback slot this entry belongs to (used for direct-mapped indexing).
+    pub slot: u32,
     /// Receiver layout observed when the cache entry was populated.
     pub receiver_shape: u64,
     /// Prototype-chain generation snapshot for the receiver.
     pub proto_generation: u32,
-    /// Cached distance from receiver to the prototype that supplied the value.
-    pub proto_depth: u8,
-    /// Property key associated with the cached lookup.
-    pub property_key: Rc<str>,
     /// Value returned by the inherited property lookup.
     pub value: JsValue,
+}
+
+impl Default for ProtoLoadIc {
+    fn default() -> Self {
+        Self {
+            slot: u32::MAX,
+            receiver_shape: 0,
+            proto_generation: 0,
+            value: JsValue::Undefined,
+        }
+    }
+}
+
+const PROTO_IC_SIZE: usize = 32;
+
+#[derive(Debug, Clone)]
+/// Fixed-size direct-mapped cache for prototype-chain IC entries.
+///
+/// Uses `slot & (PROTO_IC_SIZE - 1)` as index, matching the `MegamorphicIc`
+/// design for O(1) lookup without hashing overhead.
+pub struct ProtoIcCache {
+    entries: Box<[ProtoLoadIc; PROTO_IC_SIZE]>,
+}
+
+impl Default for ProtoIcCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProtoIcCache {
+    /// Creates an empty cache with all sentinel entries.
+    pub fn new() -> Self {
+        Self {
+            entries: Box::new(std::array::from_fn(|_| ProtoLoadIc::default())),
+        }
+    }
+
+    /// Probes for a cached entry matching `slot` and `receiver_layout`.
+    #[inline(always)]
+    pub fn probe(&self, slot: u32, receiver_layout: u64) -> Option<&ProtoLoadIc> {
+        let idx = (slot as usize) & (PROTO_IC_SIZE - 1);
+        let entry = &self.entries[idx];
+        if entry.slot == slot && entry.receiver_shape == receiver_layout {
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    /// Inserts or overwrites the entry for the given slot.
+    pub fn update(&mut self, ic: ProtoLoadIc) {
+        let idx = (ic.slot as usize) & (PROTO_IC_SIZE - 1);
+        self.entries[idx] = ic;
+    }
+
+    /// Evicts the entry for `slot` (sets it back to the sentinel).
+    pub fn remove(&mut self, slot: u32) {
+        let idx = (slot as usize) & (PROTO_IC_SIZE - 1);
+        if self.entries[idx].slot == slot {
+            self.entries[idx] = ProtoLoadIc::default();
+        }
+    }
 }
 
 /// Small inline-buffered argument storage for interpreter function calls.
@@ -2817,7 +2878,7 @@ impl InterpreterFrame {
             self.proto_load_ic = self
                 .bytecode_array
                 .shared_proto_load_ic()
-                .or_else(|| Some(Box::new(HashMap::new())));
+                .or_else(|| Some(Box::new(ProtoIcCache::new())));
         }
         self.proto_load_ic.as_mut().unwrap()
     }
@@ -4655,36 +4716,26 @@ impl Interpreter {
                                             }
                                         }
                                     }
-                                    if let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1) {
-                                        let prop_name = frame.get_string_constant(name_idx)?;
-                                        if let Some(ic) = frame
-                                            .proto_load_ic
-                                            .as_ref()
-                                            .and_then(|cache| cache.get(&slot))
-                                            && ic.receiver_shape == layout
-                                            && ic.proto_depth != 0
-                                            && ic.property_key.as_ref() == prop_name.as_ref()
-                                            && ic.proto_generation == pm.proto_generation()
-                                            && !plain_object_has_own_property(
-                                                &pm,
-                                                prop_name.as_ref(),
-                                            )
-                                        {
-                                            let val = ic.value.clone();
-                                            drop(pm);
-                                            if let JsValue::Smi(v) = &val {
-                                                sa = *v;
-                                                smi_acc_bool = false;
-                                                smi_acc_spilled = false;
-                                                hot_acc = Some(NanBoxedValue::from_smi(*v));
-                                            } else {
-                                                acc = val;
-                                                smi_acc_spilled = true;
-                                                smi_acc_bool = false;
-                                                hot_acc = None;
-                                            }
-                                            continue 'smi;
+                                    if let Some(ic) = frame
+                                        .proto_load_ic
+                                        .as_ref()
+                                        .and_then(|cache| cache.probe(slot, layout))
+                                        && ic.proto_generation == pm.proto_generation()
+                                    {
+                                        let val = ic.value.cheap_clone();
+                                        drop(pm);
+                                        if let JsValue::Smi(v) = &val {
+                                            sa = *v;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*v));
+                                        } else {
+                                            acc = val;
+                                            smi_acc_spilled = true;
+                                            smi_acc_bool = false;
+                                            hot_acc = None;
                                         }
+                                        continue 'smi;
                                     }
                                 }
                                 // IC miss or non-PlainObject ΓÇö exit SMI mode.
@@ -6674,21 +6725,14 @@ impl Interpreter {
                                         }
                                     }
                                 }
-                                if let Operand::ConstantPoolIdx(name_idx) = *instr.operand(1) {
-                                    let prop_name = frame.get_string_constant(name_idx)?;
-                                    if let Some(ic) = frame
-                                        .proto_load_ic
-                                        .as_ref()
-                                        .and_then(|cache| cache.get(&slot))
-                                        && ic.receiver_shape == layout
-                                        && ic.proto_depth != 0
-                                        && ic.property_key.as_ref() == prop_name.as_ref()
-                                        && ic.proto_generation == pm.proto_generation()
-                                        && !plain_object_has_own_property(&pm, prop_name.as_ref())
-                                    {
-                                        acc = ic.value.clone();
-                                        continue 'dispatch;
-                                    }
+                                if let Some(ic) = frame
+                                    .proto_load_ic
+                                    .as_ref()
+                                    .and_then(|cache| cache.probe(slot, layout))
+                                    && ic.proto_generation == pm.proto_generation()
+                                {
+                                    acc = ic.value.cheap_clone();
+                                    continue 'dispatch;
                                 }
                             }
                         }
@@ -9743,7 +9787,23 @@ pub(super) fn try_inline_small_function(
     }
 
     let decoded = ba.shared_decoded_instructions().ok()?;
-    let instrs = decoded.0.as_slice();
+    let all_instrs = decoded.0.as_slice();
+
+    // Strip leading CreateMappedArguments/CreateUnmappedArguments + Star pair.
+    // Sloppy-mode functions always emit these, but when the arguments object
+    // is never used in the body (common for closures), we can safely skip them
+    // to match the useful bytecode pattern underneath.
+    let instrs = if all_instrs.len() >= 2
+        && matches!(
+            all_instrs[0].opcode,
+            Opcode::CreateMappedArguments | Opcode::CreateUnmappedArguments
+        )
+        && all_instrs[1].opcode == Opcode::Star
+    {
+        &all_instrs[2..]
+    } else {
+        all_instrs
+    };
 
     match instrs {
         [lda, ret] if lda.opcode == Opcode::LdaSmi && ret.opcode == Opcode::Return => {
