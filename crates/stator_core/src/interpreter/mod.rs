@@ -1401,123 +1401,15 @@ pub fn maybe_compile_maglev(ba: &BytecodeArray) {
 ///
 /// On platforms where the JIT is not available this always returns `None`.
 #[allow(dead_code)]
-fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
-    #[cfg(all(target_arch = "x86_64", unix))]
-    {
-        // Maglev execution is temporarily disabled.  Every sloppy-mode
-        // function emits CreateMappedArguments which falls to the
-        // unconditional-deopt catch-all in codegen.  The first execution
-        // always deopts, but for some programs (closures, constructors,
-        // deep chains, keyed stores) the deopt path itself triggers
-        // SIGSEGV.  Disabling execution has zero performance impact
-        // because the result was always a deopt back to the interpreter.
-        // Re-enable once CreateMappedArguments has a proper codegen stub.
-        return None;
-
-        // Skip if Maglev previously deopted.
-        if ba.jit_maglev_has_deopted() {
-            return None;
-        }
-
-        MAGLEV_DIAG_TRIED.with(|c| c.set(c.get() + 1));
-
-        use crate::compiler::baseline::compiler::{
-            JIT_DEOPT, jit_runtime_set_context, jit_runtime_setup, jit_runtime_teardown,
-            jit_to_jsvalue_ext,
-        };
-        use crate::compiler::maglev::codegen::CachedMaglevCode;
-
-        let cache = ba.maglev_executable_cache();
-
-        // Lazily initialise the cached executable from raw code bytes.
-        {
-            let needs_init = cache.borrow().is_none();
-            if needs_init {
-                // Lock the shared Maglev JIT cache (written by the background
-                // thread) and copy the code bytes + slot count while the lock
-                // is held.  The mmap for `CachedMaglevCode` happens outside
-                // the lock.
-                let jit_cache = ba.maglev_jit_cache_arc();
-                let cached_data = jit_cache.lock().ok().and_then(|guard| {
-                    guard
-                        .as_ref()
-                        .map(|c| (c.as_bytes().to_vec(), c.register_file_slots))
-                });
-                if let Some((code, register_file_slots)) = cached_data {
-                    // SAFETY: `code` was produced by `maglev_codegen::compile`.
-                    let exec = unsafe { CachedMaglevCode::new(&code, register_file_slots) };
-                    *cache.borrow_mut() = exec;
-                } else {
-                    maybe_compile_maglev(ba);
-                    MAGLEV_DIAG_NOT_READY.with(|c| c.set(c.get() + 1));
-                }
-            }
-        }
-
-        // Borrow the cache to get a pointer to the executable, then
-        // drop the borrow before execution so we can invalidate on deopt.
-        let exec_ptr: *const CachedMaglevCode = {
-            let guard = cache.borrow();
-            match guard.as_ref() {
-                Some(cached) => cached as *const CachedMaglevCode,
-                None => return None,
-            }
-        };
-        // SAFETY: The Rc<RefCell> keeps the CachedMaglevCode alive for the
-        // duration of this function.  We dropped the borrow guard above but
-        // the data is still valid because we only invalidate AFTER execution.
-        let cached = unsafe { &*exec_ptr };
-
-        // Set up thread-local state so runtime stubs can access the
-        // constant pool, heap-object table, and property IC.
-        jit_runtime_setup(ba);
-
-        // Convert args — may allocate heap handles in RT_HEAP.
-        let jit_args: Vec<i64> = args.iter().map(jsvalue_to_jit).collect();
-
-        // Set closure context for context-slot stubs.
-        let ctx_raw = {
-            let ctx = ba.closure_context();
-            let ptr = ctx.map(Rc::as_ptr).unwrap_or(std::ptr::null()) as i64;
-            jit_runtime_set_context(ctx.cloned());
-            ptr
-        };
-
-        // Mark that we are executing Maglev code so stubs can track deopts.
-        MAGLEV_EXECUTING.with(|f| f.set(true));
-
-        // SAFETY: The cached code was produced by `maglev_codegen::compile`.
-        let result = unsafe { cached.execute(&jit_args, ctx_raw) };
-
-        MAGLEV_EXECUTING.with(|f| f.set(false));
-
-        let deopt_offset = (result as u64).wrapping_sub(JIT_DEOPT as u64);
-        let ret = if deopt_offset <= 5 {
-            MAGLEV_DIAG_DEOPTED.with(|c| c.set(c.get() + 1));
-            // Track per-category deopt: 0=generic, 1=overflow, 2=stub,
-            // 3=global, 4=divzero, 5+=unknown
-            MAGLEV_DIAG_DEOPT_CATS.with(|c| {
-                let mut cats = c.get();
-                let idx = (deopt_offset as usize).min(5);
-                cats[idx] += 1;
-                c.set(cats);
-            });
-            ba.mark_jit_maglev_deopted();
-            // Invalidate the cached executable so the next attempt
-            // re-loads from the shared Arc (which may have been
-            // recompiled with better type feedback).
-            *cache.borrow_mut() = None;
-            None
-        } else {
-            MAGLEV_DIAG_EXECUTED.with(|c| c.set(c.get() + 1));
-            jit_to_jsvalue_ext(result).map(Ok)
-        };
-
-        jit_runtime_teardown();
-        return ret;
-    }
-    #[allow(unreachable_code)]
-    let _ = (ba, args);
+fn try_execute_maglev(_ba: &BytecodeArray, _args: &[JsValue]) -> Option<StatorResult<JsValue>> {
+    // Maglev execution is temporarily disabled.  Every sloppy-mode
+    // function emits CreateMappedArguments which falls to the
+    // unconditional-deopt catch-all in codegen.  The first execution
+    // always deopts, but for some programs (closures, constructors,
+    // deep chains, keyed stores) the deopt path itself triggers
+    // SIGSEGV.  Disabling execution has zero performance impact
+    // because the result was always a deopt back to the interpreter.
+    // Re-enable once CreateMappedArguments has a proper codegen stub.
     None
 }
 
@@ -1761,10 +1653,15 @@ impl MegamorphicIc {
 pub struct ProtoLoadIc {
     /// Feedback slot this entry belongs to (used for direct-mapped indexing).
     pub slot: u32,
-    /// Receiver layout observed when the cache entry was populated.
-    pub receiver_shape: u64,
     /// Prototype-chain generation snapshot for the receiver.
     pub proto_generation: u32,
+    /// Receiver layout observed when the cache entry was populated.
+    pub receiver_shape: u64,
+    /// Global prototype-mutation epoch snapshot taken when this entry was
+    /// populated.  When the current epoch still matches, no prototype in
+    /// the entire runtime has been mutated, so `proto_generation` is
+    /// guaranteed valid and need not be recomputed.
+    pub proto_global_epoch: u64,
     /// Value returned by the inherited property lookup.
     pub value: JsValue,
 }
@@ -1775,6 +1672,7 @@ impl Default for ProtoLoadIc {
             slot: u32::MAX,
             receiver_shape: 0,
             proto_generation: 0,
+            proto_global_epoch: u64::MAX,
             value: JsValue::Undefined,
         }
     }
@@ -1811,6 +1709,33 @@ impl ProtoIcCache {
         let idx = (slot as usize) & (PROTO_IC_SIZE - 1);
         let entry = &self.entries[idx];
         if entry.slot == slot && entry.receiver_shape == receiver_layout {
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    /// Fast-path probe guarded by the global prototype-mutation epoch.
+    ///
+    /// When the epoch matches, no prototype anywhere in the runtime has
+    /// been mutated since the entry was populated, so the cached
+    /// `proto_generation` is guaranteed valid and `proto_generation()`
+    /// need not be called at all.
+    #[inline(always)]
+    pub fn probe_epoch(
+        &self,
+        slot: u32,
+        receiver_layout: u64,
+        global_epoch: u64,
+    ) -> Option<&ProtoLoadIc> {
+        let idx = (slot as usize) & (PROTO_IC_SIZE - 1);
+        // SAFETY: PROTO_IC_SIZE is a power of two so the mask is always
+        // in bounds.
+        let entry = unsafe { self.entries.get_unchecked(idx) };
+        if entry.slot == slot
+            && entry.proto_global_epoch == global_epoch
+            && entry.receiver_shape == receiver_layout
+        {
             Some(entry)
         } else {
             None
@@ -4723,6 +4648,29 @@ impl Interpreter {
                                             }
                                         }
                                     }
+                                    // Epoch-fast: skip proto_generation()
+                                    // when the global epoch is unchanged.
+                                    let global_epoch = PropertyMap::global_proto_mutation_epoch();
+                                    if let Some(ic) =
+                                        frame.proto_load_ic.as_ref().and_then(|cache| {
+                                            cache.probe_epoch(slot, layout, global_epoch)
+                                        })
+                                    {
+                                        let val = ic.value.cheap_clone();
+                                        drop(pm);
+                                        if let JsValue::Smi(v) = &val {
+                                            sa = *v;
+                                            smi_acc_bool = false;
+                                            smi_acc_spilled = false;
+                                            hot_acc = Some(NanBoxedValue::from_smi(*v));
+                                        } else {
+                                            acc = val;
+                                            smi_acc_spilled = true;
+                                            smi_acc_bool = false;
+                                            hot_acc = None;
+                                        }
+                                        continue 'smi;
+                                    }
                                     if let Some(ic) = frame
                                         .proto_load_ic
                                         .as_ref()
@@ -6731,6 +6679,17 @@ impl Interpreter {
                                             }
                                         }
                                     }
+                                }
+                                // Epoch-fast: skip proto_generation()
+                                // when the global epoch is unchanged.
+                                let global_epoch = PropertyMap::global_proto_mutation_epoch();
+                                if let Some(ic) = frame
+                                    .proto_load_ic
+                                    .as_ref()
+                                    .and_then(|cache| cache.probe_epoch(slot, layout, global_epoch))
+                                {
+                                    acc = ic.value.cheap_clone();
+                                    continue 'dispatch;
                                 }
                                 if let Some(ic) = frame
                                     .proto_load_ic

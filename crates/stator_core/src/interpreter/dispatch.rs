@@ -3862,12 +3862,26 @@ fn handle_lda_named_property(
             }
         }
     }
-    // ── Prototype-chain IC fast path (before full clone) ───────────────────────────
+    // -- Prototype-chain IC fast path (epoch-guarded) ----
+    // Uses the already-cloned `obj` (avoids a second Rc::clone from the
+    // register) and checks the global prototype-mutation epoch first so
+    // that `proto_generation()` can be skipped when no prototype in the
+    // runtime has been mutated since the IC entry was populated.
     if slot != u32::MAX
-        && let JsValue::PlainObject(map) = ctx.frame.read_reg(obj_v)?.cheap_clone()
+        && let JsValue::PlainObject(ref map) = obj
     {
+        let global_epoch = PropertyMap::global_proto_mutation_epoch();
         let pm = map.borrow();
         let layout = pm.layout_id();
+        if let Some(ic) = ctx
+            .frame
+            .proto_load_ic
+            .as_ref()
+            .and_then(|cache| cache.probe_epoch(slot, layout, global_epoch))
+        {
+            ctx.frame.accumulator = ic.value.cheap_clone();
+            return Ok(DispatchAction::Continue);
+        }
         if let Some(ic) = ctx
             .frame
             .proto_load_ic
@@ -4028,6 +4042,7 @@ fn handle_lda_named_property(
                 slot,
                 receiver_shape: pm.layout_id(),
                 proto_generation: pm.proto_generation(),
+                proto_global_epoch: PropertyMap::global_proto_mutation_epoch(),
                 value: result.cheap_clone(),
             });
         } else if let Some(cache) = &mut ctx.frame.proto_load_ic {
