@@ -519,9 +519,12 @@ impl ObjectLiteralTemplate {
             values: acquire_values_vec(cap),
             attrs: Rc::clone(&self.attrs),
             integer_key_count: self.integer_key_count,
-            index: self.cached_index.clone(),
-            inline_cache: (cap > SMALL_PROPERTY_LINEAR_SCAN_CAP)
-                .then(|| Box::new(InlinePropertyCache::new())),
+            index: if cap <= SMALL_PROPERTY_LINEAR_SCAN_CAP {
+                PropertyIndex::Inline
+            } else {
+                self.cached_index.clone()
+            },
+            inline_cache: None,
             shape_id: self.cached_shape_id,
             layout_id: self.layout_id,
             proto_generation: Cell::new(0),
@@ -556,9 +559,12 @@ impl ObjectLiteralTemplate {
             values,
             attrs: Rc::clone(&self.attrs),
             integer_key_count: self.integer_key_count,
-            index: self.cached_index.clone(),
-            inline_cache: (cap > SMALL_PROPERTY_LINEAR_SCAN_CAP)
-                .then(|| Box::new(InlinePropertyCache::new())),
+            index: if cap <= SMALL_PROPERTY_LINEAR_SCAN_CAP {
+                PropertyIndex::Inline
+            } else {
+                self.cached_index.clone()
+            },
+            inline_cache: None,
             shape_id: self.cached_shape_id,
             layout_id: self.layout_id,
             proto_generation: Cell::new(0),
@@ -657,9 +663,12 @@ impl PropertyMap {
         self.keys = Rc::clone(&template.keys);
         self.attrs = Rc::clone(&template.attrs);
         self.integer_key_count = template.integer_key_count;
-        self.index = template.cached_index.clone();
-        self.inline_cache =
-            (cap > SMALL_PROPERTY_LINEAR_SCAN_CAP).then(|| Box::new(InlinePropertyCache::new()));
+        self.index = if cap <= SMALL_PROPERTY_LINEAR_SCAN_CAP {
+            PropertyIndex::Inline
+        } else {
+            template.cached_index.clone()
+        };
+        self.inline_cache = None;
         self.shape_id = template.cached_shape_id;
         self.layout_id = template.layout_id;
         self.proto_generation.set(0);
@@ -690,9 +699,12 @@ impl PropertyMap {
         self.keys = Rc::clone(&template.keys);
         self.attrs = Rc::clone(&template.attrs);
         self.integer_key_count = template.integer_key_count;
-        self.index = template.cached_index.clone();
-        self.inline_cache =
-            (cap > SMALL_PROPERTY_LINEAR_SCAN_CAP).then(|| Box::new(InlinePropertyCache::new()));
+        self.index = if cap <= SMALL_PROPERTY_LINEAR_SCAN_CAP {
+            PropertyIndex::Inline
+        } else {
+            template.cached_index.clone()
+        };
+        self.inline_cache = None;
         self.shape_id = template.cached_shape_id;
         self.layout_id = template.layout_id;
         self.proto_generation.set(0);
