@@ -2848,7 +2848,7 @@ pub(crate) mod jit_runtime {
                         let jit_result = unsafe { maglev_exec.execute(&[], ctx_raw) };
                         bc_ref.set(saved_ba);
 
-                        if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
+                        if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
                             unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
                             if let Some(ctx) = saved_ctx {
                                 unsafe { *ctx_ref.as_ptr() = ctx };
@@ -2856,7 +2856,7 @@ pub(crate) mod jit_runtime {
                             return Some(jit_result);
                         }
 
-                        if jit_result == JIT_DEOPT {
+                        if is_jit_deopt(jit_result) {
                             // Callee Maglev deopted — mark + invalidate,
                             // then fall through to baseline/interpreter so
                             // the CALLER is not forced to deopt.
@@ -2920,7 +2920,7 @@ pub(crate) mod jit_runtime {
                     bc_ref.set(saved_ba);
 
                     // Non-heap results skip the round-trip conversion.
-                    if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
+                    if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
                         // SAFETY: no active heap borrows.
                         unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
                         if let Some(ctx) = saved_ctx {
@@ -2929,7 +2929,7 @@ pub(crate) mod jit_runtime {
                         return Some(jit_result);
                     }
 
-                    if jit_result == JIT_DEOPT {
+                    if is_jit_deopt(jit_result) {
                         // Callee baseline JIT deopted — mark it and
                         // fall through to interpreter so the CALLER
                         // is not forced to deopt.

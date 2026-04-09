@@ -923,25 +923,33 @@ impl<'a> MaglevCodegen<'a> {
         // alignment padding when needed) to align RSP to 0 mod 16
         // before the inner `call`.
 
+        // Save the register-file pointer (RDI) into R14 immediately,
+        // BEFORE any function calls that would clobber caller-saved
+        // registers (RDI is caller-saved in SysV ABI).
+        self.masm.mov_rr(Reg64::R14, Reg64::Rdi);
+
         // Cache the closure-context raw pointer (RSI) in a reserved
         // register-file slot BEFORE any calls that might clobber RSI.
-        // RDI still points to the register file at this point.
+        // R14 now holds the register-file pointer.
         #[cfg(all(target_arch = "x86_64", unix))]
         if let Some(offset) = self.ctx_regfile_offset {
             self.masm
-                .mov_store_base_disp32(Reg64::Rdi, offset, Reg64::Rsi);
+                .mov_store_base_disp32(Reg64::R14, offset, Reg64::Rsi);
         }
 
         // When the function has direct calls or keyed array accesses,
         // cache the RT_PTRS TLS Cell address in R15 to avoid per-call
         // TLS lookups.
-        // RSP ≡ 8 mod 16 here → call pushes 8 → callee sees 0 mod 16. ✓
+        // RSP ≡ 8 mod 16 here; push R11 to align to 0 mod 16 before
+        // call, so callee sees RSP ≡ 8 mod 16 per SysV ABI.
         #[cfg(all(target_arch = "x86_64", unix))]
         if self.needs_r15 {
+            self.masm.push(Reg64::R11); // alignment padding
             let addr = jit_runtime::jit_runtime_get_rt_ptrs_cell_addr as *const () as i64;
             self.masm.mov_ri(Reg64::R11, addr);
             self.masm.call_reg(Reg64::R11);
             self.masm.mov_rr(Reg64::R15, Reg64::Rax);
+            self.masm.pop(Reg64::R11); // restore alignment
         }
 
         // Allocate cache slots on the stack: monomorphic call caches +
@@ -957,8 +965,6 @@ impl<'a> MaglevCodegen<'a> {
                     .mov_store_base_disp32(Reg64::Rsp, i * 8, Reg64::R11);
             }
         }
-
-        self.masm.mov_rr(Reg64::R14, Reg64::Rdi);
     }
 
     /// Emit the normal function return sequence.
