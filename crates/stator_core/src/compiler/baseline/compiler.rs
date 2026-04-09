@@ -162,7 +162,9 @@ pub(crate) mod jit_runtime {
     use crate::interpreter::GlobalEnv;
     use crate::objects::map::PropertyAttributes;
     use crate::objects::property_map::{
-        INTERNAL_PROTO_PROPERTY_KEY, PropertyMap, recycle_object_rc,
+        INTERNAL_PROTO_PROPERTY_KEY, ObjectLiteralTemplate, PropertyMap,
+        acquire_object_rc_from_template, acquire_object_rc_from_template_with_values,
+        recycle_object_rc,
     };
     use crate::objects::value::{JsContext, JsValue, NativeIterator};
 
@@ -293,6 +295,18 @@ pub(crate) mod jit_runtime {
         /// Cleared by [`jit_runtime_setup`] to avoid stale handles.
         static RT_ARRAY_METHOD_IC: Cell<ArrayMethodIcEntry> = const {
             Cell::new(ArrayMethodIcEntry::EMPTY)
+        };
+
+        /// Single-entry IC that caches the most recent object-literal
+        /// template pointer.  Avoids the `RefCell` borrow and `HashMap`
+        /// lookup on the `object_literal_templates` map for repeated
+        /// creation of the same literal shape (e.g. `{x:1, y:2, z:3}`
+        /// inside a tight loop).
+        ///
+        /// Cleared by [`jit_runtime_setup`] when the [`BytecodeArray`]
+        /// changes.
+        static RT_OBJECT_IC: Cell<ObjectLiteralIcEntry> = const {
+            Cell::new(ObjectLiteralIcEntry::EMPTY)
         };
     }
 
@@ -426,6 +440,39 @@ pub(crate) mod jit_runtime {
         };
     }
 
+    /// Single-entry inline cache for object-literal template lookups.
+    ///
+    /// Caches a raw pointer to the [`ObjectLiteralTemplate`] stored inside
+    /// the [`BytecodeArray`]'s `object_literal_templates` map so that the
+    /// hot path can skip the `RefCell` borrow and `HashMap` probe on
+    /// repeated calls with the same `(slot, ba)` pair.
+    ///
+    /// # Safety
+    ///
+    /// The `template` pointer is derived from a
+    /// `Box<ObjectLiteralTemplate>` inside
+    /// `ObjectLiteralCacheEntry::Cached`.  That heap allocation is stable
+    /// because cached entries are never removed or replaced.  The IC is
+    /// invalidated when the [`BytecodeArray`] changes (see
+    /// [`jit_runtime_setup`]).
+    #[derive(Clone, Copy)]
+    struct ObjectLiteralIcEntry {
+        /// Feedback slot this entry is for.
+        slot: u32,
+        /// BytecodeArray pointer this entry belongs to.
+        ba: *const BytecodeArray,
+        /// Raw pointer to the cached template.
+        template: *const ObjectLiteralTemplate,
+    }
+
+    impl ObjectLiteralIcEntry {
+        const EMPTY: Self = Self {
+            slot: u32::MAX,
+            ba: std::ptr::null(),
+            template: std::ptr::null(),
+        };
+    }
+
     /// Populate [`RT_PTRS`] so that runtime stubs can bypass per-variable
     /// `.with()` calls.
     ///
@@ -501,6 +548,7 @@ pub(crate) mod jit_runtime {
                 c.proto = [(u32::MAX, 0, 0); 32];
             });
             RT_ARRAY_METHOD_IC.with(|c| c.set(ArrayMethodIcEntry::EMPTY));
+            RT_OBJECT_IC.with(|c| c.set(ObjectLiteralIcEntry::EMPTY));
         }
     }
 
@@ -580,6 +628,13 @@ pub(crate) mod jit_runtime {
     #[inline]
     fn is_heap_handle(v: i64) -> bool {
         (JIT_HEAP_TAG..JIT_HEAP_TAG + 0x1_0000_0000).contains(&v)
+    }
+
+    /// Returns `true` when `v` is any JIT deopt sentinel
+    /// (`JIT_DEOPT` through `JIT_DEOPT_DIVZERO`).
+    #[inline]
+    fn is_jit_deopt(v: i64) -> bool {
+        (v as u64).wrapping_sub(JIT_DEOPT as u64) <= 5
     }
 
     /// Allocate a new heap handle for `val`, returning the `i64` handle.
@@ -2221,10 +2276,9 @@ pub(crate) mod jit_runtime {
                     // the CALLER is not forced to deopt.
                     ba.mark_jit_maglev_deopted();
                     *maglev_cache.borrow_mut() = None;
-                    // Clear Arc so lazy transfer won't reload deopted code.
-                    if let Ok(mut guard) = ba.maglev_jit_cache_arc().lock() {
-                        *guard = None;
-                    }
+                    // NOTE: Arc is intentionally NOT cleared — the deopt
+                    // guard around lazy transfer prevents reload.  Clearing
+                    // the Arc caused SIGSEGV on process exit.
                 }
             }
         }
@@ -2273,10 +2327,6 @@ pub(crate) mod jit_runtime {
                     }
                     ba.mark_jit_maglev_deopted();
                     *maglev_cache.borrow_mut() = None;
-                    // Clear Arc so lazy transfer won't reload deopted code.
-                    if let Ok(mut guard) = ba.maglev_jit_cache_arc().lock() {
-                        *guard = None;
-                    }
                 }
             }
         }
@@ -2402,7 +2452,7 @@ pub(crate) mod jit_runtime {
             // Fast path: non-heap results (Smi, bool, undefined, null) don't
             // reference heap handles and survive truncation unchanged.  Skip
             // the jit_to_jsvalue_ext → jsvalue_to_jit_i64 round-trip.
-            if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
+            if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
                 // SAFETY: no active borrows; truncate/restore via raw pointer.
                 unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
                 if let Some(ctx) = saved_ctx {
@@ -2413,7 +2463,7 @@ pub(crate) mod jit_runtime {
 
             // Heap handle or deopt: resolve the handle before truncation
             // destroys it, then re-encode after cleanup.
-            let result_val = if jit_result == JIT_DEOPT {
+            let result_val = if is_jit_deopt(jit_result) {
                 None
             } else {
                 jit_to_jsvalue_ext(jit_result)
@@ -2446,13 +2496,13 @@ pub(crate) mod jit_runtime {
         RT_BYTECODE.with(|b| b.set(saved_ba));
 
         // Fast path: non-heap results survive truncation unchanged.
-        if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
+        if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
             recycle_and_truncate_heap(heap_base);
             RT_CONTEXT.with(|c| *c.borrow_mut() = saved_ctx);
             return Some(jit_result);
         }
 
-        let result_val = if jit_result == JIT_DEOPT {
+        let result_val = if is_jit_deopt(jit_result) {
             None
         } else {
             jit_to_jsvalue_ext(jit_result)
@@ -2512,7 +2562,7 @@ pub(crate) mod jit_runtime {
             let jit_result = unsafe { maglev_exec.execute(jit_args, ctx_raw) };
             bc_ref.set(saved_ba);
 
-            if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
+            if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
                 // SAFETY: no active borrows; truncate/restore via raw ptr.
                 unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
                 if let Some(ctx) = saved_ctx {
@@ -2521,7 +2571,7 @@ pub(crate) mod jit_runtime {
                 return Some(jit_result);
             }
 
-            let result_val = if jit_result == JIT_DEOPT {
+            let result_val = if is_jit_deopt(jit_result) {
                 None
             } else {
                 jit_to_jsvalue_ext(jit_result)
@@ -2547,13 +2597,13 @@ pub(crate) mod jit_runtime {
         let jit_result = unsafe { maglev_exec.execute(jit_args, ctx_raw) };
         RT_BYTECODE.with(|b| b.set(saved_ba));
 
-        if jit_result != JIT_DEOPT && jit_result < JIT_HEAP_TAG {
+        if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
             recycle_and_truncate_heap(heap_base);
             RT_CONTEXT.with(|c| *c.borrow_mut() = saved_ctx);
             return Some(jit_result);
         }
 
-        let result_val = if jit_result == JIT_DEOPT {
+        let result_val = if is_jit_deopt(jit_result) {
             None
         } else {
             jit_to_jsvalue_ext(jit_result)
@@ -2812,11 +2862,8 @@ pub(crate) mod jit_runtime {
                             // the CALLER is not forced to deopt.
                             ba.mark_jit_maglev_deopted();
                             *maglev_cache.borrow_mut() = None;
-                            // Clear Arc storage so lazy transfer won't
-                            // reload deopted code on subsequent calls.
-                            if let Ok(mut guard) = ba.maglev_jit_cache_arc().lock() {
-                                *guard = None;
-                            }
+                            // NOTE: Arc not cleared — deopt guard on lazy
+                            // transfer prevents reload.
                             unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
                             if let Some(ctx) = saved_ctx {
                                 // SAFETY: no active borrows; restore context.
@@ -5621,15 +5668,51 @@ pub(crate) mod jit_runtime {
                 // BytecodeArray.
                 let ba_ref = unsafe { &*ba };
 
-                // Fast path: clone a previously cached template,
-                // reusing a pooled Rc<RefCell<PropertyMap>> wrapper.
-                if let Some(rc) = ba_ref.clone_object_literal_template_pooled(slot) {
+                // Ultra-fast path: single-entry IC hit.
+                // Skips the RefCell borrow + HashMap lookup on the
+                // BytecodeArray's template map.
+                let ic = RT_OBJECT_IC.with(|c| c.get());
+                if ic.slot == slot && ic.ba == ba {
+                    // SAFETY: template pointer is valid — it points to
+                    // Box heap memory owned by the BytecodeArray's
+                    // template map which is alive for the entire JIT
+                    // execution.  Cached entries are never removed or
+                    // replaced.
+                    let template = unsafe { &*ic.template };
+                    let rc = acquire_object_rc_from_template(template);
                     let obj = JsValue::PlainObject(rc);
                     return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
                 }
 
-                // Second execution: promote pending → cached.
+                // Fast path: template cached in BA — populate the IC.
+                if let Some(rc) = ba_ref.clone_object_literal_template_pooled(slot) {
+                    let tmpl_ptr = ba_ref.get_cached_template_ptr(slot);
+                    if !tmpl_ptr.is_null() {
+                        RT_OBJECT_IC.with(|c| {
+                            c.set(ObjectLiteralIcEntry {
+                                slot,
+                                ba,
+                                template: tmpl_ptr,
+                            })
+                        });
+                    }
+                    let obj = JsValue::PlainObject(rc);
+                    return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
+                }
+
+                // Second execution: promote pending → cached, then
+                // populate the IC for future hits.
                 if let Some(rc) = ba_ref.promote_object_literal_template_pooled(slot) {
+                    let tmpl_ptr = ba_ref.get_cached_template_ptr(slot);
+                    if !tmpl_ptr.is_null() {
+                        RT_OBJECT_IC.with(|c| {
+                            c.set(ObjectLiteralIcEntry {
+                                slot,
+                                ba,
+                                template: tmpl_ptr,
+                            })
+                        });
+                    }
                     let obj = JsValue::PlainObject(rc);
                     return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
                 }
@@ -5718,12 +5801,35 @@ pub(crate) mod jit_runtime {
                 // SAFETY: pointer is valid and points to a live BytecodeArray.
                 let ba_ref = unsafe { &*ba };
 
-                // ── Hot path: template cached, values pre-filled ──
                 // Decode to a stack array to avoid a Vec allocation.
                 let js_values = decode_jit_values_array(count, &vals);
+
+                // ── Ultra-fast path: IC hit ──
+                let ic = RT_OBJECT_IC.with(|c| c.get());
+                if ic.slot == slot && ic.ba == ba {
+                    // SAFETY: template pointer valid — see IC safety
+                    // comment on ObjectLiteralIcEntry.
+                    let template = unsafe { &*ic.template };
+                    let rc =
+                        acquire_object_rc_from_template_with_values(template, &js_values[..count]);
+                    let obj = JsValue::PlainObject(rc);
+                    return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
+                }
+
+                // ── Hot path: template cached in BA — populate IC ──
                 if let Some(rc) = ba_ref
                     .clone_object_literal_template_with_values_pooled(slot, &js_values[..count])
                 {
+                    let tmpl_ptr = ba_ref.get_cached_template_ptr(slot);
+                    if !tmpl_ptr.is_null() {
+                        RT_OBJECT_IC.with(|c| {
+                            c.set(ObjectLiteralIcEntry {
+                                slot,
+                                ba,
+                                template: tmpl_ptr,
+                            })
+                        });
+                    }
                     let obj = JsValue::PlainObject(rc);
                     return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
                 }
@@ -5732,6 +5838,16 @@ pub(crate) mod jit_runtime {
                 if let Some(rc) = ba_ref
                     .promote_object_literal_template_with_values_pooled(slot, &js_values[..count])
                 {
+                    let tmpl_ptr = ba_ref.get_cached_template_ptr(slot);
+                    if !tmpl_ptr.is_null() {
+                        RT_OBJECT_IC.with(|c| {
+                            c.set(ObjectLiteralIcEntry {
+                                slot,
+                                ba,
+                                template: tmpl_ptr,
+                            })
+                        });
+                    }
                     let obj = JsValue::PlainObject(rc);
                     return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
                 }

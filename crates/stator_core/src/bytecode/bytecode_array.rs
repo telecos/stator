@@ -1072,6 +1072,28 @@ impl BytecodeArray {
 
     // ─── Pooled object-literal template API ──────────────────────────────
 
+    /// Returns a raw pointer to the cached [`ObjectLiteralTemplate`] for
+    /// `slot`, or `null` if no cached entry exists.
+    ///
+    /// The returned pointer is valid for the lifetime of the
+    /// [`BytecodeArray`] because the `Box<ObjectLiteralTemplate>` heap
+    /// allocation is stable (entries are never removed or replaced once
+    /// promoted to `Cached`).
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the [`BytecodeArray`] outlives the pointer.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    pub(crate) fn get_cached_template_ptr(&self, slot: u32) -> *const ObjectLiteralTemplate {
+        let borrow = self.object_literal_templates.borrow();
+        match borrow.get(&slot) {
+            Some(ObjectLiteralCacheEntry::Cached(template)) => {
+                &**template as *const ObjectLiteralTemplate
+            }
+            _ => std::ptr::null(),
+        }
+    }
+
     /// Like [`clone_object_literal_template`](Self::clone_object_literal_template)
     /// but returns a pooled `Rc<RefCell<PropertyMap>>`, reusing the
     /// control-block and values `Vec` allocations when possible.
