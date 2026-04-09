@@ -8038,10 +8038,12 @@ pub use jit_runtime::{
 };
 
 #[cfg(all(target_arch = "x86_64", unix))]
+pub(crate) use jit_runtime::RTPTRS_BYTECODE_OFFSET;
+#[cfg(all(target_arch = "x86_64", unix))]
 pub use jit_runtime::{
-    ArrayIcInfo, JsContextLayout, JsValueLayout, RTPTRS_BYTECODE_OFFSET, VecJsValueLayout,
-    jit_runtime_fill_array_ic_r15, jit_runtime_inline_load_keyed_smi_ic_r15,
-    probe_jscontext_layout, probe_jsvalue_layout, probe_vec_jsvalue_layout,
+    ArrayIcInfo, JsContextLayout, JsValueLayout, VecJsValueLayout, jit_runtime_fill_array_ic_r15,
+    jit_runtime_inline_load_keyed_smi_ic_r15, probe_jscontext_layout, probe_jsvalue_layout,
+    probe_vec_jsvalue_layout,
 };
 
 /// A single entry in the safepoint table.
