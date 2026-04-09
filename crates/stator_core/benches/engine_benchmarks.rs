@@ -38,7 +38,7 @@ use stator_core::gc::handle::HandleScope;
 use stator_core::gc::heap::{Heap, HeapObject};
 use stator_core::interpreter::{
     GlobalEnv, Interpreter, InterpreterFrame, globals_promotion_diagnostics, licm_diagnostics,
-    maglev_diagnostics,
+    maglev_deopt_categories, maglev_diagnostics,
 };
 use stator_core::objects::property_map::PropertyMap;
 use stator_core::objects::tagged::TaggedValue;
@@ -753,7 +753,7 @@ fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_millis(500)
+        && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -820,7 +820,7 @@ fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_millis(500)
+        && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -864,7 +864,7 @@ fn bench_property_access_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_millis(500)
+        && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -915,7 +915,7 @@ fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_millis(500)
+        && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -962,7 +962,7 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_millis(500)
+        && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -1010,7 +1010,7 @@ fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_millis(500)
+        && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -1060,7 +1060,7 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_millis(500)
+        && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -1115,7 +1115,7 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_millis(500)
+        && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
@@ -1128,8 +1128,13 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
     });
     let (tried, executed, deopted, not_ready, compilations, code_bytes, started, failed, panicked) =
         maglev_diagnostics();
+    let cats = maglev_deopt_categories();
     eprintln!(
         "MAGLEV_DIAG[sieve_primes_1k]: tried={tried} executed={executed} deopted={deopted} not_ready={not_ready} compilations={compilations} code_bytes={code_bytes} started={started} failed={failed} panicked={panicked}"
+    );
+    eprintln!(
+        "  deopt_cats: generic={} overflow={} stub={} global={} divzero={} unknown={}",
+        cats[0], cats[1], cats[2], cats[3], cats[4], cats[5]
     );
 }
 
@@ -1159,7 +1164,7 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_millis(500)
+        && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }

@@ -929,6 +929,8 @@ thread_local! {
     static MAGLEV_DIAG_EXECUTED: Cell<u64> = const { Cell::new(0) };
     /// How many times Maglev JIT code returned `JIT_DEOPT`.
     static MAGLEV_DIAG_DEOPTED: Cell<u64> = const { Cell::new(0) };
+    /// Per-category deopt counters: [generic, overflow, stub, global, divzero, unknown].
+    static MAGLEV_DIAG_DEOPT_CATS: Cell<[u64; 6]> = const { Cell::new([0; 6]) };
     /// How many times the Maglev cache was empty and background compilation
     /// had not yet delivered code.
     static MAGLEV_DIAG_NOT_READY: Cell<u64> = const { Cell::new(0) };
@@ -1080,6 +1082,17 @@ pub fn maglev_diagnostics() -> (u64, u64, u64, u64, u32, usize, u32, u32, u32) {
     }
     #[allow(unreachable_code)]
     (0, 0, 0, 0, 0, 0, 0, 0, 0)
+}
+
+/// Return per-category deopt counters:
+/// `[generic, overflow, stub, global, divzero, unknown]`.
+pub fn maglev_deopt_categories() -> [u64; 6] {
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        return MAGLEV_DIAG_DEOPT_CATS.with(|c| c.get());
+    }
+    #[allow(unreachable_code)]
+    [0; 6]
 }
 
 /// Return LICM diagnostic counters.
@@ -1474,6 +1487,14 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
         let deopt_offset = (result as u64).wrapping_sub(JIT_DEOPT as u64);
         let ret = if deopt_offset <= 5 {
             MAGLEV_DIAG_DEOPTED.with(|c| c.set(c.get() + 1));
+            // Track per-category deopt: 0=generic, 1=overflow, 2=stub,
+            // 3=global, 4=divzero, 5+=unknown
+            MAGLEV_DIAG_DEOPT_CATS.with(|c| {
+                let mut cats = c.get();
+                let idx = (deopt_offset as usize).min(5);
+                cats[idx] += 1;
+                c.set(cats);
+            });
             ba.mark_jit_maglev_deopted();
             // Invalidate the cached executable so the next attempt
             // re-loads from the shared Arc (which may have been
