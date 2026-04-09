@@ -2453,8 +2453,13 @@ pub(crate) mod jit_runtime {
             // reference heap handles and survive truncation unchanged.  Skip
             // the jit_to_jsvalue_ext → jsvalue_to_jit_i64 round-trip.
             if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
-                // SAFETY: no active borrows; truncate/restore via raw pointer.
-                unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                // SAFETY: no active borrows; skip truncation when the
+                // callee allocated no heap handles.
+                unsafe {
+                    if (*heap_ref.as_ptr()).len() != heap_base {
+                        (*heap_ref.as_ptr()).truncate(heap_base);
+                    }
+                }
                 if let Some(ctx) = saved_ctx {
                     unsafe { *ctx_ref.as_ptr() = ctx };
                 }
@@ -2469,8 +2474,13 @@ pub(crate) mod jit_runtime {
                 jit_to_jsvalue_ext(jit_result)
             };
 
-            // SAFETY: no active borrows; truncate/restore via raw pointer.
-            unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+            // SAFETY: no active borrows; skip truncation when the
+            // callee allocated no heap handles.
+            unsafe {
+                if (*heap_ref.as_ptr()).len() != heap_base {
+                    (*heap_ref.as_ptr()).truncate(heap_base);
+                }
+            }
             if let Some(ctx) = saved_ctx {
                 // SAFETY: no active borrows; restore context via raw pointer.
                 unsafe { *ctx_ref.as_ptr() = ctx };
@@ -2563,8 +2573,13 @@ pub(crate) mod jit_runtime {
             bc_ref.set(saved_ba);
 
             if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
-                // SAFETY: no active borrows; truncate/restore via raw ptr.
-                unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                // SAFETY: no active borrows; skip truncation when the
+                // callee allocated no heap handles.
+                unsafe {
+                    if (*heap_ref.as_ptr()).len() != heap_base {
+                        (*heap_ref.as_ptr()).truncate(heap_base);
+                    }
+                }
                 if let Some(ctx) = saved_ctx {
                     unsafe { *ctx_ref.as_ptr() = ctx };
                 }
@@ -2576,8 +2591,13 @@ pub(crate) mod jit_runtime {
             } else {
                 jit_to_jsvalue_ext(jit_result)
             };
-            // SAFETY: no active borrows; truncate/restore via raw ptr.
-            unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+            // SAFETY: no active borrows; skip truncation when the
+            // callee allocated no heap handles.
+            unsafe {
+                if (*heap_ref.as_ptr()).len() != heap_base {
+                    (*heap_ref.as_ptr()).truncate(heap_base);
+                }
+            }
             if let Some(ctx) = saved_ctx {
                 unsafe { *ctx_ref.as_ptr() = ctx };
             }
@@ -2849,7 +2869,11 @@ pub(crate) mod jit_runtime {
                         bc_ref.set(saved_ba);
 
                         if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
-                            unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                            unsafe {
+                                if (*heap_ref.as_ptr()).len() != heap_base {
+                                    (*heap_ref.as_ptr()).truncate(heap_base);
+                                }
+                            }
                             if let Some(ctx) = saved_ctx {
                                 unsafe { *ctx_ref.as_ptr() = ctx };
                             }
@@ -2864,7 +2888,11 @@ pub(crate) mod jit_runtime {
                             *maglev_cache.borrow_mut() = None;
                             // NOTE: Arc not cleared — deopt guard on lazy
                             // transfer prevents reload.
-                            unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                            unsafe {
+                                if (*heap_ref.as_ptr()).len() != heap_base {
+                                    (*heap_ref.as_ptr()).truncate(heap_base);
+                                }
+                            }
                             if let Some(ctx) = saved_ctx {
                                 // SAFETY: no active borrows; restore context.
                                 unsafe { *ctx_ref.as_ptr() = ctx };
@@ -2872,7 +2900,11 @@ pub(crate) mod jit_runtime {
                             // Fall through to baseline JIT / interpreter.
                         } else {
                             let result_val = jit_to_jsvalue_ext(jit_result);
-                            unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                            unsafe {
+                                if (*heap_ref.as_ptr()).len() != heap_base {
+                                    (*heap_ref.as_ptr()).truncate(heap_base);
+                                }
+                            }
                             if let Some(ctx) = saved_ctx {
                                 unsafe { *ctx_ref.as_ptr() = ctx };
                             }
@@ -2921,8 +2953,13 @@ pub(crate) mod jit_runtime {
 
                     // Non-heap results skip the round-trip conversion.
                     if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
-                        // SAFETY: no active heap borrows.
-                        unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                        // SAFETY: no active heap borrows; skip truncation
+                        // when the callee allocated no heap handles.
+                        unsafe {
+                            if (*heap_ref.as_ptr()).len() != heap_base {
+                                (*heap_ref.as_ptr()).truncate(heap_base);
+                            }
+                        }
                         if let Some(ctx) = saved_ctx {
                             unsafe { *ctx_ref.as_ptr() = ctx };
                         }
@@ -2935,7 +2972,11 @@ pub(crate) mod jit_runtime {
                         // is not forced to deopt.
                         ba.mark_jit_baseline_deopted();
                         // SAFETY: no active heap borrows.
-                        unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                        unsafe {
+                            if (*heap_ref.as_ptr()).len() != heap_base {
+                                (*heap_ref.as_ptr()).truncate(heap_base);
+                            }
+                        }
                         if let Some(ctx) = saved_ctx {
                             unsafe { *ctx_ref.as_ptr() = ctx };
                         }
@@ -2943,7 +2984,11 @@ pub(crate) mod jit_runtime {
                     } else {
                         let result_val = jit_to_jsvalue_ext(jit_result);
                         // SAFETY: no active heap borrows.
-                        unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+                        unsafe {
+                            if (*heap_ref.as_ptr()).len() != heap_base {
+                                (*heap_ref.as_ptr()).truncate(heap_base);
+                            }
+                        }
                         if let Some(ctx) = saved_ctx {
                             unsafe { *ctx_ref.as_ptr() = ctx };
                         }
@@ -3429,8 +3474,13 @@ pub(crate) mod jit_runtime {
 
         // Fast path: non-heap results don't reference heap handles.
         if result != JIT_DEOPT && result < JIT_HEAP_TAG {
-            // SAFETY: no active heap borrows.
-            unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+            // SAFETY: no active heap borrows; skip truncation when
+            // the callee allocated no heap handles.
+            unsafe {
+                if (*heap_ref.as_ptr()).len() != heap_base {
+                    (*heap_ref.as_ptr()).truncate(heap_base);
+                }
+            }
             if ctx_changed {
                 DIRECT_CALL_OLD_CTX.with(|c| {
                     let old = c.borrow_mut().take();
@@ -3448,8 +3498,13 @@ pub(crate) mod jit_runtime {
             jit_to_jsvalue_ext(result)
         };
 
-        // SAFETY: no active heap borrows.
-        unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+        // SAFETY: no active heap borrows; skip truncation when
+        // the callee allocated no heap handles.
+        unsafe {
+            if (*heap_ref.as_ptr()).len() != heap_base {
+                (*heap_ref.as_ptr()).truncate(heap_base);
+            }
+        }
         if ctx_changed {
             DIRECT_CALL_OLD_CTX.with(|c| {
                 let old = c.borrow_mut().take();
@@ -3935,10 +3990,15 @@ pub(crate) mod jit_runtime {
         // ── Call ─────────────────────────────────────────────────
         // Allocate a register file on the Rust stack.  For small
         // frames (≤ 2 slots, e.g. closures), skip zeroing — the
-        // callee overwrites all slots before reading.
+        // callee overwrites all slots before reading.  For larger
+        // frames, zero only the slots the callee actually uses
+        // instead of the full 16-slot array.
         let mut reg_file = std::mem::MaybeUninit::<[i64; 16]>::uninit();
         if reg_slots > 2 {
-            reg_file = std::mem::MaybeUninit::new([0i64; 16]);
+            // SAFETY: writing zeroes into MaybeUninit memory is valid.
+            unsafe {
+                std::ptr::write_bytes(reg_file.as_mut_ptr() as *mut i64, 0, reg_slots.min(16));
+            }
         }
         // SAFETY: entry_point is a valid JIT code pointer produced by
         // the baseline or Maglev compiler.
@@ -3950,8 +4010,13 @@ pub(crate) mod jit_runtime {
         bc_ref.set(saved_ba);
 
         if result != JIT_DEOPT && result < JIT_HEAP_TAG {
-            // SAFETY: no active borrows; truncate via raw pointer.
-            unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+            // SAFETY: no active borrows; skip truncation when the
+            // callee allocated no heap handles.
+            unsafe {
+                if (*heap_ref.as_ptr()).len() != heap_base {
+                    (*heap_ref.as_ptr()).truncate(heap_base);
+                }
+            }
             if let Some(ctx) = saved_ctx {
                 // SAFETY: no active borrows; restore context.
                 unsafe { *ctx_ref.as_ptr() = ctx };
@@ -3967,7 +4032,11 @@ pub(crate) mod jit_runtime {
         };
 
         // SAFETY: no active borrows; truncate/restore via raw pointer.
-        unsafe { (*heap_ref.as_ptr()).truncate(heap_base) };
+        unsafe {
+            if (*heap_ref.as_ptr()).len() != heap_base {
+                (*heap_ref.as_ptr()).truncate(heap_base);
+            }
+        }
         if let Some(ctx) = saved_ctx {
             unsafe { *ctx_ref.as_ptr() = ctx };
         }
