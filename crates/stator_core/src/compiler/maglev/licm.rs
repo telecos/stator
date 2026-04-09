@@ -603,33 +603,6 @@ fn is_pure(node: &ValueNode) -> bool {
             | ValueNode::CreateUnmappedArguments
             | ValueNode::CreateRestParameter
             | ValueNode::CreateRegExpLiteral { .. }
-            | ValueNode::CheckSmi { .. }
-            | ValueNode::CheckNumber { .. }
-            | ValueNode::CheckHeapObject { .. }
-            | ValueNode::CheckSymbol { .. }
-            | ValueNode::CheckString { .. }
-            | ValueNode::CheckStringOrStringWrapper { .. }
-            | ValueNode::CheckSeqOneByteString { .. }
-            | ValueNode::CheckMaps { .. }
-            | ValueNode::CheckMapsWithMigration { .. }
-            | ValueNode::CheckValue { .. }
-            | ValueNode::CheckDynamicValue { .. }
-            | ValueNode::CheckInt32IsSmi { .. }
-            | ValueNode::CheckUint32IsSmi { .. }
-            | ValueNode::CheckHoleyFloat64IsSmi { .. }
-            | ValueNode::CheckInt32Condition { .. }
-            | ValueNode::CheckCacheIndicesNotCleared { .. }
-            | ValueNode::CheckFloat64IsNan { .. }
-            | ValueNode::CheckedSmiAdd { .. }
-            | ValueNode::CheckedSmiSubtract { .. }
-            | ValueNode::CheckedSmiMultiply { .. }
-            | ValueNode::CheckedSmiDivide { .. }
-            | ValueNode::CheckedSmiModulus { .. }
-            | ValueNode::CheckedSmiIncrement { .. }
-            | ValueNode::CheckedSmiDecrement { .. }
-            | ValueNode::CheckedFloat64ToInt32 { .. }
-            | ValueNode::CheckedTaggedToInt32 { .. }
-            | ValueNode::CheckedTaggedToFloat64 { .. }
             | ValueNode::Debugger
             | ValueNode::Abort { .. }
             | ValueNode::DeleteProperty { .. }
