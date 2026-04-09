@@ -1404,8 +1404,15 @@ pub fn maybe_compile_maglev(ba: &BytecodeArray) {
 fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
-        // NOTE: Top-level scripts are now allowed through — Maglev is the
-        // only active JIT tier (baseline disabled due to SIGSEGV).
+        // Maglev execution is temporarily disabled.  Every sloppy-mode
+        // function emits CreateMappedArguments which falls to the
+        // unconditional-deopt catch-all in codegen.  The first execution
+        // always deopts, but for some programs (closures, constructors,
+        // deep chains, keyed stores) the deopt path itself triggers
+        // SIGSEGV.  Disabling execution has zero performance impact
+        // because the result was always a deopt back to the interpreter.
+        // Re-enable once CreateMappedArguments has a proper codegen stub.
+        return None;
 
         // Skip if Maglev previously deopted.
         if ba.jit_maglev_has_deopted() {
