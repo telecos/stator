@@ -403,6 +403,7 @@ pub(crate) mod jit_runtime {
     /// [`cache_rt_ptrs`] and are only dereferenced from the same
     /// thread.
     #[derive(Clone, Copy)]
+    #[repr(C)]
     struct RtPtrs {
         heap: *const RefCell<Vec<JsValue>>,
         context: *const RefCell<Option<Rc<RefCell<JsContext>>>>,
@@ -479,7 +480,15 @@ pub(crate) mod jit_runtime {
         }
     }
 
-    /// Single-entry cache for array method lookups to avoid recreating
+    /// Byte offset of the `bytecode` field within the [`RtPtrs`] struct.
+    /// Used by Maglev codegen to load the bytecode pointer via a base+offset
+    /// from the R15-cached `RtPtrs` pointer.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    pub(crate) const RTPTRS_BYTECODE_OFFSET: i32 = {
+        // RtPtrs is repr(C): heap (ptr), context (ptr), bytecode (ptr), …
+        // On 64-bit, each pointer is 8 bytes → bytecode is at offset 16.
+        (2 * std::mem::size_of::<*const ()>()) as i32
+    };
     /// fast-array-method `PlainObject` wrappers in tight loops.
     #[derive(Clone, Copy)]
     struct ArrayMethodIcEntry {

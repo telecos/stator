@@ -250,14 +250,18 @@ fn release_values_vec(v: Vec<JsValue>) {
 /// On pool hit the inner `PropertyMap` is reinitialised in place —
 /// reusing both the `Rc` control-block and the values `Vec`, which
 /// eliminates **all** per-object heap allocations on the hot path.
+#[inline]
 pub(crate) fn acquire_object_rc_from_template(
     template: &ObjectLiteralTemplate,
 ) -> Rc<RefCell<PropertyMap>> {
     OBJECT_RC_POOL
         .try_with(|pool| {
-            let mut pool = pool.borrow_mut();
+            // SAFETY: single-threaded JIT runtime — no concurrent borrows.
+            let pool = unsafe { &mut *pool.as_ptr() };
             if let Some(rc) = pool.pop() {
-                rc.borrow_mut().reinitialize_from_template(template);
+                // SAFETY: Rc exclusively owned (just popped, strong_count == 1).
+                let map = unsafe { &mut *rc.as_ptr() };
+                map.reinitialize_from_template(template);
                 rc
             } else {
                 Rc::new(RefCell::new(template.instantiate()))
@@ -272,16 +276,33 @@ pub(crate) fn acquire_object_rc_from_template(
 ///
 /// Like [`acquire_object_rc_from_template`] but copies `values` into the
 /// existing values `Vec` instead of filling with `Undefined`.
+///
+/// On the hot path (pool hit with same template) this bypasses all
+/// `Rc` refcount operations and `RefCell` borrow checks, reducing
+/// per-object overhead to just overwriting the values buffer.
+#[inline]
 pub(crate) fn acquire_object_rc_from_template_with_values(
     template: &ObjectLiteralTemplate,
     values: &[JsValue],
 ) -> Rc<RefCell<PropertyMap>> {
     OBJECT_RC_POOL
         .try_with(|pool| {
-            let mut pool = pool.borrow_mut();
+            // SAFETY: single-threaded JIT runtime — no concurrent borrows
+            // possible.  Bypassing the RefCell runtime borrow check on the
+            // pool avoids one atomic-like flag write per object.
+            let pool = unsafe { &mut *pool.as_ptr() };
             if let Some(rc) = pool.pop() {
-                rc.borrow_mut()
-                    .reinitialize_from_template_with_values(template, values);
+                // SAFETY: same single-threaded guarantee — the Rc is
+                // exclusively owned (just popped, strong_count == 1) so
+                // there are no outstanding borrows.
+                let map = unsafe { &mut *rc.as_ptr() };
+                if Rc::ptr_eq(&map.keys, &template.keys) && map.values.len() == values.len() {
+                    // Same template — skip Rc refcount ops and redundant
+                    // field writes; just overwrite the values in place.
+                    map.reinitialize_values_inplace(values);
+                } else {
+                    map.reinitialize_from_template_with_values(template, values);
+                }
                 rc
             } else {
                 Rc::new(RefCell::new(
@@ -694,8 +715,15 @@ impl PropertyMap {
         debug_assert_eq!(values.len(), cap);
         let capacity_hint = template.capacity_hint.max(cap);
 
-        self.values.clear();
-        self.values.extend_from_slice(values);
+        // When the vec already has the right length, overwrite in place
+        // to avoid the clear()+extend_from_slice() overhead (no Vec
+        // metadata manipulation, no capacity check).
+        if self.values.len() == cap {
+            self.values[..cap].clone_from_slice(&values[..cap]);
+        } else {
+            self.values.clear();
+            self.values.extend_from_slice(values);
+        }
         self.keys = Rc::clone(&template.keys);
         self.attrs = Rc::clone(&template.attrs);
         self.integer_key_count = template.integer_key_count;
@@ -714,6 +742,36 @@ impl PropertyMap {
         self.has_accessors = template.has_accessors;
         self.template_next_slot = cap;
         self.capacity_hint = capacity_hint;
+    }
+
+    /// Ultra-fast reinitialize for recycled objects from the **same**
+    /// template.
+    ///
+    /// Pre-condition: `self.keys` already points to the template's shared
+    /// key vector (verified by the caller via [`Rc::ptr_eq`]) and
+    /// `self.values.len() == values.len()`.
+    ///
+    /// Because the structural shape (keys, attrs, index, shape_id, etc.)
+    /// is identical, this method only overwrites the values buffer and
+    /// resets the prototype-chain caches.  This avoids:
+    ///
+    /// * two `Rc` refcount increments + decrements (keys, attrs),
+    /// * the `Vec::clear` + `Vec::extend_from_slice` overhead,
+    /// * ~10 redundant scalar field writes.
+    #[inline(always)]
+    fn reinitialize_values_inplace(&mut self, values: &[JsValue]) {
+        let count = values.len();
+        debug_assert_eq!(self.values.len(), count);
+
+        // Direct indexed overwrite: each assignment drops the old value
+        // (a no-op for Smi) and bitwise-copies the new one.
+        self.values[..count].clone_from_slice(&values[..count]);
+        self.template_next_slot = count;
+        // Proto caches must be reset for a fresh object identity.
+        self.proto_generation.set(0);
+        self.proto_epoch.set(0);
+        self.proto_global_epoch.set(0);
+        // inline_cache is already None for short-lived template objects.
     }
 
     /// Creates a property map pre-populated with the given boilerplate
