@@ -748,7 +748,8 @@ fn simplify_identities_in_block(block: &mut BasicBlock) {
                 }
             }
             // x | 0 → x, 0 | x → x
-            ValueNode::Int32BitwiseOr { left, right } => {
+            ValueNode::Int32BitwiseOr { left, right }
+            | ValueNode::GenericBitwiseOr { left, right, .. } => {
                 if consts.get(right) == Some(&0) {
                     Some(*left)
                 } else if consts.get(left) == Some(&0) {
@@ -758,7 +759,8 @@ fn simplify_identities_in_block(block: &mut BasicBlock) {
                 }
             }
             // x ^ 0 → x, 0 ^ x → x
-            ValueNode::Int32BitwiseXor { left, right } => {
+            ValueNode::Int32BitwiseXor { left, right }
+            | ValueNode::GenericBitwiseXor { left, right, .. } => {
                 if consts.get(right) == Some(&0) {
                     Some(*left)
                 } else if consts.get(left) == Some(&0) {
@@ -768,7 +770,8 @@ fn simplify_identities_in_block(block: &mut BasicBlock) {
                 }
             }
             // x & -1 → x, -1 & x → x
-            ValueNode::Int32BitwiseAnd { left, right } => {
+            ValueNode::Int32BitwiseAnd { left, right }
+            | ValueNode::GenericBitwiseAnd { left, right, .. } => {
                 if consts.get(right) == Some(&-1) {
                     Some(*left)
                 } else if consts.get(left) == Some(&-1) {
@@ -829,7 +832,8 @@ fn eliminate_identity_operations_global(graph: &mut MaglevGraph) {
         for (id, node) in &mut block.nodes {
             let replacement: Option<NodeId> = match node {
                 // x | 0 → x, 0 | x → x
-                ValueNode::Int32BitwiseOr { left, right } => {
+                ValueNode::Int32BitwiseOr { left, right }
+                | ValueNode::GenericBitwiseOr { left, right, .. } => {
                     if consts.get(right) == Some(&0) {
                         Some(*left)
                     } else if consts.get(left) == Some(&0) {
@@ -839,7 +843,8 @@ fn eliminate_identity_operations_global(graph: &mut MaglevGraph) {
                     }
                 }
                 // x & -1 → x, -1 & x → x
-                ValueNode::Int32BitwiseAnd { left, right } => {
+                ValueNode::Int32BitwiseAnd { left, right }
+                | ValueNode::GenericBitwiseAnd { left, right, .. } => {
                     if consts.get(right) == Some(&-1) {
                         Some(*left)
                     } else if consts.get(left) == Some(&-1) {
