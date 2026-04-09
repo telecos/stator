@@ -84,6 +84,8 @@
 #[cfg(all(target_arch = "x86_64", unix))]
 use crate::bytecode::bytecodes::Opcode;
 #[cfg(all(target_arch = "x86_64", unix))]
+use crate::compiler::baseline::compiler::RTPTRS_BYTECODE_OFFSET;
+#[cfg(all(target_arch = "x86_64", unix))]
 use crate::compiler::baseline::compiler::jit_runtime;
 use crate::compiler::baseline::compiler::{
     DeoptEntry, JIT_DEOPT, JIT_FALSE, JIT_NULL, JIT_TRUE, JIT_UNDEFINED, METADATA_MAGIC,
@@ -5406,21 +5408,33 @@ impl<'a> MaglevCodegen<'a> {
     // inline cache** (MIC): after the first successful call through
     // `jit_runtime_get_jit_entry`, the callee identity, entry point,
     // context pointer, and BA pointer are cached in per-site frame slots.
-    // On subsequent calls, if the callee identity matches, the much
-    // lighter `jit_runtime_mono_call_prepare` is used instead.
+    // On subsequent calls, if the callee identity matches, the dispatch
+    // is done entirely in JIT assembly: BA save/restore via the R15
+    // `RtPtrs.bytecode` Cell pointer, register-file allocation on the
+    // x86 stack, and a direct `call` to the entry point — zero Rust FFI
+    // calls on the hot path.
 
     /// Emit a direct-call fast path for `CallUndefinedReceiver0` with a
-    /// monomorphic inline cache.
+    /// monomorphic inline cache and fully-inline JIT-to-JIT dispatch.
     ///
-    /// ## Mono fast path (cache hit)
+    /// ## Mono fast path (cache hit) — inline dispatch
     ///
     /// ```text
     ///  cmp  callee, [RBP - cache_callee_off]
     ///  jne  cache_miss
-    ///  ; call mono_prepare(callee, cached_ba, cached_ctx)
-    ///  ; allocate register file, call cached entry_point
-    ///  ; call finish_direct_call
+    ///  ; BA save: load [R15+16] → Cell ptr → save old BA
+    ///  ; BA set:  store callee BA into Cell
+    ///  ; allocate 128-byte register file on x86 stack
+    ///  ; call cached entry_point(reg_file, cached_ctx)
+    ///  ; deallocate register file
+    ///  ; BA restore: write old BA back into Cell
+    ///  ; deopt check → done or stub fallback
     /// ```
+    ///
+    /// This eliminates ALL Rust FFI calls on the monomorphic hit path.
+    /// Context is passed directly to the callee via RSI, avoiding the
+    /// expensive global context swap (Rc clone + mem::replace).  Heap
+    /// cleanup is deferred to the caller's finish path.
     ///
     /// ## Cache miss / first call
     ///
@@ -5466,39 +5480,90 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, off_callee);
         self.masm.jne(&mut cache_miss);
 
-        // ── Mono HIT: fused prepare + call + finish ─────────────────
-        // Route through a single Rust function that handles prepare
-        // (BA save, heap base, context check+swap), calls the callee
-        // entry point (with conditional register-file zeroing), and
-        // does finish (BA restore, heap truncate, context restore).
+        // ── Mono HIT: inline JIT-to-JIT dispatch ─────────────────
         //
-        // This eliminates 2 FFI boundaries vs the old 3-step approach
-        // (separate prepare + x86 call + finish).
+        // Instead of calling `jit_runtime_mono_dispatch_call_0_r15` (which
+        // does context swap, heap tracking, register-file alloc, etc. in
+        // Rust), we perform the critical operations directly in machine
+        // code:
         //
-        // Args (SysV AMD64):
-        //   RDI = entry_point     RSI = ba_ptr
-        //   RDX = cached_ctx_ptr  RCX = rt_ptrs_cell (R15)
-        //   R8  = reg_slots       R9  = callee_i64
+        //   1. Save/set the current BytecodeArray via R15→RtPtrs.bytecode
+        //   2. Allocate a 128-byte register file on the x86 stack
+        //   3. Direct `call` to the callee's Maglev entry point
+        //   4. Restore the BytecodeArray
+        //   5. Return (no context swap, no heap truncation)
+        //
+        // This eliminates ALL Rust FFI overhead on the hot path.  Context
+        // is passed to the callee via RSI (the standard Maglev parameter),
+        // so no global context swap is needed.  Heap cleanup is deferred
+        // to the caller's own finish path.
+        //
+        // Stack layout at the point of `call entry_point`:
+        //   RSP+0       128-byte register file  (callee's RDI)
+        //   RSP+128     saved old BA             (pushed second)
+        //   RSP+136     saved bytecode Cell ptr  (pushed first)
+        //   RSP+144...  saved live regs from emit_save_live_regs
+        //
+        // RSP ≡ 0 mod 16 before `call` (2 pushes + sub 128 = -144 from
+        // the aligned post-save_live_regs state).
+
+        // 1. BA save/swap via R15 → RtPtrs.bytecode (repr(C) offset 16).
+        //    RAX = bytecode Cell ptr, R10 = current BA (to save).
         self.masm
-            .mov_load_base_disp32(Reg64::Rdi, Reg64::Rbp, off_entry);
+            .mov_load_base_disp32(Reg64::Rax, Reg64::R15, RTPTRS_BYTECODE_OFFSET);
+        // RAX = *const Cell<*const BytecodeArray>
+        self.masm.mov_load_base_disp32(Reg64::R10, Reg64::Rax, 0); // R10 = current BA
         self.masm
-            .mov_load_base_disp32(Reg64::Rsi, Reg64::Rbp, off_ba);
-        self.masm
-            .mov_load_base_disp32(Reg64::Rdx, Reg64::Rbp, off_ctx);
-        self.masm.mov_rr(Reg64::Rcx, Reg64::R15);
+            .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_ba); // RCX = callee BA
+        self.masm.mov_store_base_disp32(Reg64::Rax, 0, Reg64::Rcx); // set callee BA
+
+        // Push saved BA + Cell ptr (2 pushes → RSP -= 16, stays aligned).
+        self.masm.push(Reg64::Rax); // bytecode Cell ptr
+        self.masm.push(Reg64::R10); // old BA
+
+        // 2. Allocate 128-byte register file on the stack.
+        self.masm.sub_ri(Reg64::Rsp, 128);
+        // RSP ≡ 0 mod 16 (was 0, -16 from pushes, -128 from sub = -144).
+
+        // 3. Conditional zeroing: skip for ≤ 2 register slots (simple
+        //    closures overwrite all slots before reading).
         self.masm
             .mov_load_base_disp32(Reg64::R8, Reg64::Rbp, off_regslots);
-        self.masm.mov_rr(Reg64::R9, Reg64::R11); // callee_i64
+        let mut zero_done = Label::new();
+        self.masm.cmp_ri(Reg64::R8, 2);
+        self.masm.jcc(CondCode::LessEq, &mut zero_done);
 
-        let dispatch_addr = jit_runtime::jit_runtime_mono_dispatch_call_0_r15 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, dispatch_addr as i64);
+        // Large frame: zero with rep stosq.
+        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+        self.masm.mov_rr(Reg64::Rcx, Reg64::R8);
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
+        self.masm.rep_stosq();
+
+        self.masm.bind_label(&mut zero_done);
+
+        // 4. Set up call: RDI = register file, RSI = cached context.
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
+        self.masm
+            .mov_load_base_disp32(Reg64::Rsi, Reg64::Rbp, off_ctx);
+
+        // 5. Direct CALL to callee's Maglev entry point.
+        self.masm
+            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, off_entry);
         self.masm.call_reg(Reg64::R11);
 
-        // If callee JIT returned JIT_DEOPT, fall back to the runtime
-        // stub (which runs the interpreter) instead of deopting the
-        // CALLER.
+        // 6. Deallocate register file.
+        self.masm.add_ri(Reg64::Rsp, 128);
+
+        // 7. Restore BA: pop saved values and write back.
+        self.masm.pop(Reg64::Rcx); // RCX = saved old BA
+        self.masm.pop(Reg64::Rdx); // RDX = bytecode Cell ptr
+        self.masm.mov_store_base_disp32(Reg64::Rdx, 0, Reg64::Rcx); // restore BA
+
+        // 8. Deopt check: if result < i32::MIN (signed), the callee
+        //    deopted — fall back to the runtime stub.
         self.masm.cmp_ri(Reg64::Rax, i32::MIN);
         self.masm.jcc(CondCode::GreaterEq, &mut done_label);
+
         // Callee deopt: reload callee from mono cache and call stub.
         self.masm
             .mov_load_base_disp32(Reg64::Rdi, Reg64::Rbp, off_callee);
@@ -6226,6 +6291,15 @@ impl<'a> MaglevCodegen<'a> {
                 | ValueNode::Int32LessThanOrEqual { .. }
                 | ValueNode::Int32GreaterThan { .. }
                 | ValueNode::Int32GreaterThanOrEqual { .. }
+                // Int32 bitwise / shift — bit-parallel or uses 32-bit ops;
+                // only the lower 32 bits of inputs affect the lower 32 bits
+                // of the result.
+                | ValueNode::Int32BitwiseOr { .. }
+                | ValueNode::Int32BitwiseAnd { .. }
+                | ValueNode::Int32BitwiseXor { .. }
+                | ValueNode::Int32ShiftLeft { .. }
+                | ValueNode::Int32ShiftRight { .. }
+                | ValueNode::Int32ShiftRightLogical { .. }
                 // Generic bitwise — smi_guarded path uses 64-bit OR/AND/XOR
                 // which are bit-parallel (lower 32 bits independent of upper).
                 | ValueNode::GenericBitwiseOr { .. }

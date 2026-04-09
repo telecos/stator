@@ -289,6 +289,17 @@ fn fold_block_constants(block: &mut BasicBlock) {
                 }
             }
 
+            // ── Int32 bitwise ────────────────────────────────────────────
+            ValueNode::Int32BitwiseOr { left, right } => {
+                fold_i32_bin(left, right, &consts, |a, b| a | b)
+            }
+            ValueNode::Int32BitwiseAnd { left, right } => {
+                fold_i32_bin(left, right, &consts, |a, b| a & b)
+            }
+            ValueNode::Int32BitwiseXor { left, right } => {
+                fold_i32_bin(left, right, &consts, |a, b| a ^ b)
+            }
+
             _ => None,
         };
 
