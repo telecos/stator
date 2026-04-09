@@ -5590,24 +5590,31 @@ pub(crate) mod jit_runtime {
             Some(JsValue::Array(arr)) => {
                 // SAFETY: single-threaded JIT; no concurrent borrows.
                 let data = unsafe { &*arr.as_ptr() };
-                match data.get(key) {
-                    Some(JsValue::Smi(n)) => InlineKeyedResult {
+                if key >= data.len() {
+                    return InlineKeyedResult {
+                        value: JIT_UNDEFINED,
+                        hit: 1,
+                    };
+                }
+                // SAFETY: bounds verified above.
+                match unsafe { data.get_unchecked(key) } {
+                    JsValue::Smi(n) => InlineKeyedResult {
                         value: i64::from(*n),
                         hit: 1,
                     },
-                    Some(JsValue::Boolean(b)) => InlineKeyedResult {
+                    JsValue::Boolean(b) => InlineKeyedResult {
                         value: if *b { JIT_TRUE } else { JIT_FALSE },
                         hit: 1,
                     },
-                    Some(JsValue::Undefined) => InlineKeyedResult {
+                    JsValue::Undefined => InlineKeyedResult {
                         value: JIT_UNDEFINED,
                         hit: 1,
                     },
-                    Some(JsValue::Null) => InlineKeyedResult {
+                    JsValue::Null => InlineKeyedResult {
                         value: JIT_NULL,
                         hit: 1,
                     },
-                    Some(JsValue::TheHole) | None => InlineKeyedResult {
+                    JsValue::TheHole => InlineKeyedResult {
                         value: JIT_UNDEFINED,
                         hit: 1,
                     },
@@ -5883,7 +5890,14 @@ pub(crate) mod jit_runtime {
         value_i64: i64,
         ptrs: RtPtrs,
     ) -> InlineKeyedResult {
-        if !is_heap_handle(obj_i64) || smi_key < 0 {
+        if !is_heap_handle(obj_i64) || smi_key < 0 || is_heap_handle(value_i64) {
+            return InlineKeyedResult::from_generic(sta_keyed_property_inner(
+                obj_i64, smi_key, value_i64,
+            ));
+        }
+        let key = smi_key as usize;
+        let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+        if !ptrs.is_cached() {
             return InlineKeyedResult::from_generic(sta_keyed_property_inner(
                 obj_i64, smi_key, value_i64,
             ));
@@ -5892,11 +5906,6 @@ pub(crate) mod jit_runtime {
         // Check booleans first — hot path for sieve-like patterns where
         // every element is `true`/`false`, avoiding the wider Smi range
         // comparison on each store.
-        if is_heap_handle(value_i64) {
-            return InlineKeyedResult::from_generic(sta_keyed_property_inner(
-                obj_i64, smi_key, value_i64,
-            ));
-        }
         let value = if value_i64 == JIT_TRUE {
             JsValue::Boolean(true)
         } else if value_i64 == JIT_FALSE {
@@ -5911,13 +5920,6 @@ pub(crate) mod jit_runtime {
             ));
         };
 
-        let key = smi_key as usize;
-        let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
-        if !ptrs.is_cached() {
-            return InlineKeyedResult::from_generic(sta_keyed_property_inner(
-                obj_i64, smi_key, value_i64,
-            ));
-        }
         // SAFETY: cached pointers valid for thread lifetime.
         let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
         match heap.get(obj_idx) {
@@ -5925,7 +5927,8 @@ pub(crate) mod jit_runtime {
                 // SAFETY: single-threaded JIT; no concurrent borrows.
                 let v = unsafe { &mut *arr.as_ptr() };
                 if key < v.len() {
-                    v[key] = value;
+                    // SAFETY: bounds verified above.
+                    unsafe { *v.get_unchecked_mut(key) = value };
                     InlineKeyedResult {
                         value: value_i64,
                         hit: 1,
@@ -5958,12 +5961,14 @@ pub(crate) mod jit_runtime {
         ic_ptr: i64,
         ptrs: RtPtrs,
     ) -> InlineKeyedResult {
-        if !is_heap_handle(obj_i64) || smi_key < 0 {
+        if !is_heap_handle(obj_i64) || smi_key < 0 || is_heap_handle(value_i64) {
             return InlineKeyedResult::from_generic(sta_keyed_property_inner(
                 obj_i64, smi_key, value_i64,
             ));
         }
-        if is_heap_handle(value_i64) {
+        let key = smi_key as usize;
+        let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+        if !ptrs.is_cached() {
             return InlineKeyedResult::from_generic(sta_keyed_property_inner(
                 obj_i64, smi_key, value_i64,
             ));
@@ -5984,13 +5989,6 @@ pub(crate) mod jit_runtime {
             ));
         };
 
-        let key = smi_key as usize;
-        let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
-        if !ptrs.is_cached() {
-            return InlineKeyedResult::from_generic(sta_keyed_property_inner(
-                obj_i64, smi_key, value_i64,
-            ));
-        }
         // SAFETY: cached pointers valid for thread lifetime.
         let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
         match heap.get(obj_idx) {
@@ -5998,8 +5996,8 @@ pub(crate) mod jit_runtime {
                 // SAFETY: single-threaded JIT; no concurrent borrows.
                 let v = unsafe { &mut *arr.as_ptr() };
                 if key < v.len() {
-                    // Fast in-bounds store.
-                    v[key] = value;
+                    // SAFETY: bounds verified above.
+                    unsafe { *v.get_unchecked_mut(key) = value };
                 } else {
                     // Out-of-bounds — grow allocation if needed.
                     if key >= v.capacity() {
@@ -6014,7 +6012,8 @@ pub(crate) mod jit_runtime {
                     // boundary).
                     let cap = v.capacity();
                     v.resize(cap, JsValue::TheHole);
-                    v[key] = value;
+                    // SAFETY: key < cap after resize.
+                    unsafe { *v.get_unchecked_mut(key) = value };
                 }
 
                 // Update caller's IC slots so subsequent x86 inline

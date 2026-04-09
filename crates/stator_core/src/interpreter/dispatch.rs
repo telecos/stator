@@ -4329,7 +4329,7 @@ fn handle_lda_keyed_property(
     let Operand::Register(obj_v) = *instr.operand(0) else {
         return Err(err_bad_operand("LdaKeyedProperty", 0));
     };
-    // ── Fast path: Smi key on PlainObject — O(1) HashMap lookup ──────
+    // ── Fast path: Smi key — Array first (hot for sieve), then PlainObject.
     // Skips to_property_key (String alloc), getter check (format! alloc),
     // and prototype chain walk.  Numeric keys on arrays never have getters.
     if let JsValue::Smi(idx) = &ctx.frame.accumulator
@@ -4337,7 +4337,19 @@ fn handle_lda_keyed_property(
     {
         let idx_val = *idx;
         let obj = ctx.frame.read_reg(obj_v)?;
-        if let JsValue::PlainObject(map) = obj {
+        if let JsValue::Array(items) = obj {
+            // SAFETY: single-threaded interpreter; no concurrent borrows
+            // possible between the raw deref and the element read.
+            let data = unsafe { &*items.as_ptr() };
+            let i = idx_val as usize;
+            ctx.frame.accumulator = if i < data.len() {
+                // SAFETY: bounds verified above.
+                unsafe { data.get_unchecked(i) }.cheap_clone()
+            } else {
+                JsValue::Undefined
+            };
+            return Ok(DispatchAction::Continue);
+        } else if let JsValue::PlainObject(map) = obj {
             let borrow = map.borrow();
             let key_str = itoa_stack(idx_val as u32);
             if let Some(val) = borrow.get(key_str.as_str()) {
@@ -4347,16 +4359,6 @@ fn handle_lda_keyed_property(
                 return Ok(DispatchAction::Continue);
             }
             // Fall through for missing elements (prototype chain)
-        } else if let JsValue::Array(items) = obj {
-            let borrow = items.borrow();
-            let i = idx_val as usize;
-            let result = borrow
-                .get(i)
-                .map(|v| v.cheap_clone())
-                .unwrap_or(JsValue::Undefined);
-            drop(borrow);
-            ctx.frame.accumulator = result;
-            return Ok(DispatchAction::Continue);
         }
     }
     // ── General path ─────────────────────────────────────────────────
@@ -4388,17 +4390,34 @@ fn handle_sta_keyed_property(
     let Operand::Register(key_v) = *instr.operand(1) else {
         return Err(err_bad_operand("StaKeyedProperty", 1));
     };
-    // ── Fast path: Smi key on PlainObject — direct HashMap store ─────
+    // ── Fast path: Smi key — Array first (hot for sieve), then PlainObject.
     // Skips setter check, prototype walk, writable check, and string alloc.
     // Numeric indices on array-like PlainObjects never have setter accessors.
     if let JsValue::Smi(idx) = ctx.frame.read_reg(key_v)?
         && *idx >= 0
     {
         let idx_val = *idx;
+        // Read accumulator before the object register so we don't need
+        // Rc::clone — both reads are shared borrows of ctx.frame.
+        let val = ctx.frame.accumulator.cheap_clone();
         let obj_ref = ctx.frame.read_reg(obj_v)?;
-        if let JsValue::PlainObject(map) = obj_ref {
+        if let JsValue::Array(items) = obj_ref {
+            let i = idx_val as usize;
+            // SAFETY: single-threaded interpreter; no concurrent borrows
+            // possible between the raw deref and the element write.
+            let v = unsafe { &mut *items.as_ptr() };
+            if i < v.len() {
+                // SAFETY: bounds verified above.
+                unsafe { *v.get_unchecked_mut(i) = val };
+            } else if i == v.len() {
+                v.push(val);
+            } else {
+                v.resize(i, JsValue::TheHole);
+                v.push(val);
+            }
+            return Ok(DispatchAction::Continue);
+        } else if let JsValue::PlainObject(map) = obj_ref {
             let map_rc = Rc::clone(map);
-            let val = ctx.frame.accumulator.cheap_clone();
             let key_str = itoa_stack(idx_val as u32);
             let mut m = map_rc.borrow_mut();
             m.insert(key_str.as_str().to_owned(), val);
@@ -4410,20 +4429,6 @@ fn handle_sta_keyed_property(
             };
             if i >= cur_len {
                 m.insert("length".to_owned(), JsValue::Smi((i + 1) as i32));
-            }
-            return Ok(DispatchAction::Continue);
-        } else if let JsValue::Array(items) = obj_ref {
-            let items_rc = Rc::clone(items);
-            let val = ctx.frame.accumulator.cheap_clone();
-            let i = idx_val as usize;
-            let mut v = items_rc.borrow_mut();
-            if i < v.len() {
-                v[i] = val;
-            } else if i == v.len() {
-                v.push(val);
-            } else {
-                v.resize(i, JsValue::TheHole);
-                v.push(val);
             }
             return Ok(DispatchAction::Continue);
         }
