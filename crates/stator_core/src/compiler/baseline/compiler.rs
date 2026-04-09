@@ -194,6 +194,39 @@ pub(crate) mod jit_runtime {
         };
     }
 
+    /// One slot of the prototype-chain inline cache.
+    ///
+    /// In addition to the shape-based validation (existing), this entry
+    /// stores the receiver's JIT heap handle and the global prototype
+    /// mutation epoch at the time the IC was populated.  This enables a
+    /// **handle-based fast path** that returns the cached value without
+    /// dereferencing the heap→Rc→PropertyMap→shape chain, as long as the
+    /// global epoch has not advanced (i.e. no prototype in the program has
+    /// been mutated since the entry was written).
+    #[derive(Clone, Copy)]
+    struct ProtoIcEntry {
+        /// Constant-pool index of the property name.
+        name_idx: u32,
+        /// Shape id of the receiver at IC population time.
+        shape: u64,
+        /// JIT i64 heap handle of the receiver object.
+        receiver_handle: i64,
+        /// Global prototype mutation epoch at IC population time.
+        global_epoch: u64,
+        /// Pre-encoded JIT i64 result value.
+        cached_value: i64,
+    }
+
+    impl ProtoIcEntry {
+        const EMPTY: Self = Self {
+            name_idx: u32::MAX,
+            shape: 0,
+            receiver_handle: 0,
+            global_epoch: u64::MAX,
+            cached_value: 0,
+        };
+    }
+
     /// Combined inline caches for named-property stubs.
     ///
     /// Merging the LDA and prototype ICs into one TLS variable saves
@@ -202,9 +235,8 @@ pub(crate) mod jit_runtime {
     struct JitPropertyIcState {
         /// Own-property IC, indexed by `name_idx & 63`.
         lda: [LdaIcEntry; 64],
-        /// Prototype-chain IC: `(name_idx, own_shape_id, cached_value)`.
-        /// Direct-mapped by `name_idx & 31`.
-        proto: [(u32, u64, i64); 32],
+        /// Prototype-chain IC, direct-mapped by `name_idx & 31`.
+        proto: [ProtoIcEntry; 32],
     }
 
     /// Combined global-environment + inline-cache state for
@@ -240,7 +272,7 @@ pub(crate) mod jit_runtime {
         static RT_PROP_IC: RefCell<JitPropertyIcState> = const {
             RefCell::new(JitPropertyIcState {
                 lda: [LdaIcEntry::EMPTY; 64],
-                proto: [(u32::MAX, 0, 0); 32],
+                proto: [ProtoIcEntry::EMPTY; 32],
             })
         };
 
@@ -365,6 +397,12 @@ pub(crate) mod jit_runtime {
         /// thread and is invalidated whenever `callee_i64` changes.
         static CACHED_CALLEE: Cell<CachedCalleeEntry> =
             const { Cell::new(CachedCalleeEntry::EMPTY) };
+
+        /// When `true`, the `CreateMappedArguments` trampoline returns
+        /// `JIT_UNDEFINED` immediately instead of building a full arguments
+        /// object.  Set by the closure call path when the callee has 0
+        /// formal parameters (the arguments object is dead code).
+        static SKIP_MAPPED_ARGS: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Extended single-entry callee cache entry.
@@ -382,6 +420,10 @@ pub(crate) mod jit_runtime {
         ctx_ptr: i64,
         entry_fn: usize,
         reg_slots: usize,
+        /// Cached Maglev code entry point (0 = not available).
+        maglev_fn: usize,
+        /// Maglev register-file slot count.
+        maglev_reg_slots: usize,
     }
 
     impl CachedCalleeEntry {
@@ -391,6 +433,8 @@ pub(crate) mod jit_runtime {
             ctx_ptr: 0,
             entry_fn: 0,
             reg_slots: 0,
+            maglev_fn: 0,
+            maglev_reg_slots: 0,
         };
     }
 
@@ -419,6 +463,8 @@ pub(crate) mod jit_runtime {
         /// [`RT_SETUP_GEN`] before use; a mismatch forces a re-cache.
         #[allow(dead_code)]
         generation: u64,
+        /// Pointer to the `Cell<bool>` for `SKIP_MAPPED_ARGS`.
+        skip_mapped_args: *const Cell<bool>,
     }
 
     impl RtPtrs {
@@ -431,6 +477,7 @@ pub(crate) mod jit_runtime {
             direct_call: std::ptr::null(),
             cached_callee: std::ptr::null(),
             generation: 0,
+            skip_mapped_args: std::ptr::null(),
         };
 
         fn is_cached(&self) -> bool {
@@ -476,6 +523,26 @@ pub(crate) mod jit_runtime {
                 unsafe { &*self.cached_callee }.set(entry);
             } else {
                 CACHED_CALLEE.with(|c| c.set(entry));
+            }
+        }
+
+        /// Read `SKIP_MAPPED_ARGS` via the cached pointer.
+        fn get_skip_mapped_args(&self) -> bool {
+            if !self.skip_mapped_args.is_null() {
+                // SAFETY: pointer set by cache_rt_ptrs; valid for thread lifetime.
+                unsafe { &*self.skip_mapped_args }.get()
+            } else {
+                SKIP_MAPPED_ARGS.with(|c| c.get())
+            }
+        }
+
+        /// Store `SKIP_MAPPED_ARGS` via the cached pointer.
+        fn set_skip_mapped_args(&self, val: bool) {
+            if !self.skip_mapped_args.is_null() {
+                // SAFETY: pointer set by cache_rt_ptrs; valid for thread lifetime.
+                unsafe { &*self.skip_mapped_args }.set(val);
+            } else {
+                SKIP_MAPPED_ARGS.with(|c| c.set(val));
             }
         }
     }
@@ -579,19 +646,22 @@ pub(crate) mod jit_runtime {
                         RT_PROP_IC.with(|ic| {
                             DIRECT_CALL_STATE.with(|dc| {
                                 CACHED_CALLEE.with(|cc| {
-                                    let setup_gen = RT_SETUP_GEN.with(|g| g.get());
-                                    RT_PTRS.with(|p| {
-                                        p.set(RtPtrs {
-                                            heap: heap as *const RefCell<Vec<JsValue>>,
-                                            context: ctx as *const RefCell<
-                                                Option<Rc<RefCell<JsContext>>>,
-                                            >,
-                                            bytecode: bc as *const Cell<*const BytecodeArray>,
-                                            global: g as *const RefCell<JitGlobalState>,
-                                            prop_ic: ic as *const RefCell<JitPropertyIcState>,
-                                            direct_call: dc as *const Cell<DirectCallState>,
-                                            cached_callee: cc as *const Cell<CachedCalleeEntry>,
-                                            generation: setup_gen,
+                                    SKIP_MAPPED_ARGS.with(|sma| {
+                                        let setup_gen = RT_SETUP_GEN.with(|g| g.get());
+                                        RT_PTRS.with(|p| {
+                                            p.set(RtPtrs {
+                                                heap: heap as *const RefCell<Vec<JsValue>>,
+                                                context: ctx as *const RefCell<
+                                                    Option<Rc<RefCell<JsContext>>>,
+                                                >,
+                                                bytecode: bc as *const Cell<*const BytecodeArray>,
+                                                global: g as *const RefCell<JitGlobalState>,
+                                                prop_ic: ic as *const RefCell<JitPropertyIcState>,
+                                                direct_call: dc as *const Cell<DirectCallState>,
+                                                cached_callee: cc as *const Cell<CachedCalleeEntry>,
+                                                generation: setup_gen,
+                                                skip_mapped_args: sma as *const Cell<bool>,
+                                            });
                                         });
                                     });
                                 });
@@ -639,7 +709,7 @@ pub(crate) mod jit_runtime {
             RT_PROP_IC.with(|ic| {
                 let mut c = ic.borrow_mut();
                 c.lda = [LdaIcEntry::EMPTY; 64];
-                c.proto = [(u32::MAX, 0, 0); 32];
+                c.proto = [ProtoIcEntry::EMPTY; 32];
             });
             RT_ARRAY_METHOD_IC.with(|c| c.set(ArrayMethodIcEntry::EMPTY));
             RT_OBJECT_IC.with(|c| c.set(ObjectLiteralIcEntry::EMPTY));
@@ -1003,6 +1073,14 @@ pub(crate) mod jit_runtime {
             // Build arguments objects from the JIT register file which
             // stores parameters at flat indices 0..parameter_count.
             Opcode::CreateMappedArguments => {
+                // Fast path: when the caller has determined that the
+                // arguments object is unused (0-param closure), return
+                // undefined immediately to avoid the expensive allocation.
+                let ptrs = RT_PTRS.with(|p| p.get());
+                if ptrs.get_skip_mapped_args() {
+                    return Some(JIT_UNDEFINED);
+                }
+
                 let ba_ptr = RT_BYTECODE.with(|b| b.get());
                 if ba_ptr.is_null() {
                     return None;
@@ -1882,6 +1960,27 @@ pub(crate) mod jit_runtime {
         if !is_heap_handle(obj_i64) {
             return None;
         }
+
+        // ── Phase 0: handle-based proto IC (skips heap dereference) ─────
+        // When the receiver handle + name + global prototype epoch all
+        // match, the cached value is guaranteed valid without touching
+        // the heap→Rc→PropertyMap→shape chain.  This is the hottest path
+        // for repeated prototype-chain property reads in tight loops.
+        let proto_slot = (name_idx & 31) as usize;
+        if ptrs.is_cached() {
+            let pe = {
+                // SAFETY: cached pointer valid for thread lifetime.
+                let cache = unsafe { &*(&*ptrs.prop_ic).as_ptr() };
+                cache.proto[proto_slot]
+            };
+            if pe.receiver_handle == obj_i64 && pe.name_idx == name_idx {
+                let epoch = PropertyMap::global_proto_mutation_epoch();
+                if pe.global_epoch == epoch {
+                    return Some(pe.cached_value);
+                }
+            }
+        }
+
         let idx = (obj_i64 - JIT_HEAP_TAG) as usize;
         let lda_slot = (name_idx & 63) as usize;
 
@@ -1932,9 +2031,20 @@ pub(crate) mod jit_runtime {
                     ));
                 }
 
-                // ── Prototype IC hit (pre-encoded i64, zero clone) ──
-                if proto_entry.0 == name_idx && proto_entry.1 == shape {
-                    return Some(proto_entry.2);
+                // ── Prototype IC hit (shape-based fallback) ─────
+                // Phase 0 (handle+epoch) already ran above and missed,
+                // so try the shape-based check that tolerates epoch
+                // changes as long as the receiver's shape is unchanged.
+                if proto_entry.name_idx == name_idx && proto_entry.shape == shape {
+                    // Re-stamp the entry with the current epoch so that
+                    // Phase 0 will hit on the next access.
+                    let epoch = PropertyMap::global_proto_mutation_epoch();
+                    // SAFETY: scoped borrow dropped above; single-threaded.
+                    let cache_mut = unsafe { &mut *ic_ref.as_ptr() };
+                    let pe = &mut cache_mut.proto[proto_slot];
+                    pe.receiver_handle = obj_i64;
+                    pe.global_epoch = epoch;
+                    return Some(proto_entry.cached_value);
                 }
             }
 
@@ -1988,7 +2098,13 @@ pub(crate) mod jit_runtime {
                     let result = jit_proto_chain_walk(proto.as_ref(), prop_name);
                     // SAFETY: IC `cache` ref was dropped; single-threaded JIT.
                     let cache_mut = unsafe { &mut *ic_ref.as_ptr() };
-                    cache_mut.proto[proto_slot] = (name_idx, shape, result);
+                    cache_mut.proto[proto_slot] = ProtoIcEntry {
+                        name_idx,
+                        shape,
+                        receiver_handle: obj_i64,
+                        global_epoch: PropertyMap::global_proto_mutation_epoch(),
+                        cached_value: result,
+                    };
                     return Some(result);
                 }
                 JsValue::Array(arr) => {
@@ -2058,8 +2174,8 @@ pub(crate) mod jit_runtime {
 
                             let proto_slot = (name_idx & 31) as usize;
                             let pe = &cache.proto[proto_slot];
-                            if pe.0 == name_idx && pe.1 == shape {
-                                return Some(Ok(pe.2));
+                            if pe.name_idx == name_idx && pe.shape == shape {
+                                return Some(Ok(pe.cached_value));
                             }
 
                             None
@@ -2095,7 +2211,13 @@ pub(crate) mod jit_runtime {
                         let result = jit_proto_chain_walk(proto.as_ref(), prop_name);
                         let proto_slot = (name_idx & 31) as usize;
                         RT_PROP_IC.with(|ic| {
-                            ic.borrow_mut().proto[proto_slot] = (name_idx, shape, result);
+                            ic.borrow_mut().proto[proto_slot] = ProtoIcEntry {
+                                name_idx,
+                                shape,
+                                receiver_handle: obj_i64,
+                                global_epoch: PropertyMap::global_proto_mutation_epoch(),
+                                cached_value: result,
+                            };
                         });
                         Some(Ok(result))
                     }
@@ -2188,12 +2310,18 @@ pub(crate) mod jit_runtime {
                     let result = jit_proto_chain_walk(proto.as_ref(), prop_name);
 
                     let proto_slot = (name_idx & 31) as usize;
+                    let new_entry = ProtoIcEntry {
+                        name_idx,
+                        shape,
+                        receiver_handle: obj_i64,
+                        global_epoch: PropertyMap::global_proto_mutation_epoch(),
+                        cached_value: result,
+                    };
                     if ptrs.is_cached() {
-                        unsafe { &*ptrs.prop_ic }.borrow_mut().proto[proto_slot] =
-                            (name_idx, shape, result);
+                        unsafe { &*ptrs.prop_ic }.borrow_mut().proto[proto_slot] = new_entry;
                     } else {
                         RT_PROP_IC.with(|ic| {
-                            ic.borrow_mut().proto[proto_slot] = (name_idx, shape, result);
+                            ic.borrow_mut().proto[proto_slot] = new_entry;
                         });
                     }
 
@@ -2919,6 +3047,27 @@ pub(crate) mod jit_runtime {
         }
     }
 
+    /// Extract the Maglev entry point and register-file slot count from
+    /// a `BytecodeArray`'s Maglev executable cache, if available and not
+    /// deopted.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn extract_maglev_entry(ba: &BytecodeArray) -> (usize, usize) {
+        if ba.jit_maglev_has_deopted() {
+            return (0, 0);
+        }
+        let maglev_cache = ba.maglev_executable_cache();
+        // SAFETY: single-threaded JIT; no concurrent mutation.
+        let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
+        if let Some(maglev_exec) = maglev_ref.as_ref() {
+            (
+                maglev_exec.entry_point() as usize,
+                maglev_exec.register_file_slots,
+            )
+        } else {
+            (0, 0)
+        }
+    }
+
     /// Inner implementation for [`jit_runtime_call_undefined_receiver0`].
     ///
     /// Uses cached TLS pointers for the entire call path so only one
@@ -2968,12 +3117,18 @@ pub(crate) mod jit_runtime {
                                 let (entry_fn, reg_slots) = extract_exec_entry(ba_ref);
                                 #[cfg(not(all(target_arch = "x86_64", unix)))]
                                 let (entry_fn, reg_slots) = (0usize, 0usize);
+                                #[cfg(all(target_arch = "x86_64", unix))]
+                                let (maglev_fn, maglev_reg_slots) = extract_maglev_entry(ba_ref);
+                                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                                let (maglev_fn, maglev_reg_slots) = (0usize, 0usize);
                                 let entry = CachedCalleeEntry {
                                     callee_i64,
                                     ba_ptr: ptr,
                                     ctx_ptr,
                                     entry_fn,
                                     reg_slots,
+                                    maglev_fn,
+                                    maglev_reg_slots,
                                 };
                                 ptrs.set_cached_callee(entry);
                                 (ptr, entry)
@@ -3001,6 +3156,107 @@ pub(crate) mod jit_runtime {
                 // removes entries above `heap_base` (set after this point).
                 let ba: &BytecodeArray = unsafe { &*ba_ptr };
 
+                // Skip CreateMappedArguments for closures with 0 formal
+                // parameters — the arguments object is dead code in this
+                // common case (e.g. `function() { return count++; }`).
+                let skip_args = ba.parameter_count() == 0;
+
+                // ── Cached Maglev ultra-fast path ──────────────
+                // When the Maglev entry pointer is cached, skip the
+                // RefCell lookup, lazy transfer check, and
+                // CachedMaglevCode::execute overhead.
+                #[cfg(all(target_arch = "x86_64", unix))]
+                if cached_entry.maglev_fn != 0 && !ba.jit_maglev_has_deopted() {
+                    let ctx_ref = unsafe { &*ptrs.context };
+                    let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+
+                    let callee_ctx_ptr = cached_entry.ctx_ptr as *const RefCell<JsContext>;
+                    let current_ctx_ptr = unsafe {
+                        (*ctx_ref.as_ptr())
+                            .as_ref()
+                            .map(Rc::as_ptr)
+                            .unwrap_or(std::ptr::null())
+                    };
+                    let same_context = std::ptr::eq(callee_ctx_ptr, current_ctx_ptr);
+                    let saved_ctx = if same_context {
+                        None
+                    } else {
+                        let callee_ctx = ba.closure_context().cloned();
+                        Some(unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx) })
+                    };
+
+                    bc_ref.set(ba_ptr);
+                    if skip_args {
+                        ptrs.set_skip_mapped_args(true);
+                    }
+                    let mut reg_file = std::mem::MaybeUninit::<[i64; 16]>::uninit();
+                    if cached_entry.maglev_reg_slots > 4 {
+                        unsafe {
+                            std::ptr::write_bytes(
+                                reg_file.as_mut_ptr() as *mut i64,
+                                0,
+                                cached_entry.maglev_reg_slots.min(16),
+                            );
+                        }
+                    }
+                    // SAFETY: Maglev entry is valid x86-64 with signature
+                    // `extern "C" fn(*mut i64, i64) -> i64`.
+                    let f: extern "C" fn(*mut i64, i64) -> i64 =
+                        unsafe { std::mem::transmute(cached_entry.maglev_fn as *const ()) };
+                    let jit_result = f(reg_file.as_mut_ptr() as *mut i64, cached_entry.ctx_ptr);
+                    bc_ref.set(saved_ba);
+                    if skip_args {
+                        ptrs.set_skip_mapped_args(false);
+                    }
+
+                    if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
+                        // Smi result from a 0-param closure: skip heap
+                        // truncation when no allocations occurred.
+                        if !skip_args {
+                            unsafe {
+                                if (*heap_ref.as_ptr()).len() != heap_base {
+                                    (*heap_ref.as_ptr()).truncate(heap_base);
+                                }
+                            }
+                        }
+                        if let Some(ctx) = saved_ctx {
+                            unsafe { *ctx_ref.as_ptr() = ctx };
+                        }
+                        return Some(jit_result);
+                    }
+
+                    if is_jit_deopt(jit_result) {
+                        ba.mark_jit_maglev_deopted();
+                        // Invalidate cached Maglev pointer.
+                        let mut entry = cached_entry;
+                        entry.maglev_fn = 0;
+                        entry.maglev_reg_slots = 0;
+                        ptrs.set_cached_callee(entry);
+                        let maglev_cache = ba.maglev_executable_cache();
+                        *maglev_cache.borrow_mut() = None;
+                        unsafe {
+                            if (*heap_ref.as_ptr()).len() != heap_base {
+                                (*heap_ref.as_ptr()).truncate(heap_base);
+                            }
+                        }
+                        if let Some(ctx) = saved_ctx {
+                            unsafe { *ctx_ref.as_ptr() = ctx };
+                        }
+                        // Fall through to baseline JIT / interpreter.
+                    } else {
+                        let result_val = jit_to_jsvalue_ext(jit_result);
+                        unsafe {
+                            if (*heap_ref.as_ptr()).len() != heap_base {
+                                (*heap_ref.as_ptr()).truncate(heap_base);
+                            }
+                        }
+                        if let Some(ctx) = saved_ctx {
+                            unsafe { *ctx_ref.as_ptr() = ctx };
+                        }
+                        return result_val.map(jsvalue_to_jit_i64);
+                    }
+                }
+
                 // ── Maglev fast path (preferred) ───────────────
                 #[cfg(all(target_arch = "x86_64", unix))]
                 if !ba.jit_maglev_has_deopted() {
@@ -3026,6 +3282,12 @@ pub(crate) mod jit_runtime {
                     }
                     let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
                     if let Some(maglev_exec) = maglev_ref.as_ref() {
+                        // Upgrade the callee cache with the Maglev entry.
+                        let mut entry = cached_entry;
+                        entry.maglev_fn = maglev_exec.entry_point() as usize;
+                        entry.maglev_reg_slots = maglev_exec.register_file_slots;
+                        ptrs.set_cached_callee(entry);
+
                         let ctx_ref = unsafe { &*ptrs.context };
                         let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
 
@@ -3047,15 +3309,23 @@ pub(crate) mod jit_runtime {
                         };
 
                         bc_ref.set(ba_ptr);
+                        if skip_args {
+                            ptrs.set_skip_mapped_args(true);
+                        }
                         let ctx_raw = callee_ctx_ptr as i64;
                         // SAFETY: Maglev code is valid x86-64.
                         let jit_result = unsafe { maglev_exec.execute(&[], ctx_raw) };
                         bc_ref.set(saved_ba);
+                        if skip_args {
+                            ptrs.set_skip_mapped_args(false);
+                        }
 
                         if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
-                            unsafe {
-                                if (*heap_ref.as_ptr()).len() != heap_base {
-                                    (*heap_ref.as_ptr()).truncate(heap_base);
+                            if !skip_args {
+                                unsafe {
+                                    if (*heap_ref.as_ptr()).len() != heap_base {
+                                        (*heap_ref.as_ptr()).truncate(heap_base);
+                                    }
                                 }
                             }
                             if let Some(ctx) = saved_ctx {
@@ -3135,6 +3405,9 @@ pub(crate) mod jit_runtime {
                         };
 
                         bc_ref.set(ba_ptr);
+                        if skip_args {
+                            ptrs.set_skip_mapped_args(true);
+                        }
                         let mut reg_file = std::mem::MaybeUninit::<[i64; 16]>::uninit();
                         if entry.reg_slots > 4 {
                             unsafe {
@@ -3149,6 +3422,9 @@ pub(crate) mod jit_runtime {
                             unsafe { std::mem::transmute(entry.entry_fn as *const ()) };
                         let jit_result = f(reg_file.as_mut_ptr() as *mut i64, entry.ctx_ptr);
                         bc_ref.set(saved_ba);
+                        if skip_args {
+                            ptrs.set_skip_mapped_args(false);
+                        }
 
                         if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
                             unsafe {
@@ -3219,20 +3495,28 @@ pub(crate) mod jit_runtime {
                     };
 
                     bc_ref.set(ba_ptr);
+                    if skip_args {
+                        ptrs.set_skip_mapped_args(true);
+                    }
                     // SAFETY: cached executable code contains valid
                     // x86-64 instructions.  No `&Vec<JsValue>` ref
                     // is alive during this call.
                     let jit_result = unsafe { exec.execute(&[], ctx_ptr_i64) };
 
                     bc_ref.set(saved_ba);
+                    if skip_args {
+                        ptrs.set_skip_mapped_args(false);
+                    }
 
                     // Non-heap results skip the round-trip conversion.
                     if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
                         // SAFETY: no active heap borrows; skip truncation
                         // when the callee allocated no heap handles.
-                        unsafe {
-                            if (*heap_ref.as_ptr()).len() != heap_base {
-                                (*heap_ref.as_ptr()).truncate(heap_base);
+                        if !skip_args {
+                            unsafe {
+                                if (*heap_ref.as_ptr()).len() != heap_base {
+                                    (*heap_ref.as_ptr()).truncate(heap_base);
+                                }
                             }
                         }
                         if let Some(ctx) = saved_ctx {
@@ -5241,12 +5525,30 @@ pub(crate) mod jit_runtime {
         if !is_heap_handle(obj_i64) || !ptrs.is_cached() {
             return InlineNamedResult::MISS;
         }
+
+        // ── Handle-based proto IC (skips heap dereference) ──────────
+        let ic_ref = unsafe { &*ptrs.prop_ic };
+        let proto_slot = (name_idx & 31) as usize;
+        {
+            // SAFETY: scoped borrow; dropped before any IC mutation.
+            let cache = unsafe { &*ic_ref.as_ptr() };
+            let pe = cache.proto[proto_slot];
+            if pe.receiver_handle == obj_i64 && pe.name_idx == name_idx {
+                let epoch = PropertyMap::global_proto_mutation_epoch();
+                if pe.global_epoch == epoch {
+                    return InlineNamedResult {
+                        value: pe.cached_value,
+                        hit: 1,
+                    };
+                }
+            }
+        }
+
         let idx = (obj_i64 - JIT_HEAP_TAG) as usize;
         let lda_slot = (name_idx & 63) as usize;
 
         // SAFETY: cached pointers set by cache_rt_ptrs; valid for thread lifetime.
         let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
-        let ic_ref = unsafe { &*ptrs.prop_ic };
 
         let heap_val = match heap.get(idx) {
             Some(v) => v,
@@ -5261,7 +5563,7 @@ pub(crate) mod jit_runtime {
             let (ic_entry, proto_entry) = {
                 // SAFETY: scoped borrow; dropped before IC mutation.
                 let cache = unsafe { &*ic_ref.as_ptr() };
-                (cache.lda[lda_slot], cache.proto[(name_idx & 31) as usize])
+                (cache.lda[lda_slot], cache.proto[proto_slot])
             };
 
             // ── Own-property IC hit ────────────────────────────────
@@ -5284,10 +5586,16 @@ pub(crate) mod jit_runtime {
                 }
             }
 
-            // ── Prototype IC hit (pre-encoded i64, zero clone) ─────
-            if proto_entry.0 == name_idx && proto_entry.1 == shape {
+            // ── Prototype IC hit (shape-based fallback) ────────────
+            if proto_entry.name_idx == name_idx && proto_entry.shape == shape {
+                // Re-stamp the entry so handle+epoch check hits next time.
+                let epoch = PropertyMap::global_proto_mutation_epoch();
+                let cache_mut = unsafe { &mut *ic_ref.as_ptr() };
+                let pe = &mut cache_mut.proto[proto_slot];
+                pe.receiver_handle = obj_i64;
+                pe.global_epoch = epoch;
                 return InlineNamedResult {
-                    value: proto_entry.2,
+                    value: proto_entry.cached_value,
                     hit: 1,
                 };
             }
