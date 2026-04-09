@@ -5516,6 +5516,19 @@ pub(crate) mod jit_runtime {
 
     impl InlineKeyedResult {
         const MISS: Self = Self { value: 0, hit: 0 };
+
+        /// Wraps an `Option<i64>` from a full generic stub into a result.
+        /// `Some(v)` → hit, `None` → `JIT_DEOPT`.
+        #[inline(always)]
+        fn from_generic(v: Option<i64>) -> Self {
+            match v {
+                Some(val) => Self { value: val, hit: 1 },
+                None => Self {
+                    value: JIT_DEOPT,
+                    hit: 1,
+                },
+            }
+        }
     }
 
     /// Inline-friendly array element **load** for known-integer keys.
@@ -5565,12 +5578,12 @@ pub(crate) mod jit_runtime {
 
     fn inline_load_keyed_with_ptrs(obj_i64: i64, smi_key: i64, ptrs: RtPtrs) -> InlineKeyedResult {
         if !is_heap_handle(obj_i64) || smi_key < 0 {
-            return InlineKeyedResult::MISS;
+            return InlineKeyedResult::from_generic(lda_keyed_property_inner(obj_i64, smi_key));
         }
         let key = smi_key as usize;
         let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
         if !ptrs.is_cached() {
-            return InlineKeyedResult::MISS;
+            return InlineKeyedResult::from_generic(lda_keyed_property_inner(obj_i64, smi_key));
         }
         // SAFETY: cached pointers set by cache_rt_ptrs; valid for
         // thread lifetime.
@@ -5600,12 +5613,14 @@ pub(crate) mod jit_runtime {
                         value: JIT_UNDEFINED,
                         hit: 1,
                     },
-                    // Heap-object element (String, Object, …) needs the
-                    // full generic stub for heap-handle allocation.
-                    _ => InlineKeyedResult::MISS,
+                    // Heap-object element — delegate to full generic stub
+                    // for heap-handle allocation.
+                    _ => {
+                        InlineKeyedResult::from_generic(lda_keyed_property_inner(obj_i64, smi_key))
+                    }
                 }
             }
-            _ => InlineKeyedResult::MISS,
+            _ => InlineKeyedResult::from_generic(lda_keyed_property_inner(obj_i64, smi_key)),
         }
     }
 

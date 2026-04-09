@@ -384,7 +384,7 @@ pub const TURBOFAN_TIERING_THRESHOLD: u32 = 50;
 type SharedMegamorphicIc = Rc<RefCell<Option<Box<crate::interpreter::MegamorphicIc>>>>;
 
 /// Shared, lazily-allocated prototype-chain IC state.
-type SharedProtoLoadIc = Rc<RefCell<Option<Box<HashMap<u32, crate::interpreter::ProtoLoadIc>>>>>;
+type SharedProtoLoadIc = Rc<RefCell<Option<Box<crate::interpreter::ProtoIcCache>>>>;
 
 /// Shared, lazily-allocated global-variable IC state.
 type SharedGlobalIc = Rc<RefCell<Option<Box<HashMap<u32, (usize, u64)>>>>>;
@@ -1202,14 +1202,12 @@ impl BytecodeArray {
     }
 
     /// Returns a clone of the shared prototype-chain load IC, if populated.
-    pub fn shared_proto_load_ic(
-        &self,
-    ) -> Option<Box<HashMap<u32, crate::interpreter::ProtoLoadIc>>> {
+    pub fn shared_proto_load_ic(&self) -> Option<Box<crate::interpreter::ProtoIcCache>> {
         self.shared_proto_load_ic.borrow().clone()
     }
 
     /// Writes back a prototype-chain load IC to the shared cache.
-    pub fn set_shared_proto_load_ic(&self, ic: Box<HashMap<u32, crate::interpreter::ProtoLoadIc>>) {
+    pub fn set_shared_proto_load_ic(&self, ic: Box<crate::interpreter::ProtoIcCache>) {
         *self.shared_proto_load_ic.borrow_mut() = Some(ic);
     }
 

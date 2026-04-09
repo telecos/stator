@@ -28,12 +28,12 @@ use super::{
     has_prototype_in_chain, is_js_receiver, js_add, js_less_than, keyed_load, keyed_store,
     make_construct_this, maybe_cache_construct_boilerplate, maybe_compile_baseline,
     maybe_compile_maglev, maybe_compile_turbofan, normalize_async_iterator, number_to_jsvalue,
-    plain_object_has_own_property, plain_object_to_array_items, populate_self_name, proto_lookup,
-    proto_lookup_cached_resolution, proto_lookup_chain_depth, proto_lookup_rc,
-    resolve_construct_proto, resolve_jump, restore_closure_context, run_callee_pooled,
-    set_function_name_if_missing, set_pending_exception, settle_async_iterator_result, strict_eq,
-    to_array_index, to_bigint, to_property_key, try_execute_best_jit,
-    try_fast_named_property_lookup, try_inline_small_function, walk_context_chain,
+    plain_object_to_array_items, populate_self_name, proto_lookup, proto_lookup_cached_resolution,
+    proto_lookup_chain_depth, proto_lookup_rc, resolve_construct_proto, resolve_jump,
+    restore_closure_context, run_callee_pooled, set_function_name_if_missing,
+    set_pending_exception, settle_async_iterator_result, strict_eq, to_array_index, to_bigint,
+    to_property_key, try_execute_best_jit, try_fast_named_property_lookup,
+    try_inline_small_function, walk_context_chain,
 };
 use crate::builtins::error::{ErrorKind, pop_call_frame, push_call_frame};
 use crate::builtins::proxy::{
@@ -3862,6 +3862,23 @@ fn handle_lda_named_property(
             }
         }
     }
+    // ── Prototype-chain IC fast path (before full clone) ───────────────────────────
+    if slot != u32::MAX
+        && let JsValue::PlainObject(map) = ctx.frame.read_reg(obj_v)?.cheap_clone()
+    {
+        let pm = map.borrow();
+        let layout = pm.layout_id();
+        if let Some(ic) = ctx
+            .frame
+            .proto_load_ic
+            .as_ref()
+            .and_then(|cache| cache.probe(slot, layout))
+            && ic.proto_generation == pm.proto_generation()
+        {
+            ctx.frame.accumulator = ic.value.cheap_clone();
+            return Ok(DispatchAction::Continue);
+        }
+    }
     // Slow path: clone the object for generic property lookup.
     let obj = ctx.frame.read_reg(obj_v)?.clone();
     // Resolve property name (deferred past the megamorphic fast path).
@@ -3869,27 +3886,6 @@ fn handle_lda_named_property(
     if is_private_storage_key(&prop_name) {
         ctx.frame.accumulator = load_private_named_property(&obj, &prop_name)?;
         return Ok(DispatchAction::Continue);
-    }
-    // ── Prototype-chain IC fast path ────────────────────────────────────
-    // Complements the megamorphic IC for deeper prototype chains (2+ levels).
-    if slot != u32::MAX
-        && let JsValue::PlainObject(ref map) = obj
-        && let Some(ic) = ctx
-            .frame
-            .proto_load_ic
-            .as_ref()
-            .and_then(|cache| cache.get(&slot))
-    {
-        let pm = map.borrow();
-        if ic.receiver_shape == pm.layout_id()
-            && ic.proto_depth != 0
-            && ic.property_key.as_ref() == prop_name.as_ref()
-            && ic.proto_generation == pm.proto_generation()
-            && !plain_object_has_own_property(&pm, prop_name.as_ref())
-        {
-            ctx.frame.accumulator = ic.value.cheap_clone();
-            return Ok(DispatchAction::Continue);
-        }
     }
     // Polymorphic cache: check if any cached entry matches by pointer identity.
     if slot != u32::MAX {
@@ -4027,19 +4023,15 @@ fn handle_lda_named_property(
             }
         }
         // ── Populate prototype-chain IC for deeper inherited hits ────────
-        if let Some(depth) = inherited_proto_depth {
-            ctx.frame.proto_load_ic_mut().insert(
+        if let Some(_depth) = inherited_proto_depth {
+            ctx.frame.proto_load_ic_mut().update(ProtoLoadIc {
                 slot,
-                ProtoLoadIc {
-                    receiver_shape: pm.layout_id(),
-                    proto_generation: pm.proto_generation(),
-                    proto_depth: depth,
-                    property_key: Rc::clone(&prop_name),
-                    value: result.cheap_clone(),
-                },
-            );
+                receiver_shape: pm.layout_id(),
+                proto_generation: pm.proto_generation(),
+                value: result.cheap_clone(),
+            });
         } else if let Some(cache) = &mut ctx.frame.proto_load_ic {
-            cache.remove(&slot);
+            cache.remove(slot);
         }
     }
     // Update polymorphic cache (up to 8 entries per slot).

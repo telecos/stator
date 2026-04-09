@@ -2693,6 +2693,18 @@ impl<'a> MaglevCodegen<'a> {
                 );
             }
 
+            // ── Arguments creation: emit cheap undefined placeholder ──────
+            // Sloppy-mode functions always emit CreateMappedArguments even
+            // when `arguments` is never used.  Emit JIT_UNDEFINED instead
+            // of deopt to avoid the SIGSEGV from unconditional deopt.
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::CreateMappedArguments
+            | ValueNode::CreateUnmappedArguments
+            | ValueNode::CreateRestParameter => {
+                self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
+                self.emit_store(id, Reg64::R11);
+            }
+
             // ── Unsupported nodes → unconditional deopt ───────────────────────
             #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(unused_variables))]
             _other => {
