@@ -3439,6 +3439,8 @@ impl Interpreter {
                                     | Opcode::Jump
                                     | Opcode::Return
                                     | Opcode::Nop
+                                    | Opcode::CallAnyReceiver
+                                    | Opcode::LdaGlobalStar
                             )
                         {
                             acc = materialize_acc!();
