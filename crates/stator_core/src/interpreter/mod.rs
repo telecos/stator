@@ -1402,15 +1402,74 @@ pub fn maybe_compile_maglev(ba: &BytecodeArray) {
 ///
 /// On platforms where the JIT is not available this always returns `None`.
 #[allow(dead_code)]
-fn try_execute_maglev(_ba: &BytecodeArray, _args: &[JsValue]) -> Option<StatorResult<JsValue>> {
-    // Maglev execution is temporarily disabled.  Every sloppy-mode
-    // function emits CreateMappedArguments which falls to the
-    // unconditional-deopt catch-all in codegen.  The first execution
-    // always deopts, but for some programs (closures, constructors,
-    // deep chains, keyed stores) the deopt path itself triggers
-    // SIGSEGV.  Disabling execution has zero performance impact
-    // because the result was always a deopt back to the interpreter.
-    // Re-enable once CreateMappedArguments has a proper codegen stub.
+fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        if ba.jit_maglev_has_deopted() {
+            return None;
+        }
+
+        MAGLEV_DIAG_TRIED.with(|c| c.set(c.get() + 1));
+
+        use crate::compiler::baseline::compiler::{
+            JIT_DEOPT, jit_runtime_set_context, jit_runtime_setup, jit_runtime_teardown,
+            jit_to_jsvalue_ext,
+        };
+        use crate::compiler::maglev::codegen::CachedMaglevCode;
+
+        let cache = ba.maglev_executable_cache();
+
+        {
+            let needs_init = cache.borrow().is_none();
+            if needs_init {
+                let jit_cache = ba.maglev_jit_cache_arc();
+                let cached_data = jit_cache.lock().ok().and_then(|guard| {
+                    guard
+                        .as_ref()
+                        .map(|c| (c.as_bytes().to_vec(), c.register_file_slots))
+                });
+                if let Some((code, register_file_slots)) = cached_data {
+                    // SAFETY: `code` was produced by `maglev_codegen::compile`.
+                    let exec = unsafe { CachedMaglevCode::new(&code, register_file_slots) };
+                    *cache.borrow_mut() = exec;
+                } else {
+                    maybe_compile_maglev(ba);
+                    MAGLEV_DIAG_NOT_READY.with(|c| c.set(c.get() + 1));
+                }
+            }
+        }
+
+        let guard = cache.borrow();
+        let cached = guard.as_ref()?;
+
+        jit_runtime_setup(ba);
+        let jit_args: Vec<i64> = args.iter().map(jsvalue_to_jit).collect();
+
+        {
+            let ctx = ba.closure_context().cloned();
+            jit_runtime_set_context(ctx);
+        }
+
+        MAGLEV_EXECUTING.with(|f| f.set(true));
+        // SAFETY: The cached code was produced by `maglev_codegen::compile`.
+        let result = unsafe { cached.execute(&jit_args) };
+        MAGLEV_EXECUTING.with(|f| f.set(false));
+
+        let deopt_offset = (result as u64).wrapping_sub(JIT_DEOPT as u64);
+        let ret = if deopt_offset <= 5 {
+            MAGLEV_DIAG_DEOPTED.with(|c| c.set(c.get() + 1));
+            ba.mark_jit_maglev_deopted();
+            None
+        } else {
+            MAGLEV_DIAG_EXECUTED.with(|c| c.set(c.get() + 1));
+            jit_to_jsvalue_ext(result).map(Ok)
+        };
+
+        jit_runtime_teardown();
+        return ret;
+    }
+    #[allow(unreachable_code)]
+    let _ = (ba, args);
     None
 }
 
@@ -3183,6 +3242,7 @@ impl Interpreter {
     /// Inner dispatch loop, extracted so that nested calls can skip the
     /// `stacker::maybe_grow` closure boundary that prevents LLVM from
     /// inlining across the call.
+    #[allow(clippy::collapsible_if)]
     fn run_dispatch(frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
         // Provide the global environment to JIT runtime stubs so that
         // LdaGlobal / StaGlobal can access global variables.
@@ -4081,14 +4141,22 @@ impl Interpreter {
                                 hot_acc = Some(NanBoxedValue::from_boolean(cmp));
                             }
                             Opcode::JumpIfTrue | Opcode::JumpIfToBooleanTrue => {
-                                // Accumulator is Smi ΓÇö truthy iff non-zero.
-                                if sa != 0 {
+                                let truthy = if smi_acc_spilled {
+                                    acc.to_boolean()
+                                } else {
+                                    sa != 0
+                                };
+                                if truthy {
                                     pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
                                 }
                             }
                             Opcode::JumpIfFalse | Opcode::JumpIfToBooleanFalse => {
-                                // Accumulator is Smi ΓÇö falsy iff zero.
-                                if sa == 0 {
+                                let truthy = if smi_acc_spilled {
+                                    acc.to_boolean()
+                                } else {
+                                    sa != 0
+                                };
+                                if !truthy {
                                     pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
                                 }
                             }
@@ -9715,20 +9783,26 @@ fn inline_chained_context_slot_update(
             _ => return None,
         },
         Opcode::AddSmi => {
-            if matches!(current, JsValue::BigInt(_)) {
-                return None;
+            let imm = checked_operand_imm(update, 0)?;
+            match current {
+                JsValue::Smi(value) => match value.checked_add(imm) {
+                    Some(result) => JsValue::Smi(result),
+                    None => JsValue::HeapNumber(value as f64 + imm as f64),
+                },
+                JsValue::BigInt(_) => return None,
+                _ => number_to_jsvalue(current.to_number().ok()? + f64::from(imm)),
             }
-            number_to_jsvalue(
-                current.to_number().ok()? + f64::from(checked_operand_imm(update, 0)?),
-            )
         }
         Opcode::SubSmi => {
-            if matches!(current, JsValue::BigInt(_)) {
-                return None;
+            let imm = checked_operand_imm(update, 0)?;
+            match current {
+                JsValue::Smi(value) => match value.checked_sub(imm) {
+                    Some(result) => JsValue::Smi(result),
+                    None => JsValue::HeapNumber(value as f64 - imm as f64),
+                },
+                JsValue::BigInt(_) => return None,
+                _ => number_to_jsvalue(current.to_number().ok()? - f64::from(imm)),
             }
-            number_to_jsvalue(
-                current.to_number().ok()? - f64::from(checked_operand_imm(update, 0)?),
-            )
         }
         _ => return None,
     };

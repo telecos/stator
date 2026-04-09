@@ -2319,6 +2319,15 @@ fn handle_call_undefined_receiver0(
     let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
     match callee {
         JsValue::Function(ba) => {
+            // ── Fast path: already-JIT'd closures skip inline + tiering ──
+            if ba.has_any_jit_code() && !ba.is_generator() && !ba.is_async() {
+                ba.increment_invocation_count();
+                let no_args: &[JsValue] = &[];
+                if let Some(jit_result) = try_execute_best_jit(&ba, no_args) {
+                    ctx.frame.accumulator = jit_result?;
+                    return Ok(DispatchAction::Continue);
+                }
+            }
             if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
                 && !ba.has_exception_handler()
                 && !ba.is_generator()
@@ -3814,35 +3823,32 @@ fn handle_lda_named_property(
         ctx.frame.accumulator = load_private_named_property(&obj, &prop_name)?;
         return Ok(DispatchAction::Continue);
     }
-    // ── Monomorphic IC fast path ───────────────────────────────────────
-    // Single-entry-per-slot cache: if the object has the same layout
-    // (shape) as the last successful own-property lookup, read directly
-    // at the cached offset — skips mega-IC hash probe entirely.
+    // ── Merged IC fast paths (mono → mega → proto) ──────────────────
+    // A single outer guard + single RefCell borrow covers all three IC
+    // tiers, saving 1-2 borrow/drop round-trips per hot iteration.
     if slot != u32::MAX
         && let JsValue::PlainObject(ref map) = obj
-        && let Some((cached_layout, cached_offset)) = mono_load_probe(ctx.frame, slot)
     {
         let pm = map.borrow();
-        if pm.layout_id() as usize == cached_layout
+        let layout = pm.layout_id();
+
+        // 1. Monomorphic IC: exact layout + cached offset.
+        if let Some((cached_layout, cached_offset)) = mono_load_probe(ctx.frame, slot)
+            && layout as usize == cached_layout
             && let Some(val) = pm.get_by_offset(cached_offset)
         {
             ctx.frame.accumulator = val.cheap_clone();
             return Ok(DispatchAction::Continue);
         }
-    }
-    // ── Megamorphic IC fast path────────────────────────────────────────
-    if slot != u32::MAX
-        && let JsValue::PlainObject(ref map) = obj
-    {
-        let pm = map.borrow();
+
+        // 2. Megamorphic IC: hash-probed own-property or one-hop proto.
         if let Some(ic) = ctx
             .frame
             .mega_load_ic
             .as_ref()
-            .and_then(|cache| cache.probe(slot, pm.layout_id()))
+            .and_then(|cache| cache.probe(slot, layout))
         {
             if !ic.is_proto {
-                // Own-property hit: O(1) offset access on receiver.
                 if pm.matches_key_at_offset(ic.cached_offset as usize, prop_name.as_ref())
                     && let Some(val) = pm.get_by_offset(ic.cached_offset as usize)
                 {
@@ -3852,8 +3858,6 @@ fn handle_lda_named_property(
                     return Ok(DispatchAction::Continue);
                 }
             } else {
-                // Proto-property hit: verify the immediate prototype's layout
-                // matches, then read by offset from the proto.
                 let proto_layout = ic.proto_layout;
                 let offset = ic.cached_offset;
                 if let Some(JsValue::PlainObject(proto_map)) = pm.get(INTERNAL_PROTO_PROPERTY_KEY) {
@@ -3871,18 +3875,9 @@ fn handle_lda_named_property(
                 }
             }
         }
-    }
-    // -- Prototype-chain IC fast path (epoch-guarded) ----
-    // Uses the already-cloned `obj` (avoids a second Rc::clone from the
-    // register) and checks the global prototype-mutation epoch first so
-    // that `proto_generation()` can be skipped when no prototype in the
-    // runtime has been mutated since the IC entry was populated.
-    if slot != u32::MAX
-        && let JsValue::PlainObject(ref map) = obj
-    {
+
+        // 3. Prototype-chain IC (epoch-guarded, then generation).
         let global_epoch = PropertyMap::global_proto_mutation_epoch();
-        let pm = map.borrow();
-        let layout = pm.layout_id();
         if let Some(ic) = ctx
             .frame
             .proto_load_ic
@@ -3897,19 +3892,11 @@ fn handle_lda_named_property(
             .proto_load_ic
             .as_ref()
             .and_then(|cache| cache.probe(slot, layout))
-            && ic.proto_generation == pm.proto_generation()
+            && ic.proto_generation == pm.proto_generation_with_epoch(global_epoch)
         {
             ctx.frame.accumulator = ic.value.cheap_clone();
             return Ok(DispatchAction::Continue);
         }
-    }
-    // Slow path: clone the object for generic property lookup.
-    let obj = ctx.frame.read_reg(obj_v)?.clone();
-    // Resolve property name (deferred past the megamorphic fast path).
-    let prop_name = ctx.frame.get_string_constant(name_idx)?;
-    if is_private_storage_key(&prop_name) {
-        ctx.frame.accumulator = load_private_named_property(&obj, &prop_name)?;
-        return Ok(DispatchAction::Continue);
     }
     // Polymorphic cache: check if any cached entry matches by pointer identity.
     if slot != u32::MAX {
