@@ -1155,6 +1155,7 @@ fn seed_jit_feedback(ba: &BytecodeArray) -> FeedbackVector {
 /// in the thread-local heap side-table via [`alloc_jit_heap_handle`] and
 /// referenced by handle.  This makes JIT entry infallible for all types.
 #[cfg(all(target_arch = "x86_64", unix))]
+#[allow(dead_code)]
 fn jsvalue_to_jit(v: &JsValue) -> i64 {
     use crate::compiler::baseline::compiler::{
         JIT_FALSE, JIT_NULL, JIT_TRUE, JIT_UNDEFINED, alloc_jit_heap_handle,
@@ -3373,6 +3374,8 @@ impl Interpreter {
                                     | Opcode::LdaNamedProperty
                                     | Opcode::LdaKeyedProperty
                                     | Opcode::LdaGlobal
+                                    | Opcode::CreateObjectLiteral
+                                    | Opcode::DefineNamedOwnProperty
                                     | Opcode::Jump
                                     | Opcode::Return
                                     | Opcode::Nop
@@ -26251,5 +26254,72 @@ mod tests {
         );
         // Null
         assert_eq!(HotRegisters::decode(NanBoxedValue::null()), JsValue::Null);
+    }
+
+    #[test]
+    fn dump_closure_counter_bytecode() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::recursive_descent;
+
+        let source = r#"
+            function make_counter() {
+                var count = 0;
+                return function() { count = count + 1; return count; };
+            }
+            var counter = make_counter();
+            var result = 0;
+            for (var i = 0; i < 1000; i++) {
+                result = counter();
+            }
+            result;
+        "#;
+        let program = recursive_descent::parse(source).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+
+        eprintln!(
+            "=== TOP-LEVEL bytecodes (count={}) ===",
+            ba.bytecode_count()
+        );
+        let decoded = ba.shared_decoded_instructions().unwrap();
+        for (i, instr) in decoded.0.iter().enumerate() {
+            eprintln!("  [{}] {:?} {:?}", i, instr.opcode, instr.operands());
+        }
+
+        for (idx, entry) in ba.constant_pool().iter().enumerate() {
+            if let ConstantPoolEntry::Function(inner_ba) = entry {
+                eprintln!(
+                    "\n=== INNER FUNC cp[{}] bc_count={} ===",
+                    idx,
+                    inner_ba.bytecode_count()
+                );
+                let inner_decoded = inner_ba.shared_decoded_instructions().unwrap();
+                for (i, instr) in inner_decoded.0.iter().enumerate() {
+                    eprintln!("  [{}] {:?} {:?}", i, instr.opcode, instr.operands());
+                }
+
+                for (jdx, jentry) in inner_ba.constant_pool().iter().enumerate() {
+                    if let ConstantPoolEntry::Function(closure_ba) = jentry {
+                        eprintln!(
+                            "\n=== CLOSURE cp[{}] bc_count={} param={} ===",
+                            jdx,
+                            closure_ba.bytecode_count(),
+                            closure_ba.parameter_count()
+                        );
+                        eprintln!(
+                            "    is_arrow={} is_strict={} has_exc_handler={} is_gen={} is_async={}",
+                            closure_ba.is_arrow(),
+                            closure_ba.is_strict(),
+                            closure_ba.has_exception_handler(),
+                            closure_ba.is_generator(),
+                            closure_ba.is_async()
+                        );
+                        let closure_decoded = closure_ba.shared_decoded_instructions().unwrap();
+                        for (i, instr) in closure_decoded.0.iter().enumerate() {
+                            eprintln!("  [{}] {:?} {:?}", i, instr.opcode, instr.operands());
+                        }
+                    }
+                }
+            }
+        }
     }
 }
