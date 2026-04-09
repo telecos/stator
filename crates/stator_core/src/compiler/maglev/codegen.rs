@@ -1860,13 +1860,13 @@ impl<'a> MaglevCodegen<'a> {
                     self.masm.call_reg(Reg64::R11);
                     self.emit_restore_live_regs(saved);
                     self.emit_deopt_check_rax();
-                    // Speculative Smi-or-Boolean guard for globals that
-                    // feed only into arithmetic.
+                    // Speculative Smi guard for globals that feed only
+                    // into arithmetic.
                     if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
-                        self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
-                        self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+                        self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+                        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
                         self.masm
-                            .jcc(CondCode::GreaterEq, &mut self.deopt_stub_label);
+                            .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
                     }
                     self.emit_store(id, Reg64::Rax);
                 }
@@ -1953,14 +1953,13 @@ impl<'a> MaglevCodegen<'a> {
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::LoadKeyedGeneric { object, key, .. } => {
                 self.emit_inline_load_keyed_smi(id, *object, *key);
-                // Speculative Smi-or-Boolean guard for keyed loads that
-                // feed only into arithmetic.  Booleans coerce to 0/1
-                // in the lower 32 bits, which is correct for i32 ops.
+                // Speculative Smi guard for keyed loads that feed only
+                // into arithmetic (e.g. array element used in addition).
                 if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
-                    self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
-                    self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+                    self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+                    self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
                     self.masm
-                        .jcc(CondCode::GreaterEq, &mut self.deopt_stub_label);
+                        .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
                     // Re-store the validated result (emit_inline_load_keyed_smi
                     // already stored RAX; the guard does not clobber it).
                 }
@@ -2692,28 +2691,6 @@ impl<'a> MaglevCodegen<'a> {
                     *right,
                     jit_runtime::jit_runtime_tagged_not_equal as *const () as usize,
                 );
-            }
-
-            // ── Arguments objects → trampoline call ────────────────────────────
-            //
-            // Sloppy-mode functions always emit CreateMappedArguments even
-            // when `arguments` is never read.  DCE cannot remove these
-            // nodes (it exposes latent regalloc bugs), so we route them
-            // through the runtime trampoline which creates the arguments
-            // object and returns a valid heap handle.  This avoids the
-            // catch-all unconditional deopt that previously prevented ALL
-            // sloppy-mode functions from executing in Maglev.
-            #[cfg(all(target_arch = "x86_64", unix))]
-            ValueNode::CreateMappedArguments => {
-                self.emit_trampoline_call(id, Opcode::CreateMappedArguments as u8, 0, 0);
-            }
-            #[cfg(all(target_arch = "x86_64", unix))]
-            ValueNode::CreateUnmappedArguments => {
-                self.emit_trampoline_call(id, Opcode::CreateUnmappedArguments as u8, 0, 0);
-            }
-            #[cfg(all(target_arch = "x86_64", unix))]
-            ValueNode::CreateRestParameter => {
-                self.emit_trampoline_call(id, Opcode::CreateRestParameter as u8, 0, 0);
             }
 
             // ── Unsupported nodes → unconditional deopt ───────────────────────
@@ -4827,14 +4804,14 @@ impl<'a> MaglevCodegen<'a> {
         // Deopt check: harmless on fast path (RAX is always valid);
         // catches JIT_DEOPT from the generic stub on the slow path.
         self.emit_deopt_check_rax();
-        // Speculative Smi-or-Boolean guard: if this LoadNamedGeneric is in
-        // the smi_guarded set (feeds only into arithmetic), verify the
-        // result is Smi or Boolean.  Undefined / null / heap → deopt.
+        // Speculative Smi guard: if this LoadNamedGeneric is in the
+        // smi_guarded set (feeds only into arithmetic), verify the result
+        // is actually a Smi.  Non-Smi → deopt.
         if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
-            self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
-            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
             self.masm
-                .jcc(CondCode::GreaterEq, &mut self.deopt_stub_label);
+                .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
         }
         self.emit_store(id, Reg64::Rax);
     }
