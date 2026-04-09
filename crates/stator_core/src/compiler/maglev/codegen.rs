@@ -735,15 +735,22 @@ impl<'a> MaglevCodegen<'a> {
             let raw = mono_call_cache_bytes + array_ic_bytes;
             if raw == 0 { 0 } else { (raw + 15) & !15 }
         };
-        // IC base is addressed relative to RBP.  After callee-saved
+        // IC base is addressed relative to RBP.  After 5 callee-saved
         // pushes, RSP = RBP − 40.  The cache area starts at RSP after
         // `sub rsp, total_cache_bytes`, i.e. at RBP − 40 − total_cache_bytes.
-        // The array IC sits at the *end* of the cache reservation, right
-        // after the mono call cache.
         //
-        // From RBP:  -(48 + mono_call_cache_bytes)  …  -(48 + mono_call_cache_bytes + 32)
+        // The array IC (32 bytes: handle, data_ptr, len, vec_ptr) is placed
+        // at the BOTTOM of the cache area (lowest address = RSP), below any
+        // mono-call-cache slots.  Fields are at positive offsets from base:
+        //   base+0  = handle
+        //   base+8  = data_ptr
+        //   base+16 = len
+        //   base+24 = vec_ptr
+        //
+        // This ensures IC fields never overlap with callee-saved registers
+        // (which occupy [RBP-40 .. RBP-8]).
         let array_ic_base: i32 = if has_keyed_sites {
-            -(48 + mono_call_cache_bytes)
+            -(40 + total_cache_bytes)
         } else {
             0
         };
@@ -1624,16 +1631,37 @@ impl<'a> MaglevCodegen<'a> {
 
             // ── Boolean conversion ───────────────────────────────────────────
             //
-            // Produce JIT_FALSE when the input is zero (Smi 0), JIT_FALSE, or
-            // JIT_NULL / JIT_UNDEFINED.  Produce JIT_TRUE otherwise.
-            // Implementation: compare with 0; if non-zero → true, else false.
+            // Produce JIT_FALSE when the input is falsy (Smi 0, JIT_FALSE,
+            // JIT_NULL, JIT_UNDEFINED).  Produce JIT_TRUE otherwise.
+            //
+            // Falsy values:  0 (Smi 0), JIT_FALSE (0x1_0000_0000),
+            //   JIT_UNDEFINED (0x1_0000_0002), JIT_NULL (0x1_0000_0003).
+            // Strategy: check each falsy value, default to JIT_TRUE.
             ValueNode::ToBoolean { value } => {
                 self.emit_load(*value, Reg64::R11);
+                let mut is_falsy = Label::new();
+                let mut done = Label::new();
+                // Smi 0 is falsy.
                 self.masm.cmp_ri(Reg64::R11, 0);
-                self.masm.setcc_al(CondCode::NotEqual);
-                self.masm.movzx_r64_al(Reg64::R11);
+                self.masm.jcc(CondCode::Equal, &mut is_falsy);
+                // JIT_FALSE is falsy.
                 self.masm.mov_ri(Reg64::R10, JIT_FALSE);
-                self.masm.add_rr(Reg64::R11, Reg64::R10);
+                self.masm.cmp_rr(Reg64::R11, Reg64::R10);
+                self.masm.jcc(CondCode::Equal, &mut is_falsy);
+                // JIT_UNDEFINED is falsy.
+                self.masm.mov_ri(Reg64::R10, JIT_UNDEFINED);
+                self.masm.cmp_rr(Reg64::R11, Reg64::R10);
+                self.masm.jcc(CondCode::Equal, &mut is_falsy);
+                // JIT_NULL is falsy.
+                self.masm.mov_ri(Reg64::R10, JIT_NULL);
+                self.masm.cmp_rr(Reg64::R11, Reg64::R10);
+                self.masm.jcc(CondCode::Equal, &mut is_falsy);
+                // Everything else is truthy.
+                self.masm.mov_ri(Reg64::R11, JIT_TRUE);
+                self.masm.jmp(&mut done);
+                self.masm.bind_label(&mut is_falsy);
+                self.masm.mov_ri(Reg64::R11, JIT_FALSE);
+                self.masm.bind_label(&mut done);
                 self.emit_store(id, Reg64::R11);
             }
 
