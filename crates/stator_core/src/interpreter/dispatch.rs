@@ -2215,8 +2215,10 @@ fn handle_tail_call(
                         maybe_compile_turbofan(&ba);
                     }
                     if let Some(jit_result) = try_execute_best_jit(&ba, &args) {
-                        ctx.frame.accumulator = jit_result?;
-                        return Ok(DispatchAction::Continue);
+                        // TailCall is terminal — the callee's result IS our
+                        // return value.  Use Return, not Continue (there is
+                        // no instruction after TailCall to continue to).
+                        return Ok(DispatchAction::Return(jit_result?));
                     }
                 }
                 // ── Proper tail call: reuse the frame ─
