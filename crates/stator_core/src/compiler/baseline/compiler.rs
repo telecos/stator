@@ -577,15 +577,11 @@ pub(crate) mod jit_runtime {
                                             context: ctx as *const RefCell<
                                                 Option<Rc<RefCell<JsContext>>>,
                                             >,
-                                            bytecode: bc
-                                                as *const Cell<*const BytecodeArray>,
+                                            bytecode: bc as *const Cell<*const BytecodeArray>,
                                             global: g as *const RefCell<JitGlobalState>,
-                                            prop_ic: ic
-                                                as *const RefCell<JitPropertyIcState>,
-                                            direct_call: dc
-                                                as *const Cell<DirectCallState>,
-                                            cached_callee: cc
-                                                as *const Cell<CachedCalleeEntry>,
+                                            prop_ic: ic as *const RefCell<JitPropertyIcState>,
+                                            direct_call: dc as *const Cell<DirectCallState>,
+                                            cached_callee: cc as *const Cell<CachedCalleeEntry>,
                                             generation: setup_gen,
                                         });
                                     });
@@ -3070,9 +3066,7 @@ pub(crate) mod jit_runtime {
                             None
                         } else {
                             let callee_ctx = ba.closure_context().cloned();
-                            Some(unsafe {
-                                std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx)
-                            })
+                            Some(unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx) })
                         };
 
                         bc_ref.set(ba_ptr);
