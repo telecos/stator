@@ -78,6 +78,12 @@ const PROPERTY_STORAGE_POOL_CAP: usize = 64;
 /// Avoid retaining very large backing allocations in the pool.
 const MAX_POOLED_PROPERTY_CAPACITY: usize = SMALL_PROPERTY_LINEAR_SCAN_CAP * 4;
 
+/// Maximum number of `Rc<RefCell<PropertyMap>>` wrappers kept in the
+/// per-thread object pool.  Sized to accommodate hot loops that create
+/// many short-lived objects (e.g. 1000-iteration benchmarks).
+#[cfg(all(target_arch = "x86_64", unix))]
+const OBJECT_RC_POOL_CAP: usize = 1024;
+
 thread_local! {
     static PROPERTY_STORAGE_POOL: RefCell<Vec<PropertyStorageBuffers>> =
         RefCell::new(Vec::with_capacity(PROPERTY_STORAGE_POOL_CAP));
@@ -86,6 +92,17 @@ thread_local! {
     /// whose shared keys/attrs prevent full-buffer recycling.
     static VALUES_VEC_POOL: RefCell<Vec<Vec<JsValue>>> =
         RefCell::new(Vec::with_capacity(PROPERTY_STORAGE_POOL_CAP));
+
+    /// Pool of `Rc<RefCell<PropertyMap>>` wrappers for reuse.
+    ///
+    /// Entries are returned here by [`recycle_object_rc`] when the JIT
+    /// heap is cleared.  [`acquire_object_rc_from_template`] pops an
+    /// entry, reinitialises its inner [`PropertyMap`] in place (reusing
+    /// both the `Rc` control-block allocation and the values `Vec`), and
+    /// hands it back out — eliminating all per-object heap allocations on
+    /// the hot path.
+    static OBJECT_RC_POOL: RefCell<Vec<Rc<RefCell<PropertyMap>>>> =
+        RefCell::new(Vec::with_capacity(64));
 }
 
 #[derive(Debug)]
@@ -223,6 +240,77 @@ fn release_values_vec(v: Vec<JsValue>) {
         let mut pool = pool.borrow_mut();
         if pool.len() < PROPERTY_STORAGE_POOL_CAP {
             pool.push(v);
+        }
+    });
+}
+
+/// Acquire an `Rc<RefCell<PropertyMap>>` wrapper initialised from a
+/// template, reusing a pooled allocation when possible.
+///
+/// On pool hit the inner `PropertyMap` is reinitialised in place —
+/// reusing both the `Rc` control-block and the values `Vec`, which
+/// eliminates **all** per-object heap allocations on the hot path.
+pub(crate) fn acquire_object_rc_from_template(
+    template: &ObjectLiteralTemplate,
+) -> Rc<RefCell<PropertyMap>> {
+    OBJECT_RC_POOL
+        .try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if let Some(rc) = pool.pop() {
+                rc.borrow_mut().reinitialize_from_template(template);
+                rc
+            } else {
+                Rc::new(RefCell::new(template.instantiate()))
+            }
+        })
+        .unwrap_or_else(|_| Rc::new(RefCell::new(template.instantiate())))
+}
+
+/// Acquire an `Rc<RefCell<PropertyMap>>` wrapper initialised from a
+/// template with pre-filled values, reusing a pooled allocation when
+/// possible.
+///
+/// Like [`acquire_object_rc_from_template`] but copies `values` into the
+/// existing values `Vec` instead of filling with `Undefined`.
+pub(crate) fn acquire_object_rc_from_template_with_values(
+    template: &ObjectLiteralTemplate,
+    values: &[JsValue],
+) -> Rc<RefCell<PropertyMap>> {
+    OBJECT_RC_POOL
+        .try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if let Some(rc) = pool.pop() {
+                rc.borrow_mut()
+                    .reinitialize_from_template_with_values(template, values);
+                rc
+            } else {
+                Rc::new(RefCell::new(
+                    template.instantiate_with_values(values.to_vec()),
+                ))
+            }
+        })
+        .unwrap_or_else(|_| {
+            Rc::new(RefCell::new(
+                template.instantiate_with_values(values.to_vec()),
+            ))
+        })
+}
+
+/// Return an `Rc<RefCell<PropertyMap>>` to the thread-local object pool.
+///
+/// Called when the JIT heap is cleared so that future object-creation
+/// calls can reuse the `Rc` control-block and `PropertyMap` allocations.
+/// The `Rc` is pooled only if it is the **sole owner**
+/// (`strong_count == 1`) and the pool has capacity.
+#[cfg(all(target_arch = "x86_64", unix))]
+pub(crate) fn recycle_object_rc(rc: Rc<RefCell<PropertyMap>>) {
+    if Rc::strong_count(&rc) != 1 {
+        return;
+    }
+    let _ = OBJECT_RC_POOL.try_with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < OBJECT_RC_POOL_CAP {
+            pool.push(rc);
         }
     });
 }
@@ -552,6 +640,68 @@ impl PropertyMap {
     /// Creates a property map pre-allocated for `capacity` entries.
     pub fn with_capacity(capacity: usize) -> Self {
         Self::from_buffers(capacity, acquire_storage_buffers(capacity))
+    }
+
+    /// Reinitialize this map from a template, reusing existing allocations.
+    ///
+    /// This is the pool-friendly counterpart of
+    /// [`ObjectLiteralTemplate::instantiate`]: instead of building a fresh
+    /// `PropertyMap`, it overwrites `self` in place — reusing the values
+    /// `Vec` allocation and avoiding the values-pool lookup.
+    fn reinitialize_from_template(&mut self, template: &ObjectLiteralTemplate) {
+        let cap = template.keys.len();
+        let capacity_hint = template.capacity_hint.max(cap);
+
+        self.values.clear();
+        self.values.resize(cap, JsValue::Undefined);
+        self.keys = Rc::clone(&template.keys);
+        self.attrs = Rc::clone(&template.attrs);
+        self.integer_key_count = template.integer_key_count;
+        self.index = template.cached_index.clone();
+        self.inline_cache =
+            (cap > SMALL_PROPERTY_LINEAR_SCAN_CAP).then(|| Box::new(InlinePropertyCache::new()));
+        self.shape_id = template.cached_shape_id;
+        self.layout_id = template.layout_id;
+        self.proto_generation.set(0);
+        self.proto_epoch.set(0);
+        self.proto_global_epoch.set(0);
+        self.extensible = template.extensible;
+        self.has_accessors = template.has_accessors;
+        self.template_next_slot = 0;
+        self.capacity_hint = capacity_hint;
+    }
+
+    /// Reinitialize this map from a template with pre-filled values.
+    ///
+    /// Like [`reinitialize_from_template`](Self::reinitialize_from_template)
+    /// but copies `values` into the existing values `Vec` instead of
+    /// filling with `Undefined`.
+    fn reinitialize_from_template_with_values(
+        &mut self,
+        template: &ObjectLiteralTemplate,
+        values: &[JsValue],
+    ) {
+        let cap = template.keys.len();
+        debug_assert_eq!(values.len(), cap);
+        let capacity_hint = template.capacity_hint.max(cap);
+
+        self.values.clear();
+        self.values.extend_from_slice(values);
+        self.keys = Rc::clone(&template.keys);
+        self.attrs = Rc::clone(&template.attrs);
+        self.integer_key_count = template.integer_key_count;
+        self.index = template.cached_index.clone();
+        self.inline_cache =
+            (cap > SMALL_PROPERTY_LINEAR_SCAN_CAP).then(|| Box::new(InlinePropertyCache::new()));
+        self.shape_id = template.cached_shape_id;
+        self.layout_id = template.layout_id;
+        self.proto_generation.set(0);
+        self.proto_epoch.set(0);
+        self.proto_global_epoch.set(0);
+        self.extensible = template.extensible;
+        self.has_accessors = template.has_accessors;
+        self.template_next_slot = cap;
+        self.capacity_hint = capacity_hint;
     }
 
     /// Creates a property map pre-populated with the given boilerplate

@@ -51,7 +51,10 @@ use crate::bytecode::{
 };
 use crate::compiler::turbofan::TurbofanCompiledCode;
 use crate::error::{StatorError, StatorResult};
-use crate::objects::property_map::{ObjectLiteralTemplate, PropertyMap};
+use crate::objects::property_map::{
+    ObjectLiteralTemplate, PropertyMap, acquire_object_rc_from_template,
+    acquire_object_rc_from_template_with_values,
+};
 use crate::objects::value::{JsContext, JsValue};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1065,6 +1068,89 @@ impl BytecodeArray {
         self.object_literal_templates
             .borrow_mut()
             .insert(slot, ObjectLiteralCacheEntry::Pending(map));
+    }
+
+    // ─── Pooled object-literal template API ──────────────────────────────
+
+    /// Like [`clone_object_literal_template`](Self::clone_object_literal_template)
+    /// but returns a pooled `Rc<RefCell<PropertyMap>>`, reusing the
+    /// control-block and values `Vec` allocations when possible.
+    pub fn clone_object_literal_template_pooled(
+        &self,
+        slot: u32,
+    ) -> Option<Rc<RefCell<PropertyMap>>> {
+        let borrow = self.object_literal_templates.borrow();
+        match borrow.get(&slot) {
+            Some(ObjectLiteralCacheEntry::Cached(template)) => {
+                Some(acquire_object_rc_from_template(template))
+            }
+            _ => None,
+        }
+    }
+
+    /// Like [`promote_object_literal_template`](Self::promote_object_literal_template)
+    /// but returns a pooled `Rc<RefCell<PropertyMap>>`.
+    pub fn promote_object_literal_template_pooled(
+        &self,
+        slot: u32,
+    ) -> Option<Rc<RefCell<PropertyMap>>> {
+        let pending_rc = {
+            let borrow = self.object_literal_templates.borrow();
+            match borrow.get(&slot) {
+                Some(ObjectLiteralCacheEntry::Pending(rc)) => Some(Rc::clone(rc)),
+                _ => None,
+            }
+        };
+        let first_rc = pending_rc?;
+        let first_borrow = first_rc.borrow();
+        let template = ObjectLiteralTemplate::capture(&first_borrow)?;
+        let rc = acquire_object_rc_from_template(&template);
+        drop(first_borrow);
+        self.object_literal_templates
+            .borrow_mut()
+            .insert(slot, ObjectLiteralCacheEntry::Cached(Box::new(template)));
+        Some(rc)
+    }
+
+    /// Like [`clone_object_literal_template_with_values`](Self::clone_object_literal_template_with_values)
+    /// but returns a pooled `Rc<RefCell<PropertyMap>>`.
+    pub fn clone_object_literal_template_with_values_pooled(
+        &self,
+        slot: u32,
+        values: &[JsValue],
+    ) -> Option<Rc<RefCell<PropertyMap>>> {
+        let borrow = self.object_literal_templates.borrow();
+        match borrow.get(&slot) {
+            Some(ObjectLiteralCacheEntry::Cached(template)) => Some(
+                acquire_object_rc_from_template_with_values(template, values),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Like [`promote_object_literal_template_with_values`](Self::promote_object_literal_template_with_values)
+    /// but returns a pooled `Rc<RefCell<PropertyMap>>`.
+    pub fn promote_object_literal_template_with_values_pooled(
+        &self,
+        slot: u32,
+        values: &[JsValue],
+    ) -> Option<Rc<RefCell<PropertyMap>>> {
+        let pending_rc = {
+            let borrow = self.object_literal_templates.borrow();
+            match borrow.get(&slot) {
+                Some(ObjectLiteralCacheEntry::Pending(rc)) => Some(Rc::clone(rc)),
+                _ => None,
+            }
+        };
+        let first_rc = pending_rc?;
+        let first_borrow = first_rc.borrow();
+        let template = ObjectLiteralTemplate::capture(&first_borrow)?;
+        let rc = acquire_object_rc_from_template_with_values(&template, values);
+        drop(first_borrow);
+        self.object_literal_templates
+            .borrow_mut()
+            .insert(slot, ObjectLiteralCacheEntry::Cached(Box::new(template)));
+        Some(rc)
     }
 
     // ─── Shared megamorphic IC accessors ─────────────────────────────────

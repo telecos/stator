@@ -1815,23 +1815,31 @@ impl<'a> MaglevCodegen<'a> {
                             let dst = phys_reg(n);
                             self.masm.mov_load_base_disp32(dst, Reg64::R14, off);
                             // Speculative Smi guard for promoted globals that
-                            // feed only into arithmetic.
+                            // feed only into arithmetic.  Promoted globals in
+                            // the preheader may start as `undefined` (e.g.
+                            // `var temp;`).  Instead of deopting, coerce to 0
+                            // which matches ToInt32(undefined) = 0.
                             if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
                                 self.masm.movsxd_rr(Reg64::R11, dst);
                                 self.masm.cmp_rr(Reg64::R11, dst);
-                                self.masm
-                                    .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
+                                let mut smi_ok = Label::new();
+                                self.masm.jcc(CondCode::Equal, &mut smi_ok);
+                                self.masm.xor_rr(dst, dst);
+                                self.masm.bind_label(&mut smi_ok);
                             }
                         }
                         _ => {
                             self.masm.mov_load_base_disp32(Reg64::R11, Reg64::R14, off);
                             // Speculative Smi guard for promoted globals that
-                            // feed only into arithmetic.
+                            // feed only into arithmetic.  Coerce non-Smi to 0
+                            // (= ToInt32(undefined)) instead of deopting.
                             if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
                                 self.masm.movsxd_rr(Reg64::R10, Reg64::R11);
                                 self.masm.cmp_rr(Reg64::R10, Reg64::R11);
-                                self.masm
-                                    .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
+                                let mut smi_ok = Label::new();
+                                self.masm.jcc(CondCode::Equal, &mut smi_ok);
+                                self.masm.xor_rr(Reg64::R11, Reg64::R11);
+                                self.masm.bind_label(&mut smi_ok);
                             }
                             self.emit_store(id, Reg64::R11);
                         }
