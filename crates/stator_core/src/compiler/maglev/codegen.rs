@@ -6848,6 +6848,16 @@ impl<'a> MaglevCodegen<'a> {
 
         // Fixed-point propagation through GenericAdd/Sub/Mul/Inc/Dec/Negate
         // and Phi.
+        //
+        // **Optimistic Phi speculation**: loop-carried Phis have a cyclic
+        // dependency (Phi → arithmetic → Phi) that prevents strict
+        // "all inputs in set" from ever converging.  We break the cycle
+        // by treating a Phi as smi_guarded when:
+        //   (a) at least one input is already in the set (entry edge), AND
+        //   (b) ALL consumers are arithmetic-compatible.
+        // This is safe because the downstream arithmetic operations have
+        // overflow/deopt guards that will bail out if the speculative Smi
+        // assumption is violated at runtime.
         loop {
             let mut changed = false;
             for block in graph.blocks() {
@@ -6868,7 +6878,24 @@ impl<'a> MaglevCodegen<'a> {
                         | ValueNode::GenericDecrement { value, .. }
                         | ValueNode::GenericNegate { value, .. }
                         | ValueNode::GenericBitwiseNot { value, .. } => set.contains(value),
-                        ValueNode::Phi { inputs } => inputs.iter().all(|inp| set.contains(inp)),
+                        ValueNode::Phi { inputs } => {
+                            if inputs.iter().all(|inp| set.contains(inp)) {
+                                true
+                            } else {
+                                // Optimistic: at least one entry-edge input is
+                                // in the set AND all consumers are arithmetic.
+                                let any_in_set = inputs.iter().any(|inp| set.contains(inp));
+                                any_in_set
+                                    && consumers_of.get(id).is_some_and(|cs| {
+                                        !cs.is_empty()
+                                            && cs.iter().all(|c| {
+                                                node_lookup.get(c).is_some_and(|n| {
+                                                    Self::is_arithmetic_compatible_consumer(n)
+                                                })
+                                            })
+                                    })
+                            }
+                        }
                         _ => false,
                     };
                     if derived && !branch_conditions.contains(id) {
