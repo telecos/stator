@@ -1086,14 +1086,14 @@ pub(crate) mod jit_runtime {
                         let ba_ref = unsafe { &*ba };
 
                         // Fast path: clone a previously cached template.
-                        if let Some(map) = ba_ref.clone_object_literal_template(slot) {
-                            let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                        if let Some(rc) = ba_ref.clone_object_literal_template_pooled(slot) {
+                            let obj = JsValue::PlainObject(rc);
                             return Some(jsvalue_to_jit_i64(obj));
                         }
 
                         // Second execution: promote pending → cached.
-                        if let Some(map) = ba_ref.promote_object_literal_template(slot) {
-                            let obj = JsValue::PlainObject(Rc::new(RefCell::new(map)));
+                        if let Some(rc) = ba_ref.promote_object_literal_template_pooled(slot) {
+                            let obj = JsValue::PlainObject(rc);
                             return Some(jsvalue_to_jit_i64(obj));
                         }
 
