@@ -5886,14 +5886,18 @@ pub(crate) mod jit_runtime {
         ptrs: RtPtrs,
     ) -> InlineKeyedResult {
         if !is_heap_handle(obj_i64) || smi_key < 0 {
-            return InlineKeyedResult::MISS;
+            return InlineKeyedResult::from_generic(sta_keyed_property_inner(
+                obj_i64, smi_key, value_i64,
+            ));
         }
         // Decode value inline for common types only.
         // Check booleans first — hot path for sieve-like patterns where
         // every element is `true`/`false`, avoiding the wider Smi range
         // comparison on each store.
         if is_heap_handle(value_i64) {
-            return InlineKeyedResult::MISS;
+            return InlineKeyedResult::from_generic(sta_keyed_property_inner(
+                obj_i64, smi_key, value_i64,
+            ));
         }
         let value = if value_i64 == JIT_TRUE {
             JsValue::Boolean(true)
@@ -5904,13 +5908,17 @@ pub(crate) mod jit_runtime {
         } else if value_i64 == JIT_UNDEFINED {
             JsValue::Undefined
         } else {
-            return InlineKeyedResult::MISS;
+            return InlineKeyedResult::from_generic(sta_keyed_property_inner(
+                obj_i64, smi_key, value_i64,
+            ));
         };
 
         let key = smi_key as usize;
         let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
         if !ptrs.is_cached() {
-            return InlineKeyedResult::MISS;
+            return InlineKeyedResult::from_generic(sta_keyed_property_inner(
+                obj_i64, smi_key, value_i64,
+            ));
         }
         // SAFETY: cached pointers valid for thread lifetime.
         let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
@@ -5926,10 +5934,14 @@ pub(crate) mod jit_runtime {
                     }
                 } else {
                     // Out-of-bounds: needs full stub for Vec growth.
-                    InlineKeyedResult::MISS
+                    InlineKeyedResult::from_generic(sta_keyed_property_inner(
+                        obj_i64, smi_key, value_i64,
+                    ))
                 }
             }
-            _ => InlineKeyedResult::MISS,
+            _ => InlineKeyedResult::from_generic(sta_keyed_property_inner(
+                obj_i64, smi_key, value_i64,
+            )),
         }
     }
 
@@ -5949,10 +5961,14 @@ pub(crate) mod jit_runtime {
         ptrs: RtPtrs,
     ) -> InlineKeyedResult {
         if !is_heap_handle(obj_i64) || smi_key < 0 {
-            return InlineKeyedResult::MISS;
+            return InlineKeyedResult::from_generic(sta_keyed_property_inner(
+                obj_i64, smi_key, value_i64,
+            ));
         }
         if is_heap_handle(value_i64) {
-            return InlineKeyedResult::MISS;
+            return InlineKeyedResult::from_generic(sta_keyed_property_inner(
+                obj_i64, smi_key, value_i64,
+            ));
         }
         // Decode value — check booleans first (hot for sieve-like
         // patterns) to avoid the wider Smi range comparison.
@@ -5965,13 +5981,17 @@ pub(crate) mod jit_runtime {
         } else if value_i64 == JIT_UNDEFINED {
             JsValue::Undefined
         } else {
-            return InlineKeyedResult::MISS;
+            return InlineKeyedResult::from_generic(sta_keyed_property_inner(
+                obj_i64, smi_key, value_i64,
+            ));
         };
 
         let key = smi_key as usize;
         let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
         if !ptrs.is_cached() {
-            return InlineKeyedResult::MISS;
+            return InlineKeyedResult::from_generic(sta_keyed_property_inner(
+                obj_i64, smi_key, value_i64,
+            ));
         }
         // SAFETY: cached pointers valid for thread lifetime.
         let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
@@ -6019,7 +6039,9 @@ pub(crate) mod jit_runtime {
                     hit: 1,
                 }
             }
-            _ => InlineKeyedResult::MISS,
+            _ => InlineKeyedResult::from_generic(sta_keyed_property_inner(
+                obj_i64, smi_key, value_i64,
+            )),
         }
     }
 
@@ -6394,7 +6416,9 @@ pub(crate) mod jit_runtime {
                         value: JIT_UNDEFINED,
                         hit: 1,
                     },
-                    _ => InlineKeyedResult::MISS,
+                    _ => {
+                        InlineKeyedResult::from_generic(lda_keyed_property_inner(obj_i64, smi_key))
+                    }
                 };
             }
         }
