@@ -297,6 +297,17 @@ pub(crate) mod jit_runtime {
             Cell::new(ArrayMethodIcEntry::EMPTY)
         };
 
+        /// Single-entry IC for `call_property1` dispatch.  Caches the
+        /// callee heap handle so that repeated `arr.push(v)` calls in
+        /// a tight loop skip the `PropertyMap` lookup used to identify
+        /// the fast-array-method tag.
+        ///
+        /// Unconditionally cleared by [`jit_runtime_setup`] because
+        /// heap handles are recycled between invocations.
+        static RT_CALL_PROP1_IC: Cell<CallProp1IcEntry> = const {
+            Cell::new(CallProp1IcEntry::EMPTY)
+        };
+
         /// Single-entry IC that caches the most recent object-literal
         /// template pointer.  Avoids the `RefCell` borrow and `HashMap`
         /// lookup on the `object_literal_templates` map for repeated
@@ -440,6 +451,26 @@ pub(crate) mod jit_runtime {
         };
     }
 
+    /// Single-entry IC for `CallProperty1` dispatch.
+    ///
+    /// Caches the callee heap handle together with a tag that identifies
+    /// the fast method (currently only `Array.prototype.push`).  On an IC
+    /// hit, [`call_property1_inner`] skips the `PlainObject` deref and
+    /// `PropertyMap::get("\0stator.fast_array_method")` hash-map probe
+    /// that otherwise dominates tight `arr.push()` loops.
+    #[derive(Clone, Copy)]
+    struct CallProp1IcEntry {
+        /// Heap handle of the callee last seen.
+        callee: i64,
+        /// Identified method tag — `0` means empty/miss.
+        tag: u8,
+    }
+
+    impl CallProp1IcEntry {
+        const EMPTY: Self = Self { callee: 0, tag: 0 };
+        const TAG_ARRAY_PUSH: u8 = 1;
+    }
+
     /// Single-entry inline cache for object-literal template lookups.
     ///
     /// Caches a raw pointer to the [`ObjectLiteralTemplate`] stored inside
@@ -526,6 +557,9 @@ pub(crate) mod jit_runtime {
         let ba_ptr = ba as *const BytecodeArray;
         RT_BYTECODE.with(|b| b.set(ba_ptr));
         recycle_and_clear_heap();
+        // The call-property1 IC caches heap handles that are invalidated
+        // by recycle_and_clear_heap, so clear it unconditionally.
+        RT_CALL_PROP1_IC.with(|c| c.set(CallProp1IcEntry::EMPTY));
         // Only reset the property and array-method ICs when the function
         // changes.  Re-entrant calls to the same BytecodeArray (e.g.
         // criterion iterations) keep warm IC state, saving ~190ns per
@@ -5978,16 +6012,6 @@ pub(crate) mod jit_runtime {
         }
     }
 
-    /// Decode up to 3 JIT `i64` register values into a pre-sized `Vec`.
-    #[inline]
-    fn decode_jit_values(count: usize, vals: &[i64; 3]) -> Vec<JsValue> {
-        let mut out = Vec::with_capacity(count);
-        for &v in &vals[..count] {
-            out.push(decode_one_jit_value(v));
-        }
-        out
-    }
-
     /// Decode up to 3 JIT `i64` register values into a stack-allocated
     /// array, avoiding a `Vec` heap allocation on the fused hot path.
     #[inline]
@@ -6319,6 +6343,46 @@ pub(crate) mod jit_runtime {
         call_property1_inner(callee_i64, receiver_i64, arg0_i64).unwrap_or(JIT_DEOPT)
     }
 
+    /// IC-hit fast path for `Array.prototype.push` in `CallProperty1`.
+    ///
+    /// Called when [`RT_CALL_PROP1_IC`] identifies the callee as a
+    /// previously-seen array-push method.  Performs only a receiver
+    /// type check, value decode, and the actual `Vec::push` — skipping
+    /// the `PlainObject` deref and `PropertyMap` probe entirely.
+    #[inline(always)]
+    fn call_property1_ic_push(receiver_i64: i64, arg0_i64: i64) -> Option<i64> {
+        if !is_heap_handle(receiver_i64) {
+            return None;
+        }
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if !ptrs.is_cached() {
+            return None;
+        }
+        let recv_idx = (receiver_i64 - JIT_HEAP_TAG) as usize;
+        // SAFETY: cached pointers set by cache_rt_ptrs; valid for thread lifetime.
+        let heap_ref = unsafe { &*ptrs.heap };
+        // SAFETY: single-threaded JIT; no concurrent mutable borrows.
+        let heap = unsafe { &*heap_ref.as_ptr() };
+        match heap.get(recv_idx)? {
+            JsValue::Array(arr) => {
+                let arg0 = if is_heap_handle(arg0_i64) {
+                    let a_idx = (arg0_i64 - JIT_HEAP_TAG) as usize;
+                    heap.get(a_idx).cloned().unwrap_or(JsValue::Undefined)
+                } else if arg0_i64 >= i32::MIN as i64 && arg0_i64 <= i32::MAX as i64 {
+                    JsValue::Smi(arg0_i64 as i32)
+                } else {
+                    super::jit_to_jsvalue(arg0_i64).unwrap_or(JsValue::Undefined)
+                };
+                // SAFETY: single-threaded JIT; no concurrent borrows of
+                // this array during push.
+                let items = unsafe { &mut *arr.as_ptr() };
+                items.push(arg0);
+                Some(items.len() as i64)
+            }
+            _ => None,
+        }
+    }
+
     /// Inner implementation for [`jit_runtime_call_property1`].
     ///
     /// Handles three callee shapes:
@@ -6327,6 +6391,22 @@ pub(crate) mod jit_runtime {
     /// 2. `NativeFunction` — generic Rust-closure dispatch.
     /// 3. Anything else → DEOPT.
     fn call_property1_inner(callee_i64: i64, receiver_i64: i64, arg0_i64: i64) -> Option<i64> {
+        // ── IC fast path: skip callee identification on cache hit ─────
+        //
+        // In tight `arr.push(v)` loops the callee heap handle is the
+        // same on every iteration.  The IC lets us jump straight to the
+        // push implementation without dereffing the PlainObject or
+        // probing its PropertyMap for the "\0stator.fast_array_method"
+        // marker — the two most expensive operations on the slow path.
+        let ic = RT_CALL_PROP1_IC.with(|c| c.get());
+        if ic.callee == callee_i64 && ic.tag == CallProp1IcEntry::TAG_ARRAY_PUSH {
+            if let Some(result) = call_property1_ic_push(receiver_i64, arg0_i64) {
+                return Some(result);
+            }
+            // Receiver was not an Array → invalidate IC, fall through.
+            RT_CALL_PROP1_IC.with(|c| c.set(CallProp1IcEntry::EMPTY));
+        }
+
         // ── Fast path: use cached heap to avoid jit_i64_to_jsvalue clones ──
         let ptrs = RT_PTRS.with(|p| p.get());
         if ptrs.is_cached() && is_heap_handle(callee_i64) {
@@ -6347,6 +6427,14 @@ pub(crate) mod jit_runtime {
                         if let Some(JsValue::Array(arr)) = heap.get(recv_idx) {
                             match method_name.as_ref() {
                                 "push" => {
+                                    // Populate IC so subsequent iterations
+                                    // skip the PropertyMap probe.
+                                    RT_CALL_PROP1_IC.with(|c| {
+                                        c.set(CallProp1IcEntry {
+                                            callee: callee_i64,
+                                            tag: CallProp1IcEntry::TAG_ARRAY_PUSH,
+                                        })
+                                    });
                                     // Inline value decode for common types.
                                     let arg0 = if is_heap_handle(arg0_i64) {
                                         let a_idx = (arg0_i64 - JIT_HEAP_TAG) as usize;

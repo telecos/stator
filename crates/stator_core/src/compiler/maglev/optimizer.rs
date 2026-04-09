@@ -2428,12 +2428,15 @@ fn has_side_effects(node: &ValueNode) -> bool {
             | ValueNode::FastCreateClosure { .. }
             | ValueNode::CreateEmptyObjectLiteral
             | ValueNode::CreateEmptyArrayLiteral { .. }
-            // NOTE: CreateMappedArguments, CreateUnmappedArguments, and
-            // CreateRestParameter are intentionally NOT listed here.
-            // They are pure allocations: if nothing consumes the result
-            // (i.e. the function never references `arguments`), DCE can
-            // safely eliminate them.  This avoids an unconditional deopt
-            // in codegen for closures that don't use `arguments`.
+            // CreateMappedArguments / CreateUnmappedArguments / CreateRestParameter
+            // MUST be treated as side-effecting.  Removing them via DCE changes
+            // the Maglev graph shape, which alters register allocation and
+            // exposes latent regalloc bugs on Linux release builds (SIGSEGV /
+            // wrong results).  Codegen already handles them as cheap no-ops
+            // when they appear in the graph.
+            | ValueNode::CreateMappedArguments
+            | ValueNode::CreateUnmappedArguments
+            | ValueNode::CreateRestParameter
             | ValueNode::CreateRegExpLiteral { .. }
             // Guards deoptimise on failure — side-effecting.
             | ValueNode::CheckSmi { .. }
