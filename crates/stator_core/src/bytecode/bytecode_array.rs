@@ -377,7 +377,7 @@ pub const MAGLEV_TIERING_THRESHOLD: u32 = 5;
 /// Maglev graph builder followed by Cranelift CLIF lowering and
 /// optimisation, producing code that is expected to reach within 90 % of
 /// peak throughput.
-pub const TURBOFAN_TIERING_THRESHOLD: u32 = 1_000;
+pub const TURBOFAN_TIERING_THRESHOLD: u32 = 50;
 
 /// Shared, lazily-allocated megamorphic IC state persisted on a
 /// [`BytecodeArray`] across invocations.
@@ -1705,6 +1705,11 @@ impl BytecodeArray {
     /// should no longer be attempted.
     pub fn jit_maglev_has_deopted(&self) -> bool {
         self.jit_maglev_deopt_count.get() >= Self::MAX_MAGLEV_DEOPT_RETRIES
+    }
+
+    /// Returns the current Maglev deopt count for diagnostics.
+    pub fn maglev_deopt_count(&self) -> u32 {
+        self.jit_maglev_deopt_count.get()
     }
 
     /// Increment the Maglev deopt counter.  After

@@ -753,10 +753,18 @@ fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
+        && !ba.has_turbofan_jit_code()
         && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    eprintln!(
+        "BENCH_JIT[arithmetic]: has_maglev={} has_turbofan={} deopt_count={} inv_count={}",
+        ba.has_maglev_jit_code(),
+        ba.has_turbofan_jit_code(),
+        ba.maglev_deopt_count(),
+        ba.invocation_count(),
+    );
     // Snapshot before measurement
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
@@ -842,10 +850,18 @@ fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
+        && !ba.has_turbofan_jit_code()
         && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    eprintln!(
+        "BENCH_JIT[fib_40]: has_maglev={} has_turbofan={} deopt_count={} inv_count={}",
+        ba.has_maglev_jit_code(),
+        ba.has_turbofan_jit_code(),
+        ba.maglev_deopt_count(),
+        ba.invocation_count(),
+    );
     // Snapshot before measurement
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
@@ -908,10 +924,18 @@ fn bench_property_access_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
+        && !ba.has_turbofan_jit_code()
         && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    eprintln!(
+        "BENCH_JIT[property_access]: has_maglev={} has_turbofan={} deopt_count={} inv_count={}",
+        ba.has_maglev_jit_code(),
+        ba.has_turbofan_jit_code(),
+        ba.maglev_deopt_count(),
+        ba.invocation_count(),
+    );
     // Snapshot before measurement
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
@@ -981,10 +1005,18 @@ fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
+        && !ba.has_turbofan_jit_code()
         && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    eprintln!(
+        "BENCH_JIT[object_creation]: has_maglev={} has_turbofan={} deopt_count={} inv_count={}",
+        ba.has_maglev_jit_code(),
+        ba.has_turbofan_jit_code(),
+        ba.maglev_deopt_count(),
+        ba.invocation_count(),
+    );
     // Snapshot before measurement
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
@@ -1050,10 +1082,18 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
+        && !ba.has_turbofan_jit_code()
         && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    eprintln!(
+        "BENCH_JIT[array_push_sum]: has_maglev={} has_turbofan={} deopt_count={} inv_count={}",
+        ba.has_maglev_jit_code(),
+        ba.has_turbofan_jit_code(),
+        ba.maglev_deopt_count(),
+        ba.invocation_count(),
+    );
     // Snapshot before measurement
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
@@ -1120,10 +1160,18 @@ fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
+        && !ba.has_turbofan_jit_code()
         && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    eprintln!(
+        "BENCH_JIT[closure_counter]: has_maglev={} has_turbofan={} deopt_count={} inv_count={}",
+        ba.has_maglev_jit_code(),
+        ba.has_turbofan_jit_code(),
+        ba.maglev_deopt_count(),
+        ba.invocation_count(),
+    );
     // Snapshot before measurement
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
@@ -1192,10 +1240,18 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
+        && !ba.has_turbofan_jit_code()
         && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    eprintln!(
+        "BENCH_JIT[prototype_chain]: has_maglev={} has_turbofan={} deopt_count={} inv_count={}",
+        ba.has_maglev_jit_code(),
+        ba.has_turbofan_jit_code(),
+        ba.maglev_deopt_count(),
+        ba.invocation_count(),
+    );
     // Snapshot before measurement
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
@@ -1269,10 +1325,18 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
+        && !ba.has_turbofan_jit_code()
         && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    eprintln!(
+        "BENCH_JIT[sieve_primes]: has_maglev={} has_turbofan={} deopt_count={} inv_count={}",
+        ba.has_maglev_jit_code(),
+        ba.has_turbofan_jit_code(),
+        ba.maglev_deopt_count(),
+        ba.invocation_count(),
+    );
     // Snapshot before measurement
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
@@ -1335,10 +1399,18 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
     // Wait for background Maglev compilation to complete
     let warmup_start = std::time::Instant::now();
     while !ba.has_all_maglev_jit_code()
+        && !ba.has_turbofan_jit_code()
         && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    eprintln!(
+        "BENCH_JIT[deep_object]: has_maglev={} has_turbofan={} deopt_count={} inv_count={}",
+        ba.has_maglev_jit_code(),
+        ba.has_turbofan_jit_code(),
+        ba.maglev_deopt_count(),
+        ba.invocation_count(),
+    );
     // Snapshot before measurement
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();

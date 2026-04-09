@@ -1678,11 +1678,15 @@ pub(super) fn try_execute_best_jit(
     if DEBUG_ATTACHED.with(|f| f.get()) {
         return None;
     }
-    // Try Maglev first — register clobbering fix + deopt check in global loads
-    // should resolve SIGSEGV on property-heavy benchmarks.
+    // Try Turbofan first (highest tier — Cranelift native code).
+    if let Some(r) = try_execute_turbofan(ba, args) {
+        return Some(r);
+    }
+    // Then Maglev (register-allocated JIT).
     if let Some(r) = try_execute_maglev(ba, args) {
         return Some(r);
     }
+    // Baseline JIT (disabled — SIGSEGV from unsafe runtime stubs).
     try_execute_jit(ba, args)
 }
 
