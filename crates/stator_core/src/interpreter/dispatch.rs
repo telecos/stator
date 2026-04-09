@@ -2202,7 +2202,9 @@ fn handle_tail_call(
                 }
             } else {
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
-                // ── Tiering (cold path: gated on reaching baseline threshold) ──
+                // ── Tiering (cold path: compile but do NOT execute JIT
+                //    for tail calls — TailCall always causes JIT_DEOPT
+                //    because Maglev/Turbofan emit Deoptimize for it) ──
                 let count = ba.increment_invocation_count();
                 if count >= TIERING_THRESHOLD {
                     if !ba.has_any_jit_code() {
@@ -2214,12 +2216,12 @@ fn handle_tail_call(
                     if count >= TURBOFAN_TIERING_THRESHOLD {
                         maybe_compile_turbofan(&ba);
                     }
-                    if let Some(jit_result) = try_execute_best_jit(&ba, &args) {
-                        // TailCall is terminal — the callee's result IS our
-                        // return value.  Use Return, not Continue (there is
-                        // no instruction after TailCall to continue to).
-                        return Ok(DispatchAction::Return(jit_result?));
-                    }
+                    // NOTE: We intentionally do NOT call try_execute_best_jit
+                    // here.  TailCall is a terminal opcode that Maglev/Turbofan
+                    // cannot handle (they emit Deoptimize).  Attempting JIT
+                    // execution on every tail-call iteration is wasteful and
+                    // the deopt side-effects corrupt thread-local state.
+                    // JIT execution happens at function entry (run_dispatch).
                 }
                 // ── Proper tail call: reuse the frame ─
                 let param_count = ba.parameter_count() as usize;
