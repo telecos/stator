@@ -163,9 +163,8 @@ pub(crate) mod jit_runtime {
     use crate::objects::map::PropertyAttributes;
     use crate::objects::property_map::{
         INTERNAL_PROTO_PROPERTY_KEY, ObjectLiteralTemplate, PropertyMap,
-        acquire_object_rc_from_template, acquire_object_rc_from_template_cached,
-        acquire_object_rc_from_template_with_values,
-        acquire_object_rc_from_template_with_values_cached, recycle_object_rc,
+        acquire_object_rc_from_template_cached, acquire_object_rc_from_template_with_values_cached,
+        recycle_object_rc,
     };
     use crate::objects::value::{JsContext, JsValue, NativeIterator};
 
