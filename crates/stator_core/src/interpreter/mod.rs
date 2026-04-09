@@ -1445,6 +1445,12 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
         jit_runtime_setup(ba);
         let jit_args: Vec<i64> = args.iter().map(jsvalue_to_jit).collect();
 
+        // Get closure context as raw pointer (0 for top-level scripts).
+        let ctx_ptr: i64 = ba
+            .closure_context()
+            .map(|rc| Rc::as_ptr(rc) as i64)
+            .unwrap_or(0);
+
         {
             let ctx = ba.closure_context().cloned();
             jit_runtime_set_context(ctx);
@@ -1452,7 +1458,7 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
 
         MAGLEV_EXECUTING.with(|f| f.set(true));
         // SAFETY: The cached code was produced by `maglev_codegen::compile`.
-        let result = unsafe { cached.execute(&jit_args) };
+        let result = unsafe { cached.execute(&jit_args, ctx_ptr) };
         MAGLEV_EXECUTING.with(|f| f.set(false));
 
         let deopt_offset = (result as u64).wrapping_sub(JIT_DEOPT as u64);
