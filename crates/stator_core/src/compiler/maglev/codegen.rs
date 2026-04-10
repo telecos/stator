@@ -2726,10 +2726,6 @@ impl<'a> MaglevCodegen<'a> {
             // ── Unsupported nodes → unconditional deopt ───────────────────────
             #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(unused_variables))]
             _other => {
-                eprintln!(
-                    "MAGLEV_CODEGEN: unhandled node id={:?} → unconditional deopt: {:?}",
-                    id, _other,
-                );
                 self.emit_deopt_unconditional(0);
                 // Satisfy the allocation invariant: write a placeholder.
                 self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
@@ -5038,8 +5034,16 @@ impl<'a> MaglevCodegen<'a> {
         let layout = cached_jsvalue_layout();
         let ic_base = self.array_ic_base;
         let ic_off_handle = ic_base;
-        let ic_off_data = ic_base + 8;
+        // ic_off_data at +8 is still WRITTEN by the IC-fill stub but we
+        // deliberately ignore it on the fast path — see below.
+        let _ic_off_data = ic_base + 8;
         let ic_off_len = ic_base + 16;
+        // The store IC (and the load-IC fill stub) writes the Vec struct
+        // pointer at +24.  Unlike data_ptr, the Vec struct itself never
+        // moves (it lives inside a RefCell), so this pointer is always
+        // valid.  We dereference it at offset 0 to obtain the *current*
+        // buffer pointer, which may have changed after a reallocation.
+        let ic_off_vec_ptr = ic_base + 24;
 
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
@@ -5065,9 +5069,17 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.cmp_rm(Reg64::R10, Reg64::Rbp, ic_off_len);
         self.masm.jcc(CondCode::AboveEq, &mut slow_label);
 
-        // Load cached data pointer.
+        // Re-derive a *fresh* data pointer from the Vec struct pointer
+        // instead of trusting the cached data_ptr (which becomes stale
+        // after Vec reallocation — the root cause of the sieve SIGSEGV).
         self.masm
-            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_data);
+            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_vec_ptr);
+        // vec_ptr == 0 means the IC hasn't been filled by a store yet.
+        self.masm.test_rr(Reg64::R11, Reg64::R11);
+        self.masm.je(&mut slow_label);
+        // Dereference vec_ptr to get the current buffer pointer.
+        // Vec layout: [ptr, len, cap] — data pointer is at offset 0.
+        self.masm.mov_load_base_disp32(Reg64::R11, Reg64::R11, 0);
 
         // Compute element address: R11 + R10 * sizeof(JsValue).
         // jsvalue_size is always 24 = 3 * 8; replace IMUL (3c latency)
@@ -5236,8 +5248,13 @@ impl<'a> MaglevCodegen<'a> {
             layout.jsvalue_size, 24,
             "LEA chain assumes JsValue is 24 bytes"
         );
+        // Re-derive fresh data pointer from Vec struct (same fix as
+        // the load IC — prevents stale-pointer SIGSEGV after realloc).
         self.masm
-            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_data);
+            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_vec_ptr);
+        self.masm.test_rr(Reg64::R11, Reg64::R11);
+        self.masm.je(&mut slow_label);
+        self.masm.mov_load_base_disp32(Reg64::R11, Reg64::R11, 0);
         self.masm.lea_scaled(Reg64::R10, Reg64::R10, Reg64::R10, 2); // R10 = index * 3
         // SHL R10, 3 — REX.WB C1 /4 r/m=R10(enc=2), imm8=3
         self.masm.emit_byte(0x49); // REX.W + REX.B
@@ -5331,8 +5348,10 @@ impl<'a> MaglevCodegen<'a> {
             // Compute element address: data_ptr + key * sizeof(JsValue).
             // Save key in R11 (we need it for len increment).
             self.masm.mov_rr(Reg64::R11, Reg64::R10);
+            // Re-derive fresh data pointer from Vec struct.
             self.masm
-                .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, ic_off_data);
+                .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, ic_off_vec_ptr);
+            self.masm.mov_load_base_disp32(Reg64::R10, Reg64::R10, 0);
             self.masm
                 .imul_rri(Reg64::R11, Reg64::R11, layout.jsvalue_size as i32);
             self.masm.add_rr(Reg64::R10, Reg64::R11);
