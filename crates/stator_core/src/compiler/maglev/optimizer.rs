@@ -467,102 +467,116 @@ fn mark_truncated(
     node_map: &HashMap<NodeId, ValueNode>,
     replacements: &mut HashMap<NodeId, ValueNode>,
 ) {
+    if replacements.contains_key(&id) {
+        return;
+    }
     let uc = use_counts.get(&id);
     if uc != Some(&1) {
         return;
     }
-    if let Some(node) = node_map.get(&id) {
-        let (new_node, inputs) = match node {
-            // CheckedSmi* → Int32*: always safe (inputs already Smi-checked).
-            ValueNode::CheckedSmiAdd { left, right } => (
+    let Some(node) = node_map.get(&id) else {
+        return;
+    };
+
+    // CheckedSmi* → Int32*: always safe (inputs already Smi-checked).
+    // Convert immediately and recurse into inputs.
+    match node {
+        ValueNode::CheckedSmiAdd { left, right } => {
+            replacements.insert(
+                id,
                 ValueNode::Int32Add {
                     left: *left,
                     right: *right,
                 },
-                vec![*left, *right],
-            ),
-            ValueNode::CheckedSmiSubtract { left, right } => (
+            );
+            mark_truncated(*left, use_counts, node_map, replacements);
+            mark_truncated(*right, use_counts, node_map, replacements);
+            return;
+        }
+        ValueNode::CheckedSmiSubtract { left, right } => {
+            replacements.insert(
+                id,
                 ValueNode::Int32Subtract {
                     left: *left,
                     right: *right,
                 },
-                vec![*left, *right],
-            ),
-            ValueNode::CheckedSmiMultiply { left, right } => (
+            );
+            mark_truncated(*left, use_counts, node_map, replacements);
+            mark_truncated(*right, use_counts, node_map, replacements);
+            return;
+        }
+        ValueNode::CheckedSmiMultiply { left, right } => {
+            replacements.insert(
+                id,
                 ValueNode::Int32Multiply {
                     left: *left,
                     right: *right,
                 },
-                vec![*left, *right],
-            ),
-            ValueNode::CheckedSmiIncrement { value } => {
-                (ValueNode::Int32Increment { value: *value }, vec![*value])
-            }
-            ValueNode::CheckedSmiDecrement { value } => {
-                (ValueNode::Int32Decrement { value: *value }, vec![*value])
-            }
-            // Generic* → Int32*: only safe when both inputs are provably i32.
-            ValueNode::GenericAdd { left, right, .. } => {
-                if !is_provably_i32(*left, replacements, node_map)
-                    || !is_provably_i32(*right, replacements, node_map)
-                {
-                    return;
-                }
-                (
-                    ValueNode::Int32Add {
-                        left: *left,
-                        right: *right,
-                    },
-                    vec![*left, *right],
-                )
-            }
-            ValueNode::GenericSubtract { left, right, .. } => {
-                if !is_provably_i32(*left, replacements, node_map)
-                    || !is_provably_i32(*right, replacements, node_map)
-                {
-                    return;
-                }
-                (
-                    ValueNode::Int32Subtract {
-                        left: *left,
-                        right: *right,
-                    },
-                    vec![*left, *right],
-                )
-            }
-            ValueNode::GenericMultiply { left, right, .. } => {
-                if !is_provably_i32(*left, replacements, node_map)
-                    || !is_provably_i32(*right, replacements, node_map)
-                {
-                    return;
-                }
-                (
-                    ValueNode::Int32Multiply {
-                        left: *left,
-                        right: *right,
-                    },
-                    vec![*left, *right],
-                )
-            }
-            ValueNode::GenericIncrement { value, .. } => {
-                if !is_provably_i32(*value, replacements, node_map) {
-                    return;
-                }
-                (ValueNode::Int32Increment { value: *value }, vec![*value])
-            }
-            ValueNode::GenericDecrement { value, .. } => {
-                if !is_provably_i32(*value, replacements, node_map) {
-                    return;
-                }
-                (ValueNode::Int32Decrement { value: *value }, vec![*value])
-            }
-            _ => return,
-        };
-
-        replacements.insert(id, new_node);
-        for input in inputs {
-            mark_truncated(input, use_counts, node_map, replacements);
+            );
+            mark_truncated(*left, use_counts, node_map, replacements);
+            mark_truncated(*right, use_counts, node_map, replacements);
+            return;
         }
+        ValueNode::CheckedSmiIncrement { value } => {
+            replacements.insert(id, ValueNode::Int32Increment { value: *value });
+            mark_truncated(*value, use_counts, node_map, replacements);
+            return;
+        }
+        ValueNode::CheckedSmiDecrement { value } => {
+            replacements.insert(id, ValueNode::Int32Decrement { value: *value });
+            mark_truncated(*value, use_counts, node_map, replacements);
+            return;
+        }
+        _ => {}
+    }
+
+    // Generic* → Int32*: recurse into inputs FIRST so they get converted
+    // before we check is_provably_i32.  This allows chains like
+    //   GenericBitwiseOr → GenericSub → GenericAdd → GenericMul → Phi
+    // to be fully converted in a single backward walk.
+    match node {
+        ValueNode::GenericAdd { left, right, .. }
+        | ValueNode::GenericSubtract { left, right, .. }
+        | ValueNode::GenericMultiply { left, right, .. } => {
+            mark_truncated(*left, use_counts, node_map, replacements);
+            mark_truncated(*right, use_counts, node_map, replacements);
+            if !is_provably_i32(*left, replacements, node_map)
+                || !is_provably_i32(*right, replacements, node_map)
+            {
+                return;
+            }
+            let new_node = match node {
+                ValueNode::GenericAdd { left, right, .. } => ValueNode::Int32Add {
+                    left: *left,
+                    right: *right,
+                },
+                ValueNode::GenericSubtract { left, right, .. } => ValueNode::Int32Subtract {
+                    left: *left,
+                    right: *right,
+                },
+                ValueNode::GenericMultiply { left, right, .. } => ValueNode::Int32Multiply {
+                    left: *left,
+                    right: *right,
+                },
+                _ => unreachable!(),
+            };
+            replacements.insert(id, new_node);
+        }
+        ValueNode::GenericIncrement { value, .. } => {
+            mark_truncated(*value, use_counts, node_map, replacements);
+            if !is_provably_i32(*value, replacements, node_map) {
+                return;
+            }
+            replacements.insert(id, ValueNode::Int32Increment { value: *value });
+        }
+        ValueNode::GenericDecrement { value, .. } => {
+            mark_truncated(*value, use_counts, node_map, replacements);
+            if !is_provably_i32(*value, replacements, node_map) {
+                return;
+            }
+            replacements.insert(id, ValueNode::Int32Decrement { value: *value });
+        }
+        _ => {}
     }
 }
 
