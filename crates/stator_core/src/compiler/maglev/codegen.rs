@@ -5214,7 +5214,7 @@ impl<'a> MaglevCodegen<'a> {
         let vec_layout = cached_vec_jsvalue_layout();
         let ic_base = self.array_ic_base;
         let ic_off_handle = ic_base;
-        let ic_off_data = ic_base + 8;
+        let _ic_off_data = ic_base + 8;
         let ic_off_len = ic_base + 16;
         let ic_off_vec_ptr = ic_base + 24;
 
