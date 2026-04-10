@@ -1752,7 +1752,10 @@ impl BytecodeArray {
     /// Kept low: the warmup phase runs 200 iterations with Maglev to warm
     /// JIT inline caches, so any function that *still* deopts after warmup
     /// has a persistent issue and retrying further just wastes time.
-    const MAX_MAGLEV_DEOPT_RETRIES: u32 = 3;
+    /// With exponential backoff (2^count), 10 retries means ~1024
+    /// invocations before permanent block — enough for transient IC
+    /// cold-start deopts to resolve.
+    const MAX_MAGLEV_DEOPT_RETRIES: u32 = 10;
 
     /// Returns `true` if Maglev JIT code should NOT be attempted right now.
     ///
