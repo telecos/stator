@@ -4942,8 +4942,18 @@ impl<'a> MaglevCodegen<'a> {
             .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_data);
 
         // Compute element address: R11 + R10 * sizeof(JsValue).
-        self.masm
-            .imul_rri(Reg64::R10, Reg64::R10, layout.jsvalue_size as i32);
+        // jsvalue_size is always 24 = 3 * 8; replace IMUL (3c latency)
+        // with LEA+SHL (1c + 1c).
+        debug_assert_eq!(
+            layout.jsvalue_size, 24,
+            "LEA chain assumes JsValue is 24 bytes"
+        );
+        self.masm.lea_scaled(Reg64::R10, Reg64::R10, Reg64::R10, 2); // R10 = index * 3
+        // SHL R10, 3 — REX.WB C1 /4 r/m=R10(enc=2), imm8=3
+        self.masm.emit_byte(0x49); // REX.W + REX.B
+        self.masm.emit_byte(0xC1); // SHL r/m64, imm8
+        self.masm.emit_byte(0xE2); // ModRM: mod=11, /4, r/m=2
+        self.masm.emit_byte(0x03); // shift count = 3
         self.masm.add_rr(Reg64::R11, Reg64::R10);
 
         // Load discriminant byte.
@@ -5092,10 +5102,20 @@ impl<'a> MaglevCodegen<'a> {
         // Hoist element address computation: R10 = data_ptr + key * 24.
         // After this, R10 holds the element address (raw key is no
         // longer needed — bounds check already passed).
+        // jsvalue_size is always 24 = 3 * 8; replace IMUL (3c latency)
+        // with LEA+SHL (1c + 1c).
+        debug_assert_eq!(
+            layout.jsvalue_size, 24,
+            "LEA chain assumes JsValue is 24 bytes"
+        );
         self.masm
             .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_data);
-        self.masm
-            .imul_rri(Reg64::R10, Reg64::R10, layout.jsvalue_size as i32);
+        self.masm.lea_scaled(Reg64::R10, Reg64::R10, Reg64::R10, 2); // R10 = index * 3
+        // SHL R10, 3 — REX.WB C1 /4 r/m=R10(enc=2), imm8=3
+        self.masm.emit_byte(0x49); // REX.W + REX.B
+        self.masm.emit_byte(0xC1); // SHL r/m64, imm8
+        self.masm.emit_byte(0xE2); // ModRM: mod=11, /4, r/m=2
+        self.masm.emit_byte(0x03); // shift count = 3
         self.masm.add_rr(Reg64::R10, Reg64::R11);
 
         // Decode the JIT value encoding → determine what to store.
