@@ -4919,23 +4919,33 @@ impl Interpreter {
                                     // RefCell overhead on the hot path.
                                     let data = unsafe { &*items.as_ptr() };
                                     let i = sa as usize;
-                                    let result = if i < data.len() {
-                                        unsafe { data.get_unchecked(i) }.cheap_clone()
+                                    if i < data.len() {
+                                        // Match on reference to avoid cloning
+                                        // Smi/Boolean (Copy types).
+                                        match unsafe { data.get_unchecked(i) } {
+                                            JsValue::Smi(v) => {
+                                                sa = *v;
+                                                smi_acc_bool = false;
+                                                smi_acc_spilled = false;
+                                                hot_acc = Some(NanBoxedValue::from_smi(*v));
+                                            }
+                                            JsValue::Boolean(b) => {
+                                                sa = *b as i32;
+                                                smi_acc_bool = true;
+                                                smi_acc_spilled = false;
+                                                hot_acc = Some(NanBoxedValue::from_boolean(*b));
+                                            }
+                                            JsValue::TheHole | JsValue::Undefined => {
+                                                acc = JsValue::Undefined;
+                                                smi_acc_spilled = true;
+                                            }
+                                            other => {
+                                                acc = other.cheap_clone();
+                                                smi_acc_spilled = true;
+                                            }
+                                        }
                                     } else {
-                                        JsValue::Undefined
-                                    };
-                                    if let JsValue::Smi(v) = result {
-                                        sa = v;
-                                        smi_acc_bool = false;
-                                        smi_acc_spilled = false;
-                                        hot_acc = Some(NanBoxedValue::from_smi(v));
-                                    } else if let JsValue::Boolean(b) = result {
-                                        sa = b as i32;
-                                        smi_acc_bool = true;
-                                        smi_acc_spilled = false;
-                                        hot_acc = Some(NanBoxedValue::from_boolean(b));
-                                    } else {
-                                        acc = result;
+                                        acc = JsValue::Undefined;
                                         smi_acc_spilled = true;
                                     }
                                     continue 'smi;
@@ -4962,13 +4972,23 @@ impl Interpreter {
                                         // SAFETY: single-threaded interpreter; no
                                         // concurrent borrows possible.
                                         let v = unsafe { &mut *items.as_ptr() };
+                                        // Fast inline materialization: for bool/smi
+                                        // accumulators, build the JsValue directly
+                                        // without the materialize_acc branch chain.
+                                        let val = if smi_acc_spilled {
+                                            acc.cheap_clone()
+                                        } else if smi_acc_bool {
+                                            JsValue::Boolean(sa != 0)
+                                        } else {
+                                            JsValue::Smi(sa)
+                                        };
                                         if i < v.len() {
-                                            unsafe { *v.get_unchecked_mut(i) = materialize_acc!() };
+                                            unsafe { *v.get_unchecked_mut(i) = val };
                                         } else if i == v.len() {
-                                            v.push(materialize_acc!());
+                                            v.push(val);
                                         } else {
                                             v.resize(i, JsValue::TheHole);
-                                            v.push(materialize_acc!());
+                                            v.push(val);
                                         }
                                         continue 'smi;
                                     }
