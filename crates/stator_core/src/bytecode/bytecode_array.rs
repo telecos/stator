@@ -1697,7 +1697,7 @@ impl BytecodeArray {
     /// back to the interpreter.  Set high so that loops with i32 overflow
     /// (e.g. large accumulators) still benefit from Maglev on the
     /// non-overflowing prefix of every execution.
-    const MAX_MAGLEV_DEOPT_RETRIES: u32 = 1_000_000;
+    const MAX_MAGLEV_DEOPT_RETRIES: u32 = 100;
 
     /// Returns `true` if Maglev JIT code has deopted too many times and
     /// should no longer be attempted.

@@ -10,6 +10,10 @@ crate-type = ["rlib"]
 name = "engine_benchmarks"
 harness = false
 
+[[bench]]
+name = "precompiled_benchmarks"
+harness = false
+
 [lints]
 workspace = true
 
