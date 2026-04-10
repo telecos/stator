@@ -2307,7 +2307,21 @@ pub(crate) mod jit_runtime {
                     let prop_name = get_rt_string_constant_ref_with_ptrs(name_idx, &ptrs)?;
                     let val = crate::interpreter::fn_props_get(ba, prop_name);
                     if matches!(val, JsValue::Undefined) {
-                        None // IC miss → Phase 2 for lazy prototype creation
+                        if prop_name == "prototype" && !ba.is_arrow() && !ba.is_generator() {
+                            // Lazy prototype creation (ES §10.2.5).
+                            let func_val = JsValue::Function(Rc::clone(ba));
+                            let mut proto_map = PropertyMap::new();
+                            proto_map.insert("constructor".to_string(), func_val);
+                            let proto_obj = JsValue::PlainObject(Rc::new(RefCell::new(proto_map)));
+                            crate::interpreter::fn_props_set(
+                                ba,
+                                "prototype".to_string(),
+                                proto_obj.clone(),
+                            );
+                            Some(Err(proto_obj))
+                        } else {
+                            Some(Ok(JIT_UNDEFINED))
+                        }
                     } else {
                         Some(encode_or_clone_ref(&val).map_err(|_| val))
                     }
@@ -2418,7 +2432,22 @@ pub(crate) mod jit_runtime {
                         let prop_name = get_rt_string_constant_ref(name_idx)?;
                         let val = crate::interpreter::fn_props_get(ba, prop_name);
                         if matches!(val, JsValue::Undefined) {
-                            None // IC miss → Phase 2
+                            if prop_name == "prototype" && !ba.is_arrow() && !ba.is_generator() {
+                                // Lazy prototype creation (ES §10.2.5).
+                                let func_val = JsValue::Function(Rc::clone(ba));
+                                let mut proto_map = PropertyMap::new();
+                                proto_map.insert("constructor".to_string(), func_val);
+                                let proto_obj =
+                                    JsValue::PlainObject(Rc::new(RefCell::new(proto_map)));
+                                crate::interpreter::fn_props_set(
+                                    ba,
+                                    "prototype".to_string(),
+                                    proto_obj.clone(),
+                                );
+                                Some(Err(proto_obj))
+                            } else {
+                                Some(Ok(JIT_UNDEFINED))
+                            }
                         } else {
                             Some(encode_or_clone_ref(&val).map_err(|_| val))
                         }
