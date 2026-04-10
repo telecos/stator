@@ -5151,6 +5151,45 @@ pub(crate) mod jit_runtime {
         }
     }
 
+    /// Combined hole-check + encode for array elements.  Returns the JIT
+    /// i64 encoding directly — `TheHole` maps to `JIT_UNDEFINED`, common
+    /// primitives encode inline, and heap types return `None` for
+    /// fallback through `encode_or_clone_ref`.
+    ///
+    /// This merges the separate `!matches!(v, TheHole)` guard and
+    /// `encode_element_fast` call into a single match, eliminating one
+    /// branch per element access on the hot path.
+    #[inline(always)]
+    fn encode_array_element(v: &JsValue) -> Option<i64> {
+        match v {
+            JsValue::Boolean(b) => Some(if *b { JIT_TRUE } else { JIT_FALSE }),
+            JsValue::Smi(n) => Some(i64::from(*n)),
+            JsValue::Undefined | JsValue::TheHole => Some(JIT_UNDEFINED),
+            JsValue::Null => Some(JIT_NULL),
+            _ => None,
+        }
+    }
+
+    /// Decode a non-heap JIT i64 value to `JsValue`.  Checks booleans
+    /// first (hot for sieve-like benchmarks), then Smi range, then
+    /// other constants.  Returns `None` if the encoding is unrecognised.
+    #[inline(always)]
+    fn decode_non_heap_value_fast(value_i64: i64) -> Option<JsValue> {
+        // Boolean constants are the hottest values in sieve-style
+        // benchmarks — check them before the wider Smi range test.
+        if value_i64 == JIT_TRUE {
+            Some(JsValue::Boolean(true))
+        } else if value_i64 == JIT_FALSE {
+            Some(JsValue::Boolean(false))
+        } else if value_i64 >= i32::MIN as i64 && value_i64 <= i32::MAX as i64 {
+            Some(JsValue::Smi(value_i64 as i32))
+        } else if value_i64 == JIT_UNDEFINED {
+            Some(JsValue::Undefined)
+        } else {
+            super::jit_to_jsvalue(value_i64)
+        }
+    }
+
     /// Inner implementation for [`jit_runtime_lda_keyed_property`].
     fn lda_keyed_property_inner(obj_i64: i64, key_i64: i64) -> Option<i64> {
         let ptrs = RT_PTRS.with(|p| p.get());
@@ -5176,19 +5215,20 @@ pub(crate) mod jit_runtime {
                 let heap = unsafe { &*heap_ref.as_ptr() };
                 match heap.get(obj_idx)? {
                     JsValue::Array(arr) => {
-                        let borrow = unsafe { &*arr.as_ptr() };
-                        match borrow.get(smi_key) {
-                            Some(v) if !matches!(v, JsValue::TheHole) => {
-                                // Inline fast encode for booleans/Smis (common
-                                // in sieve-style benchmarks) before falling
-                                // back to the generic encoder.
-                                if let Some(fast_val) = encode_element_fast(v) {
-                                    Some(Ok(fast_val))
-                                } else {
-                                    Some(encode_or_clone_ref(v))
-                                }
+                        // SAFETY: single-threaded JIT; no concurrent borrows.
+                        let data = unsafe { &*arr.as_ptr() };
+                        if smi_key < data.len() {
+                            // SAFETY: bounds verified above.
+                            let v = unsafe { data.get_unchecked(smi_key) };
+                            // Combined hole-check + encode in a single
+                            // match — one fewer branch per element access.
+                            if let Some(fast_val) = encode_array_element(v) {
+                                Some(Ok(fast_val))
+                            } else {
+                                Some(encode_or_clone_ref(v))
                             }
-                            _ => Some(Ok(JIT_UNDEFINED)),
+                        } else {
+                            Some(Ok(JIT_UNDEFINED))
                         }
                     }
                     JsValue::PlainObject(map_rc) => {
@@ -5206,16 +5246,17 @@ pub(crate) mod jit_runtime {
                     let heap = heap.borrow();
                     match heap.get(obj_idx)? {
                         JsValue::Array(arr) => {
-                            let borrow = arr.borrow();
-                            match borrow.get(smi_key) {
-                                Some(v) if !matches!(v, JsValue::TheHole) => {
-                                    if let Some(fast_val) = encode_element_fast(v) {
-                                        Some(Ok(fast_val))
-                                    } else {
-                                        Some(encode_or_clone_ref(v))
-                                    }
+                            let data = arr.borrow();
+                            if smi_key < data.len() {
+                                // SAFETY: bounds verified above.
+                                let v = unsafe { data.get_unchecked(smi_key) };
+                                if let Some(fast_val) = encode_array_element(v) {
+                                    Some(Ok(fast_val))
+                                } else {
+                                    Some(encode_or_clone_ref(v))
                                 }
-                                _ => Some(Ok(JIT_UNDEFINED)),
+                            } else {
+                                Some(Ok(JIT_UNDEFINED))
                             }
                         }
                         JsValue::PlainObject(map_rc) => {
@@ -5335,20 +5376,8 @@ pub(crate) mod jit_runtime {
             && key_i64 <= i32::MAX as i64
             && !is_heap_handle(value_i64)
         {
-            // Decode value inline for common types (avoids jit_to_jsvalue).
-            let value = if value_i64 >= i32::MIN as i64 && value_i64 <= i32::MAX as i64 {
-                JsValue::Smi(value_i64 as i32)
-            } else if value_i64 == JIT_TRUE {
-                JsValue::Boolean(true)
-            } else if value_i64 == JIT_FALSE {
-                JsValue::Boolean(false)
-            } else if value_i64 == JIT_UNDEFINED {
-                JsValue::Undefined
-            } else if let Some(v) = super::jit_to_jsvalue(value_i64) {
-                v
-            } else {
-                return None;
-            };
+            // Decode value: booleans first (hot for sieve-like patterns).
+            let value = decode_non_heap_value_fast(value_i64)?;
             let smi_key = key_i64 as usize;
             let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
             let ptrs = RT_PTRS.with(|p| p.get());
@@ -5364,13 +5393,17 @@ pub(crate) mod jit_runtime {
                         // SAFETY: single-threaded JIT; no concurrent
                         // borrows of this array during keyed store.
                         let v = unsafe { &mut *arr.as_ptr() };
-                        if smi_key >= v.len() {
+                        if smi_key < v.len() {
+                            // SAFETY: bounds verified above.
+                            unsafe { *v.get_unchecked_mut(smi_key) = value };
+                        } else {
                             let cur_len = v.len();
                             let new_cap = (smi_key + 1).next_power_of_two();
                             v.reserve(new_cap - cur_len);
                             v.resize(smi_key + 1, JsValue::TheHole);
+                            // SAFETY: resize just made smi_key valid.
+                            unsafe { *v.get_unchecked_mut(smi_key) = value };
                         }
-                        v[smi_key] = value;
                         Some(())
                     }
                     JsValue::PlainObject(map_rc) => {
@@ -5387,13 +5420,17 @@ pub(crate) mod jit_runtime {
                     match heap.get(obj_idx)? {
                         JsValue::Array(arr) => {
                             let mut v = arr.borrow_mut();
-                            if smi_key >= v.len() {
+                            if smi_key < v.len() {
+                                // SAFETY: bounds verified above.
+                                unsafe { *v.get_unchecked_mut(smi_key) = value };
+                            } else {
                                 let cur_len = v.len();
                                 let new_cap = (smi_key + 1).next_power_of_two();
                                 v.reserve(new_cap - cur_len);
                                 v.resize(smi_key + 1, JsValue::TheHole);
+                                // SAFETY: resize just made smi_key valid.
+                                unsafe { *v.get_unchecked_mut(smi_key) = value };
                             }
-                            v[smi_key] = value;
                             Some(())
                         }
                         JsValue::PlainObject(map_rc) => {
@@ -5452,19 +5489,8 @@ pub(crate) mod jit_runtime {
             && key_i64 <= i32::MAX as i64
             && !is_heap_handle(value_i64)
         {
-            let value = if value_i64 >= i32::MIN as i64 && value_i64 <= i32::MAX as i64 {
-                JsValue::Smi(value_i64 as i32)
-            } else if value_i64 == JIT_TRUE {
-                JsValue::Boolean(true)
-            } else if value_i64 == JIT_FALSE {
-                JsValue::Boolean(false)
-            } else if value_i64 == JIT_UNDEFINED {
-                JsValue::Undefined
-            } else if let Some(v) = super::jit_to_jsvalue(value_i64) {
-                v
-            } else {
-                return None;
-            };
+            // Decode value: booleans first (hot for sieve-like patterns).
+            let value = decode_non_heap_value_fast(value_i64)?;
             let smi_key = key_i64 as usize;
             let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
             let fast = if ptrs.is_cached() {
@@ -5479,13 +5505,17 @@ pub(crate) mod jit_runtime {
                         // SAFETY: single-threaded JIT; no concurrent
                         // borrows of this array during keyed store.
                         let v = unsafe { &mut *arr.as_ptr() };
-                        if smi_key >= v.len() {
+                        if smi_key < v.len() {
+                            // SAFETY: bounds verified above.
+                            unsafe { *v.get_unchecked_mut(smi_key) = value };
+                        } else {
                             let cur_len = v.len();
                             let new_cap = (smi_key + 1).next_power_of_two();
                             v.reserve(new_cap - cur_len);
                             v.resize(smi_key + 1, JsValue::TheHole);
+                            // SAFETY: resize just made smi_key valid.
+                            unsafe { *v.get_unchecked_mut(smi_key) = value };
                         }
-                        v[smi_key] = value;
                         Some(())
                     }
                     JsValue::PlainObject(map_rc) => {
@@ -5502,13 +5532,17 @@ pub(crate) mod jit_runtime {
                     match heap.get(obj_idx)? {
                         JsValue::Array(arr) => {
                             let mut v = arr.borrow_mut();
-                            if smi_key >= v.len() {
+                            if smi_key < v.len() {
+                                // SAFETY: bounds verified above.
+                                unsafe { *v.get_unchecked_mut(smi_key) = value };
+                            } else {
                                 let cur_len = v.len();
                                 let new_cap = (smi_key + 1).next_power_of_two();
                                 v.reserve(new_cap - cur_len);
                                 v.resize(smi_key + 1, JsValue::TheHole);
+                                // SAFETY: resize just made smi_key valid.
+                                unsafe { *v.get_unchecked_mut(smi_key) = value };
                             }
-                            v[smi_key] = value;
                             Some(())
                         }
                         JsValue::PlainObject(map_rc) => {
@@ -5695,19 +5729,20 @@ pub(crate) mod jit_runtime {
             match heap.get(obj_idx)? {
                 JsValue::Array(arr) => {
                     // SAFETY: single-threaded JIT; no concurrent borrows.
-                    let borrow = unsafe { &*arr.as_ptr() };
-                    match borrow.get(idx) {
-                        Some(v) if !matches!(v, JsValue::TheHole) => {
-                            if let Some(fast_val) = encode_element_fast(v) {
-                                Some(fast_val)
-                            } else {
-                                Some(match encode_or_clone_ref(v) {
-                                    Ok(val) => val,
-                                    Err(obj_val) => alloc_heap_handle(obj_val),
-                                })
-                            }
+                    let data = unsafe { &*arr.as_ptr() };
+                    if idx < data.len() {
+                        // SAFETY: bounds verified above.
+                        let v = unsafe { data.get_unchecked(idx) };
+                        if let Some(fast_val) = encode_array_element(v) {
+                            Some(fast_val)
+                        } else {
+                            Some(match encode_or_clone_ref(v) {
+                                Ok(val) => val,
+                                Err(obj_val) => alloc_heap_handle(obj_val),
+                            })
                         }
-                        _ => Some(JIT_UNDEFINED),
+                    } else {
+                        Some(JIT_UNDEFINED)
                     }
                 }
                 _ => None,
@@ -5717,19 +5752,20 @@ pub(crate) mod jit_runtime {
                 let heap = heap.borrow();
                 match heap.get(obj_idx)? {
                     JsValue::Array(arr) => {
-                        let borrow = arr.borrow();
-                        match borrow.get(idx) {
-                            Some(v) if !matches!(v, JsValue::TheHole) => {
-                                if let Some(fast_val) = encode_element_fast(v) {
-                                    Some(fast_val)
-                                } else {
-                                    Some(match encode_or_clone_ref(v) {
-                                        Ok(val) => val,
-                                        Err(obj_val) => alloc_heap_handle(obj_val),
-                                    })
-                                }
+                        let data = arr.borrow();
+                        if idx < data.len() {
+                            // SAFETY: bounds verified above.
+                            let v = unsafe { data.get_unchecked(idx) };
+                            if let Some(fast_val) = encode_array_element(v) {
+                                Some(fast_val)
+                            } else {
+                                Some(match encode_or_clone_ref(v) {
+                                    Ok(val) => val,
+                                    Err(obj_val) => alloc_heap_handle(obj_val),
+                                })
                             }
-                            _ => Some(JIT_UNDEFINED),
+                        } else {
+                            Some(JIT_UNDEFINED)
                         }
                     }
                     _ => None,

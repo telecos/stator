@@ -1138,6 +1138,54 @@ impl BytecodeArray {
         }
     }
 
+    /// Returns a reference to the cached [`ObjectLiteralTemplate`] for
+    /// `slot`, bypassing the `RefCell` borrow check.
+    ///
+    /// Returns `None` if no cached template exists for the slot (i.e. the
+    /// entry is `Pending` or absent).
+    ///
+    /// This enables the caller to first attempt in-place reuse of an
+    /// existing object before falling back to pool-based allocation.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure no mutable borrow of the
+    /// `object_literal_templates` `RefCell` is active, and the returned
+    /// reference must not be held across any mutation of the cache.
+    pub(crate) unsafe fn get_cached_template_unchecked(
+        &self,
+        slot: u32,
+    ) -> Option<&ObjectLiteralTemplate> {
+        // SAFETY: single-threaded interpreter — no concurrent borrows.
+        let map = unsafe { &*self.object_literal_templates.as_ptr() };
+        match map.get(&slot) {
+            Some(ObjectLiteralCacheEntry::Cached(template)) => Some(template),
+            _ => None,
+        }
+    }
+
+    /// Like [`clone_object_literal_template_with_values_pooled`] but
+    /// bypasses the `RefCell` runtime borrow check on the template cache.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure no mutable borrow of the
+    /// `object_literal_templates` `RefCell` is active.
+    pub unsafe fn clone_object_literal_template_with_values_pooled_unchecked(
+        &self,
+        slot: u32,
+        values: &[JsValue],
+    ) -> Option<Rc<RefCell<PropertyMap>>> {
+        // SAFETY: single-threaded interpreter — no concurrent borrows.
+        let map = unsafe { &*self.object_literal_templates.as_ptr() };
+        match map.get(&slot) {
+            Some(ObjectLiteralCacheEntry::Cached(template)) => Some(
+                acquire_object_rc_from_template_with_values(template, values),
+            ),
+            _ => None,
+        }
+    }
+
     /// Like [`set_object_literal_pending`] but bypasses the `RefCell`
     /// runtime borrow check.
     ///

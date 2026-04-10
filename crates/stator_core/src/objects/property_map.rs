@@ -903,6 +903,31 @@ impl PropertyMap {
         self.capacity_hint = capacity_hint;
     }
 
+    /// Try to reinitialize this map in-place with new values from the
+    /// same template, avoiding all pool operations.
+    ///
+    /// Returns `true` if the map was successfully reused (same template
+    /// hit); `false` if the caller should fall back to the pool-based
+    /// path.
+    ///
+    /// This is the ultimate fast path for tight object-creation loops:
+    /// when the target register already holds a `PlainObject` with
+    /// `strong_count == 1` from the same template, the caller can
+    /// reinitialize it in-place — skipping both pool pop and pool push.
+    #[inline(always)]
+    pub(crate) fn try_reuse_with_values(
+        &mut self,
+        template: &ObjectLiteralTemplate,
+        values: &[JsValue],
+    ) -> bool {
+        if Rc::ptr_eq(&self.keys, &template.keys) && self.values.len() == values.len() {
+            self.reinitialize_values_inplace(values);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Ultra-fast reinitialize for recycled objects from the **same**
     /// template.
     ///

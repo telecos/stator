@@ -5428,13 +5428,52 @@ impl Interpreter {
 
                                     // All properties collected — create fused
                                     // object via template+values fast path.
-                                    if let Some(rc) = frame
-                                        .bytecode_array
-                                        .clone_object_literal_template_with_values_pooled(
-                                            slot,
-                                            &fuse_vals[..prop_count],
-                                        )
-                                    {
+
+                                    // Ultra-fast path: reinitialize existing
+                                    // object in-place when the target register
+                                    // already holds a sole-owner PlainObject
+                                    // from the same template.  This eliminates
+                                    // both the pool pop and pool push — the
+                                    // hottest object-creation path.
+                                    // SAFETY: single-threaded; no concurrent
+                                    // borrows of the template cache or the Rc.
+                                    if let Some(template) = unsafe {
+                                        frame.bytecode_array.get_cached_template_unchecked(slot)
+                                    } {
+                                        let old_ref = unsafe { frame.read_reg_unchecked(star_reg) };
+                                        if let JsValue::PlainObject(old_rc) = old_ref {
+                                            if Rc::strong_count(old_rc) == 1 {
+                                                // SAFETY: Rc exclusively owned
+                                                // (strong_count == 1); no
+                                                // outstanding borrows.
+                                                let map = unsafe { &mut *old_rc.as_ptr() };
+                                                if map.try_reuse_with_values(
+                                                    template,
+                                                    &fuse_vals[..prop_count],
+                                                ) {
+                                                    sa = mini_sa;
+                                                    smi_acc_bool = false;
+                                                    smi_acc_spilled = false;
+                                                    hot_acc = Some(NanBoxedValue::from_smi(sa));
+                                                    pc = scan_pc;
+                                                    continue 'smi;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Pool-based path: create new object from
+                                    // template and recycle the old one.
+                                    // SAFETY: single-threaded; no concurrent
+                                    // borrows of the template cache.
+                                    if let Some(rc) = unsafe {
+                                        frame
+                                            .bytecode_array
+                                            .clone_object_literal_template_with_values_pooled_unchecked(
+                                                slot,
+                                                &fuse_vals[..prop_count],
+                                            )
+                                    } {
                                         let obj = JsValue::PlainObject(rc);
                                         // Store in target register, recycling
                                         // any previous PlainObject.
@@ -5743,15 +5782,52 @@ impl Interpreter {
 
                                 // All values collected — try fused template
                                 // instantiation.
-                                if let Some(rc) = frame
-                                    .bytecode_array
-                                    .clone_object_literal_template_with_values_pooled(
-                                        s,
-                                        &fuse_vals[..prop_count],
-                                    )
+
+                                // Ultra-fast path: reinitialize existing
+                                // object in-place when the target register
+                                // already holds a sole-owner PlainObject
+                                // from the same template.
+                                // SAFETY: single-threaded; no concurrent
+                                // borrows of the template cache or the Rc.
+                                if let Some(template) =
+                                    unsafe { frame.bytecode_array.get_cached_template_unchecked(s) }
                                 {
+                                    let old_ref = unsafe { frame.read_reg_unchecked(star_reg) };
+                                    if let JsValue::PlainObject(old_rc) = old_ref {
+                                        if Rc::strong_count(old_rc) == 1 {
+                                            // SAFETY: Rc exclusively owned
+                                            // (strong_count == 1); no
+                                            // outstanding borrows.
+                                            let map = unsafe { &mut *old_rc.as_ptr() };
+                                            if map.try_reuse_with_values(
+                                                template,
+                                                &fuse_vals[..prop_count],
+                                            ) {
+                                                acc = mini_acc;
+                                                pc = scan_pc;
+                                                continue 'dispatch;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Pool-based path: create new object from
+                                // template and recycle the old one.
+                                // SAFETY: single-threaded; no concurrent
+                                // borrows of the template cache.
+                                if let Some(rc) = unsafe {
+                                    frame
+                                        .bytecode_array
+                                        .clone_object_literal_template_with_values_pooled_unchecked(
+                                            s,
+                                            &fuse_vals[..prop_count],
+                                        )
+                                } {
                                     let obj = JsValue::PlainObject(rc);
-                                    unsafe { frame.write_reg_unchecked(star_reg, obj) };
+                                    let old = unsafe { frame.swap_reg_unchecked(star_reg, obj) };
+                                    if let JsValue::PlainObject(rc) = old {
+                                        recycle_object_rc(rc);
+                                    }
                                     acc = mini_acc;
                                     pc = scan_pc;
                                     continue 'dispatch;
