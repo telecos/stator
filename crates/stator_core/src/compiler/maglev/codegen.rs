@@ -4025,6 +4025,80 @@ impl<'a> MaglevCodegen<'a> {
 
         if self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right) {
             let narrow = self.narrow_int32.contains(&id);
+
+            // Strength-reduce constant multiplies: multiply is commutative,
+            // so check both operands for a known i32 constant.
+            let const_pair = self
+                .try_get_i32_constant(right)
+                .map(|imm| (left, imm))
+                .or_else(|| self.try_get_i32_constant(left).map(|imm| (right, imm)));
+
+            if let Some((var, imm)) = const_pair {
+                let lea_scale: Option<u8> = match imm {
+                    3 => Some(2),
+                    5 => Some(4),
+                    9 => Some(8),
+                    _ => None,
+                };
+
+                match self.alloc.location(id) {
+                    Some(Location::Register(n)) => {
+                        let dst = phys_reg(n);
+                        let src_reg = match self.alloc.location(var) {
+                            Some(Location::Register(sn)) => phys_reg(sn),
+                            _ => {
+                                self.emit_load(var, Reg64::R10);
+                                Reg64::R10
+                            }
+                        };
+                        if narrow {
+                            // Narrow: LEA for {3,5,9} (1c vs IMUL's 3c).
+                            // No overflow check/MOVSXD — downstream only
+                            // reads lower 32 bits.
+                            if let Some(scale) = lea_scale {
+                                if src_reg != Reg64::Rbp && src_reg != Reg64::R13 {
+                                    self.masm.lea_scaled(dst, src_reg, src_reg, scale);
+                                } else {
+                                    self.masm.imul32_rri(dst, src_reg, imm);
+                                }
+                            } else {
+                                self.masm.imul32_rri(dst, src_reg, imm);
+                            }
+                        } else {
+                            // Not narrow: IMUL-immediate sets OF for the
+                            // overflow deopt; LEA does not, so always use
+                            // IMUL-immediate here.
+                            self.masm.imul32_rri(dst, src_reg, imm);
+                            self.masm
+                                .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
+                            self.masm.movsxd_sign_extend(dst, dst);
+                        }
+                        if dst == Reg64::Rax {
+                            self.rax_holds = Some(id);
+                        }
+                    }
+                    _ => {
+                        self.emit_load(var, Reg64::R11);
+                        if narrow {
+                            if let Some(scale) = lea_scale {
+                                self.masm
+                                    .lea_scaled(Reg64::R11, Reg64::R11, Reg64::R11, scale);
+                            } else {
+                                self.masm.imul32_rri(Reg64::R11, Reg64::R11, imm);
+                            }
+                        } else {
+                            self.masm.imul32_rri(Reg64::R11, Reg64::R11, imm);
+                            self.masm
+                                .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
+                            self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
+                        }
+                        self.emit_store(id, Reg64::R11);
+                    }
+                }
+                return;
+            }
+
+            // Non-constant operands — use register×register IMUL.
             match self.alloc.location(id) {
                 Some(Location::Register(n)) => {
                     let dst = phys_reg(n);
@@ -5605,6 +5679,7 @@ impl<'a> MaglevCodegen<'a> {
         // ── Monomorphic cache check ─────────────────────────────────
         let mut cache_miss = Label::new();
         let mut done_label = Label::new();
+        let mut closure_fast_path = Label::new();
 
         self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, off_callee);
         self.masm.jne(&mut cache_miss);
@@ -5612,12 +5687,13 @@ impl<'a> MaglevCodegen<'a> {
         // Guard: if the cached ctx_ptr is non-zero this is a closure
         // call.  The raw context pointer may be dangling (the backing
         // Rc can be dropped/replaced between calls), so we must NOT
-        // reuse it.  Fall through to cache_miss which calls
-        // jit_runtime_get_jit_entry for a fresh, live ctx_ptr.
+        // reuse it.  Jump to the dedicated closure fast path which
+        // calls jit_runtime_get_jit_entry for a fresh, live ctx_ptr
+        // and dispatches without touching the mono cache.
         self.masm
             .mov_load_base_disp32(Reg64::Rax, Reg64::Rbp, off_ctx);
         self.masm.test_rr(Reg64::Rax, Reg64::Rax);
-        self.masm.jne(&mut cache_miss);
+        self.masm.jne(&mut closure_fast_path);
 
         // ── Mono HIT: inline JIT-to-JIT dispatch ─────────────────
         //
@@ -5709,6 +5785,94 @@ impl<'a> MaglevCodegen<'a> {
         let mono_retry_addr =
             jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
         self.masm.mov_ri(Reg64::R11, mono_retry_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.masm.jmp(&mut done_label);
+
+        // ── Closure fast path: fresh get_jit_entry + direct call ────
+        //
+        // Closures always take this path (ctx_ptr != 0 detected by the
+        // guard above).  We call jit_runtime_get_jit_entry for a fresh,
+        // live ctx_ptr and dispatch immediately — no mono-cache reads,
+        // no extra BA/reg-slot FFI calls between get_jit_entry and the
+        // callee.  This mirrors the proven emit_direct_call_1 flow and
+        // avoids the SIGSEGV caused by the cache-miss path's extra FFI
+        // calls potentially invalidating the context pointer.
+        self.masm.bind_label(&mut closure_fast_path);
+
+        self.masm.mov_rr(Reg64::Rdi, Reg64::R11); // callee
+        // Push callee + padding (2 pushes → RSP ≡ 0 mod 16).
+        self.masm.push(Reg64::Rdi);
+        self.masm.push(Reg64::Rdi);
+
+        let closure_get_entry_addr = jit_runtime::jit_runtime_get_jit_entry as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, closure_get_entry_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        // Check entry_point == 0 → stub fallback.
+        let mut closure_stub_fallback = Label::new();
+        self.masm.test_rr(Reg64::Rax, Reg64::Rax);
+        self.masm.je(&mut closure_stub_fallback);
+
+        // RAX = entry_point, RDX = ctx_ptr (fresh from get_jit_entry).
+        self.masm.mov_rr(Reg64::R11, Reg64::Rax); // entry
+        self.masm.mov_rr(Reg64::R10, Reg64::Rdx); // ctx
+
+        // Allocate 128-byte register file.
+        self.masm.sub_ri(Reg64::Rsp, 128);
+
+        // Zero the full register file (16 qwords).
+        self.masm.push(Reg64::R10);
+        self.masm.push(Reg64::R11);
+        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+        self.masm.mov_ri(Reg64::Rcx, 16);
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
+        self.masm.add_ri(Reg64::Rdi, 16);
+        self.masm.rep_stosq();
+        self.masm.pop(Reg64::R11);
+        self.masm.pop(Reg64::R10);
+
+        // Call entry point: RDI = register file, RSI = fresh ctx_ptr.
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+        self.masm.call_reg(Reg64::R11);
+
+        // Deallocate register file.
+        self.masm.add_ri(Reg64::Rsp, 128);
+
+        // Finish direct call (restores BA, context, truncates heap).
+        // Pass R15 (RT_PTRS cell addr) as RSI to skip TLS lookup.
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R15);
+        let closure_finish_addr =
+            jit_runtime::jit_runtime_finish_direct_call_r15 as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, closure_finish_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        // Deopt check: if callee deopted, fall back to runtime stub.
+        self.masm.cmp_ri(Reg64::Rax, i32::MIN);
+        let mut closure_ok = Label::new();
+        self.masm.jcc(CondCode::GreaterEq, &mut closure_ok);
+        // Callee deopt: callee_i64 is still on the stack.
+        self.masm.pop(Reg64::Rdi); // callee
+        self.masm.add_ri(Reg64::Rsp, 8); // discard padding
+        let closure_retry_addr =
+            jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, closure_retry_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.masm.jmp(&mut done_label);
+
+        self.masm.bind_label(&mut closure_ok);
+        // Pop saved callee + padding.
+        self.masm.add_ri(Reg64::Rsp, 16);
+        self.masm.jmp(&mut done_label);
+
+        // Closure stub fallback (get_jit_entry returned 0).
+        self.masm.bind_label(&mut closure_stub_fallback);
+        self.masm.pop(Reg64::R11); // discard padding
+        self.masm.pop(Reg64::Rdi); // callee
+        let closure_stub_addr =
+            jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, closure_stub_addr as i64);
         self.masm.call_reg(Reg64::R11);
         self.masm.jmp(&mut done_label);
 
@@ -7180,33 +7344,23 @@ impl<'a> MaglevCodegen<'a> {
 
         // Step 3: determine narrow-transparent Phis.
         //
-        // Start optimistic: Phis not consumed by control flow are initially
-        // narrow-transparent.  Phis consumed by Return are also narrow if ALL
-        // their inputs are i32-valued (candidates or i32_range) — this lets us
-        // emit a single MOVSXD at the Return site instead of per-iteration
-        // inside the loop.  Phis consumed by Return with non-i32 inputs (e.g.
-        // UndefinedConstant, heap handles) must NOT be marked narrow because
-        // MOVSXD would corrupt the sentinel/pointer value.
+        // Start optimistic: ALL Phis are initially narrow-transparent.
+        // The convergence loop (below) prunes Phis whose consumers are
+        // non-narrow or whose inputs are non-i32 when consumed by
+        // Return/Branch.  This handles transitive Phi chains: Phi_A
+        // feeding Phi_B (both Return-consumed) is correctly narrowed
+        // because the convergence sees Phi_A in narrow_phi when
+        // validating Phi_B's inputs, and vice-versa.
+        //
+        // Phis consumed by Return with non-i32 inputs (e.g.
+        // UndefinedConstant, heap handles) must NOT be marked narrow
+        // because MOVSXD would corrupt the sentinel/pointer value —
+        // the convergence loop removes those.
         let mut narrow_phi: HashSet<NodeId> = HashSet::new();
         for block in graph.blocks() {
             for (id, node) in &block.nodes {
-                if let ValueNode::Phi { inputs } = node {
-                    if ctrl_consumed.contains(id) {
-                        // Return-consumed Phi: only narrow if ALL inputs are
-                        // known i32-valued (wrapping int32 producers, i32
-                        // constants, or other narrow Phis that we will verify
-                        // in the iterative step).
-                        let all_i32 = inputs.iter().all(|inp| {
-                            candidates.contains(inp)
-                                || i32_range.contains(inp)
-                                || smi_guarded.contains(inp)
-                        });
-                        if all_i32 {
-                            narrow_phi.insert(*id);
-                        }
-                    } else {
-                        narrow_phi.insert(*id);
-                    }
+                if matches!(node, ValueNode::Phi { .. }) {
+                    narrow_phi.insert(*id);
                 }
             }
         }
@@ -7214,7 +7368,8 @@ impl<'a> MaglevCodegen<'a> {
         loop {
             let mut changed = false;
             for phi_id in narrow_phi.clone() {
-                let ok = consumers_of.get(&phi_id).is_none_or(|cs| {
+                // Check 1: all value-consumers must be narrow-compatible.
+                let consumers_ok = consumers_of.get(&phi_id).is_none_or(|cs| {
                     cs.iter().all(|c| {
                         node_lookup
                             .get(c)
@@ -7233,7 +7388,33 @@ impl<'a> MaglevCodegen<'a> {
                                 .is_some_and(|n| matches!(n, ValueNode::StoreGlobal { .. }))
                     })
                 });
-                if !ok {
+
+                // Check 2: ctrl-consumed Phis (Return/Branch) need all
+                // inputs to be provably i32-valued so that MOVSXD at the
+                // use site produces the correct value.
+                let inputs_ok = if ctrl_consumed.contains(&phi_id) {
+                    node_lookup
+                        .get(&phi_id)
+                        .and_then(|n| {
+                            if let ValueNode::Phi { inputs } = n {
+                                Some(inputs)
+                            } else {
+                                None
+                            }
+                        })
+                        .is_some_and(|inputs| {
+                            inputs.iter().all(|inp| {
+                                candidates.contains(inp)
+                                    || i32_range.contains(inp)
+                                    || smi_guarded.contains(inp)
+                                    || narrow_phi.contains(inp)
+                            })
+                        })
+                } else {
+                    true
+                };
+
+                if !consumers_ok || !inputs_ok {
                     narrow_phi.remove(&phi_id);
                     changed = true;
                 }
