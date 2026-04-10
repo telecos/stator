@@ -2499,12 +2499,26 @@ impl<'a> MaglevCodegen<'a> {
             ValueNode::Construct {
                 constructor, args, ..
             } => {
-                // Simplified: only handle 0-arg construct.
                 if args.is_empty() {
                     self.emit_stub_call_1node(
                         id,
                         *constructor,
                         jit_runtime::jit_runtime_construct0 as *const () as usize,
+                    );
+                } else if args.len() == 1 {
+                    self.emit_stub_call_2node(
+                        id,
+                        *constructor,
+                        args[0],
+                        jit_runtime::jit_runtime_construct1 as *const () as usize,
+                    );
+                } else if args.len() == 2 {
+                    self.emit_stub_call_3node(
+                        id,
+                        *constructor,
+                        args[0],
+                        args[1],
+                        jit_runtime::jit_runtime_construct2 as *const () as usize,
                     );
                 } else {
                     self.emit_deopt_unconditional(0);
@@ -3671,7 +3685,9 @@ impl<'a> MaglevCodegen<'a> {
                             }
                         }
                     }
-                    self.rax_holds = None;
+                    if dst == Reg64::Rax {
+                        self.rax_holds = Some(id);
+                    }
                 }
                 _ => {
                     self.emit_load(left, Reg64::Rax);
@@ -3777,14 +3793,16 @@ impl<'a> MaglevCodegen<'a> {
             // Common tail for register-allocated paths.
             self.masm
                 .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
+            let dst = match self.alloc.location(id) {
+                Some(Location::Register(n)) => phys_reg(n),
+                _ => unreachable!(),
+            };
             if !narrow {
-                let dst = match self.alloc.location(id) {
-                    Some(Location::Register(n)) => phys_reg(n),
-                    _ => unreachable!(),
-                };
                 self.masm.movsxd_sign_extend(dst, dst);
             }
-            self.rax_holds = None;
+            if dst == Reg64::Rax {
+                self.rax_holds = Some(id);
+            }
             return;
         }
 
@@ -3857,7 +3875,9 @@ impl<'a> MaglevCodegen<'a> {
                             }
                         }
                     }
-                    self.rax_holds = None;
+                    if dst == Reg64::Rax {
+                        self.rax_holds = Some(id);
+                    }
                 }
                 _ => {
                     self.emit_load(left, Reg64::Rax);
@@ -3902,7 +3922,9 @@ impl<'a> MaglevCodegen<'a> {
                     if !narrow {
                         self.masm.movsxd_sign_extend(dst, dst);
                     }
-                    self.rax_holds = None;
+                    if dst == Reg64::Rax {
+                        self.rax_holds = Some(id);
+                    }
                 }
                 _ => {
                     self.emit_load(left, Reg64::Rax);
@@ -3986,7 +4008,9 @@ impl<'a> MaglevCodegen<'a> {
                             }
                         }
                     }
-                    self.rax_holds = None;
+                    if dst == Reg64::Rax {
+                        self.rax_holds = Some(id);
+                    }
                 }
                 _ => {
                     self.emit_load(left, Reg64::Rax);
@@ -4030,7 +4054,9 @@ impl<'a> MaglevCodegen<'a> {
                     if !narrow {
                         self.masm.movsxd_sign_extend(dst, dst);
                     }
-                    self.rax_holds = None;
+                    if dst == Reg64::Rax {
+                        self.rax_holds = Some(id);
+                    }
                 }
                 _ => {
                     self.emit_load(left, Reg64::Rax);
@@ -4276,16 +4302,23 @@ impl<'a> MaglevCodegen<'a> {
                 if self.alloc.location(id) != self.alloc.location(left) {
                     self.emit_load(left, Reg64::R11);
                     self.emit_store(id, Reg64::R11);
+                    // emit_store may have moved R11 into RAX.
+                    if matches!(self.alloc.location(id), Some(Location::Register(n)) if phys_reg(n) == Reg64::Rax)
+                    {
+                        self.rax_holds = Some(id);
+                    }
                 }
-                self.rax_holds = None;
                 return;
             }
             if is_zero(left) {
                 if self.alloc.location(id) != self.alloc.location(right) {
                     self.emit_load(right, Reg64::R11);
                     self.emit_store(id, Reg64::R11);
+                    if matches!(self.alloc.location(id), Some(Location::Register(n)) if phys_reg(n) == Reg64::Rax)
+                    {
+                        self.rax_holds = Some(id);
+                    }
                 }
-                self.rax_holds = None;
                 return;
             }
 
@@ -4313,7 +4346,9 @@ impl<'a> MaglevCodegen<'a> {
                             }
                         }
                     }
-                    self.rax_holds = None;
+                    if dst == Reg64::Rax {
+                        self.rax_holds = Some(id);
+                    }
                 }
                 _ => {
                     self.emit_load(left, Reg64::Rax);
@@ -4388,7 +4423,9 @@ impl<'a> MaglevCodegen<'a> {
                             }
                         }
                     }
-                    self.rax_holds = None;
+                    if dst == Reg64::Rax {
+                        self.rax_holds = Some(id);
+                    }
                 }
                 _ => {
                     self.emit_load(left, Reg64::Rax);
@@ -4463,7 +4500,9 @@ impl<'a> MaglevCodegen<'a> {
                             }
                         }
                     }
-                    self.rax_holds = None;
+                    if dst == Reg64::Rax {
+                        self.rax_holds = Some(id);
+                    }
                 }
                 _ => {
                     self.emit_load(left, Reg64::Rax);
@@ -4517,7 +4556,9 @@ impl<'a> MaglevCodegen<'a> {
                     let dst = phys_reg(n);
                     self.emit_load(value, dst);
                     self.masm.add_ri(dst, 1);
-                    self.rax_holds = None;
+                    if dst == Reg64::Rax {
+                        self.rax_holds = Some(id);
+                    }
                 }
                 _ => {
                     self.emit_load(value, Reg64::Rax);
@@ -4541,7 +4582,9 @@ impl<'a> MaglevCodegen<'a> {
                     if !narrow {
                         self.masm.movsxd_sign_extend(dst, dst);
                     }
-                    self.rax_holds = None;
+                    if dst == Reg64::Rax {
+                        self.rax_holds = Some(id);
+                    }
                 }
                 _ => {
                     self.emit_load(value, Reg64::Rax);
@@ -4596,7 +4639,9 @@ impl<'a> MaglevCodegen<'a> {
                     let dst = phys_reg(n);
                     self.emit_load(value, dst);
                     self.masm.sub_ri(dst, 1);
-                    self.rax_holds = None;
+                    if dst == Reg64::Rax {
+                        self.rax_holds = Some(id);
+                    }
                 }
                 _ => {
                     self.emit_load(value, Reg64::Rax);
@@ -4620,7 +4665,9 @@ impl<'a> MaglevCodegen<'a> {
                     if !narrow {
                         self.masm.movsxd_sign_extend(dst, dst);
                     }
-                    self.rax_holds = None;
+                    if dst == Reg64::Rax {
+                        self.rax_holds = Some(id);
+                    }
                 }
                 _ => {
                     self.emit_load(value, Reg64::Rax);

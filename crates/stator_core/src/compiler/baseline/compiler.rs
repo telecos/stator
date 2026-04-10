@@ -8499,6 +8499,121 @@ pub(crate) mod jit_runtime {
             _ => None,
         }
     }
+
+    // ── Construct stub for Maglev (1 argument) ──────────────────────────────
+
+    /// Construct with exactly 1 argument — takes the constructor and one arg
+    /// as packed i64 values.
+    pub extern "C" fn jit_runtime_construct1(ctor_i64: i64, arg0_i64: i64) -> i64 {
+        construct1_inner(ctor_i64, arg0_i64).unwrap_or(JIT_DEOPT)
+    }
+
+    fn construct1_inner(ctor_i64: i64, arg0_i64: i64) -> Option<i64> {
+        use crate::interpreter::{
+            Interpreter, InterpreterFrame, make_construct_this, maybe_cache_construct_boilerplate,
+            resolve_construct_proto, restore_closure_context,
+        };
+
+        let ctor_val = jit_i64_to_jsvalue(ctor_i64);
+        match &ctor_val {
+            JsValue::Function(ba) => {
+                if ba.is_arrow() {
+                    return None;
+                }
+
+                let ctor_proto = resolve_construct_proto(&JsValue::Function(Rc::clone(ba)), ba);
+                let this_val = make_construct_this(ba, &ctor_proto);
+
+                let arg0 = jit_i64_to_jsvalue(arg0_i64);
+
+                let saved_ba = RT_BYTECODE.with(|b| b.get());
+                let env_opt = RT_GLOBAL.with(|g| g.borrow().env.as_ref().cloned());
+                let env = env_opt?;
+
+                let mut callee_frame =
+                    InterpreterFrame::new_with_globals(Rc::clone(ba), vec![arg0], env);
+                restore_closure_context(&mut callee_frame, ba);
+                callee_frame.new_target = JsValue::Function(Rc::clone(ba));
+                callee_frame
+                    .global_env
+                    .borrow_mut()
+                    .set_this(this_val.clone());
+
+                let result = Interpreter::run(&mut callee_frame);
+
+                RT_BYTECODE.with(|b| b.set(saved_ba));
+
+                let val = result.ok()?;
+                let constructed = match val {
+                    JsValue::PlainObject(_) | JsValue::Object(_) => val,
+                    _ => {
+                        maybe_cache_construct_boilerplate(ba, &this_val);
+                        this_val
+                    }
+                };
+                Some(jsvalue_to_jit_i64(constructed))
+            }
+            _ => None,
+        }
+    }
+
+    // ── Construct stub for Maglev (2 arguments) ─────────────────────────────
+
+    /// Construct with exactly 2 arguments — takes the constructor and two args
+    /// as packed i64 values.
+    pub extern "C" fn jit_runtime_construct2(ctor_i64: i64, arg0_i64: i64, arg1_i64: i64) -> i64 {
+        construct2_inner(ctor_i64, arg0_i64, arg1_i64).unwrap_or(JIT_DEOPT)
+    }
+
+    fn construct2_inner(ctor_i64: i64, arg0_i64: i64, arg1_i64: i64) -> Option<i64> {
+        use crate::interpreter::{
+            Interpreter, InterpreterFrame, make_construct_this, maybe_cache_construct_boilerplate,
+            resolve_construct_proto, restore_closure_context,
+        };
+
+        let ctor_val = jit_i64_to_jsvalue(ctor_i64);
+        match &ctor_val {
+            JsValue::Function(ba) => {
+                if ba.is_arrow() {
+                    return None;
+                }
+
+                let ctor_proto = resolve_construct_proto(&JsValue::Function(Rc::clone(ba)), ba);
+                let this_val = make_construct_this(ba, &ctor_proto);
+
+                let arg0 = jit_i64_to_jsvalue(arg0_i64);
+                let arg1 = jit_i64_to_jsvalue(arg1_i64);
+
+                let saved_ba = RT_BYTECODE.with(|b| b.get());
+                let env_opt = RT_GLOBAL.with(|g| g.borrow().env.as_ref().cloned());
+                let env = env_opt?;
+
+                let mut callee_frame =
+                    InterpreterFrame::new_with_globals(Rc::clone(ba), vec![arg0, arg1], env);
+                restore_closure_context(&mut callee_frame, ba);
+                callee_frame.new_target = JsValue::Function(Rc::clone(ba));
+                callee_frame
+                    .global_env
+                    .borrow_mut()
+                    .set_this(this_val.clone());
+
+                let result = Interpreter::run(&mut callee_frame);
+
+                RT_BYTECODE.with(|b| b.set(saved_ba));
+
+                let val = result.ok()?;
+                let constructed = match val {
+                    JsValue::PlainObject(_) | JsValue::Object(_) => val,
+                    _ => {
+                        maybe_cache_construct_boilerplate(ba, &this_val);
+                        this_val
+                    }
+                };
+                Some(jsvalue_to_jit_i64(constructed))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]
