@@ -3702,9 +3702,11 @@ impl<'a> MaglevCodegen<'a> {
 
         // Speculative Smi: both inputs were guarded upstream (by
         // LoadNamedGeneric Smi guard or a prior smi_guarded op).
-        // Skip input Smi checks; emit 32-bit ADD + JO overflow deopt.
+        // Skip input Smi checks; emit 64-bit ADD + JO overflow deopt.
+        // Stator Smis are i64, so we must use 64-bit arithmetic here —
+        // 32-bit ADD would spuriously deopt when intermediate sums
+        // exceed ±2^31 (e.g. arithmetic_loop accumulating to ~5 billion).
         if self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right) {
-            let narrow = self.narrow_int32.contains(&id);
             // Try to operate directly in the destination register to avoid
             // an extra MOV from RAX.
             if let Some(imm) = self.try_get_i32_constant(right) {
@@ -3712,16 +3714,12 @@ impl<'a> MaglevCodegen<'a> {
                     Some(Location::Register(n)) => {
                         let dst = phys_reg(n);
                         self.emit_load(left, dst);
-                        self.masm.add32_ri(dst, imm);
+                        self.masm.add_ri(dst, imm);
                     }
                     _ => {
                         self.emit_load(left, Reg64::Rax);
-                        self.masm.add32_ri(Reg64::Rax, imm);
-                        self.masm
-                            .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-                        if !narrow {
-                            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
-                        }
+                        self.masm.add_ri(Reg64::Rax, imm);
+                        self.emit_deopt_on_i64_overflow(0);
                         self.emit_store(id, Reg64::Rax);
                         self.rax_holds = Some(id);
                         return;
@@ -3733,16 +3731,12 @@ impl<'a> MaglevCodegen<'a> {
                     Some(Location::Register(n)) => {
                         let dst = phys_reg(n);
                         self.emit_load(right, dst);
-                        self.masm.add32_ri(dst, imm);
+                        self.masm.add_ri(dst, imm);
                     }
                     _ => {
                         self.emit_load(right, Reg64::Rax);
-                        self.masm.add32_ri(Reg64::Rax, imm);
-                        self.masm
-                            .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-                        if !narrow {
-                            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
-                        }
+                        self.masm.add_ri(Reg64::Rax, imm);
+                        self.emit_deopt_on_i64_overflow(0);
                         self.emit_store(id, Reg64::Rax);
                         self.rax_holds = Some(id);
                         return;
@@ -3761,16 +3755,16 @@ impl<'a> MaglevCodegen<'a> {
                         if right_in_dst {
                             self.emit_load(right, Reg64::R10);
                             self.emit_load(left, dst);
-                            self.masm.add32_rr(dst, Reg64::R10);
+                            self.masm.add_rr(dst, Reg64::R10);
                         } else {
                             self.emit_load(left, dst);
                             match self.alloc.location(right) {
                                 Some(Location::Register(rn)) if phys_reg(rn) != dst => {
-                                    self.masm.add32_rr(dst, phys_reg(rn));
+                                    self.masm.add_rr(dst, phys_reg(rn));
                                 }
                                 _ => {
                                     self.emit_load(right, Reg64::R10);
-                                    self.masm.add32_rr(dst, Reg64::R10);
+                                    self.masm.add_rr(dst, Reg64::R10);
                                 }
                             }
                         }
@@ -3778,12 +3772,8 @@ impl<'a> MaglevCodegen<'a> {
                     _ => {
                         self.emit_load(left, Reg64::Rax);
                         self.emit_load(right, Reg64::R10);
-                        self.masm.add32_rr(Reg64::Rax, Reg64::R10);
-                        self.masm
-                            .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-                        if !narrow {
-                            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
-                        }
+                        self.masm.add_rr(Reg64::Rax, Reg64::R10);
+                        self.emit_deopt_on_i64_overflow(0);
                         self.emit_store(id, Reg64::Rax);
                         self.rax_holds = Some(id);
                         return;
@@ -3791,15 +3781,11 @@ impl<'a> MaglevCodegen<'a> {
                 }
             }
             // Common tail for register-allocated paths.
-            self.masm
-                .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
+            self.emit_deopt_on_i64_overflow(0);
             let dst = match self.alloc.location(id) {
                 Some(Location::Register(n)) => phys_reg(n),
                 _ => unreachable!(),
             };
-            if !narrow {
-                self.masm.movsxd_sign_extend(dst, dst);
-            }
             if dst == Reg64::Rax {
                 self.rax_holds = Some(id);
             }
@@ -3891,7 +3877,6 @@ impl<'a> MaglevCodegen<'a> {
         }
 
         if self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right) {
-            let narrow = self.narrow_int32.contains(&id);
             match self.alloc.location(id) {
                 Some(Location::Register(n)) => {
                     let dst = phys_reg(n);
@@ -3904,24 +3889,20 @@ impl<'a> MaglevCodegen<'a> {
                     if right_in_dst {
                         self.emit_load(right, Reg64::R10);
                         self.emit_load(left, dst);
-                        self.masm.sub32_rr(dst, Reg64::R10);
+                        self.masm.sub_rr(dst, Reg64::R10);
                     } else {
                         self.emit_load(left, dst);
                         match self.alloc.location(right) {
                             Some(Location::Register(rn)) if phys_reg(rn) != dst => {
-                                self.masm.sub32_rr(dst, phys_reg(rn));
+                                self.masm.sub_rr(dst, phys_reg(rn));
                             }
                             _ => {
                                 self.emit_load(right, Reg64::R10);
-                                self.masm.sub32_rr(dst, Reg64::R10);
+                                self.masm.sub_rr(dst, Reg64::R10);
                             }
                         }
                     }
-                    self.masm
-                        .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-                    if !narrow {
-                        self.masm.movsxd_sign_extend(dst, dst);
-                    }
+                    self.emit_deopt_on_i64_overflow(0);
                     if dst == Reg64::Rax {
                         self.rax_holds = Some(id);
                     }
@@ -3929,12 +3910,8 @@ impl<'a> MaglevCodegen<'a> {
                 _ => {
                     self.emit_load(left, Reg64::Rax);
                     self.emit_load(right, Reg64::R10);
-                    self.masm.sub32_rr(Reg64::Rax, Reg64::R10);
-                    self.masm
-                        .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-                    if !narrow {
-                        self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
-                    }
+                    self.masm.sub_rr(Reg64::Rax, Reg64::R10);
+                    self.emit_deopt_on_i64_overflow(0);
                     self.emit_store(id, Reg64::Rax);
                     self.rax_holds = Some(id);
                 }
@@ -4034,13 +4011,6 @@ impl<'a> MaglevCodegen<'a> {
                 .or_else(|| self.try_get_i32_constant(left).map(|imm| (right, imm)));
 
             if let Some((var, imm)) = const_pair {
-                let lea_scale: Option<u8> = match imm {
-                    3 => Some(2),
-                    5 => Some(4),
-                    9 => Some(8),
-                    _ => None,
-                };
-
                 match self.alloc.location(id) {
                     Some(Location::Register(n)) => {
                         let dst = phys_reg(n);
@@ -4055,6 +4025,12 @@ impl<'a> MaglevCodegen<'a> {
                             // Narrow: LEA for {3,5,9} (1c vs IMUL's 3c).
                             // No overflow check/MOVSXD — downstream only
                             // reads lower 32 bits.
+                            let lea_scale: Option<u8> = match imm {
+                                3 => Some(2),
+                                5 => Some(4),
+                                9 => Some(8),
+                                _ => None,
+                            };
                             if let Some(scale) = lea_scale {
                                 if src_reg != Reg64::Rbp && src_reg != Reg64::R13 {
                                     self.masm.lea_scaled(dst, src_reg, src_reg, scale);
@@ -4065,13 +4041,9 @@ impl<'a> MaglevCodegen<'a> {
                                 self.masm.imul32_rri(dst, src_reg, imm);
                             }
                         } else {
-                            // Not narrow: IMUL-immediate sets OF for the
-                            // overflow deopt; LEA does not, so always use
-                            // IMUL-immediate here.
-                            self.masm.imul32_rri(dst, src_reg, imm);
-                            self.masm
-                                .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-                            self.masm.movsxd_sign_extend(dst, dst);
+                            // 64-bit IMUL sets OF for the overflow deopt.
+                            self.masm.imul_rri(dst, src_reg, imm);
+                            self.emit_deopt_on_i64_overflow(0);
                         }
                         if dst == Reg64::Rax {
                             self.rax_holds = Some(id);
@@ -4080,6 +4052,12 @@ impl<'a> MaglevCodegen<'a> {
                     _ => {
                         self.emit_load(var, Reg64::R11);
                         if narrow {
+                            let lea_scale: Option<u8> = match imm {
+                                3 => Some(2),
+                                5 => Some(4),
+                                9 => Some(8),
+                                _ => None,
+                            };
                             if let Some(scale) = lea_scale {
                                 self.masm
                                     .lea_scaled(Reg64::R11, Reg64::R11, Reg64::R11, scale);
@@ -4087,10 +4065,8 @@ impl<'a> MaglevCodegen<'a> {
                                 self.masm.imul32_rri(Reg64::R11, Reg64::R11, imm);
                             }
                         } else {
-                            self.masm.imul32_rri(Reg64::R11, Reg64::R11, imm);
-                            self.masm
-                                .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-                            self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
+                            self.masm.imul_rri(Reg64::R11, Reg64::R11, imm);
+                            self.emit_deopt_on_i64_overflow(0);
                         }
                         self.emit_store(id, Reg64::R11);
                     }
@@ -4098,7 +4074,7 @@ impl<'a> MaglevCodegen<'a> {
                 return;
             }
 
-            // Non-constant operands — use register×register IMUL.
+            // Non-constant operands — use register×register 64-bit IMUL.
             match self.alloc.location(id) {
                 Some(Location::Register(n)) => {
                     let dst = phys_reg(n);
@@ -4110,24 +4086,20 @@ impl<'a> MaglevCodegen<'a> {
                     if right_in_dst {
                         self.emit_load(right, Reg64::R10);
                         self.emit_load(left, dst);
-                        self.masm.imul32_rr(dst, Reg64::R10);
+                        self.masm.imul_rr(dst, Reg64::R10);
                     } else {
                         self.emit_load(left, dst);
                         match self.alloc.location(right) {
                             Some(Location::Register(rn)) if phys_reg(rn) != dst => {
-                                self.masm.imul32_rr(dst, phys_reg(rn));
+                                self.masm.imul_rr(dst, phys_reg(rn));
                             }
                             _ => {
                                 self.emit_load(right, Reg64::R10);
-                                self.masm.imul32_rr(dst, Reg64::R10);
+                                self.masm.imul_rr(dst, Reg64::R10);
                             }
                         }
                     }
-                    self.masm
-                        .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-                    if !narrow {
-                        self.masm.movsxd_sign_extend(dst, dst);
-                    }
+                    self.emit_deopt_on_i64_overflow(0);
                     if dst == Reg64::Rax {
                         self.rax_holds = Some(id);
                     }
@@ -4135,12 +4107,8 @@ impl<'a> MaglevCodegen<'a> {
                 _ => {
                     self.emit_load(left, Reg64::Rax);
                     self.emit_load(right, Reg64::R10);
-                    self.masm.imul32_rr(Reg64::Rax, Reg64::R10);
-                    self.masm
-                        .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-                    if !narrow {
-                        self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
-                    }
+                    self.masm.imul_rr(Reg64::Rax, Reg64::R10);
+                    self.emit_deopt_on_i64_overflow(0);
                     self.emit_store(id, Reg64::Rax);
                     self.rax_holds = Some(id);
                 }
@@ -4673,29 +4641,20 @@ impl<'a> MaglevCodegen<'a> {
         }
 
         if self.smi_guarded.contains(&value) {
-            let narrow = self.narrow_int32.contains(&id);
             match self.alloc.location(id) {
                 Some(Location::Register(n)) => {
                     let dst = phys_reg(n);
                     self.emit_load(value, dst);
-                    self.masm.add32_ri(dst, 1);
-                    self.masm
-                        .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-                    if !narrow {
-                        self.masm.movsxd_sign_extend(dst, dst);
-                    }
+                    self.masm.add_ri(dst, 1);
+                    self.emit_deopt_on_i64_overflow(0);
                     if dst == Reg64::Rax {
                         self.rax_holds = Some(id);
                     }
                 }
                 _ => {
                     self.emit_load(value, Reg64::Rax);
-                    self.masm.add32_ri(Reg64::Rax, 1);
-                    self.masm
-                        .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-                    if !narrow {
-                        self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
-                    }
+                    self.masm.add_ri(Reg64::Rax, 1);
+                    self.emit_deopt_on_i64_overflow(0);
                     self.emit_store(id, Reg64::Rax);
                     self.rax_holds = Some(id);
                 }
@@ -4756,29 +4715,20 @@ impl<'a> MaglevCodegen<'a> {
         }
 
         if self.smi_guarded.contains(&value) {
-            let narrow = self.narrow_int32.contains(&id);
             match self.alloc.location(id) {
                 Some(Location::Register(n)) => {
                     let dst = phys_reg(n);
                     self.emit_load(value, dst);
-                    self.masm.sub32_ri(dst, 1);
-                    self.masm
-                        .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-                    if !narrow {
-                        self.masm.movsxd_sign_extend(dst, dst);
-                    }
+                    self.masm.sub_ri(dst, 1);
+                    self.emit_deopt_on_i64_overflow(0);
                     if dst == Reg64::Rax {
                         self.rax_holds = Some(id);
                     }
                 }
                 _ => {
                     self.emit_load(value, Reg64::Rax);
-                    self.masm.sub32_ri(Reg64::Rax, 1);
-                    self.masm
-                        .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-                    if !narrow {
-                        self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
-                    }
+                    self.masm.sub_ri(Reg64::Rax, 1);
+                    self.emit_deopt_on_i64_overflow(0);
                     self.emit_store(id, Reg64::Rax);
                     self.rax_holds = Some(id);
                 }
@@ -4829,12 +4779,8 @@ impl<'a> MaglevCodegen<'a> {
         if self.smi_guarded.contains(&value) {
             self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
             self.emit_load(value, Reg64::R10);
-            self.masm.sub32_rr(Reg64::Rax, Reg64::R10);
-            self.masm
-                .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
-            if !self.narrow_int32.contains(&id) {
-                self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
-            }
+            self.masm.sub_rr(Reg64::Rax, Reg64::R10);
+            self.emit_deopt_on_i64_overflow(0);
             self.emit_store(id, Reg64::Rax);
             return;
         }
