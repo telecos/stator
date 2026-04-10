@@ -5308,6 +5308,145 @@ impl Interpreter {
                             }
                             Opcode::CreateObjectLiteral => {
                                 let slot = unsafe { operand_flag_unchecked(instr, 1) } as u32;
+                                let prop_count =
+                                    unsafe { operand_flag_unchecked(instr, 2) } as usize;
+
+                                // ── Fused create+fill path ──
+                                // Detect Star rX followed by N × (value-instr*
+                                // + DefineNamedOwnProperty rX) and create the
+                                // object with all values pre-filled, bypassing
+                                // per-property try_template_fill overhead.
+                                'smi_fuse: {
+                                    if prop_count == 0 || prop_count > 8 {
+                                        break 'smi_fuse;
+                                    }
+                                    if pc >= instructions.len() {
+                                        break 'smi_fuse;
+                                    }
+                                    let star_instr = unsafe { instructions.get_unchecked(pc) };
+                                    if star_instr.opcode != Opcode::Star {
+                                        break 'smi_fuse;
+                                    }
+                                    let star_reg = unsafe { operand_reg_unchecked(star_instr, 0) };
+
+                                    let mut scan_pc = pc + 1;
+                                    #[rustfmt::skip]
+                                    let mut fuse_vals = [
+                                        JsValue::Undefined, JsValue::Undefined,
+                                        JsValue::Undefined, JsValue::Undefined,
+                                        JsValue::Undefined, JsValue::Undefined,
+                                        JsValue::Undefined, JsValue::Undefined,
+                                    ];
+                                    let mut mini_sa: i32 = 0;
+                                    let mut mini_valid = false;
+                                    let mut filled = 0usize;
+
+                                    while filled < prop_count {
+                                        if scan_pc >= instructions.len() {
+                                            break 'smi_fuse;
+                                        }
+                                        let si = unsafe { instructions.get_unchecked(scan_pc) };
+                                        scan_pc += 1;
+                                        match si.opcode {
+                                            Opcode::Ldar => {
+                                                let r = unsafe { operand_reg_unchecked(si, 0) };
+                                                let v = unsafe { frame.read_reg_unchecked(r) };
+                                                if let JsValue::Smi(n) = v {
+                                                    mini_sa = *n;
+                                                    mini_valid = true;
+                                                } else {
+                                                    break 'smi_fuse;
+                                                }
+                                            }
+                                            Opcode::LdaSmi => {
+                                                mini_sa = unsafe { operand_imm_unchecked(si, 0) };
+                                                mini_valid = true;
+                                            }
+                                            Opcode::LdaZero => {
+                                                mini_sa = 0;
+                                                mini_valid = true;
+                                            }
+                                            Opcode::AddSmi => {
+                                                if !mini_valid {
+                                                    break 'smi_fuse;
+                                                }
+                                                let imm = unsafe { operand_imm_unchecked(si, 0) };
+                                                match mini_sa.checked_add(imm) {
+                                                    Some(r) => mini_sa = r,
+                                                    None => break 'smi_fuse,
+                                                }
+                                            }
+                                            Opcode::SubSmi => {
+                                                if !mini_valid {
+                                                    break 'smi_fuse;
+                                                }
+                                                let imm = unsafe { operand_imm_unchecked(si, 0) };
+                                                match mini_sa.checked_sub(imm) {
+                                                    Some(r) => mini_sa = r,
+                                                    None => break 'smi_fuse,
+                                                }
+                                            }
+                                            Opcode::MulSmi => {
+                                                if !mini_valid {
+                                                    break 'smi_fuse;
+                                                }
+                                                let imm = unsafe { operand_imm_unchecked(si, 0) };
+                                                match mini_sa.checked_mul(imm) {
+                                                    Some(r) => mini_sa = r,
+                                                    None => break 'smi_fuse,
+                                                }
+                                            }
+                                            Opcode::DefineNamedOwnProperty => {
+                                                if !mini_valid {
+                                                    break 'smi_fuse;
+                                                }
+                                                let obj_reg =
+                                                    unsafe { operand_reg_unchecked(si, 0) };
+                                                if obj_reg != star_reg {
+                                                    break 'smi_fuse;
+                                                }
+                                                fuse_vals[filled] = JsValue::Smi(mini_sa);
+                                                filled += 1;
+                                            }
+                                            _ => break 'smi_fuse,
+                                        }
+                                    }
+
+                                    // All properties collected — create fused
+                                    // object via template+values fast path.
+                                    if let Some(rc) = frame
+                                        .bytecode_array
+                                        .clone_object_literal_template_with_values_pooled(
+                                            slot,
+                                            &fuse_vals[..prop_count],
+                                        )
+                                    {
+                                        let obj = JsValue::PlainObject(rc);
+                                        // Store in target register, recycling
+                                        // any previous PlainObject.
+                                        let old =
+                                            unsafe { frame.swap_reg_unchecked(star_reg, obj) };
+                                        if let JsValue::PlainObject(rc) = old {
+                                            recycle_object_rc(rc);
+                                        }
+                                        let idx = frame.reg_flat_index_unchecked(star_reg);
+                                        if let Some(ref mut hr) = frame.hot_registers {
+                                            hr.invalidate(idx);
+                                        }
+                                        // Accumulator = last property value.
+                                        sa = mini_sa;
+                                        smi_acc_bool = false;
+                                        smi_acc_spilled = false;
+                                        hot_acc = Some(NanBoxedValue::from_smi(sa));
+                                        pc = scan_pc;
+                                        continue 'smi;
+                                    }
+                                    // Template not cached yet — fall through
+                                    // to unfused path below.
+                                }
+
+                                // Non-fused path (fuse scan failed or template
+                                // not cached).
                                 // SAFETY: single-threaded; no concurrent borrows.
                                 if let Some(rc) = unsafe {
                                     frame
@@ -5320,6 +5459,7 @@ impl Interpreter {
                                     hot_acc = None;
                                     continue 'smi;
                                 }
+                                // Template not cached: exit SMI loop.
                                 acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
@@ -5481,7 +5621,132 @@ impl Interpreter {
                     }
                     Opcode::CreateObjectLiteral => {
                         if let Operand::FeedbackSlot(s) = *instr.operand(1) {
-                            // Fast path: clone from cached template.
+                            let prop_count = match instr.operand_at(2) {
+                                Some(Operand::Flag(count)) if *count > 0 => *count as usize,
+                                _ => 0,
+                            };
+
+                            // ── Fused create+fill (cached template) ──
+                            // Lookahead: Star + (value-instr* +
+                            // DefineNamedOwnProperty) × N, then create
+                            // the object with all values pre-filled.
+                            'dispatch_fuse: {
+                                if prop_count == 0 || prop_count > 8 {
+                                    break 'dispatch_fuse;
+                                }
+                                if pc >= instructions.len() {
+                                    break 'dispatch_fuse;
+                                }
+                                let star_instr = unsafe { instructions.get_unchecked(pc) };
+                                if star_instr.opcode != Opcode::Star {
+                                    break 'dispatch_fuse;
+                                }
+                                let star_reg = unsafe { operand_reg_unchecked(star_instr, 0) };
+
+                                let mut scan_pc = pc + 1;
+                                #[rustfmt::skip]
+                                let mut fuse_vals = [
+                                    JsValue::Undefined, JsValue::Undefined,
+                                    JsValue::Undefined, JsValue::Undefined,
+                                    JsValue::Undefined, JsValue::Undefined,
+                                    JsValue::Undefined, JsValue::Undefined,
+                                ];
+                                let mut mini_acc = JsValue::Undefined;
+                                let mut filled = 0usize;
+
+                                while filled < prop_count {
+                                    if scan_pc >= instructions.len() {
+                                        break 'dispatch_fuse;
+                                    }
+                                    let si = unsafe { instructions.get_unchecked(scan_pc) };
+                                    scan_pc += 1;
+                                    match si.opcode {
+                                        Opcode::Ldar => {
+                                            let r = unsafe { operand_reg_unchecked(si, 0) };
+                                            mini_acc = unsafe { frame.read_reg_unchecked(r) }
+                                                .cheap_clone();
+                                        }
+                                        Opcode::LdaSmi => {
+                                            let v = unsafe { operand_imm_unchecked(si, 0) };
+                                            mini_acc = JsValue::Smi(v);
+                                        }
+                                        Opcode::LdaZero => {
+                                            mini_acc = JsValue::Smi(0);
+                                        }
+                                        Opcode::AddSmi => {
+                                            let imm = unsafe { operand_imm_unchecked(si, 0) };
+                                            if let JsValue::Smi(n) = &mini_acc {
+                                                if let Some(r) = n.checked_add(imm) {
+                                                    mini_acc = JsValue::Smi(r);
+                                                } else {
+                                                    break 'dispatch_fuse;
+                                                }
+                                            } else {
+                                                break 'dispatch_fuse;
+                                            }
+                                        }
+                                        Opcode::SubSmi => {
+                                            let imm = unsafe { operand_imm_unchecked(si, 0) };
+                                            if let JsValue::Smi(n) = &mini_acc {
+                                                if let Some(r) = n.checked_sub(imm) {
+                                                    mini_acc = JsValue::Smi(r);
+                                                } else {
+                                                    break 'dispatch_fuse;
+                                                }
+                                            } else {
+                                                break 'dispatch_fuse;
+                                            }
+                                        }
+                                        Opcode::MulSmi => {
+                                            let imm = unsafe { operand_imm_unchecked(si, 0) };
+                                            if let JsValue::Smi(n) = &mini_acc {
+                                                if let Some(r) = n.checked_mul(imm) {
+                                                    mini_acc = JsValue::Smi(r);
+                                                } else {
+                                                    break 'dispatch_fuse;
+                                                }
+                                            } else {
+                                                break 'dispatch_fuse;
+                                            }
+                                        }
+                                        Opcode::DefineNamedOwnProperty => {
+                                            if matches!(
+                                                mini_acc,
+                                                JsValue::Undefined | JsValue::Function(_)
+                                            ) {
+                                                break 'dispatch_fuse;
+                                            }
+                                            let obj_reg = unsafe { operand_reg_unchecked(si, 0) };
+                                            if obj_reg != star_reg {
+                                                break 'dispatch_fuse;
+                                            }
+                                            fuse_vals[filled] = mini_acc.cheap_clone();
+                                            filled += 1;
+                                        }
+                                        _ => break 'dispatch_fuse,
+                                    }
+                                }
+
+                                // All values collected — try fused template
+                                // instantiation.
+                                if let Some(rc) = frame
+                                    .bytecode_array
+                                    .clone_object_literal_template_with_values_pooled(
+                                        s,
+                                        &fuse_vals[..prop_count],
+                                    )
+                                {
+                                    let obj = JsValue::PlainObject(rc);
+                                    unsafe { frame.write_reg_unchecked(star_reg, obj) };
+                                    acc = mini_acc;
+                                    pc = scan_pc;
+                                    continue 'dispatch;
+                                }
+                                // Template not cached yet — fall through to
+                                // promote / first-exec paths.
+                            }
+
+                            // Non-fused cached clone.
                             // SAFETY: single-threaded; no concurrent borrows.
                             if let Some(rc) = unsafe {
                                 frame
@@ -5500,10 +5765,7 @@ impl Interpreter {
                                 continue 'dispatch;
                             }
                             // First execution: create normally and record.
-                            let capacity = match instr.operand_at(2) {
-                                Some(Operand::Flag(count)) if *count > 0 => *count as usize,
-                                _ => 4,
-                            };
+                            let capacity = if prop_count > 0 { prop_count } else { 4 };
                             let map = PropertyMap::with_capacity(capacity);
                             let rc = Rc::new(RefCell::new(map));
                             // SAFETY: single-threaded; no concurrent borrows.

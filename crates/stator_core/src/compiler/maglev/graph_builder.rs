@@ -674,7 +674,9 @@ impl<'a> GraphBuilder<'a> {
             }
 
             // StaKeyedProperty [obj_reg, key_reg, slot]
-            Opcode::StaKeyedProperty => {
+            // StaInArrayLiteral [array_reg, index_reg, slot] — same layout,
+            // stores accumulator at a keyed index in an array literal.
+            Opcode::StaKeyedProperty | Opcode::StaInArrayLiteral => {
                 let obj_reg = self.operand_register(instr, 0)?;
                 let key_reg = self.operand_register(instr, 1)?;
                 let slot = self.operand_feedback_slot(instr, 2)?;
@@ -683,6 +685,21 @@ impl<'a> GraphBuilder<'a> {
                 let value = self.env_get_accumulator()?;
                 self.emit_keyed_property_store(obj, key, value, slot)?;
                 // Invalidate property CSE — keyed store may affect named lookups.
+                self.known_props.clear();
+            }
+
+            // DefineKeyedOwnProperty [obj, key_reg, flags, slot]
+            // DefineKeyedOwnPropertyInLiteral [obj, key_reg, flags, slot]
+            // Semantically equivalent to a keyed store for JIT purposes.
+            Opcode::DefineKeyedOwnProperty | Opcode::DefineKeyedOwnPropertyInLiteral => {
+                let obj_reg = self.operand_register(instr, 0)?;
+                let key_reg = self.operand_register(instr, 1)?;
+                // operand 2 is flags — not needed at IR level.
+                let slot = self.operand_feedback_slot(instr, 3)?;
+                let obj = self.env_get_register(obj_reg)?;
+                let key = self.env_get_register(key_reg)?;
+                let value = self.env_get_accumulator()?;
+                self.emit_keyed_property_store(obj, key, value, slot)?;
                 self.known_props.clear();
             }
 
@@ -3284,6 +3301,146 @@ mod tests {
         assert!(
             has_generic,
             "expected LoadKeyedGeneric when feedback is megamorphic"
+        );
+    }
+
+    /// Regression test: the sieve_primes benchmark must compile to a
+    /// non-degenerate graph with zero spurious deoptimisation blocks.
+    #[test]
+    fn test_sieve_benchmark_no_deopt() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::recursive_descent;
+
+        let source = r#"
+            var n = 1000;
+            var sieve = [];
+            for (var i = 0; i <= n; i++) sieve[i] = true;
+            sieve[0] = false;
+            sieve[1] = false;
+            for (var i = 2; i * i <= n; i++) {
+                if (sieve[i]) {
+                    for (var j = i * i; j <= n; j = j + i) {
+                        sieve[j] = false;
+                    }
+                }
+            }
+            var count = 0;
+            for (var i = 0; i <= n; i++) {
+                if (sieve[i]) count = count + 1;
+            }
+            count;
+        "#;
+
+        let program = recursive_descent::parse(source).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+        let feedback = FeedbackVector::new(ba.feedback_metadata());
+        let graph = GraphBuilder::build(&ba, &feedback).unwrap();
+
+        let deopt_blocks: Vec<_> = graph
+            .blocks()
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| matches!(b.control, Some(ControlNode::Deoptimize { .. })))
+            .map(|(i, _)| i)
+            .collect();
+
+        assert!(
+            deopt_blocks.is_empty(),
+            "sieve graph has Deoptimize control in blocks {deopt_blocks:?} — \
+             indicates unhandled bytecodes"
+        );
+        assert!(
+            !graph.is_degenerate(),
+            "sieve graph should not be degenerate"
+        );
+    }
+
+    /// Regression test: property access benchmark must compile cleanly.
+    #[test]
+    fn test_property_access_benchmark_no_deopt() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::recursive_descent;
+
+        let source = r#"
+            var obj = { a: 1, b: 2, c: 3, d: 4, e: 5 };
+            var sum = 0;
+            for (var i = 0; i < 1000; i++) {
+                sum = sum + obj.a + obj.b + obj.c + obj.d + obj.e;
+            }
+            sum;
+        "#;
+
+        let program = recursive_descent::parse(source).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+        let feedback = FeedbackVector::new(ba.feedback_metadata());
+        let graph = GraphBuilder::build(&ba, &feedback).unwrap();
+
+        let deopt_blocks: Vec<_> = graph
+            .blocks()
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| matches!(b.control, Some(ControlNode::Deoptimize { .. })))
+            .map(|(i, _)| i)
+            .collect();
+
+        assert!(
+            deopt_blocks.is_empty(),
+            "property_access graph has Deoptimize control in blocks {deopt_blocks:?}"
+        );
+        assert!(
+            !graph.is_degenerate(),
+            "property_access graph should not be degenerate"
+        );
+    }
+
+    /// Verify that array literals with multiple elements (which emit
+    /// `StaInArrayLiteral`) compile without spurious deopts.
+    #[test]
+    fn test_array_literal_sta_in_array_literal_no_deopt() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::recursive_descent;
+
+        let source = r#"
+            var a = [10, 20, 30, 40, 50];
+            var sum = 0;
+            for (var i = 0; i < 5; i++) {
+                sum = sum + a[i];
+            }
+            sum;
+        "#;
+
+        let program = recursive_descent::parse(source).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+
+        // Sanity-check: bytecodes should contain StaInArrayLiteral.
+        let instructions = ba.instructions().unwrap();
+        let has_sta_in_array = instructions
+            .iter()
+            .any(|i| i.opcode == crate::bytecode::bytecodes::Opcode::StaInArrayLiteral);
+        assert!(
+            has_sta_in_array,
+            "expected StaInArrayLiteral in array literal bytecodes"
+        );
+
+        let feedback = FeedbackVector::new(ba.feedback_metadata());
+        let graph = GraphBuilder::build(&ba, &feedback).unwrap();
+
+        let deopt_blocks: Vec<_> = graph
+            .blocks()
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| matches!(b.control, Some(ControlNode::Deoptimize { .. })))
+            .map(|(i, _)| i)
+            .collect();
+
+        assert!(
+            deopt_blocks.is_empty(),
+            "array literal graph has Deoptimize in blocks {deopt_blocks:?} — \
+             StaInArrayLiteral handler may be missing"
+        );
+        assert!(
+            !graph.is_degenerate(),
+            "array literal graph should not be degenerate"
         );
     }
 }

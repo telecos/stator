@@ -215,9 +215,6 @@ pub(crate) mod jit_runtime {
         global_epoch: u64,
         /// Pre-encoded JIT i64 result value.
         cached_value: i64,
-        /// Shape id of the prototype object where the property was found.
-        /// Used to detect prototype swaps on the shape-based fallback path.
-        proto_handle: i64,
     }
 
     impl ProtoIcEntry {
@@ -227,7 +224,6 @@ pub(crate) mod jit_runtime {
             receiver_handle: 0,
             global_epoch: u64::MAX,
             cached_value: 0,
-            proto_handle: 0,
         };
     }
 
@@ -2148,7 +2144,7 @@ pub(crate) mod jit_runtime {
                     let proto = map
                         .get(INTERNAL_PROTO_PROPERTY_KEY)
                         .or_else(|| map.get("__proto__"));
-                    let (result, proto_handle) = jit_proto_chain_walk(proto, prop_name);
+                    let (result, _proto_handle) = jit_proto_chain_walk(proto, prop_name);
                     // SAFETY: IC `cache` ref was dropped; single-threaded JIT.
                     let cache_mut = unsafe { &mut *ic_ref.as_ptr() };
                     cache_mut.proto[proto_slot] = ProtoIcEntry {
@@ -2157,7 +2153,6 @@ pub(crate) mod jit_runtime {
                         receiver_handle: obj_i64,
                         global_epoch: PropertyMap::global_proto_mutation_epoch(),
                         cached_value: result,
-                        proto_handle,
                     };
                     return Some(result);
                 }
@@ -2261,7 +2256,7 @@ pub(crate) mod jit_runtime {
                         let proto = map
                             .get(INTERNAL_PROTO_PROPERTY_KEY)
                             .or_else(|| map.get("__proto__"));
-                        let (result, proto_handle) = jit_proto_chain_walk(proto, prop_name);
+                        let (result, _proto_handle) = jit_proto_chain_walk(proto, prop_name);
                         let proto_slot = (name_idx & 31) as usize;
                         RT_PROP_IC.with(|ic| {
                             ic.borrow_mut().proto[proto_slot] = ProtoIcEntry {
@@ -2270,7 +2265,6 @@ pub(crate) mod jit_runtime {
                                 receiver_handle: obj_i64,
                                 global_epoch: PropertyMap::global_proto_mutation_epoch(),
                                 cached_value: result,
-                                proto_handle,
                             };
                         });
                         Some(Ok(result))
@@ -2359,7 +2353,7 @@ pub(crate) mod jit_runtime {
                     let proto = map
                         .get(INTERNAL_PROTO_PROPERTY_KEY)
                         .or_else(|| map.get("__proto__"));
-                    let (result, proto_handle) = jit_proto_chain_walk(proto, prop_name);
+                    let (result, _proto_handle) = jit_proto_chain_walk(proto, prop_name);
 
                     let proto_slot = (name_idx & 31) as usize;
                     let new_entry = ProtoIcEntry {
@@ -2368,7 +2362,6 @@ pub(crate) mod jit_runtime {
                         receiver_handle: obj_i64,
                         global_epoch: PropertyMap::global_proto_mutation_epoch(),
                         cached_value: result,
-                        proto_handle,
                     };
                     if ptrs.is_cached() {
                         unsafe { &*ptrs.prop_ic }.borrow_mut().proto[proto_slot] = new_entry;

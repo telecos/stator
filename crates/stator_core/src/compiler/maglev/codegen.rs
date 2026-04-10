@@ -2890,58 +2890,14 @@ impl<'a> MaglevCodegen<'a> {
                     }
                 }
             } else {
-                // Partition entries into those truly involved in the
-                // conflict cycle and those that can use a direct copy.
-                // An entry is "in conflict" when its destination matches
-                // another entry's source (we'd clobber it) or its source
-                // matches another entry's destination (it'd be clobbered).
-                let mut conflicting: Vec<(NodeId, NodeId)> = Vec::new();
-                let mut safe: Vec<(NodeId, NodeId)> = Vec::new();
-
-                for &(phi_id, src_id) in &phi_ops {
-                    let phi_loc = self.alloc.location(phi_id);
-                    let src_loc = self.alloc.location(src_id);
-                    let in_cycle = phi_ops.iter().any(|&(op, os)| {
-                        (op != phi_id || os != src_id)
-                            && (self.alloc.location(os) == phi_loc
-                                || self.alloc.location(op) == src_loc)
-                    });
-                    if in_cycle {
-                        conflicting.push((phi_id, src_id));
-                    } else {
-                        safe.push((phi_id, src_id));
-                    }
+                // Parallel-move: push/pop through stack.
+                for (_phi_id, src_id) in &phi_ops {
+                    self.emit_load(*src_id, Reg64::R11);
+                    self.masm.push(Reg64::R11);
                 }
-
-                // Non-conflicting entries: direct copy, skip when
-                // source register already equals destination register.
-                for (phi_id, src_id) in &safe {
-                    match (self.alloc.location(*phi_id), self.alloc.location(*src_id)) {
-                        (Some(Location::Register(dn)), Some(Location::Register(sn)))
-                            if phys_reg(dn) != phys_reg(sn) =>
-                        {
-                            self.masm.mov_rr(phys_reg(dn), phys_reg(sn));
-                        }
-                        (Some(Location::Register(_)), Some(Location::Register(_))) => {
-                            // Same register — skip the MOV.
-                        }
-                        _ => {
-                            self.emit_load(*src_id, Reg64::R11);
-                            self.emit_store(*phi_id, Reg64::R11);
-                        }
-                    }
-                }
-
-                // Conflicting entries: parallel-move via push/pop.
-                if !conflicting.is_empty() {
-                    for &(_phi_id, src_id) in &conflicting {
-                        self.emit_load(src_id, Reg64::R11);
-                        self.masm.push(Reg64::R11);
-                    }
-                    for &(phi_id, _src_id) in conflicting.iter().rev() {
-                        self.masm.pop(Reg64::R11);
-                        self.emit_store(phi_id, Reg64::R11);
-                    }
+                for (phi_id, _src_id) in phi_ops.iter().rev() {
+                    self.masm.pop(Reg64::R11);
+                    self.emit_store(*phi_id, Reg64::R11);
                 }
             }
         }
@@ -5601,6 +5557,16 @@ impl<'a> MaglevCodegen<'a> {
         let mut done_label = Label::new();
 
         self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, off_callee);
+        self.masm.jne(&mut cache_miss);
+
+        // Guard: if the cached ctx_ptr is non-zero this is a closure
+        // call.  The raw context pointer may be dangling (the backing
+        // Rc can be dropped/replaced between calls), so we must NOT
+        // reuse it.  Fall through to cache_miss which calls
+        // jit_runtime_get_jit_entry for a fresh, live ctx_ptr.
+        self.masm
+            .mov_load_base_disp32(Reg64::Rax, Reg64::Rbp, off_ctx);
+        self.masm.test_rr(Reg64::Rax, Reg64::Rax);
         self.masm.jne(&mut cache_miss);
 
         // ── Mono HIT: inline JIT-to-JIT dispatch ─────────────────
