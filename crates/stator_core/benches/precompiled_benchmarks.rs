@@ -105,19 +105,14 @@ fn warmup_with_maglev(
 // ---------------------------------------------------------------------------
 
 fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
-    // Wrap in function to match V8's benchmark setup (local vars → registers,
-    // enables Maglev register allocation + LICM + global promotion).
     let source = r#"
-        function bench() {
-            var a = 0, b = 1;
-            for (var i = 0; i < 40; i++) {
-                var t = a + b;
-                a = b;
-                b = t;
-            }
-            return b;
+        var a = 0, b = 1;
+        for (var i = 0; i < 40; i++) {
+            var t = a + b;
+            a = b;
+            b = t;
         }
-        bench();
+        b;
     "#;
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
@@ -149,14 +144,11 @@ fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
 
 fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
     let source = r#"
-        function bench() {
-            var n = 0;
-            for (var i = 0; i < 10000; i++) {
-                n = (n + i * 3 - 1) | 0;
-            }
-            return n;
+        var n = 0;
+        for (var i = 0; i < 10000; i++) {
+            n = (n + i * 3 - 1) | 0;
         }
-        bench();
+        n;
     "#;
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
@@ -188,15 +180,12 @@ fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
 
 fn bench_property_access_1k_precompiled(c: &mut Criterion) {
     let source = r#"
-        function bench() {
-            var obj = { a: 1, b: 2, c: 3, d: 4, e: 5 };
-            var sum = 0;
-            for (var i = 0; i < 1000; i++) {
-                sum = sum + obj.a + obj.b + obj.c + obj.d + obj.e;
-            }
-            return sum;
+        var obj = { a: 1, b: 2, c: 3, d: 4, e: 5 };
+        var sum = 0;
+        for (var i = 0; i < 1000; i++) {
+            sum = sum + obj.a + obj.b + obj.c + obj.d + obj.e;
         }
-        bench();
+        sum;
     "#;
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
@@ -236,14 +225,11 @@ fn bench_property_access_1k_precompiled(c: &mut Criterion) {
 
 fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
     let source = r#"
-        function bench() {
-            var last;
-            for (var i = 0; i < 1000; i++) {
-                last = { x: i, y: i + 1, z: i * 2 };
-            }
-            return last.x + last.y + last.z;
+        var last;
+        for (var i = 0; i < 1000; i++) {
+            last = { x: i, y: i + 1, z: i * 2 };
         }
-        bench();
+        last.x + last.y + last.z;
     "#;
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
@@ -275,18 +261,15 @@ fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
 
 fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
     let source = r#"
-        function bench() {
-            var arr = [];
-            for (var i = 0; i < 1000; i++) {
-                arr.push(i);
-            }
-            var sum = 0;
-            for (var i = 0; i < arr.length; i++) {
-                sum = sum + arr[i];
-            }
-            return sum;
+        var arr = [];
+        for (var i = 0; i < 1000; i++) {
+            arr.push(i);
         }
-        bench();
+        var sum = 0;
+        for (var i = 0; i < arr.length; i++) {
+            sum = sum + arr[i];
+        }
+        sum;
     "#;
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
@@ -318,19 +301,16 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
 
 fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
     let source = r#"
-        function bench() {
-            function make_counter() {
-                var count = 0;
-                return function() { count = count + 1; return count; };
-            }
-            var counter = make_counter();
-            var result = 0;
-            for (var i = 0; i < 1000; i++) {
-                result = counter();
-            }
-            return result;
+        function make_counter() {
+            var count = 0;
+            return function() { count = count + 1; return count; };
         }
-        bench();
+        var counter = make_counter();
+        var result = 0;
+        for (var i = 0; i < 1000; i++) {
+            result = counter();
+        }
+        result;
     "#;
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
@@ -362,21 +342,18 @@ fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
 
 fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
     let source = r#"
-        function bench() {
-            function Base() {}
-            Base.prototype.x = 42;
-            function Mid() {}
-            Mid.prototype = new Base();
-            function Leaf() {}
-            Leaf.prototype = new Mid();
-            var obj = new Leaf();
-            var sum = 0;
-            for (var i = 0; i < 1000; i++) {
-                sum = sum + obj.x;
-            }
-            return sum;
+        function Base() {}
+        Base.prototype.x = 42;
+        function Mid() {}
+        Mid.prototype = new Base();
+        function Leaf() {}
+        Leaf.prototype = new Mid();
+        var obj = new Leaf();
+        var sum = 0;
+        for (var i = 0; i < 1000; i++) {
+            sum = sum + obj.x;
         }
-        bench();
+        sum;
     "#;
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
@@ -408,26 +385,23 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
 
 fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
     let source = r#"
-        function bench() {
-            var n = 1000;
-            var sieve = [];
-            for (var i = 0; i <= n; i++) sieve[i] = true;
-            sieve[0] = false;
-            sieve[1] = false;
-            for (var i = 2; i * i <= n; i++) {
-                if (sieve[i]) {
-                    for (var j = i * i; j <= n; j = j + i) {
-                        sieve[j] = false;
-                    }
+        var n = 1000;
+        var sieve = [];
+        for (var i = 0; i <= n; i++) sieve[i] = true;
+        sieve[0] = false;
+        sieve[1] = false;
+        for (var i = 2; i * i <= n; i++) {
+            if (sieve[i]) {
+                for (var j = i * i; j <= n; j = j + i) {
+                    sieve[j] = false;
                 }
             }
-            var count = 0;
-            for (var i = 0; i <= n; i++) {
-                if (sieve[i]) count = count + 1;
-            }
-            return count;
         }
-        bench();
+        var count = 0;
+        for (var i = 0; i <= n; i++) {
+            if (sieve[i]) count = count + 1;
+        }
+        count;
     "#;
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
@@ -454,15 +428,12 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
 
 fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
     let source = r#"
-        function bench() {
-            var root = { a: { b: { c: { d: { e: 99 } } } } };
-            var sum = 0;
-            for (var i = 0; i < 1000; i++) {
-                sum = sum + root.a.b.c.d.e;
-            }
-            return sum;
+        var root = { a: { b: { c: { d: { e: 99 } } } } };
+        var sum = 0;
+        for (var i = 0; i < 1000; i++) {
+            sum = sum + root.a.b.c.d.e;
         }
-        bench();
+        sum;
     "#;
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
