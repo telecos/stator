@@ -816,7 +816,11 @@ pub(crate) mod jit_runtime {
         // derived from Rc values that lived in the now-cleared heap.
         // A matching `callee_i64` (deterministic allocation from an empty
         // heap) would cause a use-after-free via the stale `ba_ptr`.
-        CACHED_CALLEE.with(|c| c.set(CachedCalleeEntry::EMPTY));
+        CACHED_CALLEE.with(|c| {
+            let old = c.get();
+            drop_cached_ctx_rc_raw(old.ctx_rc_raw);
+            c.set(CachedCalleeEntry::EMPTY);
+        });
         // Only reset the property and array-method ICs when the function
         // changes.  Re-entrant calls to the same BytecodeArray (e.g.
         // criterion iterations) keep warm IC state, saving ~190ns per
@@ -2897,8 +2901,16 @@ pub(crate) mod jit_runtime {
             let ctx_ref = unsafe { &*ptrs.context };
             let bc_ref = unsafe { &*ptrs.bytecode };
 
-            // SAFETY: no active borrows; read length via raw pointer.
-            let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+            let skip_args = ba.parameter_count() == 0;
+
+            // Defer heap_base for 0-param closures — on the Smi
+            // fast path the read and truncation are both skipped.
+            let heap_base = if skip_args {
+                0usize
+            } else {
+                // SAFETY: no active borrows; read length via raw pointer.
+                unsafe { (*heap_ref.as_ptr()).len() }
+            };
 
             // Compare callee context with current context — if they're
             // the same (common for closures in tight loops), skip the
@@ -2925,12 +2937,18 @@ pub(crate) mod jit_runtime {
             };
 
             bc_ref.set(&**ba as *const BytecodeArray);
+            if skip_args {
+                ptrs.set_skip_mapped_args(true);
+            }
 
             // SAFETY: cached executable code was produced by the
             // baseline compiler and contains valid x86-64 instructions.
             let jit_result = unsafe { exec.execute(jit_args, ctx_ptr) };
 
             bc_ref.set(saved_ba);
+            if skip_args {
+                ptrs.set_skip_mapped_args(false);
+            }
 
             // Fast path: non-heap results (Smi, bool, undefined, null) don't
             // reference heap handles and survive truncation unchanged.  Skip
@@ -2938,9 +2956,11 @@ pub(crate) mod jit_runtime {
             if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
                 // SAFETY: no active borrows; skip truncation when the
                 // callee allocated no heap handles.
-                unsafe {
-                    if (*heap_ref.as_ptr()).len() != heap_base {
-                        (*heap_ref.as_ptr()).truncate(heap_base);
+                if !skip_args {
+                    unsafe {
+                        if (*heap_ref.as_ptr()).len() != heap_base {
+                            (*heap_ref.as_ptr()).truncate(heap_base);
+                        }
                     }
                 }
                 if let Some(ctx) = saved_ctx {
@@ -2948,6 +2968,13 @@ pub(crate) mod jit_runtime {
                 }
                 return Some(jit_result);
             }
+
+            // Slow paths need the real heap_base.
+            let heap_base = if skip_args {
+                unsafe { (*heap_ref.as_ptr()).len() }
+            } else {
+                heap_base
+            };
 
             // Heap handle or deopt: resolve the handle before truncation
             // destroys it, then re-encode after cleanup.
@@ -3028,8 +3055,16 @@ pub(crate) mod jit_runtime {
             let ctx_ref = unsafe { &*ptrs.context };
             let bc_ref = unsafe { &*ptrs.bytecode };
 
-            // SAFETY: no active borrows; read length via raw pointer.
-            let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
+            let skip_args = ba.parameter_count() == 0;
+
+            // Defer heap_base for 0-param closures — on the Smi
+            // fast path the read and truncation are both skipped.
+            let heap_base = if skip_args {
+                0usize
+            } else {
+                // SAFETY: no active borrows; read length via raw pointer.
+                unsafe { (*heap_ref.as_ptr()).len() }
+            };
 
             let callee_ctx_raw = ba.closure_context();
             let callee_ctx_ptr = callee_ctx_raw.map(Rc::as_ptr).unwrap_or(std::ptr::null());
@@ -3050,17 +3085,25 @@ pub(crate) mod jit_runtime {
             };
 
             bc_ref.set(&**ba as *const BytecodeArray);
+            if skip_args {
+                ptrs.set_skip_mapped_args(true);
+            }
             let ctx_raw = callee_ctx_ptr as i64;
             // SAFETY: Maglev code is valid x86-64.  Context set in TLS.
             let jit_result = unsafe { maglev_exec.execute(jit_args, ctx_raw) };
             bc_ref.set(saved_ba);
+            if skip_args {
+                ptrs.set_skip_mapped_args(false);
+            }
 
             if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
                 // SAFETY: no active borrows; skip truncation when the
                 // callee allocated no heap handles.
-                unsafe {
-                    if (*heap_ref.as_ptr()).len() != heap_base {
-                        (*heap_ref.as_ptr()).truncate(heap_base);
+                if !skip_args {
+                    unsafe {
+                        if (*heap_ref.as_ptr()).len() != heap_base {
+                            (*heap_ref.as_ptr()).truncate(heap_base);
+                        }
                     }
                 }
                 if let Some(ctx) = saved_ctx {
@@ -3068,6 +3111,13 @@ pub(crate) mod jit_runtime {
                 }
                 return Some(jit_result);
             }
+
+            // Slow paths need the real heap_base.
+            let heap_base = if skip_args {
+                unsafe { (*heap_ref.as_ptr()).len() }
+            } else {
+                heap_base
+            };
 
             let result_val = if is_jit_deopt(jit_result) {
                 None
@@ -3465,7 +3515,15 @@ pub(crate) mod jit_runtime {
                     let saved_ctx = if same_context {
                         None
                     } else {
-                        let callee_ctx = ba.closure_context().cloned();
+                        // Zero-cost context swap: create an Rc from the
+                        // cached raw pointer without touching atomic
+                        // refcounts.  The matching `Rc::into_raw` on
+                        // restore converts it back without decrementing.
+                        let callee_ctx = if !cached_entry.ctx_rc_raw.is_null() {
+                            Some(unsafe { Rc::from_raw(cached_entry.ctx_rc_raw) })
+                        } else {
+                            None
+                        };
                         Some(unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx) })
                     };
 
@@ -3503,8 +3561,14 @@ pub(crate) mod jit_runtime {
                                 }
                             }
                         }
-                        if let Some(ctx) = saved_ctx {
-                            unsafe { *ctx_ref.as_ptr() = ctx };
+                        if let Some(saved) = saved_ctx {
+                            // Zero-cost restore: swap back, convert the
+                            // removed callee Rc to raw (no refcount change).
+                            let removed =
+                                unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), saved) };
+                            if let Some(rc) = removed {
+                                let _ = Rc::into_raw(rc);
+                            }
                         }
                         return Some(jit_result);
                     }
@@ -3531,8 +3595,12 @@ pub(crate) mod jit_runtime {
                                 (*heap_ref.as_ptr()).truncate(heap_base);
                             }
                         }
-                        if let Some(ctx) = saved_ctx {
-                            unsafe { *ctx_ref.as_ptr() = ctx };
+                        if let Some(saved) = saved_ctx {
+                            let removed =
+                                unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), saved) };
+                            if let Some(rc) = removed {
+                                let _ = Rc::into_raw(rc);
+                            }
                         }
                         // Fall through to baseline JIT / interpreter.
                     } else {
@@ -3542,8 +3610,12 @@ pub(crate) mod jit_runtime {
                                 (*heap_ref.as_ptr()).truncate(heap_base);
                             }
                         }
-                        if let Some(ctx) = saved_ctx {
-                            unsafe { *ctx_ref.as_ptr() = ctx };
+                        if let Some(saved) = saved_ctx {
+                            let removed =
+                                unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), saved) };
+                            if let Some(rc) = removed {
+                                let _ = Rc::into_raw(rc);
+                            }
                         }
                         return result_val.map(jsvalue_to_jit_i64);
                     }
@@ -3601,7 +3673,11 @@ pub(crate) mod jit_runtime {
                         let saved_ctx = if same_context {
                             None
                         } else {
-                            let callee_ctx = callee_ctx_raw.cloned();
+                            let callee_ctx = if !cached_entry.ctx_rc_raw.is_null() {
+                                Some(unsafe { Rc::from_raw(cached_entry.ctx_rc_raw) })
+                            } else {
+                                callee_ctx_raw.cloned()
+                            };
                             Some(unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx) })
                         };
 
@@ -3625,8 +3701,12 @@ pub(crate) mod jit_runtime {
                                     }
                                 }
                             }
-                            if let Some(ctx) = saved_ctx {
-                                unsafe { *ctx_ref.as_ptr() = ctx };
+                            if let Some(saved) = saved_ctx {
+                                let removed =
+                                    unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), saved) };
+                                if let Some(rc) = removed {
+                                    let _ = Rc::into_raw(rc);
+                                }
                             }
                             return Some(jit_result);
                         }
@@ -3653,9 +3733,12 @@ pub(crate) mod jit_runtime {
                                     (*heap_ref.as_ptr()).truncate(heap_base);
                                 }
                             }
-                            if let Some(ctx) = saved_ctx {
-                                // SAFETY: no active borrows; restore context.
-                                unsafe { *ctx_ref.as_ptr() = ctx };
+                            if let Some(saved) = saved_ctx {
+                                let removed =
+                                    unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), saved) };
+                                if let Some(rc) = removed {
+                                    let _ = Rc::into_raw(rc);
+                                }
                             }
                             // Fall through to baseline JIT / interpreter.
                         } else {
@@ -3665,8 +3748,12 @@ pub(crate) mod jit_runtime {
                                     (*heap_ref.as_ptr()).truncate(heap_base);
                                 }
                             }
-                            if let Some(ctx) = saved_ctx {
-                                unsafe { *ctx_ref.as_ptr() = ctx };
+                            if let Some(saved) = saved_ctx {
+                                let removed =
+                                    unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), saved) };
+                                if let Some(rc) = removed {
+                                    let _ = Rc::into_raw(rc);
+                                }
                             }
                             return result_val.map(jsvalue_to_jit_i64);
                         }
@@ -3711,7 +3798,11 @@ pub(crate) mod jit_runtime {
                         let saved_ctx = if same_context {
                             None
                         } else {
-                            let callee_ctx = ba.closure_context().cloned();
+                            let callee_ctx = if !entry.ctx_rc_raw.is_null() {
+                                Some(unsafe { Rc::from_raw(entry.ctx_rc_raw) })
+                            } else {
+                                ba.closure_context().cloned()
+                            };
                             Some(unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx) })
                         };
 
@@ -3745,8 +3836,12 @@ pub(crate) mod jit_runtime {
                                     }
                                 }
                             }
-                            if let Some(ctx) = saved_ctx {
-                                unsafe { *ctx_ref.as_ptr() = ctx };
+                            if let Some(saved) = saved_ctx {
+                                let removed =
+                                    unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), saved) };
+                                if let Some(rc) = removed {
+                                    let _ = Rc::into_raw(rc);
+                                }
                             }
                             return Some(jit_result);
                         }
@@ -3760,14 +3855,20 @@ pub(crate) mod jit_runtime {
 
                         if is_jit_deopt(jit_result) {
                             ba.mark_jit_baseline_deopted();
+                            // Drop ctx_rc_raw before clearing the entry.
+                            drop_cached_ctx_rc_raw(entry.ctx_rc_raw);
                             ptrs.set_cached_callee(CachedCalleeEntry::EMPTY);
                             unsafe {
                                 if (*heap_ref.as_ptr()).len() != heap_base {
                                     (*heap_ref.as_ptr()).truncate(heap_base);
                                 }
                             }
-                            if let Some(ctx) = saved_ctx {
-                                unsafe { *ctx_ref.as_ptr() = ctx };
+                            if let Some(saved) = saved_ctx {
+                                let removed =
+                                    unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), saved) };
+                                if let Some(rc) = removed {
+                                    let _ = Rc::into_raw(rc);
+                                }
                             }
                         } else {
                             let result_val = jit_to_jsvalue_ext(jit_result);
@@ -3776,8 +3877,12 @@ pub(crate) mod jit_runtime {
                                     (*heap_ref.as_ptr()).truncate(heap_base);
                                 }
                             }
-                            if let Some(ctx) = saved_ctx {
-                                unsafe { *ctx_ref.as_ptr() = ctx };
+                            if let Some(saved) = saved_ctx {
+                                let removed =
+                                    unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), saved) };
+                                if let Some(rc) = removed {
+                                    let _ = Rc::into_raw(rc);
+                                }
                             }
                             return result_val.map(jsvalue_to_jit_i64);
                         }
@@ -3815,7 +3920,11 @@ pub(crate) mod jit_runtime {
                     let saved_ctx = if same_context {
                         None
                     } else {
-                        let callee_ctx = callee_ctx_raw.cloned();
+                        let callee_ctx = if !cached_entry.ctx_rc_raw.is_null() {
+                            Some(unsafe { Rc::from_raw(cached_entry.ctx_rc_raw) })
+                        } else {
+                            callee_ctx_raw.cloned()
+                        };
                         // SAFETY: no active borrows of context RefCell.
                         Some(unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx) })
                     };
@@ -3845,8 +3954,12 @@ pub(crate) mod jit_runtime {
                                 }
                             }
                         }
-                        if let Some(ctx) = saved_ctx {
-                            unsafe { *ctx_ref.as_ptr() = ctx };
+                        if let Some(saved) = saved_ctx {
+                            let removed =
+                                unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), saved) };
+                            if let Some(rc) = removed {
+                                let _ = Rc::into_raw(rc);
+                            }
                         }
                         return Some(jit_result);
                     }
@@ -3869,8 +3982,12 @@ pub(crate) mod jit_runtime {
                                 (*heap_ref.as_ptr()).truncate(heap_base);
                             }
                         }
-                        if let Some(ctx) = saved_ctx {
-                            unsafe { *ctx_ref.as_ptr() = ctx };
+                        if let Some(saved) = saved_ctx {
+                            let removed =
+                                unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), saved) };
+                            if let Some(rc) = removed {
+                                let _ = Rc::into_raw(rc);
+                            }
                         }
                         // Fall through to interpreter below.
                     } else {
@@ -3881,8 +3998,12 @@ pub(crate) mod jit_runtime {
                                 (*heap_ref.as_ptr()).truncate(heap_base);
                             }
                         }
-                        if let Some(ctx) = saved_ctx {
-                            unsafe { *ctx_ref.as_ptr() = ctx };
+                        if let Some(saved) = saved_ctx {
+                            let removed =
+                                unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), saved) };
+                            if let Some(rc) = removed {
+                                let _ = Rc::into_raw(rc);
+                            }
                         }
                         return result_val.map(jsvalue_to_jit_i64);
                     }
