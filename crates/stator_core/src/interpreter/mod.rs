@@ -5457,12 +5457,33 @@ impl Interpreter {
                     }
                     Opcode::CreateObjectLiteral => {
                         if let Operand::FeedbackSlot(s) = *instr.operand(1) {
+                            // Fast path: clone from cached template.
                             if let Some(rc) =
                                 frame.bytecode_array.clone_object_literal_template_pooled(s)
                             {
                                 acc = JsValue::PlainObject(rc);
                                 continue 'dispatch;
                             }
+                            // Second execution: promote pending to cached.
+                            if let Some(rc) = frame
+                                .bytecode_array
+                                .promote_object_literal_template_pooled(s)
+                            {
+                                acc = JsValue::PlainObject(rc);
+                                continue 'dispatch;
+                            }
+                            // First execution: create normally and record.
+                            let capacity = match instr.operand_at(2) {
+                                Some(Operand::Flag(count)) if *count > 0 => *count as usize,
+                                _ => 4,
+                            };
+                            let map = PropertyMap::with_capacity(capacity);
+                            let rc = Rc::new(RefCell::new(map));
+                            frame
+                                .bytecode_array
+                                .set_object_literal_pending(s, Rc::clone(&rc));
+                            acc = JsValue::PlainObject(rc);
+                            continue 'dispatch;
                         }
                         frame.pc = pc;
                         frame.accumulator = acc;

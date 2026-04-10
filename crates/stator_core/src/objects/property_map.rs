@@ -295,13 +295,9 @@ pub(crate) fn acquire_object_rc_from_template_with_values(
                 // exclusively owned (just popped, strong_count == 1) so
                 // there are no outstanding borrows.
                 let map = unsafe { &mut *rc.as_ptr() };
-                if Rc::ptr_eq(&map.keys, &template.keys) && map.values.len() == values.len() {
-                    // Same template — skip Rc refcount ops and redundant
-                    // field writes; just overwrite the values in place.
-                    map.reinitialize_values_inplace(values);
-                } else {
-                    map.reinitialize_from_template_with_values(template, values);
-                }
+                // reinitialize_from_template_with_values handles the
+                // same-template fast path internally.
+                map.reinitialize_from_template_with_values(template, values);
                 rc
             } else {
                 Rc::new(RefCell::new(
@@ -748,8 +744,36 @@ impl PropertyMap {
     /// [`ObjectLiteralTemplate::instantiate`]: instead of building a fresh
     /// `PropertyMap`, it overwrites `self` in place — reusing the values
     /// `Vec` allocation and avoiding the values-pool lookup.
+    ///
+    /// When the recycled map was created from the **same** template
+    /// (detected via [`Rc::ptr_eq`] on keys), the method takes an
+    /// ultra-fast path that skips all `Rc` refcount operations and
+    /// redundant scalar writes — reducing per-object overhead to ~4
+    /// field writes on the hot loop.
+    #[inline(always)]
     fn reinitialize_from_template(&mut self, template: &ObjectLiteralTemplate) {
         let cap = template.keys.len();
+
+        // Ultra-fast path: same template — the structural shape (keys,
+        // attrs, index, shape_id, layout_id, extensible, has_accessors)
+        // is already correct.  Skip Rc refcount ops and most writes.
+        if Rc::ptr_eq(&self.keys, &template.keys) && self.values.len() == cap {
+            // For flat old values (Smi, HeapNumber, Bool, etc.) we can
+            // skip the clear entirely: template fill will overwrite all
+            // slots before anyone reads the object.  Non-flat values
+            // (String, PlainObject, etc.) must be dropped to avoid leaks.
+            if !Self::all_flat(&self.values[..cap]) {
+                for v in self.values.iter_mut() {
+                    *v = JsValue::Undefined;
+                }
+            }
+            self.template_next_slot = 0;
+            self.proto_generation.set(0);
+            self.proto_epoch.set(0);
+            self.proto_global_epoch.set(0);
+            return;
+        }
+
         let capacity_hint = template.capacity_hint.max(cap);
 
         self.values.clear();
@@ -779,6 +803,11 @@ impl PropertyMap {
     /// Like [`reinitialize_from_template`](Self::reinitialize_from_template)
     /// but copies `values` into the existing values `Vec` instead of
     /// filling with `Undefined`.
+    ///
+    /// When the recycled map was created from the same template, this
+    /// delegates to [`reinitialize_values_inplace`] which skips all `Rc`
+    /// refcount operations and uses `memcpy` for flat value types.
+    #[inline(always)]
     fn reinitialize_from_template_with_values(
         &mut self,
         template: &ObjectLiteralTemplate,
@@ -786,6 +815,14 @@ impl PropertyMap {
     ) {
         let cap = template.keys.len();
         debug_assert_eq!(values.len(), cap);
+
+        // Ultra-fast path: same template — delegate to the values-only
+        // reinitializer which skips Rc refcount ops entirely.
+        if Rc::ptr_eq(&self.keys, &template.keys) && self.values.len() == cap {
+            self.reinitialize_values_inplace(values);
+            return;
+        }
+
         let capacity_hint = template.capacity_hint.max(cap);
 
         // When the vec already has the right length, overwrite in place

@@ -542,6 +542,12 @@ pub struct BytecodeArray {
     /// [`clone_for_closure`] shares the counter across all clones — a
     /// deopt in one clone counts toward the limit for all of them.
     jit_maglev_deopt_count: Rc<Cell<u32>>,
+    /// Invocation count at which Maglev should next be attempted after a
+    /// deopt.  When deopt happens, this is set to
+    /// `invocation_count + 2^deopt_count`, creating exponential backoff
+    /// that lets the interpreter run (with warm ICs) instead of
+    /// repeatedly entering and immediately deopting Maglev code.
+    maglev_next_try_at: Rc<Cell<u32>>,
     /// Captured closure context set by `CreateClosure`.
     ///
     /// When a function is created as a closure, this holds the enclosing
@@ -735,6 +741,7 @@ impl BytecodeArray {
             turbofan_compile_started: Arc::new(AtomicBool::new(false)),
             jit_baseline_deopted: Rc::new(Cell::new(false)),
             jit_maglev_deopt_count: Rc::new(Cell::new(0)),
+            maglev_next_try_at: Rc::new(Cell::new(0)),
             closure_context: None,
             writes_closure_vars: false,
             has_fn_props: Cell::new(false),
@@ -1700,10 +1707,24 @@ impl BytecodeArray {
     /// split prevents cross-contamination, so a generous limit is safe.
     const MAX_MAGLEV_DEOPT_RETRIES: u32 = 10_000;
 
-    /// Returns `true` if Maglev JIT code has deopted too many times and
-    /// should no longer be attempted.
+    /// Returns `true` if Maglev JIT code should NOT be attempted right now.
+    ///
+    /// This is true in two cases:
+    /// 1. The total deopt count exceeds [`MAX_MAGLEV_DEOPT_RETRIES`].
+    /// 2. The function is in an exponential cooldown period after a recent
+    ///    deopt (invocation_count < next_try_at).
     pub fn jit_maglev_has_deopted(&self) -> bool {
-        self.jit_maglev_deopt_count.get() >= Self::MAX_MAGLEV_DEOPT_RETRIES
+        let count = self.jit_maglev_deopt_count.get();
+        if count >= Self::MAX_MAGLEV_DEOPT_RETRIES {
+            return true;
+        }
+        // Exponential cooldown: skip Maglev until enough interpreter
+        // invocations have elapsed since last deopt.
+        let next = self.maglev_next_try_at.get();
+        if next > 0 && self.invocation_count.get() < next {
+            return true;
+        }
+        false
     }
 
     /// Returns the current Maglev deopt count for diagnostics.

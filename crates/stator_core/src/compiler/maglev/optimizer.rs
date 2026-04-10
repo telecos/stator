@@ -866,7 +866,9 @@ fn eliminate_identity_operations_global(graph: &mut MaglevGraph) {
                     }
                 }
                 // x + 0 → x, 0 + x → x
-                ValueNode::Int32Add { left, right } => {
+                ValueNode::Int32Add { left, right }
+                | ValueNode::CheckedSmiAdd { left, right }
+                | ValueNode::GenericAdd { left, right, .. } => {
                     if consts.get(right) == Some(&0) {
                         Some(*left)
                     } else if consts.get(left) == Some(&0) {
@@ -876,7 +878,9 @@ fn eliminate_identity_operations_global(graph: &mut MaglevGraph) {
                     }
                 }
                 // x - 0 → x
-                ValueNode::Int32Subtract { left, right } => {
+                ValueNode::Int32Subtract { left, right }
+                | ValueNode::CheckedSmiSubtract { left, right }
+                | ValueNode::GenericSubtract { left, right, .. } => {
                     if consts.get(right) == Some(&0) {
                         Some(*left)
                     } else {
@@ -884,7 +888,9 @@ fn eliminate_identity_operations_global(graph: &mut MaglevGraph) {
                     }
                 }
                 // x * 1 → x, 1 * x → x
-                ValueNode::Int32Multiply { left, right } => {
+                ValueNode::Int32Multiply { left, right }
+                | ValueNode::CheckedSmiMultiply { left, right }
+                | ValueNode::GenericMultiply { left, right, .. } => {
                     if consts.get(right) == Some(&1) {
                         Some(*left)
                     } else if consts.get(left) == Some(&1) {

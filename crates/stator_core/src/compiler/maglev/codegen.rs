@@ -1283,11 +1283,24 @@ impl<'a> MaglevCodegen<'a> {
             ValueNode::Int32BitwiseOr { left, right } => {
                 if let Some(imm) = self.try_get_i32_constant(*right) {
                     if imm == 0 {
-                        // OR x, 0 is identity — just copy left to result.
-                        self.emit_load(*left, Reg64::R11);
-                        self.emit_store(id, Reg64::R11);
+                        // OR x, 0 is identity — skip entirely when src and
+                        // dst share the same location.
+                        if self.alloc.location(id) != self.alloc.location(*left) {
+                            self.emit_load(*left, Reg64::R11);
+                            self.emit_store(id, Reg64::R11);
+                        }
                     } else {
                         self.emit_int32_binop_imm(*left, imm, id, MacroAssembler::or_ri);
+                    }
+                } else if let Some(imm) = self.try_get_i32_constant(*left) {
+                    if imm == 0 {
+                        // 0 | x is identity.
+                        if self.alloc.location(id) != self.alloc.location(*right) {
+                            self.emit_load(*right, Reg64::R11);
+                            self.emit_store(id, Reg64::R11);
+                        }
+                    } else {
+                        self.emit_int32_binop_imm(*right, imm, id, MacroAssembler::or_ri);
                     }
                 } else {
                     self.emit_int32_binop(*left, *right, id, MacroAssembler::or_rr);
@@ -2862,8 +2875,13 @@ impl<'a> MaglevCodegen<'a> {
                 // No conflicts — safe to do direct copies.
                 for (phi_id, src_id) in &phi_ops {
                     match (self.alloc.location(*phi_id), self.alloc.location(*src_id)) {
-                        (Some(Location::Register(dn)), Some(Location::Register(sn))) => {
+                        (Some(Location::Register(dn)), Some(Location::Register(sn)))
+                            if phys_reg(dn) != phys_reg(sn) =>
+                        {
                             self.masm.mov_rr(phys_reg(dn), phys_reg(sn));
+                        }
+                        (Some(Location::Register(_)), Some(Location::Register(_))) => {
+                            // Same register — skip.
                         }
                         _ => {
                             self.emit_load(*src_id, Reg64::R11);
@@ -4248,6 +4266,26 @@ impl<'a> MaglevCodegen<'a> {
         if (self.i32_range.contains(&left) && self.i32_range.contains(&right))
             || (self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right))
         {
+            // Identity: x | 0 → x, 0 | x → x.  Skip entirely when the
+            // result shares the same location as the non-zero operand.
+            let is_zero = |n: NodeId| self.try_get_i32_constant(n) == Some(0);
+            if is_zero(right) {
+                if self.alloc.location(id) != self.alloc.location(left) {
+                    self.emit_load(left, Reg64::R11);
+                    self.emit_store(id, Reg64::R11);
+                }
+                self.rax_holds = None;
+                return;
+            }
+            if is_zero(left) {
+                if self.alloc.location(id) != self.alloc.location(right) {
+                    self.emit_load(right, Reg64::R11);
+                    self.emit_store(id, Reg64::R11);
+                }
+                self.rax_holds = None;
+                return;
+            }
+
             match self.alloc.location(id) {
                 Some(Location::Register(n)) => {
                     let dst = phys_reg(n);
