@@ -81,6 +81,8 @@ fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
         ba.maglev_deopt_count(),
         ba.invocation_count(),
     );
+    // Reset deopt cooldown so Maglev re-enters during Criterion measurement.
+    ba.reset_maglev_deopt_count();
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("fib_40_iterative_precompiled", |b| {
@@ -128,6 +130,7 @@ fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
         ba.maglev_deopt_count(),
         ba.invocation_count(),
     );
+    ba.reset_maglev_deopt_count();
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("arithmetic_loop_10k_precompiled", |b| {
@@ -176,6 +179,7 @@ fn bench_property_access_1k_precompiled(c: &mut Criterion) {
         ba.maglev_deopt_count(),
         ba.invocation_count(),
     );
+    ba.reset_maglev_deopt_count();
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("property_access_1k_precompiled", |b| {
@@ -231,6 +235,7 @@ fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
         ba.maglev_deopt_count(),
         ba.invocation_count(),
     );
+    ba.reset_maglev_deopt_count();
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("object_creation_1k_precompiled", |b| {
@@ -282,6 +287,7 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
         ba.maglev_deopt_count(),
         ba.invocation_count(),
     );
+    ba.reset_maglev_deopt_count();
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("array_push_sum_1k_precompiled", |b| {
@@ -334,6 +340,7 @@ fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
         ba.maglev_deopt_count(),
         ba.invocation_count(),
     );
+    ba.reset_maglev_deopt_count();
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("closure_counter_1k_precompiled", |b| {
@@ -388,6 +395,7 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
         ba.maglev_deopt_count(),
         ba.invocation_count(),
     );
+    ba.reset_maglev_deopt_count();
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("prototype_chain_1k_precompiled", |b| {
@@ -447,6 +455,7 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
         ba.maglev_deopt_count(),
         ba.invocation_count(),
     );
+    ba.reset_maglev_deopt_count();
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("sieve_primes_1k_precompiled", |b| {
@@ -495,6 +504,7 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
         ba.maglev_deopt_count(),
         ba.invocation_count(),
     );
+    ba.reset_maglev_deopt_count();
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("deep_object_access_1k_precompiled", |b| {
