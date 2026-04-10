@@ -3422,11 +3422,6 @@ impl Interpreter {
                     let mut smi_vars_dirty = false;
                     'smi: loop {
                         if pc >= frame.loop_end_pc {
-                            // Flush deferred slot writes.
-                            if smi_vars_dirty {
-                                frame.global_env.borrow_mut().sync_slots_to_vars();
-                                frame.global_cache_invalidate();
-                            }
                             frame.loop_end_pc = 0;
                             acc = materialize_acc!();
                             frame.smi_mode = false;
@@ -3471,11 +3466,6 @@ impl Interpreter {
                                     | Opcode::LdaGlobalStar
                             )
                         {
-                            // Flush deferred slot writes.
-                            if smi_vars_dirty {
-                                frame.global_env.borrow_mut().sync_slots_to_vars();
-                                frame.global_cache_invalidate();
-                            }
                             acc = materialize_acc!();
                             frame.smi_mode = false;
                             frame.loop_end_pc = 0;
@@ -4924,17 +4914,26 @@ impl Interpreter {
                                 if sa >= 0
                                     && let JsValue::Array(items) = obj
                                 {
-                                    let borrow = items.borrow();
-                                    let result = borrow
-                                        .get(sa as usize)
-                                        .cloned()
-                                        .unwrap_or(JsValue::Undefined);
-                                    drop(borrow);
+                                    // SAFETY: single-threaded interpreter; no
+                                    // concurrent borrows possible.  Bypasses
+                                    // RefCell overhead on the hot path.
+                                    let data = unsafe { &*items.as_ptr() };
+                                    let i = sa as usize;
+                                    let result = if i < data.len() {
+                                        unsafe { data.get_unchecked(i) }.cheap_clone()
+                                    } else {
+                                        JsValue::Undefined
+                                    };
                                     if let JsValue::Smi(v) = result {
                                         sa = v;
                                         smi_acc_bool = false;
                                         smi_acc_spilled = false;
                                         hot_acc = Some(NanBoxedValue::from_smi(v));
+                                    } else if let JsValue::Boolean(b) = result {
+                                        sa = b as i32;
+                                        smi_acc_bool = true;
+                                        smi_acc_spilled = false;
+                                        hot_acc = Some(NanBoxedValue::from_boolean(b));
                                     } else {
                                         acc = result;
                                         smi_acc_spilled = true;
@@ -4960,12 +4959,17 @@ impl Interpreter {
                                     let i = *idx as usize;
                                     let obj_ref = unsafe { frame.read_reg_unchecked(obj_v) };
                                     if let JsValue::Array(items) = obj_ref {
-                                        let items_rc = Rc::clone(items);
-                                        let mut v = items_rc.borrow_mut();
-                                        if i >= v.len() {
-                                            v.resize(i + 1, JsValue::TheHole);
+                                        // SAFETY: single-threaded interpreter; no
+                                        // concurrent borrows possible.
+                                        let v = unsafe { &mut *items.as_ptr() };
+                                        if i < v.len() {
+                                            unsafe { *v.get_unchecked_mut(i) = materialize_acc!() };
+                                        } else if i == v.len() {
+                                            v.push(materialize_acc!());
+                                        } else {
+                                            v.resize(i, JsValue::TheHole);
+                                            v.push(materialize_acc!());
                                         }
-                                        v[i] = materialize_acc!();
                                         continue 'smi;
                                     }
                                 }
@@ -5340,11 +5344,6 @@ impl Interpreter {
                             _ => {
                                 // Unsupported opcode — exit SMI loop and let
                                 // the regular dispatch handle it.
-                                // Flush deferred slot writes.
-                                if smi_vars_dirty {
-                                    frame.global_env.borrow_mut().sync_slots_to_vars();
-                                    frame.global_cache_invalidate();
-                                }
                                 acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
@@ -5353,6 +5352,13 @@ impl Interpreter {
                             }
                         }
                         continue 'smi;
+                    }
+                    // After exiting the SMI loop: flush deferred IC slot
+                    // writes so that both `vars` and `global_cache` reflect
+                    // any StaGlobal IC writes made during the loop.
+                    if smi_vars_dirty {
+                        frame.global_env.borrow_mut().sync_slots_to_vars();
+                        frame.global_cache_invalidate();
                     }
                     continue 'dispatch;
                 }
@@ -7080,6 +7086,28 @@ impl Interpreter {
                                     continue 'dispatch;
                                 }
                             }
+
+                            // Poly-load cache: check Array/Function by pointer
+                            // identity (covers array method lookups like
+                            // `arr.push`).
+                            if let Some(obj_ptr) = match obj {
+                                JsValue::Array(arr) => Some(Rc::as_ptr(arr) as usize),
+                                JsValue::Function(ba) => Some(Rc::as_ptr(ba) as usize),
+                                _ => None,
+                            } {
+                                if let Some(entries) = frame
+                                    .poly_load_cache
+                                    .as_ref()
+                                    .and_then(|cache| cache.get(&slot))
+                                {
+                                    for &(cached_ptr, ref cached_val) in entries {
+                                        if cached_ptr == obj_ptr {
+                                            acc = cached_val.cheap_clone();
+                                            continue 'dispatch;
+                                        }
+                                    }
+                                }
+                            }
                         }
                         // Fall through to table dispatch for misses and
                         // non-PlainObject receivers.
@@ -7238,14 +7266,20 @@ impl Interpreter {
                         {
                             let obj = unsafe { frame.read_reg_unchecked(obj_v) };
                             if let JsValue::Array(items) = obj {
-                                let borrow = items.borrow();
+                                // SAFETY: single-threaded interpreter; no
+                                // concurrent borrows possible.
+                                let data = unsafe { &*items.as_ptr() };
                                 let i = *idx as usize;
-                                let result = match borrow.get(i) {
-                                    Some(v) if !v.is_the_hole() => v.clone(),
-                                    _ => JsValue::Undefined,
+                                acc = if i < data.len() {
+                                    let v = unsafe { data.get_unchecked(i) };
+                                    if !v.is_the_hole() {
+                                        v.cheap_clone()
+                                    } else {
+                                        JsValue::Undefined
+                                    }
+                                } else {
+                                    JsValue::Undefined
                                 };
-                                drop(borrow);
-                                acc = result;
                                 continue 'dispatch;
                             }
                         }
@@ -7295,11 +7329,12 @@ impl Interpreter {
                                 let i = *idx as usize;
                                 let obj_ref = unsafe { frame.read_reg_unchecked(obj_v) };
                                 if let JsValue::Array(items) = obj_ref {
-                                    let items_rc = Rc::clone(items);
                                     let val = acc.cheap_clone();
-                                    let mut v = items_rc.borrow_mut();
+                                    // SAFETY: single-threaded interpreter; no
+                                    // concurrent borrows possible.
+                                    let v = unsafe { &mut *items.as_ptr() };
                                     if i < v.len() {
-                                        v[i] = val;
+                                        unsafe { *v.get_unchecked_mut(i) = val };
                                     } else if i == v.len() {
                                         v.push(val);
                                     } else {
@@ -7761,16 +7796,16 @@ impl Interpreter {
                         let arg_reg = unsafe { operand_reg_unchecked(instr, 2) };
                         let callee = unsafe { frame.read_reg_unchecked(callee_reg) };
                         if let JsValue::PlainObject(callee_map) = callee {
-                            let method_name = callee_map
-                                .borrow()
-                                .get(FAST_ARRAY_METHOD_KEY)
-                                .and_then(|v| {
-                                    if let JsValue::String(s) = v {
-                                        Some(Rc::clone(s))
-                                    } else {
-                                        None
-                                    }
-                                });
+                            // SAFETY: single-threaded interpreter; no
+                            // concurrent borrows possible.
+                            let callee_pm = unsafe { &*callee_map.as_ptr() };
+                            let method_name = callee_pm.get(FAST_ARRAY_METHOD_KEY).and_then(|v| {
+                                if let JsValue::String(s) = v {
+                                    Some(Rc::clone(s))
+                                } else {
+                                    None
+                                }
+                            });
                             if let Some(name) = method_name {
                                 let recv = unsafe { frame.read_reg_unchecked(recv_reg) };
                                 if let JsValue::Array(arr) = recv {
@@ -7778,7 +7813,9 @@ impl Interpreter {
                                         unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
                                     acc = match &*name {
                                         "push" => {
-                                            let mut items = arr.borrow_mut();
+                                            // SAFETY: single-threaded; no
+                                            // concurrent borrows.
+                                            let items = unsafe { &mut *arr.as_ptr() };
                                             items.push(arg);
                                             JsValue::Smi(items.len() as i32)
                                         }
