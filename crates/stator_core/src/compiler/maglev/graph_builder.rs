@@ -13,11 +13,12 @@
 //! The builder consults the feedback vector to decide whether to emit
 //! *speculative* (fast-path) IR or *generic* (slow-path) IR:
 //!
-//! - **Arithmetic** — when the binary-op slot shows
-//!   [`InlineCacheState::Monomorphic`] or [`InlineCacheState::Polymorphic`]
-//!   the builder emits [`ValueNode::CheckedSmiAdd`] (or the matching
-//!   variant), preceded by [`ValueNode::CheckSmi`] guards on both operands.
-//!   Otherwise it falls back to [`ValueNode::GenericAdd`] (etc.).
+//! - **Arithmetic** — the builder always emits [`ValueNode::GenericAdd`]
+//!   (or the matching variant) for all binary arithmetic operations.
+//!   Generic ops enable `smi_guarded` analysis on upstream loads and
+//!   have a runtime fallback on overflow instead of deopt.  The codegen
+//!   selects the optimal path at emit time: inline i32 ALU for
+//!   `smi_guarded` loads, or full Smi-check + runtime fallback otherwise.
 //!
 //! - **Property loads** — when the load-property slot shows
 //!   [`InlineCacheState::Monomorphic`] the builder emits a
@@ -1898,17 +1899,16 @@ impl<'a> GraphBuilder<'a> {
         is_keyed_kind && is_warm
     }
 
-    /// Emit a binary arithmetic operation.
+    /// Emit a binary operation using Generic IR nodes.
     ///
-    /// Always emits Smi-guarded checked operations for core arithmetic
-    /// (Add/Sub/Mul/Div/Mod). The `CheckSmi` guards deopt to the interpreter
-    /// if values are non-Smi. This works correctly even when the feedback
-    /// vector is Uninitialized (Maglev compiles on a background thread with
-    /// a fresh FeedbackVector).
-    ///
-    /// Emit a binary operation. Core arithmetic and bitwise/shift ops use
-    /// native Int32 instructions after Smi guards. Exponentiation still
-    /// requires a generic stub for runtime coercion.
+    /// All arithmetic and bitwise operations use Generic* nodes which:
+    /// 1. Enable `smi_guarded` analysis — upstream loads see only
+    ///    arithmetic-compatible consumers and qualify for speculative
+    ///    Smi coercion at the load site.
+    /// 2. Have proper runtime fallbacks — overflow or type mismatches
+    ///    call `jit_runtime_generic_*` instead of permanently deopting.
+    /// 3. The codegen selects the optimal emit path at code-generation
+    ///    time based on `smi_guarded`, `i32_range`, or generic analysis.
     fn emit_binary_op(
         &mut self,
         left: NodeId,
@@ -1916,39 +1916,88 @@ impl<'a> GraphBuilder<'a> {
         slot: u32,
         kind: BinaryOpKind,
     ) -> StatorResult<NodeId> {
-        // Guard both operands as Smis.
-        self.emit(ValueNode::CheckSmi { receiver: left })?;
-        self.emit(ValueNode::CheckSmi { receiver: right })?;
-        // Emit native Int32 instructions for arithmetic and bitwise ops.
-        // Bitwise/shift ops cannot overflow (they produce valid i32 for any
-        // two i32 inputs), so no post-operation deopt is needed.
+        // Use Generic operations for Add/Sub/Mul/Div/Mod instead of
+        // CheckedSmi variants.  Generic ops enable `smi_guarded` analysis
+        // on upstream loads (they are arithmetic-compatible consumers),
+        // and their codegen has a proper runtime fallback on overflow
+        // instead of deopt.  The `smi_guarded` fast path (inline 32-bit
+        // ALU + JO) is nearly as fast as CheckedSmi, but the slow path
+        // calls jit_runtime_generic_* instead of deopting — preventing
+        // permanent Maglev blocking from transient overflows.
+        //
+        // Bitwise/shift ops cannot overflow (they produce valid i32 for
+        // any two i32 inputs), so no post-operation deopt is needed.
         self.emit(match kind {
-            BinaryOpKind::Add => ValueNode::CheckedSmiAdd { left, right },
-            BinaryOpKind::Sub => ValueNode::CheckedSmiSubtract { left, right },
-            BinaryOpKind::Mul => ValueNode::CheckedSmiMultiply { left, right },
-            BinaryOpKind::Div => ValueNode::CheckedSmiDivide { left, right },
-            BinaryOpKind::Mod => ValueNode::CheckedSmiModulus { left, right },
+            BinaryOpKind::Add => ValueNode::GenericAdd {
+                left,
+                right,
+                feedback_slot: slot,
+            },
+            BinaryOpKind::Sub => ValueNode::GenericSubtract {
+                left,
+                right,
+                feedback_slot: slot,
+            },
+            BinaryOpKind::Mul => ValueNode::GenericMultiply {
+                left,
+                right,
+                feedback_slot: slot,
+            },
+            BinaryOpKind::Div => ValueNode::GenericDivide {
+                left,
+                right,
+                feedback_slot: slot,
+            },
+            BinaryOpKind::Mod => ValueNode::GenericModulus {
+                left,
+                right,
+                feedback_slot: slot,
+            },
             BinaryOpKind::Exp => ValueNode::GenericExponentiate {
                 left,
                 right,
                 feedback_slot: slot,
             },
-            BinaryOpKind::BitwiseOr => ValueNode::Int32BitwiseOr { left, right },
-            BinaryOpKind::BitwiseXor => ValueNode::Int32BitwiseXor { left, right },
-            BinaryOpKind::BitwiseAnd => ValueNode::Int32BitwiseAnd { left, right },
-            BinaryOpKind::ShiftLeft => ValueNode::Int32ShiftLeft { left, right },
-            BinaryOpKind::ShiftRight => ValueNode::Int32ShiftRight { left, right },
-            BinaryOpKind::ShiftRightLogical => ValueNode::Int32ShiftRightLogical { left, right },
+            BinaryOpKind::BitwiseOr => ValueNode::GenericBitwiseOr {
+                left,
+                right,
+                feedback_slot: slot,
+            },
+            BinaryOpKind::BitwiseXor => ValueNode::GenericBitwiseXor {
+                left,
+                right,
+                feedback_slot: slot,
+            },
+            BinaryOpKind::BitwiseAnd => ValueNode::GenericBitwiseAnd {
+                left,
+                right,
+                feedback_slot: slot,
+            },
+            BinaryOpKind::ShiftLeft => ValueNode::GenericShiftLeft {
+                left,
+                right,
+                feedback_slot: slot,
+            },
+            BinaryOpKind::ShiftRight => ValueNode::GenericShiftRight {
+                left,
+                right,
+                feedback_slot: slot,
+            },
+            BinaryOpKind::ShiftRightLogical => ValueNode::GenericShiftRightLogical {
+                left,
+                right,
+                feedback_slot: slot,
+            },
         })
     }
 
     /// Emit a comparison, specialising on Smi feedback.
     ///
     /// When feedback is unavailable (Uninitialized) we still emit Smi-guarded
-    /// Int32 comparisons: the `CheckSmi` guards will deopt to the interpreter
-    /// if values turn out to be non-Smi, which is correct fallback behaviour.
-    /// The previous code incorrectly emitted `TaggedEqual` (===) for all
-    /// comparison kinds when feedback was Uninitialized.
+    /// Int32 comparisons.  We omit explicit `CheckSmi` guards here so that
+    /// upstream loads can qualify as `smi_guarded` (all their consumers will
+    /// be arithmetic-compatible).  The `smi_guarded` coercion at the load
+    /// site ensures values reaching Int32 comparisons are valid i32.
     fn emit_comparison(
         &mut self,
         left: NodeId,
@@ -1956,8 +2005,6 @@ impl<'a> GraphBuilder<'a> {
         _slot: u32,
         kind: CompareKind,
     ) -> StatorResult<NodeId> {
-        self.emit(ValueNode::CheckSmi { receiver: left })?;
-        self.emit(ValueNode::CheckSmi { receiver: right })?;
         self.emit(match kind {
             CompareKind::LessThan => ValueNode::Int32LessThan { left, right },
             CompareKind::GreaterThan => ValueNode::Int32GreaterThan { left, right },
@@ -1966,16 +2013,22 @@ impl<'a> GraphBuilder<'a> {
         })
     }
 
-    /// Emit an increment or decrement with Smi speculation.
+    /// Emit an increment or decrement.
     ///
-    /// Always emits the Smi-guarded checked path; `CheckSmi` deopts to the
-    /// interpreter for non-Smi values.
-    fn emit_inc_dec(&mut self, val: NodeId, _slot: u32, is_inc: bool) -> StatorResult<NodeId> {
-        self.emit(ValueNode::CheckSmi { receiver: val })?;
+    /// Uses GenericIncrement/GenericDecrement so the operation is
+    /// arithmetic-compatible for `smi_guarded` analysis and has a
+    /// runtime fallback instead of deopt on overflow.
+    fn emit_inc_dec(&mut self, val: NodeId, slot: u32, is_inc: bool) -> StatorResult<NodeId> {
         if is_inc {
-            self.emit(ValueNode::CheckedSmiIncrement { value: val })
+            self.emit(ValueNode::GenericIncrement {
+                value: val,
+                feedback_slot: slot,
+            })
         } else {
-            self.emit(ValueNode::CheckedSmiDecrement { value: val })
+            self.emit(ValueNode::GenericDecrement {
+                value: val,
+                feedback_slot: slot,
+            })
         }
     }
 
@@ -2601,7 +2654,7 @@ mod tests {
     #[test]
     fn test_add_uninitialized_still_checked_smi() {
         // r0 = 1; acc = r0 + r0; return
-        // Even with Uninitialized feedback, we emit CheckedSmiAdd.
+        // We now emit GenericAdd instead of CheckedSmiAdd.
         let meta = FeedbackMetadata::new(vec![FeedbackSlotKind::BinaryOp]);
         let instrs = vec![
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
@@ -2615,11 +2668,11 @@ mod tests {
         let (arr, vec) = build(instrs, vec![], 1, 0, meta);
         let graph = GraphBuilder::build(&arr, &vec).unwrap();
         let block = graph.entry_block().unwrap();
-        let has_checked_add = block
+        let has_generic_add = block
             .nodes
             .iter()
-            .any(|(_, n)| matches!(n, ValueNode::CheckedSmiAdd { .. }));
-        assert!(has_checked_add, "expected CheckedSmiAdd node");
+            .any(|(_, n)| matches!(n, ValueNode::GenericAdd { .. }));
+        assert!(has_generic_add, "expected GenericAdd node");
     }
 
     // ── Arithmetic – speculative Smi path ────────────────────────────────────
@@ -2641,16 +2694,16 @@ mod tests {
         fvec.set_state(0, InlineCacheState::Monomorphic);
         let graph = GraphBuilder::build(&arr, &fvec).unwrap();
         let block = graph.entry_block().unwrap();
-        let has_checked_add = block
+        let has_generic_add = block
             .nodes
             .iter()
-            .any(|(_, n)| matches!(n, ValueNode::CheckedSmiAdd { .. }));
-        let has_smi_guard = block
+            .any(|(_, n)| matches!(n, ValueNode::GenericAdd { .. }));
+        let no_smi_guard = !block
             .nodes
             .iter()
             .any(|(_, n)| matches!(n, ValueNode::CheckSmi { .. }));
-        assert!(has_checked_add, "expected CheckedSmiAdd node");
-        assert!(has_smi_guard, "expected CheckSmi guard node");
+        assert!(has_generic_add, "expected GenericAdd node");
+        assert!(no_smi_guard, "CheckSmi guards should not be emitted");
     }
 
     #[test]
@@ -2673,7 +2726,7 @@ mod tests {
             block
                 .nodes
                 .iter()
-                .any(|(_, n)| matches!(n, ValueNode::CheckedSmiSubtract { .. }))
+                .any(|(_, n)| matches!(n, ValueNode::GenericSubtract { .. }))
         );
     }
 
@@ -2693,7 +2746,7 @@ mod tests {
             block
                 .nodes
                 .iter()
-                .any(|(_, n)| matches!(n, ValueNode::CheckedSmiIncrement { .. }))
+                .any(|(_, n)| matches!(n, ValueNode::GenericIncrement { .. }))
         );
     }
 
@@ -2712,7 +2765,7 @@ mod tests {
             block
                 .nodes
                 .iter()
-                .any(|(_, n)| matches!(n, ValueNode::CheckedSmiDecrement { .. }))
+                .any(|(_, n)| matches!(n, ValueNode::GenericDecrement { .. }))
         );
     }
 
@@ -2953,12 +3006,12 @@ mod tests {
         let (arr, vec) = build(instrs, vec![], 0, 0, meta);
         let graph = GraphBuilder::build(&arr, &vec).unwrap();
         let block = graph.entry_block().unwrap();
-        // Uninitialized feedback → CheckedSmiAdd (always Smi-guarded)
+        // Uninitialized feedback → GenericAdd (with runtime fallback)
         assert!(
             block
                 .nodes
                 .iter()
-                .any(|(_, n)| matches!(n, ValueNode::CheckedSmiAdd { .. }))
+                .any(|(_, n)| matches!(n, ValueNode::GenericAdd { .. }))
         );
     }
 
@@ -2981,7 +3034,7 @@ mod tests {
             block
                 .nodes
                 .iter()
-                .any(|(_, n)| matches!(n, ValueNode::CheckedSmiAdd { .. }))
+                .any(|(_, n)| matches!(n, ValueNode::GenericAdd { .. }))
         );
     }
 

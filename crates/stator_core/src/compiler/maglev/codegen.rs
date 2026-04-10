@@ -7311,9 +7311,15 @@ impl<'a> MaglevCodegen<'a> {
             ValueNode::GenericAdd { .. }
                 | ValueNode::GenericSubtract { .. }
                 | ValueNode::GenericMultiply { .. }
+                | ValueNode::GenericDivide { .. }
+                | ValueNode::GenericModulus { .. }
+                | ValueNode::GenericExponentiate { .. }
                 | ValueNode::GenericBitwiseOr { .. }
                 | ValueNode::GenericBitwiseAnd { .. }
                 | ValueNode::GenericBitwiseXor { .. }
+                | ValueNode::GenericShiftLeft { .. }
+                | ValueNode::GenericShiftRight { .. }
+                | ValueNode::GenericShiftRightLogical { .. }
                 | ValueNode::GenericIncrement { .. }
                 | ValueNode::GenericDecrement { .. }
                 | ValueNode::GenericNegate { .. }
@@ -7326,6 +7332,7 @@ impl<'a> MaglevCodegen<'a> {
                 | ValueNode::Int32StrictEqual { .. }
                 | ValueNode::TaggedEqual { .. }
                 | ValueNode::TaggedNotEqual { .. }
+                | ValueNode::StoreGlobal { .. }
                 | ValueNode::Phi { .. }
         )
     }
