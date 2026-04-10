@@ -2090,31 +2090,15 @@ pub(crate) mod jit_runtime {
                 // so try the shape-based check that tolerates epoch
                 // changes as long as the receiver's shape is unchanged.
                 if proto_entry.name_idx == name_idx && proto_entry.shape == shape {
-                    // Validate the prototype hasn't been swapped by
-                    // comparing the direct prototype's shape against
-                    // the cached proto_handle.
-                    let cur_proto_shape = map
-                        .get(INTERNAL_PROTO_PROPERTY_KEY)
-                        .or_else(|| map.get("__proto__"))
-                        .and_then(|v| match v {
-                            JsValue::PlainObject(rc) => {
-                                // SAFETY: single-threaded; read-only.
-                                Some(unsafe { &*rc.as_ptr() }.shape_id() as i64)
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or(0);
-                    if cur_proto_shape == proto_entry.proto_handle {
-                        // Re-stamp the entry with the current epoch so that
-                        // Phase 0 will hit on the next access.
-                        let epoch = PropertyMap::global_proto_mutation_epoch();
-                        // SAFETY: scoped borrow dropped above; single-threaded.
-                        let cache_mut = unsafe { &mut *ic_ref.as_ptr() };
-                        let pe = &mut cache_mut.proto[proto_slot];
-                        pe.receiver_handle = obj_i64;
-                        pe.global_epoch = epoch;
-                        return Some(proto_entry.cached_value);
-                    }
+                    // Re-stamp the entry with the current epoch so that
+                    // Phase 0 will hit on the next access.
+                    let epoch = PropertyMap::global_proto_mutation_epoch();
+                    // SAFETY: scoped borrow dropped above; single-threaded.
+                    let cache_mut = unsafe { &mut *ic_ref.as_ptr() };
+                    let pe = &mut cache_mut.proto[proto_slot];
+                    pe.receiver_handle = obj_i64;
+                    pe.global_epoch = epoch;
+                    return Some(proto_entry.cached_value);
                 }
             }
 
@@ -2245,22 +2229,7 @@ pub(crate) mod jit_runtime {
                             let proto_slot = (name_idx & 31) as usize;
                             let pe = &cache.proto[proto_slot];
                             if pe.name_idx == name_idx && pe.shape == shape {
-                                // Validate the direct prototype's shape
-                                // against the cached proto_handle.
-                                let cur_ph = map
-                                    .get(INTERNAL_PROTO_PROPERTY_KEY)
-                                    .or_else(|| map.get("__proto__"))
-                                    .and_then(|v| match v {
-                                        JsValue::PlainObject(rc) => {
-                                            // SAFETY: single-threaded; read-only.
-                                            Some(unsafe { &*rc.as_ptr() }.shape_id() as i64)
-                                        }
-                                        _ => None,
-                                    })
-                                    .unwrap_or(0);
-                                if cur_ph == pe.proto_handle {
-                                    return Some(Ok(pe.cached_value));
-                                }
+                                return Some(Ok(pe.cached_value));
                             }
 
                             None
@@ -6038,31 +6007,16 @@ pub(crate) mod jit_runtime {
 
             // ── Prototype IC hit (shape-based fallback) ────────────
             if proto_entry.name_idx == name_idx && proto_entry.shape == shape {
-                // Validate the direct prototype's shape against the
-                // cached proto_handle before re-stamping.
-                let cur_proto_shape = map
-                    .get(INTERNAL_PROTO_PROPERTY_KEY)
-                    .or_else(|| map.get("__proto__"))
-                    .and_then(|v| match v {
-                        JsValue::PlainObject(rc) => {
-                            // SAFETY: single-threaded; read-only.
-                            Some(unsafe { &*rc.as_ptr() }.shape_id() as i64)
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or(0);
-                if cur_proto_shape == proto_entry.proto_handle {
-                    // Re-stamp the entry so handle+epoch check hits next time.
-                    let epoch = PropertyMap::global_proto_mutation_epoch();
-                    let cache_mut = unsafe { &mut *ic_ref.as_ptr() };
-                    let pe = &mut cache_mut.proto[proto_slot];
-                    pe.receiver_handle = obj_i64;
-                    pe.global_epoch = epoch;
-                    return InlineNamedResult {
-                        value: proto_entry.cached_value,
-                        hit: 1,
-                    };
-                }
+                // Re-stamp the entry so handle+epoch check hits next time.
+                let epoch = PropertyMap::global_proto_mutation_epoch();
+                let cache_mut = unsafe { &mut *ic_ref.as_ptr() };
+                let pe = &mut cache_mut.proto[proto_slot];
+                pe.receiver_handle = obj_i64;
+                pe.global_epoch = epoch;
+                return InlineNamedResult {
+                    value: proto_entry.cached_value,
+                    hit: 1,
+                };
             }
         }
 
