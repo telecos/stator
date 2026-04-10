@@ -439,34 +439,6 @@ pub(crate) mod jit_runtime {
     pub const STUB_FAST_ARRAY_PUSH: usize = 20;
     pub const STUB_TRAMPOLINE: usize = 21;
 
-    /// Human-readable names for each stub index (for diagnostic printing).
-    pub const STUB_NAMES: [&str; STUB_DEOPT_SLOTS] = [
-        "lda_named",
-        "sta_named",
-        "lda_global",
-        "sta_global",
-        "construct0",
-        "construct1",
-        "construct2",
-        "create_obj_props",
-        "fast_create_obj",
-        "lda_keyed",
-        "sta_keyed",
-        "call_undef0",
-        "create_closure",
-        "sta_named_own",
-        "call_prop0",
-        "call_prop1",
-        "call_undef1",
-        "call_undef2",
-        "fast_array_load",
-        "fast_array_store",
-        "fast_array_push",
-        "trampoline",
-        "_reserved22",
-        "_reserved23",
-    ];
-
     /// Record a deopt for the stub at the given index.
     #[inline]
     fn track_stub_deopt(idx: usize) {
@@ -506,6 +478,15 @@ pub(crate) mod jit_runtime {
         maglev_fn: usize,
         /// Maglev register-file slot count.
         maglev_reg_slots: usize,
+        /// Cached `ba.parameter_count() == 0` — avoids a virtual call
+        /// on every cached hit.
+        skip_args: bool,
+        /// Raw pointer from `Rc::into_raw(Rc::clone(ctx))`.  Holds one
+        /// strong reference count so that per-call context swaps can use
+        /// `Rc::from_raw` / `Rc::into_raw` without touching atomic
+        /// refcounts.  Must be dropped via [`drop_cached_ctx_rc_raw`]
+        /// when the entry is invalidated.
+        ctx_rc_raw: *const RefCell<JsContext>,
     }
 
     impl CachedCalleeEntry {
@@ -517,7 +498,22 @@ pub(crate) mod jit_runtime {
             reg_slots: 0,
             maglev_fn: 0,
             maglev_reg_slots: 0,
+            skip_args: false,
+            ctx_rc_raw: std::ptr::null(),
         };
+    }
+
+    /// Drop the `Rc` refcount held by a [`CachedCalleeEntry::ctx_rc_raw`]
+    /// pointer.  Must be called before overwriting an entry whose
+    /// `ctx_rc_raw` is non-null with a different callee or EMPTY.
+    fn drop_cached_ctx_rc_raw(raw: *const RefCell<JsContext>) {
+        if !raw.is_null() {
+            // SAFETY: `raw` was produced by `Rc::into_raw(Rc::clone(..))`.
+            // The matching decrement here balances that clone.
+            unsafe {
+                drop(Rc::from_raw(raw));
+            }
+        }
     }
 
     /// Cached raw pointers to frequently-accessed TLS variables.
@@ -3375,6 +3371,16 @@ pub(crate) mod jit_runtime {
                                     .map(Rc::as_ptr)
                                     .unwrap_or(std::ptr::null())
                                     as i64;
+                                // Clone the closure context Rc and convert
+                                // to a raw pointer via `Rc::into_raw`.
+                                // This holds one strong reference count so
+                                // that per-call context swaps can use
+                                // `Rc::from_raw` / `Rc::into_raw` without
+                                // touching atomic refcounts.
+                                let ctx_rc_raw = ba_ref
+                                    .closure_context()
+                                    .map(|rc| Rc::into_raw(Rc::clone(rc)))
+                                    .unwrap_or(std::ptr::null());
                                 #[cfg(all(target_arch = "x86_64", unix))]
                                 let (entry_fn, reg_slots) = extract_exec_entry(ba_ref);
                                 #[cfg(not(all(target_arch = "x86_64", unix)))]
@@ -3391,7 +3397,14 @@ pub(crate) mod jit_runtime {
                                     reg_slots,
                                     maglev_fn,
                                     maglev_reg_slots,
+                                    skip_args: ba_ref.parameter_count() == 0,
+                                    ctx_rc_raw,
                                 };
+                                // Drop old entry's Rc refcount if callee changed.
+                                let old = ptrs.get_cached_callee();
+                                if !old.ctx_rc_raw.is_null() && old.callee_i64 != callee_i64 {
+                                    drop_cached_ctx_rc_raw(old.ctx_rc_raw);
+                                }
                                 ptrs.set_cached_callee(entry);
                                 (ptr, entry)
                             }
@@ -3421,7 +3434,7 @@ pub(crate) mod jit_runtime {
                 // Skip CreateMappedArguments for closures with 0 formal
                 // parameters — the arguments object is dead code in this
                 // common case (e.g. `function() { return count++; }`).
-                let skip_args = ba.parameter_count() == 0;
+                let skip_args = cached_entry.skip_args;
 
                 // ── Cached Maglev ultra-fast path ──────────────
                 // When the Maglev entry pointer is cached, skip the
@@ -5136,29 +5149,13 @@ pub(crate) mod jit_runtime {
         })
     }
 
-    /// Inline encode a `&JsValue` to JIT i64 for the most common element
-    /// types (Boolean, Smi, Undefined) without going through the full
-    /// `encode_or_clone_ref` match.  Returns `None` for heap types that
-    /// need a handle allocation.
-    #[inline(always)]
-    fn encode_element_fast(v: &JsValue) -> Option<i64> {
-        match v {
-            JsValue::Boolean(b) => Some(if *b { JIT_TRUE } else { JIT_FALSE }),
-            JsValue::Smi(n) => Some(i64::from(*n)),
-            JsValue::Undefined => Some(JIT_UNDEFINED),
-            JsValue::Null => Some(JIT_NULL),
-            _ => None,
-        }
-    }
-
     /// Combined hole-check + encode for array elements.  Returns the JIT
     /// i64 encoding directly — `TheHole` maps to `JIT_UNDEFINED`, common
     /// primitives encode inline, and heap types return `None` for
     /// fallback through `encode_or_clone_ref`.
     ///
-    /// This merges the separate `!matches!(v, TheHole)` guard and
-    /// `encode_element_fast` call into a single match, eliminating one
-    /// branch per element access on the hot path.
+    /// Handles the hole-check and encoding in a single match, eliminating
+    /// one branch per element access on the hot path.
     #[inline(always)]
     fn encode_array_element(v: &JsValue) -> Option<i64> {
         match v {
