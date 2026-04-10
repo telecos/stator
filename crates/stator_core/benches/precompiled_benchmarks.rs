@@ -19,8 +19,8 @@ use stator_core::compiler::baseline::compiler::{
     STUB_DEOPT_SLOTS, STUB_NAMES, reset_stub_deopt_counts, stub_deopt_counts,
 };
 use stator_core::interpreter::{
-    GlobalEnv, Interpreter, InterpreterFrame, globals_promotion_diagnostics, licm_diagnostics,
-    maglev_deopt_categories, maglev_diagnostics,
+    GlobalEnv, Interpreter, InterpreterFrame, globals_promotion_diagnostics, jit_entry_diagnostics,
+    licm_diagnostics, maglev_deopt_categories, maglev_diagnostics,
 };
 use stator_core::parser::recursive_descent;
 
@@ -522,6 +522,9 @@ fn print_maglev_diag(
     } else {
         eprintln!("  stub_deopts: {}", parts.join(" "));
     }
+    // Atomic (non-TLS) diagnostics for cross-checking.
+    let (entered, hit, miss) = jit_entry_diagnostics();
+    eprintln!("  ATOMIC_JIT[{name}]: entered={entered} maglev_hit={hit} maglev_miss={miss}");
 }
 
 // ---------------------------------------------------------------------------

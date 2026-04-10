@@ -8241,6 +8241,7 @@ pub(crate) mod jit_runtime {
     /// * `RSI` (`slot_idx`) – context slot index.
     ///
     /// Returns the slot value as `i64` in `RAX`, or [`JIT_DEOPT`].
+    #[allow(dead_code)] // Called from JIT-emitted assembly, not Rust code.
     pub extern "C" fn jit_runtime_load_context_slot_direct(ctx_i64: i64, slot_idx: i64) -> i64 {
         let slot = slot_idx as usize;
 
@@ -8289,6 +8290,7 @@ pub(crate) mod jit_runtime {
     /// * `RDX` (`value_i64`) – JIT i64 encoding of the value to store.
     ///
     /// Returns `value_i64` in `RAX` on success, or [`JIT_DEOPT`].
+    #[allow(dead_code)] // Called from JIT-emitted assembly, not Rust code.
     pub extern "C" fn jit_runtime_store_context_slot_direct(
         ctx_i64: i64,
         slot_idx: i64,

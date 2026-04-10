@@ -998,6 +998,25 @@ static MAGLEV_COMPILATION_FAILED: std::sync::atomic::AtomicU32 =
 static MAGLEV_COMPILATION_PANICKED: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
+/// Atomic diagnostic: how many times try_execute_best_jit was entered.
+static DIAG_BEST_JIT_ENTERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Atomic diagnostic: how many times try_execute_maglev returned Some.
+static DIAG_MAGLEV_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Atomic diagnostic: how many times try_execute_maglev returned None.
+static DIAG_MAGLEV_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Return a snapshot of the atomic JIT entry diagnostics.
+///
+/// Returns `(best_jit_entered, maglev_hit, maglev_miss)`.
+pub fn jit_entry_diagnostics() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        DIAG_BEST_JIT_ENTERED.load(Relaxed),
+        DIAG_MAGLEV_HIT.load(Relaxed),
+        DIAG_MAGLEV_MISS.load(Relaxed),
+    )
+}
+
 /// Process-wide count of successful Turbofan compilations.
 ///
 /// Uses atomics so the background compilation thread can update the counter
@@ -1624,6 +1643,7 @@ pub(super) fn try_execute_best_jit(
     ba: &BytecodeArray,
     args: &[JsValue],
 ) -> Option<StatorResult<JsValue>> {
+    DIAG_BEST_JIT_ENTERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Never run JIT when a debugger is attached — the debugger needs
     // to single-step through interpreted bytecodes.
     if DEBUG_ATTACHED.with(|f| f.get()) {
@@ -1635,8 +1655,10 @@ pub(super) fn try_execute_best_jit(
     }
     // Then Maglev (register-allocated JIT).
     if let Some(r) = try_execute_maglev(ba, args) {
+        DIAG_MAGLEV_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Some(r);
     }
+    DIAG_MAGLEV_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Baseline JIT (disabled — SIGSEGV from unsafe runtime stubs).
     try_execute_jit(ba, args)
 }
