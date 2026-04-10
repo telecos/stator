@@ -1803,7 +1803,7 @@ impl BytecodeArray {
     /// With exponential backoff (2^count), 10 retries means ~1024
     /// invocations before permanent block — enough for transient IC
     /// cold-start deopts to resolve.
-    const MAX_MAGLEV_DEOPT_RETRIES: u32 = 10;
+    const MAX_MAGLEV_DEOPT_RETRIES: u32 = 1000;
 
     /// Returns `true` if Maglev JIT code should NOT be attempted right now.
     ///

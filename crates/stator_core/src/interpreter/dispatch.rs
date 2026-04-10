@@ -4429,9 +4429,9 @@ fn handle_sta_keyed_property(
             }
             return Ok(DispatchAction::Continue);
         } else if let JsValue::PlainObject(map) = obj_ref {
-            let map_rc = Rc::clone(map);
+            // SAFETY: single-threaded interpreter; no concurrent borrows.
+            let m = unsafe { &mut *map.as_ptr() };
             let key_str = itoa_stack(idx_val as u32);
-            let mut m = map_rc.borrow_mut();
             m.insert(key_str.as_str().to_owned(), val);
             // Update length if needed for array-like objects.
             let i = idx_val as usize;

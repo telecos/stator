@@ -5711,6 +5711,31 @@ pub(crate) mod jit_runtime {
         })
     }
 
+    /// Like [`jit_runtime_fast_array_load`] but accepts a pre-cached
+    /// pointer to the `RT_PTRS` TLS cell, eliminating one TLS lookup.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_handle`) – JIT i64 heap handle for the receiver.
+    /// * `RSI` (`index`) – non-negative Smi-encoded integer index.
+    /// * `RDX` (`rt_ptrs_cell`) – pointer to `Cell<RtPtrs>` TLS slot.
+    ///
+    /// Returns the element as a JIT `i64` in `RAX`, or [`JIT_DEOPT`].
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    pub extern "C" fn jit_runtime_fast_array_load_r15(
+        obj_handle: i64,
+        index: i64,
+        rt_ptrs_cell: i64,
+    ) -> i64 {
+        // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
+        // TLS slot lives for the thread's entire lifetime.
+        let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
+        fast_array_load_with_ptrs(obj_handle, index, ptrs).unwrap_or_else(|| {
+            track_stub_deopt(STUB_FAST_ARRAY_LOAD);
+            JIT_DEOPT
+        })
+    }
+
     /// Inner implementation for [`jit_runtime_fast_array_load`].
     fn fast_array_load_inner(obj_handle: i64, index: i64) -> Option<i64> {
         if !is_heap_handle(obj_handle) || index < 0 || index > i32::MAX as i64 {
@@ -5719,6 +5744,21 @@ pub(crate) mod jit_runtime {
         let idx = index as usize;
         let obj_idx = (obj_handle - JIT_HEAP_TAG) as usize;
         let ptrs = RT_PTRS.with(|p| p.get());
+        fast_array_load_core(idx, obj_idx, ptrs)
+    }
+
+    /// Like [`fast_array_load_inner`] but accepts pre-resolved pointers.
+    #[inline(always)]
+    fn fast_array_load_with_ptrs(obj_handle: i64, index: i64, ptrs: RtPtrs) -> Option<i64> {
+        if !is_heap_handle(obj_handle) || index < 0 || index > i32::MAX as i64 {
+            return None;
+        }
+        fast_array_load_core(index as usize, (obj_handle - JIT_HEAP_TAG) as usize, ptrs)
+    }
+
+    /// Shared core for fast array load with already-resolved indices.
+    #[inline(always)]
+    fn fast_array_load_core(idx: usize, obj_idx: usize, ptrs: RtPtrs) -> Option<i64> {
         if ptrs.is_cached() {
             // SAFETY: cached pointers set by cache_rt_ptrs;
             // valid for thread lifetime.
@@ -5800,6 +5840,33 @@ pub(crate) mod jit_runtime {
         })
     }
 
+    /// Like [`jit_runtime_fast_array_store`] but accepts a pre-cached
+    /// pointer to the `RT_PTRS` TLS cell, eliminating one TLS lookup.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_handle`) – JIT i64 heap handle for the receiver.
+    /// * `RSI` (`index`) – non-negative Smi-encoded integer index.
+    /// * `RDX` (`value_i64`) – JIT i64 encoding of the value to store.
+    /// * `RCX` (`rt_ptrs_cell`) – pointer to `Cell<RtPtrs>` TLS slot.
+    ///
+    /// Returns `value_i64` in `RAX` on success, or [`JIT_DEOPT`].
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    pub extern "C" fn jit_runtime_fast_array_store_r15(
+        obj_handle: i64,
+        index: i64,
+        value_i64: i64,
+        rt_ptrs_cell: i64,
+    ) -> i64 {
+        // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
+        // TLS slot lives for the thread's entire lifetime.
+        let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
+        fast_array_store_with_ptrs(obj_handle, index, value_i64, ptrs).unwrap_or_else(|| {
+            track_stub_deopt(STUB_FAST_ARRAY_STORE);
+            JIT_DEOPT
+        })
+    }
+
     /// Inner implementation for [`jit_runtime_fast_array_store`].
     fn fast_array_store_inner(obj_handle: i64, index: i64, value_i64: i64) -> Option<i64> {
         if !is_heap_handle(obj_handle) || index < 0 || index > i32::MAX as i64 {
@@ -5808,24 +5875,48 @@ pub(crate) mod jit_runtime {
         let smi_key = index as usize;
         let obj_idx = (obj_handle - JIT_HEAP_TAG) as usize;
 
-        // Decode value inline for common types (avoids full jit_to_jsvalue).
+        // Decode value: booleans first (hot for sieve-like patterns),
+        // then Smi range, with heap handle fallback.
         let value = if !is_heap_handle(value_i64) {
-            if value_i64 >= i32::MIN as i64 && value_i64 <= i32::MAX as i64 {
-                JsValue::Smi(value_i64 as i32)
-            } else if value_i64 == JIT_TRUE {
-                JsValue::Boolean(true)
-            } else if value_i64 == JIT_FALSE {
-                JsValue::Boolean(false)
-            } else if value_i64 == JIT_UNDEFINED {
-                JsValue::Undefined
-            } else {
-                super::jit_to_jsvalue(value_i64)?
-            }
+            decode_non_heap_value_fast(value_i64)?
         } else {
             jit_i64_to_jsvalue(value_i64)
         };
 
         let ptrs = RT_PTRS.with(|p| p.get());
+        fast_array_store_core(smi_key, obj_idx, value, value_i64, ptrs)
+    }
+
+    /// Like [`fast_array_store_inner`] but accepts pre-resolved pointers.
+    #[inline(always)]
+    fn fast_array_store_with_ptrs(
+        obj_handle: i64,
+        index: i64,
+        value_i64: i64,
+        ptrs: RtPtrs,
+    ) -> Option<i64> {
+        if !is_heap_handle(obj_handle) || index < 0 || index > i32::MAX as i64 {
+            return None;
+        }
+        let smi_key = index as usize;
+        let obj_idx = (obj_handle - JIT_HEAP_TAG) as usize;
+        let value = if !is_heap_handle(value_i64) {
+            decode_non_heap_value_fast(value_i64)?
+        } else {
+            jit_i64_to_jsvalue(value_i64)
+        };
+        fast_array_store_core(smi_key, obj_idx, value, value_i64, ptrs)
+    }
+
+    /// Shared core for fast array store with already-resolved values.
+    #[inline(always)]
+    fn fast_array_store_core(
+        smi_key: usize,
+        obj_idx: usize,
+        value: JsValue,
+        value_i64: i64,
+        ptrs: RtPtrs,
+    ) -> Option<i64> {
         if ptrs.is_cached() {
             // SAFETY: cached pointers set by cache_rt_ptrs;
             // valid for thread lifetime.
@@ -5837,13 +5928,17 @@ pub(crate) mod jit_runtime {
                 JsValue::Array(arr) => {
                     // SAFETY: single-threaded JIT; no concurrent borrows.
                     let v = unsafe { &mut *arr.as_ptr() };
-                    if smi_key >= v.len() {
+                    if smi_key < v.len() {
+                        // SAFETY: bounds verified above.
+                        unsafe { *v.get_unchecked_mut(smi_key) = value };
+                    } else {
                         let cur_len = v.len();
                         let new_cap = (smi_key + 1).next_power_of_two();
                         v.reserve(new_cap - cur_len);
                         v.resize(smi_key + 1, JsValue::TheHole);
+                        // SAFETY: resize just made smi_key valid.
+                        unsafe { *v.get_unchecked_mut(smi_key) = value };
                     }
-                    v[smi_key] = value;
                     Some(value_i64)
                 }
                 _ => None,
@@ -5854,13 +5949,17 @@ pub(crate) mod jit_runtime {
                 match heap.get(obj_idx)? {
                     JsValue::Array(arr) => {
                         let mut v = arr.borrow_mut();
-                        if smi_key >= v.len() {
+                        if smi_key < v.len() {
+                            // SAFETY: bounds verified above.
+                            unsafe { *v.get_unchecked_mut(smi_key) = value };
+                        } else {
                             let cur_len = v.len();
                             let new_cap = (smi_key + 1).next_power_of_two();
                             v.reserve(new_cap - cur_len);
                             v.resize(smi_key + 1, JsValue::TheHole);
+                            // SAFETY: resize just made smi_key valid.
+                            unsafe { *v.get_unchecked_mut(smi_key) = value };
                         }
-                        v[smi_key] = value;
                         Some(value_i64)
                     }
                     _ => None,
@@ -6054,32 +6153,19 @@ pub(crate) mod jit_runtime {
                     };
                 }
                 // SAFETY: bounds verified above.
-                match unsafe { data.get_unchecked(key) } {
-                    JsValue::Smi(n) => InlineKeyedResult {
-                        value: i64::from(*n),
+                let v = unsafe { data.get_unchecked(key) };
+                // Combined hole-check + encode via encode_array_element.
+                if let Some(encoded) = encode_array_element(v) {
+                    InlineKeyedResult {
+                        value: encoded,
                         hit: 1,
-                    },
-                    JsValue::Boolean(b) => InlineKeyedResult {
-                        value: if *b { JIT_TRUE } else { JIT_FALSE },
-                        hit: 1,
-                    },
-                    JsValue::Undefined => InlineKeyedResult {
-                        value: JIT_UNDEFINED,
-                        hit: 1,
-                    },
-                    JsValue::Null => InlineKeyedResult {
-                        value: JIT_NULL,
-                        hit: 1,
-                    },
-                    JsValue::TheHole => InlineKeyedResult {
-                        value: JIT_UNDEFINED,
-                        hit: 1,
-                    },
+                    }
+                } else {
                     // Heap-object element — delegate to full generic stub
                     // for heap-handle allocation.
-                    _ => InlineKeyedResult::from_generic(lda_keyed_property_with_ptrs(
+                    InlineKeyedResult::from_generic(lda_keyed_property_with_ptrs(
                         obj_i64, smi_key, ptrs,
-                    )),
+                    ))
                 }
             }
             _ => InlineKeyedResult::from_generic(lda_keyed_property_with_ptrs(
@@ -6851,30 +6937,23 @@ pub(crate) mod jit_runtime {
                 }
                 // Element load — reuse the already-resolved `data` ref.
                 let key = smi_key as usize;
-                return match data.get(key) {
-                    Some(JsValue::Boolean(b)) => InlineKeyedResult {
-                        value: if *b { JIT_TRUE } else { JIT_FALSE },
-                        hit: 1,
-                    },
-                    Some(JsValue::Smi(n)) => InlineKeyedResult {
-                        value: i64::from(*n),
-                        hit: 1,
-                    },
-                    Some(JsValue::Undefined) => InlineKeyedResult {
-                        value: JIT_UNDEFINED,
-                        hit: 1,
-                    },
-                    Some(JsValue::Null) => InlineKeyedResult {
-                        value: JIT_NULL,
-                        hit: 1,
-                    },
-                    Some(JsValue::TheHole) | None => InlineKeyedResult {
-                        value: JIT_UNDEFINED,
-                        hit: 1,
-                    },
-                    _ => InlineKeyedResult::from_generic(lda_keyed_property_with_ptrs(
-                        obj_i64, smi_key, ptrs,
-                    )),
+                if key < data.len() {
+                    // SAFETY: bounds verified above.
+                    let v = unsafe { data.get_unchecked(key) };
+                    return if let Some(encoded) = encode_array_element(v) {
+                        InlineKeyedResult {
+                            value: encoded,
+                            hit: 1,
+                        }
+                    } else {
+                        InlineKeyedResult::from_generic(lda_keyed_property_with_ptrs(
+                            obj_i64, smi_key, ptrs,
+                        ))
+                    };
+                }
+                return InlineKeyedResult {
+                    value: JIT_UNDEFINED,
+                    hit: 1,
                 };
             }
         }
