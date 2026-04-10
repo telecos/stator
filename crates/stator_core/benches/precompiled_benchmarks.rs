@@ -53,6 +53,49 @@ fn print_deopt_state(
     );
 }
 
+/// Two-phase warmup: (1) trigger Maglev compilation with warm ICs, then
+/// (2) run a validation phase with fresh deopt counter so Maglev's own
+/// inline ICs warm up.  Without the second phase, Maglev may deopt on
+/// the first JIT execution (cold JIT ICs) and exponential backoff blocks
+/// it permanently during Criterion measurement.
+fn warmup_with_maglev(
+    ba: &Rc<stator_core::bytecode::bytecode_array::BytecodeArray>,
+    env: &Rc<RefCell<GlobalEnv>>,
+    name: &str,
+) {
+    // Phase 1: 100 interpreter iterations to warm ICs + trigger Maglev.
+    for _ in 0..100 {
+        let mut frame = InterpreterFrame::new_with_globals(Rc::clone(ba), vec![], Rc::clone(env));
+        let _ = Interpreter::run(&mut frame);
+    }
+    // Wait for background Maglev compilation to complete.
+    let start = std::time::Instant::now();
+    while !ba.has_all_maglev_jit_code()
+        && !ba.has_turbofan_jit_code()
+        && start.elapsed() < std::time::Duration::from_millis(2000)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    eprintln!(
+        "BENCH_JIT[{name}]: has_maglev={} has_turbofan={} deopt_count={} inv_count={}",
+        ba.has_maglev_jit_code(),
+        ba.has_turbofan_jit_code(),
+        ba.maglev_deopt_count(),
+        ba.invocation_count(),
+    );
+    // Phase 2: Reset deopt counter and run validation iterations.
+    // Maglev retries with compiled code + warm interpreter ICs.
+    // The JIT's own inline ICs populate during these iterations.
+    ba.reset_maglev_deopt_count();
+    for _ in 0..100 {
+        let mut frame = InterpreterFrame::new_with_globals(Rc::clone(ba), vec![], Rc::clone(env));
+        let _ = Interpreter::run(&mut frame);
+    }
+    // Phase 3: Final reset before Criterion measurement.
+    ba.reset_maglev_deopt_count();
+    print_deopt_state(name, ba);
+}
+
 // ---------------------------------------------------------------------------
 // Precompiled benchmark functions
 // ---------------------------------------------------------------------------
@@ -76,29 +119,7 @@ fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
         ba.bytecodes().len()
     );
     let env = make_global_env();
-    // Warmup: trigger Maglev compilation
-    for _ in 0..100 {
-        let mut frame = InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
-        let _ = Interpreter::run(&mut frame);
-    }
-    // Wait for background Maglev compilation to complete
-    let warmup_start = std::time::Instant::now();
-    while !ba.has_all_maglev_jit_code()
-        && !ba.has_turbofan_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    eprintln!(
-        "BENCH_JIT[fib_40]: has_maglev={} has_turbofan={} deopt_count={} inv_count={}",
-        ba.has_maglev_jit_code(),
-        ba.has_turbofan_jit_code(),
-        ba.maglev_deopt_count(),
-        ba.invocation_count(),
-    );
-    // Reset deopt cooldown so Maglev re-enters during Criterion measurement.
-    ba.reset_maglev_deopt_count();
-    print_deopt_state("fib_40", &ba);
+    warmup_with_maglev(&ba, &env, "fib_40");
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("fib_40_iterative_precompiled", |b| {
@@ -128,26 +149,7 @@ fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
         ba.bytecodes().len()
     );
     let env = make_global_env();
-    for _ in 0..100 {
-        let mut frame = InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
-        let _ = Interpreter::run(&mut frame);
-    }
-    let warmup_start = std::time::Instant::now();
-    while !ba.has_all_maglev_jit_code()
-        && !ba.has_turbofan_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    eprintln!(
-        "BENCH_JIT[arithmetic]: has_maglev={} has_turbofan={} deopt_count={} inv_count={}",
-        ba.has_maglev_jit_code(),
-        ba.has_turbofan_jit_code(),
-        ba.maglev_deopt_count(),
-        ba.invocation_count(),
-    );
-    ba.reset_maglev_deopt_count();
-    print_deopt_state("arithmetic", &ba);
+    warmup_with_maglev(&ba, &env, "arithmetic_loop");
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("arithmetic_loop_10k_precompiled", |b| {
@@ -178,26 +180,7 @@ fn bench_property_access_1k_precompiled(c: &mut Criterion) {
         ba.bytecodes().len()
     );
     let env = make_global_env();
-    for _ in 0..100 {
-        let mut frame = InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
-        let _ = Interpreter::run(&mut frame);
-    }
-    let warmup_start = std::time::Instant::now();
-    while !ba.has_all_maglev_jit_code()
-        && !ba.has_turbofan_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    eprintln!(
-        "BENCH_JIT[property_access]: has_maglev={} has_turbofan={} deopt_count={} inv_count={}",
-        ba.has_maglev_jit_code(),
-        ba.has_turbofan_jit_code(),
-        ba.maglev_deopt_count(),
-        ba.invocation_count(),
-    );
-    ba.reset_maglev_deopt_count();
-    print_deopt_state("property_access", &ba);
+    warmup_with_maglev(&ba, &env, "property_access");
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("property_access_1k_precompiled", |b| {
@@ -235,26 +218,7 @@ fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
         ba.bytecodes().len()
     );
     let env = make_global_env();
-    for _ in 0..100 {
-        let mut frame = InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
-        let _ = Interpreter::run(&mut frame);
-    }
-    let warmup_start = std::time::Instant::now();
-    while !ba.has_all_maglev_jit_code()
-        && !ba.has_turbofan_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    eprintln!(
-        "BENCH_JIT[object_creation]: has_maglev={} has_turbofan={} deopt_count={} inv_count={}",
-        ba.has_maglev_jit_code(),
-        ba.has_turbofan_jit_code(),
-        ba.maglev_deopt_count(),
-        ba.invocation_count(),
-    );
-    ba.reset_maglev_deopt_count();
-    print_deopt_state("object_creation", &ba);
+    warmup_with_maglev(&ba, &env, "object_creation");
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("object_creation_1k_precompiled", |b| {
@@ -288,26 +252,7 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
         ba.bytecodes().len()
     );
     let env = make_global_env();
-    for _ in 0..100 {
-        let mut frame = InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
-        let _ = Interpreter::run(&mut frame);
-    }
-    let warmup_start = std::time::Instant::now();
-    while !ba.has_all_maglev_jit_code()
-        && !ba.has_turbofan_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    eprintln!(
-        "BENCH_JIT[array_push_sum]: has_maglev={} has_turbofan={} deopt_count={} inv_count={}",
-        ba.has_maglev_jit_code(),
-        ba.has_turbofan_jit_code(),
-        ba.maglev_deopt_count(),
-        ba.invocation_count(),
-    );
-    ba.reset_maglev_deopt_count();
-    print_deopt_state("array_push_sum", &ba);
+    warmup_with_maglev(&ba, &env, "array_push_sum");
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("array_push_sum_1k_precompiled", |b| {
@@ -342,26 +287,7 @@ fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
         ba.bytecodes().len()
     );
     let env = make_global_env();
-    for _ in 0..100 {
-        let mut frame = InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
-        let _ = Interpreter::run(&mut frame);
-    }
-    let warmup_start = std::time::Instant::now();
-    while !ba.has_all_maglev_jit_code()
-        && !ba.has_turbofan_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    eprintln!(
-        "BENCH_JIT[closure_counter]: has_maglev={} has_turbofan={} deopt_count={} inv_count={}",
-        ba.has_maglev_jit_code(),
-        ba.has_turbofan_jit_code(),
-        ba.maglev_deopt_count(),
-        ba.invocation_count(),
-    );
-    ba.reset_maglev_deopt_count();
-    print_deopt_state("closure_counter", &ba);
+    warmup_with_maglev(&ba, &env, "closure_counter");
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("closure_counter_1k_precompiled", |b| {
@@ -398,26 +324,7 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
         ba.bytecodes().len()
     );
     let env = make_global_env();
-    for _ in 0..100 {
-        let mut frame = InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
-        let _ = Interpreter::run(&mut frame);
-    }
-    let warmup_start = std::time::Instant::now();
-    while !ba.has_all_maglev_jit_code()
-        && !ba.has_turbofan_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    eprintln!(
-        "BENCH_JIT[prototype_chain]: has_maglev={} has_turbofan={} deopt_count={} inv_count={}",
-        ba.has_maglev_jit_code(),
-        ba.has_turbofan_jit_code(),
-        ba.maglev_deopt_count(),
-        ba.invocation_count(),
-    );
-    ba.reset_maglev_deopt_count();
-    print_deopt_state("prototype_chain", &ba);
+    warmup_with_maglev(&ba, &env, "prototype_chain");
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("prototype_chain_1k_precompiled", |b| {
@@ -459,26 +366,7 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
         ba.bytecodes().len()
     );
     let env = make_global_env();
-    for _ in 0..100 {
-        let mut frame = InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
-        let _ = Interpreter::run(&mut frame);
-    }
-    let warmup_start = std::time::Instant::now();
-    while !ba.has_all_maglev_jit_code()
-        && !ba.has_turbofan_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    eprintln!(
-        "BENCH_JIT[sieve_primes]: has_maglev={} has_turbofan={} deopt_count={} inv_count={}",
-        ba.has_maglev_jit_code(),
-        ba.has_turbofan_jit_code(),
-        ba.maglev_deopt_count(),
-        ba.invocation_count(),
-    );
-    ba.reset_maglev_deopt_count();
-    print_deopt_state("sieve_primes", &ba);
+    warmup_with_maglev(&ba, &env, "sieve_primes");
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("sieve_primes_1k_precompiled", |b| {
@@ -509,26 +397,7 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
         ba.bytecodes().len()
     );
     let env = make_global_env();
-    for _ in 0..100 {
-        let mut frame = InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
-        let _ = Interpreter::run(&mut frame);
-    }
-    let warmup_start = std::time::Instant::now();
-    while !ba.has_all_maglev_jit_code()
-        && !ba.has_turbofan_jit_code()
-        && warmup_start.elapsed() < std::time::Duration::from_millis(2000)
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    eprintln!(
-        "BENCH_JIT[deep_object]: has_maglev={} has_turbofan={} deopt_count={} inv_count={}",
-        ba.has_maglev_jit_code(),
-        ba.has_turbofan_jit_code(),
-        ba.maglev_deopt_count(),
-        ba.invocation_count(),
-    );
-    ba.reset_maglev_deopt_count();
-    print_deopt_state("deep_object", &ba);
+    warmup_with_maglev(&ba, &env, "deep_object");
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("deep_object_access_1k_precompiled", |b| {

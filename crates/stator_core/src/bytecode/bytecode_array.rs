@@ -1782,8 +1782,9 @@ impl BytecodeArray {
         let count = self.jit_maglev_deopt_count.get();
         self.jit_maglev_deopt_count.set(count.saturating_add(1));
         // Exponential backoff: wait 2^count invocations before
-        // re-entering Maglev.  Capped at 2^20 ≈ 1M to avoid overflow.
-        let backoff = 1u32 << count.min(20);
+        // re-entering Maglev.  Capped at 2^10 = 1024 to allow recovery
+        // from transient deopts (e.g. cold JIT ICs after compilation).
+        let backoff = 1u32 << count.min(10);
         let next_try = self.invocation_count.get().saturating_add(backoff);
         self.maglev_next_try_at.set(next_try);
     }
