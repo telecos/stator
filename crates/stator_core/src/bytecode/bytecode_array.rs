@@ -1745,9 +1745,14 @@ impl BytecodeArray {
     /// Maximum number of Maglev deopt retries before permanently falling
     /// back to the interpreter.  Set high so that loops with i32 overflow
     /// (e.g. large accumulators) still benefit from Maglev on the
-    /// non-overflowing prefix of every execution.  The benchmark binary
-    /// split prevents cross-contamination, so a generous limit is safe.
-    const MAX_MAGLEV_DEOPT_RETRIES: u32 = 10_000;
+    /// non-overflowing prefix of every execution.  After this many deopts
+    /// the function is permanently blocked from re-entering Maglev, letting
+    /// the interpreter (which may actually be faster for pathological cases
+    /// like prototype-chain lookups that always trigger OVERFLOW) take over.
+    /// Kept low: the warmup phase runs 200 iterations with Maglev to warm
+    /// JIT inline caches, so any function that *still* deopts after warmup
+    /// has a persistent issue and retrying further just wastes time.
+    const MAX_MAGLEV_DEOPT_RETRIES: u32 = 3;
 
     /// Returns `true` if Maglev JIT code should NOT be attempted right now.
     ///
