@@ -5234,6 +5234,121 @@ pub(crate) mod jit_runtime {
         Some(value_i64)
     }
 
+    /// Variant of [`sta_keyed_property_inner`] that accepts pre-fetched
+    /// [`RtPtrs`] to avoid a TLS lookup on the fast path.
+    fn sta_keyed_property_with_ptrs(
+        obj_i64: i64,
+        key_i64: i64,
+        value_i64: i64,
+        ptrs: RtPtrs,
+    ) -> Option<i64> {
+        if is_heap_handle(obj_i64)
+            && key_i64 >= 0
+            && key_i64 <= i32::MAX as i64
+            && !is_heap_handle(value_i64)
+        {
+            let value = if value_i64 >= i32::MIN as i64 && value_i64 <= i32::MAX as i64 {
+                JsValue::Smi(value_i64 as i32)
+            } else if value_i64 == JIT_TRUE {
+                JsValue::Boolean(true)
+            } else if value_i64 == JIT_FALSE {
+                JsValue::Boolean(false)
+            } else if value_i64 == JIT_UNDEFINED {
+                JsValue::Undefined
+            } else if let Some(v) = super::jit_to_jsvalue(value_i64) {
+                v
+            } else {
+                return None;
+            };
+            let smi_key = key_i64 as usize;
+            let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+            let fast = if ptrs.is_cached() {
+                // SAFETY: cached pointers set by cache_rt_ptrs;
+                // valid for thread lifetime.
+                let heap_ref = unsafe { &*ptrs.heap };
+                // SAFETY: single-threaded JIT; no concurrent
+                // mutable borrows of RT_HEAP during keyed store.
+                let heap = unsafe { &*heap_ref.as_ptr() };
+                match heap.get(obj_idx)? {
+                    JsValue::Array(arr) => {
+                        // SAFETY: single-threaded JIT; no concurrent
+                        // borrows of this array during keyed store.
+                        let v = unsafe { &mut *arr.as_ptr() };
+                        if smi_key >= v.len() {
+                            let cur_len = v.len();
+                            let new_cap = (smi_key + 1).next_power_of_two();
+                            v.reserve(new_cap - cur_len);
+                            v.resize(smi_key + 1, JsValue::TheHole);
+                        }
+                        v[smi_key] = value;
+                        Some(())
+                    }
+                    JsValue::PlainObject(map_rc) => {
+                        let key_str = smi_key.to_string();
+                        // SAFETY: single-threaded JIT; no concurrent borrows.
+                        unsafe { &mut *map_rc.as_ptr() }.insert(key_str, value);
+                        Some(())
+                    }
+                    _ => None,
+                }
+            } else {
+                RT_HEAP.with(|heap| {
+                    let heap = heap.borrow();
+                    match heap.get(obj_idx)? {
+                        JsValue::Array(arr) => {
+                            let mut v = arr.borrow_mut();
+                            if smi_key >= v.len() {
+                                let cur_len = v.len();
+                                let new_cap = (smi_key + 1).next_power_of_two();
+                                v.reserve(new_cap - cur_len);
+                                v.resize(smi_key + 1, JsValue::TheHole);
+                            }
+                            v[smi_key] = value;
+                            Some(())
+                        }
+                        JsValue::PlainObject(map_rc) => {
+                            let key_str = smi_key.to_string();
+                            map_rc.borrow_mut().insert(key_str, value);
+                            Some(())
+                        }
+                        _ => None,
+                    }
+                })
+            };
+            if fast.is_some() {
+                return Some(value_i64);
+            }
+        }
+
+        // Slow path: clone-based fallback.
+        let obj = jit_i64_to_jsvalue(obj_i64);
+        let key = jit_i64_to_jsvalue(key_i64);
+        let value = jit_i64_to_jsvalue(value_i64);
+
+        match (&obj, &key) {
+            (JsValue::Array(arr), JsValue::Smi(idx)) if *idx >= 0 => {
+                let i = *idx as usize;
+                let mut v = arr.borrow_mut();
+                if i >= v.len() {
+                    let cur_len = v.len();
+                    let new_cap = (i + 1).next_power_of_two();
+                    v.reserve(new_cap - cur_len);
+                    v.resize(i + 1, JsValue::TheHole);
+                }
+                v[i] = value;
+            }
+            (JsValue::PlainObject(map_rc), JsValue::Smi(idx)) if *idx >= 0 => {
+                let key_str = idx.to_string();
+                map_rc.borrow_mut().insert(key_str, value);
+            }
+            (JsValue::PlainObject(map_rc), JsValue::String(s)) => {
+                map_rc.borrow_mut().insert(s.to_string(), value);
+            }
+            _ => return None,
+        }
+        Some(value_i64)
+    }
+
     /// Keyed store with IC update: performs the store AND writes the
     /// array's current `(handle, data_ptr, len)` back to the caller's IC
     /// slots.  This avoids the "invalidate + miss next time" pattern that
