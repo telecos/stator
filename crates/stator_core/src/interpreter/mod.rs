@@ -940,6 +940,8 @@ thread_local! {
     /// How many times `jit_runtime_lda_global` returned `JIT_DEOPT` during
     /// Maglev execution.
     static MAGLEV_DIAG_GLOBAL_DEOPT: Cell<u64> = const { Cell::new(0) };
+    /// How many times `try_execute_maglev` was blocked by the deopt guard.
+    static MAGLEV_DIAG_BLOCKED: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Increment the Maglev global-load deopt counter (called from
@@ -1057,13 +1059,14 @@ pub fn turbofan_stats() -> (u32, usize) {
 /// started, failed, panicked)`.
 ///
 /// On platforms without Maglev JIT support all values are zero.
-pub fn maglev_diagnostics() -> (u64, u64, u64, u64, u32, usize, u32, u32, u32) {
+pub fn maglev_diagnostics() -> (u64, u64, u64, u64, u32, usize, u32, u32, u32, u64) {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
         let tried = MAGLEV_DIAG_TRIED.with(|c| c.get());
         let executed = MAGLEV_DIAG_EXECUTED.with(|c| c.get());
         let deopted = MAGLEV_DIAG_DEOPTED.with(|c| c.get());
         let not_ready = MAGLEV_DIAG_NOT_READY.with(|c| c.get());
+        let blocked = MAGLEV_DIAG_BLOCKED.with(|c| c.get());
         let (compilations, code_bytes) = maglev_stats();
         let started = MAGLEV_COMPILATION_STARTED.load(std::sync::atomic::Ordering::Relaxed);
         let failed = MAGLEV_COMPILATION_FAILED.load(std::sync::atomic::Ordering::Relaxed);
@@ -1078,10 +1081,11 @@ pub fn maglev_diagnostics() -> (u64, u64, u64, u64, u32, usize, u32, u32, u32) {
             started,
             failed,
             panicked,
+            blocked,
         );
     }
     #[allow(unreachable_code)]
-    (0, 0, 0, 0, 0, 0, 0, 0, 0)
+    (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 }
 
 /// Return per-category deopt counters:
@@ -1408,6 +1412,7 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
     #[cfg(all(target_arch = "x86_64", unix))]
     {
         if ba.jit_maglev_has_deopted() {
+            MAGLEV_DIAG_BLOCKED.with(|c| c.set(c.get() + 1));
             return None;
         }
 

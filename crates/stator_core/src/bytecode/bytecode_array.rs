@@ -1797,6 +1797,16 @@ impl BytecodeArray {
         self.maglev_next_try_at.set(0);
     }
 
+    /// Returns the current `next_try_at` value for diagnostics.
+    pub fn maglev_next_try_at(&self) -> u32 {
+        self.maglev_next_try_at.get()
+    }
+
+    /// Returns `true` if the Maglev executable cache has been populated.
+    pub fn has_maglev_executable_cached(&self) -> bool {
+        self.maglev_executable.borrow().is_some()
+    }
+
     /// Returns a clone of the cached Maglev-JIT machine code and
     /// register-file slot count, or `None` if Maglev compilation has not
     /// finished yet.

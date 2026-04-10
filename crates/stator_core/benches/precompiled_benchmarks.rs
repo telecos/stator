@@ -38,6 +38,21 @@ fn make_global_env() -> Rc<RefCell<GlobalEnv>> {
     Rc::new(RefCell::new(env))
 }
 
+/// Print deopt state after reset — helps diagnose why Maglev may be blocked.
+fn print_deopt_state(
+    name: &str,
+    ba: &std::rc::Rc<stator_core::bytecode::bytecode_array::BytecodeArray>,
+) {
+    eprintln!(
+        "DEOPT_STATE[{name}]: has_deopted={} count={} next_try={} inv={} cache_populated={}",
+        ba.jit_maglev_has_deopted(),
+        ba.maglev_deopt_count(),
+        ba.maglev_next_try_at(),
+        ba.invocation_count(),
+        ba.has_maglev_executable_cached(),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Precompiled benchmark functions
 // ---------------------------------------------------------------------------
@@ -83,10 +98,12 @@ fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
     );
     // Reset deopt cooldown so Maglev re-enters during Criterion measurement.
     ba.reset_maglev_deopt_count();
+    print_deopt_state("fib_40", &ba);
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("fib_40_iterative_precompiled", |b| {
         b.iter(|| {
+            ba.reset_maglev_deopt_count();
             let mut frame =
                 InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
@@ -131,10 +148,12 @@ fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
         ba.invocation_count(),
     );
     ba.reset_maglev_deopt_count();
+    print_deopt_state("arithmetic", &ba);
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("arithmetic_loop_10k_precompiled", |b| {
         b.iter(|| {
+            ba.reset_maglev_deopt_count();
             let mut frame =
                 InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
             black_box(Interpreter::run(black_box(&mut frame)).unwrap());
@@ -180,10 +199,12 @@ fn bench_property_access_1k_precompiled(c: &mut Criterion) {
         ba.invocation_count(),
     );
     ba.reset_maglev_deopt_count();
+    print_deopt_state("property_access", &ba);
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("property_access_1k_precompiled", |b| {
         b.iter(|| {
+            ba.reset_maglev_deopt_count();
             let mut frame =
                 InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
@@ -236,10 +257,12 @@ fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
         ba.invocation_count(),
     );
     ba.reset_maglev_deopt_count();
+    print_deopt_state("object_creation", &ba);
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("object_creation_1k_precompiled", |b| {
         b.iter(|| {
+            ba.reset_maglev_deopt_count();
             let mut frame =
                 InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
@@ -288,10 +311,12 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
         ba.invocation_count(),
     );
     ba.reset_maglev_deopt_count();
+    print_deopt_state("array_push_sum", &ba);
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("array_push_sum_1k_precompiled", |b| {
         b.iter(|| {
+            ba.reset_maglev_deopt_count();
             let mut frame =
                 InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
@@ -341,10 +366,12 @@ fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
         ba.invocation_count(),
     );
     ba.reset_maglev_deopt_count();
+    print_deopt_state("closure_counter", &ba);
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("closure_counter_1k_precompiled", |b| {
         b.iter(|| {
+            ba.reset_maglev_deopt_count();
             let mut frame =
                 InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
@@ -396,10 +423,12 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
         ba.invocation_count(),
     );
     ba.reset_maglev_deopt_count();
+    print_deopt_state("prototype_chain", &ba);
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("prototype_chain_1k_precompiled", |b| {
         b.iter(|| {
+            ba.reset_maglev_deopt_count();
             let mut frame =
                 InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
@@ -456,10 +485,12 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
         ba.invocation_count(),
     );
     ba.reset_maglev_deopt_count();
+    print_deopt_state("sieve_primes", &ba);
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("sieve_primes_1k_precompiled", |b| {
         b.iter(|| {
+            ba.reset_maglev_deopt_count();
             let mut frame =
                 InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
@@ -505,10 +536,12 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
         ba.invocation_count(),
     );
     ba.reset_maglev_deopt_count();
+    print_deopt_state("deep_object", &ba);
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     c.bench_function("deep_object_access_1k_precompiled", |b| {
         b.iter(|| {
+            ba.reset_maglev_deopt_count();
             let mut frame =
                 InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
@@ -523,18 +556,29 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
 
 fn print_maglev_diag(
     name: &str,
-    diag_before: &(u64, u64, u64, u64, u32, usize, u32, u32, u32),
+    diag_before: &(u64, u64, u64, u64, u32, usize, u32, u32, u32, u64),
     cats_before: &[u64; 6],
 ) {
-    let (tried, executed, deopted, not_ready, compilations, code_bytes, started, failed, panicked) =
-        maglev_diagnostics();
+    let (
+        tried,
+        executed,
+        deopted,
+        not_ready,
+        compilations,
+        code_bytes,
+        started,
+        failed,
+        panicked,
+        blocked,
+    ) = maglev_diagnostics();
     let cats_after = maglev_deopt_categories();
     eprintln!(
-        "MAGLEV_DIAG[{name}]: tried={} executed={} deopted={} not_ready={} compilations={} code_bytes={} started={} failed={} panicked={}",
+        "MAGLEV_DIAG[{name}]: tried={} executed={} deopted={} not_ready={} blocked={} compilations={} code_bytes={} started={} failed={} panicked={}",
         tried - diag_before.0,
         executed - diag_before.1,
         deopted - diag_before.2,
         not_ready - diag_before.3,
+        blocked - diag_before.9,
         compilations - diag_before.4,
         code_bytes - diag_before.5,
         started - diag_before.6,
