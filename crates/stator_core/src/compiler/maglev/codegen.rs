@@ -5730,21 +5730,18 @@ impl<'a> MaglevCodegen<'a> {
         // ── Monomorphic cache check ─────────────────────────────────
         let mut cache_miss = Label::new();
         let mut done_label = Label::new();
-        let mut closure_fast_path = Label::new();
 
         self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, off_callee);
         self.masm.jne(&mut cache_miss);
 
-        // Guard: if the cached ctx_ptr is non-zero this is a closure
-        // call.  The raw context pointer may be dangling (the backing
-        // Rc can be dropped/replaced between calls), so we must NOT
-        // reuse it.  Jump to the dedicated closure fast path which
-        // calls jit_runtime_get_jit_entry for a fresh, live ctx_ptr
-        // and dispatches without touching the mono cache.
-        self.masm
-            .mov_load_base_disp32(Reg64::Rax, Reg64::Rbp, off_ctx);
-        self.masm.test_rr(Reg64::Rax, Reg64::Rax);
-        self.masm.jne(&mut closure_fast_path);
+        // Closures now use the same mono-cache inline path as plain
+        // functions.  The cached ctx_ptr is safe because:
+        //   - callee_i64 matched → the heap handle is the same closure
+        //   - the closure's Rc<BytecodeArray> keeps the context Rc alive
+        //   - the callee receives context via RSI (direct context slot
+        //     stubs), NOT from the global TLS context cell
+        // No global context swap is needed: the callee's Maglev code
+        // only touches its own context through the RSI pointer.
 
         // ── Mono HIT: inline JIT-to-JIT dispatch ─────────────────
         //
@@ -5836,94 +5833,6 @@ impl<'a> MaglevCodegen<'a> {
         let mono_retry_addr =
             jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
         self.masm.mov_ri(Reg64::R11, mono_retry_addr as i64);
-        self.masm.call_reg(Reg64::R11);
-        self.masm.jmp(&mut done_label);
-
-        // ── Closure fast path: fresh get_jit_entry + direct call ────
-        //
-        // Closures always take this path (ctx_ptr != 0 detected by the
-        // guard above).  We call jit_runtime_get_jit_entry for a fresh,
-        // live ctx_ptr and dispatch immediately — no mono-cache reads,
-        // no extra BA/reg-slot FFI calls between get_jit_entry and the
-        // callee.  This mirrors the proven emit_direct_call_1 flow and
-        // avoids the SIGSEGV caused by the cache-miss path's extra FFI
-        // calls potentially invalidating the context pointer.
-        self.masm.bind_label(&mut closure_fast_path);
-
-        self.masm.mov_rr(Reg64::Rdi, Reg64::R11); // callee
-        // Push callee + padding (2 pushes → RSP ≡ 0 mod 16).
-        self.masm.push(Reg64::Rdi);
-        self.masm.push(Reg64::Rdi);
-
-        let closure_get_entry_addr = jit_runtime::jit_runtime_get_jit_entry as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, closure_get_entry_addr as i64);
-        self.masm.call_reg(Reg64::R11);
-
-        // Check entry_point == 0 → stub fallback.
-        let mut closure_stub_fallback = Label::new();
-        self.masm.test_rr(Reg64::Rax, Reg64::Rax);
-        self.masm.je(&mut closure_stub_fallback);
-
-        // RAX = entry_point, RDX = ctx_ptr (fresh from get_jit_entry).
-        self.masm.mov_rr(Reg64::R11, Reg64::Rax); // entry
-        self.masm.mov_rr(Reg64::R10, Reg64::Rdx); // ctx
-
-        // Allocate 128-byte register file.
-        self.masm.sub_ri(Reg64::Rsp, 128);
-
-        // Zero the full register file (16 qwords).
-        self.masm.push(Reg64::R10);
-        self.masm.push(Reg64::R11);
-        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
-        self.masm.mov_ri(Reg64::Rcx, 16);
-        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
-        self.masm.add_ri(Reg64::Rdi, 16);
-        self.masm.rep_stosq();
-        self.masm.pop(Reg64::R11);
-        self.masm.pop(Reg64::R10);
-
-        // Call entry point: RDI = register file, RSI = fresh ctx_ptr.
-        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
-        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
-        self.masm.call_reg(Reg64::R11);
-
-        // Deallocate register file.
-        self.masm.add_ri(Reg64::Rsp, 128);
-
-        // Finish direct call (restores BA, context, truncates heap).
-        // Pass R15 (RT_PTRS cell addr) as RSI to skip TLS lookup.
-        self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
-        self.masm.mov_rr(Reg64::Rsi, Reg64::R15);
-        let closure_finish_addr =
-            jit_runtime::jit_runtime_finish_direct_call_r15 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, closure_finish_addr as i64);
-        self.masm.call_reg(Reg64::R11);
-
-        // Deopt check: if callee deopted, fall back to runtime stub.
-        self.masm.cmp_ri(Reg64::Rax, i32::MIN);
-        let mut closure_ok = Label::new();
-        self.masm.jcc(CondCode::GreaterEq, &mut closure_ok);
-        // Callee deopt: callee_i64 is still on the stack.
-        self.masm.pop(Reg64::Rdi); // callee
-        self.masm.add_ri(Reg64::Rsp, 8); // discard padding
-        let closure_retry_addr =
-            jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, closure_retry_addr as i64);
-        self.masm.call_reg(Reg64::R11);
-        self.masm.jmp(&mut done_label);
-
-        self.masm.bind_label(&mut closure_ok);
-        // Pop saved callee + padding.
-        self.masm.add_ri(Reg64::Rsp, 16);
-        self.masm.jmp(&mut done_label);
-
-        // Closure stub fallback (get_jit_entry returned 0).
-        self.masm.bind_label(&mut closure_stub_fallback);
-        self.masm.pop(Reg64::R11); // discard padding
-        self.masm.pop(Reg64::Rdi); // callee
-        let closure_stub_addr =
-            jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, closure_stub_addr as i64);
         self.masm.call_reg(Reg64::R11);
         self.masm.jmp(&mut done_label);
 
