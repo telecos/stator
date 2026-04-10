@@ -403,6 +403,88 @@ pub(crate) mod jit_runtime {
         /// object.  Set by the closure call path when the callee has 0
         /// formal parameters (the arguments object is dead code).
         static SKIP_MAPPED_ARGS: Cell<bool> = const { Cell::new(false) };
+
+        /// Per-stub deopt failure tracking.  Each index corresponds to a
+        /// specific runtime stub (see `STUB_*` constants).
+        static RT_STUB_DEOPT_COUNTS: Cell<[u64; STUB_DEOPT_SLOTS]> =
+            const { Cell::new([0; STUB_DEOPT_SLOTS]) };
+    }
+
+    // ── Per-stub deopt tracking ─────────────────────────────────────────
+
+    /// Number of slots in the per-stub deopt counter array.
+    pub const STUB_DEOPT_SLOTS: usize = 24;
+
+    /// Stub deopt tracking indices.
+    pub const STUB_LDA_NAMED: usize = 0;
+    pub const STUB_STA_NAMED: usize = 1;
+    pub const STUB_LDA_GLOBAL: usize = 2;
+    pub const STUB_STA_GLOBAL: usize = 3;
+    pub const STUB_CONSTRUCT0: usize = 4;
+    pub const STUB_CONSTRUCT1: usize = 5;
+    pub const STUB_CONSTRUCT2: usize = 6;
+    pub const STUB_CREATE_OBJ_WITH_PROPS: usize = 7;
+    pub const STUB_FAST_CREATE_OBJ: usize = 8;
+    pub const STUB_LDA_KEYED: usize = 9;
+    pub const STUB_STA_KEYED: usize = 10;
+    pub const STUB_CALL_UNDEF0: usize = 11;
+    pub const STUB_CREATE_CLOSURE: usize = 12;
+    pub const STUB_STA_NAMED_OWN: usize = 13;
+    pub const STUB_CALL_PROP0: usize = 14;
+    pub const STUB_CALL_PROP1: usize = 15;
+    pub const STUB_CALL_UNDEF1: usize = 16;
+    pub const STUB_CALL_UNDEF2: usize = 17;
+    pub const STUB_FAST_ARRAY_LOAD: usize = 18;
+    pub const STUB_FAST_ARRAY_STORE: usize = 19;
+    pub const STUB_FAST_ARRAY_PUSH: usize = 20;
+    pub const STUB_TRAMPOLINE: usize = 21;
+
+    /// Human-readable names for each stub index (for diagnostic printing).
+    pub const STUB_NAMES: [&str; STUB_DEOPT_SLOTS] = [
+        "lda_named",
+        "sta_named",
+        "lda_global",
+        "sta_global",
+        "construct0",
+        "construct1",
+        "construct2",
+        "create_obj_props",
+        "fast_create_obj",
+        "lda_keyed",
+        "sta_keyed",
+        "call_undef0",
+        "create_closure",
+        "sta_named_own",
+        "call_prop0",
+        "call_prop1",
+        "call_undef1",
+        "call_undef2",
+        "fast_array_load",
+        "fast_array_store",
+        "fast_array_push",
+        "trampoline",
+        "_reserved22",
+        "_reserved23",
+    ];
+
+    /// Record a deopt for the stub at the given index.
+    #[inline]
+    fn track_stub_deopt(idx: usize) {
+        RT_STUB_DEOPT_COUNTS.with(|c| {
+            let mut arr = c.get();
+            arr[idx] = arr[idx].saturating_add(1);
+            c.set(arr);
+        });
+    }
+
+    /// Return the current per-stub deopt counts.
+    pub fn stub_deopt_counts() -> [u64; STUB_DEOPT_SLOTS] {
+        RT_STUB_DEOPT_COUNTS.with(|c| c.get())
+    }
+
+    /// Reset all per-stub deopt counts to zero.
+    pub fn reset_stub_deopt_counts() {
+        RT_STUB_DEOPT_COUNTS.with(|c| c.set([0; STUB_DEOPT_SLOTS]));
     }
 
     /// Extended single-entry callee cache entry.
@@ -1071,7 +1153,10 @@ pub(crate) mod jit_runtime {
         operand1: i64,
         operand2: i64,
     ) -> i64 {
-        jit_runtime_dispatch(opcode, regs, acc, operand1, operand2).unwrap_or(JIT_DEOPT)
+        jit_runtime_dispatch(opcode, regs, acc, operand1, operand2).unwrap_or_else(|| {
+            track_stub_deopt(STUB_TRAMPOLINE);
+            JIT_DEOPT
+        })
     }
 
     /// Inner dispatch for the trampoline.  Returns `None` to signal deopt.
@@ -1983,7 +2068,10 @@ pub(crate) mod jit_runtime {
         name_idx: u32,
         _feedback_slot: u32,
     ) -> i64 {
-        lda_named_property_inner(obj_i64, name_idx).unwrap_or(JIT_DEOPT)
+        lda_named_property_inner(obj_i64, name_idx).unwrap_or_else(|| {
+            track_stub_deopt(STUB_LDA_NAMED);
+            JIT_DEOPT
+        })
     }
 
     /// Like [`jit_runtime_lda_named_property`] but accepts a pre-cached
@@ -2008,7 +2096,10 @@ pub(crate) mod jit_runtime {
         // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
         // TLS slot lives for the thread's entire lifetime.
         let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
-        lda_named_property_inner_with_ptrs(obj_i64, name_idx, ptrs).unwrap_or(JIT_DEOPT)
+        lda_named_property_inner_with_ptrs(obj_i64, name_idx, ptrs).unwrap_or_else(|| {
+            track_stub_deopt(STUB_LDA_NAMED);
+            JIT_DEOPT
+        })
     }
 
     /// Inner implementation for [`jit_runtime_lda_named_property`].
@@ -2603,7 +2694,10 @@ pub(crate) mod jit_runtime {
     ///
     /// Returns the call result as `i64` in `RAX`, or [`JIT_DEOPT`].
     pub extern "C" fn jit_runtime_call_undefined_receiver0(callee_i64: i64) -> i64 {
-        call_undefined_receiver0_inner(callee_i64).unwrap_or(JIT_DEOPT)
+        call_undefined_receiver0_inner(callee_i64).unwrap_or_else(|| {
+            track_stub_deopt(STUB_CALL_UNDEF0);
+            JIT_DEOPT
+        })
     }
 
     /// Execute a JS `Function` callee via JIT (preferred) or interpreter
@@ -3803,7 +3897,10 @@ pub(crate) mod jit_runtime {
     ///
     /// Returns the result as `i64` in `RAX`, or [`JIT_DEOPT`].
     pub extern "C" fn jit_runtime_call_undefined_receiver1(callee_i64: i64, arg0_i64: i64) -> i64 {
-        call_undefined_receiver1_inner(callee_i64, arg0_i64).unwrap_or(JIT_DEOPT)
+        call_undefined_receiver1_inner(callee_i64, arg0_i64).unwrap_or_else(|| {
+            track_stub_deopt(STUB_CALL_UNDEF1);
+            JIT_DEOPT
+        })
     }
 
     /// Inner implementation for [`jit_runtime_call_undefined_receiver1`].
@@ -3883,7 +3980,10 @@ pub(crate) mod jit_runtime {
         arg0_i64: i64,
         arg1_i64: i64,
     ) -> i64 {
-        call_undefined_receiver2_inner(callee_i64, arg0_i64, arg1_i64).unwrap_or(JIT_DEOPT)
+        call_undefined_receiver2_inner(callee_i64, arg0_i64, arg1_i64).unwrap_or_else(|| {
+            track_stub_deopt(STUB_CALL_UNDEF2);
+            JIT_DEOPT
+        })
     }
 
     fn call_undefined_receiver2_inner(
@@ -4809,6 +4909,7 @@ pub(crate) mod jit_runtime {
     pub extern "C" fn jit_runtime_lda_global(name_idx: i64) -> i64 {
         let result = lda_global_inner(name_idx as u32).unwrap_or(JIT_DEOPT);
         if result == JIT_DEOPT {
+            track_stub_deopt(STUB_LDA_GLOBAL);
             // Track global-load failures during Maglev execution for
             // diagnostics.
             crate::interpreter::maglev_track_global_deopt();
@@ -4884,7 +4985,10 @@ pub(crate) mod jit_runtime {
     ///
     /// Returns `value_i64` in `RAX` on success, or [`JIT_DEOPT`].
     pub extern "C" fn jit_runtime_sta_global(name_idx: i64, value_i64: i64) -> i64 {
-        sta_global_inner(name_idx as u32, value_i64).unwrap_or(JIT_DEOPT)
+        sta_global_inner(name_idx as u32, value_i64).unwrap_or_else(|| {
+            track_stub_deopt(STUB_STA_GLOBAL);
+            JIT_DEOPT
+        })
     }
 
     /// Inner implementation for [`jit_runtime_sta_global`].
@@ -4970,7 +5074,10 @@ pub(crate) mod jit_runtime {
     ///
     /// Returns the element value as `i64` in `RAX`, or [`JIT_DEOPT`].
     pub extern "C" fn jit_runtime_lda_keyed_property(obj_i64: i64, key_i64: i64) -> i64 {
-        lda_keyed_property_inner(obj_i64, key_i64).unwrap_or(JIT_DEOPT)
+        lda_keyed_property_inner(obj_i64, key_i64).unwrap_or_else(|| {
+            track_stub_deopt(STUB_LDA_KEYED);
+            JIT_DEOPT
+        })
     }
 
     /// Like [`jit_runtime_lda_keyed_property`] but accepts a pre-cached
@@ -4994,7 +5101,10 @@ pub(crate) mod jit_runtime {
         // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
         // TLS slot lives for the thread's entire lifetime.
         let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
-        lda_keyed_property_with_ptrs(obj_i64, key_i64, ptrs).unwrap_or(JIT_DEOPT)
+        lda_keyed_property_with_ptrs(obj_i64, key_i64, ptrs).unwrap_or_else(|| {
+            track_stub_deopt(STUB_LDA_KEYED);
+            JIT_DEOPT
+        })
     }
 
     /// Inline encode a `&JsValue` to JIT i64 for the most common element
@@ -5153,7 +5263,10 @@ pub(crate) mod jit_runtime {
         key_i64: i64,
         value_i64: i64,
     ) -> i64 {
-        sta_keyed_property_inner(obj_i64, key_i64, value_i64).unwrap_or(JIT_DEOPT)
+        sta_keyed_property_inner(obj_i64, key_i64, value_i64).unwrap_or_else(|| {
+            track_stub_deopt(STUB_STA_KEYED);
+            JIT_DEOPT
+        })
     }
 
     /// Like [`jit_runtime_sta_keyed_property`] but accepts a pre-cached
@@ -5178,7 +5291,10 @@ pub(crate) mod jit_runtime {
         // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
         // TLS slot lives for the thread's entire lifetime.
         let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
-        sta_keyed_property_with_ptrs(obj_i64, key_i64, value_i64, ptrs).unwrap_or(JIT_DEOPT)
+        sta_keyed_property_with_ptrs(obj_i64, key_i64, value_i64, ptrs).unwrap_or_else(|| {
+            track_stub_deopt(STUB_STA_KEYED);
+            JIT_DEOPT
+        })
     }
 
     /// Inner implementation for [`jit_runtime_sta_keyed_property`].
@@ -5453,7 +5569,10 @@ pub(crate) mod jit_runtime {
                 }
             }
         }
-        result.unwrap_or(JIT_DEOPT)
+        result.unwrap_or_else(|| {
+            track_stub_deopt(STUB_STA_KEYED);
+            JIT_DEOPT
+        })
     }
 
     /// R15 variant of [`jit_runtime_sta_keyed_property_with_ic`] that
@@ -5499,7 +5618,10 @@ pub(crate) mod jit_runtime {
                 }
             }
         }
-        result.unwrap_or(JIT_DEOPT)
+        result.unwrap_or_else(|| {
+            track_stub_deopt(STUB_STA_KEYED);
+            JIT_DEOPT
+        })
     }
 
     // ── Specialized fast-path array element stubs ────────────────────────
@@ -5520,7 +5642,10 @@ pub(crate) mod jit_runtime {
     /// Returns the element as a JIT `i64` in `RAX`, or [`JIT_DEOPT`].
     #[unsafe(no_mangle)]
     pub extern "C" fn jit_runtime_fast_array_load(obj_handle: i64, index: i64) -> i64 {
-        fast_array_load_inner(obj_handle, index).unwrap_or(JIT_DEOPT)
+        fast_array_load_inner(obj_handle, index).unwrap_or_else(|| {
+            track_stub_deopt(STUB_FAST_ARRAY_LOAD);
+            JIT_DEOPT
+        })
     }
 
     /// Inner implementation for [`jit_runtime_fast_array_load`].
@@ -5604,7 +5729,10 @@ pub(crate) mod jit_runtime {
         index: i64,
         value_i64: i64,
     ) -> i64 {
-        fast_array_store_inner(obj_handle, index, value_i64).unwrap_or(JIT_DEOPT)
+        fast_array_store_inner(obj_handle, index, value_i64).unwrap_or_else(|| {
+            track_stub_deopt(STUB_FAST_ARRAY_STORE);
+            JIT_DEOPT
+        })
     }
 
     /// Inner implementation for [`jit_runtime_fast_array_store`].
@@ -5695,7 +5823,10 @@ pub(crate) mod jit_runtime {
         _method_handle: i64,
         value_i64: i64,
     ) -> i64 {
-        fast_array_push_inner(obj_handle, value_i64).unwrap_or(JIT_DEOPT)
+        fast_array_push_inner(obj_handle, value_i64).unwrap_or_else(|| {
+            track_stub_deopt(STUB_FAST_ARRAY_PUSH);
+            JIT_DEOPT
+        })
     }
 
     /// Inner implementation for [`jit_runtime_fast_array_push`].
@@ -6706,7 +6837,10 @@ pub(crate) mod jit_runtime {
         name_idx: u32,
         value_i64: i64,
     ) -> i64 {
-        sta_named_property_inner(obj_i64, name_idx, value_i64).unwrap_or(JIT_DEOPT)
+        sta_named_property_inner(obj_i64, name_idx, value_i64).unwrap_or_else(|| {
+            track_stub_deopt(STUB_STA_NAMED);
+            JIT_DEOPT
+        })
     }
 
     /// Inner implementation for [`jit_runtime_sta_named_property`].
@@ -6796,7 +6930,10 @@ pub(crate) mod jit_runtime {
         feedback_slot: i64,
         capacity: i64,
     ) -> i64 {
-        fast_create_object_literal_inner(feedback_slot, capacity).unwrap_or(JIT_DEOPT)
+        fast_create_object_literal_inner(feedback_slot, capacity).unwrap_or_else(|| {
+            track_stub_deopt(STUB_FAST_CREATE_OBJ);
+            JIT_DEOPT
+        })
     }
 
     /// Inner implementation for [`jit_runtime_fast_create_object_literal`].
@@ -6916,7 +7053,10 @@ pub(crate) mod jit_runtime {
         val2: i64,
     ) -> i64 {
         create_object_with_props_inner(feedback_slot, names_packed, val0, val1, val2)
-            .unwrap_or(JIT_DEOPT)
+            .unwrap_or_else(|| {
+                track_stub_deopt(STUB_CREATE_OBJ_WITH_PROPS);
+                JIT_DEOPT
+            })
     }
 
     /// Inner implementation for [`jit_runtime_create_object_with_props`].
@@ -7104,7 +7244,12 @@ pub(crate) mod jit_runtime {
         name_idx: i64,
         value_i64: i64,
     ) -> i64 {
-        fast_sta_named_own_property_inner(obj_i64, name_idx as u32, value_i64).unwrap_or(JIT_DEOPT)
+        fast_sta_named_own_property_inner(obj_i64, name_idx as u32, value_i64).unwrap_or_else(
+            || {
+                track_stub_deopt(STUB_STA_NAMED_OWN);
+                JIT_DEOPT
+            },
+        )
     }
 
     /// Inner implementation for [`jit_runtime_fast_sta_named_own_property`].
@@ -7171,7 +7316,10 @@ pub(crate) mod jit_runtime {
     ///
     /// Returns the call result as `i64` in `RAX`, or [`JIT_DEOPT`].
     pub extern "C" fn jit_runtime_call_property0(callee_i64: i64, receiver_i64: i64) -> i64 {
-        call_property0_inner(callee_i64, receiver_i64).unwrap_or(JIT_DEOPT)
+        call_property0_inner(callee_i64, receiver_i64).unwrap_or_else(|| {
+            track_stub_deopt(STUB_CALL_PROP0);
+            JIT_DEOPT
+        })
     }
 
     /// Inner implementation for [`jit_runtime_call_property0`].
@@ -7388,7 +7536,10 @@ pub(crate) mod jit_runtime {
         receiver_i64: i64,
         arg0_i64: i64,
     ) -> i64 {
-        call_property1_inner(callee_i64, receiver_i64, arg0_i64).unwrap_or(JIT_DEOPT)
+        call_property1_inner(callee_i64, receiver_i64, arg0_i64).unwrap_or_else(|| {
+            track_stub_deopt(STUB_CALL_PROP1);
+            JIT_DEOPT
+        })
     }
 
     /// IC-hit fast path for `Array.prototype.push` in `CallProperty1`.
@@ -7979,13 +8130,16 @@ pub(crate) mod jit_runtime {
         // BytecodeArray for the duration of the JIT execution.
         let ba_ptr = RT_BYTECODE.with(|b| b.get());
         if ba_ptr.is_null() {
+            track_stub_deopt(STUB_CREATE_CLOSURE);
             return JIT_DEOPT;
         }
         let ba = unsafe { &*ba_ptr };
         let Some(entry) = ba.get_constant(cp_idx as u32) else {
+            track_stub_deopt(STUB_CREATE_CLOSURE);
             return JIT_DEOPT;
         };
         let ConstantPoolEntry::Function(inner_ba) = entry else {
+            track_stub_deopt(STUB_CREATE_CLOSURE);
             return JIT_DEOPT;
         };
         let closure_ctx = RT_CONTEXT.with(|ctx_cell| {
@@ -8471,7 +8625,10 @@ pub(crate) mod jit_runtime {
     /// Simplified construct for 0 arguments — takes the constructor value
     /// directly instead of reading from the register file.
     pub extern "C" fn jit_runtime_construct0(ctor_i64: i64) -> i64 {
-        construct0_inner(ctor_i64).unwrap_or(JIT_DEOPT)
+        construct0_inner(ctor_i64).unwrap_or_else(|| {
+            track_stub_deopt(STUB_CONSTRUCT0);
+            JIT_DEOPT
+        })
     }
 
     fn construct0_inner(ctor_i64: i64) -> Option<i64> {
@@ -8536,7 +8693,10 @@ pub(crate) mod jit_runtime {
     /// Construct with exactly 1 argument — takes the constructor and one arg
     /// as packed i64 values.
     pub extern "C" fn jit_runtime_construct1(ctor_i64: i64, arg0_i64: i64) -> i64 {
-        construct1_inner(ctor_i64, arg0_i64).unwrap_or(JIT_DEOPT)
+        construct1_inner(ctor_i64, arg0_i64).unwrap_or_else(|| {
+            track_stub_deopt(STUB_CONSTRUCT1);
+            JIT_DEOPT
+        })
     }
 
     fn construct1_inner(ctor_i64: i64, arg0_i64: i64) -> Option<i64> {
@@ -8593,7 +8753,10 @@ pub(crate) mod jit_runtime {
     /// Construct with exactly 2 arguments — takes the constructor and two args
     /// as packed i64 values.
     pub extern "C" fn jit_runtime_construct2(ctor_i64: i64, arg0_i64: i64, arg1_i64: i64) -> i64 {
-        construct2_inner(ctor_i64, arg0_i64, arg1_i64).unwrap_or(JIT_DEOPT)
+        construct2_inner(ctor_i64, arg0_i64, arg1_i64).unwrap_or_else(|| {
+            track_stub_deopt(STUB_CONSTRUCT2);
+            JIT_DEOPT
+        })
     }
 
     fn construct2_inner(ctor_i64: i64, arg0_i64: i64, arg1_i64: i64) -> Option<i64> {
@@ -8661,6 +8824,63 @@ pub use jit_runtime::{
     jit_runtime_inline_load_keyed_smi_ic_r15, probe_jscontext_layout, probe_jsvalue_layout,
     probe_vec_jsvalue_layout,
 };
+
+// ── Per-stub deopt tracking (platform-independent API) ──────────────────
+
+/// Number of slots in the per-stub deopt counter array.
+pub const STUB_DEOPT_SLOTS: usize = 24;
+
+/// Human-readable names for each stub index (for diagnostic printing).
+pub const STUB_NAMES: [&str; STUB_DEOPT_SLOTS] = [
+    "lda_named",
+    "sta_named",
+    "lda_global",
+    "sta_global",
+    "construct0",
+    "construct1",
+    "construct2",
+    "create_obj_props",
+    "fast_create_obj",
+    "lda_keyed",
+    "sta_keyed",
+    "call_undef0",
+    "create_closure",
+    "sta_named_own",
+    "call_prop0",
+    "call_prop1",
+    "call_undef1",
+    "call_undef2",
+    "fast_array_load",
+    "fast_array_store",
+    "fast_array_push",
+    "trampoline",
+    "_reserved22",
+    "_reserved23",
+];
+
+/// Return the current per-stub deopt counts.
+///
+/// On platforms without the JIT (non-x86-64/non-Unix), returns all zeros.
+pub fn stub_deopt_counts() -> [u64; STUB_DEOPT_SLOTS] {
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        jit_runtime::stub_deopt_counts()
+    }
+    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    {
+        [0; STUB_DEOPT_SLOTS]
+    }
+}
+
+/// Reset all per-stub deopt counts to zero.
+///
+/// On platforms without the JIT this is a no-op.
+pub fn reset_stub_deopt_counts() {
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        jit_runtime::reset_stub_deopt_counts();
+    }
+}
 
 /// A single entry in the safepoint table.
 ///

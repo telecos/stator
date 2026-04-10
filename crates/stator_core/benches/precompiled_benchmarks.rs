@@ -15,6 +15,9 @@ use std::rc::Rc;
 use criterion::{Criterion, criterion_group, criterion_main};
 
 use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
+use stator_core::compiler::baseline::compiler::{
+    STUB_DEOPT_SLOTS, STUB_NAMES, reset_stub_deopt_counts, stub_deopt_counts,
+};
 use stator_core::interpreter::{
     GlobalEnv, Interpreter, InterpreterFrame, globals_promotion_diagnostics, licm_diagnostics,
     maglev_deopt_categories, maglev_diagnostics,
@@ -93,6 +96,7 @@ fn warmup_with_maglev(
     }
     // Phase 3: Final reset before Criterion measurement.
     ba.reset_maglev_deopt_count();
+    reset_stub_deopt_counts();
     print_deopt_state(name, ba);
 }
 
@@ -122,6 +126,7 @@ fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
     warmup_with_maglev(&ba, &env, "fib_40");
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
+    let stubs_before = stub_deopt_counts();
     c.bench_function("fib_40_iterative_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -129,7 +134,12 @@ fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
-    print_maglev_diag("fib_40_iterative", &diag_before, &cats_before);
+    print_maglev_diag(
+        "fib_40_iterative",
+        &diag_before,
+        &cats_before,
+        &stubs_before,
+    );
 }
 
 fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
@@ -152,6 +162,7 @@ fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
     warmup_with_maglev(&ba, &env, "arithmetic_loop");
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
+    let stubs_before = stub_deopt_counts();
     c.bench_function("arithmetic_loop_10k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -159,7 +170,12 @@ fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap());
         });
     });
-    print_maglev_diag("arithmetic_loop_10k", &diag_before, &cats_before);
+    print_maglev_diag(
+        "arithmetic_loop_10k",
+        &diag_before,
+        &cats_before,
+        &stubs_before,
+    );
 }
 
 fn bench_property_access_1k_precompiled(c: &mut Criterion) {
@@ -183,6 +199,7 @@ fn bench_property_access_1k_precompiled(c: &mut Criterion) {
     warmup_with_maglev(&ba, &env, "property_access");
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
+    let stubs_before = stub_deopt_counts();
     c.bench_function("property_access_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -190,7 +207,12 @@ fn bench_property_access_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
-    print_maglev_diag("property_access_1k", &diag_before, &cats_before);
+    print_maglev_diag(
+        "property_access_1k",
+        &diag_before,
+        &cats_before,
+        &stubs_before,
+    );
     let (loops, hoisted, named_hoisted, blocked) = licm_diagnostics();
     eprintln!(
         "LICM_DIAG[property_access_1k]: loops={loops} hoisted={hoisted} named_generic_hoisted={named_hoisted} blocked_by_side_effects={blocked}"
@@ -221,6 +243,7 @@ fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
     warmup_with_maglev(&ba, &env, "object_creation");
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
+    let stubs_before = stub_deopt_counts();
     c.bench_function("object_creation_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -228,7 +251,12 @@ fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
-    print_maglev_diag("object_creation_1k", &diag_before, &cats_before);
+    print_maglev_diag(
+        "object_creation_1k",
+        &diag_before,
+        &cats_before,
+        &stubs_before,
+    );
 }
 
 fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
@@ -255,6 +283,7 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
     warmup_with_maglev(&ba, &env, "array_push_sum");
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
+    let stubs_before = stub_deopt_counts();
     c.bench_function("array_push_sum_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -262,7 +291,12 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
-    print_maglev_diag("array_push_sum_1k", &diag_before, &cats_before);
+    print_maglev_diag(
+        "array_push_sum_1k",
+        &diag_before,
+        &cats_before,
+        &stubs_before,
+    );
 }
 
 fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
@@ -290,6 +324,7 @@ fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
     warmup_with_maglev(&ba, &env, "closure_counter");
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
+    let stubs_before = stub_deopt_counts();
     c.bench_function("closure_counter_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -297,7 +332,12 @@ fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
-    print_maglev_diag("closure_counter_1k", &diag_before, &cats_before);
+    print_maglev_diag(
+        "closure_counter_1k",
+        &diag_before,
+        &cats_before,
+        &stubs_before,
+    );
 }
 
 fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
@@ -327,6 +367,7 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
     warmup_with_maglev(&ba, &env, "prototype_chain");
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
+    let stubs_before = stub_deopt_counts();
     c.bench_function("prototype_chain_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -334,7 +375,12 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
-    print_maglev_diag("prototype_chain_1k", &diag_before, &cats_before);
+    print_maglev_diag(
+        "prototype_chain_1k",
+        &diag_before,
+        &cats_before,
+        &stubs_before,
+    );
 }
 
 fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
@@ -369,6 +415,7 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
     warmup_with_maglev(&ba, &env, "sieve_primes");
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
+    let stubs_before = stub_deopt_counts();
     c.bench_function("sieve_primes_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -376,7 +423,7 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
-    print_maglev_diag("sieve_primes_1k", &diag_before, &cats_before);
+    print_maglev_diag("sieve_primes_1k", &diag_before, &cats_before, &stubs_before);
 }
 
 fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
@@ -400,6 +447,7 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
     warmup_with_maglev(&ba, &env, "deep_object");
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
+    let stubs_before = stub_deopt_counts();
     c.bench_function("deep_object_access_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -407,7 +455,12 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
             black_box(Interpreter::run(black_box(&mut frame)).unwrap())
         });
     });
-    print_maglev_diag("deep_object_access_1k", &diag_before, &cats_before);
+    print_maglev_diag(
+        "deep_object_access_1k",
+        &diag_before,
+        &cats_before,
+        &stubs_before,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +471,7 @@ fn print_maglev_diag(
     name: &str,
     diag_before: &(u64, u64, u64, u64, u32, usize, u32, u32, u32, u64),
     cats_before: &[u64; 6],
+    stubs_before: &[u64; STUB_DEOPT_SLOTS],
 ) {
     let (
         tried,
@@ -432,6 +486,7 @@ fn print_maglev_diag(
         blocked,
     ) = maglev_diagnostics();
     let cats_after = maglev_deopt_categories();
+    let stubs_after = stub_deopt_counts();
     eprintln!(
         "MAGLEV_DIAG[{name}]: tried={} executed={} deopted={} not_ready={} blocked={} compilations={} code_bytes={} started={} failed={} panicked={}",
         tried - diag_before.0,
@@ -454,6 +509,19 @@ fn print_maglev_diag(
         cats_after[4] - cats_before[4],
         cats_after[5] - cats_before[5]
     );
+    // Per-stub deopt breakdown — only print non-zero deltas.
+    let mut parts = Vec::new();
+    for i in 0..STUB_DEOPT_SLOTS {
+        let delta = stubs_after[i] - stubs_before[i];
+        if delta > 0 {
+            parts.push(format!("{}={}", STUB_NAMES[i], delta));
+        }
+    }
+    if parts.is_empty() {
+        eprintln!("  stub_deopts: (none)");
+    } else {
+        eprintln!("  stub_deopts: {}", parts.join(" "));
+    }
 }
 
 // ---------------------------------------------------------------------------
