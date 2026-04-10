@@ -387,16 +387,64 @@ pub(crate) fn acquire_object_rc_from_template_cached(
     Rc::new(RefCell::new(template.instantiate()))
 }
 
+/// Return an `Rc<RefCell<PropertyMap>>` to the thread-local object pool
+/// using a pre-cached raw pointer, bypassing both TLS lookup and RefCell
+/// borrow checking.
+///
+/// # Safety
+///
+/// `pool_ptr` must point to a live `RefCell<Vec<…>>` on the current
+/// thread (as returned by [`object_rc_pool_ptr`]).  The caller must
+/// ensure no concurrent borrows exist (single-threaded JIT guarantee).
+#[cfg(all(target_arch = "x86_64", unix))]
+#[inline(always)]
+pub(crate) fn recycle_object_rc_cached(
+    rc: Rc<RefCell<PropertyMap>>,
+    pool_ptr: *const RefCell<Vec<Rc<RefCell<PropertyMap>>>>,
+) {
+    if Rc::strong_count(&rc) != 1 {
+        return;
+    }
+    if pool_ptr.is_null() {
+        return;
+    }
+    // SAFETY: same single-threaded guarantee as acquire_object_rc_from_template_cached.
+    let pool = unsafe { &mut *(&*pool_ptr).as_ptr() };
+    if pool.len() < OBJECT_RC_POOL_CAP {
+        pool.push(rc);
+    }
+}
+
 /// Return an `Rc<RefCell<PropertyMap>>` to the thread-local object pool.
 ///
 /// Called when the JIT heap is cleared so that future object-creation
 /// calls can reuse the `Rc` control-block and `PropertyMap` allocations.
 /// The `Rc` is pooled only if it is the **sole owner**
 /// (`strong_count == 1`) and the pool has capacity.
+///
+/// On supported platforms this uses a raw-pointer fast path that avoids
+/// the `RefCell` borrow check; elsewhere it falls back to
+/// `borrow_mut()`.
 pub(crate) fn recycle_object_rc(rc: Rc<RefCell<PropertyMap>>) {
     if Rc::strong_count(&rc) != 1 {
         return;
     }
+
+    // Fast path: bypass RefCell overhead via raw pointer (x86_64 unix).
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        let pool_ptr = object_rc_pool_ptr();
+        if !pool_ptr.is_null() {
+            // SAFETY: pointer obtained from current thread's TLS; single-
+            // threaded execution guarantees no concurrent borrows.
+            let pool = unsafe { &mut *(&*pool_ptr).as_ptr() };
+            if pool.len() < OBJECT_RC_POOL_CAP {
+                pool.push(rc);
+            }
+            return;
+        }
+    }
+
     let _ = OBJECT_RC_POOL.try_with(|pool| {
         let mut pool = pool.borrow_mut();
         if pool.len() < OBJECT_RC_POOL_CAP {

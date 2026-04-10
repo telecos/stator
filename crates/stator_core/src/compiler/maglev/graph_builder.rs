@@ -25,6 +25,15 @@
 //!   Polymorphic or uninitialized slots fall back to
 //!   [`ValueNode::LoadNamedGeneric`].
 //!
+//! - **Keyed property access** — when a `KeyedLoadProperty` or
+//!   `KeyedStoreProperty` slot is [`InlineCacheState::Monomorphic`] or
+//!   [`InlineCacheState::Polymorphic`] the builder emits a
+//!   [`ValueNode::CheckSmi`] guard on the key followed by
+//!   [`ValueNode::LoadFixedArrayElement`] /
+//!   [`ValueNode::StoreFixedArrayElement`].  Uninitialized or megamorphic
+//!   slots fall back to [`ValueNode::LoadKeyedGeneric`] /
+//!   [`ValueNode::StoreKeyedGeneric`].
+//!
 //! ## Liveness / register frame
 //!
 //! Bytecode registers (including the accumulator, which is stored at index
@@ -74,7 +83,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
-use crate::bytecode::feedback::FeedbackVector;
+use crate::bytecode::feedback::{FeedbackSlotKind, FeedbackVector, InlineCacheState};
 use crate::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, NodeId, ValueNode};
 use crate::error::{StatorError, StatorResult};
 
@@ -172,10 +181,11 @@ impl Environment {
 pub struct GraphBuilder<'a> {
     /// The bytecode being compiled.
     bytecode: &'a BytecodeArray,
-    /// Runtime feedback for speculative decisions (currently unused —
-    /// Maglev compiles on a background thread with a fresh FeedbackVector,
-    /// so all slots are Uninitialized; we always emit Smi-guarded code).
-    _feedback: &'a FeedbackVector,
+    /// Runtime feedback for speculative decisions.  When keyed access slots
+    /// show [`InlineCacheState::Monomorphic`] or [`Polymorphic`] the builder
+    /// emits `CheckSmi` + `LoadFixedArrayElement`/`StoreFixedArrayElement`
+    /// instead of the generic stubs.
+    feedback: &'a FeedbackVector,
     /// The graph under construction.
     graph: MaglevGraph,
     /// Current SSA environment (register → NodeId).
@@ -218,7 +228,7 @@ impl<'a> GraphBuilder<'a> {
 
         let mut builder = Self {
             bytecode,
-            _feedback: feedback,
+            feedback,
             graph: MaglevGraph::new(parameter_count),
             env: Environment::new(parameter_count as usize, frame_size),
             current_block: 0,
@@ -639,11 +649,7 @@ impl<'a> GraphBuilder<'a> {
                 let slot = self.operand_feedback_slot(instr, 1)?;
                 let obj = self.env_get_register(obj_reg)?;
                 let key = self.env_get_accumulator()?;
-                let id = self.emit(ValueNode::LoadKeyedGeneric {
-                    object: obj,
-                    key,
-                    feedback_slot: slot,
-                })?;
+                let id = self.emit_keyed_property_load(obj, key, slot)?;
                 self.env.set_accumulator(id);
             }
 
@@ -675,12 +681,7 @@ impl<'a> GraphBuilder<'a> {
                 let obj = self.env_get_register(obj_reg)?;
                 let key = self.env_get_register(key_reg)?;
                 let value = self.env_get_accumulator()?;
-                self.emit(ValueNode::StoreKeyedGeneric {
-                    object: obj,
-                    key,
-                    value,
-                    feedback_slot: slot,
-                })?;
+                self.emit_keyed_property_store(obj, key, value, slot)?;
                 // Invalidate property CSE — keyed store may affect named lookups.
                 self.known_props.clear();
             }
@@ -1799,6 +1800,85 @@ impl<'a> GraphBuilder<'a> {
         // Cache the result for subsequent loads of the same property.
         self.known_props.insert(cse_key, id);
         Ok(id)
+    }
+
+    /// Emit a keyed property load, specialising on the feedback slot state.
+    ///
+    /// - **Monomorphic / Polymorphic** with `KeyedLoadProperty` kind →
+    ///   `CheckSmi` guard on the key + `LoadFixedArrayElement` (fast path).
+    ///   This avoids the expensive `LoadKeyedGeneric` runtime stub for the
+    ///   common pattern of `arr[i]` where `i` is always a Smi index.
+    /// - Otherwise → `LoadKeyedGeneric` (slow path).
+    fn emit_keyed_property_load(
+        &mut self,
+        object: NodeId,
+        key: NodeId,
+        slot: u32,
+    ) -> StatorResult<NodeId> {
+        if self.is_keyed_smi_access(slot) {
+            // Guard: key must be a Smi (integer index).  Deopts to
+            // interpreter if a non-Smi key is encountered at runtime.
+            self.emit(ValueNode::CheckSmi { receiver: key })?;
+            // Emit the fast-path element load.
+            self.emit(ValueNode::LoadFixedArrayElement {
+                elements: object,
+                index: key,
+            })
+        } else {
+            self.emit(ValueNode::LoadKeyedGeneric {
+                object,
+                key,
+                feedback_slot: slot,
+            })
+        }
+    }
+
+    /// Emit a keyed property store, specialising on the feedback slot state.
+    ///
+    /// - **Monomorphic / Polymorphic** with `KeyedStoreProperty` kind →
+    ///   `CheckSmi` guard on the key + `StoreFixedArrayElement` (fast path).
+    /// - Otherwise → `StoreKeyedGeneric` (slow path).
+    fn emit_keyed_property_store(
+        &mut self,
+        object: NodeId,
+        key: NodeId,
+        value: NodeId,
+        slot: u32,
+    ) -> StatorResult<NodeId> {
+        if self.is_keyed_smi_access(slot) {
+            self.emit(ValueNode::CheckSmi { receiver: key })?;
+            self.emit(ValueNode::StoreFixedArrayElement {
+                elements: object,
+                index: key,
+                value,
+            })
+        } else {
+            self.emit(ValueNode::StoreKeyedGeneric {
+                object,
+                key,
+                value,
+                feedback_slot: slot,
+            })
+        }
+    }
+
+    /// Return `true` when feedback for `slot` indicates Smi-indexed array
+    /// access that is safe to specialize.
+    ///
+    /// The slot must be a keyed property kind (`KeyedLoadProperty` or
+    /// `KeyedStoreProperty`) **and** be in [`Monomorphic`] or [`Polymorphic`]
+    /// state — meaning the interpreter has observed this site accessing a
+    /// consistent element kind with integer indices.
+    fn is_keyed_smi_access(&self, slot: u32) -> bool {
+        let is_keyed_kind = matches!(
+            self.feedback.kind_of(slot),
+            Some(FeedbackSlotKind::KeyedLoadProperty | FeedbackSlotKind::KeyedStoreProperty)
+        );
+        let is_warm = matches!(
+            self.feedback.get_state(slot),
+            Some(InlineCacheState::Monomorphic | InlineCacheState::Polymorphic)
+        );
+        is_keyed_kind && is_warm
     }
 
     /// Emit a binary arithmetic operation.
@@ -3029,6 +3109,181 @@ mod tests {
         assert!(
             !graph.is_degenerate(),
             "deep_object_access_1k graph is degenerate — Maglev won't compile it"
+        );
+    }
+
+    // ── Keyed property specialization ────────────────────────────────────────
+
+    /// When the feedback slot for `LdaKeyedProperty` is `Monomorphic`,
+    /// the builder should emit `CheckSmi` + `LoadFixedArrayElement` instead
+    /// of the generic `LoadKeyedGeneric`.
+    #[test]
+    fn test_keyed_load_monomorphic_specializes_to_fixed_array() {
+        // Bytecode: LdaSmi(0), Star(r1), Ldar(r0), LdaKeyedProperty(r0, slot:0), Return
+        //   r0 = param 0 (the array)
+        //   r1 = the key (0)
+        //   acc = arr[0]
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(0)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(0)]),
+            // LdaKeyedProperty r0, [slot 0]
+            Instruction::new_unchecked(
+                Opcode::LdaKeyedProperty,
+                vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let metadata = FeedbackMetadata::new(vec![FeedbackSlotKind::KeyedLoadProperty]);
+        let (arr, mut fv) = build(instrs, vec![], 2, 1, metadata);
+        // Simulate warm feedback.
+        fv.set_state(0, InlineCacheState::Monomorphic);
+
+        let graph = GraphBuilder::build(&arr, &fv).unwrap();
+        let block = graph.entry_block().unwrap();
+
+        // Should contain a CheckSmi guard on the key.
+        let has_check_smi = block
+            .nodes
+            .iter()
+            .any(|(_, n)| matches!(n, ValueNode::CheckSmi { .. }));
+        assert!(has_check_smi, "expected CheckSmi guard for key");
+
+        // Should contain a LoadFixedArrayElement (not LoadKeyedGeneric).
+        let has_fast_load = block
+            .nodes
+            .iter()
+            .any(|(_, n)| matches!(n, ValueNode::LoadFixedArrayElement { .. }));
+        assert!(has_fast_load, "expected LoadFixedArrayElement (fast path)");
+
+        let has_generic = block
+            .nodes
+            .iter()
+            .any(|(_, n)| matches!(n, ValueNode::LoadKeyedGeneric { .. }));
+        assert!(
+            !has_generic,
+            "LoadKeyedGeneric should NOT appear when feedback is monomorphic"
+        );
+    }
+
+    /// When the feedback slot for `LdaKeyedProperty` is `Uninitialized`,
+    /// the builder should fall back to `LoadKeyedGeneric`.
+    #[test]
+    fn test_keyed_load_uninitialized_falls_back_to_generic() {
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(0)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(0)]),
+            Instruction::new_unchecked(
+                Opcode::LdaKeyedProperty,
+                vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let metadata = FeedbackMetadata::new(vec![FeedbackSlotKind::KeyedLoadProperty]);
+        let (arr, fv) = build(instrs, vec![], 2, 1, metadata);
+        // fv slot 0 stays Uninitialized (default).
+
+        let graph = GraphBuilder::build(&arr, &fv).unwrap();
+        let block = graph.entry_block().unwrap();
+
+        let has_generic = block
+            .nodes
+            .iter()
+            .any(|(_, n)| matches!(n, ValueNode::LoadKeyedGeneric { .. }));
+        assert!(
+            has_generic,
+            "expected LoadKeyedGeneric when feedback is uninitialized"
+        );
+
+        let has_fast_load = block
+            .nodes
+            .iter()
+            .any(|(_, n)| matches!(n, ValueNode::LoadFixedArrayElement { .. }));
+        assert!(
+            !has_fast_load,
+            "LoadFixedArrayElement should NOT appear without warm feedback"
+        );
+    }
+
+    /// When the feedback slot for `StaKeyedProperty` is `Monomorphic`,
+    /// the builder should emit `CheckSmi` + `StoreFixedArrayElement`.
+    #[test]
+    fn test_keyed_store_monomorphic_specializes_to_fixed_array() {
+        // Bytecode: LdaSmi(42), StaKeyedProperty(r0, r1, slot:0), Return
+        //   r0 = param 0 (the array), r1 = param 1 (the key)
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
+            // StaKeyedProperty r0, r1, [slot 0]
+            Instruction::new_unchecked(
+                Opcode::StaKeyedProperty,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::FeedbackSlot(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let metadata = FeedbackMetadata::new(vec![FeedbackSlotKind::KeyedStoreProperty]);
+        let (arr, mut fv) = build(instrs, vec![], 2, 2, metadata);
+        fv.set_state(0, InlineCacheState::Monomorphic);
+
+        let graph = GraphBuilder::build(&arr, &fv).unwrap();
+        let block = graph.entry_block().unwrap();
+
+        let has_check_smi = block
+            .nodes
+            .iter()
+            .any(|(_, n)| matches!(n, ValueNode::CheckSmi { .. }));
+        assert!(has_check_smi, "expected CheckSmi guard for key");
+
+        let has_fast_store = block
+            .nodes
+            .iter()
+            .any(|(_, n)| matches!(n, ValueNode::StoreFixedArrayElement { .. }));
+        assert!(
+            has_fast_store,
+            "expected StoreFixedArrayElement (fast path)"
+        );
+
+        let has_generic = block
+            .nodes
+            .iter()
+            .any(|(_, n)| matches!(n, ValueNode::StoreKeyedGeneric { .. }));
+        assert!(
+            !has_generic,
+            "StoreKeyedGeneric should NOT appear when feedback is monomorphic"
+        );
+    }
+
+    /// Megamorphic feedback should fall back to the generic path.
+    #[test]
+    fn test_keyed_load_megamorphic_falls_back_to_generic() {
+        let instrs = vec![
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(0)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(0)]),
+            Instruction::new_unchecked(
+                Opcode::LdaKeyedProperty,
+                vec![Operand::Register(0), Operand::FeedbackSlot(0)],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let metadata = FeedbackMetadata::new(vec![FeedbackSlotKind::KeyedLoadProperty]);
+        let (arr, mut fv) = build(instrs, vec![], 2, 1, metadata);
+        fv.set_state(0, InlineCacheState::Megamorphic);
+
+        let graph = GraphBuilder::build(&arr, &fv).unwrap();
+        let block = graph.entry_block().unwrap();
+
+        let has_generic = block
+            .nodes
+            .iter()
+            .any(|(_, n)| matches!(n, ValueNode::LoadKeyedGeneric { .. }));
+        assert!(
+            has_generic,
+            "expected LoadKeyedGeneric when feedback is megamorphic"
         );
     }
 }

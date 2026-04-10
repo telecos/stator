@@ -1770,12 +1770,18 @@ impl BytecodeArray {
         self.jit_maglev_deopt_count.get()
     }
 
-    /// Increment the Maglev deopt counter.  After
-    /// [`MAX_MAGLEV_DEOPT_RETRIES`] the interpreter will permanently
-    /// skip Maglev for this function.
+    /// Increment the Maglev deopt counter and set the exponential
+    /// cooldown so Maglev is not re-entered until enough interpreter
+    /// invocations have elapsed.  After [`MAX_MAGLEV_DEOPT_RETRIES`]
+    /// the interpreter will permanently skip Maglev for this function.
     pub fn mark_jit_maglev_deopted(&self) {
         let count = self.jit_maglev_deopt_count.get();
         self.jit_maglev_deopt_count.set(count.saturating_add(1));
+        // Exponential backoff: wait 2^count invocations before
+        // re-entering Maglev.  Capped at 2^20 ≈ 1M to avoid overflow.
+        let backoff = 1u32 << count.min(20);
+        let next_try = self.invocation_count.get().saturating_add(backoff);
+        self.maglev_next_try_at.set(next_try);
     }
 
     /// Reset the Maglev deopt counter, allowing re-optimization.
@@ -1784,6 +1790,7 @@ impl BytecodeArray {
     /// after recompilation with better type feedback).
     pub fn reset_maglev_deopt_count(&self) {
         self.jit_maglev_deopt_count.set(0);
+        self.maglev_next_try_at.set(0);
     }
 
     /// Returns a clone of the cached Maglev-JIT machine code and
