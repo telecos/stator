@@ -6265,6 +6265,9 @@ impl<'a> MaglevCodegen<'a> {
                 | ValueNode::Int32Negate { .. }
                 | ValueNode::Int32Increment { .. }
                 | ValueNode::Int32Decrement { .. }
+                | ValueNode::Int32BitwiseOr { .. }
+                | ValueNode::Int32BitwiseAnd { .. }
+                | ValueNode::Int32BitwiseXor { .. }
         )
     }
 

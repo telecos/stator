@@ -5286,10 +5286,12 @@ impl Interpreter {
                             }
                             Opcode::CreateObjectLiteral => {
                                 let slot = unsafe { operand_flag_unchecked(instr, 1) } as u32;
-                                if let Some(rc) = frame
-                                    .bytecode_array
-                                    .clone_object_literal_template_pooled(slot)
-                                {
+                                // SAFETY: single-threaded; no concurrent borrows.
+                                if let Some(rc) = unsafe {
+                                    frame
+                                        .bytecode_array
+                                        .clone_object_literal_template_pooled_unchecked(slot)
+                                } {
                                     acc = JsValue::PlainObject(rc);
                                     smi_acc_spilled = true;
                                     smi_acc_bool = false;
@@ -5458,9 +5460,12 @@ impl Interpreter {
                     Opcode::CreateObjectLiteral => {
                         if let Operand::FeedbackSlot(s) = *instr.operand(1) {
                             // Fast path: clone from cached template.
-                            if let Some(rc) =
-                                frame.bytecode_array.clone_object_literal_template_pooled(s)
-                            {
+                            // SAFETY: single-threaded; no concurrent borrows.
+                            if let Some(rc) = unsafe {
+                                frame
+                                    .bytecode_array
+                                    .clone_object_literal_template_pooled_unchecked(s)
+                            } {
                                 acc = JsValue::PlainObject(rc);
                                 continue 'dispatch;
                             }
@@ -5479,9 +5484,12 @@ impl Interpreter {
                             };
                             let map = PropertyMap::with_capacity(capacity);
                             let rc = Rc::new(RefCell::new(map));
-                            frame
-                                .bytecode_array
-                                .set_object_literal_pending(s, Rc::clone(&rc));
+                            // SAFETY: single-threaded; no concurrent borrows.
+                            unsafe {
+                                frame
+                                    .bytecode_array
+                                    .set_object_literal_pending_unchecked(s, Rc::clone(&rc));
+                            }
                             acc = JsValue::PlainObject(rc);
                             continue 'dispatch;
                         }

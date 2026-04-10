@@ -1117,6 +1117,44 @@ impl BytecodeArray {
         }
     }
 
+    /// Like [`clone_object_literal_template_pooled`] but bypasses the
+    /// `RefCell` runtime borrow check on the template cache.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure no mutable borrow of the
+    /// `object_literal_templates` `RefCell` is active.
+    pub unsafe fn clone_object_literal_template_pooled_unchecked(
+        &self,
+        slot: u32,
+    ) -> Option<Rc<RefCell<PropertyMap>>> {
+        // SAFETY: single-threaded interpreter — no concurrent borrows.
+        let map = unsafe { &*self.object_literal_templates.as_ptr() };
+        match map.get(&slot) {
+            Some(ObjectLiteralCacheEntry::Cached(template)) => {
+                Some(acquire_object_rc_from_template(template))
+            }
+            _ => None,
+        }
+    }
+
+    /// Like [`set_object_literal_pending`] but bypasses the `RefCell`
+    /// runtime borrow check.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure no outstanding borrow of the
+    /// `object_literal_templates` `RefCell` exists.
+    pub unsafe fn set_object_literal_pending_unchecked(
+        &self,
+        slot: u32,
+        map_rc: Rc<RefCell<PropertyMap>>,
+    ) {
+        // SAFETY: single-threaded interpreter — no concurrent borrows.
+        let cache = unsafe { &mut *self.object_literal_templates.as_ptr() };
+        cache.insert(slot, ObjectLiteralCacheEntry::Pending(map_rc));
+    }
+
     /// Like [`promote_object_literal_template`](Self::promote_object_literal_template)
     /// but returns a pooled `Rc<RefCell<PropertyMap>>`.
     pub fn promote_object_literal_template_pooled(

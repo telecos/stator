@@ -7780,10 +7780,12 @@ pub(crate) mod jit_runtime {
 
     /// Load a value from a context slot using a JIT-encoded context value.
     ///
-    /// Unlike [`jit_runtime_lda_context_slot_direct`] (which takes a raw
-    /// pointer), this function accepts the same heap-handle encoding that
-    /// the Maglev register allocator produces, avoiding the trampoline
-    /// overhead for depth-0 `LoadContextSlot` nodes.
+    /// Handles two encoding formats:
+    /// 1. **Heap handle** – from `CreateFunctionContext` (in JIT_HEAP_TAG
+    ///    range). Decoded via `jit_i64_to_jsvalue`.
+    /// 2. **Raw pointer** – from the direct-call cache's closure context
+    ///    (`Rc::as_ptr`). Dereferenced directly as
+    ///    `*const RefCell<JsContext>`.
     ///
     /// # Calling convention (SysV AMD64)
     ///
@@ -7792,25 +7794,45 @@ pub(crate) mod jit_runtime {
     ///
     /// Returns the slot value as `i64` in `RAX`, or [`JIT_DEOPT`].
     pub extern "C" fn jit_runtime_load_context_slot_direct(ctx_i64: i64, slot_idx: i64) -> i64 {
-        let ctx_val = jit_i64_to_jsvalue(ctx_i64);
-        match ctx_val {
-            JsValue::Context(ctx_rc) => {
-                let ctx = ctx_rc.borrow();
-                ctx.slots
-                    .get(slot_idx as usize)
-                    .map(jsvalue_ref_to_jit_i64)
-                    .unwrap_or(JIT_UNDEFINED)
-            }
-            _ => JIT_DEOPT,
+        let slot = slot_idx as usize;
+
+        // Path 1: heap handle (from CreateFunctionContext etc.)
+        if is_heap_handle(ctx_i64) {
+            let ctx_val = jit_i64_to_jsvalue(ctx_i64);
+            return match ctx_val {
+                JsValue::Context(ctx_rc) => {
+                    let ctx = ctx_rc.borrow();
+                    ctx.slots
+                        .get(slot)
+                        .map(jsvalue_ref_to_jit_i64)
+                        .unwrap_or(JIT_UNDEFINED)
+                }
+                _ => JIT_DEOPT,
+            };
         }
+
+        // Path 2: raw pointer (from direct-call closure context cache).
+        // SAFETY: ctx_i64 is `Rc::as_ptr(rc) as usize` where `rc` is
+        // held alive by the callee's BytecodeArray. Single-threaded
+        // JIT guarantees no concurrent borrows.
+        if ctx_i64 != 0 {
+            let ctx_ref = unsafe { &*(ctx_i64 as *const RefCell<JsContext>) };
+            let ctx = unsafe { &*ctx_ref.as_ptr() };
+            return ctx
+                .slots
+                .get(slot)
+                .map(jsvalue_ref_to_jit_i64)
+                .unwrap_or(JIT_UNDEFINED);
+        }
+
+        JIT_DEOPT
     }
 
     /// Store a value into a context slot using a JIT-encoded context value.
     ///
-    /// Unlike [`jit_runtime_sta_context_slot_direct`] (which takes a raw
-    /// pointer), this function accepts the same heap-handle encoding that
-    /// the Maglev register allocator produces, avoiding the trampoline
-    /// overhead for depth-0 `StoreContextSlot` nodes.
+    /// Handles two encoding formats:
+    /// 1. **Heap handle** – from `CreateFunctionContext`.
+    /// 2. **Raw pointer** – from the direct-call closure context cache.
     ///
     /// # Calling convention (SysV AMD64)
     ///
@@ -7824,20 +7846,46 @@ pub(crate) mod jit_runtime {
         slot_idx: i64,
         value_i64: i64,
     ) -> i64 {
-        let value = jit_i64_to_jsvalue(value_i64);
-        let ctx_val = jit_i64_to_jsvalue(ctx_i64);
-        match ctx_val {
-            JsValue::Context(ctx_rc) => {
-                let mut ctx = ctx_rc.borrow_mut();
-                let slot = slot_idx as usize;
-                if slot >= ctx.slots.len() {
-                    ctx.slots.resize(slot + 1, JsValue::Undefined);
+        let slot = slot_idx as usize;
+
+        // Decode value (needed for both paths).
+        let value = if value_i64 >= i32::MIN as i64 && value_i64 <= i32::MAX as i64 {
+            JsValue::Smi(value_i64 as i32)
+        } else {
+            jit_i64_to_jsvalue(value_i64)
+        };
+
+        // Path 1: heap handle (from CreateFunctionContext etc.)
+        if is_heap_handle(ctx_i64) {
+            let ctx_val = jit_i64_to_jsvalue(ctx_i64);
+            return match ctx_val {
+                JsValue::Context(ctx_rc) => {
+                    let mut ctx = ctx_rc.borrow_mut();
+                    if slot >= ctx.slots.len() {
+                        ctx.slots.resize(slot + 1, JsValue::Undefined);
+                    }
+                    ctx.slots[slot] = value;
+                    value_i64
                 }
-                ctx.slots[slot] = value;
-                value_i64
-            }
-            _ => JIT_DEOPT,
+                _ => JIT_DEOPT,
+            };
         }
+
+        // Path 2: raw pointer (from direct-call closure context cache).
+        // SAFETY: ctx_i64 is `Rc::as_ptr(rc) as usize` where `rc` is
+        // held alive by the callee's BytecodeArray. Single-threaded
+        // JIT guarantees no concurrent borrows.
+        if ctx_i64 != 0 {
+            let ctx_ref = unsafe { &*(ctx_i64 as *const RefCell<JsContext>) };
+            let ctx = unsafe { &mut *ctx_ref.as_ptr() };
+            if slot >= ctx.slots.len() {
+                ctx.slots.resize(slot + 1, JsValue::Undefined);
+            }
+            ctx.slots[slot] = value;
+            return value_i64;
+        }
+
+        JIT_DEOPT
     }
 
     // ── CreateFunctionContext / CreateClosure / Object & Array stubs ────────

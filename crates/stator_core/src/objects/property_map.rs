@@ -2959,4 +2959,57 @@ mod tests {
         assert!(matches!(pm.index, PropertyIndex::Inline));
         assert_eq!(pm.get("k0"), Some(&JsValue::Smi(0)));
     }
+
+    /// Verify that `reinitialize_from_template` takes the same-template
+    /// fast path when the recycled map already matches (Rc::ptr_eq on keys).
+    #[test]
+    fn test_reinitialize_same_template_fast_path() {
+        let mut pm = PropertyMap::new();
+        pm.insert("x".to_string(), JsValue::Smi(1));
+        pm.insert("y".to_string(), JsValue::Smi(2));
+        pm.insert("z".to_string(), JsValue::Smi(3));
+        let template = ObjectLiteralTemplate::capture(&pm).unwrap();
+
+        // First reinit - installs the template's keys Rc.
+        pm.reinitialize_from_template(&template);
+        assert!(Rc::ptr_eq(&pm.keys, &template.keys));
+        assert_eq!(pm.template_next_slot, 0);
+
+        // Set values so they are non-Undefined.
+        pm.values[0] = JsValue::Smi(10);
+        pm.values[1] = JsValue::Smi(20);
+        pm.values[2] = JsValue::Smi(30);
+
+        // Second reinit - same template; should hit the fast path.
+        // keys Rc must remain pointer-identical (no clone+drop cycle).
+        let keys_ptr_before = Rc::as_ptr(&pm.keys);
+        pm.reinitialize_from_template(&template);
+        assert_eq!(Rc::as_ptr(&pm.keys), keys_ptr_before);
+        assert_eq!(pm.template_next_slot, 0);
+    }
+
+    /// Verify that `reinitialize_from_template_with_values` takes the
+    /// same-template fast path and installs the provided values directly.
+    #[test]
+    fn test_reinitialize_same_template_with_values_fast_path() {
+        let mut pm = PropertyMap::new();
+        pm.insert("a".to_string(), JsValue::Smi(0));
+        pm.insert("b".to_string(), JsValue::Smi(0));
+        let template = ObjectLiteralTemplate::capture(&pm).unwrap();
+
+        // First reinit with values.
+        let vals = [JsValue::Smi(7), JsValue::Smi(8)];
+        pm.reinitialize_from_template_with_values(&template, &vals);
+        assert_eq!(pm.values[0], JsValue::Smi(7));
+        assert_eq!(pm.values[1], JsValue::Smi(8));
+        assert!(Rc::ptr_eq(&pm.keys, &template.keys));
+
+        // Second reinit - same template fast path.
+        let keys_ptr_before = Rc::as_ptr(&pm.keys);
+        let vals2 = [JsValue::Smi(42), JsValue::Smi(99)];
+        pm.reinitialize_from_template_with_values(&template, &vals2);
+        assert_eq!(Rc::as_ptr(&pm.keys), keys_ptr_before);
+        assert_eq!(pm.values[0], JsValue::Smi(42));
+        assert_eq!(pm.values[1], JsValue::Smi(99));
+    }
 }

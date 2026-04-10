@@ -5673,11 +5673,12 @@ fn handle_create_object_literal(
 
     if let Some(slot) = slot {
         // Fast path: clone a previously cached template.
-        if let Some(rc) = ctx
-            .frame
-            .bytecode_array
-            .clone_object_literal_template_pooled(slot)
-        {
+        // SAFETY: single-threaded; no concurrent borrows.
+        if let Some(rc) = unsafe {
+            ctx.frame
+                .bytecode_array
+                .clone_object_literal_template_pooled_unchecked(slot)
+        } {
             ctx.frame.accumulator = JsValue::PlainObject(rc);
             return Ok(DispatchAction::Continue);
         }
@@ -5693,9 +5694,12 @@ fn handle_create_object_literal(
         // First execution: create normally and record as pending.
         let map = PropertyMap::with_capacity(capacity);
         let rc = Rc::new(RefCell::new(map));
-        ctx.frame
-            .bytecode_array
-            .set_object_literal_pending(slot, Rc::clone(&rc));
+        // SAFETY: single-threaded; no concurrent borrows.
+        unsafe {
+            ctx.frame
+                .bytecode_array
+                .set_object_literal_pending_unchecked(slot, Rc::clone(&rc));
+        }
         ctx.frame.accumulator = JsValue::PlainObject(rc);
         return Ok(DispatchAction::Continue);
     }
