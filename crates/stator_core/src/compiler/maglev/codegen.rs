@@ -6827,6 +6827,38 @@ impl<'a> MaglevCodegen<'a> {
             }
         }
 
+        // Optimistic Phi seeding for loop-carried Smi values.
+        //
+        // In loops like `sum = sum + obj.a`, the Phi for `sum` has a
+        // SmiConstant preheader input and a GenericAdd loop-body input.
+        // Without seeding, neither GenericAdd nor Phi can enter the set
+        // first (circular dependency).  We break the tie by optimistically
+        // adding Phis with at least one smi_guarded input whose consumers
+        // are all arithmetic-compatible.  The fixed-point then derives the
+        // GenericAdd results, confirming the Phi.  A verification pass
+        // afterwards removes any Phis that weren't fully confirmed.
+        for block in graph.blocks() {
+            for (id, node) in &block.nodes {
+                if let ValueNode::Phi { inputs } = node
+                    && !set.contains(id)
+                    && !branch_conditions.contains(id)
+                {
+                    let any_in_set = inputs.iter().any(|inp| set.contains(inp));
+                    let all_arith = consumers_of.get(id).is_some_and(|cs| {
+                        !cs.is_empty()
+                            && cs.iter().all(|c| {
+                                node_lookup
+                                    .get(c)
+                                    .is_some_and(|n| Self::is_arithmetic_compatible_consumer(n))
+                            })
+                    });
+                    if any_in_set && all_arith {
+                        set.insert(*id);
+                    }
+                }
+            }
+        }
+
         // Fixed-point propagation through GenericAdd/Sub/Mul/Inc/Dec/Negate
         // and Phi.
         loop {
@@ -6854,6 +6886,42 @@ impl<'a> MaglevCodegen<'a> {
                     };
                     if derived && !branch_conditions.contains(id) {
                         set.insert(*id);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Verify optimistic Phis: remove any whose inputs are not all
+        // confirmed in the final set, then cascade to derived nodes.
+        loop {
+            let mut changed = false;
+            for block in graph.blocks() {
+                for (id, node) in &block.nodes {
+                    if !set.contains(id) || i32_range.contains(id) {
+                        continue;
+                    }
+                    let ok = match node {
+                        ValueNode::Phi { inputs } => inputs.iter().all(|inp| set.contains(inp)),
+                        ValueNode::GenericAdd { left, right, .. }
+                        | ValueNode::GenericSubtract { left, right, .. }
+                        | ValueNode::GenericMultiply { left, right, .. }
+                        | ValueNode::GenericBitwiseOr { left, right, .. }
+                        | ValueNode::GenericBitwiseAnd { left, right, .. }
+                        | ValueNode::GenericBitwiseXor { left, right, .. } => {
+                            set.contains(left) && set.contains(right)
+                        }
+                        ValueNode::GenericIncrement { value, .. }
+                        | ValueNode::GenericDecrement { value, .. }
+                        | ValueNode::GenericNegate { value, .. }
+                        | ValueNode::GenericBitwiseNot { value, .. } => set.contains(value),
+                        _ => true,
+                    };
+                    if !ok {
+                        set.remove(id);
                         changed = true;
                     }
                 }

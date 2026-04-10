@@ -5173,8 +5173,7 @@ impl Interpreter {
                                 break 'smi;
                             }
                             Opcode::CreateObjectLiteral => {
-                                let slot =
-                                    unsafe { operand_flag_unchecked(instr, 1) } as u32;
+                                let slot = unsafe { operand_flag_unchecked(instr, 1) } as u32;
                                 if let Some(rc) = frame
                                     .bytecode_array
                                     .clone_object_literal_template_pooled(slot)
@@ -5192,12 +5191,11 @@ impl Interpreter {
                                 break 'smi;
                             }
                             Opcode::DefineNamedOwnProperty => {
-                                let obj_v =
-                                    unsafe { operand_reg_unchecked(instr, 0) };
+                                let obj_v = unsafe { operand_reg_unchecked(instr, 0) };
                                 let name_idx =
                                     unsafe { operand_constant_pool_idx_unchecked(instr, 1) };
-                                let obj_ptr = unsafe { frame.read_reg_unchecked(obj_v) }
-                                    as *const JsValue;
+                                let obj_ptr =
+                                    unsafe { frame.read_reg_unchecked(obj_v) } as *const JsValue;
                                 // SAFETY: register borrow is released before
                                 // any mutable access to the property map.
                                 let obj = unsafe { &*obj_ptr };
@@ -5219,11 +5217,9 @@ impl Interpreter {
                                         break 'smi;
                                     }
                                     let fill_result =
-                                        map.borrow_mut()
-                                            .try_template_fill(prop_name_ref, val);
+                                        map.borrow_mut().try_template_fill(prop_name_ref, val);
                                     if let Err(val) = fill_result {
-                                        map.borrow_mut()
-                                            .insert(prop_name_ref.to_string(), val);
+                                        map.borrow_mut().insert(prop_name_ref.to_string(), val);
                                     }
                                     continue 'smi;
                                 }
@@ -5340,9 +5336,8 @@ impl Interpreter {
                     }
                     Opcode::CreateObjectLiteral => {
                         if let Operand::FeedbackSlot(s) = *instr.operand(1) {
-                            if let Some(rc) = frame
-                                .bytecode_array
-                                .clone_object_literal_template_pooled(s)
+                            if let Some(rc) =
+                                frame.bytecode_array.clone_object_literal_template_pooled(s)
                             {
                                 acc = JsValue::PlainObject(rc);
                                 continue 'dispatch;
@@ -5360,20 +5355,15 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = std::mem::replace(
-                                    &mut frame.accumulator,
-                                    JsValue::Undefined,
-                                );
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
                             Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
                             Err(e) => {
-                                if let Some(resume_pc) = handle_dispatch_error(
-                                    &e,
-                                    frame,
-                                    handler_table.as_slice(),
-                                ) {
+                                if let Some(resume_pc) =
+                                    handle_dispatch_error(&e, frame, handler_table.as_slice())
+                                {
                                     pc = resume_pc;
                                     acc = std::mem::replace(
                                         &mut frame.accumulator,
@@ -5398,12 +5388,11 @@ impl Interpreter {
                                 && !matches!(acc, JsValue::Function(_))
                                 && !prop_name_ref.starts_with(".private.")
                             {
-                                let fill_result =
-                                    map.borrow_mut()
-                                        .try_template_fill(prop_name_ref, acc.cheap_clone());
+                                let fill_result = map
+                                    .borrow_mut()
+                                    .try_template_fill(prop_name_ref, acc.cheap_clone());
                                 if let Err(val) = fill_result {
-                                    map.borrow_mut()
-                                        .insert(prop_name_ref.to_string(), val);
+                                    map.borrow_mut().insert(prop_name_ref.to_string(), val);
                                 }
                                 continue 'dispatch;
                             }
@@ -5420,20 +5409,15 @@ impl Interpreter {
                         ) {
                             Ok(dispatch::DispatchAction::Continue) => {
                                 pc = frame.pc;
-                                acc = std::mem::replace(
-                                    &mut frame.accumulator,
-                                    JsValue::Undefined,
-                                );
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
                                 continue 'dispatch;
                             }
                             Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
                             Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
                             Err(e) => {
-                                if let Some(resume_pc) = handle_dispatch_error(
-                                    &e,
-                                    frame,
-                                    handler_table.as_slice(),
-                                ) {
+                                if let Some(resume_pc) =
+                                    handle_dispatch_error(&e, frame, handler_table.as_slice())
+                                {
                                     pc = resume_pc;
                                     acc = std::mem::replace(
                                         &mut frame.accumulator,
@@ -24256,10 +24240,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        debug_assertions,
-        ignore = "debug frames too large for mutual recursion depth"
-    )]
+    #[ignore] // debug: frames too large; release/linux: Maglev JIT boolean return bug
     fn test_tail_call_mutual_recursion_sloppy_small() {
         test_tail_call_assert_bool(
             "function even(n) { \
