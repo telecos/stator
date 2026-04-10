@@ -5017,8 +5017,15 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.bind_label(&mut generic_label);
         self.emit_load(object, Reg64::Rdi);
         self.emit_load(key, Reg64::Rsi);
-        let stub_addr = jit_runtime::jit_runtime_lda_keyed_property as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        if self.needs_r15 {
+            // Pass R15 (cached RT_PTRS cell) in RDX (3rd arg).
+            self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
+            let stub_addr = jit_runtime::jit_runtime_lda_keyed_property_r15 as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        } else {
+            let stub_addr = jit_runtime::jit_runtime_lda_keyed_property as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        }
         self.masm.call_reg(Reg64::R11);
 
         self.emit_restore_live_regs(saved);
@@ -5296,8 +5303,22 @@ impl<'a> MaglevCodegen<'a> {
             if self.array_ic_base != 0 {
                 self.masm
                     .lea_base_disp32(Reg64::Rcx, Reg64::Rbp, self.array_ic_base);
+                if self.needs_r15 {
+                    // Pass R15 (cached RT_PTRS cell) in R8 (5th arg).
+                    self.masm.mov_rr(Reg64::R8, Reg64::R15);
+                    let stub_addr = jit_runtime::jit_runtime_sta_keyed_property_with_ic_r15
+                        as *const () as usize;
+                    self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+                } else {
+                    let stub_addr =
+                        jit_runtime::jit_runtime_sta_keyed_property_with_ic as *const () as usize;
+                    self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+                }
+            } else if self.needs_r15 {
+                // Pass R15 (cached RT_PTRS cell) in RCX (4th arg).
+                self.masm.mov_rr(Reg64::Rcx, Reg64::R15);
                 let stub_addr =
-                    jit_runtime::jit_runtime_sta_keyed_property_with_ic as *const () as usize;
+                    jit_runtime::jit_runtime_sta_keyed_property_r15 as *const () as usize;
                 self.masm.mov_ri(Reg64::R11, stub_addr as i64);
             } else {
                 let stub_addr = jit_runtime::jit_runtime_sta_keyed_property as *const () as usize;

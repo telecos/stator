@@ -5121,6 +5121,31 @@ pub(crate) mod jit_runtime {
         sta_keyed_property_inner(obj_i64, key_i64, value_i64).unwrap_or(JIT_DEOPT)
     }
 
+    /// Like [`jit_runtime_sta_keyed_property`] but accepts a pre-cached
+    /// pointer to the `RT_PTRS` TLS cell in the 4th argument,
+    /// eliminating one TLS lookup per keyed store.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_i64`)      – JIT i64 heap handle for the receiver.
+    /// * `RSI` (`key_i64`)      – non-negative Smi key.
+    /// * `RDX` (`value_i64`)    – JIT i64 encoding of the value.
+    /// * `RCX` (`rt_ptrs_cell`) – pointer to `Cell<RtPtrs>` TLS slot.
+    ///
+    /// Returns `value_i64` on success, or [`JIT_DEOPT`].
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    pub extern "C" fn jit_runtime_sta_keyed_property_r15(
+        obj_i64: i64,
+        key_i64: i64,
+        value_i64: i64,
+        rt_ptrs_cell: i64,
+    ) -> i64 {
+        // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
+        // TLS slot lives for the thread's entire lifetime.
+        let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
+        sta_keyed_property_with_ptrs(obj_i64, key_i64, value_i64, ptrs).unwrap_or(JIT_DEOPT)
+    }
+
     /// Inner implementation for [`jit_runtime_sta_keyed_property`].
     fn sta_keyed_property_inner(obj_i64: i64, key_i64: i64, value_i64: i64) -> Option<i64> {
         // Ultra-fast path: Array[positive Smi] with inline value decode.
@@ -5390,6 +5415,52 @@ pub(crate) mod jit_runtime {
                         *ic_slots.add(2) = data.len() as i64;
                         *ic_slots.add(3) = arr.as_ptr() as *const Vec<JsValue> as i64;
                     }
+                }
+            }
+        }
+        result.unwrap_or(JIT_DEOPT)
+    }
+
+    /// R15 variant of [`jit_runtime_sta_keyed_property_with_ic`] that
+    /// accepts a pre-cached `Cell<RtPtrs>` pointer, eliminating two
+    /// TLS lookups (one for the store, one for the IC update).
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_i64`)      – JIT i64 heap handle for the receiver.
+    /// * `RSI` (`key_i64`)      – non-negative Smi key.
+    /// * `RDX` (`value_i64`)    – JIT i64 encoding of the value.
+    /// * `RCX` (`ic_slots`)     – pointer to 4 consecutive `i64` IC slots.
+    /// * `R8`  (`rt_ptrs_cell`) – pointer to the TLS `Cell<RtPtrs>`.
+    ///
+    /// Returns `value_i64` on success, or [`JIT_DEOPT`].
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // FFI entry point; caller guarantees valid pointer.
+    pub extern "C" fn jit_runtime_sta_keyed_property_with_ic_r15(
+        obj_i64: i64,
+        key_i64: i64,
+        value_i64: i64,
+        ic_slots: *mut i64,
+        rt_ptrs_cell: i64,
+    ) -> i64 {
+        // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
+        // TLS slot lives for the thread's entire lifetime.
+        let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
+        let result = sta_keyed_property_with_ptrs(obj_i64, key_i64, value_i64, ptrs);
+        if result.is_some() && is_heap_handle(obj_i64) && ptrs.is_cached() {
+            let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+            // SAFETY: cached pointers valid for thread lifetime.
+            let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+            if let Some(JsValue::Array(arr)) = heap.get(obj_idx) {
+                // SAFETY: single-threaded JIT; no concurrent borrows.
+                let data = unsafe { &*arr.as_ptr() };
+                // SAFETY: ic_slots points to 4 writable i64s on the
+                // caller's stack frame (Maglev-generated code).
+                unsafe {
+                    *ic_slots = obj_i64;
+                    *ic_slots.add(1) = data.as_ptr() as i64;
+                    *ic_slots.add(2) = data.len() as i64;
+                    *ic_slots.add(3) = arr.as_ptr() as *const Vec<JsValue> as i64;
                 }
             }
         }
@@ -5727,12 +5798,16 @@ pub(crate) mod jit_runtime {
 
     fn inline_load_keyed_with_ptrs(obj_i64: i64, smi_key: i64, ptrs: RtPtrs) -> InlineKeyedResult {
         if !is_heap_handle(obj_i64) || smi_key < 0 {
-            return InlineKeyedResult::from_generic(lda_keyed_property_inner(obj_i64, smi_key));
+            return InlineKeyedResult::from_generic(lda_keyed_property_with_ptrs(
+                obj_i64, smi_key, ptrs,
+            ));
         }
         let key = smi_key as usize;
         let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
         if !ptrs.is_cached() {
-            return InlineKeyedResult::from_generic(lda_keyed_property_inner(obj_i64, smi_key));
+            return InlineKeyedResult::from_generic(lda_keyed_property_with_ptrs(
+                obj_i64, smi_key, ptrs,
+            ));
         }
         // SAFETY: cached pointers set by cache_rt_ptrs; valid for
         // thread lifetime.
@@ -5771,12 +5846,14 @@ pub(crate) mod jit_runtime {
                     },
                     // Heap-object element — delegate to full generic stub
                     // for heap-handle allocation.
-                    _ => {
-                        InlineKeyedResult::from_generic(lda_keyed_property_inner(obj_i64, smi_key))
-                    }
+                    _ => InlineKeyedResult::from_generic(lda_keyed_property_with_ptrs(
+                        obj_i64, smi_key, ptrs,
+                    )),
                 }
             }
-            _ => InlineKeyedResult::from_generic(lda_keyed_property_inner(obj_i64, smi_key)),
+            _ => InlineKeyedResult::from_generic(lda_keyed_property_with_ptrs(
+                obj_i64, smi_key, ptrs,
+            )),
         }
     }
 
@@ -6135,8 +6212,8 @@ pub(crate) mod jit_runtime {
         } else if value_i64 == JIT_UNDEFINED {
             JsValue::Undefined
         } else {
-            return InlineKeyedResult::from_generic(sta_keyed_property_inner(
-                obj_i64, smi_key, value_i64,
+            return InlineKeyedResult::from_generic(sta_keyed_property_with_ptrs(
+                obj_i64, smi_key, value_i64, ptrs,
             ));
         };
 
@@ -6187,8 +6264,8 @@ pub(crate) mod jit_runtime {
                     hit: 1,
                 }
             }
-            _ => InlineKeyedResult::from_generic(sta_keyed_property_inner(
-                obj_i64, smi_key, value_i64,
+            _ => InlineKeyedResult::from_generic(sta_keyed_property_with_ptrs(
+                obj_i64, smi_key, value_i64, ptrs,
             )),
         }
     }
@@ -6564,9 +6641,9 @@ pub(crate) mod jit_runtime {
                         value: JIT_UNDEFINED,
                         hit: 1,
                     },
-                    _ => {
-                        InlineKeyedResult::from_generic(lda_keyed_property_inner(obj_i64, smi_key))
-                    }
+                    _ => InlineKeyedResult::from_generic(lda_keyed_property_with_ptrs(
+                        obj_i64, smi_key, ptrs,
+                    )),
                 };
             }
         }
