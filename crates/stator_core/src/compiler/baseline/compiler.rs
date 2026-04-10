@@ -4938,6 +4938,30 @@ pub(crate) mod jit_runtime {
         lda_keyed_property_inner(obj_i64, key_i64).unwrap_or(JIT_DEOPT)
     }
 
+    /// Like [`jit_runtime_lda_keyed_property`] but accepts a pre-cached
+    /// pointer to the `RT_PTRS` TLS cell in the 3rd argument (R15),
+    /// eliminating one TLS lookup per keyed load on the generic fallback
+    /// path.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_i64`) – JIT i64 encoding of the receiver.
+    /// * `RSI` (`key_i64`) – JIT i64 encoding of the key (accumulator).
+    /// * `RDX` (`rt_ptrs_cell`) – pointer to `Cell<RtPtrs>` TLS slot.
+    ///
+    /// Returns the element value as `i64` in `RAX`, or [`JIT_DEOPT`].
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    pub extern "C" fn jit_runtime_lda_keyed_property_r15(
+        obj_i64: i64,
+        key_i64: i64,
+        rt_ptrs_cell: i64,
+    ) -> i64 {
+        // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
+        // TLS slot lives for the thread's entire lifetime.
+        let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
+        lda_keyed_property_with_ptrs(obj_i64, key_i64, ptrs).unwrap_or(JIT_DEOPT)
+    }
+
     /// Inline encode a `&JsValue` to JIT i64 for the most common element
     /// types (Boolean, Smi, Undefined) without going through the full
     /// `encode_or_clone_ref` match.  Returns `None` for heap types that
@@ -4955,12 +4979,24 @@ pub(crate) mod jit_runtime {
 
     /// Inner implementation for [`jit_runtime_lda_keyed_property`].
     fn lda_keyed_property_inner(obj_i64: i64, key_i64: i64) -> Option<i64> {
+        let ptrs = RT_PTRS.with(|p| p.get());
+        lda_keyed_property_with_ptrs(obj_i64, key_i64, ptrs)
+    }
+
+    /// Like [`lda_keyed_property_inner`] but accepts pre-resolved
+    /// [`RtPtrs`], eliminating a redundant TLS lookup when the caller
+    /// already has cached pointers (e.g. from R15).
+    #[inline(always)]
+    fn lda_keyed_property_with_ptrs(
+        obj_i64: i64,
+        key_i64: i64,
+        ptrs: RtPtrs,
+    ) -> Option<i64> {
         // Ultra-fast path: positive Smi index (0..=i32::MAX).
         // Avoids jit_to_jsvalue conversion entirely — just use the i64 as usize.
         if is_heap_handle(obj_i64) && key_i64 >= 0 && key_i64 <= i32::MAX as i64 {
             let smi_key = key_i64 as usize;
             let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
-            let ptrs = RT_PTRS.with(|p| p.get());
             let fast = if ptrs.is_cached() {
                 // SAFETY: cached pointers set by cache_rt_ptrs;
                 // valid for thread lifetime.

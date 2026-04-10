@@ -5825,11 +5825,13 @@ fn handle_define_named_own_property(
             map.borrow_mut()
                 .insert_with_attrs(prop_name_ref.to_string(), val, attrs);
         } else {
-            let fill_result = map.borrow_mut().try_template_fill(prop_name_ref, val);
+            // SAFETY: single-threaded interpreter; no concurrent borrows.
+            let pm = unsafe { &mut *map.as_ptr() };
+            let fill_result = pm.try_template_fill(prop_name_ref, val);
             if let Err(val) = fill_result {
                 // Template fill missed — fall back to normal insert.
                 // Only clone the property name string here (cold path).
-                map.borrow_mut().insert(prop_name_ref.to_string(), val);
+                pm.insert(prop_name_ref.to_string(), val);
             }
         }
     }

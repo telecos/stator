@@ -5328,10 +5328,12 @@ impl Interpreter {
                                         pc -= 1;
                                         break 'smi;
                                     }
-                                    let fill_result =
-                                        map.borrow_mut().try_template_fill(prop_name_ref, val);
+                                    // SAFETY: single-threaded interpreter; no
+                                    // concurrent borrows possible.
+                                    let pm = unsafe { &mut *map.as_ptr() };
+                                    let fill_result = pm.try_template_fill(prop_name_ref, val);
                                     if let Err(val) = fill_result {
-                                        map.borrow_mut().insert(prop_name_ref.to_string(), val);
+                                        pm.insert(prop_name_ref.to_string(), val);
                                     }
                                     continue 'smi;
                                 }
@@ -5507,11 +5509,13 @@ impl Interpreter {
                                 && !matches!(acc, JsValue::Function(_))
                                 && !prop_name_ref.starts_with(".private.")
                             {
-                                let fill_result = map
-                                    .borrow_mut()
-                                    .try_template_fill(prop_name_ref, acc.cheap_clone());
+                                // SAFETY: single-threaded interpreter; no
+                                // concurrent borrows possible.
+                                let pm = unsafe { &mut *map.as_ptr() };
+                                let fill_result =
+                                    pm.try_template_fill(prop_name_ref, acc.cheap_clone());
                                 if let Err(val) = fill_result {
-                                    map.borrow_mut().insert(prop_name_ref.to_string(), val);
+                                    pm.insert(prop_name_ref.to_string(), val);
                                 }
                                 continue 'dispatch;
                             }
