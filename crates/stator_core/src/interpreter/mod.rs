@@ -1139,6 +1139,8 @@ fn seed_jit_feedback(ba: &BytecodeArray) -> FeedbackVector {
                     FeedbackSlotKind::BinaryOp
                         | FeedbackSlotKind::Compare
                         | FeedbackSlotKind::BinaryOpInc
+                        | FeedbackSlotKind::KeyedLoadProperty
+                        | FeedbackSlotKind::KeyedStoreProperty
                 )
             )
         {
