@@ -4437,6 +4437,34 @@ impl<'a> MaglevCodegen<'a> {
 
         self.rax_holds = None;
         self.emit_load(left, Reg64::Rdi);
+
+        // Identity: x | 0 → x (non-smi-guarded path).  Skip the Smi check
+        // on the right operand and the OR instruction entirely.
+        if self.try_get_i32_constant(right) == Some(0) {
+            let mut slow_label = Label::new();
+            let mut done_label = Label::new();
+            self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+            self.masm.jne(&mut slow_label);
+            // Left is Smi — result is just left (x | 0 == x).
+            self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
+            self.masm.jmp(&mut done_label);
+
+            self.masm.bind_label(&mut slow_label);
+            self.emit_load(right, Reg64::R10);
+            let saved = self.emit_save_live_regs(id);
+            self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+            let addr = jit_runtime::jit_runtime_generic_bitwise_or as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, addr as i64);
+            self.masm.call_reg(Reg64::R11);
+            self.emit_restore_live_regs(saved);
+            self.emit_deopt_check_rax();
+
+            self.masm.bind_label(&mut done_label);
+            self.emit_store(id, Reg64::Rax);
+            return;
+        }
+
         self.emit_load(right, Reg64::R10);
 
         let mut slow_label = Label::new();
@@ -7033,9 +7061,38 @@ impl<'a> MaglevCodegen<'a> {
                         | ValueNode::Int32ShiftRightLogical { .. }
                         | ValueNode::Int32Divide { .. }
                         | ValueNode::Int32Modulus { .. }
+                        // JS bitwise ops always produce i32 (ToInt32 on
+                        // both operands per spec), so Generic variants are
+                        // unconditionally in the i32 range.
+                        | ValueNode::GenericBitwiseOr { .. }
+                        | ValueNode::GenericBitwiseAnd { .. }
+                        | ValueNode::GenericBitwiseXor { .. }
+                        | ValueNode::GenericBitwiseNot { .. }
                 );
                 if is_i32 {
                     i32_range.insert(*id);
+                }
+            }
+        }
+
+        // Phase 1.5: optimistic Phi seeding for loop-counter patterns.
+        //
+        // In `for (var i = 0; i < N; i++) { ... (i * 3) | 0 ... }`, the
+        // Phi for `i` has a SmiConstant preheader input and a
+        // GenericIncrement body input.  Neither can enter i32_range
+        // without the other (circular dependency).  We break the tie by
+        // optimistically adding Phis that have at least one i32_range
+        // input.  The fixed-point then confirms via GenericIncrement.
+        // A verification pass afterwards removes any unconfirmed Phis.
+        for block in graph.blocks() {
+            for (id, node) in &block.nodes {
+                if let ValueNode::Phi { inputs } = node
+                    && !i32_range.contains(id)
+                {
+                    let any_in_set = inputs.iter().any(|inp| i32_range.contains(inp));
+                    if any_in_set {
+                        i32_range.insert(*id);
+                    }
                 }
             }
         }
@@ -7059,10 +7116,83 @@ impl<'a> MaglevCodegen<'a> {
                         }
                         ValueNode::CheckedSmiIncrement { value }
                         | ValueNode::CheckedSmiDecrement { value } => i32_range.contains(value),
+                        // GenericIncrement/Decrement of an i32-range value
+                        // produce i32 (with overflow deopt).  This lets
+                        // loop-counter Phis (0, i++) converge to i32_range.
+                        ValueNode::GenericIncrement { value, .. }
+                        | ValueNode::GenericDecrement { value, .. } => i32_range.contains(value),
                         _ => false,
                     };
                     if derived {
                         i32_range.insert(*id);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Phase 3: verify optimistic Phis.  Remove any whose inputs are
+        // not all confirmed i32_range, then cascade removals.
+        let phase1_seeds: HashSet<NodeId> = graph
+            .blocks()
+            .iter()
+            .flat_map(|b| b.nodes.iter())
+            .filter_map(|(id, node)| {
+                // Intrinsic i32 producers and unconditional bitwise ops
+                // are always valid — don't remove them.
+                let intrinsic = matches!(
+                    node,
+                    ValueNode::SmiConstant { .. }
+                        | ValueNode::Int32Constant { .. }
+                        | ValueNode::Int32Add { .. }
+                        | ValueNode::Int32Subtract { .. }
+                        | ValueNode::Int32Multiply { .. }
+                        | ValueNode::Int32Negate { .. }
+                        | ValueNode::Int32Increment { .. }
+                        | ValueNode::Int32Decrement { .. }
+                        | ValueNode::Int32BitwiseAnd { .. }
+                        | ValueNode::Int32BitwiseOr { .. }
+                        | ValueNode::Int32BitwiseXor { .. }
+                        | ValueNode::Int32ShiftLeft { .. }
+                        | ValueNode::Int32ShiftRight { .. }
+                        | ValueNode::Int32ShiftRightLogical { .. }
+                        | ValueNode::Int32Divide { .. }
+                        | ValueNode::Int32Modulus { .. }
+                        | ValueNode::GenericBitwiseOr { .. }
+                        | ValueNode::GenericBitwiseAnd { .. }
+                        | ValueNode::GenericBitwiseXor { .. }
+                        | ValueNode::GenericBitwiseNot { .. }
+                );
+                if intrinsic { Some(*id) } else { None }
+            })
+            .collect();
+        loop {
+            let mut changed = false;
+            for block in graph.blocks() {
+                for (id, node) in &block.nodes {
+                    if !i32_range.contains(id) || phase1_seeds.contains(id) {
+                        continue;
+                    }
+                    let ok = match node {
+                        ValueNode::Phi { inputs } => {
+                            inputs.iter().all(|inp| i32_range.contains(inp))
+                        }
+                        ValueNode::CheckedSmiAdd { left, right }
+                        | ValueNode::CheckedSmiSubtract { left, right }
+                        | ValueNode::CheckedSmiMultiply { left, right } => {
+                            i32_range.contains(left) && i32_range.contains(right)
+                        }
+                        ValueNode::CheckedSmiIncrement { value }
+                        | ValueNode::CheckedSmiDecrement { value }
+                        | ValueNode::GenericIncrement { value, .. }
+                        | ValueNode::GenericDecrement { value, .. } => i32_range.contains(value),
+                        _ => true,
+                    };
+                    if !ok {
+                        i32_range.remove(id);
                         changed = true;
                     }
                 }
