@@ -398,6 +398,7 @@ pub(crate) fn acquire_object_rc_from_template_cached(
 /// ensure no concurrent borrows exist (single-threaded JIT guarantee).
 #[cfg(all(target_arch = "x86_64", unix))]
 #[inline(always)]
+#[allow(dead_code)]
 pub(crate) fn recycle_object_rc_cached(
     rc: Rc<RefCell<PropertyMap>>,
     pool_ptr: *const RefCell<Vec<Rc<RefCell<PropertyMap>>>>,
