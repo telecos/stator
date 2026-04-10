@@ -409,6 +409,11 @@ fn propagate_int32_truncation(graph: &mut MaglevGraph) -> usize {
     }
 
     // 3. Find truncation points (bitwise/shift ops) and walk backward.
+    //    Both Int32 and Generic bitwise/shift ops truncate to i32 —
+    //    Generic variants still call ToInt32 on their operands, which
+    //    wraps to 32 bits.  Recognizing Generic truncation points lets
+    //    the pass convert `(a + b) | 0` patterns where the graph
+    //    builder emitted GenericAdd + GenericBitwiseOr.
     let mut replacements: HashMap<NodeId, ValueNode> = HashMap::new();
     for block in graph.blocks() {
         for (_node_id, node) in &block.nodes {
@@ -418,7 +423,13 @@ fn propagate_int32_truncation(graph: &mut MaglevGraph) -> usize {
                 | ValueNode::Int32BitwiseAnd { left, right }
                 | ValueNode::Int32ShiftLeft { left, right }
                 | ValueNode::Int32ShiftRight { left, right }
-                | ValueNode::Int32ShiftRightLogical { left, right } => {
+                | ValueNode::Int32ShiftRightLogical { left, right }
+                | ValueNode::GenericBitwiseOr { left, right, .. }
+                | ValueNode::GenericBitwiseXor { left, right, .. }
+                | ValueNode::GenericBitwiseAnd { left, right, .. }
+                | ValueNode::GenericShiftLeft { left, right, .. }
+                | ValueNode::GenericShiftRight { left, right, .. }
+                | ValueNode::GenericShiftRightLogical { left, right, .. } => {
                     mark_truncated(*left, &use_counts, &node_map, &mut replacements);
                     mark_truncated(*right, &use_counts, &node_map, &mut replacements);
                 }
@@ -441,9 +452,15 @@ fn propagate_int32_truncation(graph: &mut MaglevGraph) -> usize {
     count
 }
 
-/// Walk backward from a truncation point, replacing `CheckedSmi*` with
-/// unchecked `Int32*`.  Only touches nodes whose non-CheckSmi use count is
-/// exactly one (the truncating path).
+/// Walk backward from a truncation point, replacing `CheckedSmi*` and
+/// `Generic*` arithmetic with unchecked `Int32*`.  Only touches nodes
+/// whose non-transparent use count is exactly one (the truncating path).
+///
+/// `Generic*` conversions are guarded: both inputs must be provably
+/// integer-valued (Smi constants, Int32 ops, bitwise ops that always
+/// produce i32, Phi nodes in smi loops, or nodes already converted by
+/// this pass).  This prevents miscompilation when a Generic op's input
+/// could be a string or object at runtime.
 fn mark_truncated(
     id: NodeId,
     use_counts: &HashMap<NodeId, usize>,
@@ -456,6 +473,7 @@ fn mark_truncated(
     }
     if let Some(node) = node_map.get(&id) {
         let (new_node, inputs) = match node {
+            // CheckedSmi* → Int32*: always safe (inputs already Smi-checked).
             ValueNode::CheckedSmiAdd { left, right } => (
                 ValueNode::Int32Add {
                     left: *left,
@@ -483,6 +501,61 @@ fn mark_truncated(
             ValueNode::CheckedSmiDecrement { value } => {
                 (ValueNode::Int32Decrement { value: *value }, vec![*value])
             }
+            // Generic* → Int32*: only safe when both inputs are provably i32.
+            ValueNode::GenericAdd { left, right, .. } => {
+                if !is_provably_i32(*left, replacements, node_map)
+                    || !is_provably_i32(*right, replacements, node_map)
+                {
+                    return;
+                }
+                (
+                    ValueNode::Int32Add {
+                        left: *left,
+                        right: *right,
+                    },
+                    vec![*left, *right],
+                )
+            }
+            ValueNode::GenericSubtract { left, right, .. } => {
+                if !is_provably_i32(*left, replacements, node_map)
+                    || !is_provably_i32(*right, replacements, node_map)
+                {
+                    return;
+                }
+                (
+                    ValueNode::Int32Subtract {
+                        left: *left,
+                        right: *right,
+                    },
+                    vec![*left, *right],
+                )
+            }
+            ValueNode::GenericMultiply { left, right, .. } => {
+                if !is_provably_i32(*left, replacements, node_map)
+                    || !is_provably_i32(*right, replacements, node_map)
+                {
+                    return;
+                }
+                (
+                    ValueNode::Int32Multiply {
+                        left: *left,
+                        right: *right,
+                    },
+                    vec![*left, *right],
+                )
+            }
+            ValueNode::GenericIncrement { value, .. } => {
+                if !is_provably_i32(*value, replacements, node_map) {
+                    return;
+                }
+                (ValueNode::Int32Increment { value: *value }, vec![*value])
+            }
+            ValueNode::GenericDecrement { value, .. } => {
+                if !is_provably_i32(*value, replacements, node_map) {
+                    return;
+                }
+                (ValueNode::Int32Decrement { value: *value }, vec![*value])
+            }
             _ => return,
         };
 
@@ -491,6 +564,51 @@ fn mark_truncated(
             mark_truncated(input, use_counts, node_map, replacements);
         }
     }
+}
+
+/// Returns `true` when `id` is known to produce an i32 value, making it
+/// safe to feed into a wrapping `Int32*` operation.
+fn is_provably_i32(
+    id: NodeId,
+    replacements: &HashMap<NodeId, ValueNode>,
+    node_map: &HashMap<NodeId, ValueNode>,
+) -> bool {
+    // Already converted to Int32 by this pass.
+    if replacements.contains_key(&id) {
+        return true;
+    }
+    let Some(node) = node_map.get(&id) else {
+        return false;
+    };
+    matches!(
+        node,
+        // Constants are always i32.
+        ValueNode::SmiConstant { .. }
+            | ValueNode::Int32Constant { .. }
+            // Int32 operations always produce i32.
+            | ValueNode::Int32Add { .. }
+            | ValueNode::Int32Subtract { .. }
+            | ValueNode::Int32Multiply { .. }
+            | ValueNode::Int32Negate { .. }
+            | ValueNode::Int32Increment { .. }
+            | ValueNode::Int32Decrement { .. }
+            | ValueNode::Int32BitwiseOr { .. }
+            | ValueNode::Int32BitwiseAnd { .. }
+            | ValueNode::Int32BitwiseXor { .. }
+            | ValueNode::Int32ShiftLeft { .. }
+            | ValueNode::Int32ShiftRight { .. }
+            | ValueNode::Int32ShiftRightLogical { .. }
+            // JS bitwise ops always produce i32 (ToInt32 per spec).
+            | ValueNode::GenericBitwiseOr { .. }
+            | ValueNode::GenericBitwiseAnd { .. }
+            | ValueNode::GenericBitwiseXor { .. }
+            | ValueNode::GenericBitwiseNot { .. }
+            // Phi in smi loops: preheader is SmiConstant, back-edge is
+            // i32 result (BitwiseOr or smi-guarded arithmetic).  Safe
+            // because the smi-guarded load point already deopts on
+            // non-integer values.
+            | ValueNode::Phi { .. }
+    )
 }
 
 /// Visit all [`NodeId`] inputs of a [`ValueNode`], calling `f` for each.
