@@ -1530,10 +1530,14 @@ impl BytecodeArray {
     #[inline(always)]
     pub fn increment_invocation_count(&self) -> u32 {
         let old = self.invocation_count.get();
-        if old >= TURBOFAN_TIERING_THRESHOLD {
-            return old;
-        }
-        let new = old + 1;
+        // Saturate at u32::MAX to avoid overflow while still
+        // progressing past TURBOFAN_TIERING_THRESHOLD.  The tiering
+        // checks in run_inner only fire on equality, so incrementing
+        // past the threshold is harmless.  Keeping the counter alive
+        // is essential: the Maglev deopt cooldown compares
+        // invocation_count against next_try_at, and capping it early
+        // can permanently lock out re-optimisation.
+        let new = old.saturating_add(1);
         self.invocation_count.set(new);
         new
     }

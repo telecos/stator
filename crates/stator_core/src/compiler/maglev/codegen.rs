@@ -2726,6 +2726,10 @@ impl<'a> MaglevCodegen<'a> {
             // ── Unsupported nodes → unconditional deopt ───────────────────────
             #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(unused_variables))]
             _other => {
+                eprintln!(
+                    "MAGLEV_CODEGEN: unhandled node id={:?} → unconditional deopt: {:?}",
+                    id, _other,
+                );
                 self.emit_deopt_unconditional(0);
                 // Satisfy the allocation invariant: write a placeholder.
                 self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);

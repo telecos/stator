@@ -734,6 +734,11 @@ pub(crate) mod jit_runtime {
         // The call-property1 IC caches heap handles that are invalidated
         // by recycle_and_clear_heap, so clear it unconditionally.
         RT_CALL_PROP1_IC.with(|c| c.set(CallProp1IcEntry::EMPTY));
+        // The cached callee entry holds raw pointers (`ba_ptr`, `ctx_ptr`)
+        // derived from Rc values that lived in the now-cleared heap.
+        // A matching `callee_i64` (deterministic allocation from an empty
+        // heap) would cause a use-after-free via the stale `ba_ptr`.
+        CACHED_CALLEE.with(|c| c.set(CachedCalleeEntry::EMPTY));
         // Only reset the property and array-method ICs when the function
         // changes.  Re-entrant calls to the same BytecodeArray (e.g.
         // criterion iterations) keep warm IC state, saving ~190ns per
@@ -757,6 +762,32 @@ pub(crate) mod jit_runtime {
             });
             RT_ARRAY_METHOD_IC.with(|c| c.set(ArrayMethodIcEntry::EMPTY));
             RT_OBJECT_IC.with(|c| c.set(ObjectLiteralIcEntry::EMPTY));
+        } else {
+            // IC kept warm for performance, but heap handles cached inside
+            // the IC entries are stale after `recycle_and_clear_heap()`.
+            // Invalidate only the handle fields — shape, offset, and name
+            // information remains valid so the next access re-populates
+            // quickly (single IC-miss instead of a full cold start).
+            RT_PROP_IC.with(|ic| {
+                let mut c = ic.borrow_mut();
+                for entry in c.lda.iter_mut() {
+                    entry.cached_handle = 0;
+                    entry.cached_ptr = 0;
+                }
+                for entry in c.proto.iter_mut() {
+                    // Zero receiver_handle so that Phase 0 (handle+epoch
+                    // match) cannot return a stale cached_value.
+                    entry.receiver_handle = 0;
+                    // If cached_value itself is a heap handle, the whole
+                    // entry must be reset — returning it would dereference
+                    // freed heap memory.
+                    if is_heap_handle(entry.cached_value) {
+                        *entry = ProtoIcEntry::EMPTY;
+                    }
+                }
+            });
+            // Array-method IC caches receiver and method heap handles.
+            RT_ARRAY_METHOD_IC.with(|c| c.set(ArrayMethodIcEntry::EMPTY));
         }
     }
 
