@@ -1943,6 +1943,10 @@ fn fuse_object_literal_stores_in_block(block: &mut BasicBlock) {
         let mut values: Vec<NodeId> = Vec::new();
         let mut j = i + 1;
 
+        // Track the actual indices of the StoreNamedGeneric nodes we consume,
+        // since pure-value nodes (SmiConstant, etc.) may be interleaved.
+        let mut store_indices: Vec<usize> = Vec::new();
+
         while j < len && names.len() < MAX_FUSED_OBJECT_PROPS {
             match &nodes[j].1 {
                 ValueNode::StoreNamedGeneric {
@@ -1953,6 +1957,23 @@ fn fuse_object_literal_stores_in_block(block: &mut BasicBlock) {
                 } if *object == create_node_id => {
                     names.push(*name);
                     values.push(*value);
+                    store_indices.push(j);
+                    j += 1;
+                }
+                // Skip pure value nodes that may be interleaved between stores.
+                ValueNode::SmiConstant { .. }
+                | ValueNode::Float64Constant { .. }
+                | ValueNode::Int32Constant { .. }
+                | ValueNode::Uint32Constant { .. }
+                | ValueNode::BigIntConstant { .. }
+                | ValueNode::TrueConstant
+                | ValueNode::FalseConstant
+                | ValueNode::NullConstant
+                | ValueNode::UndefinedConstant
+                | ValueNode::RootConstant { .. }
+                | ValueNode::ExternalConstant { .. }
+                | ValueNode::StringConstant { .. }
+                | ValueNode::ConstantPoolEntry { .. } => {
                     j += 1;
                 }
                 _ => break,
@@ -1965,9 +1986,7 @@ fn fuse_object_literal_stores_in_block(block: &mut BasicBlock) {
         }
 
         // Record indices of consumed StoreNamedGeneric nodes for removal.
-        for k in (i + 1)..(i + 1 + names.len()) {
-            remove_indices.push(k);
-        }
+        remove_indices.extend_from_slice(&store_indices);
 
         // Replace CreateObjectLiteral with the fused node.
         replacements.push((

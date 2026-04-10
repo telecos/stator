@@ -798,19 +798,22 @@ impl<'a> MaglevCodegen<'a> {
         // extra register-file slot beyond the allocator's spill area.
         self.scan_and_promote_globals(base_slots);
 
-        // If the function uses LoadCurrentContextSlot / StoreCurrentContextSlot,
-        // reserve one extra register-file slot to cache the closure-context raw
-        // pointer (RSI at entry).  This lets context-slot stubs bypass TLS.
-        let has_current_ctx_ops = self.graph.blocks().iter().any(|b| {
+        // If the function uses any context-slot operations (both current-context
+        // and explicit-depth variants), reserve one extra register-file slot to
+        // cache the closure-context raw pointer (RSI at entry).  This lets
+        // context-slot stubs bypass TLS.
+        let has_context_ops = self.graph.blocks().iter().any(|b| {
             b.nodes.iter().any(|(_nid, n)| {
                 matches!(
                     n,
-                    ValueNode::LoadCurrentContextSlot { .. }
+                    ValueNode::LoadContextSlot { .. }
+                        | ValueNode::StoreContextSlot { .. }
+                        | ValueNode::LoadCurrentContextSlot { .. }
                         | ValueNode::StoreCurrentContextSlot { .. }
                 )
             })
         });
-        if has_current_ctx_ops {
+        if has_context_ops {
             let slot = base_slots + self.promoted_extra_slots;
             self.ctx_regfile_offset = Some((slot as i32) * 8);
             self.promoted_extra_slots += 1;
