@@ -2651,8 +2651,11 @@ pub(crate) mod jit_runtime {
                     if let Some(result) = exec_maglev_callee(ba, maglev_exec, jit_args, saved_ba) {
                         return Some(result);
                     }
+                    // Callee Maglev deopted — only mark the flag.
+                    // Do NOT clear the cache: a parent recursive call
+                    // may hold a return address pointing into this JIT
+                    // code page.  Clearing would munmap it → SIGSEGV.
                     ba.mark_jit_maglev_deopted();
-                    *maglev_cache.borrow_mut() = None;
                 }
             }
         }
@@ -3344,13 +3347,14 @@ pub(crate) mod jit_runtime {
 
                     if is_jit_deopt(jit_result) {
                         ba.mark_jit_maglev_deopted();
-                        // Invalidate cached Maglev pointer.
+                        // Invalidate cached Maglev pointer in the direct-call
+                        // cache so future calls don't try the JIT fast path.
+                        // Do NOT clear maglev_cache: a parent recursive frame
+                        // may hold a return address into this JIT code page.
                         let mut entry = cached_entry;
                         entry.maglev_fn = 0;
                         entry.maglev_reg_slots = 0;
                         ptrs.set_cached_callee(entry);
-                        let maglev_cache = ba.maglev_executable_cache();
-                        *maglev_cache.borrow_mut() = None;
                         unsafe {
                             if (*heap_ref.as_ptr()).len() != heap_base {
                                 (*heap_ref.as_ptr()).truncate(heap_base);
@@ -3467,8 +3471,10 @@ pub(crate) mod jit_runtime {
                             // Callee Maglev deopted — mark + invalidate,
                             // then fall through to baseline/interpreter so
                             // the CALLER is not forced to deopt.
+                            // Do NOT clear maglev_cache: a parent recursive
+                            // frame may hold a return address into this JIT
+                            // code page.  The deopt flag prevents future use.
                             ba.mark_jit_maglev_deopted();
-                            *maglev_cache.borrow_mut() = None;
                             // NOTE: Arc not cleared — deopt guard on lazy
                             // transfer prevents reload.
                             unsafe {
