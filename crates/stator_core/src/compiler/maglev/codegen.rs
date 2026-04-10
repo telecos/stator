@@ -2653,7 +2653,7 @@ impl<'a> MaglevCodegen<'a> {
                     self.emit_load(*context, Reg64::Rdi);
                     self.masm.mov_ri(Reg64::Rsi, i64::from(*slot));
                     let addr =
-                        jit_runtime::jit_runtime_load_context_slot_direct as *const () as usize;
+                        jit_runtime::jit_runtime_load_context_slot_lean as *const () as usize;
                     self.masm.mov_ri(Reg64::R11, addr as i64);
                     self.masm.call_reg(Reg64::R11);
                     self.emit_restore_live_regs(saved);
@@ -2684,7 +2684,7 @@ impl<'a> MaglevCodegen<'a> {
                     self.emit_load(*value, Reg64::Rdx);
                     self.masm.mov_ri(Reg64::Rsi, i64::from(*slot));
                     let addr =
-                        jit_runtime::jit_runtime_store_context_slot_direct as *const () as usize;
+                        jit_runtime::jit_runtime_store_context_slot_lean as *const () as usize;
                     self.masm.mov_ri(Reg64::R11, addr as i64);
                     self.masm.call_reg(Reg64::R11);
                     self.emit_restore_live_regs(saved);
@@ -5077,8 +5077,6 @@ impl<'a> MaglevCodegen<'a> {
         let mut done_label = Label::new();
         let mut load_smi = Label::new();
         let mut load_bool = Label::new();
-        let mut load_undef = Label::new();
-        let mut load_null = Label::new();
 
         // ── Fast path (scratch regs only: R11, R10, RAX) ────────────
 
@@ -5128,16 +5126,14 @@ impl<'a> MaglevCodegen<'a> {
         self.masm
             .movzx_byte_base_disp32(Reg64::Rax, Reg64::R11, layout.disc_offset as i32);
 
-        // Dispatch on discriminant.
-        self.masm.cmp_ri(Reg64::Rax, layout.smi_disc as i32);
-        self.masm.je(&mut load_smi);
+        // Dispatch on discriminant — Bool first (hot for boolean arrays
+        // like the sieve benchmark), then Smi.  Undefined/Null/other
+        // fall through to the slow path (rare in practice).
         self.masm.cmp_ri(Reg64::Rax, layout.bool_disc as i32);
         self.masm.je(&mut load_bool);
-        self.masm.cmp_ri(Reg64::Rax, layout.undef_disc as i32);
-        self.masm.je(&mut load_undef);
-        self.masm.cmp_ri(Reg64::Rax, layout.null_disc as i32);
-        self.masm.je(&mut load_null);
-        // Unknown discriminant (String, Object, …) → slow path.
+        self.masm.cmp_ri(Reg64::Rax, layout.smi_disc as i32);
+        self.masm.je(&mut load_smi);
+        // Undef, Null, String, Object, … → slow path.
         self.masm.jmp(&mut slow_label);
 
         // ── load_smi: sign-extend i32 payload ───────────────────────
@@ -5156,17 +5152,8 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.add_rr(Reg64::Rax, Reg64::R11);
         self.masm.jmp(&mut done_label);
 
-        // ── load_undef ──────────────────────────────────────────────
-        self.masm.bind_label(&mut load_undef);
-        self.masm.mov_ri(Reg64::Rax, JIT_UNDEFINED);
-        self.masm.jmp(&mut done_label);
-
-        // ── load_null ───────────────────────────────────────────────
-        self.masm.bind_label(&mut load_null);
-        self.masm.mov_ri(Reg64::Rax, JIT_NULL);
-        self.masm.jmp(&mut done_label);
-
         // ── Slow path: IC miss / non-inlineable type ────────────────
+        // Undefined, Null, String, Object, etc. are all handled here.
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
 
@@ -5292,18 +5279,18 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.add_rr(Reg64::R10, Reg64::R11);
 
         // Decode the JIT value encoding → determine what to store.
+        // Bool check first (hot for boolean arrays like sieve).
+        // XOR with JIT_FALSE: JIT_FALSE→0, JIT_TRUE→1, all else→>1.
+        // R11 holds the bool payload (0 or 1) on the taken path.
+        self.masm.mov_ri(Reg64::R11, JIT_FALSE);
+        self.masm.xor_rr(Reg64::R11, Reg64::Rax);
+        self.masm.cmp_ri(Reg64::R11, 2);
+        self.masm.jcc(CondCode::Below, &mut store_bool);
+
         // Smi range: i32::MIN..=i32::MAX (sign-extended to i64).
         self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
         self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
         self.masm.je(&mut store_smi);
-
-        // Check for JIT_TRUE / JIT_FALSE (33-bit values).
-        self.masm.mov_ri(Reg64::R11, JIT_TRUE);
-        self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
-        self.masm.je(&mut store_bool);
-        self.masm.mov_ri(Reg64::R11, JIT_FALSE);
-        self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
-        self.masm.je(&mut store_bool);
 
         // Not a Smi or Bool → fall through to slow path.
         self.masm.jmp(&mut slow_label);
@@ -5324,24 +5311,19 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.jmp(&mut done_label);
 
         // ── store_bool: write JsValue::Boolean(v) directly ──────────
-        // R10 = element addr, RAX = JIT_TRUE or JIT_FALSE.
+        // R10 = element addr, R11 = bool payload (0 or 1) from XOR.
+        // RAX still holds the original JIT encoding (untouched).
         self.masm.bind_label(&mut store_bool);
         self.masm.mov_store_byte_imm_base_disp32(
             Reg64::R10,
             layout.disc_offset as i32,
             layout.bool_disc,
         );
-        // Compute bool payload: value - JIT_FALSE (0 or 1).
-        // Use R11 for JIT_FALSE so R10 (element addr) is preserved.
-        self.masm.mov_ri(Reg64::R11, JIT_FALSE);
-        self.masm.sub_rr(Reg64::Rax, Reg64::R11);
         self.masm.mov_store_dword_base_disp32(
             Reg64::R10,
             layout.bool_payload_offset as i32,
-            Reg64::Rax,
+            Reg64::R11,
         );
-        // Restore the original JIT encoding in RAX for emit_store.
-        self.emit_load(value, Reg64::Rax);
         self.masm.jmp(&mut done_label);
 
         // ── Inline grow: key == len && len < capacity ───────────────
@@ -5389,18 +5371,17 @@ impl<'a> MaglevCodegen<'a> {
             let mut grow_store_bool = Label::new();
             let mut grow_update_len = Label::new();
 
+            // Check Bool first (hot for boolean arrays like sieve).
+            // XOR with JIT_FALSE: JIT_FALSE→0, JIT_TRUE→1, all else→>1.
+            self.masm.mov_ri(Reg64::R11, JIT_FALSE);
+            self.masm.xor_rr(Reg64::R11, Reg64::Rax);
+            self.masm.cmp_ri(Reg64::R11, 2);
+            self.masm.jcc(CondCode::Below, &mut grow_store_bool);
+
             // Check if Smi (sign-extends to same value).
             self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
             self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
             self.masm.je(&mut grow_store_smi);
-
-            // Check Bool.
-            self.masm.mov_ri(Reg64::R11, JIT_TRUE);
-            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
-            self.masm.je(&mut grow_store_bool);
-            self.masm.mov_ri(Reg64::R11, JIT_FALSE);
-            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
-            self.masm.je(&mut grow_store_bool);
 
             // Not Smi or Bool → fall through to slow path.
             self.masm.jmp(&mut slow_label);
@@ -5419,22 +5400,19 @@ impl<'a> MaglevCodegen<'a> {
             );
             self.masm.jmp(&mut grow_update_len);
 
-            // Write Bool.
+            // Write Bool — R11 already holds the payload (0 or 1)
+            // from the XOR check.  RAX is untouched.
             self.masm.bind_label(&mut grow_store_bool);
             self.masm.mov_store_byte_imm_base_disp32(
                 Reg64::R10,
                 layout.disc_offset as i32,
                 layout.bool_disc,
             );
-            self.masm.mov_ri(Reg64::R11, JIT_FALSE);
-            self.masm.sub_rr(Reg64::Rax, Reg64::R11);
             self.masm.mov_store_dword_base_disp32(
                 Reg64::R10,
                 layout.bool_payload_offset as i32,
-                Reg64::Rax,
+                Reg64::R11,
             );
-            // Restore RAX for emit_store.
-            self.emit_load(value, Reg64::Rax);
 
             // Increment Vec::len and IC cached len.
             self.masm.bind_label(&mut grow_update_len);

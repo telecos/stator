@@ -8336,6 +8336,91 @@ pub(crate) mod jit_runtime {
         JIT_DEOPT
     }
 
+    // ── Lean context-slot helpers (Maglev fast path) ──────────────────────
+    //
+    // These handle **only** the raw-pointer context path used by depth-0
+    // closure contexts (stored as `Rc::as_ptr()`).  By dropping the
+    // heap-handle decoding path and the `RefCell::borrow()` it requires,
+    // the generated machine code is roughly half the size of the `_direct`
+    // variants, which improves icache utilisation and branch prediction in
+    // tight closure loops (e.g. `closure_counter_1k`).
+    //
+    // When the context is a heap handle (from `CreateFunctionContext`) or
+    // null, the lean helpers return [`JIT_DEOPT`], letting Maglev fall
+    // back to the interpreter.
+
+    /// Lean context-slot **loader** for Maglev codegen.
+    ///
+    /// Reads `ctx.slots[slot]` from a raw-pointer context and encodes the
+    /// result as a JIT `i64`.  Returns [`JIT_DEOPT`] for heap-handle or
+    /// null contexts.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`ctx_i64`) – raw `*const RefCell<JsContext>` as `i64`.
+    /// * `RSI` (`slot_idx`) – context slot index.
+    ///
+    /// Returns the slot value as `i64` in `RAX`, or [`JIT_DEOPT`].
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    #[inline(never)]
+    pub extern "C" fn jit_runtime_load_context_slot_lean(ctx_i64: i64, slot_idx: i64) -> i64 {
+        // Only handle raw pointer contexts — reject null and heap handles.
+        if ctx_i64 == 0 || is_heap_handle(ctx_i64) {
+            return JIT_DEOPT;
+        }
+        let slot = slot_idx as usize;
+        // SAFETY: ctx_i64 is `Rc::as_ptr(rc) as usize` where `rc` is held
+        // alive by the callee's BytecodeArray.  Single-threaded JIT
+        // guarantees no concurrent borrows.
+        let ctx_ref = unsafe { &*(ctx_i64 as *const RefCell<JsContext>) };
+        let ctx = unsafe { &*ctx_ref.as_ptr() };
+        ctx.slots
+            .get(slot)
+            .map(jsvalue_ref_to_jit_i64)
+            .unwrap_or(JIT_UNDEFINED)
+    }
+
+    /// Lean context-slot **store** for Maglev codegen.
+    ///
+    /// Writes `value` into `ctx.slots[slot]` of a raw-pointer context.
+    /// Returns [`JIT_DEOPT`] for heap-handle or null contexts.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`ctx_i64`) – raw `*const RefCell<JsContext>` as `i64`.
+    /// * `RSI` (`slot_idx`) – context slot index.
+    /// * `RDX` (`value_i64`) – JIT `i64` encoding of the value to store.
+    ///
+    /// Returns `value_i64` in `RAX` on success, or [`JIT_DEOPT`].
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    #[inline(never)]
+    pub extern "C" fn jit_runtime_store_context_slot_lean(
+        ctx_i64: i64,
+        slot_idx: i64,
+        value_i64: i64,
+    ) -> i64 {
+        // Only handle raw pointer contexts.
+        if ctx_i64 == 0 || is_heap_handle(ctx_i64) {
+            return JIT_DEOPT;
+        }
+        let slot = slot_idx as usize;
+        let value = if is_smi(value_i64) {
+            JsValue::Smi(value_i64 as i32)
+        } else {
+            jit_i64_to_jsvalue(value_i64)
+        };
+        // SAFETY: ctx_i64 is `Rc::as_ptr(rc) as usize` where `rc` is held
+        // alive by the callee's BytecodeArray.  Single-threaded JIT
+        // guarantees no concurrent borrows.
+        let ctx_ref = unsafe { &*(ctx_i64 as *const RefCell<JsContext>) };
+        let ctx = unsafe { &mut *ctx_ref.as_ptr() };
+        if slot >= ctx.slots.len() {
+            ctx.slots.resize(slot + 1, JsValue::Undefined);
+        }
+        ctx.slots[slot] = value;
+        value_i64
+    }
+
     // ── CreateFunctionContext / CreateClosure / Object & Array stubs ────────
 
     /// Create an empty plain object.
