@@ -408,6 +408,14 @@ pub(crate) mod jit_runtime {
         /// specific runtime stub (see `STUB_*` constants).
         static RT_STUB_DEOPT_COUNTS: Cell<[u64; STUB_DEOPT_SLOTS]> =
             const { Cell::new([0; STUB_DEOPT_SLOTS]) };
+
+        /// Repeat-callee cache for [`exec_maglev_callee`].
+        ///
+        /// When a tight loop calls the same closure repeatedly, this cache
+        /// stores the resolved context pointer and comparison result so that
+        /// per-call context lookups and pointer comparisons are skipped.
+        static MAGLEV_CALLEE_CACHE: Cell<MaglevCalleeCache> =
+            const { Cell::new(MaglevCalleeCache::EMPTY) };
     }
 
     // ── Per-stub deopt tracking ─────────────────────────────────────────
@@ -503,6 +511,35 @@ pub(crate) mod jit_runtime {
         };
     }
 
+    /// Repeat-callee cache for [`exec_maglev_callee`].
+    ///
+    /// Caches the resolved callee identity and context-comparison result
+    /// so that repeated calls to the same closure skip the
+    /// `closure_context()` lookup, context pointer read, and pointer
+    /// comparison on every iteration.
+    #[derive(Clone, Copy)]
+    struct MaglevCalleeCache {
+        /// Raw pointer to the callee's [`BytecodeArray`].  `null` = empty.
+        ba_ptr: *const BytecodeArray,
+        /// Cached callee context pointer (as `i64` for direct use in JIT).
+        ctx_ptr: i64,
+        /// Whether the callee's context pointer matched the runtime
+        /// context on the last call.  When `true`, all context
+        /// save/restore work can be skipped.
+        same_context: bool,
+        /// Cached `ba.parameter_count() == 0`.
+        skip_args: bool,
+    }
+
+    impl MaglevCalleeCache {
+        const EMPTY: Self = Self {
+            ba_ptr: std::ptr::null(),
+            ctx_ptr: 0,
+            same_context: false,
+            skip_args: false,
+        };
+    }
+
     /// Drop the `Rc` refcount held by a [`CachedCalleeEntry::ctx_rc_raw`]
     /// pointer.  Must be called before overwriting an entry whose
     /// `ctx_rc_raw` is non-null with a different callee or EMPTY.
@@ -549,6 +586,8 @@ pub(crate) mod jit_runtime {
         /// Cached pointer to the `OBJECT_RC_POOL` thread-local, so that
         /// `acquire_object_rc_from_template*` variants can skip TLS.
         object_rc_pool: *const RefCell<Vec<Rc<RefCell<PropertyMap>>>>,
+        /// Cached pointer to the `MAGLEV_CALLEE_CACHE` thread-local.
+        maglev_callee_cache: *const Cell<MaglevCalleeCache>,
     }
 
     impl RtPtrs {
@@ -564,6 +603,7 @@ pub(crate) mod jit_runtime {
             skip_mapped_args: std::ptr::null(),
             object_ic: std::ptr::null(),
             object_rc_pool: std::ptr::null(),
+            maglev_callee_cache: std::ptr::null(),
         };
 
         fn is_cached(&self) -> bool {
@@ -651,6 +691,28 @@ pub(crate) mod jit_runtime {
                 unsafe { &*self.object_ic }.set(entry);
             } else {
                 RT_OBJECT_IC.with(|c| c.set(entry));
+            }
+        }
+
+        /// Read [`MaglevCalleeCache`] via the cached pointer.
+        #[inline(always)]
+        fn get_maglev_callee_cache(&self) -> MaglevCalleeCache {
+            if !self.maglev_callee_cache.is_null() {
+                // SAFETY: pointer set by cache_rt_ptrs; valid for thread lifetime.
+                unsafe { &*self.maglev_callee_cache }.get()
+            } else {
+                MAGLEV_CALLEE_CACHE.with(|c| c.get())
+            }
+        }
+
+        /// Store [`MaglevCalleeCache`] via the cached pointer.
+        #[inline(always)]
+        fn set_maglev_callee_cache(&self, entry: MaglevCalleeCache) {
+            if !self.maglev_callee_cache.is_null() {
+                // SAFETY: pointer set by cache_rt_ptrs; valid for thread lifetime.
+                unsafe { &*self.maglev_callee_cache }.set(entry);
+            } else {
+                MAGLEV_CALLEE_CACHE.with(|c| c.set(entry));
             }
         }
     }
@@ -756,32 +818,39 @@ pub(crate) mod jit_runtime {
                                 CACHED_CALLEE.with(|cc| {
                                     SKIP_MAPPED_ARGS.with(|sma| {
                                         RT_OBJECT_IC.with(|oic| {
-                                            let pool_ptr =
-                                                crate::objects::property_map::object_rc_pool_ptr();
-                                            let setup_gen = RT_SETUP_GEN.with(|g| g.get());
-                                            RT_PTRS.with(|p| {
-                                                p.set(RtPtrs {
-                                                    heap: heap as *const RefCell<Vec<JsValue>>,
-                                                    context: ctx as *const RefCell<
-                                                        Option<Rc<RefCell<JsContext>>>,
-                                                    >,
-                                                    bytecode: bc as *const Cell<
-                                                        *const BytecodeArray,
-                                                    >,
-                                                    global: g as *const RefCell<JitGlobalState>,
-                                                    prop_ic: ic as *const RefCell<
-                                                        JitPropertyIcState,
-                                                    >,
-                                                    direct_call: dc as *const Cell<DirectCallState>,
-                                                    cached_callee: cc as *const Cell<
-                                                        CachedCalleeEntry,
-                                                    >,
-                                                    generation: setup_gen,
-                                                    skip_mapped_args: sma as *const Cell<bool>,
-                                                    object_ic: oic as *const Cell<
-                                                        ObjectLiteralIcEntry,
-                                                    >,
-                                                    object_rc_pool: pool_ptr,
+                                            MAGLEV_CALLEE_CACHE.with(|mcc| {
+                                                let pool_ptr =
+                                                    crate::objects::property_map::object_rc_pool_ptr();
+                                                let setup_gen = RT_SETUP_GEN.with(|g| g.get());
+                                                RT_PTRS.with(|p| {
+                                                    p.set(RtPtrs {
+                                                        heap: heap as *const RefCell<Vec<JsValue>>,
+                                                        context: ctx as *const RefCell<
+                                                            Option<Rc<RefCell<JsContext>>>,
+                                                        >,
+                                                        bytecode: bc as *const Cell<
+                                                            *const BytecodeArray,
+                                                        >,
+                                                        global: g
+                                                            as *const RefCell<JitGlobalState>,
+                                                        prop_ic: ic as *const RefCell<
+                                                            JitPropertyIcState,
+                                                        >,
+                                                        direct_call: dc
+                                                            as *const Cell<DirectCallState>,
+                                                        cached_callee: cc as *const Cell<
+                                                            CachedCalleeEntry,
+                                                        >,
+                                                        generation: setup_gen,
+                                                        skip_mapped_args: sma
+                                                            as *const Cell<bool>,
+                                                        object_ic: oic as *const Cell<
+                                                            ObjectLiteralIcEntry,
+                                                        >,
+                                                        object_rc_pool: pool_ptr,
+                                                        maglev_callee_cache: mcc
+                                                            as *const Cell<MaglevCalleeCache>,
+                                                    });
                                                 });
                                             });
                                         });
@@ -3039,6 +3108,10 @@ pub(crate) mod jit_runtime {
     /// Similar to [`exec_jit_callee`] but uses the Maglev JIT tier's
     /// cached code.  Maglev reads context from `RT_CONTEXT` TLS rather
     /// than receiving it as a function parameter.
+    ///
+    /// Uses [`MaglevCalleeCache`] to skip `closure_context()` lookup,
+    /// context pointer comparison, and `skip_mapped_args` toggling when
+    /// the same callee is called repeatedly (e.g. closures in a tight loop).
     #[cfg(all(target_arch = "x86_64", unix))]
     fn exec_maglev_callee(
         ba: &Rc<BytecodeArray>,
@@ -3054,8 +3127,36 @@ pub(crate) mod jit_runtime {
             let heap_ref = unsafe { &*ptrs.heap };
             let ctx_ref = unsafe { &*ptrs.context };
             let bc_ref = unsafe { &*ptrs.bytecode };
+            let ba_ptr = &**ba as *const BytecodeArray;
 
-            let skip_args = ba.parameter_count() == 0;
+            // ── Repeat-callee cache: skip context lookup on cache hit ──
+            let cache = ptrs.get_maglev_callee_cache();
+            let (skip_args, ctx_raw, same_context) = if cache.ba_ptr == ba_ptr {
+                // Cache hit — reuse resolved context pointer and
+                // comparison result from the previous call.
+                (cache.skip_args, cache.ctx_ptr, cache.same_context)
+            } else {
+                // Cache miss — resolve and populate.
+                let skip_args = ba.parameter_count() == 0;
+                let callee_ctx_raw = ba.closure_context();
+                let callee_ctx_ptr = callee_ctx_raw.map(Rc::as_ptr).unwrap_or(std::ptr::null());
+                // SAFETY: no active borrows; read current context pointer.
+                let current_ctx_ptr = unsafe {
+                    (*ctx_ref.as_ptr())
+                        .as_ref()
+                        .map(Rc::as_ptr)
+                        .unwrap_or(std::ptr::null())
+                };
+                let same_context = std::ptr::eq(callee_ctx_ptr, current_ctx_ptr);
+                let ctx_raw = callee_ctx_ptr as i64;
+                ptrs.set_maglev_callee_cache(MaglevCalleeCache {
+                    ba_ptr,
+                    ctx_ptr: ctx_raw,
+                    same_context,
+                    skip_args,
+                });
+                (skip_args, ctx_raw, same_context)
+            };
 
             // Defer heap_base for 0-param closures — on the Smi
             // fast path the read and truncation are both skipped.
@@ -3066,29 +3167,18 @@ pub(crate) mod jit_runtime {
                 unsafe { (*heap_ref.as_ptr()).len() }
             };
 
-            let callee_ctx_raw = ba.closure_context();
-            let callee_ctx_ptr = callee_ctx_raw.map(Rc::as_ptr).unwrap_or(std::ptr::null());
-            // SAFETY: no active borrows; read current context pointer.
-            let current_ctx_ptr = unsafe {
-                (*ctx_ref.as_ptr())
-                    .as_ref()
-                    .map(Rc::as_ptr)
-                    .unwrap_or(std::ptr::null())
-            };
-            let same_context = std::ptr::eq(callee_ctx_ptr, current_ctx_ptr);
             let saved_ctx = if same_context {
                 None
             } else {
-                let callee_ctx = callee_ctx_raw.cloned();
+                let callee_ctx = ba.closure_context().cloned();
                 // SAFETY: no active borrows; swap context via raw pointer.
                 Some(unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx) })
             };
 
-            bc_ref.set(&**ba as *const BytecodeArray);
+            bc_ref.set(ba_ptr);
             if skip_args {
                 ptrs.set_skip_mapped_args(true);
             }
-            let ctx_raw = callee_ctx_ptr as i64;
             // SAFETY: Maglev code is valid x86-64.  Context set in TLS.
             let jit_result = unsafe { maglev_exec.execute(jit_args, ctx_raw) };
             bc_ref.set(saved_ba);
@@ -3096,10 +3186,14 @@ pub(crate) mod jit_runtime {
                 ptrs.set_skip_mapped_args(false);
             }
 
+            // ── Fast return for Smi results ───────────────────────
             if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
-                // SAFETY: no active borrows; skip truncation when the
-                // callee allocated no heap handles.
+                // Skip heap truncation for 0-param closures (heap_base
+                // was never read) and skip context restore when
+                // same_context is true (no swap occurred).
                 if !skip_args {
+                    // SAFETY: no active borrows; truncate only when the
+                    // callee allocated heap handles.
                     unsafe {
                         if (*heap_ref.as_ptr()).len() != heap_base {
                             (*heap_ref.as_ptr()).truncate(heap_base);
@@ -3120,6 +3214,9 @@ pub(crate) mod jit_runtime {
             };
 
             let result_val = if is_jit_deopt(jit_result) {
+                // Callee deopted — invalidate the repeat-callee cache
+                // so the next call re-evaluates context state.
+                ptrs.set_maglev_callee_cache(MaglevCalleeCache::EMPTY);
                 None
             } else {
                 jit_to_jsvalue_ext(jit_result)
@@ -3490,6 +3587,10 @@ pub(crate) mod jit_runtime {
                 // When the Maglev entry pointer is cached, skip the
                 // RefCell lookup, lazy transfer check, and
                 // CachedMaglevCode::execute overhead.
+                //
+                // Uses MaglevCalleeCache for the context comparison so
+                // that repeated calls to the same closure skip the
+                // TLS context read and pointer comparison.
                 #[cfg(all(target_arch = "x86_64", unix))]
                 if cached_entry.maglev_fn != 0 && !ba.jit_maglev_has_deopted() {
                     let ctx_ref = unsafe { &*ptrs.context };
@@ -3504,14 +3605,28 @@ pub(crate) mod jit_runtime {
                         unsafe { (*heap_ref.as_ptr()).len() }
                     };
 
-                    let callee_ctx_ptr = cached_entry.ctx_ptr as *const RefCell<JsContext>;
-                    let current_ctx_ptr = unsafe {
-                        (*ctx_ref.as_ptr())
-                            .as_ref()
-                            .map(Rc::as_ptr)
-                            .unwrap_or(std::ptr::null())
+                    // Repeat-callee cache: reuse the context comparison
+                    // result when the same callee is called again.
+                    let mcache = ptrs.get_maglev_callee_cache();
+                    let same_context = if mcache.ba_ptr == ba_ptr {
+                        mcache.same_context
+                    } else {
+                        let callee_ctx_ptr = cached_entry.ctx_ptr as *const RefCell<JsContext>;
+                        let current_ctx_ptr = unsafe {
+                            (*ctx_ref.as_ptr())
+                                .as_ref()
+                                .map(Rc::as_ptr)
+                                .unwrap_or(std::ptr::null())
+                        };
+                        let same = std::ptr::eq(callee_ctx_ptr, current_ctx_ptr);
+                        ptrs.set_maglev_callee_cache(MaglevCalleeCache {
+                            ba_ptr,
+                            ctx_ptr: cached_entry.ctx_ptr,
+                            same_context: same,
+                            skip_args,
+                        });
+                        same
                     };
-                    let same_context = std::ptr::eq(callee_ctx_ptr, current_ctx_ptr);
                     let saved_ctx = if same_context {
                         None
                     } else {
@@ -3590,6 +3705,8 @@ pub(crate) mod jit_runtime {
                         entry.maglev_fn = 0;
                         entry.maglev_reg_slots = 0;
                         ptrs.set_cached_callee(entry);
+                        // Invalidate repeat-callee cache on deopt.
+                        ptrs.set_maglev_callee_cache(MaglevCalleeCache::EMPTY);
                         unsafe {
                             if (*heap_ref.as_ptr()).len() != heap_base {
                                 (*heap_ref.as_ptr()).truncate(heap_base);
@@ -4965,22 +5082,41 @@ pub(crate) mod jit_runtime {
         let saved_ba = bc_ref.get();
         bc_ref.set(ba_ptr as *const BytecodeArray);
 
-        // SAFETY: single-threaded JIT; no concurrent heap mutation.
-        let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
-
-        // Context swap using std::mem::replace (same pattern as
-        // exec_jit_callee).  Keeps the old context on the Rust stack
-        // instead of in a TLS slot, eliminating DIRECT_CALL_OLD_CTX
-        // accesses.
-        let callee_ctx_raw = cached_ctx_ptr as *const RefCell<JsContext>;
-        // SAFETY: no active borrows of context RefCell.
-        let current_ctx = unsafe {
-            (*ctx_ref.as_ptr())
-                .as_ref()
-                .map(Rc::as_ptr)
-                .unwrap_or(std::ptr::null())
+        // Use repeat-callee cache for the context comparison: when
+        // the same callee is dispatched repeatedly, skip the TLS
+        // context read and pointer comparison.
+        let ba_raw = ba_ptr as *const BytecodeArray;
+        let mcache = ptrs.get_maglev_callee_cache();
+        let same_context = if mcache.ba_ptr == ba_raw {
+            mcache.same_context
+        } else {
+            let callee_ctx_raw = cached_ctx_ptr as *const RefCell<JsContext>;
+            // SAFETY: no active borrows of context RefCell.
+            let current_ctx = unsafe {
+                (*ctx_ref.as_ptr())
+                    .as_ref()
+                    .map(Rc::as_ptr)
+                    .unwrap_or(std::ptr::null())
+            };
+            let same = std::ptr::eq(callee_ctx_raw, current_ctx);
+            ptrs.set_maglev_callee_cache(MaglevCalleeCache {
+                ba_ptr: ba_raw,
+                ctx_ptr: cached_ctx_ptr,
+                same_context: same,
+                skip_args: true, // 0-arg dispatch
+            });
+            same
         };
-        let same_context = std::ptr::eq(callee_ctx_raw, current_ctx);
+
+        // SAFETY: single-threaded JIT; no concurrent heap mutation.
+        // Defer heap_base snapshot: for same-context 0-arg closures
+        // returning Smi, the heap is never touched and truncation is
+        // skipped entirely.
+        let heap_base = if same_context {
+            0usize // sentinel — unused when same_context + Smi result
+        } else {
+            unsafe { (*heap_ref.as_ptr()).len() }
+        };
 
         let saved_ctx = if same_context {
             None
@@ -5024,11 +5160,16 @@ pub(crate) mod jit_runtime {
         bc_ref.set(saved_ba);
 
         if result != JIT_DEOPT && result < JIT_HEAP_TAG {
-            // SAFETY: no active borrows; skip truncation when the
-            // callee allocated no heap handles.
-            unsafe {
-                if (*heap_ref.as_ptr()).len() != heap_base {
-                    (*heap_ref.as_ptr()).truncate(heap_base);
+            // Smi result fast path: skip heap truncation when
+            // same_context (heap_base was deferred) and skip context
+            // restore (no swap occurred).
+            if !same_context {
+                // SAFETY: no active borrows; truncate when callee
+                // allocated heap handles.
+                unsafe {
+                    if (*heap_ref.as_ptr()).len() != heap_base {
+                        (*heap_ref.as_ptr()).truncate(heap_base);
+                    }
                 }
             }
             if let Some(ctx) = saved_ctx {
@@ -5037,6 +5178,13 @@ pub(crate) mod jit_runtime {
             }
             return result;
         }
+
+        // Heap handle or deopt: need real heap_base for truncation.
+        let heap_base = if same_context {
+            unsafe { (*heap_ref.as_ptr()).len() }
+        } else {
+            heap_base
+        };
 
         // Heap handle or deopt: resolve before truncation.
         let result_val = if result == JIT_DEOPT {
