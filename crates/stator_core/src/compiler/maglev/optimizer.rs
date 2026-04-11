@@ -3957,4 +3957,128 @@ mod tests {
             "CheckSmi on CheckedSmiAdd output should be eliminated"
         );
     }
+
+    // ── Trivial Phi elimination ──────────────────────────────────────────────
+
+    #[test]
+    fn test_trivial_phi_self_referencing_eliminated() {
+        // Simulate a loop-header identity Phi: Phi(X, self) → should become X.
+        //
+        //   Block 0 (preheader):
+        //     NodeId(0) = CreateEmptyObjectLiteral   ← the "root" object
+        //     → Jump to block 1
+        //
+        //   Block 1 (loop header):
+        //     NodeId(1) = Phi([NodeId(0), NodeId(1)])  ← trivial!
+        //     NodeId(2) = LoadNamedGeneric(NodeId(1), "a")
+        //     → Return NodeId(2)
+        //
+        // After trivial-Phi elimination, NodeId(2) should reference NodeId(0)
+        // directly, and the Phi should be dead.
+        let mut graph = MaglevGraph::new(0);
+
+        // Block 0: preheader
+        let mut b0 = BasicBlock::new(0);
+        let root = graph.alloc_node_id(); // NodeId(0)
+        b0.push_with_id(root, ValueNode::CreateEmptyObjectLiteral);
+        b0.set_control(ControlNode::Jump { target: 1 });
+        graph.add_block(b0);
+
+        // Block 1: loop header with identity Phi
+        let mut b1 = BasicBlock::new(1);
+        b1.predecessors = vec![0, 1]; // entry + back-edge
+        b1.is_loop_header = true;
+        let phi_id = graph.alloc_node_id(); // NodeId(1)
+        b1.push_with_id(
+            phi_id,
+            ValueNode::Phi {
+                inputs: vec![root, phi_id],
+            },
+        );
+        let load = graph.alloc_node_id(); // NodeId(2)
+        b1.push_with_id(
+            load,
+            ValueNode::LoadNamedGeneric {
+                object: phi_id,
+                name: 0,
+                feedback_slot: 0,
+            },
+        );
+        b1.set_control(ControlNode::Return { value: load });
+        graph.add_block(b1);
+
+        // Run the full optimizer (which includes trivial Phi elimination).
+        optimize(&mut graph);
+
+        // The LoadNamedGeneric should now reference the preheader's root
+        // (NodeId(0)) directly, not the Phi (NodeId(1)).
+        let load_node = graph.blocks()[1]
+            .nodes
+            .iter()
+            .find(|(_, n)| matches!(n, ValueNode::LoadNamedGeneric { .. }));
+        if let Some((_, ValueNode::LoadNamedGeneric { object, .. })) = load_node {
+            assert_eq!(
+                *object, root,
+                "LoadNamedGeneric should reference preheader root after Phi elimination"
+            );
+        } else {
+            // The load might have been moved to block 0 by LICM (even better!)
+            let load_in_b0 = graph.blocks()[0]
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::LoadNamedGeneric { .. }));
+            assert!(
+                load_in_b0,
+                "LoadNamedGeneric should be hoisted to preheader by LICM"
+            );
+        }
+    }
+
+    #[test]
+    fn test_trivial_phi_non_trivial_preserved() {
+        // A real Phi with two distinct non-self inputs should NOT be eliminated.
+        //
+        //   Block 0: NodeId(0) = SmiConstant(0)  → Jump to block 1
+        //   Block 1: NodeId(2) = Phi([NodeId(0), NodeId(1)])
+        //            NodeId(1) = GenericIncrement(NodeId(2))
+        //            → Return NodeId(2)
+        let mut graph = MaglevGraph::new(0);
+
+        let mut b0 = BasicBlock::new(0);
+        let zero = graph.alloc_node_id();
+        b0.push_with_id(zero, ValueNode::SmiConstant { value: 0 });
+        b0.set_control(ControlNode::Jump { target: 1 });
+        graph.add_block(b0);
+
+        let mut b1 = BasicBlock::new(1);
+        b1.predecessors = vec![0, 1];
+        b1.is_loop_header = true;
+        let phi_id = graph.alloc_node_id();
+        let inc_id = graph.alloc_node_id();
+        b1.push_with_id(
+            phi_id,
+            ValueNode::Phi {
+                inputs: vec![zero, inc_id],
+            },
+        );
+        b1.push_with_id(
+            inc_id,
+            ValueNode::GenericIncrement {
+                value: phi_id,
+                feedback_slot: 0,
+            },
+        );
+        b1.set_control(ControlNode::Return { value: phi_id });
+        graph.add_block(b1);
+
+        optimize(&mut graph);
+
+        // The Phi should still exist (it's not trivial — two distinct inputs).
+        let phi_exists = graph
+            .blocks()
+            .iter()
+            .flat_map(|b| b.nodes.iter())
+            .any(|(_, n)| matches!(n, ValueNode::Phi { .. }));
+        assert!(phi_exists, "Non-trivial Phi should be preserved");
+    }
 }
