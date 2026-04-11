@@ -2920,6 +2920,7 @@ impl<'a> MaglevCodegen<'a> {
     }
 
     /// Record that physical register `reg` now holds the value of `id`.
+    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
     fn note_reg_holds(&mut self, reg: Reg64, id: NodeId) {
         if reg == Reg64::Rax {
             self.rax_holds = Some(id);
