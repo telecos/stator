@@ -877,13 +877,11 @@ fn eliminate_trivial_phis(graph: &mut MaglevGraph) {
                             }
                         }
                     }
-                    if is_trivial {
-                        if let Some(replacement) = unique_external {
-                            subst.insert(id, replacement);
-                        }
-                        // If unique_external is None, all inputs are self-refs
-                        // (unreachable Phi) — leave it for DCE.
+                    if is_trivial && let Some(replacement) = unique_external {
+                        subst.insert(id, replacement);
                     }
+                    // If unique_external is None, all inputs are self-refs
+                    // (unreachable Phi) — leave it for DCE.
                 }
             }
         }
@@ -898,11 +896,11 @@ fn eliminate_trivial_phis(graph: &mut MaglevGraph) {
             let mut changed = false;
             let keys: Vec<NodeId> = subst.keys().copied().collect();
             for key in keys {
-                if let Some(&further) = subst.get(&subst[&key]) {
-                    if subst[&key] != further {
-                        subst.insert(key, further);
-                        changed = true;
-                    }
+                if let Some(&further) = subst.get(&subst[&key])
+                    && subst[&key] != further
+                {
+                    subst.insert(key, further);
+                    changed = true;
                 }
             }
             if !changed {

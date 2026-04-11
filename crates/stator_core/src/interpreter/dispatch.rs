@@ -2109,13 +2109,11 @@ fn handle_call_any_receiver(
                 if arg_count == 0
                     && ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
                     && !ba.has_exception_handler()
-                {
-                    if let Some(result) =
+                    && let Some(result) =
                         try_inline_small_function(ba.as_ref(), &[], &ctx.frame.global_env)
-                    {
-                        ctx.frame.accumulator = result;
-                        return Ok(DispatchAction::Continue);
-                    }
+                {
+                    ctx.frame.accumulator = result;
+                    return Ok(DispatchAction::Continue);
                 }
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
                 // ── Tiering (cold path: gated on reaching baseline threshold) ──
