@@ -959,6 +959,16 @@ pub fn maglev_track_global_deopt() {
 #[cfg(not(all(target_arch = "x86_64", unix)))]
 pub fn maglev_track_global_deopt() {}
 
+// ── Unconditional diagnostic counters (compile on all platforms) ──────────────
+thread_local! {
+    /// How many times `try_execute_maglev` found the executable cache empty
+    /// after the initialisation attempt.
+    static DIAG_MAGLEV_CACHE_EMPTY: Cell<u64> = const { Cell::new(0) };
+    /// How many times `try_execute_turbofan` returned `Some` inside
+    /// `try_execute_best_jit` (i.e. Turbofan intercepted before Maglev).
+    static DIAG_TURBOFAN_HIT: Cell<u64> = const { Cell::new(0) };
+}
+
 /// Set a wall-clock deadline for all interpreter execution on the current
 /// thread.  Passing `None` clears any existing deadline.
 pub fn set_execution_deadline(deadline: Option<Instant>) {
@@ -1075,10 +1085,13 @@ pub fn turbofan_stats() -> (u32, usize) {
 /// Return Maglev diagnostic counters for the current thread.
 ///
 /// Returns `(tried, executed, deopted, not_ready, compilations, code_bytes,
-/// started, failed, panicked)`.
+/// started, failed, panicked, blocked, cache_empty, turbofan_hit)`.
 ///
-/// On platforms without Maglev JIT support all values are zero.
-pub fn maglev_diagnostics() -> (u64, u64, u64, u64, u32, usize, u32, u32, u32, u64) {
+/// On platforms without Maglev JIT support the JIT-specific values are zero,
+/// but `cache_empty` and `turbofan_hit` are always valid.
+pub fn maglev_diagnostics() -> (u64, u64, u64, u64, u32, usize, u32, u32, u32, u64, u64, u64) {
+    let cache_empty = DIAG_MAGLEV_CACHE_EMPTY.with(|c| c.get());
+    let turbofan_hit = DIAG_TURBOFAN_HIT.with(|c| c.get());
     #[cfg(all(target_arch = "x86_64", unix))]
     {
         let tried = MAGLEV_DIAG_TRIED.with(|c| c.get());
@@ -1101,10 +1114,12 @@ pub fn maglev_diagnostics() -> (u64, u64, u64, u64, u32, usize, u32, u32, u32, u
             failed,
             panicked,
             blocked,
+            cache_empty,
+            turbofan_hit,
         );
     }
     #[allow(unreachable_code)]
-    (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, cache_empty, turbofan_hit)
 }
 
 /// Return per-category deopt counters:
@@ -1468,7 +1483,11 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
         }
 
         let guard = cache.borrow();
-        let cached = guard.as_ref()?;
+        if guard.is_none() {
+            DIAG_MAGLEV_CACHE_EMPTY.with(|c| c.set(c.get() + 1));
+            return None;
+        }
+        let cached = guard.as_ref().unwrap();
 
         jit_runtime_setup(ba);
         let jit_args: Vec<i64> = args.iter().map(jsvalue_to_jit).collect();
@@ -1651,6 +1670,7 @@ pub(super) fn try_execute_best_jit(
     }
     // Try Turbofan first (highest tier — Cranelift native code).
     if let Some(r) = try_execute_turbofan(ba, args) {
+        DIAG_TURBOFAN_HIT.with(|c| c.set(c.get() + 1));
         return Some(r);
     }
     // Then Maglev (register-allocated JIT).
@@ -4244,17 +4264,26 @@ impl Interpreter {
                                     // the background thread finishes before
                                     // the next invocation of this function.
                                     maybe_compile_maglev(&frame.bytecode_array);
-                                    // NOTE: We do NOT call try_execute_best_jit
-                                    // here (OSR path).  Maglev's global
-                                    // promotion inserts preheader LoadGlobals
-                                    // that read stale interpreter values when
-                                    // OSR restarts the function mid-execution.
-                                    // Maglev execution happens at function
-                                    // entry (run_dispatch top) instead.
                                 } else if frame.osr_loop_count == MAGLEV_OSR_LOOP_THRESHOLD {
                                     maybe_compile_maglev(&frame.bytecode_array);
                                 } else if frame.osr_loop_count == TURBOFAN_OSR_LOOP_THRESHOLD {
                                     maybe_compile_turbofan(&frame.bytecode_array);
+                                }
+
+                                // OSR: attempt JIT execution once, shortly
+                                // after compilation was triggered.
+                                if frame.osr_loop_count == OSR_LOOP_THRESHOLD + 1
+                                    || frame.osr_loop_count == MAGLEV_OSR_LOOP_THRESHOLD + 1
+                                {
+                                    acc = materialize_acc!();
+                                    frame.pc = pc;
+                                    frame.accumulator = acc.cheap_clone();
+                                    if let Some(jit_result) = try_execute_best_jit(
+                                        &frame.bytecode_array,
+                                        &frame.call_args,
+                                    ) {
+                                        return jit_result;
+                                    }
                                 }
                                 // Only EXPAND loop_end_pc ΓÇö never shrink it.
                                 // Nested loops have smaller loop_end values;
@@ -6933,12 +6962,26 @@ impl Interpreter {
                                 maybe_compile_baseline(&frame.bytecode_array);
                             }
                             maybe_compile_maglev(&frame.bytecode_array);
-                            // See SMI-mode JumpLoop comment: no OSR JIT
-                            // execution — Maglev fires at function entry.
                         } else if frame.osr_loop_count == MAGLEV_OSR_LOOP_THRESHOLD {
                             maybe_compile_maglev(&frame.bytecode_array);
                         } else if frame.osr_loop_count == TURBOFAN_OSR_LOOP_THRESHOLD {
                             maybe_compile_turbofan(&frame.bytecode_array);
+                        }
+
+                        // OSR: attempt JIT execution once, shortly after
+                        // compilation was triggered.  This is the fallback
+                        // for cases where the function-entry path didn't fire
+                        // (e.g. top-level scripts that are only invoked once).
+                        if frame.osr_loop_count == OSR_LOOP_THRESHOLD + 1
+                            || frame.osr_loop_count == MAGLEV_OSR_LOOP_THRESHOLD + 1
+                        {
+                            frame.pc = pc;
+                            frame.accumulator = acc.cheap_clone();
+                            if let Some(jit_result) =
+                                try_execute_best_jit(&frame.bytecode_array, &frame.call_args)
+                            {
+                                return jit_result;
+                            }
                         }
 
                         // ΓöÇΓöÇ Back-edge periodic checks ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
