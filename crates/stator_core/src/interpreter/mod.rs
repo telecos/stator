@@ -199,7 +199,10 @@ use crate::error::{StatorError, StatorResult};
 use crate::inspector::debugger::Debugger;
 use crate::objects::map::PropertyAttributes;
 use crate::objects::nanbox::NanBoxedValue;
-use crate::objects::property_map::{INTERNAL_PROTO_PROPERTY_KEY, PropertyMap, recycle_object_rc};
+use crate::objects::property_map::{
+    INTERNAL_PROTO_PROPERTY_KEY, ObjectLiteralTemplate, PropertyMap,
+    acquire_object_rc_from_template_with_values, recycle_object_rc,
+};
 use crate::objects::string_intern::intern;
 use crate::objects::value::{JsContext, JsValue};
 
@@ -3441,6 +3444,12 @@ impl Interpreter {
             let mut pc = frame.pc;
             let mut acc = frame.accumulator.cheap_clone();
 
+            // Template cache for fused CreateEmptyObjectLiteral + N ×
+            // DefineNamedOwnProperty sequences.  Keyed by the instruction
+            // index of the CreateEmptyObjectLiteral so multiple such
+            // instructions in the same function each get their own cache.
+            let mut empty_obj_template: Option<(usize, ObjectLiteralTemplate)> = None;
+
             'dispatch: loop {
                 // ΓöÇΓöÇ Debug hook (pre-fetch) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
                 if debug_active {
@@ -6163,11 +6172,56 @@ impl Interpreter {
                                 break 'empty_fuse;
                             }
 
-                            // Build the PropertyMap with all properties at
-                            // once, avoiding per-property insert overhead.
-                            let mut pm = PropertyMap::with_capacity(keys.len());
+                            // Collect values into a contiguous slice for
+                            // template instantiation.
+                            let n = keys.len();
+                            let val_slice = &vals[..n];
+
+                            // Fast path: cached template from prior iteration.
+                            let create_pc = pc - 1; // pc already advanced past CreateEmptyObjectLiteral
+                            if let Some((cached_pc, ref tmpl)) = empty_obj_template {
+                                if cached_pc == create_pc {
+                                    let rc = acquire_object_rc_from_template_with_values(
+                                        tmpl, val_slice,
+                                    );
+                                    let old = unsafe {
+                                        frame.swap_reg_unchecked(
+                                            star_reg,
+                                            JsValue::PlainObject(Rc::clone(&rc)),
+                                        )
+                                    };
+                                    if let JsValue::PlainObject(old_rc) = old {
+                                        recycle_object_rc(old_rc);
+                                    }
+                                    // Flush mini shadow registers to real frame.
+                                    for entry in mini_regs.iter_mut().take(mini_reg_count) {
+                                        if entry.0 != star_reg {
+                                            unsafe {
+                                                frame.write_reg_unchecked(
+                                                    entry.0,
+                                                    std::mem::replace(
+                                                        &mut entry.1,
+                                                        JsValue::Undefined,
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    acc = mini_acc;
+                                    pc = scan_pc;
+                                    continue 'dispatch;
+                                }
+                            }
+
+                            // Cold path: first iteration — build via
+                            // insert_rc and capture template.
+                            let mut pm = PropertyMap::with_capacity(n);
                             for (k, v) in keys.into_iter().zip(vals) {
                                 pm.insert_rc(k, v);
+                            }
+                            // Capture template for subsequent iterations.
+                            if let Some(tmpl) = ObjectLiteralTemplate::capture(&pm) {
+                                empty_obj_template = Some((create_pc, tmpl));
                             }
                             let obj = JsValue::PlainObject(Rc::new(RefCell::new(pm)));
                             unsafe { frame.write_reg_unchecked(star_reg, obj) };

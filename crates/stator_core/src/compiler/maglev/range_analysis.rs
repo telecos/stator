@@ -306,6 +306,88 @@ fn try_rewrite(
             ))
         }
 
+        // ── Generic arithmetic — lower to Int32 when range fits ──────────
+        ValueNode::GenericAdd { left, right, .. } => {
+            let (lr, rr) = (ranges.get(left)?, ranges.get(right)?);
+            let out = Range {
+                min: lr.min + rr.min,
+                max: lr.max + rr.max,
+            };
+            let repl = if out.fits_i32() {
+                Some(ValueNode::Int32Add {
+                    left: *left,
+                    right: *right,
+                })
+            } else {
+                None
+            };
+            Some((out, repl))
+        }
+        ValueNode::GenericSubtract { left, right, .. } => {
+            let (lr, rr) = (ranges.get(left)?, ranges.get(right)?);
+            let out = Range {
+                min: lr.min - rr.max,
+                max: lr.max - rr.min,
+            };
+            let repl = if out.fits_i32() {
+                Some(ValueNode::Int32Subtract {
+                    left: *left,
+                    right: *right,
+                })
+            } else {
+                None
+            };
+            Some((out, repl))
+        }
+        ValueNode::GenericMultiply { left, right, .. } => {
+            let (lr, rr) = (ranges.get(left)?, ranges.get(right)?);
+            let candidates = [
+                lr.min * rr.min,
+                lr.min * rr.max,
+                lr.max * rr.min,
+                lr.max * rr.max,
+            ];
+            let out = Range {
+                min: candidates.iter().copied().min().unwrap(),
+                max: candidates.iter().copied().max().unwrap(),
+            };
+            let repl = if out.fits_i32() {
+                Some(ValueNode::Int32Multiply {
+                    left: *left,
+                    right: *right,
+                })
+            } else {
+                None
+            };
+            Some((out, repl))
+        }
+        ValueNode::GenericIncrement { value, .. } => {
+            let vr = ranges.get(value)?;
+            let out = Range {
+                min: vr.min + 1,
+                max: vr.max + 1,
+            };
+            let repl = if out.fits_i32() {
+                Some(ValueNode::Int32Increment { value: *value })
+            } else {
+                None
+            };
+            Some((out, repl))
+        }
+        ValueNode::GenericDecrement { value, .. } => {
+            let vr = ranges.get(value)?;
+            let out = Range {
+                min: vr.min - 1,
+                max: vr.max - 1,
+            };
+            let repl = if out.fits_i32() {
+                Some(ValueNode::Int32Decrement { value: *value })
+            } else {
+                None
+            };
+            Some((out, repl))
+        }
+
         _ => None,
     }
 }
@@ -488,9 +570,19 @@ fn find_step_delta(
 ) -> Option<i64> {
     let (_, step_node) = node_map.get(step_id)?;
     match step_node {
-        ValueNode::CheckedSmiIncrement { value } if value == phi_id => Some(1),
-        ValueNode::CheckedSmiDecrement { value } if value == phi_id => Some(-1),
-        ValueNode::CheckedSmiAdd { left, right } if left == phi_id => {
+        ValueNode::CheckedSmiIncrement { value } | ValueNode::GenericIncrement { value, .. }
+            if value == phi_id =>
+        {
+            Some(1)
+        }
+        ValueNode::CheckedSmiDecrement { value } | ValueNode::GenericDecrement { value, .. }
+            if value == phi_id =>
+        {
+            Some(-1)
+        }
+        ValueNode::CheckedSmiAdd { left, right } | ValueNode::GenericAdd { left, right, .. }
+            if left == phi_id =>
+        {
             let r = ranges.get(right)?;
             if r.min == r.max { Some(r.min) } else { None }
         }
@@ -584,19 +676,24 @@ fn compute_induction_ranges(
     }
 }
 
-/// Convert a checked Smi step node to its unchecked `Int32*` equivalent.
+/// Convert a checked Smi or Generic step node to its unchecked `Int32*`
+/// equivalent.  Generic variants are safe to lower here because the range
+/// analysis has already proven that the operands stay within `i32` across
+/// all loop iterations.
 fn lower_checked_to_unchecked(node: &ValueNode) -> Option<ValueNode> {
     match node {
-        ValueNode::CheckedSmiIncrement { value } => {
+        ValueNode::CheckedSmiIncrement { value } | ValueNode::GenericIncrement { value, .. } => {
             Some(ValueNode::Int32Increment { value: *value })
         }
-        ValueNode::CheckedSmiDecrement { value } => {
+        ValueNode::CheckedSmiDecrement { value } | ValueNode::GenericDecrement { value, .. } => {
             Some(ValueNode::Int32Decrement { value: *value })
         }
-        ValueNode::CheckedSmiAdd { left, right } => Some(ValueNode::Int32Add {
-            left: *left,
-            right: *right,
-        }),
+        ValueNode::CheckedSmiAdd { left, right } | ValueNode::GenericAdd { left, right, .. } => {
+            Some(ValueNode::Int32Add {
+                left: *left,
+                right: *right,
+            })
+        }
         _ => None,
     }
 }
@@ -648,12 +745,18 @@ fn rewrite_accumulator_phis(
                 continue;
             };
 
-            // Match additive accumulator: back = CheckedSmiAdd { phi, addend }.
+            // Match additive accumulator: back = CheckedSmiAdd/GenericAdd { phi, addend }.
             let addend_range = match back_node {
-                ValueNode::CheckedSmiAdd { left, right } if *left == *phi_id => {
+                ValueNode::CheckedSmiAdd { left, right }
+                | ValueNode::GenericAdd { left, right, .. }
+                    if *left == *phi_id =>
+                {
                     ranges.get(right).copied()
                 }
-                ValueNode::CheckedSmiAdd { left, right } if *right == *phi_id => {
+                ValueNode::CheckedSmiAdd { left, right }
+                | ValueNode::GenericAdd { left, right, .. }
+                    if *right == *phi_id =>
+                {
                     ranges.get(left).copied()
                 }
                 _ => None,
@@ -699,7 +802,8 @@ fn rewrite_accumulator_phis(
             };
 
             let replacement = match back_node {
-                ValueNode::CheckedSmiAdd { left, right } => ValueNode::Int32Add {
+                ValueNode::CheckedSmiAdd { left, right }
+                | ValueNode::GenericAdd { left, right, .. } => ValueNode::Int32Add {
                     left: *left,
                     right: *right,
                 },
