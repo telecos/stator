@@ -1,6 +1,6 @@
 //! Maglev IR optimisation passes.
 //!
-//! Eight passes are implemented and composed by [`optimize`]:
+//! Nine passes are implemented and composed by [`optimize`]:
 //!
 //! 1. **Constant folding** — replaces arithmetic/comparison nodes whose *all*
 //!    inputs resolve to compile-time constant nodes with a new constant node,
@@ -23,28 +23,34 @@
 //!    `i32` with unchecked `Int32*` equivalents (eliminating deopt overhead).
 //!    See [`crate::compiler::maglev::range_analysis`].
 //!
-//! 4. **Loop-invariant code motion (LICM)** — detects natural loops via
+//! 4. **Trivial Phi elimination** — replaces Phi nodes whose non-self
+//!    inputs are all the same value with that value.  This is essential for
+//!    enabling LICM: loop-header Phis like `Phi(X, self)` for variables
+//!    that are never modified in the loop body are replaced by `X`, moving
+//!    their definition out of the loop and unblocking hoisting.
+//!
+//! 5. **Loop-invariant code motion (LICM)** — detects natural loops via
 //!    back-edges and hoists pure nodes whose inputs are all defined outside
 //!    the loop into the preheader block.
 //!    See [`crate::compiler::maglev::licm`].
 //!
-//! 5. **Redundant type-guard elimination** — removes `CheckSmi` guards on
+//! 6. **Redundant type-guard elimination** — removes `CheckSmi` guards on
 //!    values already known to be Smis.  A value is *known Smi* when it is
 //!    produced by `SmiConstant` or any `CheckedSmi*` node, or when a prior
 //!    `CheckSmi` for the same receiver already appears in the same block.
 //!
-//! 6. **Redundant `CheckMaps` removal** — within each basic block, a
+//! 7. **Redundant `CheckMaps` removal** — within each basic block, a
 //!    `CheckMaps { receiver, feedback_slot }` node is redundant if an
 //!    identical guard for the *same* (receiver, feedback_slot) pair has
 //!    already been emitted earlier in the same block.  The duplicate is
 //!    replaced by a [`ValueNode::UndefinedConstant`] placeholder and the
 //!    relevant ID is remapped so all consumers still compile correctly.
 //!
-//! 7. **Inlining analysis** — scans for `CallKnownFunction` nodes with
+//! 8. **Inlining analysis** — scans for `CallKnownFunction` nodes with
 //!    small argument counts and marks them as inlining candidates for a
 //!    future inlining pass.
 //!
-//! 8. **Dead-code elimination** — removes `ValueNode`s whose [`NodeId`]
+//! 9. **Dead-code elimination** — removes `ValueNode`s whose [`NodeId`]
 //!    is never referenced by any other node (value or control) in the graph.
 //!    Pure side-effect-free nodes that produce a value which nobody consumes
 //!    are safe to drop.  Nodes with observable side-effects (stores, calls,
@@ -102,8 +108,8 @@ pub fn globals_promoted_diagnostics() -> (u32, u32) {
 /// Run all optimisation passes on `graph` in place.
 ///
 /// Passes are applied in the order: constant folding → strength reduction →
-/// range analysis → LICM → redundant type-guard elimination → inlining
-/// analysis → redundant-CheckMaps removal → DCE.
+/// range analysis → trivial Phi elimination → LICM → redundant type-guard
+/// elimination → inlining analysis → redundant-CheckMaps removal → DCE.
 ///
 /// Multiple rounds are *not* performed; a single sweep of each pass is
 /// sufficient for the patterns targeted here.
@@ -118,6 +124,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     reassociate_arithmetic(graph);
     strength_reduce(graph);
     crate::compiler::maglev::range_analysis::eliminate_overflow_checks(graph);
+    eliminate_trivial_phis(graph);
     let _licm_hoisted = crate::compiler::maglev::licm::hoist_loop_invariants(graph);
     // TODO: implement loop peeling — execute the first iteration outside the
     // loop to establish type information (e.g. from CheckSmi guards), then
@@ -126,6 +133,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // current graph structure.
     eliminate_common_subexpressions(graph);
     let _globals_promoted = promote_loop_globals_counted(graph);
+    eliminate_trivial_phis(graph);
     let _licm_hoisted2 = crate::compiler::maglev::licm::hoist_loop_invariants(graph);
     // Re-run range analysis after global promotion: promotion replaces
     // LoadGlobal/StoreGlobal with Phi nodes, exposing induction variable
@@ -820,6 +828,101 @@ fn visit_control_inputs(ctrl: &ControlNode, f: &mut impl FnMut(NodeId)) {
         ControlNode::Return { value } => f(*value),
         ControlNode::Branch { condition, .. } => f(*condition),
         ControlNode::Jump { .. } | ControlNode::Deoptimize { .. } => {}
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trivial Phi elimination
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Eliminate trivial Phi nodes whose value is statically determined.
+///
+/// A Phi node is *trivial* when every non-self input refers to the same
+/// [`NodeId`] `X`.  Such a Phi always evaluates to `X` regardless of which
+/// predecessor is taken, so all uses of the Phi can be replaced by `X`.
+/// This commonly arises in loop headers for variables that are never
+/// modified inside the loop body (e.g. `Phi(root, self)` for an object
+/// reference that is only read).
+///
+/// Eliminating trivial Phis is a prerequisite for effective LICM: a
+/// [`ValueNode::LoadNamedGeneric`] whose receiver is a trivial Phi in the
+/// loop header appears to depend on a loop-body definition.  Once the Phi
+/// is replaced, the load's input lives in the preheader and becomes
+/// eligible for hoisting.
+///
+/// The pass iterates to a fixed point so that cascading trivial Phis
+/// (where one Phi's sole external input is another trivial Phi) are fully
+/// resolved.
+fn eliminate_trivial_phis(graph: &mut MaglevGraph) {
+    // Iterate to a fixed point for cascading trivial Phis.
+    loop {
+        // Step 1: Scan all blocks for trivial Phi nodes.
+        let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
+        for block in graph.blocks() {
+            for &(id, ref node) in &block.nodes {
+                if let ValueNode::Phi { inputs } = node {
+                    // Collect unique non-self inputs.
+                    let mut unique_external = None;
+                    let mut is_trivial = true;
+                    for &inp in inputs {
+                        if inp == id {
+                            continue; // skip self-references
+                        }
+                        match unique_external {
+                            None => unique_external = Some(inp),
+                            Some(prev) if prev == inp => {} // same as before
+                            Some(_) => {
+                                is_trivial = false;
+                                break;
+                            }
+                        }
+                    }
+                    if is_trivial {
+                        if let Some(replacement) = unique_external {
+                            subst.insert(id, replacement);
+                        }
+                        // If unique_external is None, all inputs are self-refs
+                        // (unreachable Phi) — leave it for DCE.
+                    }
+                }
+            }
+        }
+
+        if subst.is_empty() {
+            break;
+        }
+
+        // Transitively resolve substitution chains: if A→B and B→C, then
+        // A→C. Limit iterations to avoid infinite loops from malformed IR.
+        for _ in 0..subst.len() {
+            let mut changed = false;
+            let keys: Vec<NodeId> = subst.keys().copied().collect();
+            for key in keys {
+                if let Some(&further) = subst.get(&subst[&key]) {
+                    if subst[&key] != further {
+                        subst.insert(key, further);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Step 2: Replace trivial Phi nodes with dead placeholders.
+        for block in graph.blocks_mut() {
+            for (id, node) in &mut block.nodes {
+                if subst.contains_key(id) {
+                    *node = ValueNode::UndefinedConstant;
+                }
+            }
+        }
+
+        // Step 3: Apply substitution to all node inputs and control nodes.
+        for block in graph.blocks_mut() {
+            apply_subst_to_block(block, &subst);
+        }
     }
 }
 

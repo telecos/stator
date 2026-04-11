@@ -19,8 +19,9 @@ use stator_core::compiler::baseline::compiler::{
     STUB_DEOPT_SLOTS, STUB_NAMES, reset_stub_deopt_counts, stub_deopt_counts,
 };
 use stator_core::interpreter::{
-    GlobalEnv, Interpreter, InterpreterFrame, globals_promotion_diagnostics, jit_entry_diagnostics,
-    licm_diagnostics, maglev_deopt_categories, maglev_diagnostics,
+    GlobalEnv, Interpreter, InterpreterFrame, dispatch_entry_diagnostics,
+    globals_promotion_diagnostics, jit_entry_diagnostics, licm_diagnostics,
+    maglev_deopt_categories, maglev_diagnostics,
 };
 use stator_core::parser::recursive_descent;
 
@@ -128,6 +129,7 @@ fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
     let cats_before = maglev_deopt_categories();
     let stubs_before = stub_deopt_counts();
     let jit_before = jit_entry_diagnostics();
+    let dispatch_before = dispatch_entry_diagnostics();
     c.bench_function("fib_40_iterative_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -141,6 +143,7 @@ fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
         &cats_before,
         &stubs_before,
         &jit_before,
+        &dispatch_before,
     );
 }
 
@@ -166,6 +169,7 @@ fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
     let cats_before = maglev_deopt_categories();
     let stubs_before = stub_deopt_counts();
     let jit_before = jit_entry_diagnostics();
+    let dispatch_before = dispatch_entry_diagnostics();
     c.bench_function("arithmetic_loop_10k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -179,6 +183,7 @@ fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
         &cats_before,
         &stubs_before,
         &jit_before,
+        &dispatch_before,
     );
 }
 
@@ -205,6 +210,7 @@ fn bench_property_access_1k_precompiled(c: &mut Criterion) {
     let cats_before = maglev_deopt_categories();
     let stubs_before = stub_deopt_counts();
     let jit_before = jit_entry_diagnostics();
+    let dispatch_before = dispatch_entry_diagnostics();
     c.bench_function("property_access_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -218,6 +224,7 @@ fn bench_property_access_1k_precompiled(c: &mut Criterion) {
         &cats_before,
         &stubs_before,
         &jit_before,
+        &dispatch_before,
     );
     let (loops, hoisted, named_hoisted, blocked) = licm_diagnostics();
     eprintln!(
@@ -251,6 +258,7 @@ fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
     let cats_before = maglev_deopt_categories();
     let stubs_before = stub_deopt_counts();
     let jit_before = jit_entry_diagnostics();
+    let dispatch_before = dispatch_entry_diagnostics();
     c.bench_function("object_creation_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -264,6 +272,7 @@ fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
         &cats_before,
         &stubs_before,
         &jit_before,
+        &dispatch_before,
     );
 }
 
@@ -293,6 +302,7 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
     let cats_before = maglev_deopt_categories();
     let stubs_before = stub_deopt_counts();
     let jit_before = jit_entry_diagnostics();
+    let dispatch_before = dispatch_entry_diagnostics();
     c.bench_function("array_push_sum_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -306,6 +316,7 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
         &cats_before,
         &stubs_before,
         &jit_before,
+        &dispatch_before,
     );
 }
 
@@ -336,6 +347,7 @@ fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
     let cats_before = maglev_deopt_categories();
     let stubs_before = stub_deopt_counts();
     let jit_before = jit_entry_diagnostics();
+    let dispatch_before = dispatch_entry_diagnostics();
     c.bench_function("closure_counter_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -349,6 +361,7 @@ fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
         &cats_before,
         &stubs_before,
         &jit_before,
+        &dispatch_before,
     );
 }
 
@@ -381,6 +394,7 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
     let cats_before = maglev_deopt_categories();
     let stubs_before = stub_deopt_counts();
     let jit_before = jit_entry_diagnostics();
+    let dispatch_before = dispatch_entry_diagnostics();
     c.bench_function("prototype_chain_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -394,6 +408,7 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
         &cats_before,
         &stubs_before,
         &jit_before,
+        &dispatch_before,
     );
 }
 
@@ -431,6 +446,7 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
     let cats_before = maglev_deopt_categories();
     let stubs_before = stub_deopt_counts();
     let jit_before = jit_entry_diagnostics();
+    let dispatch_before = dispatch_entry_diagnostics();
     c.bench_function("sieve_primes_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -444,6 +460,7 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
         &cats_before,
         &stubs_before,
         &jit_before,
+        &dispatch_before,
     );
 }
 
@@ -470,6 +487,7 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
     let cats_before = maglev_deopt_categories();
     let stubs_before = stub_deopt_counts();
     let jit_before = jit_entry_diagnostics();
+    let dispatch_before = dispatch_entry_diagnostics();
     c.bench_function("deep_object_access_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -483,6 +501,7 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
         &cats_before,
         &stubs_before,
         &jit_before,
+        &dispatch_before,
     );
 }
 
@@ -496,6 +515,7 @@ fn print_maglev_diag(
     cats_before: &[u64; 6],
     stubs_before: &[u64; STUB_DEOPT_SLOTS],
     jit_before: &(u64, u64, u64),
+    dispatch_before: &(u64, u64),
 ) {
     let (
         tried,
@@ -552,12 +572,20 @@ fn print_maglev_diag(
     }
     // Atomic (non-TLS) diagnostics for cross-checking.
     let (entered, hit, miss) = jit_entry_diagnostics();
+    let (inner_now, dispatch_now) = dispatch_entry_diagnostics();
     eprintln!(
         "  ATOMIC_JIT[{name}]: entered={} maglev_hit={} maglev_miss={} (entered_delta={})",
         entered,
         hit,
         miss,
         entered - jit_before.0
+    );
+    eprintln!(
+        "  DISPATCH[{name}]: run_inner={} run_dispatch={} (inner_delta={} dispatch_delta={})",
+        inner_now,
+        dispatch_now,
+        inner_now - dispatch_before.0,
+        dispatch_now - dispatch_before.1
     );
 }
 

@@ -2105,6 +2105,18 @@ fn handle_call_any_receiver(
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
                 ctx.frame.accumulator = Interpreter::run_async_function(Rc::clone(&ba), args)?;
             } else {
+                // ── Inline small functions (zero-arg fast path) ──
+                if arg_count == 0
+                    && ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+                    && !ba.has_exception_handler()
+                {
+                    if let Some(result) =
+                        try_inline_small_function(ba.as_ref(), &[], &ctx.frame.global_env)
+                    {
+                        ctx.frame.accumulator = result;
+                        return Ok(DispatchAction::Continue);
+                    }
+                }
                 let args = collect_args(ctx.frame, args_start_v, arg_count)?;
                 // ── Tiering (cold path: gated on reaching baseline threshold) ──
                 let count = ba.increment_invocation_count();

@@ -1014,6 +1014,11 @@ static DIAG_BEST_JIT_ENTERED: std::sync::atomic::AtomicU64 = std::sync::atomic::
 static DIAG_MAGLEV_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Atomic diagnostic: how many times try_execute_maglev returned None.
 static DIAG_MAGLEV_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Atomic diagnostic: how many times `run_dispatch` was entered.
+static DIAG_RUN_DISPATCH_ENTERED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Atomic diagnostic: how many times `run_inner` was entered.
+static DIAG_RUN_INNER_ENTERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Return a snapshot of the atomic JIT entry diagnostics.
 ///
@@ -1024,6 +1029,17 @@ pub fn jit_entry_diagnostics() -> (u64, u64, u64) {
         DIAG_BEST_JIT_ENTERED.load(Relaxed),
         DIAG_MAGLEV_HIT.load(Relaxed),
         DIAG_MAGLEV_MISS.load(Relaxed),
+    )
+}
+
+/// Return a snapshot of the `run_dispatch` and `run_inner` entry counters.
+///
+/// Returns `(run_inner_entered, run_dispatch_entered)`.
+pub fn dispatch_entry_diagnostics() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        DIAG_RUN_INNER_ENTERED.load(Relaxed),
+        DIAG_RUN_DISPATCH_ENTERED.load(Relaxed),
     )
 }
 
@@ -1173,13 +1189,7 @@ fn seed_jit_feedback(ba: &BytecodeArray) -> FeedbackVector {
         if feedback.get_state(slot) == Some(InlineCacheState::Uninitialized)
             && matches!(
                 ba.feedback_metadata().kind_of(slot),
-                Some(
-                    FeedbackSlotKind::BinaryOp
-                        | FeedbackSlotKind::Compare
-                        | FeedbackSlotKind::BinaryOpInc
-                        | FeedbackSlotKind::KeyedLoadProperty
-                        | FeedbackSlotKind::KeyedStoreProperty
-                )
+                Some(FeedbackSlotKind::KeyedLoadProperty | FeedbackSlotKind::KeyedStoreProperty)
             )
         {
             let _ = feedback.set_state(slot, InlineCacheState::Monomorphic);
@@ -1381,10 +1391,7 @@ pub fn maybe_compile_maglev(ba: &BytecodeArray) {
                     if matches!(
                         input.ba.feedback_metadata().kind_of(slot),
                         Some(
-                            FeedbackSlotKind::BinaryOp
-                                | FeedbackSlotKind::Compare
-                                | FeedbackSlotKind::BinaryOpInc
-                                | FeedbackSlotKind::KeyedLoadProperty
+                            FeedbackSlotKind::KeyedLoadProperty
                                 | FeedbackSlotKind::KeyedStoreProperty
                         )
                     ) {
@@ -1620,11 +1627,7 @@ pub(super) fn maybe_compile_turbofan(ba: &BytecodeArray) {
                 if matches!(
                     input.ba.feedback_metadata().kind_of(slot),
                     Some(
-                        FeedbackSlotKind::BinaryOp
-                            | FeedbackSlotKind::Compare
-                            | FeedbackSlotKind::BinaryOpInc
-                            | FeedbackSlotKind::KeyedLoadProperty
-                            | FeedbackSlotKind::KeyedStoreProperty
+                        FeedbackSlotKind::KeyedLoadProperty | FeedbackSlotKind::KeyedStoreProperty
                     )
                 ) {
                     let _ = feedback.set_state(slot, InlineCacheState::Monomorphic);
@@ -1788,10 +1791,11 @@ impl MegamorphicIc {
     }
 
     /// Probes the cache for a `(slot, receiver_layout)` pair.
-    #[inline]
+    #[inline(always)]
     pub fn probe(&self, slot: u32, receiver_layout: u64) -> Option<&MegamorphicIcEntry> {
         let idx = (slot as usize) & (MEGAMORPHIC_IC_SIZE - 1);
-        let entry = &self.entries[idx];
+        // SAFETY: idx is masked to [0, MEGAMORPHIC_IC_SIZE), always in bounds.
+        let entry = unsafe { self.entries.get_unchecked(idx) };
         if entry.slot == slot && entry.receiver_layout == receiver_layout {
             Some(entry)
         } else {
@@ -3279,7 +3283,9 @@ impl Interpreter {
     }
 
     fn run_inner(frame: &mut InterpreterFrame, skip_globals: bool) -> StatorResult<JsValue> {
-        // Increment invocation count for tiering ΓÇö ensures top-level code
+        DIAG_RUN_INNER_ENTERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Increment invocation count for tiering — ensures top-level code
         // (not just function calls) participates in JIT compilation decisions.
         let inv_count = frame.bytecode_array.increment_invocation_count();
 
@@ -3326,6 +3332,32 @@ impl Interpreter {
             if frame.bytecode_array.is_async() && frame.generator_state.is_none() {
                 return Self::run_async_function(frame.bytecode_array.clone(), CallArgs::new());
             }
+
+            // JIT fast-path: attempt JIT execution BEFORE the stacker closure
+            // boundary.  Previously the JIT check lived only inside
+            // `run_dispatch`, reached through `stacker::maybe_grow`.  On
+            // Linux x86-64 the stacker closure prevented the JIT entry from
+            // being reached during Criterion measurement for all benchmarks
+            // except `fib_40` (the only one where Maglev never deopted).
+            // Moving the check here ensures `try_execute_best_jit` is always
+            // called, regardless of stack-growth mechanics.
+            #[cfg(all(target_arch = "x86_64", unix))]
+            {
+                use crate::compiler::baseline::compiler::{
+                    jit_runtime_set_context, jit_runtime_set_global_env,
+                };
+                jit_runtime_set_global_env(frame.global_env.clone());
+                let ctx = frame.context.as_ref().and_then(|v| match v {
+                    JsValue::Context(rc) => Some(Rc::clone(rc)),
+                    _ => None,
+                });
+                jit_runtime_set_context(ctx);
+            }
+            if let Some(jit_result) = try_execute_best_jit(&frame.bytecode_array, &frame.call_args)
+            {
+                return jit_result;
+            }
+
             // run_callee() handles the stacker guard for deep recursion.
             // Top-level calls (via `run()`) also need it.
             if skip_globals {
@@ -3358,8 +3390,14 @@ impl Interpreter {
     /// inlining across the call.
     #[allow(clippy::collapsible_if)]
     fn run_dispatch(frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
+        DIAG_RUN_DISPATCH_ENTERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         // Provide the global environment to JIT runtime stubs so that
-        // LdaGlobal / StaGlobal can access global variables.
+        // LdaGlobal / StaGlobal can access global variables.  This is
+        // also needed for JIT calls made from *within* the interpreter
+        // loop (e.g. dispatch_call).  The primary JIT entry check now
+        // lives in `run_inner`, but nested function calls inside the
+        // loop still need the runtime pointers.
         #[cfg(all(target_arch = "x86_64", unix))]
         {
             use crate::compiler::baseline::compiler::jit_runtime_set_global_env;
@@ -3376,12 +3414,6 @@ impl Interpreter {
                 _ => None,
             });
             jit_runtime_set_context(ctx);
-        }
-
-        // Fast path: if JIT code was compiled in a previous invocation,
-        // execute it directly without entering the interpreter loop.
-        if let Some(jit_result) = try_execute_best_jit(&frame.bytecode_array, &frame.call_args) {
-            return jit_result;
         }
 
         // Outer loop: re-entered when a TailCall opcode rewrites the frame
@@ -3608,9 +3640,111 @@ impl Interpreter {
                             Opcode::Star => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
                                 let idx = frame.reg_flat_index_unchecked(reg);
+
+                                // Fast path: Smi accumulator.  In hot loops the
+                                // target register already holds a Smi, so we can
+                                // overwrite directly (no Rc to recycle).
+                                if !smi_acc_spilled && !smi_acc_bool {
+                                    unsafe {
+                                        frame.write_reg_unchecked(reg, JsValue::Smi(sa));
+                                    }
+                                    if let Some(ref mut hr) = frame.hot_registers {
+                                        hr.write_smi(idx, sa);
+                                    }
+
+                                    // Fuse Star + LdaNamedProperty [+ Add]:
+                                    // eliminates 1–2 dispatch cycles per
+                                    // property access in tight loops.
+                                    if pc < frame.loop_end_pc {
+                                        let next = unsafe { instructions.get_unchecked(pc) };
+                                        if next.opcode == Opcode::LdaNamedProperty {
+                                            let obj_v = unsafe { operand_reg_unchecked(next, 0) };
+                                            let slot = unsafe {
+                                                match *next.operand_unchecked(2) {
+                                                    Operand::FeedbackSlot(s) => s,
+                                                    _ => std::hint::unreachable_unchecked(),
+                                                }
+                                            };
+                                            let obj_ptr = unsafe { frame.read_reg_unchecked(obj_v) }
+                                                as *const JsValue;
+                                            let obj = unsafe { &*obj_ptr };
+                                            if let JsValue::PlainObject(map) = obj {
+                                                // SAFETY: single-threaded; no
+                                                // concurrent borrows in SMI loop.
+                                                let pm = unsafe { &*map.as_ptr() };
+                                                let layout = pm.layout_id();
+                                                if let Some(ic) = frame
+                                                    .mega_load_ic
+                                                    .as_ref()
+                                                    .and_then(|cache| cache.probe(slot, layout))
+                                                {
+                                                    if !ic.is_proto {
+                                                        // SAFETY: IC guarantees
+                                                        // offset valid for
+                                                        // matching layout.
+                                                        let val = unsafe {
+                                                            pm.get_by_offset_unchecked(
+                                                                ic.cached_offset as usize,
+                                                            )
+                                                        };
+                                                        if let JsValue::Smi(v) = val {
+                                                            // Triple: Star +
+                                                            // LdaNamedProperty +
+                                                            // Add
+                                                            if pc + 1 < frame.loop_end_pc {
+                                                                let next2 = unsafe {
+                                                                    instructions
+                                                                        .get_unchecked(pc + 1)
+                                                                };
+                                                                if next2.opcode == Opcode::Add {
+                                                                    let add_reg = unsafe {
+                                                                        operand_reg_unchecked(
+                                                                            next2, 0,
+                                                                        )
+                                                                    };
+                                                                    let b = unsafe {
+                                                                        frame.read_reg_num_hot_unchecked(add_reg)
+                                                                    };
+                                                                    if let Some(r) =
+                                                                        (*v).checked_add(b)
+                                                                    {
+                                                                        sa = r;
+                                                                        smi_acc_bool = false;
+                                                                        smi_acc_spilled = false;
+                                                                        hot_acc = Some(
+                                                                            NanBoxedValue::from_smi(
+                                                                                r,
+                                                                            ),
+                                                                        );
+                                                                        pc += 2;
+                                                                        continue 'smi;
+                                                                    }
+                                                                }
+                                                            }
+                                                            // Double: Star +
+                                                            // LdaNamedProperty
+                                                            sa = *v;
+                                                            smi_acc_bool = false;
+                                                            smi_acc_spilled = false;
+                                                            hot_acc =
+                                                                Some(NanBoxedValue::from_smi(*v));
+                                                            pc += 1;
+                                                            continue 'smi;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // IC miss or non-Smi: Star done,
+                                            // fall through to normal dispatch
+                                            // for the LdaNamedProperty.
+                                            continue 'smi;
+                                        }
+                                    }
+                                    continue 'smi;
+                                }
+
+                                // Slow path: non-Smi acc.
                                 let val = materialize_acc!();
-                                // Swap out old value so we can recycle its Rc
-                                // if it was a sole-owner PlainObject.
                                 let old = unsafe { frame.swap_reg_unchecked(reg, val) };
                                 if let JsValue::PlainObject(rc) = old {
                                     recycle_object_rc(rc);
@@ -4886,7 +5020,9 @@ impl Interpreter {
                                     let name_idx =
                                         unsafe { operand_constant_pool_idx_unchecked(instr, 1) };
                                     if frame.is_length_constant(name_idx) {
-                                        let len = items.borrow().len();
+                                        // SAFETY: single-threaded; no concurrent
+                                        // borrows.
+                                        let len = unsafe { &*items.as_ptr() }.len();
                                         if len <= i32::MAX as usize {
                                             sa = len as i32;
                                             smi_acc_bool = false;
@@ -4898,7 +5034,10 @@ impl Interpreter {
                                 }
 
                                 if let JsValue::PlainObject(map) = obj {
-                                    let pm = map.borrow();
+                                    // SAFETY: single-threaded interpreter; no
+                                    // concurrent borrows possible during the
+                                    // SMI loop.  Bypasses RefCell overhead.
+                                    let pm = unsafe { &*map.as_ptr() };
                                     let layout = pm.layout_id();
                                     if let Some(ic) = frame
                                         .mega_load_ic
@@ -4906,22 +5045,76 @@ impl Interpreter {
                                         .and_then(|cache| cache.probe(slot, layout))
                                     {
                                         if !ic.is_proto {
-                                            if let Some(val) =
-                                                pm.get_by_offset(ic.cached_offset as usize)
-                                            {
-                                                if let JsValue::Smi(v) = val {
-                                                    sa = *v;
-                                                    smi_acc_bool = false;
-                                                    smi_acc_spilled = false;
-                                                    hot_acc = Some(NanBoxedValue::from_smi(*v));
-                                                    continue 'smi;
+                                            // SAFETY: IC guarantees offset is
+                                            // valid when layout matches.
+                                            let val = unsafe {
+                                                pm.get_by_offset_unchecked(
+                                                    ic.cached_offset as usize,
+                                                )
+                                            };
+                                            if let JsValue::Smi(v) = val {
+                                                // Fuse LdaNamedProperty+Add:
+                                                // skip a dispatch when the next
+                                                // instruction adds a register
+                                                // to the loaded Smi.
+                                                if pc < frame.loop_end_pc {
+                                                    let next_instr = unsafe {
+                                                        instructions.get_unchecked(pc)
+                                                    };
+                                                    if next_instr.opcode == Opcode::Add {
+                                                        let add_reg = unsafe {
+                                                            operand_reg_unchecked(next_instr, 0)
+                                                        };
+                                                        let b = unsafe {
+                                                            frame.read_reg_num_hot_unchecked(
+                                                                add_reg,
+                                                            )
+                                                        };
+                                                        if let Some(r) = (*v).checked_add(b) {
+                                                            sa = r;
+                                                            smi_acc_bool = false;
+                                                            smi_acc_spilled = false;
+                                                            hot_acc =
+                                                                Some(NanBoxedValue::from_smi(r));
+                                                            pc += 1;
+                                                            continue 'smi;
+                                                        }
+                                                    }
                                                 }
-                                                acc = val.clone();
-                                                smi_acc_spilled = true;
+                                                sa = *v;
                                                 smi_acc_bool = false;
-                                                hot_acc = None;
+                                                smi_acc_spilled = false;
+                                                hot_acc = Some(NanBoxedValue::from_smi(*v));
                                                 continue 'smi;
                                             }
+                                            // Non-Smi own property: fuse with
+                                            // following Star to save a dispatch
+                                            // in property chains (a.b.c.d.e).
+                                            acc = val.clone();
+                                            smi_acc_spilled = true;
+                                            smi_acc_bool = false;
+                                            hot_acc = None;
+                                            if pc < frame.loop_end_pc {
+                                                let next_instr = unsafe {
+                                                    instructions.get_unchecked(pc)
+                                                };
+                                                if next_instr.opcode == Opcode::Star {
+                                                    let star_reg = unsafe {
+                                                        operand_reg_unchecked(next_instr, 0)
+                                                    };
+                                                    let old = unsafe {
+                                                        frame.swap_reg_unchecked(
+                                                            star_reg,
+                                                            acc.cheap_clone(),
+                                                        )
+                                                    };
+                                                    if let JsValue::PlainObject(rc) = old {
+                                                        recycle_object_rc(rc);
+                                                    }
+                                                    pc += 1;
+                                                }
+                                            }
+                                            continue 'smi;
                                         } else {
                                             // Proto-IC: load from prototype.
                                             let proto_layout = ic.proto_layout;
@@ -4929,16 +5122,24 @@ impl Interpreter {
                                             if let Some(JsValue::PlainObject(proto_map)) =
                                                 pm.get(INTERNAL_PROTO_PROPERTY_KEY)
                                             {
-                                                let proto_pm = proto_map.borrow();
-                                                if proto_pm.layout_id() == proto_layout
-                                                    && let Some(val) =
-                                                        proto_pm.get_by_offset(offset as usize)
-                                                {
+                                                // SAFETY: single-threaded; no
+                                                // concurrent borrows.
+                                                let proto_pm =
+                                                    unsafe { &*proto_map.as_ptr() };
+                                                if proto_pm.layout_id() == proto_layout {
+                                                    // SAFETY: IC guarantees
+                                                    // offset valid for layout.
+                                                    let val = unsafe {
+                                                        proto_pm.get_by_offset_unchecked(
+                                                            offset as usize,
+                                                        )
+                                                    };
                                                     if let JsValue::Smi(v) = val {
                                                         sa = *v;
                                                         smi_acc_bool = false;
                                                         smi_acc_spilled = false;
-                                                        hot_acc = Some(NanBoxedValue::from_smi(*v));
+                                                        hot_acc =
+                                                            Some(NanBoxedValue::from_smi(*v));
                                                         continue 'smi;
                                                     }
                                                     acc = val.clone();
@@ -4959,7 +5160,6 @@ impl Interpreter {
                                         })
                                     {
                                         let val = ic.value.cheap_clone();
-                                        drop(pm);
                                         if let JsValue::Smi(v) = &val {
                                             sa = *v;
                                             smi_acc_bool = false;
@@ -4980,7 +5180,6 @@ impl Interpreter {
                                         && ic.proto_generation == pm.proto_generation()
                                     {
                                         let val = ic.value.cheap_clone();
-                                        drop(pm);
                                         if let JsValue::Smi(v) = &val {
                                             sa = *v;
                                             smi_acc_bool = false;

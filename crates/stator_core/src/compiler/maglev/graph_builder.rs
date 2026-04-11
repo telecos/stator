@@ -3496,4 +3496,85 @@ mod tests {
             "array literal graph should not be degenerate"
         );
     }
+
+    /// The actual deep_object benchmark runs inside an arrow function, not a
+    /// top-level script. Verify that the *function* version also produces a
+    /// non-degenerate Maglev graph and that LICM hoists the property loads.
+    #[test]
+    fn test_deep_object_arrow_function_not_degenerate() {
+        use crate::bytecode::bytecode_array::ConstantPoolEntry;
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::compiler::maglev::optimizer::optimize;
+        use crate::parser::recursive_descent;
+
+        // Wrap the benchmark body in a function declaration so the bytecode
+        // generator compiles it as a function (registers, not globals).
+        let source = r#"
+            function deep() {
+                var root = { a: { b: { c: { d: { e: 99 } } } } };
+                var sum = 0;
+                for (var i = 0; i < 1000; i++) {
+                    sum = sum + root.a.b.c.d.e;
+                }
+                return sum;
+            }
+        "#;
+
+        let program = recursive_descent::parse(source).unwrap();
+        let script_ba = BytecodeGenerator::compile_program(&program).unwrap();
+
+        // Extract the inner function's BytecodeArray from the script's
+        // constant pool.
+        let inner_ba = script_ba
+            .constant_pool()
+            .iter()
+            .find_map(|entry| match entry {
+                ConstantPoolEntry::Function(ba) => Some(ba.clone()),
+                _ => None,
+            })
+            .expect("should find inner function BA in constant pool");
+
+        let instructions = inner_ba.instructions().unwrap();
+        eprintln!(
+            "deep_arrow: {} bytecodes, {} raw bytes",
+            instructions.len(),
+            inner_ba.bytecodes().len()
+        );
+        for (idx, instr) in instructions.iter().enumerate() {
+            eprintln!("  [{idx:3}] {:?}", instr.opcode);
+        }
+
+        let feedback = FeedbackVector::new(inner_ba.feedback_metadata());
+        let mut graph = GraphBuilder::build(&inner_ba, &feedback).unwrap();
+        optimize(&mut graph);
+
+        let degen = graph.is_degenerate();
+        eprintln!("deep_arrow: is_degenerate={degen}");
+
+        if let Some(entry) = graph.entry_block() {
+            eprintln!(
+                "deep_arrow: entry block has {} nodes, control={:?}",
+                entry.nodes.len(),
+                entry.control
+            );
+        }
+
+        // Print all blocks for diagnostics.
+        for block in graph.blocks() {
+            eprintln!(
+                "deep_arrow: block {} has {} nodes, control={:?}",
+                block.id,
+                block.nodes.len(),
+                block.control
+            );
+            for (nid, node) in &block.nodes {
+                eprintln!("  {nid:?} = {node:?}");
+            }
+        }
+
+        assert!(
+            !graph.is_degenerate(),
+            "deep_object arrow function graph is degenerate — Maglev won't compile it"
+        );
+    }
 }
