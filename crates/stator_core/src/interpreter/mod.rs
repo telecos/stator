@@ -2251,7 +2251,12 @@ impl GlobalEnv {
     /// `StaGlobal` in loops.
     #[inline(always)]
     pub fn store_by_index_sync(&mut self, idx: usize, key: &str, value: JsValue) {
-        self.slots[idx] = value.clone();
+        // Recycle old PlainObject back to the Rc pool so that subsequent
+        // object-literal creation can reuse the allocation.
+        let old = std::mem::replace(&mut self.slots[idx], value.clone());
+        if let JsValue::PlainObject(rc) = old {
+            recycle_object_rc(rc);
+        }
         if let Some(v) = self.vars.get_mut(key) {
             *v = value;
         }
@@ -4562,7 +4567,17 @@ impl Interpreter {
                                     {
                                         // SAFETY: env_ptr valid, slot_idx from prior IC population.
                                         unsafe {
-                                            (&mut (*env_ptr).slots)[slot_idx] = val.cheap_clone();
+                                            // Recycle the old PlainObject before
+                                            // overwriting — this feeds the pool so
+                                            // the fused CreateObjectLiteral path
+                                            // can reuse allocations.
+                                            let old = std::mem::replace(
+                                                &mut (&mut (*env_ptr).slots)[slot_idx],
+                                                val.cheap_clone(),
+                                            );
+                                            if let JsValue::PlainObject(rc) = old {
+                                                recycle_object_rc(rc);
+                                            }
                                             (*env_ptr).generation =
                                                 (*env_ptr).generation.wrapping_add(1);
                                         }
@@ -5712,6 +5727,69 @@ impl Interpreter {
                                     // All properties collected — create fused
                                     // object via template+values fast path.
 
+                                    // ── Extended fuse: detect trailing Ldar rX + StaGlobal ──
+                                    // In patterns like `last = { x: i, y: i+1, z: i*2 }` the
+                                    // compiler emits  Star rX / ... / Ldar rX / StaGlobal [name].
+                                    // The Ldar spills the object into `acc` and StaGlobal clones
+                                    // it into the global slot, giving the Rc strong_count ≥ 3
+                                    // (register + acc + global), which defeats the reuse path.
+                                    //
+                                    // We detect the trailing `Ldar rX + StaGlobal` sequence here
+                                    // and, when the global IC is populated, pre-clear `acc` and
+                                    // the global slot so the register is the sole owner (count==1).
+                                    // After reuse we write back to the global slot and skip the
+                                    // Ldar+StaGlobal bytecodes entirely.
+                                    let mut fused_sta_global: Option<(usize, u32)> = None; // (slot_idx, name_idx)
+                                    if scan_pc + 1 < instructions.len() {
+                                        let maybe_ldar =
+                                            unsafe { instructions.get_unchecked(scan_pc) };
+                                        if maybe_ldar.opcode == Opcode::Ldar {
+                                            let ldar_reg =
+                                                unsafe { operand_reg_unchecked(maybe_ldar, 0) };
+                                            if ldar_reg == star_reg {
+                                                let maybe_sta = unsafe {
+                                                    instructions.get_unchecked(scan_pc + 1)
+                                                };
+                                                if maybe_sta.opcode == Opcode::StaGlobal {
+                                                    let gname_idx = unsafe {
+                                                        operand_constant_pool_idx_unchecked(
+                                                            maybe_sta, 0,
+                                                        )
+                                                    };
+                                                    if let Some(&(gsi, _)) = frame
+                                                        .global_ic
+                                                        .as_ref()
+                                                        .and_then(|ic| ic.get(&gname_idx))
+                                                    {
+                                                        fused_sta_global = Some((gsi, gname_idx));
+                                                        // Pre-clear the spilled accumulator
+                                                        // so its Rc contribution drops.
+                                                        if smi_acc_spilled {
+                                                            if let JsValue::PlainObject(_) = &acc {
+                                                                acc = JsValue::Undefined;
+                                                            }
+                                                            // Keep smi_acc_spilled true;
+                                                            // it will be reset below.
+                                                        }
+                                                        // Pre-clear the global slot — the
+                                                        // object will be written back after
+                                                        // reuse / pool allocation.
+                                                        // SAFETY: env_ptr valid, gsi from IC.
+                                                        unsafe {
+                                                            let old = std::mem::replace(
+                                                                &mut (&mut (*env_ptr).slots)[gsi],
+                                                                JsValue::Undefined,
+                                                            );
+                                                            if let JsValue::PlainObject(rc) = old {
+                                                                recycle_object_rc(rc);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     // Ultra-fast path: reinitialize existing
                                     // object in-place when the target register
                                     // already holds a sole-owner PlainObject
@@ -5734,6 +5812,21 @@ impl Interpreter {
                                                     template,
                                                     &fuse_vals[..prop_count],
                                                 ) {
+                                                    // Write back to global slot if
+                                                    // we fused the trailing StaGlobal.
+                                                    if let Some((gsi, _)) = fused_sta_global {
+                                                        // SAFETY: env_ptr valid, gsi from IC.
+                                                        unsafe {
+                                                            (&mut (*env_ptr).slots)[gsi] =
+                                                                old_ref.cheap_clone();
+                                                            (*env_ptr).generation = (*env_ptr)
+                                                                .generation
+                                                                .wrapping_add(1);
+                                                        }
+                                                        smi_vars_dirty = true;
+                                                        // Skip the Ldar + StaGlobal.
+                                                        scan_pc += 2;
+                                                    }
                                                     sa = mini_sa;
                                                     smi_acc_bool = false;
                                                     smi_acc_spilled = false;
@@ -5768,6 +5861,21 @@ impl Interpreter {
                                         let idx = frame.reg_flat_index_unchecked(star_reg);
                                         if let Some(ref mut hr) = frame.hot_registers {
                                             hr.invalidate(idx);
+                                        }
+                                        // Write back to global slot if we fused
+                                        // the trailing StaGlobal.
+                                        if let Some((gsi, _)) = fused_sta_global {
+                                            let reg_ref =
+                                                unsafe { frame.read_reg_unchecked(star_reg) };
+                                            // SAFETY: env_ptr valid, gsi from IC.
+                                            unsafe {
+                                                (&mut (*env_ptr).slots)[gsi] =
+                                                    reg_ref.cheap_clone();
+                                                (*env_ptr).generation =
+                                                    (*env_ptr).generation.wrapping_add(1);
+                                            }
+                                            smi_vars_dirty = true;
+                                            scan_pc += 2;
                                         }
                                         // Accumulator = last property value.
                                         sa = mini_sa;
@@ -5968,6 +6076,12 @@ impl Interpreter {
                             let mut keys: ArrayVec<Rc<str>, 8> = ArrayVec::new();
                             let mut vals: ArrayVec<JsValue, 8> = ArrayVec::new();
                             let mut mini_acc = JsValue::Undefined;
+                            // Committed state: rolled back to on unknown opcode
+                            // so that only fully-consumed property definitions
+                            // are fused and any trailing instructions (e.g.
+                            // Ldar + StaGlobal) are left for the dispatch loop.
+                            let mut commit_scan_pc: usize = pc + 1;
+                            let mut commit_mini_acc = JsValue::Undefined;
                             // Shadow register file for the mini-interpreter.
                             // Up to 4 scratch registers tracked.
                             let mut mini_regs: [(u32, JsValue); 4] = [
@@ -6160,11 +6274,27 @@ impl Interpreter {
                                             }
                                             keys.push(Rc::from(s.as_str()));
                                             vals.push(mini_acc.cheap_clone());
+                                            // Commit: everything up to and
+                                            // including this property is safe
+                                            // to fuse.
+                                            commit_scan_pc = scan_pc;
+                                            commit_mini_acc = mini_acc.cheap_clone();
                                         } else {
                                             break 'empty_fuse;
                                         }
                                     }
-                                    _ => break 'empty_fuse,
+                                    _ => {
+                                        // Unknown opcode.  If we already
+                                        // collected properties, roll back to
+                                        // the last committed state and let the
+                                        // dispatch loop handle the rest.
+                                        if !keys.is_empty() {
+                                            scan_pc = commit_scan_pc;
+                                            mini_acc = commit_mini_acc;
+                                            break; // exit while, not the block
+                                        }
+                                        break 'empty_fuse;
+                                    }
                                 }
                             }
 
