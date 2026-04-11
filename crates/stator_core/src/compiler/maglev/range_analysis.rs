@@ -22,8 +22,9 @@
 //! # Limitations
 //!
 //! - Only a single forward pass is performed (no fixed-point iteration).
-//! - Phi nodes not involved in a recognised induction variable pattern are
-//!   not assigned a range (they are skipped).
+//! - Phi nodes not involved in a recognised induction variable pattern
+//!   receive the union of their input ranges when all inputs have known
+//!   ranges; otherwise they are skipped.
 //! - Only positive step deltas are handled for loop induction.
 //! - Only `i32` ranges are tracked; `f64` and `u32` are left untouched.
 //!
@@ -150,7 +151,7 @@ pub fn eliminate_overflow_checks(graph: &mut MaglevGraph) {
                 ranges.insert(*id, r);
             }
 
-            if let Some((out_range, replacement)) = try_rewrite(node, &ranges) {
+            if let Some((out_range, replacement)) = try_rewrite(node, *id, &ranges) {
                 ranges.insert(*id, out_range);
                 if let Some(new_node) = replacement {
                     *node = new_node;
@@ -191,9 +192,35 @@ fn seed_range(node: &ValueNode) -> Option<Range> {
 /// Returns `None` if the node is not an arithmetic node we track.
 fn try_rewrite(
     node: &ValueNode,
+    node_id: NodeId,
     ranges: &HashMap<NodeId, Range>,
 ) -> Option<(Range, Option<ValueNode>)> {
     match node {
+        // ── Phi — propagate as union of input ranges ─────────────────────
+        // If Phase 1 already assigned a range (induction / accumulator),
+        // keep it — it is more precise.
+        ValueNode::Phi { inputs } => {
+            if ranges.contains_key(&node_id) {
+                return None;
+            }
+            let mut min = i64::MAX;
+            let mut max = i64::MIN;
+            let mut any = false;
+            for input in inputs {
+                if *input == node_id {
+                    continue;
+                }
+                let r = ranges.get(input)?;
+                min = min.min(r.min);
+                max = max.max(r.max);
+                any = true;
+            }
+            if !any {
+                return None;
+            }
+            Some((Range { min, max }, None))
+        }
+
         // ── CheckedSmiAdd ────────────────────────────────────────────────
         ValueNode::CheckedSmiAdd { left, right } => {
             let (lr, rr) = (ranges.get(left)?, ranges.get(right)?);
