@@ -7310,6 +7310,27 @@ impl<'a> MaglevCodegen<'a> {
                 | ValueNode::Int32StrictEqual { .. }
                 | ValueNode::TaggedEqual { .. }
                 | ValueNode::TaggedNotEqual { .. }
+                | ValueNode::Int32Add { .. }
+                | ValueNode::Int32Subtract { .. }
+                | ValueNode::Int32Multiply { .. }
+                | ValueNode::Int32Negate { .. }
+                | ValueNode::Int32Increment { .. }
+                | ValueNode::Int32Decrement { .. }
+                | ValueNode::Int32BitwiseOr { .. }
+                | ValueNode::Int32BitwiseAnd { .. }
+                | ValueNode::Int32BitwiseXor { .. }
+                | ValueNode::Int32ShiftLeft { .. }
+                | ValueNode::Int32ShiftRight { .. }
+                | ValueNode::Int32ShiftRightLogical { .. }
+                | ValueNode::Int32Divide { .. }
+                | ValueNode::Int32Modulus { .. }
+                | ValueNode::CheckedSmiAdd { .. }
+                | ValueNode::CheckedSmiSubtract { .. }
+                | ValueNode::CheckedSmiMultiply { .. }
+                | ValueNode::CheckedSmiDivide { .. }
+                | ValueNode::CheckedSmiModulus { .. }
+                | ValueNode::CheckedSmiIncrement { .. }
+                | ValueNode::CheckedSmiDecrement { .. }
                 | ValueNode::StoreGlobal { .. }
                 | ValueNode::Phi { .. }
         )
