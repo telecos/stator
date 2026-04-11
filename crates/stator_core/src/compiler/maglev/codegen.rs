@@ -5209,6 +5209,7 @@ impl<'a> MaglevCodegen<'a> {
         let mut done_label = Label::new();
         let mut load_smi = Label::new();
         let mut load_bool = Label::new();
+        let mut load_undef = Label::new();
 
         // ── Fast path (scratch regs only: R11, R10, RAX) ────────────
 
@@ -5259,13 +5260,18 @@ impl<'a> MaglevCodegen<'a> {
             .movzx_byte_base_disp32(Reg64::Rax, Reg64::R11, layout.disc_offset as i32);
 
         // Dispatch on discriminant — Bool first (hot for boolean arrays
-        // like the sieve benchmark), then Smi.  Undefined/Null/other
-        // fall through to the slow path (rare in practice).
+        // like the sieve benchmark), then Smi.  Undefined and TheHole are
+        // handled inline (return JIT_UNDEFINED) to avoid the slow path
+        // for holey arrays.  Other types fall through to the slow path.
         self.masm.cmp_ri(Reg64::Rax, layout.bool_disc as i32);
         self.masm.je(&mut load_bool);
         self.masm.cmp_ri(Reg64::Rax, layout.smi_disc as i32);
         self.masm.je(&mut load_smi);
-        // Undef, Null, String, Object, … → slow path.
+        self.masm.cmp_ri(Reg64::Rax, layout.undef_disc as i32);
+        self.masm.je(&mut load_undef);
+        self.masm.cmp_ri(Reg64::Rax, layout.hole_disc as i32);
+        self.masm.je(&mut load_undef);
+        // Null, String, Object, … → slow path.
         self.masm.jmp(&mut slow_label);
 
         // ── load_smi: sign-extend i32 payload ───────────────────────
@@ -5284,8 +5290,15 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.add_rr(Reg64::Rax, Reg64::R11);
         self.masm.jmp(&mut done_label);
 
+        // ── load_undef: Undefined or TheHole → return JIT_UNDEFINED ──
+        // Holey arrays store TheHole for uninitialized slots; returning
+        // undefined inline avoids the slow-path FFI call.
+        self.masm.bind_label(&mut load_undef);
+        self.masm.mov_ri(Reg64::Rax, JIT_UNDEFINED);
+        self.masm.jmp(&mut done_label);
+
         // ── Slow path: IC miss / non-inlineable type ────────────────
-        // Undefined, Null, String, Object, etc. are all handled here.
+        // Null, String, Object, etc. are all handled here.
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
 
@@ -5494,8 +5507,17 @@ impl<'a> MaglevCodegen<'a> {
             self.masm
                 .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, ic_off_vec_ptr);
             self.masm.mov_load_base_disp32(Reg64::R10, Reg64::R10, 0);
-            self.masm
-                .imul_rri(Reg64::R11, Reg64::R11, layout.jsvalue_size as i32);
+            // R11 = key * 24; LEA+SHL (2c) replaces IMUL (3c).
+            debug_assert_eq!(
+                layout.jsvalue_size, 24,
+                "LEA chain assumes JsValue is 24 bytes"
+            );
+            self.masm.lea_scaled(Reg64::R11, Reg64::R11, Reg64::R11, 2); // R11 = key * 3
+            // SHL R11, 3 — REX.WB C1 /4 r/m=R11(enc=3), imm8=3
+            self.masm.emit_byte(0x49); // REX.W + REX.B
+            self.masm.emit_byte(0xC1); // SHL r/m64, imm8
+            self.masm.emit_byte(0xE3); // ModRM: mod=11, /4, r/m=3
+            self.masm.emit_byte(0x03); // shift count = 3
             self.masm.add_rr(Reg64::R10, Reg64::R11);
 
             // Decode value type and write.

@@ -4356,7 +4356,14 @@ fn handle_lda_keyed_property(
             let i = idx_val as usize;
             ctx.frame.accumulator = if i < data.len() {
                 // SAFETY: bounds verified above.
-                unsafe { data.get_unchecked(i) }.cheap_clone()
+                let v = unsafe { data.get_unchecked(i) };
+                // TheHole marks uninitialized slots in sparse arrays;
+                // return undefined per ES spec §13.10.
+                if v.is_the_hole() {
+                    JsValue::Undefined
+                } else {
+                    v.cheap_clone()
+                }
             } else {
                 JsValue::Undefined
             };

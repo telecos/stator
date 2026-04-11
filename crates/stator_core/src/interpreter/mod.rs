@@ -1368,7 +1368,29 @@ pub fn maybe_compile_maglev(ba: &BytecodeArray) {
                 // the Rust 2024 precise closure capture analysis records
                 // input.ba (SendableBytecodesArray: Send) not input.ba.0
                 // (BytecodeArray: !Send) as the captured variable.
-                let feedback = FeedbackVector::new(input.ba.feedback_metadata());
+                // Seed keyed-access and arithmetic slots as Monomorphic so
+                // the graph builder emits specialised inline nodes
+                // (LoadFixedArrayElement / StoreFixedArrayElement) instead
+                // of generic stubs.  The compile-thread BA has a fresh
+                // feedback vector (all Uninitialized), but the interpreter
+                // has already observed these sites — pre-seeding avoids
+                // the graph builder falling back to LoadKeyedGeneric.
+                use crate::bytecode::feedback::{FeedbackSlotKind, InlineCacheState};
+                let mut feedback = FeedbackVector::new(input.ba.feedback_metadata());
+                for slot in 0..input.ba.feedback_metadata().slot_count() {
+                    if matches!(
+                        input.ba.feedback_metadata().kind_of(slot),
+                        Some(
+                            FeedbackSlotKind::BinaryOp
+                                | FeedbackSlotKind::Compare
+                                | FeedbackSlotKind::BinaryOpInc
+                                | FeedbackSlotKind::KeyedLoadProperty
+                                | FeedbackSlotKind::KeyedStoreProperty
+                        )
+                    ) {
+                        let _ = feedback.set_state(slot, InlineCacheState::Monomorphic);
+                    }
+                }
                 let param_count = input.ba.parameter_count();
                 match GraphBuilder::build(&input.ba, &feedback) {
                     Ok(mut graph) => {
@@ -1592,7 +1614,22 @@ pub(super) fn maybe_compile_turbofan(ba: &BytecodeArray) {
             // Rust 2024 precise closure capture analysis records input.ba
             // (SendableBytecodesArray: Send) not input.ba.0 (BytecodeArray:
             // !Send) as the captured variable.
-            let feedback = FeedbackVector::new(input.ba.feedback_metadata());
+            use crate::bytecode::feedback::{FeedbackSlotKind, InlineCacheState};
+            let mut feedback = FeedbackVector::new(input.ba.feedback_metadata());
+            for slot in 0..input.ba.feedback_metadata().slot_count() {
+                if matches!(
+                    input.ba.feedback_metadata().kind_of(slot),
+                    Some(
+                        FeedbackSlotKind::BinaryOp
+                            | FeedbackSlotKind::Compare
+                            | FeedbackSlotKind::BinaryOpInc
+                            | FeedbackSlotKind::KeyedLoadProperty
+                            | FeedbackSlotKind::KeyedStoreProperty
+                    )
+                ) {
+                    let _ = feedback.set_state(slot, InlineCacheState::Monomorphic);
+                }
+            }
             let param_count = input.ba.parameter_count();
             if let Ok(mut graph) = GraphBuilder::build(&input.ba, &feedback) {
                 optimize(&mut graph);
