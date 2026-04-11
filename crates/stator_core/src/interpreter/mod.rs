@@ -5594,15 +5594,6 @@ impl Interpreter {
                                 frame.loop_end_pc = 0;
                                 break 'smi;
                             }
-                            Opcode::CreateEmptyObjectLiteral => {
-                                acc = JsValue::PlainObject(Rc::new(RefCell::new(
-                                    PropertyMap::with_capacity(4),
-                                )));
-                                smi_acc_spilled = true;
-                                smi_acc_bool = false;
-                                hot_acc = None;
-                                continue 'smi;
-                            }
                             Opcode::CreateObjectLiteral => {
                                 let slot = unsafe { operand_flag_unchecked(instr, 1) } as u32;
                                 let prop_count =
@@ -5833,7 +5824,7 @@ impl Interpreter {
                                     let pm = unsafe { &mut *map.as_ptr() };
                                     let fill_result = pm.try_template_fill(prop_name_ref, val);
                                     if let Err(val) = fill_result {
-                                        pm.insert(prop_name_ref.to_string(), val);
+                                        pm.insert_rc(Rc::from(prop_name_ref.as_str()), val);
                                     }
                                     continue 'smi;
                                 }
@@ -5950,6 +5941,253 @@ impl Interpreter {
                         continue 'dispatch;
                     }
                     Opcode::CreateEmptyObjectLiteral => {
+                        // ── Fused create+fill for empty object literals ──
+                        // Lookahead: Star rX + N × (value-instrs +
+                        // DefineNamedOwnProperty rX), then build the
+                        // object with all properties in one shot.
+                        'empty_fuse: {
+                            if pc >= instructions.len() {
+                                break 'empty_fuse;
+                            }
+                            let star_instr = unsafe { instructions.get_unchecked(pc) };
+                            if star_instr.opcode != Opcode::Star {
+                                break 'empty_fuse;
+                            }
+                            let star_reg = unsafe { operand_reg_unchecked(star_instr, 0) };
+
+                            let mut scan_pc = pc + 1;
+                            let mut keys: ArrayVec<Rc<str>, 8> = ArrayVec::new();
+                            let mut vals: ArrayVec<JsValue, 8> = ArrayVec::new();
+                            let mut mini_acc = JsValue::Undefined;
+                            // Shadow register file for the mini-interpreter.
+                            // Up to 4 scratch registers tracked.
+                            let mut mini_regs: [(u32, JsValue); 4] = [
+                                (u32::MAX, JsValue::Undefined),
+                                (u32::MAX, JsValue::Undefined),
+                                (u32::MAX, JsValue::Undefined),
+                                (u32::MAX, JsValue::Undefined),
+                            ];
+                            let mut mini_reg_count: usize = 0;
+
+                            // Read a register: check mini shadow first, then
+                            // the real frame.
+                            macro_rules! mini_read_reg {
+                                ($r:expr) => {{
+                                    let rv = $r;
+                                    let mut found = None;
+                                    for i in 0..mini_reg_count {
+                                        if mini_regs[i].0 == rv {
+                                            found = Some(mini_regs[i].1.cheap_clone());
+                                            break;
+                                        }
+                                    }
+                                    match found {
+                                        Some(v) => v,
+                                        None => {
+                                            unsafe { frame.read_reg_unchecked(rv) }.cheap_clone()
+                                        }
+                                    }
+                                }};
+                            }
+                            macro_rules! mini_write_reg {
+                                ($r:expr, $v:expr) => {{
+                                    let rv = $r;
+                                    let vv = $v;
+                                    let mut slot: Option<usize> = None;
+                                    for i in 0..mini_reg_count {
+                                        if mini_regs[i].0 == rv {
+                                            slot = Some(i);
+                                            break;
+                                        }
+                                    }
+                                    if let Some(idx) = slot {
+                                        mini_regs[idx].1 = vv;
+                                    } else if mini_reg_count < 4 {
+                                        mini_regs[mini_reg_count] = (rv, vv);
+                                        mini_reg_count += 1;
+                                    } else {
+                                        break 'empty_fuse;
+                                    }
+                                }};
+                            }
+
+                            while keys.len() < 8 {
+                                if scan_pc >= instructions.len() {
+                                    break 'empty_fuse;
+                                }
+                                let si = unsafe { instructions.get_unchecked(scan_pc) };
+                                scan_pc += 1;
+                                match si.opcode {
+                                    Opcode::Ldar => {
+                                        let r = unsafe { operand_reg_unchecked(si, 0) };
+                                        mini_acc = mini_read_reg!(r);
+                                    }
+                                    Opcode::LdaSmi => {
+                                        let v = unsafe { operand_imm_unchecked(si, 0) };
+                                        mini_acc = JsValue::Smi(v);
+                                    }
+                                    Opcode::LdaSmiStar => {
+                                        let v = unsafe { operand_imm_unchecked(si, 0) };
+                                        let dst = unsafe { operand_reg_unchecked(si, 1) };
+                                        mini_acc = JsValue::Smi(v);
+                                        mini_write_reg!(dst, JsValue::Smi(v));
+                                    }
+                                    Opcode::LdaZero => {
+                                        mini_acc = JsValue::Smi(0);
+                                    }
+                                    Opcode::LdaGlobal => {
+                                        if let Operand::ConstantPoolIdx(name_idx) = *si.operand(0) {
+                                            if let Some(ref ic) = frame.global_ic
+                                                && let Some(&(slot_idx, cached_gen)) =
+                                                    ic.get(&name_idx)
+                                            {
+                                                let env = frame.global_env.borrow();
+                                                if env.generation() == cached_gen {
+                                                    let value = env.get_by_index(slot_idx).clone();
+                                                    drop(env);
+                                                    if value != JsValue::TheHole {
+                                                        mini_acc = value;
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        break 'empty_fuse;
+                                    }
+                                    Opcode::Star => {
+                                        let dst = unsafe { operand_reg_unchecked(si, 0) };
+                                        mini_write_reg!(dst, mini_acc.cheap_clone());
+                                    }
+                                    Opcode::AddSmi => {
+                                        let imm = unsafe { operand_imm_unchecked(si, 0) };
+                                        if let JsValue::Smi(n) = mini_acc {
+                                            if let Some(r) = n.checked_add(imm) {
+                                                mini_acc = JsValue::Smi(r);
+                                            } else {
+                                                break 'empty_fuse;
+                                            }
+                                        } else {
+                                            break 'empty_fuse;
+                                        }
+                                    }
+                                    Opcode::SubSmi => {
+                                        let imm = unsafe { operand_imm_unchecked(si, 0) };
+                                        if let JsValue::Smi(n) = mini_acc {
+                                            if let Some(r) = n.checked_sub(imm) {
+                                                mini_acc = JsValue::Smi(r);
+                                            } else {
+                                                break 'empty_fuse;
+                                            }
+                                        } else {
+                                            break 'empty_fuse;
+                                        }
+                                    }
+                                    Opcode::MulSmi => {
+                                        let imm = unsafe { operand_imm_unchecked(si, 0) };
+                                        if let JsValue::Smi(n) = mini_acc {
+                                            if let Some(r) = n.checked_mul(imm) {
+                                                mini_acc = JsValue::Smi(r);
+                                            } else {
+                                                break 'empty_fuse;
+                                            }
+                                        } else {
+                                            break 'empty_fuse;
+                                        }
+                                    }
+                                    Opcode::Add => {
+                                        let r = unsafe { operand_reg_unchecked(si, 0) };
+                                        let rhs = mini_read_reg!(r);
+                                        match (&mini_acc, &rhs) {
+                                            (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                                if let Some(res) = a.checked_add(*b) {
+                                                    mini_acc = JsValue::Smi(res);
+                                                } else {
+                                                    break 'empty_fuse;
+                                                }
+                                            }
+                                            _ => break 'empty_fuse,
+                                        }
+                                    }
+                                    Opcode::Sub => {
+                                        let r = unsafe { operand_reg_unchecked(si, 0) };
+                                        let rhs = mini_read_reg!(r);
+                                        match (&mini_acc, &rhs) {
+                                            (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                                if let Some(res) = a.checked_sub(*b) {
+                                                    mini_acc = JsValue::Smi(res);
+                                                } else {
+                                                    break 'empty_fuse;
+                                                }
+                                            }
+                                            _ => break 'empty_fuse,
+                                        }
+                                    }
+                                    Opcode::Mul => {
+                                        let r = unsafe { operand_reg_unchecked(si, 0) };
+                                        let rhs = mini_read_reg!(r);
+                                        match (&mini_acc, &rhs) {
+                                            (JsValue::Smi(a), JsValue::Smi(b)) => {
+                                                if let Some(res) = a.checked_mul(*b) {
+                                                    mini_acc = JsValue::Smi(res);
+                                                } else {
+                                                    break 'empty_fuse;
+                                                }
+                                            }
+                                            _ => break 'empty_fuse,
+                                        }
+                                    }
+                                    Opcode::DefineNamedOwnProperty => {
+                                        let obj_reg = unsafe { operand_reg_unchecked(si, 0) };
+                                        if obj_reg != star_reg {
+                                            break 'empty_fuse;
+                                        }
+                                        let name_idx =
+                                            unsafe { operand_constant_pool_idx_unchecked(si, 1) };
+                                        if let Some(ConstantPoolEntry::String(s)) =
+                                            frame.bytecode_array.get_constant(name_idx)
+                                        {
+                                            if s.starts_with(".private.") {
+                                                break 'empty_fuse;
+                                            }
+                                            keys.push(Rc::from(s.as_str()));
+                                            vals.push(mini_acc.cheap_clone());
+                                        } else {
+                                            break 'empty_fuse;
+                                        }
+                                    }
+                                    _ => break 'empty_fuse,
+                                }
+                            }
+
+                            if keys.is_empty() {
+                                break 'empty_fuse;
+                            }
+
+                            // Build the PropertyMap with all properties at
+                            // once, avoiding per-property insert overhead.
+                            let mut pm = PropertyMap::with_capacity(keys.len());
+                            for (k, v) in keys.into_iter().zip(vals) {
+                                pm.insert_rc(k, v);
+                            }
+                            let obj = JsValue::PlainObject(Rc::new(RefCell::new(pm)));
+                            unsafe { frame.write_reg_unchecked(star_reg, obj) };
+                            // Flush mini shadow registers to real frame.
+                            for entry in mini_regs.iter_mut().take(mini_reg_count) {
+                                if entry.0 != star_reg {
+                                    unsafe {
+                                        frame.write_reg_unchecked(
+                                            entry.0,
+                                            std::mem::replace(&mut entry.1, JsValue::Undefined),
+                                        );
+                                    }
+                                }
+                            }
+                            acc = mini_acc;
+                            pc = scan_pc;
+                            continue 'dispatch;
+                        }
+
+                        // Fallback: plain empty object creation.
                         acc = JsValue::PlainObject(Rc::new(RefCell::new(
                             PropertyMap::with_capacity(4),
                         )));
@@ -6201,7 +6439,7 @@ impl Interpreter {
                                 let fill_result =
                                     pm.try_template_fill(prop_name_ref, acc.cheap_clone());
                                 if let Err(val) = fill_result {
-                                    pm.insert(prop_name_ref.to_string(), val);
+                                    pm.insert_rc(Rc::from(prop_name_ref.as_str()), val);
                                 }
                                 continue 'dispatch;
                             }
