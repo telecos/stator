@@ -37,3 +37,4 @@ _codeql_detected_source_root
 *.rcgu.o
 4610
 vs_BuildTools.exe
+CLOSURE_CALL_OVERHEAD_ANALYSIS.txt

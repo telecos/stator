@@ -4270,21 +4270,13 @@ impl Interpreter {
                                     maybe_compile_turbofan(&frame.bytecode_array);
                                 }
 
-                                // OSR: attempt JIT execution once, shortly
-                                // after compilation was triggered.
-                                if frame.osr_loop_count == OSR_LOOP_THRESHOLD + 1
-                                    || frame.osr_loop_count == MAGLEV_OSR_LOOP_THRESHOLD + 1
-                                {
-                                    acc = materialize_acc!();
-                                    frame.pc = pc;
-                                    frame.accumulator = acc.cheap_clone();
-                                    if let Some(jit_result) = try_execute_best_jit(
-                                        &frame.bytecode_array,
-                                        &frame.call_args,
-                                    ) {
-                                        return jit_result;
-                                    }
-                                }
+                                // NOTE: We do NOT call try_execute_best_jit
+                                // here (OSR path).  Maglev re-runs the
+                                // function from the start, reading globals
+                                // from the preheader.  Mid-loop OSR would
+                                // pass stale interpreter state causing
+                                // SIGSEGV.  Maglev fires at function entry
+                                // (run_dispatch top) on the NEXT invocation.
                                 // Only EXPAND loop_end_pc ΓÇö never shrink it.
                                 // Nested loops have smaller loop_end values;
                                 // shrinking would cause the outer loop to
@@ -6968,21 +6960,8 @@ impl Interpreter {
                             maybe_compile_turbofan(&frame.bytecode_array);
                         }
 
-                        // OSR: attempt JIT execution once, shortly after
-                        // compilation was triggered.  This is the fallback
-                        // for cases where the function-entry path didn't fire
-                        // (e.g. top-level scripts that are only invoked once).
-                        if frame.osr_loop_count == OSR_LOOP_THRESHOLD + 1
-                            || frame.osr_loop_count == MAGLEV_OSR_LOOP_THRESHOLD + 1
-                        {
-                            frame.pc = pc;
-                            frame.accumulator = acc.cheap_clone();
-                            if let Some(jit_result) =
-                                try_execute_best_jit(&frame.bytecode_array, &frame.call_args)
-                            {
-                                return jit_result;
-                            }
-                        }
+                        // NOTE: No OSR execution here --- see SMI-fast
+                        // path comment (mid-loop OSR causes SIGSEGV).
 
                         // ΓöÇΓöÇ Back-edge periodic checks ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
                         // All periodic work (instruction limit, wall-clock
