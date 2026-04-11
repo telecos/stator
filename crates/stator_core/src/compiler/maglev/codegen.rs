@@ -5890,17 +5890,16 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.push(Reg64::R10); // old BA
 
         // 2. Allocate register file on the stack.
-        //
-        // Zeroing is skipped entirely: JIT callees (both baseline and
-        // Maglev) initialise every register-file slot they read via
-        // SSA definitions or explicit bytecode stores, so pre-zeroing
-        // is dead work.  For Maglev callees the prologue writes
-        // context into R14-relative memory before any reads; baseline
-        // JIT bytecodes write all locals before use.  Eliminating the
-        // load+cmp+branch+rep-stosq sequence removes ~5 instructions
-        // from the hot path.
         self.masm.sub_ri(Reg64::Rsp, 128);
         // RSP ≡ 0 mod 16 (was 0, -16 from pushes, -128 from sub = -144).
+
+        // Zero register file using rep stosq.
+        // RAX, RCX, RDI are dead here (saved values already pushed),
+        // so no save/restore is needed.
+        self.masm.xor_rr(Reg64::Rax, Reg64::Rax); // RAX = 0
+        self.masm.mov_ri(Reg64::Rcx, 16); // RCX = 16 (qwords)
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
+        self.masm.rep_stosq(); // Zero 128 bytes
 
         // 3. Set up call: RDI = register file, RSI = cached context.
         self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
@@ -5991,9 +5990,19 @@ impl<'a> MaglevCodegen<'a> {
         // Stack: [RSP] = padding, [RSP+8] = callee.
 
         // Allocate 128-byte register file (fixed size for ABI compat).
-        // Zeroing skipped: JIT callees initialise slots before reading
-        // (see cache-hit path comment above).
         self.masm.sub_ri(Reg64::Rsp, 128);
+
+        // Zero register file using rep stosq.
+        self.masm.push(Reg64::R10);
+        self.masm.push(Reg64::R11);
+        self.masm.xor_rr(Reg64::Rax, Reg64::Rax); // RAX = 0
+        self.masm.mov_ri(Reg64::Rcx, 16); // RCX = 16 (qwords)
+        // RDI points to the register file at [RSP + 16] (after two pushes)
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
+        self.masm.add_ri(Reg64::Rdi, 16);
+        self.masm.rep_stosq(); // Zero 128 bytes
+        self.masm.pop(Reg64::R11);
+        self.masm.pop(Reg64::R10);
 
         // RDI = register file, RSI = ctx_ptr.
         self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
