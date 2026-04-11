@@ -113,6 +113,10 @@ pub fn codegen_globals_promoted_count() -> u32 {
 /// Number of physical registers available to the Maglev register allocator.
 pub const NUM_PHYS_REGS: u32 = 9;
 
+/// Number of allocatable registers tracked by the `reg_holds` forwarding
+/// cache: RBX(0), RCX(1), RDX(2), RSI(3), R8(4), R9(5).
+const NUM_REG_FWD: usize = 6;
+
 /// Bytes per monomorphic call-site cache slot (4 × i64 = 32 bytes).
 ///
 /// ```text
@@ -657,6 +661,14 @@ struct MaglevCodegen<'a> {
     /// Cleared at block boundaries, stub calls, and any RAX-clobbering op.
     #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
     rax_holds: Option<NodeId>,
+    /// Allocatable register forwarding: tracks which [`NodeId`] each of the
+    /// first 6 physical registers (RBX, RCX, RDX, RSI, R8, R9) currently
+    /// holds.  Used by [`emit_load`](Self::emit_load) to prefer a
+    /// register-to-register MOV (or skip it entirely when src == dst) over
+    /// a stack-slot load.  Cleared at block boundaries, stub calls, and
+    /// any operation that may clobber allocatable registers.
+    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
+    reg_holds: [Option<NodeId>; NUM_REG_FWD],
 }
 
 /// A deferred cold-path branch emitted out-of-line after all blocks.
@@ -785,6 +797,7 @@ impl<'a> MaglevCodegen<'a> {
             total_cache_bytes,
             ctx_regfile_offset: None,
             rax_holds: None,
+            reg_holds: [None; NUM_REG_FWD],
         }
     }
 
@@ -1076,9 +1089,9 @@ impl<'a> MaglevCodegen<'a> {
         self.masm
             .bind_label(&mut self.block_labels[block_idx as usize]);
 
-        // Entering a new block invalidates RAX forwarding — control flow
+        // Entering a new block invalidates register forwarding — control flow
         // from multiple predecessors may leave different values in RAX.
-        self.rax_holds = None;
+        self.clear_reg_forwarding();
 
         // Record one safepoint per block (conservative GC point).
         self.safepoints.push(SafepointEntry {
@@ -2886,17 +2899,75 @@ impl<'a> MaglevCodegen<'a> {
 
     // ── Load / store helpers ─────────────────────────────────────────────────
 
+    /// Map an allocatable physical register to its `reg_holds` index (0–5).
+    /// Returns `None` for non-allocatable registers (RAX, RDI, R10, R11, etc.).
+    fn reg_holds_index(r: Reg64) -> Option<usize> {
+        match r {
+            Reg64::Rbx => Some(0),
+            Reg64::Rcx => Some(1),
+            Reg64::Rdx => Some(2),
+            Reg64::Rsi => Some(3),
+            Reg64::R8 => Some(4),
+            Reg64::R9 => Some(5),
+            _ => None,
+        }
+    }
+
+    /// Clear all register-forwarding state (RAX + allocatable registers).
+    fn clear_reg_forwarding(&mut self) {
+        self.rax_holds = None;
+        self.reg_holds = [None; NUM_REG_FWD];
+    }
+
+    /// Record that physical register `reg` now holds the value of `id`.
+    fn note_reg_holds(&mut self, reg: Reg64, id: NodeId) {
+        if reg == Reg64::Rax {
+            self.rax_holds = Some(id);
+        }
+        if let Some(idx) = Self::reg_holds_index(reg) {
+            self.reg_holds[idx] = Some(id);
+        }
+    }
+
     /// Load the value produced by node `id` from its allocated location into
     /// `dst`.
     fn emit_load(&mut self, id: NodeId, dst: Reg64) {
-        // RAX forwarding: if RAX already holds `id`'s value (set by a
-        // previous smi_guarded arithmetic store), skip the load entirely.
-        if dst == Reg64::Rax {
-            if self.rax_holds == Some(id) {
+        // RAX forwarding: if RAX already holds `id`, prefer a
+        // register-to-register MOV (or skip entirely when dst is RAX).
+        if self.rax_holds == Some(id) {
+            if dst == Reg64::Rax {
                 return;
             }
-            // Loading a different node into RAX invalidates the cache.
+            if let Some(di) = Self::reg_holds_index(dst) {
+                self.reg_holds[di] = None;
+            }
+            self.masm.mov_rr(dst, Reg64::Rax);
+            return;
+        }
+        // Allocatable register forwarding: check if any tracked register
+        // already holds `id`, preferring a reg-to-reg MOV over a stack load.
+        for i in 0..NUM_REG_FWD {
+            if self.reg_holds[i] == Some(id) {
+                let src = phys_reg(i as u32);
+                if src == dst {
+                    return;
+                }
+                if dst == Reg64::Rax {
+                    self.rax_holds = None;
+                }
+                if let Some(di) = Self::reg_holds_index(dst) {
+                    self.reg_holds[di] = None;
+                }
+                self.masm.mov_rr(dst, src);
+                return;
+            }
+        }
+        // No forwarding hit — invalidate dst's forwarding entry.
+        if dst == Reg64::Rax {
             self.rax_holds = None;
+        }
+        if let Some(di) = Self::reg_holds_index(dst) {
+            self.reg_holds[di] = None;
         }
         match self.alloc.location(id) {
             Some(Location::Register(n)) => {
@@ -2922,6 +2993,10 @@ impl<'a> MaglevCodegen<'a> {
                 let dst = phys_reg(n);
                 if dst != src {
                     self.masm.mov_rr(dst, src);
+                }
+                // Track that this allocatable register now holds `id`.
+                if let Some(idx) = Self::reg_holds_index(dst) {
+                    self.reg_holds[idx] = Some(id);
                 }
             }
             Some(Location::StackSlot(n)) => {
@@ -3503,7 +3578,7 @@ impl<'a> MaglevCodegen<'a> {
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_save_live_regs(&mut self, at_node: NodeId) -> u8 {
         // A stub call clobbers RAX (return value), so invalidate forwarding.
-        self.rax_holds = None;
+        self.clear_reg_forwarding();
         // Intersect per-call-site liveness with the function-wide mask
         // as a safety belt.
         let mask = self.alloc.live_caller_saved_at(at_node) & self.used_caller_saved;
@@ -3613,7 +3688,7 @@ impl<'a> MaglevCodegen<'a> {
         let elem_byte_offset =
             (slot_idx * jv_layout.jsvalue_size + jv_layout.smi_payload_offset) as i32;
 
-        self.rax_holds = None;
+        self.clear_reg_forwarding();
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
 
@@ -3689,7 +3764,7 @@ impl<'a> MaglevCodegen<'a> {
         let elem_byte_offset =
             (slot_idx * jv_layout.jsvalue_size + jv_layout.smi_payload_offset) as i32;
 
-        self.rax_holds = None;
+        self.clear_reg_forwarding();
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
 
@@ -3799,9 +3874,7 @@ impl<'a> MaglevCodegen<'a> {
                             }
                         }
                     }
-                    if dst == Reg64::Rax {
-                        self.rax_holds = Some(id);
-                    }
+                    self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.emit_load(left, Reg64::Rax);
@@ -3914,16 +3987,14 @@ impl<'a> MaglevCodegen<'a> {
             if !narrow {
                 self.masm.movsxd_sign_extend(dst, dst);
             }
-            if dst == Reg64::Rax {
-                self.rax_holds = Some(id);
-            }
+            self.note_reg_holds(dst, id);
             return;
         }
 
         // Load into non-allocated registers — no save needed on fast path.
         // Generic path clobbers RAX in both fast + slow branches, so
         // invalidate the forwarding cache.
-        self.rax_holds = None;
+        self.clear_reg_forwarding();
         self.emit_load(left, Reg64::Rdi);
         self.emit_load(right, Reg64::R10);
 
@@ -3989,9 +4060,7 @@ impl<'a> MaglevCodegen<'a> {
                             }
                         }
                     }
-                    if dst == Reg64::Rax {
-                        self.rax_holds = Some(id);
-                    }
+                    self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.emit_load(left, Reg64::Rax);
@@ -4036,9 +4105,7 @@ impl<'a> MaglevCodegen<'a> {
                     if !narrow {
                         self.masm.movsxd_sign_extend(dst, dst);
                     }
-                    if dst == Reg64::Rax {
-                        self.rax_holds = Some(id);
-                    }
+                    self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.emit_load(left, Reg64::Rax);
@@ -4056,7 +4123,7 @@ impl<'a> MaglevCodegen<'a> {
             return;
         }
 
-        self.rax_holds = None;
+        self.clear_reg_forwarding();
         self.emit_load(left, Reg64::Rdi);
         self.emit_load(right, Reg64::R10);
 
@@ -4122,9 +4189,7 @@ impl<'a> MaglevCodegen<'a> {
                             }
                         }
                     }
-                    if dst == Reg64::Rax {
-                        self.rax_holds = Some(id);
-                    }
+                    self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.emit_load(left, Reg64::Rax);
@@ -4187,9 +4252,7 @@ impl<'a> MaglevCodegen<'a> {
                                 .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
                             self.masm.movsxd_sign_extend(dst, dst);
                         }
-                        if dst == Reg64::Rax {
-                            self.rax_holds = Some(id);
-                        }
+                        self.note_reg_holds(dst, id);
                     }
                     _ => {
                         self.emit_load(var, Reg64::R11);
@@ -4242,9 +4305,7 @@ impl<'a> MaglevCodegen<'a> {
                     if !narrow {
                         self.masm.movsxd_sign_extend(dst, dst);
                     }
-                    if dst == Reg64::Rax {
-                        self.rax_holds = Some(id);
-                    }
+                    self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.emit_load(left, Reg64::Rax);
@@ -4262,7 +4323,7 @@ impl<'a> MaglevCodegen<'a> {
             return;
         }
 
-        self.rax_holds = None;
+        self.clear_reg_forwarding();
         self.emit_load(left, Reg64::Rdi);
         self.emit_load(right, Reg64::R10);
 
@@ -4534,9 +4595,7 @@ impl<'a> MaglevCodegen<'a> {
                             }
                         }
                     }
-                    if dst == Reg64::Rax {
-                        self.rax_holds = Some(id);
-                    }
+                    self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.emit_load(left, Reg64::Rax);
@@ -4549,7 +4608,7 @@ impl<'a> MaglevCodegen<'a> {
             return;
         }
 
-        self.rax_holds = None;
+        self.clear_reg_forwarding();
         self.emit_load(left, Reg64::Rdi);
 
         // Identity: x | 0 → x (non-smi-guarded path).  Skip the Smi check
@@ -4639,9 +4698,7 @@ impl<'a> MaglevCodegen<'a> {
                             }
                         }
                     }
-                    if dst == Reg64::Rax {
-                        self.rax_holds = Some(id);
-                    }
+                    self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.emit_load(left, Reg64::Rax);
@@ -4654,7 +4711,7 @@ impl<'a> MaglevCodegen<'a> {
             return;
         }
 
-        self.rax_holds = None;
+        self.clear_reg_forwarding();
         self.emit_load(left, Reg64::Rdi);
         self.emit_load(right, Reg64::R10);
 
@@ -4716,9 +4773,7 @@ impl<'a> MaglevCodegen<'a> {
                             }
                         }
                     }
-                    if dst == Reg64::Rax {
-                        self.rax_holds = Some(id);
-                    }
+                    self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.emit_load(left, Reg64::Rax);
@@ -4731,7 +4786,7 @@ impl<'a> MaglevCodegen<'a> {
             return;
         }
 
-        self.rax_holds = None;
+        self.clear_reg_forwarding();
         self.emit_load(left, Reg64::Rdi);
         self.emit_load(right, Reg64::R10);
 
@@ -4772,9 +4827,7 @@ impl<'a> MaglevCodegen<'a> {
                     let dst = phys_reg(n);
                     self.emit_load(value, dst);
                     self.masm.add_ri(dst, 1);
-                    if dst == Reg64::Rax {
-                        self.rax_holds = Some(id);
-                    }
+                    self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.emit_load(value, Reg64::Rax);
@@ -4798,9 +4851,7 @@ impl<'a> MaglevCodegen<'a> {
                     if !narrow {
                         self.masm.movsxd_sign_extend(dst, dst);
                     }
-                    if dst == Reg64::Rax {
-                        self.rax_holds = Some(id);
-                    }
+                    self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.emit_load(value, Reg64::Rax);
@@ -4817,7 +4868,7 @@ impl<'a> MaglevCodegen<'a> {
             return;
         }
 
-        self.rax_holds = None;
+        self.clear_reg_forwarding();
         self.emit_load(value, Reg64::Rdi);
 
         let mut slow_label = Label::new();
@@ -4855,9 +4906,7 @@ impl<'a> MaglevCodegen<'a> {
                     let dst = phys_reg(n);
                     self.emit_load(value, dst);
                     self.masm.sub_ri(dst, 1);
-                    if dst == Reg64::Rax {
-                        self.rax_holds = Some(id);
-                    }
+                    self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.emit_load(value, Reg64::Rax);
@@ -4881,9 +4930,7 @@ impl<'a> MaglevCodegen<'a> {
                     if !narrow {
                         self.masm.movsxd_sign_extend(dst, dst);
                     }
-                    if dst == Reg64::Rax {
-                        self.rax_holds = Some(id);
-                    }
+                    self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.emit_load(value, Reg64::Rax);
@@ -4900,7 +4947,7 @@ impl<'a> MaglevCodegen<'a> {
             return;
         }
 
-        self.rax_holds = None;
+        self.clear_reg_forwarding();
         self.emit_load(value, Reg64::Rdi);
 
         let mut slow_label = Label::new();
