@@ -2175,6 +2175,9 @@ fn fuse_object_literal_stores_in_block(block: &mut BasicBlock) {
                 flags,
                 ..
             } => (*feedback_slot, *flags),
+            // Extend fusion to CreateEmptyObjectLiteral — uses default
+            // feedback_slot 0 and flags 0.
+            ValueNode::CreateEmptyObjectLiteral => (0, 0),
             _ => {
                 i += 1;
                 continue;
