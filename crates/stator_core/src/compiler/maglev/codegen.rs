@@ -5656,7 +5656,7 @@ impl<'a> MaglevCodegen<'a> {
     ///  jne  cache_miss
     ///  ; BA save: load [R15+16] → Cell ptr → save old BA
     ///  ; BA set:  store callee BA into Cell
-    ///  ; allocate 128-byte register file on x86 stack
+    ///  ; allocate 128-byte register file on x86 stack (no zeroing)
     ///  ; call cached entry_point(reg_file, cached_ctx)
     ///  ; deallocate register file
     ///  ; BA restore: write old BA back into Cell
@@ -5762,27 +5762,20 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.push(Reg64::Rax); // bytecode Cell ptr
         self.masm.push(Reg64::R10); // old BA
 
-        // 2. Allocate 128-byte register file on the stack.
+        // 2. Allocate register file on the stack.
+        //
+        // Zeroing is skipped entirely: JIT callees (both baseline and
+        // Maglev) initialise every register-file slot they read via
+        // SSA definitions or explicit bytecode stores, so pre-zeroing
+        // is dead work.  For Maglev callees the prologue writes
+        // context into R14-relative memory before any reads; baseline
+        // JIT bytecodes write all locals before use.  Eliminating the
+        // load+cmp+branch+rep-stosq sequence removes ~5 instructions
+        // from the hot path.
         self.masm.sub_ri(Reg64::Rsp, 128);
         // RSP ≡ 0 mod 16 (was 0, -16 from pushes, -128 from sub = -144).
 
-        // 3. Conditional zeroing: skip for ≤ 2 register slots (simple
-        //    closures overwrite all slots before reading).
-        self.masm
-            .mov_load_base_disp32(Reg64::R8, Reg64::Rbp, off_regslots);
-        let mut zero_done = Label::new();
-        self.masm.cmp_ri(Reg64::R8, 2);
-        self.masm.jcc(CondCode::LessEq, &mut zero_done);
-
-        // Large frame: zero with rep stosq.
-        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
-        self.masm.mov_rr(Reg64::Rcx, Reg64::R8);
-        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
-        self.masm.rep_stosq();
-
-        self.masm.bind_label(&mut zero_done);
-
-        // 4. Set up call: RDI = register file, RSI = cached context.
+        // 3. Set up call: RDI = register file, RSI = cached context.
         self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
         self.masm
             .mov_load_base_disp32(Reg64::Rsi, Reg64::Rbp, off_ctx);
@@ -5871,29 +5864,9 @@ impl<'a> MaglevCodegen<'a> {
         // Stack: [RSP] = padding, [RSP+8] = callee.
 
         // Allocate 128-byte register file (fixed size for ABI compat).
+        // Zeroing skipped: JIT callees initialise slots before reading
+        // (see cache-hit path comment above).
         self.masm.sub_ri(Reg64::Rsp, 128);
-
-        // Zero the callee's register-file slots.  For small frames
-        // (≤ 2 slots, e.g. closures) we skip zeroing entirely — the
-        // callee overwrites all slots before reading.  This avoids the
-        // ~15-30 cycle `rep stosq` startup overhead that dominates tight
-        // closure loops like the closure_counter benchmark.
-        let mut zero_done = Label::new();
-        self.masm.cmp_ri(Reg64::R8, 2);
-        self.masm.jcc(CondCode::LessEq, &mut zero_done);
-
-        // Large frame (R8 > 2): zero with rep stosq.
-        self.masm.push(Reg64::R10);
-        self.masm.push(Reg64::R11);
-        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
-        self.masm.mov_rr(Reg64::Rcx, Reg64::R8); // RCX = reg_slots
-        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
-        self.masm.add_ri(Reg64::Rdi, 16);
-        self.masm.rep_stosq();
-        self.masm.pop(Reg64::R11);
-        self.masm.pop(Reg64::R10);
-
-        self.masm.bind_label(&mut zero_done);
 
         // RDI = register file, RSI = ctx_ptr.
         self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);

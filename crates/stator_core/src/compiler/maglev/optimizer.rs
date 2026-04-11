@@ -1601,7 +1601,7 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
 
     // Details keyed by name index.
     let mut load_info: HashMap<u32, (u32, Vec<NodeId>)> = HashMap::new(); // name -> (feedback_slot, [NodeId])
-    let mut store_info: HashMap<u32, (NodeId, Vec<NodeId>)> = HashMap::new(); // name -> (last value, [NodeId])
+    let mut store_info: HashMap<u32, (NodeId, Vec<NodeId>, u32)> = HashMap::new(); // name -> (last value, [NodeId], feedback_slot)
 
     for block in graph.blocks() {
         if !lp.body.contains(&block.id) {
@@ -1622,10 +1622,13 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
                 ValueNode::StoreGlobal {
                     name,
                     value,
-                    feedback_slot: _,
+                    feedback_slot,
                 } => {
                     store_names.insert(*name);
-                    let entry = store_info.entry(*name).or_insert((*value, Vec::new()));
+                    let entry =
+                        store_info
+                            .entry(*name)
+                            .or_insert((*value, Vec::new(), *feedback_slot));
                     // Update the value to the latest store (last writer wins).
                     entry.0 = *value;
                     entry.1.push(*id);
@@ -1635,8 +1638,10 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
         }
     }
 
-    // Promotable globals: names that appear in both load and store sets.
-    let promotable: Vec<u32> = load_names.intersection(&store_names).copied().collect();
+    // Promotable globals: any global stored inside the loop (read-write OR
+    // write-only).  Read-only globals are already handled by LICM, so we only
+    // need to promote those that have at least one StoreGlobal in the body.
+    let promotable: Vec<u32> = store_names.iter().copied().collect();
     if promotable.is_empty() {
         return 0;
     }
@@ -1662,8 +1667,14 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
     // Build PromotedGlobal entries: allocate preheader loads and Phi IDs.
     let mut promoted: Vec<PromotedGlobal> = Vec::new();
     for &name in &promotable {
-        let (feedback_slot, ref load_ids) = load_info[&name];
-        let (store_value, ref store_ids) = store_info[&name];
+        let (store_value, ref store_ids, store_feedback_slot) = store_info[&name];
+
+        // For read-write globals, use feedback_slot from LoadGlobal; for
+        // write-only globals, fall back to the StoreGlobal's feedback_slot.
+        let (feedback_slot, load_ids) = match load_info.get(&name) {
+            Some((fs, ids)) => (*fs, ids.clone()),
+            None => (store_feedback_slot, Vec::new()),
+        };
 
         // If the preheader stores a known value to this global, use that
         // value directly (gives exact range).  Otherwise fall back to a
