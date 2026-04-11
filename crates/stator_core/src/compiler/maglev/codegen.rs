@@ -2636,9 +2636,12 @@ impl<'a> MaglevCodegen<'a> {
 
             // ── Deep context slot access ─────────────────────────────────────
             //
-            // For depth == 0 we bypass the generic trampoline and call a
-            // dedicated stub that decodes the JIT-encoded context value
-            // directly, saving the 5-register setup + big match dispatch.
+            // For depth == 0 we emit an inline Smi fast path that accesses
+            // the context slot directly via computed memory offsets,
+            // avoiding the function-call overhead of the lean FFI stub
+            // entirely on the hot path.  Non-Smi values and non-raw-pointer
+            // contexts fall back to the lean stub (slow path).
+            //
             // Depth > 0 still falls back to the trampoline which can walk
             // the scope chain via the register file.
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -2649,16 +2652,7 @@ impl<'a> MaglevCodegen<'a> {
                 ..
             } => {
                 if *depth == 0 {
-                    let saved = self.emit_save_live_regs(id);
-                    self.emit_load(*context, Reg64::Rdi);
-                    self.masm.mov_ri(Reg64::Rsi, i64::from(*slot));
-                    let addr =
-                        jit_runtime::jit_runtime_load_context_slot_lean as *const () as usize;
-                    self.masm.mov_ri(Reg64::R11, addr as i64);
-                    self.masm.call_reg(Reg64::R11);
-                    self.emit_restore_live_regs(saved);
-                    self.emit_deopt_check_rax();
-                    self.emit_store(id, Reg64::Rax);
+                    self.emit_inline_load_context_slot(id, *context, *slot);
                 } else {
                     self.emit_trampoline_call(
                         id,
@@ -2677,19 +2671,7 @@ impl<'a> MaglevCodegen<'a> {
                 ..
             } => {
                 if *depth == 0 {
-                    let saved = self.emit_save_live_regs(id);
-                    // Load all node arguments before setting immediates
-                    // to avoid clobbering (RSI is allocatable).
-                    self.emit_load(*context, Reg64::Rdi);
-                    self.emit_load(*value, Reg64::Rdx);
-                    self.masm.mov_ri(Reg64::Rsi, i64::from(*slot));
-                    let addr =
-                        jit_runtime::jit_runtime_store_context_slot_lean as *const () as usize;
-                    self.masm.mov_ri(Reg64::R11, addr as i64);
-                    self.masm.call_reg(Reg64::R11);
-                    self.emit_restore_live_regs(saved);
-                    self.emit_deopt_check_rax();
-                    self.emit_store(id, Reg64::Rax);
+                    self.emit_inline_store_context_slot(id, *context, *slot, *value);
                 } else {
                     // Fall back to trampoline for depth > 0 (needs
                     // chain walking via the register file).
@@ -3627,6 +3609,156 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.call_reg(Reg64::R11);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Inline Smi fast path for `LoadContextSlot` (depth == 0).
+    ///
+    /// The fast path dereferences the raw `RefCell<JsContext>` pointer
+    /// directly, reads the `Vec<JsValue>` slot, checks the discriminant
+    /// for Smi, and sign-extends the i32 payload — all using only
+    /// non-allocated scratch registers (RDI, R11, RAX) so **no
+    /// save/restore** of live registers is needed.
+    ///
+    /// Non-Smi slots or non-raw-pointer contexts fall through to the
+    /// slow path which calls `jit_runtime_load_context_slot_lean`.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_inline_load_context_slot(&mut self, id: NodeId, context: NodeId, slot: u32) {
+        let ctx_layout = cached_jscontext_layout();
+        let jv_layout = cached_jsvalue_layout();
+        let slot_idx = slot as usize;
+        let disc_byte_offset = (slot_idx * jv_layout.jsvalue_size + jv_layout.disc_offset) as i32;
+        let elem_byte_offset =
+            (slot_idx * jv_layout.jsvalue_size + jv_layout.smi_payload_offset) as i32;
+
+        self.rax_holds = None;
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+
+        // Load ctx_i64 into RDI.
+        self.emit_load(context, Reg64::Rdi);
+
+        // Quick pointer validation: raw heap pointers have upper bits
+        // set (>> 32 ≥ 3), while null, Smis, special constants, and
+        // heap handles all have (>> 32) < 3.
+        self.masm.mov_rr(Reg64::R11, Reg64::Rdi);
+        // SHR R11, 32  (REX.WB C1 /5 r/m=3, imm8=32)
+        self.masm.emit_byte(0x49);
+        self.masm.emit_byte(0xC1);
+        self.masm.emit_byte(0xEB);
+        self.masm.emit_byte(0x20);
+        self.masm.cmp_ri(Reg64::R11, 3);
+        self.masm.jcc(CondCode::Below, &mut slow_label);
+
+        // R11 = Vec<JsValue> data pointer (slots field).
+        self.masm.mov_load_base_disp32(
+            Reg64::R11,
+            Reg64::Rdi,
+            ctx_layout.slots_data_ptr_offset as i32,
+        );
+
+        // Check discriminant at slots[slot_idx]: Smi?
+        self.masm
+            .movzx_byte_base_disp32(Reg64::Rax, Reg64::R11, disc_byte_offset);
+        self.masm.cmp_ri(Reg64::Rax, jv_layout.smi_disc as i32);
+        self.masm.jne(&mut slow_label);
+
+        // Load Smi i32 payload, sign-extend to i64.
+        self.masm
+            .movsxd_base_disp32(Reg64::Rax, Reg64::R11, elem_byte_offset);
+        self.masm.jmp(&mut done_label);
+
+        // ── Slow path: save live regs and call lean stub ────────────
+        self.masm.bind_label(&mut slow_label);
+        let saved = self.emit_save_live_regs(id);
+        // RDI still holds ctx_i64 (not clobbered on the fast path).
+        self.masm.mov_ri(Reg64::Rsi, i64::from(slot));
+        let addr = jit_runtime::jit_runtime_load_context_slot_lean as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+
+        self.masm.bind_label(&mut done_label);
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Inline Smi fast path for `StoreContextSlot` (depth == 0).
+    ///
+    /// When the new value is a Smi and the context is a raw pointer,
+    /// writes the discriminant byte and i32 payload directly into the
+    /// `Vec<JsValue>` buffer using only scratch registers (RDI, R10,
+    /// R11, RAX) — no save/restore on the fast path.
+    ///
+    /// Falls back to `jit_runtime_store_context_slot_lean` for non-Smi
+    /// values or non-raw-pointer contexts.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_inline_store_context_slot(
+        &mut self,
+        id: NodeId,
+        context: NodeId,
+        slot: u32,
+        value: NodeId,
+    ) {
+        let ctx_layout = cached_jscontext_layout();
+        let jv_layout = cached_jsvalue_layout();
+        let slot_idx = slot as usize;
+        let disc_byte_offset = (slot_idx * jv_layout.jsvalue_size + jv_layout.disc_offset) as i32;
+        let elem_byte_offset =
+            (slot_idx * jv_layout.jsvalue_size + jv_layout.smi_payload_offset) as i32;
+
+        self.rax_holds = None;
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+
+        // Load value into RAX.
+        self.emit_load(value, Reg64::Rax);
+
+        // Check if the value is a Smi (fits in i32).
+        self.masm.movsxd_sign_extend(Reg64::R11, Reg64::Rax);
+        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+        self.masm.jne(&mut slow_label);
+
+        // Load ctx_i64 into RDI.
+        self.emit_load(context, Reg64::Rdi);
+
+        // Quick pointer validation (see LoadContextSlot above).
+        self.masm.mov_rr(Reg64::R11, Reg64::Rdi);
+        // SHR R11, 32
+        self.masm.emit_byte(0x49);
+        self.masm.emit_byte(0xC1);
+        self.masm.emit_byte(0xEB);
+        self.masm.emit_byte(0x20);
+        self.masm.cmp_ri(Reg64::R11, 3);
+        self.masm.jcc(CondCode::Below, &mut slow_label);
+
+        // R11 = Vec<JsValue> data pointer.
+        self.masm.mov_load_base_disp32(
+            Reg64::R11,
+            Reg64::Rdi,
+            ctx_layout.slots_data_ptr_offset as i32,
+        );
+
+        // Write Smi discriminant + i32 payload.
+        self.masm
+            .mov_store_byte_imm_base_disp32(Reg64::R11, disc_byte_offset, jv_layout.smi_disc);
+        self.masm
+            .mov_store_dword_base_disp32(Reg64::R11, elem_byte_offset, Reg64::Rax);
+        self.masm.jmp(&mut done_label);
+
+        // ── Slow path: save live regs and call lean stub ────────────
+        self.masm.bind_label(&mut slow_label);
+        let saved = self.emit_save_live_regs(id);
+        self.emit_load(context, Reg64::Rdi);
+        self.emit_load(value, Reg64::Rdx);
+        self.masm.mov_ri(Reg64::Rsi, i64::from(slot));
+        let addr = jit_runtime::jit_runtime_store_context_slot_lean as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+
+        self.masm.bind_label(&mut done_label);
         self.emit_store(id, Reg64::Rax);
     }
 
