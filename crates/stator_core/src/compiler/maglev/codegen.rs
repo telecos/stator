@@ -1876,14 +1876,6 @@ impl<'a> MaglevCodegen<'a> {
                     self.masm.call_reg(Reg64::R11);
                     self.emit_restore_live_regs(saved);
                     self.emit_deopt_check_rax();
-                    // Speculative Smi guard for globals that feed only
-                    // into arithmetic.
-                    if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
-                        self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-                        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
-                        self.masm
-                            .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
-                    }
                     self.emit_store(id, Reg64::Rax);
                 }
             }
@@ -1969,16 +1961,6 @@ impl<'a> MaglevCodegen<'a> {
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::LoadKeyedGeneric { object, key, .. } => {
                 self.emit_inline_load_keyed_smi(id, *object, *key);
-                // Speculative Smi guard for keyed loads that feed only
-                // into arithmetic (e.g. array element used in addition).
-                if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
-                    self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-                    self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
-                    self.masm
-                        .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
-                    // Re-store the validated result (emit_inline_load_keyed_smi
-                    // already stored RAX; the guard does not clobber it).
-                }
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::StoreKeyedGeneric {
@@ -5126,15 +5108,6 @@ impl<'a> MaglevCodegen<'a> {
         // Deopt check: harmless on fast path (RAX is always valid);
         // catches JIT_DEOPT from the generic stub on the slow path.
         self.emit_deopt_check_rax();
-        // Speculative Smi guard: if this LoadNamedGeneric is in the
-        // smi_guarded set (feeds only into arithmetic), verify the result
-        // is actually a Smi.  Non-Smi → deopt.
-        if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
-            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
-            self.masm
-                .jcc(CondCode::NotEqual, &mut self.deopt_stub_label);
-        }
         self.emit_store(id, Reg64::Rax);
     }
 
@@ -7265,40 +7238,20 @@ impl<'a> MaglevCodegen<'a> {
             }
         }
 
-        // Seed: add LoadNamedGeneric, LoadGlobal and LoadKeyedGeneric
-        // nodes whose consumers are ALL arithmetic-compatible
-        // (GenericAdd/Sub/Mul/bitwise/Inc/Dec/Negate, comparisons, or
-        // Phi).  This enables the inline Smi fast-path for arithmetic
-        // that consumes these loads, with a speculative movsxd+cmp
-        // guard at the load site.  Non-Smi results deopt safely.
-        // Exclude nodes used as branch conditions (boolean values).
-        for block in graph.blocks() {
-            for (id, node) in &block.nodes {
-                // LoadKeyedGeneric is intentionally excluded: array
-                // elements can be any JS type (booleans, objects, …),
-                // so speculating Smi is too aggressive and causes
-                // 100 % deopt on benchmarks like sieve_primes where
-                // every element is a boolean.
-                let is_seedable = matches!(
-                    node,
-                    ValueNode::LoadNamedGeneric { .. } | ValueNode::LoadGlobal { .. }
-                );
-                if !is_seedable {
-                    continue;
-                }
-                let all_arithmetic = consumers_of.get(id).is_some_and(|cs| {
-                    !cs.is_empty()
-                        && cs.iter().all(|c| {
-                            node_lookup
-                                .get(c)
-                                .is_some_and(|n| Self::is_arithmetic_compatible_consumer(n))
-                        })
-                }) && !branch_conditions.contains(id);
-                if all_arithmetic {
-                    set.insert(*id);
-                }
-            }
-        }
+        // NOTE: LoadNamedGeneric, LoadGlobal and LoadKeyedGeneric are
+        // intentionally NOT seeded here.  Previously we speculated
+        // that loads feeding only arithmetic consumers would return
+        // Smi values, emitting a movsxd+cmp guard at the load site
+        // that deopts on non-Smi results.  In practice this caused
+        // 100% deopt rates on property_access (where hoisted
+        // LoadNamedGeneric results triggered the guard) and
+        // sieve_primes (where non-promoted LoadGlobal guards fired).
+        // The downstream GenericAdd/Sub/Mul inline Smi fast-paths
+        // already handle the Smi check themselves, so the load-site
+        // guards only add deopt risk with no net benefit.  Removing
+        // them lets Maglev execute successfully for these benchmarks
+        // while promoted-global and SmiConstant/Phi propagation still
+        // populate the smi_guarded set for loop variables.
 
         // Optimistic Phi seeding for loop-carried Smi values.
         //

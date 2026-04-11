@@ -5058,17 +5058,15 @@ impl Interpreter {
                                                 // instruction adds a register
                                                 // to the loaded Smi.
                                                 if pc < frame.loop_end_pc {
-                                                    let next_instr = unsafe {
-                                                        instructions.get_unchecked(pc)
-                                                    };
+                                                    let next_instr =
+                                                        unsafe { instructions.get_unchecked(pc) };
                                                     if next_instr.opcode == Opcode::Add {
                                                         let add_reg = unsafe {
                                                             operand_reg_unchecked(next_instr, 0)
                                                         };
                                                         let b = unsafe {
-                                                            frame.read_reg_num_hot_unchecked(
-                                                                add_reg,
-                                                            )
+                                                            frame
+                                                                .read_reg_num_hot_unchecked(add_reg)
                                                         };
                                                         if let Some(r) = (*v).checked_add(b) {
                                                             sa = r;
@@ -5095,9 +5093,8 @@ impl Interpreter {
                                             smi_acc_bool = false;
                                             hot_acc = None;
                                             if pc < frame.loop_end_pc {
-                                                let next_instr = unsafe {
-                                                    instructions.get_unchecked(pc)
-                                                };
+                                                let next_instr =
+                                                    unsafe { instructions.get_unchecked(pc) };
                                                 if next_instr.opcode == Opcode::Star {
                                                     let star_reg = unsafe {
                                                         operand_reg_unchecked(next_instr, 0)
@@ -5124,8 +5121,7 @@ impl Interpreter {
                                             {
                                                 // SAFETY: single-threaded; no
                                                 // concurrent borrows.
-                                                let proto_pm =
-                                                    unsafe { &*proto_map.as_ptr() };
+                                                let proto_pm = unsafe { &*proto_map.as_ptr() };
                                                 if proto_pm.layout_id() == proto_layout {
                                                     // SAFETY: IC guarantees
                                                     // offset valid for layout.
@@ -5138,8 +5134,7 @@ impl Interpreter {
                                                         sa = *v;
                                                         smi_acc_bool = false;
                                                         smi_acc_spilled = false;
-                                                        hot_acc =
-                                                            Some(NanBoxedValue::from_smi(*v));
+                                                        hot_acc = Some(NanBoxedValue::from_smi(*v));
                                                         continue 'smi;
                                                     }
                                                     acc = val.clone();
@@ -5598,6 +5593,15 @@ impl Interpreter {
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
                                 break 'smi;
+                            }
+                            Opcode::CreateEmptyObjectLiteral => {
+                                acc = JsValue::PlainObject(Rc::new(RefCell::new(
+                                    PropertyMap::with_capacity(4),
+                                )));
+                                smi_acc_spilled = true;
+                                smi_acc_bool = false;
+                                hot_acc = None;
+                                continue 'smi;
                             }
                             Opcode::CreateObjectLiteral => {
                                 let slot = unsafe { operand_flag_unchecked(instr, 1) } as u32;
@@ -8599,6 +8603,66 @@ impl Interpreter {
                         }
                     }
 
+                    // Inline CallAnyReceiver (zero-arg closure fast path).
+                    //
+                    // In hot loops that invoke a closure with no arguments
+                    // (e.g. counter() inside a for-loop),
+                    // try_inline_small_function can evaluate the body
+                    // without creating a callee frame.
+                    Opcode::CallAnyReceiver => {
+                        let is_zero_arg =
+                            matches!(instr.operand_at(2), Some(Operand::RegisterCount(0)));
+                        if is_zero_arg {
+                            let callee_reg = unsafe { operand_reg_unchecked(instr, 0) };
+                            let callee = unsafe { frame.read_reg_unchecked(callee_reg) };
+                            if let JsValue::Function(func_rc) = callee {
+                                let func_ba = func_rc.as_ref();
+                                if func_ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+                                    && !func_ba.has_exception_handler()
+                                {
+                                    if let Some(result) =
+                                        try_inline_small_function(func_ba, &[], &frame.global_env)
+                                    {
+                                        acc = result;
+                                        continue 'dispatch;
+                                    }
+                                }
+                            }
+                        }
+                        // Non-inlineable — fall through to table dispatch.
+                        frame.pc = pc;
+                        frame.accumulator = acc;
+                        match dispatch_via_table(
+                            frame,
+                            instructions,
+                            byte_offsets,
+                            jump_targets,
+                            handler_table.as_slice(),
+                            instr,
+                        ) {
+                            Ok(dispatch::DispatchAction::Continue) => {
+                                pc = frame.pc;
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                continue 'dispatch;
+                            }
+                            Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                            Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                            Err(e) => {
+                                if let Some(resume_pc) =
+                                    handle_dispatch_error(&e, frame, handler_table.as_slice())
+                                {
+                                    pc = resume_pc;
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
+                                    continue 'dispatch;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+
                     // ΓöÇΓöÇ Inline CreateClosure (hot path for closures) ΓöÇΓöÇ
                     //
                     // Closure creation is frequent in idiomatic JS.
@@ -10859,7 +10923,7 @@ pub(super) const INLINE_BYTECODE_THRESHOLD: usize = 40;
 pub(super) fn try_inline_small_function(
     ba: &BytecodeArray,
     args: &[JsValue],
-    _global_env: &Rc<RefCell<GlobalEnv>>,
+    global_env: &Rc<RefCell<GlobalEnv>>,
 ) -> Option<JsValue> {
     if ba.bytecode_count() > INLINE_BYTECODE_THRESHOLD || ba.has_exception_handler() {
         return None;
@@ -11085,8 +11149,78 @@ pub(super) fn try_inline_small_function(
             let rhs = inline_arg_from_reg(args, checked_operand_reg(rhs, 0)?)?;
             inline_binary_op(op.opcode, &lhs, &rhs)
         }
+        // Global-variable add+store+return (6 instrs).
+        // Pattern: LdaSmiStar(imm,r) + LdaGlobal(cp) + Add(r) + StaGlobal(cp) + LdaGlobal(cp) + Return
+        [
+            lda_smi_star,
+            lda_global,
+            add_instr,
+            sta_global,
+            lda_reload,
+            ret,
+        ] if lda_smi_star.opcode == Opcode::LdaSmiStar
+            && lda_global.opcode == Opcode::LdaGlobal
+            && add_instr.opcode == Opcode::Add
+            && sta_global.opcode == Opcode::StaGlobal
+            && lda_reload.opcode == Opcode::LdaGlobal
+            && ret.opcode == Opcode::Return =>
+        {
+            inline_global_add_store_return(
+                ba,
+                global_env,
+                lda_smi_star,
+                lda_global,
+                sta_global,
+                lda_reload,
+            )
+        }
+        // Global-variable load+return (2 instrs).
+        [lda, ret] if lda.opcode == Opcode::LdaGlobal && ret.opcode == Opcode::Return => {
+            let name_idx = checked_operand_constant_pool_idx(lda, 0)?;
+            let name = match ba.get_constant(name_idx)? {
+                ConstantPoolEntry::String(s) => s.clone(),
+                _ => return None,
+            };
+            let env = global_env.borrow();
+            env.get(&name).cloned()
+        }
         _ => None,
     }
+}
+
+/// Inline a closure that reads a global variable, adds a constant, stores
+/// it back, and returns the updated value.
+fn inline_global_add_store_return(
+    ba: &BytecodeArray,
+    global_env: &Rc<RefCell<GlobalEnv>>,
+    lda_smi_star: &Instruction,
+    lda_global: &Instruction,
+    sta_global: &Instruction,
+    lda_reload: &Instruction,
+) -> Option<JsValue> {
+    let imm = checked_operand_imm(lda_smi_star, 0)?;
+    let load_idx = checked_operand_constant_pool_idx(lda_global, 0)?;
+    let store_idx = checked_operand_constant_pool_idx(sta_global, 0)?;
+    let reload_idx = checked_operand_constant_pool_idx(lda_reload, 0)?;
+    if load_idx != store_idx || store_idx != reload_idx {
+        return None;
+    }
+    let name = match ba.get_constant(load_idx)? {
+        ConstantPoolEntry::String(s) => s.clone(),
+        _ => return None,
+    };
+    let mut env = global_env.borrow_mut();
+    let current = env.get(&name)?;
+    let new_val = match current {
+        JsValue::Smi(n) => match n.checked_add(imm) {
+            Some(sum) => JsValue::Smi(sum),
+            None => JsValue::HeapNumber(*n as f64 + imm as f64),
+        },
+        JsValue::HeapNumber(n) => JsValue::HeapNumber(*n + imm as f64),
+        _ => return None,
+    };
+    env.insert(name.to_string(), new_val.clone());
+    Some(new_val)
 }
 
 /// Populate the self-name register for named function expressions.
