@@ -1830,17 +1830,19 @@ impl BytecodeArray {
         self.jit_maglev_deopt_count.get()
     }
 
-    /// Increment the Maglev deopt counter and set the exponential
-    /// cooldown so Maglev is not re-entered until enough interpreter
-    /// invocations have elapsed.  After [`MAX_MAGLEV_DEOPT_RETRIES`]
-    /// the interpreter will permanently skip Maglev for this function.
+    /// Increment the Maglev deopt counter and set the linear cooldown
+    /// so Maglev is not re-entered until a few interpreter invocations
+    /// have elapsed.  After [`MAX_MAGLEV_DEOPT_RETRIES`] the interpreter
+    /// will permanently skip Maglev for this function.
     pub fn mark_jit_maglev_deopted(&self) {
         let count = self.jit_maglev_deopt_count.get();
         self.jit_maglev_deopt_count.set(count.saturating_add(1));
-        // Exponential backoff: wait 2^count invocations before
-        // re-entering Maglev.  Capped at 2^10 = 1024 to allow recovery
-        // from transient deopts (e.g. cold JIT ICs after compilation).
-        let backoff = 1u32 << count.min(10);
+        // Linear backoff: wait 3 invocations per deopt before
+        // re-entering Maglev.  Exponential backoff (2^count) was too
+        // aggressive: just 7 cold-IC deopts produced a 128-invocation
+        // cooldown that exceeded Criterion's entire measurement window,
+        // forcing the benchmark to run entirely in the interpreter.
+        let backoff = 3u32.saturating_mul(count.saturating_add(1)).min(50);
         let next_try = self.invocation_count.get().saturating_add(backoff);
         self.maglev_next_try_at.set(next_try);
     }
