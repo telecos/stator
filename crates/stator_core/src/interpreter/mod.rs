@@ -3561,6 +3561,9 @@ impl Interpreter {
                     // RefCell borrow is active while we access slots.
                     let env_ptr = frame.global_env.as_ptr();
                     let mut smi_vars_dirty = false;
+                    // Cached array register for keyed-property elision.
+                    let mut cached_arr_reg: u32 = u32::MAX;
+                    let mut cached_arr_ptr: *mut Vec<JsValue> = std::ptr::null_mut();
                     'smi: loop {
                         if pc >= frame.loop_end_pc {
                             frame.loop_end_pc = 0;
@@ -3627,6 +3630,9 @@ impl Interpreter {
                                 smi_acc_spilled = false;
                                 hot_acc = Some(NanBoxedValue::from_smi(sa));
                                 let reg = unsafe { operand_reg_unchecked(instr, 1) };
+                                if reg == cached_arr_reg {
+                                    cached_arr_reg = u32::MAX;
+                                }
                                 let idx = frame.reg_flat_index_unchecked(reg);
                                 unsafe { frame.write_reg_unchecked(reg, JsValue::Smi(sa)) };
                                 if let Some(ref mut hr) = frame.hot_registers {
@@ -3654,6 +3660,9 @@ impl Interpreter {
                             Opcode::Star => {
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
                                 let idx = frame.reg_flat_index_unchecked(reg);
+                                if reg == cached_arr_reg {
+                                    cached_arr_reg = u32::MAX;
+                                }
 
                                 // Fast path: Smi accumulator.  In hot loops the
                                 // target register already holds a Smi, so we can
@@ -3811,6 +3820,9 @@ impl Interpreter {
                             Opcode::Mov => {
                                 let src = unsafe { operand_reg_unchecked(instr, 0) };
                                 let dst = unsafe { operand_reg_unchecked(instr, 1) };
+                                if dst == cached_arr_reg {
+                                    cached_arr_reg = u32::MAX;
+                                }
                                 let src_idx = frame.reg_flat_index_unchecked(src);
                                 let dst_idx = frame.reg_flat_index_unchecked(dst);
                                 let val = unsafe { frame.read_reg_unchecked(src) }.cheap_clone();
@@ -3972,10 +3984,16 @@ impl Interpreter {
                                     Some(r) => {
                                         sa = r;
                                         let dst = unsafe { operand_reg_unchecked(instr, 2) };
+                                        if dst == cached_arr_reg {
+                                            cached_arr_reg = u32::MAX;
+                                        }
                                         unsafe { frame.write_reg_unchecked(dst, JsValue::Smi(sa)) };
                                     }
                                     None => {
                                         let dst = unsafe { operand_reg_unchecked(instr, 2) };
+                                        if dst == cached_arr_reg {
+                                            cached_arr_reg = u32::MAX;
+                                        }
                                         acc = number_to_jsvalue(sa as f64 * b as f64);
                                         unsafe {
                                             frame.write_reg_unchecked(dst, acc.cheap_clone())
@@ -4003,10 +4021,16 @@ impl Interpreter {
                                     Some(r) => {
                                         sa = r;
                                         let dst = unsafe { operand_reg_unchecked(instr, 2) };
+                                        if dst == cached_arr_reg {
+                                            cached_arr_reg = u32::MAX;
+                                        }
                                         unsafe { frame.write_reg_unchecked(dst, JsValue::Smi(sa)) };
                                     }
                                     None => {
                                         let dst = unsafe { operand_reg_unchecked(instr, 2) };
+                                        if dst == cached_arr_reg {
+                                            cached_arr_reg = u32::MAX;
+                                        }
                                         acc = number_to_jsvalue(sa as f64 * b as f64);
                                         unsafe {
                                             frame.write_reg_unchecked(dst, acc.cheap_clone())
@@ -4177,10 +4201,16 @@ impl Interpreter {
                                     Some(r) => {
                                         sa = r;
                                         let dst = unsafe { operand_reg_unchecked(instr, 1) };
+                                        if dst == cached_arr_reg {
+                                            cached_arr_reg = u32::MAX;
+                                        }
                                         unsafe { frame.write_reg_unchecked(dst, JsValue::Smi(sa)) };
                                     }
                                     None => {
                                         let dst = unsafe { operand_reg_unchecked(instr, 1) };
+                                        if dst == cached_arr_reg {
+                                            cached_arr_reg = u32::MAX;
+                                        }
                                         acc = number_to_jsvalue(sa as f64 + 1.0);
                                         unsafe {
                                             frame.write_reg_unchecked(dst, acc.cheap_clone())
@@ -5123,6 +5153,9 @@ impl Interpreter {
                                                     let star_reg = unsafe {
                                                         operand_reg_unchecked(next_instr, 0)
                                                     };
+                                                    if star_reg == cached_arr_reg {
+                                                        cached_arr_reg = u32::MAX;
+                                                    }
                                                     let old = unsafe {
                                                         frame.swap_reg_unchecked(
                                                             star_reg,
@@ -5221,22 +5254,33 @@ impl Interpreter {
                                 break 'smi;
                             }
                             Opcode::LdaKeyedProperty => {
-                                // Array[Smi] fast path: sa is the index,
-                                // load value from the Array element.
+                                // Array[Smi] fast path with cached array pointer.
                                 let reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let obj = unsafe { frame.read_reg_unchecked(reg) };
-                                if sa >= 0
-                                    && let JsValue::Array(items) = obj
-                                {
-                                    // SAFETY: single-threaded interpreter; no
-                                    // concurrent borrows possible.  Bypasses
-                                    // RefCell overhead on the hot path.
-                                    let data = unsafe { &*items.as_ptr() };
+                                if sa >= 0 {
+                                    let data: &Vec<JsValue> = if reg == cached_arr_reg {
+                                        // SAFETY: pointer valid while Rc in `reg` is alive;
+                                        // every register-write site invalidates the cache.
+                                        unsafe { &*cached_arr_ptr }
+                                    } else {
+                                        let obj = unsafe { frame.read_reg_unchecked(reg) };
+                                        if let JsValue::Array(items) = obj {
+                                            let ptr = items.as_ptr();
+                                            cached_arr_reg = reg;
+                                            cached_arr_ptr = ptr;
+                                            // SAFETY: single-threaded; RefCell not borrowed.
+                                            unsafe { &*ptr }
+                                        } else {
+                                            acc = materialize_acc!();
+                                            frame.smi_mode = false;
+                                            frame.loop_end_pc = 0;
+                                            pc -= 1;
+                                            break 'smi;
+                                        }
+                                    };
                                     let i = sa as usize;
                                     if i < data.len() {
-                                        // Match on reference to avoid cloning
-                                        // Smi/Boolean (Copy types).
-                                        match unsafe { data.get_unchecked(i) } {
+                                        let elem = unsafe { data.get_unchecked(i) };
+                                        match elem {
                                             JsValue::Smi(v) => {
                                                 sa = *v;
                                                 smi_acc_bool = false;
@@ -5264,7 +5308,7 @@ impl Interpreter {
                                     }
                                     continue 'smi;
                                 }
-                                // Non-Array or negative index ΓÇö fall through
+                                // Negative index: fall through to slow path.
                                 acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
@@ -5272,8 +5316,7 @@ impl Interpreter {
                                 break 'smi;
                             }
                             Opcode::StaKeyedProperty => {
-                                // Array[Smi] store fast path: the key is in
-                                // a register, value in acc (sa).
+                                // Array[Smi] store fast path with cached array pointer.
                                 let obj_v = unsafe { operand_reg_unchecked(instr, 0) };
                                 let key_v = unsafe { operand_reg_unchecked(instr, 1) };
                                 let key_ref = unsafe { frame.read_reg_unchecked(key_v) };
@@ -5281,31 +5324,40 @@ impl Interpreter {
                                     && *idx >= 0
                                 {
                                     let i = *idx as usize;
-                                    let obj_ref = unsafe { frame.read_reg_unchecked(obj_v) };
-                                    if let JsValue::Array(items) = obj_ref {
-                                        // SAFETY: single-threaded interpreter; no
-                                        // concurrent borrows possible.
-                                        let v = unsafe { &mut *items.as_ptr() };
-                                        // Fast inline materialization: for bool/smi
-                                        // accumulators, build the JsValue directly
-                                        // without the materialize_acc branch chain.
-                                        let val = if smi_acc_spilled {
-                                            acc.cheap_clone()
-                                        } else if smi_acc_bool {
-                                            JsValue::Boolean(sa != 0)
+                                    let v: &mut Vec<JsValue> = if obj_v == cached_arr_reg {
+                                        // SAFETY: pointer valid while Rc in `obj_v` is alive.
+                                        unsafe { &mut *cached_arr_ptr }
+                                    } else {
+                                        let obj_ref = unsafe { frame.read_reg_unchecked(obj_v) };
+                                        if let JsValue::Array(items) = obj_ref {
+                                            let ptr = items.as_ptr();
+                                            cached_arr_reg = obj_v;
+                                            cached_arr_ptr = ptr;
+                                            unsafe { &mut *ptr }
                                         } else {
-                                            JsValue::Smi(sa)
-                                        };
-                                        if i < v.len() {
-                                            unsafe { *v.get_unchecked_mut(i) = val };
-                                        } else if i == v.len() {
-                                            v.push(val);
-                                        } else {
-                                            v.resize(i, JsValue::TheHole);
-                                            v.push(val);
+                                            acc = materialize_acc!();
+                                            frame.smi_mode = false;
+                                            frame.loop_end_pc = 0;
+                                            pc -= 1;
+                                            break 'smi;
                                         }
-                                        continue 'smi;
+                                    };
+                                    let val = if smi_acc_spilled {
+                                        acc.cheap_clone()
+                                    } else if smi_acc_bool {
+                                        JsValue::Boolean(sa != 0)
+                                    } else {
+                                        JsValue::Smi(sa)
+                                    };
+                                    if i < v.len() {
+                                        unsafe { *v.get_unchecked_mut(i) = val };
+                                    } else if i == v.len() {
+                                        v.push(val);
+                                    } else {
+                                        v.resize(i, JsValue::TheHole);
+                                        v.push(val);
                                     }
+                                    continue 'smi;
                                 }
                                 // Fall through
                                 acc = materialize_acc!();
@@ -5851,6 +5903,9 @@ impl Interpreter {
                                             )
                                     } {
                                         let obj = JsValue::PlainObject(rc);
+                                        if star_reg == cached_arr_reg {
+                                            cached_arr_reg = u32::MAX;
+                                        }
                                         // Store in target register, recycling
                                         // any previous PlainObject.
                                         let old =
