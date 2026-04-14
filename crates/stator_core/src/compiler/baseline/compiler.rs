@@ -6449,15 +6449,12 @@ pub(crate) mod jit_runtime {
 
     impl InlineKeyedResult {
         /// Wraps an `Option<i64>` from a full generic stub into a result.
-        /// `Some(v)` → hit, `None` → `JIT_DEOPT`.
+        /// `Some(v)` → hit, `None` → miss (fall back to generic path).
         #[inline(always)]
         fn from_generic(v: Option<i64>) -> Self {
             match v {
                 Some(val) => Self { value: val, hit: 1 },
-                None => Self {
-                    value: JIT_DEOPT,
-                    hit: 1,
-                },
+                None => Self { value: 0, hit: 0 },
             }
         }
     }
