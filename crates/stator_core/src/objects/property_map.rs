@@ -1074,7 +1074,7 @@ impl PropertyMap {
     #[inline]
     pub fn try_template_fill(&mut self, key: &str, value: JsValue) -> Result<usize, JsValue> {
         let slot = self.template_next_slot;
-        if slot < self.keys.len() && self.keys[slot].as_ref() == key {
+        if slot < self.keys.len() && slot < self.values.len() && self.keys[slot].as_ref() == key {
             self.values[slot] = value;
             self.template_next_slot = slot + 1;
             Ok(slot)
@@ -1442,9 +1442,12 @@ impl PropertyMap {
     /// Returns the value for `key`, ignoring attributes.
     pub fn get(&self, key: &str) -> Option<&JsValue> {
         if let Some(slot) = self.cache_probe(key) {
-            return Some(&self.values[slot]);
+            return self.values.get(slot);
         }
         let slot = self.lookup_slot(key)?;
+        if slot >= self.values.len() {
+            return None;
+        }
         self.cache_record(key, slot);
         Some(&self.values[slot])
     }
@@ -1454,8 +1457,11 @@ impl PropertyMap {
     pub fn get_by_rc(&self, key: &Rc<str>) -> Option<&JsValue> {
         for (slot, candidate) in self.keys.iter().enumerate() {
             if Rc::ptr_eq(candidate, key) {
-                self.cache_record(key.as_ref(), slot);
-                return Some(&self.values[slot]);
+                if slot < self.values.len() {
+                    self.cache_record(key.as_ref(), slot);
+                    return Some(&self.values[slot]);
+                }
+                return None;
             }
         }
         self.get(key.as_ref())
@@ -1464,7 +1470,7 @@ impl PropertyMap {
     /// Returns a clone of the value for `key`, ignoring attributes.
     pub fn get_cloned(&self, key: &str) -> Option<JsValue> {
         self.lookup_slot_cached(key)
-            .map(|slot| self.values[slot].clone())
+            .and_then(|slot| self.values.get(slot).cloned())
     }
 
     /// Returns `true` if the map contains an entry for `key`.
@@ -1579,28 +1585,30 @@ impl PropertyMap {
 
     /// Inserts a property using an already-interned key.
     pub fn insert_rc(&mut self, key: Rc<str>, value: JsValue) {
-        if let Some(i) = self.lookup_slot_cached(&key) {
+        if let Some(i) = self.lookup_slot_cached(&key)
+            && i < self.values.len()
+        {
             self.values[i] = value;
             self.touch_proto_generation();
-        } else {
-            // Non-extensible objects reject new properties (except internal __dunder__ keys).
-            if !self.extensible && !key.starts_with("__") {
-                return;
-            }
-            // The internal prototype link must never be enumerable.
-            let attrs = if key.as_ref() == INTERNAL_PROTO_PROPERTY_KEY {
-                BUILTIN_ATTRS
-            } else {
-                DEFAULT_ATTRS
-            };
-            let pos = self.spec_insert_pos(&key);
-            self.insert_new(key, value, attrs, pos);
-            self.bump_shape_id();
-            if pos != self.keys.len() - 1 {
-                self.cache_invalidate();
-            }
-            self.touch_proto_generation();
+            return;
         }
+        // Non-extensible objects reject new properties (except internal __dunder__ keys).
+        if !self.extensible && !key.starts_with("__") {
+            return;
+        }
+        // The internal prototype link must never be enumerable.
+        let attrs = if key.as_ref() == INTERNAL_PROTO_PROPERTY_KEY {
+            BUILTIN_ATTRS
+        } else {
+            DEFAULT_ATTRS
+        };
+        let pos = self.spec_insert_pos(&key);
+        self.insert_new(key, value, attrs, pos);
+        self.bump_shape_id();
+        if pos != self.keys.len() - 1 {
+            self.cache_invalidate();
+        }
+        self.touch_proto_generation();
     }
 
     /// Insert a built-in method or constructor property (writable,
@@ -1611,19 +1619,21 @@ impl PropertyMap {
 
     /// Inserts a built-in property using an already-interned key.
     pub fn insert_builtin_rc(&mut self, key: Rc<str>, value: JsValue) {
-        if let Some(i) = self.lookup_slot_cached(&key) {
+        if let Some(i) = self.lookup_slot_cached(&key)
+            && i < self.values.len()
+        {
             self.values[i] = value;
             Rc::make_mut(&mut self.attrs)[i] = BUILTIN_ATTRS;
             self.touch_proto_generation();
-        } else {
-            let pos = self.spec_insert_pos(&key);
-            self.insert_new(key, value, BUILTIN_ATTRS, pos);
-            self.bump_shape_id();
-            if pos != self.keys.len() - 1 {
-                self.cache_invalidate();
-            }
-            self.touch_proto_generation();
+            return;
         }
+        let pos = self.spec_insert_pos(&key);
+        self.insert_new(key, value, BUILTIN_ATTRS, pos);
+        self.bump_shape_id();
+        if pos != self.keys.len() - 1 {
+            self.cache_invalidate();
+        }
+        self.touch_proto_generation();
     }
 
     /// Set all existing properties to non-enumerable.
