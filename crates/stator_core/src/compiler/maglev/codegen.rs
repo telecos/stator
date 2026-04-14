@@ -5383,6 +5383,16 @@ impl<'a> MaglevCodegen<'a> {
 
         // ── Common exit ─────────────────────────────────────────────
         self.masm.bind_label(&mut done_label);
+        // Speculative Smi guard: if this load was added to `smi_guarded`,
+        // verify the result is a sign-extended i32 (Smi).  Non-Smi results
+        // (booleans, heap handles, undefined) trigger deopt to interpreter.
+        // Cost: 3 instructions; saves 6+ instructions per downstream
+        // GenericAdd that can now use the bare smi_guarded tier.
+        if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
+            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm.jne(&mut self.deopt_stub_label);
+        }
         self.emit_store(id, Reg64::Rax);
     }
 
@@ -7516,20 +7526,36 @@ impl<'a> MaglevCodegen<'a> {
             }
         }
 
-        // NOTE: LoadNamedGeneric, LoadGlobal and LoadKeyedGeneric are
-        // intentionally NOT seeded here.  Previously we speculated
-        // that loads feeding only arithmetic consumers would return
-        // Smi values, emitting a movsxd+cmp guard at the load site
-        // that deopts on non-Smi results.  In practice this caused
-        // 100% deopt rates on property_access (where hoisted
-        // LoadNamedGeneric results triggered the guard) and
-        // sieve_primes (where non-promoted LoadGlobal guards fired).
-        // The downstream GenericAdd/Sub/Mul inline Smi fast-paths
-        // already handle the Smi check themselves, so the load-site
-        // guards only add deopt risk with no net benefit.  Removing
-        // them lets Maglev execute successfully for these benchmarks
-        // while promoted-global and SmiConstant/Phi propagation still
-        // populate the smi_guarded set for loop variables.
+        // Seed LoadNamedGeneric into smi_guarded when ALL consumers are
+        // arithmetic-compatible.  A Smi deopt guard (MOVSXD + CMP + JNE)
+        // is emitted at the load site; the payoff is that every downstream
+        // GenericAdd/Sub/Mul can use the fast smi_guarded tier (bare ADD +
+        // JO, ~7 instructions) instead of the generic tier (~13 instructions
+        // with dual Smi checks).
+        //
+        // Previously this caused 100% deopt because a register-clobber bug
+        // in the IC fill path corrupted the loaded values.  That bug was
+        // fixed in ed049403/bd5e9b74.
+        for block in graph.blocks() {
+            for (id, node) in &block.nodes {
+                if matches!(node, ValueNode::LoadNamedGeneric { .. })
+                    && !set.contains(id)
+                    && !branch_conditions.contains(id)
+                {
+                    let all_arith = consumers_of.get(id).is_some_and(|cs| {
+                        !cs.is_empty()
+                            && cs.iter().all(|c| {
+                                node_lookup
+                                    .get(c)
+                                    .is_some_and(|n| Self::is_arithmetic_compatible_consumer(n))
+                            })
+                    });
+                    if all_arith {
+                        set.insert(*id);
+                    }
+                }
+            }
+        }
 
         // Optimistic Phi seeding for loop-carried Smi values.
         //
