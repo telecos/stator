@@ -1469,13 +1469,25 @@ impl<'a> GraphBuilder<'a> {
                 let ctx_reg = self.operand_register(instr, 0)?;
                 let slot_idx = self.operand_constant_pool_idx(instr, 1)?;
                 let depth = self.operand_immediate(instr, 2)? as u32;
-                let context = self.env_get_register(ctx_reg)?;
-                let id = self.emit(ValueNode::LoadContextSlot {
-                    context,
-                    depth,
-                    slot: slot_idx,
-                })?;
-                self.env.set_accumulator(id);
+
+                // When the context register has not been explicitly written in
+                // this function (e.g. an inner closure that receives its context
+                // via RSI at entry), the register holds the function's incoming
+                // context.  Use LoadCurrentContextSlot which reads from the
+                // cached ctx_regfile_offset slot, avoiding the stale/undefined
+                // register_file entry.
+                if self.env.get(ctx_reg).is_none() && depth == 0 {
+                    let id = self.emit(ValueNode::LoadCurrentContextSlot { slot: slot_idx })?;
+                    self.env.set_accumulator(id);
+                } else {
+                    let context = self.env_get_register(ctx_reg)?;
+                    let id = self.emit(ValueNode::LoadContextSlot {
+                        context,
+                        depth,
+                        slot: slot_idx,
+                    })?;
+                    self.env.set_accumulator(id);
+                }
             }
             Opcode::LdaCurrentContextSlot | Opcode::LdaImmutableCurrentContextSlot => {
                 let slot_idx = self.operand_constant_pool_idx(instr, 0)?;
@@ -1486,14 +1498,25 @@ impl<'a> GraphBuilder<'a> {
                 let ctx_reg = self.operand_register(instr, 0)?;
                 let slot_idx = self.operand_constant_pool_idx(instr, 1)?;
                 let depth = self.operand_immediate(instr, 2)? as u32;
-                let context = self.env_get_register(ctx_reg)?;
                 let value = self.env_get_accumulator()?;
-                self.emit(ValueNode::StoreContextSlot {
-                    context,
-                    depth,
-                    slot: slot_idx,
-                    value,
-                })?;
+
+                // Same as LdaContextSlot: when the context register has not
+                // been written, the function's incoming context (RSI) is the
+                // target.  Use StoreCurrentContextSlot for the depth==0 case.
+                if self.env.get(ctx_reg).is_none() && depth == 0 {
+                    self.emit(ValueNode::StoreCurrentContextSlot {
+                        slot: slot_idx,
+                        value,
+                    })?;
+                } else {
+                    let context = self.env_get_register(ctx_reg)?;
+                    self.emit(ValueNode::StoreContextSlot {
+                        context,
+                        depth,
+                        slot: slot_idx,
+                        value,
+                    })?;
+                }
             }
             Opcode::StaCurrentContextSlot => {
                 let slot_idx = self.operand_constant_pool_idx(instr, 0)?;
