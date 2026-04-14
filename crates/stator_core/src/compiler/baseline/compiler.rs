@@ -3442,15 +3442,17 @@ pub(crate) mod jit_runtime {
         args: Vec<JsValue>,
         saved_ba: *const BytecodeArray,
     ) -> Option<i64> {
-        use crate::interpreter::{Interpreter, InterpreterFrame};
+        use crate::interpreter::{Interpreter, InterpreterFrame, restore_closure_context};
 
         let env_opt = RT_GLOBAL.with(|g| g.borrow().env.as_ref().cloned());
 
         let result = if let Some(env) = env_opt {
             let mut frame = InterpreterFrame::new_with_globals(Rc::clone(ba), args, env);
+            restore_closure_context(&mut frame, ba);
             Interpreter::run(&mut frame)
         } else {
             let mut frame = InterpreterFrame::new(Rc::clone(ba), args);
+            restore_closure_context(&mut frame, ba);
             Interpreter::run(&mut frame)
         };
 
@@ -3482,7 +3484,7 @@ pub(crate) mod jit_runtime {
         saved_ba: *const BytecodeArray,
         ptrs: &RtPtrs,
     ) -> Option<i64> {
-        use crate::interpreter::{Interpreter, InterpreterFrame};
+        use crate::interpreter::{Interpreter, InterpreterFrame, restore_closure_context};
 
         // Read global env through the cached pointer when possible,
         // saving a TLS lookup + RefCell borrow on the hot path.
@@ -3503,9 +3505,11 @@ pub(crate) mod jit_runtime {
 
         let result = if let Some(env) = env_opt {
             let mut frame = InterpreterFrame::new_with_globals(Rc::clone(ba), vec![], env);
+            restore_closure_context(&mut frame, ba);
             Interpreter::run(&mut frame)
         } else {
             let mut frame = InterpreterFrame::new(Rc::clone(ba), vec![]);
+            restore_closure_context(&mut frame, ba);
             Interpreter::run(&mut frame)
         };
 
