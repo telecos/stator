@@ -5308,8 +5308,21 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.je(&mut load_bool);
         self.masm.cmp_ri(Reg64::Rax, jv_layout.undef_disc as i32);
         self.masm.je(&mut load_undef);
-        // Other types (String, Object, …) → slow path.
-        self.masm.jmp(&mut slow_label);
+        // Other types (String, Object, …): R11 still holds the element
+        // address.  Allocate a heap handle via a lightweight runtime
+        // call (just clone + push to heap, no property lookup needed).
+        {
+            let saved = self.emit_save_live_regs(id);
+            // RDI = element address (R11 is caller-saved, so move it)
+            self.masm.mov_rr(Reg64::Rdi, Reg64::R11);
+            let alloc_addr =
+                jit_runtime::jit_runtime_alloc_handle_for_jsvalue as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, alloc_addr as i64);
+            self.masm.call_reg(Reg64::R11);
+            self.emit_restore_live_regs(saved);
+            // alloc_heap_handle always succeeds — no deopt check needed.
+            self.masm.jmp(&mut done_label);
+        }
 
         // ── load_smi: sign-extend i32 payload ───────────────────────
         self.masm.bind_label(&mut load_smi);

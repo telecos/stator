@@ -7494,21 +7494,28 @@ pub(crate) mod jit_runtime {
             if let Some(offset) = map.offset_of(prop_name) {
                 // SAFETY: offset valid while shape_id unchanged.
                 let val = unsafe { map.get_by_offset_unchecked(offset) };
-                // Only fill the IC for inline-encodable values.
-                if let Some(encoded) = try_encode_named_ic_value(val) {
-                    // Fill IC slots: [handle, map_ptr, shape_id, offset]
-                    let map_raw = map_rc.as_ptr() as i64;
-                    unsafe {
-                        (*ic_slots)[0] = obj_i64;
-                        (*ic_slots)[1] = map_raw;
-                        (*ic_slots)[2] = shape as i64;
-                        (*ic_slots)[3] = offset as i64;
-                    }
-                    return NamedIcResult {
-                        value: encoded,
-                        hit: 1,
-                    };
+                // Encode the value as a JIT i64.  Primitives (Smi,
+                // Boolean, Undefined, Null) are encoded directly.
+                // For heap objects (PlainObject, Array, String, …) we
+                // allocate a heap handle so the IC is filled for ALL
+                // property types — this avoids falling through to the
+                // expensive generic-fallback path on IC miss.
+                let encoded = match try_encode_named_ic_value(val) {
+                    Some(enc) => enc,
+                    None => alloc_heap_handle(val.clone()),
+                };
+                // Fill IC slots: [handle, map_ptr, shape_id, offset]
+                let map_raw = map_rc.as_ptr() as i64;
+                unsafe {
+                    (*ic_slots)[0] = obj_i64;
+                    (*ic_slots)[1] = map_raw;
+                    (*ic_slots)[2] = shape as i64;
+                    (*ic_slots)[3] = offset as i64;
                 }
+                return NamedIcResult {
+                    value: encoded,
+                    hit: 1,
+                };
             }
         }
 
@@ -7531,6 +7538,36 @@ pub(crate) mod jit_runtime {
             JsValue::Null => Some(JIT_NULL),
             _ => None,
         }
+    }
+
+    /// Clone the [`JsValue`] at the given raw pointer and allocate a JIT
+    /// heap handle for it.
+    ///
+    /// Called from Maglev-generated code when the inline IC hits a
+    /// non-primitive property (Object, Array, String, etc.) that cannot
+    /// be encoded without a heap allocation.  Much cheaper than a full
+    /// IC fill call because it skips property-name lookup and shape
+    /// validation — the caller (inline IC fast path) has already
+    /// verified handle + shape.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`jsvalue_ptr`) – raw pointer to the `JsValue` in the
+    ///   PropertyMap storage (element address computed by inline IC).
+    ///
+    /// Returns the JIT heap handle (`JIT_HEAP_TAG + idx`) in `RAX`.
+    ///
+    /// # Safety
+    ///
+    /// `jsvalue_ptr` must be a valid pointer to a live `JsValue` that
+    /// will not be moved or deallocated during this call.  This is
+    /// guaranteed by the inline IC: the shape_id check ensures the
+    /// PropertyMap layout has not changed since the IC was populated.
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    pub extern "C" fn jit_runtime_alloc_handle_for_jsvalue(jsvalue_ptr: i64) -> i64 {
+        // SAFETY: caller guarantees jsvalue_ptr is a valid &JsValue.
+        let val: &JsValue = unsafe { &*(jsvalue_ptr as *const JsValue) };
+        alloc_heap_handle(val.clone())
     }
 
     // ── Array inline-cache fill + load ──────────────────────────────────
