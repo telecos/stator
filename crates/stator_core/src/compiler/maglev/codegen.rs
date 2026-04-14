@@ -5336,7 +5336,12 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.jmp(&mut done_label);
 
         // ── Generic fallback ────────────────────────────────────────
+        // The IC-fill call above clobbered caller-saved registers.
+        // Restore them so that `emit_load(object, ..)` reads the
+        // correct value, then save again for the generic stub call.
         self.masm.bind_label(&mut generic_label);
+        self.emit_restore_live_regs(saved);
+        let saved2 = self.emit_save_live_regs(id);
         self.emit_load(object, Reg64::Rdi);
         self.masm.mov_ri(Reg64::Rsi, i64::from(name));
         self.masm.mov_ri(Reg64::Rdx, i64::from(feedback_slot));
@@ -5344,7 +5349,7 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.mov_ri(Reg64::R11, stub_addr as i64);
         self.masm.call_reg(Reg64::R11);
 
-        self.emit_restore_live_regs(saved);
+        self.emit_restore_live_regs(saved2);
         self.emit_deopt_check_rax();
 
         // ── Common exit ─────────────────────────────────────────────
