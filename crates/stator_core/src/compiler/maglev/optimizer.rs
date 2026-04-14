@@ -108,8 +108,11 @@ pub fn globals_promoted_diagnostics() -> (u32, u32) {
 /// Run all optimisation passes on `graph` in place.
 ///
 /// Passes are applied in the order: constant folding → strength reduction →
-/// range analysis → trivial Phi elimination → LICM → redundant type-guard
-/// elimination → inlining analysis → redundant-CheckMaps removal → DCE.
+/// range analysis → strength reduction → trivial Phi elimination → LICM →
+/// redundant type-guard elimination → inlining analysis →
+/// redundant-CheckMaps removal → DCE.  Strength reduction runs twice: once
+/// before range analysis for existing Int32 nodes, and once after for newly
+/// lowered Int32 nodes (e.g. `GenericMultiply` → `Int32Multiply`).
 ///
 /// Multiple rounds are *not* performed; a single sweep of each pass is
 /// sufficient for the patterns targeted here.
@@ -124,6 +127,9 @@ pub fn optimize(graph: &mut MaglevGraph) {
     reassociate_arithmetic(graph);
     strength_reduce(graph);
     crate::compiler::maglev::range_analysis::eliminate_overflow_checks(graph);
+    // Re-run strength reduction: range analysis may have lowered
+    // GenericMultiply→Int32Multiply, exposing power-of-two patterns.
+    strength_reduce(graph);
     eliminate_trivial_phis(graph);
     let _licm_hoisted = crate::compiler::maglev::licm::hoist_loop_invariants(graph);
     // TODO: implement loop peeling — execute the first iteration outside the
@@ -139,6 +145,8 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // LoadGlobal/StoreGlobal with Phi nodes, exposing induction variable
     // and accumulator patterns that enable CheckedSmi→Int32 conversion.
     crate::compiler::maglev::range_analysis::eliminate_overflow_checks(graph);
+    // Re-run strength reduction after second range analysis pass.
+    strength_reduce(graph);
     // Re-run truncation after global promotion: promotion reduces
     // use-counts on arithmetic nodes — allowing CheckedSmi→Int32.
     let _truncations2 = propagate_int32_truncation(graph);
@@ -992,9 +1000,18 @@ fn simplify_identities_in_block(block: &mut BasicBlock) {
                     None
                 }
             }
-            // x | 0 → x, 0 | x → x
-            ValueNode::Int32BitwiseOr { left, right }
-            | ValueNode::GenericBitwiseOr { left, right, .. } => {
+            // x | 0 → x, 0 | x → x  (Int32 only)
+            //
+            // GenericBitwiseOr is intentionally NOT folded here: it serves
+            // as a ToInt32 truncation point for `propagate_int32_truncation`.
+            // The first truncation pass may not be able to convert the chain
+            // (e.g. when LoadGlobal is not provably i32).  After
+            // `promote_loop_globals_counted` replaces LoadGlobal with Phi
+            // nodes, the *second* truncation pass needs the BitwiseOr marker
+            // still present to walk backward and convert GenericAdd/Sub/Mul
+            // to their Int32 equivalents.  `eliminate_identity_operations_global`
+            // cleans up any remaining `GenericBitwiseOr(x, 0)` afterward.
+            ValueNode::Int32BitwiseOr { left, right } => {
                 if consts.get(right) == Some(&0) {
                     Some(*left)
                 } else if consts.get(left) == Some(&0) {

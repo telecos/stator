@@ -3284,11 +3284,37 @@ impl<'a> MaglevCodegen<'a> {
     /// Emit a 32-bit multiply by an immediate constant, with strength reduction
     /// for small constants.
     ///
+    /// - `*2` → `ADD dst, dst` + `MOVSXD`  (1c vs 3c latency for IMUL)
     /// - `*3` → `LEA dst, [src + src*2]` + `MOVSXD`  (1c vs 3c latency)
     /// - `*5` → `LEA dst, [src + src*4]` + `MOVSXD`
     /// - `*9` → `LEA dst, [src + src*8]` + `MOVSXD`
     /// - Otherwise → `IMUL32 dst, src, imm` + `MOVSXD`
     fn emit_imul32_imm(&mut self, src: NodeId, imm: i32, result: NodeId) {
+        let narrow = self.narrow_int32.contains(&result);
+
+        // Multiply by 2: use ADD dst, dst (1 cycle vs 3 for IMUL).
+        if imm == 2 {
+            match self.alloc.location(result) {
+                Some(Location::Register(n)) => {
+                    let dst = phys_reg(n);
+                    self.emit_load(src, dst);
+                    self.masm.add32_rr(dst, dst);
+                    if !narrow {
+                        self.masm.movsxd_sign_extend(dst, dst);
+                    }
+                }
+                _ => {
+                    self.emit_load(src, Reg64::R11);
+                    self.masm.add32_rr(Reg64::R11, Reg64::R11);
+                    if !narrow {
+                        self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
+                    }
+                    self.emit_store(result, Reg64::R11);
+                }
+            }
+            return;
+        }
+
         // Strength-reduce multiply by {3, 5, 9} to LEA with SIB.
         // LEA operates on 64-bit values; MOVSXD afterward gives wrapping
         // 32-bit semantics identical to IMUL32.
@@ -3298,8 +3324,6 @@ impl<'a> MaglevCodegen<'a> {
             9 => Some(8),
             _ => None,
         };
-
-        let narrow = self.narrow_int32.contains(&result);
 
         match self.alloc.location(result) {
             Some(Location::Register(n)) => {

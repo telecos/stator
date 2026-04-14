@@ -789,6 +789,10 @@ fn rewrite_accumulator_phis(
                 _ => None,
             };
 
+            // Fallback: try chained pattern like `(sum + i*2) + 1`.
+            let addend_range =
+                addend_range.or_else(|| find_chained_addend(&back_id, phi_id, node_map, ranges));
+
             let Some(addend_range) = addend_range else {
                 continue;
             };
@@ -855,6 +859,191 @@ fn rewrite_accumulator_phis(
         }
         ranges.insert(back_id, back_range);
         ranges.insert(phi_id, acc_range);
+    }
+}
+
+/// Eagerly compute the range of a node that Phase 2 has not yet processed.
+///
+/// This is used during accumulator detection (Phase 1b) to compute addend
+/// ranges for nodes like `GenericMultiply(i, 2)` whose ranges are not yet
+/// in the `ranges` map.  The `phi_id` parameter is the accumulator Phi
+/// being analysed — any subtree referencing it is rejected to avoid
+/// circular reasoning.
+fn eager_range(
+    node_id: &NodeId,
+    phi_id: &NodeId,
+    ranges: &HashMap<NodeId, Range>,
+    node_map: &HashMap<NodeId, (u32, ValueNode)>,
+    depth: u32,
+) -> Option<Range> {
+    if let Some(r) = ranges.get(node_id) {
+        return Some(*r);
+    }
+    // Reject cycles through the accumulator Phi.
+    if *node_id == *phi_id {
+        return None;
+    }
+    if depth > 8 {
+        return None;
+    }
+    let (_, node) = node_map.get(node_id)?;
+    match node {
+        ValueNode::GenericAdd { left, right, .. } | ValueNode::CheckedSmiAdd { left, right } => {
+            let lr = eager_range(left, phi_id, ranges, node_map, depth + 1)?;
+            let rr = eager_range(right, phi_id, ranges, node_map, depth + 1)?;
+            Some(Range {
+                min: lr.min.checked_add(rr.min)?,
+                max: lr.max.checked_add(rr.max)?,
+            })
+        }
+        ValueNode::GenericSubtract { left, right, .. }
+        | ValueNode::CheckedSmiSubtract { left, right } => {
+            let lr = eager_range(left, phi_id, ranges, node_map, depth + 1)?;
+            let rr = eager_range(right, phi_id, ranges, node_map, depth + 1)?;
+            Some(Range {
+                min: lr.min.checked_sub(rr.max)?,
+                max: lr.max.checked_sub(rr.min)?,
+            })
+        }
+        ValueNode::GenericMultiply { left, right, .. }
+        | ValueNode::CheckedSmiMultiply { left, right } => {
+            let lr = eager_range(left, phi_id, ranges, node_map, depth + 1)?;
+            let rr = eager_range(right, phi_id, ranges, node_map, depth + 1)?;
+            let candidates = [
+                lr.min.checked_mul(rr.min)?,
+                lr.min.checked_mul(rr.max)?,
+                lr.max.checked_mul(rr.min)?,
+                lr.max.checked_mul(rr.max)?,
+            ];
+            Some(Range {
+                min: candidates.iter().copied().min().unwrap(),
+                max: candidates.iter().copied().max().unwrap(),
+            })
+        }
+        ValueNode::GenericIncrement { value, .. } | ValueNode::CheckedSmiIncrement { value } => {
+            let vr = eager_range(value, phi_id, ranges, node_map, depth + 1)?;
+            Some(Range {
+                min: vr.min.checked_add(1)?,
+                max: vr.max.checked_add(1)?,
+            })
+        }
+        // Already-lowered Int32 ops (from Phase 1a induction rewriting).
+        ValueNode::Int32Add { left, right } => {
+            let lr = eager_range(left, phi_id, ranges, node_map, depth + 1)?;
+            let rr = eager_range(right, phi_id, ranges, node_map, depth + 1)?;
+            Some(Range {
+                min: lr.min.checked_add(rr.min)?,
+                max: lr.max.checked_add(rr.max)?,
+            })
+        }
+        ValueNode::Int32Multiply { left, right } => {
+            let lr = eager_range(left, phi_id, ranges, node_map, depth + 1)?;
+            let rr = eager_range(right, phi_id, ranges, node_map, depth + 1)?;
+            let candidates = [
+                lr.min.checked_mul(rr.min)?,
+                lr.min.checked_mul(rr.max)?,
+                lr.max.checked_mul(rr.min)?,
+                lr.max.checked_mul(rr.max)?,
+            ];
+            Some(Range {
+                min: candidates.iter().copied().min().unwrap(),
+                max: candidates.iter().copied().max().unwrap(),
+            })
+        }
+        ValueNode::Int32Increment { value } => {
+            let vr = eager_range(value, phi_id, ranges, node_map, depth + 1)?;
+            Some(Range {
+                min: vr.min.checked_add(1)?,
+                max: vr.max.checked_add(1)?,
+            })
+        }
+        ValueNode::Int32ShiftLeft { left, right } => {
+            let lr = eager_range(left, phi_id, ranges, node_map, depth + 1)?;
+            let rr = eager_range(right, phi_id, ranges, node_map, depth + 1)?;
+            if rr.min < 0 || rr.max > 31 {
+                return None;
+            }
+            Some(Range {
+                min: lr.min.checked_shl(rr.min as u32)?,
+                max: lr.max.checked_shl(rr.max as u32)?,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Walk a chain of `GenericAdd`/`CheckedSmiAdd` from the back-edge towards
+/// the accumulator Phi, summing the per-iteration addend contribution at
+/// each link.
+///
+/// For `sum = sum + (i * 2) + 1` the back-edge chain is:
+///   `GenericAdd(GenericAdd(sum_phi, i*2), 1)`
+/// This function walks the chain and returns the total addend range
+/// `[min(i*2+1), max(i*2+1)]`.
+///
+/// Returns `None` if the chain does not reach `phi_id` or if any addend
+/// range cannot be computed.
+fn find_chained_addend(
+    back_id: &NodeId,
+    phi_id: &NodeId,
+    node_map: &HashMap<NodeId, (u32, ValueNode)>,
+    ranges: &HashMap<NodeId, Range>,
+) -> Option<Range> {
+    let mut current = *back_id;
+    let mut total_min: i64 = 0;
+    let mut total_max: i64 = 0;
+    let mut depth: u32 = 0;
+
+    loop {
+        if depth > 8 {
+            return None;
+        }
+        depth += 1;
+
+        let (_, node) = node_map.get(&current)?;
+        let (left, right) = match node {
+            ValueNode::GenericAdd { left, right, .. }
+            | ValueNode::CheckedSmiAdd { left, right } => (*left, *right),
+            _ => return None,
+        };
+
+        // Check if either operand is the accumulator Phi.
+        if left == *phi_id {
+            let addend = eager_range(&right, phi_id, ranges, node_map, 0)?;
+            total_min = total_min.checked_add(addend.min)?;
+            total_max = total_max.checked_add(addend.max)?;
+            return Some(Range {
+                min: total_min,
+                max: total_max,
+            });
+        }
+        if right == *phi_id {
+            let addend = eager_range(&left, phi_id, ranges, node_map, 0)?;
+            total_min = total_min.checked_add(addend.min)?;
+            total_max = total_max.checked_add(addend.max)?;
+            return Some(Range {
+                min: total_min,
+                max: total_max,
+            });
+        }
+
+        // Neither operand is the Phi — one is an addend, the other
+        // continues the chain.  Try right as addend first (more common
+        // in `(sum + expr) + const` patterns).
+        let right_range = eager_range(&right, phi_id, ranges, node_map, 0);
+        let left_range = eager_range(&left, phi_id, ranges, node_map, 0);
+
+        if let Some(addend) = right_range {
+            total_min = total_min.checked_add(addend.min)?;
+            total_max = total_max.checked_add(addend.max)?;
+            current = left;
+        } else if let Some(addend) = left_range {
+            total_min = total_min.checked_add(addend.min)?;
+            total_max = total_max.checked_add(addend.max)?;
+            current = right;
+        } else {
+            return None;
+        }
     }
 }
 
@@ -1453,6 +1642,188 @@ mod tests {
             matches!(add_node.1, ValueNode::CheckedSmiAdd { .. }),
             "expected CheckedSmiAdd to stay checked for large accumulator, got {:?}",
             add_node.1
+        );
+    }
+
+    // ── Chained accumulator pattern: sum = sum + i*2 + 1 ────────────────
+
+    /// Build a loop graph for `for (i = 0; i < bound; i++) sum = sum + i*2 + 1;`
+    /// This creates a chained accumulator pattern where the back-edge goes
+    /// through two GenericAdd nodes: GenericAdd(GenericAdd(sum, i*2), 1).
+    fn build_chained_sum_loop_graph(
+        bound_value: i32,
+    ) -> (MaglevGraph, NodeId, NodeId, NodeId, NodeId) {
+        let mut graph = MaglevGraph::new(0);
+
+        let init_i = NodeId(0);
+        let init_sum = NodeId(1);
+        let const2 = NodeId(2);
+        let const1 = NodeId(3);
+        let phi_sum = NodeId(10);
+        let phi_i = NodeId(11);
+        let bound = NodeId(12);
+        let cmp = NodeId(13);
+        let mul = NodeId(20); // i * 2
+        let add1 = NodeId(21); // sum + i*2
+        let add2 = NodeId(22); // (sum + i*2) + 1
+        let step = NodeId(23); // i++
+
+        // Block 0 (entry)
+        let mut b0 = BasicBlock::new(0);
+        b0.push_with_id(init_i, ValueNode::SmiConstant { value: 0 });
+        b0.push_with_id(init_sum, ValueNode::SmiConstant { value: 0 });
+        b0.push_with_id(const2, ValueNode::SmiConstant { value: 2 });
+        b0.push_with_id(const1, ValueNode::SmiConstant { value: 1 });
+        b0.set_control(ControlNode::Jump { target: 1 });
+        graph.add_block(b0);
+
+        // Block 1 (header)
+        let mut b1 = BasicBlock::new(1);
+        b1.add_predecessor(0);
+        b1.add_predecessor(2);
+        b1.push_with_id(
+            phi_sum,
+            ValueNode::Phi {
+                inputs: vec![init_sum, add2],
+            },
+        );
+        b1.push_with_id(
+            phi_i,
+            ValueNode::Phi {
+                inputs: vec![init_i, step],
+            },
+        );
+        b1.push_with_id(bound, ValueNode::SmiConstant { value: bound_value });
+        b1.push_with_id(
+            cmp,
+            ValueNode::Int32LessThan {
+                left: phi_i,
+                right: bound,
+            },
+        );
+        b1.set_control(ControlNode::Branch {
+            condition: cmp,
+            if_true: 2,
+            if_false: 3,
+        });
+        graph.add_block(b1);
+
+        // Block 2 (body): t1 = i*2; t2 = sum + t1; t3 = t2 + 1; i++
+        let mut b2 = BasicBlock::new(2);
+        b2.add_predecessor(1);
+        b2.push_with_id(
+            mul,
+            ValueNode::GenericMultiply {
+                left: phi_i,
+                right: const2,
+                feedback_slot: 0,
+            },
+        );
+        b2.push_with_id(
+            add1,
+            ValueNode::GenericAdd {
+                left: phi_sum,
+                right: mul,
+                feedback_slot: 0,
+            },
+        );
+        b2.push_with_id(
+            add2,
+            ValueNode::GenericAdd {
+                left: add1,
+                right: const1,
+                feedback_slot: 0,
+            },
+        );
+        b2.push_with_id(step, ValueNode::CheckedSmiIncrement { value: phi_i });
+        b2.set_control(ControlNode::Jump { target: 1 });
+        graph.add_block(b2);
+
+        // Block 3 (exit)
+        let mut b3 = BasicBlock::new(3);
+        b3.add_predecessor(1);
+        b3.set_control(ControlNode::Return { value: phi_sum });
+        graph.add_block(b3);
+
+        (graph, add1, add2, mul, step)
+    }
+
+    #[test]
+    fn test_chained_accumulator_lowered() {
+        // sum = sum + i*2 + 1, bound = 10000
+        // Per-iteration addend range: i*2 ∈ [0, 19998], plus 1 → [1, 19999]
+        // Accumulator range: [0, 10000*19999] = [0, 199990000] fits i32
+        let (mut graph, _add1, add2, _mul, _step) = build_chained_sum_loop_graph(10_000);
+        eliminate_overflow_checks(&mut graph);
+
+        // The back-edge node (add2: (sum+i*2)+1) should be lowered to
+        // Int32Add since the accumulator range fits i32.
+        let back_node = graph.blocks()[2]
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == add2)
+            .unwrap();
+        assert!(
+            matches!(back_node.1, ValueNode::Int32Add { .. }),
+            "expected Int32Add for chained accumulator back-edge, got {:?}",
+            back_node.1
+        );
+    }
+
+    #[test]
+    fn test_chained_accumulator_intermediate_lowered() {
+        // After chained detection assigns the Phi range, Phase 2 should
+        // also lower the intermediate GenericAdd (sum + i*2) → Int32Add.
+        let (mut graph, add1, _add2, _mul, _step) = build_chained_sum_loop_graph(10_000);
+        eliminate_overflow_checks(&mut graph);
+
+        let mid_node = graph.blocks()[2]
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == add1)
+            .unwrap();
+        assert!(
+            matches!(mid_node.1, ValueNode::Int32Add { .. }),
+            "expected Int32Add for intermediate accumulator add, got {:?}",
+            mid_node.1
+        );
+    }
+
+    #[test]
+    fn test_chained_accumulator_multiply_lowered() {
+        // The GenericMultiply(i, 2) in the chain should also be lowered
+        // to Int32Multiply by Phase 2.
+        let (mut graph, _add1, _add2, mul, _step) = build_chained_sum_loop_graph(10_000);
+        eliminate_overflow_checks(&mut graph);
+
+        let mul_node = graph.blocks()[2]
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == mul)
+            .unwrap();
+        assert!(
+            matches!(mul_node.1, ValueNode::Int32Multiply { .. }),
+            "expected Int32Multiply for i*2, got {:?}",
+            mul_node.1
+        );
+    }
+
+    #[test]
+    fn test_chained_accumulator_not_lowered_huge_bound() {
+        // bound = 50000: per-iter max addend = 2*49999+1 = 99999
+        // acc_max = 50000 * 99999 = 4_999_950_000 > i32::MAX (~2.1B)
+        let (mut graph, _add1, add2, _mul, _step) = build_chained_sum_loop_graph(50_000);
+        eliminate_overflow_checks(&mut graph);
+
+        let back_node = graph.blocks()[2]
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == add2)
+            .unwrap();
+        assert!(
+            matches!(back_node.1, ValueNode::GenericAdd { .. }),
+            "expected GenericAdd to stay generic for huge accumulator, got {:?}",
+            back_node.1
         );
     }
 }
