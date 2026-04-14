@@ -167,6 +167,15 @@ fn cached_vec_jsvalue_layout() -> &'static jit_runtime::VecJsValueLayout {
     LAYOUT.get_or_init(jit_runtime::probe_vec_jsvalue_layout)
 }
 
+/// Cache the [`PropertyMap`] byte layout for inline named-property IC
+/// in the Maglev codegen.
+#[cfg(all(target_arch = "x86_64", unix))]
+fn cached_propertymap_layout() -> &'static jit_runtime::PropertyMapLayout {
+    use std::sync::OnceLock;
+    static LAYOUT: OnceLock<jit_runtime::PropertyMapLayout> = OnceLock::new();
+    LAYOUT.get_or_init(jit_runtime::probe_propertymap_layout)
+}
+
 /// A stub call argument that is either a Maglev IR node or an immediate i64.
 #[cfg(all(target_arch = "x86_64", unix))]
 enum NodeOrImm {
@@ -642,6 +651,15 @@ struct MaglevCodegen<'a> {
     /// Zero when the function has no keyed array access sites.
     #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
     array_ic_base: i32,
+    /// Byte offset from RBP of the first named-property IC slot.
+    /// Each site gets 32 bytes: `[handle, map_ptr, shape_id, offset]`.
+    /// Zero when the function has no named property access sites.
+    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
+    named_ic_base: i32,
+    /// Counter used during emission to assign sequential IC slots to
+    /// each `LoadNamedGeneric` site.
+    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
+    next_named_ic_site: i32,
     /// Total extra stack bytes reserved for caches (mono call cache +
     /// array IC + alignment padding).  Used for the single `sub rsp, N`
     /// in the prologue and `add rsp, N` in epilogue.
@@ -692,7 +710,7 @@ impl<'a> MaglevCodegen<'a> {
         // Track whether any keyed array access nodes exist.
         let mut has_keyed_sites = false;
         // Track whether any named property access nodes exist.
-        let mut has_named_sites = false;
+        let mut named_site_count: i32 = 0;
         for block in graph.blocks() {
             for (node_id, _) in &block.nodes {
                 if let Some(Location::Register(n)) = alloc.location(*node_id) {
@@ -724,8 +742,8 @@ impl<'a> MaglevCodegen<'a> {
                             | ValueNode::StoreFixedDoubleArrayElement { .. }
                     );
                 }
-                if !has_named_sites {
-                    has_named_sites = matches!(node, ValueNode::LoadNamedGeneric { .. });
+                if matches!(node, ValueNode::LoadNamedGeneric { .. }) {
+                    named_site_count += 1;
                 }
             }
         }
@@ -740,13 +758,16 @@ impl<'a> MaglevCodegen<'a> {
         } else {
             mono_call_cache_bytes
         };
-        let needs_r15 = mono_call_sites > 0 || has_keyed_sites || has_named_sites;
+        let needs_r15 = mono_call_sites > 0 || has_keyed_sites || named_site_count > 0;
         // Array IC: 32 bytes (4 × i64: handle, data_ptr, len, vec_ptr).
         // Place it after the mono cache area on the stack.  Rounded up
         // so the combined reservation stays a multiple of 16.
         let array_ic_bytes: i32 = if has_keyed_sites { 32 } else { 0 };
+        // Named property IC: 32 bytes per site (4 x i64: handle,
+        // map_ptr, shape_id, offset).
+        let named_ic_bytes: i32 = named_site_count.saturating_mul(32);
         let total_cache_bytes = {
-            let raw = mono_call_cache_bytes + array_ic_bytes;
+            let raw = mono_call_cache_bytes + array_ic_bytes + named_ic_bytes;
             if raw == 0 { 0 } else { (raw + 15) & !15 }
         };
         // IC base is addressed relative to RBP.  After 5 callee-saved
@@ -765,6 +786,14 @@ impl<'a> MaglevCodegen<'a> {
         // (which occupy [RBP-40 .. RBP-8]).
         let array_ic_base: i32 = if has_keyed_sites {
             -(40 + total_cache_bytes)
+        } else {
+            0
+        };
+        // Named IC base: placed between array IC and mono cache.
+        // Each site gets 32 bytes (4 x i64).
+        let named_ic_base: i32 = if named_site_count > 0 {
+            let array_overhead = if has_keyed_sites { 32 } else { 0 };
+            -(40 + total_cache_bytes) + array_overhead
         } else {
             0
         };
@@ -794,6 +823,8 @@ impl<'a> MaglevCodegen<'a> {
             needs_r15,
             deferred_branches: Vec::new(),
             array_ic_base,
+            named_ic_base,
+            next_named_ic_site: 0,
             total_cache_bytes,
             ctx_regfile_offset: None,
             rax_holds: None,
@@ -5148,6 +5179,31 @@ impl<'a> MaglevCodegen<'a> {
     ///   restore live regs; deopt check; store result
     /// ```
     #[cfg(all(target_arch = "x86_64", unix))]
+    /// Emit a **true-inline** fast path for named property load.
+    ///
+    /// ## Fast path (≈20 x86 instructions, ZERO function calls)
+    ///
+    /// Uses a 4-slot per-site inline cache on the JIT stack
+    /// (`[handle, map_ptr, shape_id, offset]`).
+    ///
+    /// ```text
+    ///   mov  R11, <object>            ; load receiver handle
+    ///   cmp  R11, [RBP + ic_handle]   ; IC check: same object?
+    ///   jne  slow
+    ///   mov  R10, [RBP + ic_map_ptr]  ; cached PropertyMap ptr
+    ///   mov  RAX, [R10 + shape_off]   ; LIVE shape_id from PropertyMap
+    ///   cmp  RAX, [RBP + ic_shape]    ; shape unchanged?
+    ///   jne  slow
+    ///   mov  R11, [R10 + vals_off]    ; LIVE values data pointer
+    ///   mov  R10, [RBP + ic_offset]   ; cached field offset
+    ///   <compute element address>
+    ///   <load discriminant, dispatch on type>
+    /// ```
+    ///
+    /// ## Slow path
+    ///
+    /// Calls `jit_runtime_fill_named_ic_r15` which populates the IC and
+    /// returns the value.  On miss falls back to the full generic stub.
     fn emit_inline_load_named(
         &mut self,
         id: NodeId,
@@ -5155,64 +5211,146 @@ impl<'a> MaglevCodegen<'a> {
         name: u32,
         feedback_slot: u32,
     ) {
-        let saved = self.emit_save_live_regs(id);
+        let jv_layout = cached_jsvalue_layout();
+        let pm_layout = cached_propertymap_layout();
 
-        // Load arguments into ABI registers.
-        self.emit_load(object, Reg64::Rdi);
-        self.masm.mov_ri(Reg64::Rsi, i64::from(name));
+        // Allocate this site's IC slot.
+        let site = self.next_named_ic_site;
+        self.next_named_ic_site += 1;
+        let ic_base = self.named_ic_base + site * 32;
+        let ic_off_handle = ic_base; // +0
+        let ic_off_map_ptr = ic_base + 8; // +8
+        let ic_off_shape = ic_base + 16; // +16
+        let ic_off_offset = ic_base + 24; // +24
 
-        // Save args for the potential fallback.  Four pushes (32 bytes)
-        // preserves 16-byte stack alignment (RSP ≡ 0 mod 16 after
-        // emit_save_live_regs).  We save feedback_slot since the generic
-        // stub needs it in RDX.
-        self.masm.mov_ri(Reg64::Rdx, i64::from(feedback_slot));
-        self.masm.push(Reg64::R11); // alignment padding
-        self.masm.push(Reg64::Rdx); // feedback_slot
-        self.masm.push(Reg64::Rsi); // name_idx
-        self.masm.push(Reg64::Rdi); // object
-
-        // Call the lean inline helper: returns {value, hit} in RAX:RDX.
-        // When R15 holds the RT_PTRS cell address, pass it as the 3rd
-        // argument (RDX) to skip the TLS lookup in the inline helper.
-        if self.needs_r15 {
-            self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
-            let inline_addr =
-                jit_runtime::jit_runtime_inline_lda_named_property_r15 as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, inline_addr as i64);
-        } else {
-            let inline_addr =
-                jit_runtime::jit_runtime_inline_lda_named_property as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, inline_addr as i64);
-        }
-        self.masm.call_reg(Reg64::R11);
-
-        // Check hit flag (RDX).
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
-        self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
-        self.masm.je(&mut slow_label);
+        let mut load_smi = Label::new();
+        let mut load_bool = Label::new();
+        let mut load_undef = Label::new();
 
-        // ── Fast path: inline helper handled it ──
-        // Discard the saved args (4 × 8 = 32 bytes) and jump to common exit.
-        self.masm.add_ri(Reg64::Rsp, 32);
+        // ── Fast path (scratch regs only: R11, R10, RAX) ────────────
+
+        // Load receiver into scratch register.
+        self.emit_load(object, Reg64::R11);
+
+        // IC handle check: same object?
+        self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, ic_off_handle);
+        self.masm.jne(&mut slow_label);
+
+        // Load cached PropertyMap pointer.
+        self.masm
+            .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, ic_off_map_ptr);
+        // Read LIVE shape_id from PropertyMap.
+        self.masm
+            .mov_load_base_disp32(Reg64::Rax, Reg64::R10, pm_layout.shape_id_offset as i32);
+        // Compare with cached shape_id.
+        self.masm.cmp_rm(Reg64::Rax, Reg64::Rbp, ic_off_shape);
+        self.masm.jne(&mut slow_label);
+
+        // Shape matches → property at same offset.
+        // Re-derive LIVE values data pointer from PropertyMap.
+        self.masm.mov_load_base_disp32(
+            Reg64::R11,
+            Reg64::R10,
+            pm_layout.values_data_ptr_offset as i32,
+        );
+        // R11 = values data pointer (current, not stale).
+
+        // Load cached field offset.
+        self.masm
+            .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, ic_off_offset);
+
+        // Compute element address: R11 + R10 * sizeof(JsValue).
+        // sizeof(JsValue) == 24 == 3 * 8.
+        debug_assert_eq!(
+            jv_layout.jsvalue_size, 24,
+            "LEA chain assumes JsValue is 24 bytes"
+        );
+        self.masm.lea_scaled(Reg64::R10, Reg64::R10, Reg64::R10, 2); // R10 = offset * 3
+        // SHL R10, 3 — REX.WB C1 /4 r/m=R10(enc=2), imm8=3
+        self.masm.emit_byte(0x49); // REX.W + REX.B
+        self.masm.emit_byte(0xC1); // SHL r/m64, imm8
+        self.masm.emit_byte(0xE2); // ModRM: mod=11, /4, r/m=2
+        self.masm.emit_byte(0x03); // shift count = 3
+        self.masm.add_rr(Reg64::R11, Reg64::R10);
+
+        // Load discriminant byte.
+        self.masm
+            .movzx_byte_base_disp32(Reg64::Rax, Reg64::R11, jv_layout.disc_offset as i32);
+
+        // Dispatch on type.
+        self.masm.cmp_ri(Reg64::Rax, jv_layout.smi_disc as i32);
+        self.masm.je(&mut load_smi);
+        self.masm.cmp_ri(Reg64::Rax, jv_layout.bool_disc as i32);
+        self.masm.je(&mut load_bool);
+        self.masm.cmp_ri(Reg64::Rax, jv_layout.undef_disc as i32);
+        self.masm.je(&mut load_undef);
+        // Other types (String, Object, …) → slow path.
+        self.masm.jmp(&mut slow_label);
+
+        // ── load_smi: sign-extend i32 payload ───────────────────────
+        self.masm.bind_label(&mut load_smi);
+        self.masm
+            .movsxd_base_disp32(Reg64::Rax, Reg64::R11, jv_layout.smi_payload_offset as i32);
         self.masm.jmp(&mut done_label);
 
-        // ── Slow path: fall back to the full generic stub ──
+        // ── load_bool: encode as JIT_FALSE/JIT_TRUE ─────────────────
+        self.masm.bind_label(&mut load_bool);
+        self.masm.movzx_byte_base_disp32(
+            Reg64::Rax,
+            Reg64::R11,
+            jv_layout.bool_payload_offset as i32,
+        );
+        self.masm.and_ri(Reg64::Rax, 1);
+        self.masm.mov_ri(Reg64::R11, JIT_FALSE);
+        self.masm.add_rr(Reg64::Rax, Reg64::R11);
+        self.masm.jmp(&mut done_label);
+
+        // ── load_undef: → JIT_UNDEFINED ─────────────────────────────
+        self.masm.bind_label(&mut load_undef);
+        self.masm.mov_ri(Reg64::Rax, JIT_UNDEFINED);
+        self.masm.jmp(&mut done_label);
+
+        // ── Slow path: IC miss / non-inlineable type ────────────────
         self.masm.bind_label(&mut slow_label);
-        self.masm.pop(Reg64::Rdi); // restore object
-        self.masm.pop(Reg64::Rsi); // restore name_idx
-        self.masm.pop(Reg64::Rdx); // restore feedback_slot
-        self.masm.pop(Reg64::R11); // discard alignment padding
+        let saved = self.emit_save_live_regs(id);
+
+        // Set up ABI args for jit_runtime_fill_named_ic_r15:
+        //   RDI = obj, RSI = name_idx, RDX = rt_ptrs (R15),
+        //   RCX = &ic_slots
+        self.emit_load(object, Reg64::Rdi);
+        self.masm.mov_ri(Reg64::Rsi, i64::from(name));
+        self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
+        self.masm.lea_base_disp32(Reg64::Rcx, Reg64::Rbp, ic_base);
+
+        let ic_fill_addr = jit_runtime::jit_runtime_fill_named_ic_r15 as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, ic_fill_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        // Result: RAX = value, RDX = hit flag.
+        let mut generic_label = Label::new();
+        self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
+        self.masm.je(&mut generic_label);
+        // IC-fill hit: RAX has the encoded value.
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+        self.masm.jmp(&mut done_label);
+
+        // ── Generic fallback ────────────────────────────────────────
+        self.masm.bind_label(&mut generic_label);
+        self.emit_load(object, Reg64::Rdi);
+        self.masm.mov_ri(Reg64::Rsi, i64::from(name));
+        self.masm.mov_ri(Reg64::Rdx, i64::from(feedback_slot));
         let stub_addr = jit_runtime::jit_runtime_lda_named_property as *const () as usize;
         self.masm.mov_ri(Reg64::R11, stub_addr as i64);
         self.masm.call_reg(Reg64::R11);
 
-        // ── Common exit ──
-        self.masm.bind_label(&mut done_label);
         self.emit_restore_live_regs(saved);
-        // Deopt check: harmless on fast path (RAX is always valid);
-        // catches JIT_DEOPT from the generic stub on the slow path.
         self.emit_deopt_check_rax();
+
+        // ── Common exit ─────────────────────────────────────────────
+        self.masm.bind_label(&mut done_label);
         self.emit_store(id, Reg64::Rax);
     }
 

@@ -1355,6 +1355,15 @@ impl PropertyMap {
         unsafe { self.values.get_unchecked(offset) }
     }
 
+    /// Returns the raw values slice.
+    ///
+    /// Used by the JIT layout probe to discover the byte offset of the
+    /// `values` Vec data pointer within `PropertyMap`.
+    #[inline]
+    pub fn values_as_slice(&self) -> &[JsValue] {
+        &self.values
+    }
+
     /// Returns `true` when `offset` still names `key` in the current layout.
     #[inline]
     pub fn matches_key_at_offset(&self, offset: usize, key: &str) -> bool {

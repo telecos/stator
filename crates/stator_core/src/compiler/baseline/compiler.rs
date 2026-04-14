@@ -7109,6 +7109,207 @@ pub(crate) mod jit_runtime {
         }
     }
 
+    // ── PropertyMap layout probing for inline named-property IC ────────
+
+    /// Compile-time-discovered byte layout of [`PropertyMap`] for the
+    /// inline named-property IC fast path in Maglev codegen.
+    ///
+    /// The inline IC needs to read `shape_id` and the `values` Vec data
+    /// pointer directly from a `PropertyMap` pointer using only x86
+    /// instructions (no Rust function calls).
+    #[derive(Debug, Clone, Copy)]
+    pub struct PropertyMapLayout {
+        /// Byte offset of `shape_id: u64` within `PropertyMap`.
+        pub shape_id_offset: usize,
+        /// Byte offset of the `values` Vec data-pointer field within
+        /// `PropertyMap`.  The Vec layout is `[ptr, len, cap]`; this
+        /// offset points to the `ptr` field.
+        pub values_data_ptr_offset: usize,
+    }
+
+    /// Probe the in-memory byte layout of [`PropertyMap`] to find the
+    /// offsets of `shape_id` and `values` Vec data pointer.
+    ///
+    /// Uses distinctive sentinel values to locate each field by scanning
+    /// the raw bytes of a stack-allocated PropertyMap.
+    pub fn probe_propertymap_layout() -> PropertyMapLayout {
+        // Create a PropertyMap with a distinctive shape_id.
+        let mut map = PropertyMap::with_capacity(4);
+        // Insert properties so the values Vec has a non-null data ptr.
+        map.insert("__probe_a__".to_string(), JsValue::Smi(0));
+        map.insert("__probe_b__".to_string(), JsValue::Smi(0));
+
+        let data_ptr = map.values_as_slice().as_ptr() as usize;
+
+        // Set a distinctive shape_id by performing structural mutations.
+        // Each insert bumps shape_id.  Read the current value.
+        let shape = map.shape_id();
+        assert_ne!(shape, 0, "probe: shape_id should be non-zero after inserts");
+
+        let map_ptr = &map as *const PropertyMap as *const u8;
+        let map_size = std::mem::size_of::<PropertyMap>();
+
+        // ── Find shape_id offset ──
+        let shape_bytes = shape.to_ne_bytes();
+        let mut shape_id_offset = None;
+        for i in 0..=(map_size.saturating_sub(8)) {
+            // SAFETY: reading bytes of a stack-allocated PropertyMap.
+            let matches = (0..8).all(|j| unsafe { *map_ptr.add(i + j) } == shape_bytes[j]);
+            if matches {
+                shape_id_offset = Some(i);
+                break;
+            }
+        }
+        let shape_id_offset = shape_id_offset
+            .expect("PropertyMap: cannot find shape_id field in byte representation");
+
+        // ── Find values Vec data-pointer offset ──
+        let ptr_bytes = data_ptr.to_ne_bytes();
+        let mut values_data_ptr_offset = None;
+        for i in 0..=(map_size.saturating_sub(8)) {
+            // SAFETY: reading bytes of a stack-allocated PropertyMap.
+            let matches = (0..8).all(|j| unsafe { *map_ptr.add(i + j) } == ptr_bytes[j]);
+            if matches {
+                values_data_ptr_offset = Some(i);
+                break;
+            }
+        }
+        let values_data_ptr_offset = values_data_ptr_offset
+            .expect("PropertyMap: cannot find values Vec data pointer in byte representation");
+
+        // Cross-check: insert another property and verify shape_id changed.
+        map.insert("__probe_c__".to_string(), JsValue::Smi(0));
+        let new_shape = map.shape_id();
+        let probed_shape = unsafe { *(map_ptr.add(shape_id_offset) as *const u64) };
+        assert_eq!(
+            probed_shape, new_shape,
+            "PropertyMap: shape_id field not at expected offset"
+        );
+
+        // Cross-check: verify values data pointer reads correctly.
+        let new_data_ptr = map.values_as_slice().as_ptr() as usize;
+        let probed_ptr = unsafe { *(map_ptr.add(values_data_ptr_offset) as *const usize) };
+        assert_eq!(
+            probed_ptr, new_data_ptr,
+            "PropertyMap: values data pointer not at expected offset"
+        );
+
+        PropertyMapLayout {
+            shape_id_offset,
+            values_data_ptr_offset,
+        }
+    }
+
+    // ── Named property inline-cache fill ────────────────────────────────
+
+    /// Result returned by [`jit_runtime_fill_named_ic_r15`].
+    ///
+    /// Returned via SysV AMD64 ABI in RAX:RDX.
+    #[repr(C)]
+    pub struct NamedIcResult {
+        /// JIT i64 property value (meaningful only when `hit != 0`).
+        pub value: i64,
+        /// Non-zero when the inline path succeeded.
+        pub hit: i64,
+    }
+
+    impl NamedIcResult {
+        const MISS: Self = Self { value: 0, hit: 0 };
+    }
+
+    /// Combined named-property IC fill **and** load.
+    ///
+    /// Resolves the heap handle, fills the 4-slot inline cache at
+    /// `ic_slots` (`[handle, map_ptr, shape_id, offset]`), and performs
+    /// the property load — all in a single call.
+    ///
+    /// Only fills the IC for own data-property hits on `PlainObject`
+    /// receivers (not prototype hits, getters, array length, etc.).
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`obj_i64`) – JIT i64 encoding of the receiver.
+    /// * `RSI` (`name_idx`) – constant-pool index of the property name.
+    /// * `RDX` (`rt_ptrs_cell`) – pointer to `Cell<RtPtrs>` TLS slot.
+    /// * `RCX` (`ic_slots`) – pointer to 4 consecutive `i64` on the
+    ///   stack: `[handle, map_ptr, shape_id, offset]`.
+    ///
+    /// Returns [`NamedIcResult`] in `RAX:RDX`.
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub extern "C" fn jit_runtime_fill_named_ic_r15(
+        obj_i64: i64,
+        name_idx: u32,
+        rt_ptrs_cell: i64,
+        ic_slots: *mut [i64; 4],
+    ) -> NamedIcResult {
+        if !is_heap_handle(obj_i64) {
+            return NamedIcResult::MISS;
+        }
+        let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+        // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
+        // TLS slot lives for the thread's entire lifetime.
+        let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
+        if !ptrs.is_cached() {
+            return NamedIcResult::MISS;
+        }
+        // SAFETY: cached pointers valid for thread lifetime.
+        let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+        let heap_val = match heap.get(obj_idx) {
+            Some(v) => v,
+            None => return NamedIcResult::MISS,
+        };
+
+        if let JsValue::PlainObject(map_rc) = heap_val {
+            let prop_name = match get_rt_string_constant_ref(name_idx) {
+                Some(n) => n,
+                None => return NamedIcResult::MISS,
+            };
+            // SAFETY: single-threaded JIT; no concurrent borrows.
+            let map = unsafe { &*map_rc.as_ptr() };
+            let shape = map.shape_id();
+            if let Some(offset) = map.offset_of(prop_name) {
+                // SAFETY: offset valid while shape_id unchanged.
+                let val = unsafe { map.get_by_offset_unchecked(offset) };
+                // Only fill the IC for inline-encodable values.
+                if let Some(encoded) = try_encode_named_ic_value(val) {
+                    // Fill IC slots: [handle, map_ptr, shape_id, offset]
+                    let map_raw = map_rc.as_ptr() as i64;
+                    unsafe {
+                        (*ic_slots)[0] = obj_i64;
+                        (*ic_slots)[1] = map_raw;
+                        (*ic_slots)[2] = shape as i64;
+                        (*ic_slots)[3] = offset as i64;
+                    }
+                    return NamedIcResult {
+                        value: encoded,
+                        hit: 1,
+                    };
+                }
+            }
+        }
+
+        // Fall back to the existing inline helper (probes proto IC too).
+        let result = inline_lda_named_with_ptrs(obj_i64, name_idx, ptrs);
+        NamedIcResult {
+            value: result.value,
+            hit: result.hit,
+        }
+    }
+
+    /// Try to encode a property value as a JIT i64 without allocating.
+    ///
+    /// Returns `None` for heap objects that would need a new handle.
+    fn try_encode_named_ic_value(val: &JsValue) -> Option<i64> {
+        match val {
+            JsValue::Smi(n) => Some(i64::from(*n)),
+            JsValue::Boolean(b) => Some(if *b { JIT_TRUE } else { JIT_FALSE }),
+            JsValue::Undefined => Some(JIT_UNDEFINED),
+            JsValue::Null => Some(JIT_NULL),
+            _ => None,
+        }
+    }
+
     // ── Array inline-cache fill + load ──────────────────────────────────
 
     /// Result returned by [`jit_runtime_fill_array_ic_r15`].
