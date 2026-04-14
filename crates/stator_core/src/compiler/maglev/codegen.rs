@@ -5544,6 +5544,11 @@ impl<'a> MaglevCodegen<'a> {
 
         // ── Generic fallback ────────────────────────────────────────
         self.masm.bind_label(&mut generic_label);
+        // The IC fill call above clobbered caller-saved regs (RCX, RDX,
+        // RSI, R8, R9).  Restore them so emit_load reads the correct
+        // object/key values, then re-save for the generic call.
+        self.emit_restore_live_regs(saved);
+        let saved2 = self.emit_save_live_regs(id);
         self.emit_load(object, Reg64::Rdi);
         self.emit_load(key, Reg64::Rsi);
         if self.needs_r15 {
@@ -5557,7 +5562,7 @@ impl<'a> MaglevCodegen<'a> {
         }
         self.masm.call_reg(Reg64::R11);
 
-        self.emit_restore_live_regs(saved);
+        self.emit_restore_live_regs(saved2);
         self.emit_deopt_check_rax();
 
         // ── Common exit ─────────────────────────────────────────────
