@@ -4165,6 +4165,34 @@ impl<'a> MaglevCodegen<'a> {
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_mul(&mut self, id: NodeId, left: NodeId, right: NodeId) {
         if self.i32_range.contains(&left) && self.i32_range.contains(&right) {
+            // Strength-reduce *2: ADD is 1c vs IMUL's 3c.
+            let const_2 = self
+                .try_get_i32_constant(right)
+                .filter(|&v| v == 2)
+                .map(|_| left)
+                .or_else(|| {
+                    self.try_get_i32_constant(left)
+                        .filter(|&v| v == 2)
+                        .map(|_| right)
+                });
+            if let Some(var) = const_2 {
+                match self.alloc.location(id) {
+                    Some(Location::Register(n)) => {
+                        let dst = phys_reg(n);
+                        self.emit_load(var, dst);
+                        self.masm.add_rr(dst, dst);
+                        self.note_reg_holds(dst, id);
+                    }
+                    _ => {
+                        self.emit_load(var, Reg64::Rax);
+                        self.masm.add_rr(Reg64::Rax, Reg64::Rax);
+                        self.emit_store(id, Reg64::Rax);
+                        self.rax_holds = Some(id);
+                    }
+                }
+                return;
+            }
+
             match self.alloc.location(id) {
                 Some(Location::Register(n)) => {
                     let dst = phys_reg(n);
@@ -4214,6 +4242,35 @@ impl<'a> MaglevCodegen<'a> {
                 .or_else(|| self.try_get_i32_constant(left).map(|imm| (right, imm)));
 
             if let Some((var, imm)) = const_pair {
+                // Strength-reduce *2 to ADD (1c vs IMUL's 3c).
+                // ADD correctly sets OF for the overflow deopt.
+                if imm == 2 {
+                    match self.alloc.location(id) {
+                        Some(Location::Register(n)) => {
+                            let dst = phys_reg(n);
+                            self.emit_load(var, dst);
+                            self.masm.add32_rr(dst, dst);
+                            if !narrow {
+                                self.masm
+                                    .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
+                                self.masm.movsxd_sign_extend(dst, dst);
+                            }
+                            self.note_reg_holds(dst, id);
+                        }
+                        _ => {
+                            self.emit_load(var, Reg64::R11);
+                            self.masm.add32_rr(Reg64::R11, Reg64::R11);
+                            if !narrow {
+                                self.masm
+                                    .jcc(CondCode::Overflow, &mut self.deopt_stub_label);
+                                self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
+                            }
+                            self.emit_store(id, Reg64::R11);
+                        }
+                    }
+                    return;
+                }
+
                 let lea_scale: Option<u8> = match imm {
                     3 => Some(2),
                     5 => Some(4),
