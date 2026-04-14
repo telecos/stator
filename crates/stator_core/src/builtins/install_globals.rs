@@ -6907,8 +6907,19 @@ fn make_array() -> JsValue {
                     len,
                     to_integer_or_infinity_arg(args.get(3), len as f64)?,
                 );
-                for i in s..e {
-                    array_like_set_index(arr, i, value.clone());
+                // Fast path: fill a native Array slice in one borrow
+                if let JsValue::Array(items) = arr {
+                    let mut borrow = items.borrow_mut();
+                    if e > borrow.len() {
+                        borrow.resize(e, JsValue::TheHole);
+                    }
+                    for slot in &mut borrow[s..e] {
+                        *slot = value.clone();
+                    }
+                } else {
+                    for i in s..e {
+                        array_like_set_index(arr, i, value.clone());
+                    }
                 }
                 Ok(arr.clone())
             }),
