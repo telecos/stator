@@ -982,6 +982,51 @@ pub(crate) mod jit_runtime {
         RT_PTRS.with(|p| p.set(RtPtrs::EMPTY));
     }
 
+    /// Comprehensive teardown of **all** JIT thread-local state.
+    ///
+    /// Unlike [`jit_runtime_teardown`], which intentionally preserves warm
+    /// IC state and cached contexts for the next JIT call, this function
+    /// releases *every* `Rc` and raw-pointer reference held in JIT
+    /// thread-locals.  Call it once when the thread is about to exit
+    /// (e.g. at the end of `main()` in benchmark binaries) so that
+    /// all reference-counted objects are dropped while the TLS variables
+    /// they transitively reference are still alive — preventing
+    /// use-after-free crashes during non-deterministic TLS destruction.
+    pub fn jit_full_teardown() {
+        // ── Standard teardown ──────────────────────────────────────
+        RT_BYTECODE.with(|b| b.set(std::ptr::null()));
+        recycle_and_clear_heap();
+        RT_PTRS.with(|p| p.set(RtPtrs::EMPTY));
+
+        // ── Drop leaked Rc in callee caches ────────────────────────
+        CACHED_CALLEE.with(|c| {
+            let entry = c.get();
+            drop_cached_ctx_rc_raw(entry.ctx_rc_raw);
+            c.set(CachedCalleeEntry::EMPTY);
+        });
+        MAGLEV_CALLEE_CACHE.with(|c| {
+            let cache = c.get();
+            drop_cached_ctx_rc_raw(cache.ctx_rc_raw);
+            c.set(MaglevCalleeCache::EMPTY);
+        });
+
+        // ── Release Rc-holding runtime TLS ─────────────────────────
+        RT_CONTEXT.with(|c| *c.borrow_mut() = None);
+        RT_GLOBAL.with(|g| {
+            let mut state = g.borrow_mut();
+            state.env = None;
+            state.ic = [(u32::MAX, 0, 0); 64];
+        });
+        DIRECT_CALL_OLD_CTX.with(|c| *c.borrow_mut() = None);
+        RT_LAST_BA.with(|b| b.set((std::ptr::null(), 0)));
+
+        // ── Clear heap so recycled PlainObjects don't linger ───────
+        RT_HEAP.with(|h| h.borrow_mut().clear());
+
+        // ── Drain property-map pools that may hold Rc/JsValue ──────
+        crate::objects::property_map::clear_property_map_pools();
+    }
+
     /// Set the current closure context for context-slot stubs.
     ///
     /// Called before JIT execution of closure bodies that use

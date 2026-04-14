@@ -454,6 +454,19 @@ pub(crate) fn recycle_object_rc(rc: Rc<RefCell<PropertyMap>>) {
     });
 }
 
+/// Drain all thread-local property-map pools so that cached
+/// `Rc<RefCell<PropertyMap>>`, `Vec<JsValue>`, and storage buffers are
+/// dropped while the thread-local variables they reference are still alive.
+///
+/// Called during full thread-local teardown (e.g. before benchmark process
+/// exit) to prevent cascading drops during TLS destruction from accessing
+/// already-destroyed thread-locals.
+pub fn clear_property_map_pools() {
+    OBJECT_RC_POOL.with(|pool| pool.borrow_mut().clear());
+    VALUES_VEC_POOL.with(|pool| pool.borrow_mut().clear());
+    PROPERTY_STORAGE_POOL.with(|pool| pool.borrow_mut().clear());
+}
+
 /// Returns `Some(n)` if `key` is a valid ECMAScript array index — a canonical
 /// decimal string representing an integer in `0 ..= 2^32 − 2`.
 ///

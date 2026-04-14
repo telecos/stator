@@ -21,7 +21,7 @@ use std::hint::black_box;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group};
 use stator_core::compiler::baseline::compiler::{
     STUB_DEOPT_SLOTS, STUB_NAMES, reset_stub_deopt_counts, stub_deopt_counts,
 };
@@ -61,6 +61,19 @@ fn make_global_env() -> Rc<RefCell<GlobalEnv>> {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+thread_local! {
+    static CACHED_ENV: RefCell<Option<Rc<RefCell<GlobalEnv>>>> = const { RefCell::new(None) };
+    static COMPILE_CACHE: RefCell<HashMap<u64, Rc<BytecodeArray>>> = RefCell::new(HashMap::new());
+}
+
+/// Drop cached `Rc<BytecodeArray>` and `Rc<RefCell<GlobalEnv>>` so that
+/// all reference-counted JS objects are released while thread-local
+/// storage is still alive — preventing SIGSEGV during TLS destruction.
+fn clear_eval_cache() {
+    COMPILE_CACHE.with(|c| c.borrow_mut().clear());
+    CACHED_ENV.with(|c| *c.borrow_mut() = None);
+}
+
 /// Parse, compile, and execute a snippet of JavaScript source, returning the
 /// final accumulator value.
 ///
@@ -71,10 +84,6 @@ fn make_global_env() -> Rc<RefCell<GlobalEnv>> {
 fn eval_js(source: &str) -> StatorResult<JsValue> {
     use std::hash::{Hash, Hasher};
 
-    thread_local! {
-        static CACHED_ENV: RefCell<Option<Rc<RefCell<GlobalEnv>>>> = const { RefCell::new(None) };
-        static COMPILE_CACHE: RefCell<HashMap<u64, Rc<BytecodeArray>>> = RefCell::new(HashMap::new());
-    }
     let env = CACHED_ENV.with(|c| c.borrow().clone()).unwrap_or_else(|| {
         let env = make_global_env();
         CACHED_ENV.with(|c| *c.borrow_mut() = Some(Rc::clone(&env)));
@@ -780,10 +789,25 @@ criterion_group! {
         bench_deep_object_access_1k,
 }
 
-criterion_main!(
-    infra_benches,
-    property_map_benches,
-    jsvalue_benches,
-    js_benches,
-    v8_comparison_benches
-);
+// Custom main that clears all thread-local caches before the process
+// exits, preventing SIGSEGV from non-deterministic TLS destruction order.
+fn main() {
+    infra_benches();
+    property_map_benches();
+    jsvalue_benches();
+    js_benches();
+    v8_comparison_benches();
+
+    Criterion::default().configure_from_args().final_summary();
+
+    // Release cached Rc<BytecodeArray> and Rc<RefCell<GlobalEnv>> from
+    // the eval_js helper so they drop before TLS destruction begins.
+    clear_eval_cache();
+
+    // Drain interpreter pools (FRAME_POOL, REGISTER_POOL, etc.)
+    stator_core::interpreter::clear_interpreter_state();
+
+    // Full JIT teardown: releases leaked Rc in callee caches,
+    // clears RT_CONTEXT/RT_GLOBAL, and drains property-map pools.
+    stator_core::compiler::baseline::compiler::jit_full_teardown();
+}
