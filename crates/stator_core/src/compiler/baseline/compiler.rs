@@ -534,6 +534,12 @@ pub(crate) mod jit_runtime {
         same_context: bool,
         /// Cached `ba.parameter_count() == 0`.
         skip_args: bool,
+        /// Raw pointer from `Rc::into_raw(Rc::clone(ctx))`.  Holds one
+        /// strong reference count so that the cached `ctx_ptr` remains
+        /// valid even after `set_closure_context` replaces the inner
+        /// `Rc`.  Must be dropped via [`drop_cached_ctx_rc_raw`] when
+        /// the entry is invalidated or replaced.
+        ctx_rc_raw: *const RefCell<JsContext>,
     }
 
     impl MaglevCalleeCache {
@@ -542,6 +548,7 @@ pub(crate) mod jit_runtime {
             ctx_ptr: 0,
             same_context: false,
             skip_args: false,
+            ctx_rc_raw: std::ptr::null(),
         };
     }
 
@@ -3161,14 +3168,53 @@ pub(crate) mod jit_runtime {
             // ── Repeat-callee cache: skip context lookup on cache hit ──
             let cache = ptrs.get_maglev_callee_cache();
             let (skip_args, ctx_raw, same_context) = if cache.ba_ptr == ba_ptr {
-                // Cache hit — reuse resolved context pointer and
-                // comparison result from the previous call.
-                (cache.skip_args, cache.ctx_ptr, cache.same_context)
+                // Cache hit — verify the closure context hasn't been
+                // replaced by a subsequent `set_closure_context` call
+                // (e.g. when the same closure bytecode is re-instantiated
+                // with a fresh context in a new iteration).
+                let current_ctx_ptr = ba
+                    .closure_context()
+                    .map(Rc::as_ptr)
+                    .unwrap_or(std::ptr::null()) as i64;
+                if cache.ctx_ptr == current_ctx_ptr {
+                    // Full hit — reuse resolved context pointer and
+                    // comparison result from the previous call.
+                    (cache.skip_args, cache.ctx_ptr, cache.same_context)
+                } else {
+                    // Context changed — drop old Rc, re-resolve.
+                    drop_cached_ctx_rc_raw(cache.ctx_rc_raw);
+                    let skip_args = ba.parameter_count() == 0;
+                    let callee_ctx = ba.closure_context();
+                    let ctx_rc_raw = callee_ctx
+                        .map(|rc| Rc::into_raw(Rc::clone(rc)))
+                        .unwrap_or(std::ptr::null());
+                    let ctx_raw = ctx_rc_raw as i64;
+                    // SAFETY: no active borrows; read current context pointer.
+                    let runtime_ctx_ptr = unsafe {
+                        (*ctx_ref.as_ptr())
+                            .as_ref()
+                            .map(Rc::as_ptr)
+                            .unwrap_or(std::ptr::null())
+                    };
+                    let same_context = std::ptr::eq(ctx_rc_raw, runtime_ctx_ptr);
+                    ptrs.set_maglev_callee_cache(MaglevCalleeCache {
+                        ba_ptr,
+                        ctx_ptr: ctx_raw,
+                        same_context,
+                        skip_args,
+                        ctx_rc_raw,
+                    });
+                    (skip_args, ctx_raw, same_context)
+                }
             } else {
-                // Cache miss — resolve and populate.
+                // Cache miss — drop old Rc (if any), resolve and populate.
+                drop_cached_ctx_rc_raw(cache.ctx_rc_raw);
                 let skip_args = ba.parameter_count() == 0;
-                let callee_ctx_raw = ba.closure_context();
-                let callee_ctx_ptr = callee_ctx_raw.map(Rc::as_ptr).unwrap_or(std::ptr::null());
+                let callee_ctx = ba.closure_context();
+                let ctx_rc_raw = callee_ctx
+                    .map(|rc| Rc::into_raw(Rc::clone(rc)))
+                    .unwrap_or(std::ptr::null());
+                let ctx_raw = ctx_rc_raw as i64;
                 // SAFETY: no active borrows; read current context pointer.
                 let current_ctx_ptr = unsafe {
                     (*ctx_ref.as_ptr())
@@ -3176,13 +3222,13 @@ pub(crate) mod jit_runtime {
                         .map(Rc::as_ptr)
                         .unwrap_or(std::ptr::null())
                 };
-                let same_context = std::ptr::eq(callee_ctx_ptr, current_ctx_ptr);
-                let ctx_raw = callee_ctx_ptr as i64;
+                let same_context = std::ptr::eq(ctx_rc_raw, current_ctx_ptr);
                 ptrs.set_maglev_callee_cache(MaglevCalleeCache {
                     ba_ptr,
                     ctx_ptr: ctx_raw,
                     same_context,
                     skip_args,
+                    ctx_rc_raw,
                 });
                 (skip_args, ctx_raw, same_context)
             };
@@ -3245,6 +3291,10 @@ pub(crate) mod jit_runtime {
             let result_val = if is_jit_deopt(jit_result) {
                 // Callee deopted — invalidate the repeat-callee cache
                 // so the next call re-evaluates context state.
+                // Re-read from TLS since the cache may have been
+                // updated after the initial `cache` snapshot.
+                let current_cache = ptrs.get_maglev_callee_cache();
+                drop_cached_ctx_rc_raw(current_cache.ctx_rc_raw);
                 ptrs.set_maglev_callee_cache(MaglevCalleeCache::EMPTY);
                 None
             } else {
@@ -3638,8 +3688,45 @@ pub(crate) mod jit_runtime {
                     // result when the same callee is called again.
                     let mcache = ptrs.get_maglev_callee_cache();
                     let same_context = if mcache.ba_ptr == ba_ptr {
-                        mcache.same_context
+                        // Verify context hasn't changed.
+                        let current_ctx_ptr =
+                            ba.closure_context()
+                                .map(Rc::as_ptr)
+                                .unwrap_or(std::ptr::null()) as i64;
+                        if mcache.ctx_ptr == current_ctx_ptr {
+                            mcache.same_context
+                        } else {
+                            // Context changed — drop old Rc, re-resolve.
+                            drop_cached_ctx_rc_raw(mcache.ctx_rc_raw);
+                            let callee_ctx_ptr = current_ctx_ptr as *const RefCell<JsContext>;
+                            let current_ctx_raw = unsafe {
+                                (*ctx_ref.as_ptr())
+                                    .as_ref()
+                                    .map(Rc::as_ptr)
+                                    .unwrap_or(std::ptr::null())
+                            };
+                            let same = std::ptr::eq(callee_ctx_ptr, current_ctx_raw);
+                            // Hold Rc reference to keep context alive.
+                            let ctx_rc_raw = if !cached_entry.ctx_rc_raw.is_null() {
+                                unsafe {
+                                    Rc::increment_strong_count(cached_entry.ctx_rc_raw);
+                                }
+                                cached_entry.ctx_rc_raw
+                            } else {
+                                std::ptr::null()
+                            };
+                            ptrs.set_maglev_callee_cache(MaglevCalleeCache {
+                                ba_ptr,
+                                ctx_ptr: cached_entry.ctx_ptr,
+                                same_context: same,
+                                skip_args,
+                                ctx_rc_raw,
+                            });
+                            same
+                        }
                     } else {
+                        // Cache miss — drop old Rc, resolve.
+                        drop_cached_ctx_rc_raw(mcache.ctx_rc_raw);
                         let callee_ctx_ptr = cached_entry.ctx_ptr as *const RefCell<JsContext>;
                         let current_ctx_ptr = unsafe {
                             (*ctx_ref.as_ptr())
@@ -3648,11 +3735,21 @@ pub(crate) mod jit_runtime {
                                 .unwrap_or(std::ptr::null())
                         };
                         let same = std::ptr::eq(callee_ctx_ptr, current_ctx_ptr);
+                        // Hold Rc reference to keep context alive.
+                        let ctx_rc_raw = if !cached_entry.ctx_rc_raw.is_null() {
+                            unsafe {
+                                Rc::increment_strong_count(cached_entry.ctx_rc_raw);
+                            }
+                            cached_entry.ctx_rc_raw
+                        } else {
+                            std::ptr::null()
+                        };
                         ptrs.set_maglev_callee_cache(MaglevCalleeCache {
                             ba_ptr,
                             ctx_ptr: cached_entry.ctx_ptr,
                             same_context: same,
                             skip_args,
+                            ctx_rc_raw,
                         });
                         same
                     };
@@ -3726,6 +3823,10 @@ pub(crate) mod jit_runtime {
                         entry.maglev_reg_slots = 0;
                         ptrs.set_cached_callee(entry);
                         // Invalidate repeat-callee cache on deopt.
+                        // Re-read from TLS since the cache may have been
+                        // updated after the initial `mcache` snapshot.
+                        let current_cache = ptrs.get_maglev_callee_cache();
+                        drop_cached_ctx_rc_raw(current_cache.ctx_rc_raw);
                         ptrs.set_maglev_callee_cache(MaglevCalleeCache::EMPTY);
                         unsafe {
                             if (*heap_ref.as_ptr()).len() != heap_base {
@@ -5098,9 +5199,10 @@ pub(crate) mod jit_runtime {
         // context read and pointer comparison.
         let ba_raw = ba_ptr as *const BytecodeArray;
         let mcache = ptrs.get_maglev_callee_cache();
-        let same_context = if mcache.ba_ptr == ba_raw {
+        let same_context = if mcache.ba_ptr == ba_raw && mcache.ctx_ptr == cached_ctx_ptr {
             mcache.same_context
         } else {
+            drop_cached_ctx_rc_raw(mcache.ctx_rc_raw);
             let callee_ctx_raw = cached_ctx_ptr as *const RefCell<JsContext>;
             // SAFETY: no active borrows of context RefCell.
             let current_ctx = unsafe {
@@ -5110,11 +5212,23 @@ pub(crate) mod jit_runtime {
                     .unwrap_or(std::ptr::null())
             };
             let same = std::ptr::eq(callee_ctx_raw, current_ctx);
+            // Hold Rc reference: the cached_ctx_ptr is alive this call
+            // (backed by the callee's closure_context Rc), so
+            // Rc::increment_strong_count keeps it alive across calls.
+            let ctx_rc_raw = if cached_ctx_ptr != 0 {
+                unsafe {
+                    Rc::increment_strong_count(callee_ctx_raw);
+                }
+                callee_ctx_raw
+            } else {
+                std::ptr::null()
+            };
             ptrs.set_maglev_callee_cache(MaglevCalleeCache {
                 ba_ptr: ba_raw,
                 ctx_ptr: cached_ctx_ptr,
                 same_context: same,
                 skip_args: true, // 0-arg dispatch
+                ctx_rc_raw,
             });
             same
         };
