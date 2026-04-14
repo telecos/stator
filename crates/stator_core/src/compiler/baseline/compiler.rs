@@ -3651,7 +3651,7 @@ pub(crate) mod jit_runtime {
                     // `extern "C" fn(*mut i64, i64) -> i64`.
                     let f: extern "C" fn(*mut i64, i64) -> i64 =
                         unsafe { std::mem::transmute(cached_entry.maglev_fn as *const ()) };
-                    let jit_result = f(reg_file.as_mut_ptr() as *mut i64, cached_entry.ctx_ptr);
+                    let jit_result = f(reg_file.as_mut_ptr(), cached_entry.ctx_ptr);
                     bc_ref.set(saved_ba);
                     if skip_args {
                         ptrs.set_skip_mapped_args(false);
@@ -3921,7 +3921,7 @@ pub(crate) mod jit_runtime {
                         let mut reg_file = [0i64; 16];
                         let f: extern "C" fn(*mut i64, i64) -> i64 =
                             unsafe { std::mem::transmute(entry.entry_fn as *const ()) };
-                        let jit_result = f(reg_file.as_mut_ptr() as *mut i64, entry.ctx_ptr);
+                        let jit_result = f(reg_file.as_mut_ptr(), entry.ctx_ptr);
                         bc_ref.set(saved_ba);
                         if skip_args {
                             ptrs.set_skip_mapped_args(false);
@@ -5126,7 +5126,7 @@ pub(crate) mod jit_runtime {
         // the baseline or Maglev compiler.
         let f: extern "C" fn(*mut i64, i64) -> i64 =
             unsafe { std::mem::transmute(entry_point as usize as *const ()) };
-        let result = f(reg_file.as_mut_ptr() as *mut i64, cached_ctx_ptr);
+        let result = f(reg_file.as_mut_ptr(), cached_ctx_ptr);
 
         // ── Finish ──────────────────────────────────────────────
         bc_ref.set(saved_ba);
