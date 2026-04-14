@@ -69,6 +69,7 @@ jobs:
         continue-on-error: true
         env:
           MALLOC_ARENA_MAX: "2"
+          RUST_BACKTRACE: "full"
 
       - name: Run V8-comparison benchmarks (one-by-one)
         run: |
@@ -89,6 +90,7 @@ jobs:
         continue-on-error: true
         env:
           MALLOC_ARENA_MAX: "2"
+          RUST_BACKTRACE: "full"
 
       - name: Run V8 (Node.js) comparison benchmarks
         run: |

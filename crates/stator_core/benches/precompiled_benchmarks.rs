@@ -25,6 +25,60 @@ use stator_core::interpreter::{
 };
 use stator_core::parser::recursive_descent;
 
+/// Install a SIGSEGV handler that prints diagnostic info before aborting.
+#[cfg(unix)]
+fn install_sigsegv_handler() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        extern "C" fn handler(
+            sig: libc::c_int,
+            info: *mut libc::siginfo_t,
+            _ctx: *mut libc::c_void,
+        ) {
+            let fault_addr = if info.is_null() {
+                0usize
+            } else {
+                (*info).si_addr() as usize
+            };
+            // Print to stderr — CI captures this.
+            let msg = format!(
+                "\n=== SIGSEGV HANDLER ===\nsignal={sig} fault_addr=0x{fault_addr:016x}\n\
+                 backtrace:\n{}\n=== END SIGSEGV ===\n",
+                std::backtrace::Backtrace::force_capture()
+            );
+            // Use write(2) directly to avoid stdio buffering issues in signal handler.
+            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+            libc::_exit(11);
+        }
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = handler as usize;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESETHAND;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+    });
+}
+
+#[cfg(not(unix))]
+fn install_sigsegv_handler() {}
+
+/// Check whether the current benchmark name matches the CLI filter passed
+/// via `cargo bench -- "^name$"`.  Criterion calls every registered benchmark
+/// function regardless of the filter, so we need this guard to skip warmup
+/// for non-targeted benchmarks (preventing a crashing benchmark from killing
+/// the whole process).
+fn matches_bench_filter(bench_name: &str) -> bool {
+    for arg in std::env::args().skip(1) {
+        if arg.starts_with('-') {
+            continue;
+        }
+        // First non-flag positional argument is the filter regex.
+        let pat = arg.trim_matches('^').trim_matches('$');
+        return bench_name == pat || bench_name.contains(pat) || pat.contains(bench_name);
+    }
+    true // no filter — run everything
+}
+
 /// CI-friendly Criterion configuration with reduced samples to avoid timeouts.
 fn ci_config() -> Criterion {
     Criterion::default()
@@ -67,6 +121,7 @@ fn warmup_with_maglev(
     env: &Rc<RefCell<GlobalEnv>>,
     name: &str,
 ) {
+    install_sigsegv_handler();
     // Phase 1: 100 interpreter iterations to warm ICs + trigger Maglev.
     for _ in 0..100 {
         let mut frame = InterpreterFrame::new_with_globals(Rc::clone(ba), vec![], Rc::clone(env));
@@ -124,7 +179,9 @@ fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
         ba.bytecodes().len()
     );
     let env = make_global_env();
-    warmup_with_maglev(&ba, &env, "fib_40");
+    if matches_bench_filter("fib_40_iterative_precompiled") {
+        warmup_with_maglev(&ba, &env, "fib_40");
+    }
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     let stubs_before = stub_deopt_counts();
@@ -164,7 +221,9 @@ fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
         ba.bytecodes().len()
     );
     let env = make_global_env();
-    warmup_with_maglev(&ba, &env, "arithmetic_loop");
+    if matches_bench_filter("arithmetic_loop_10k_precompiled") {
+        warmup_with_maglev(&ba, &env, "arithmetic_loop");
+    }
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     let stubs_before = stub_deopt_counts();
@@ -205,7 +264,9 @@ fn bench_property_access_1k_precompiled(c: &mut Criterion) {
         ba.bytecodes().len()
     );
     let env = make_global_env();
-    warmup_with_maglev(&ba, &env, "property_access");
+    if matches_bench_filter("property_access_1k_precompiled") {
+        warmup_with_maglev(&ba, &env, "property_access");
+    }
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     let stubs_before = stub_deopt_counts();
@@ -253,7 +314,9 @@ fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
         ba.bytecodes().len()
     );
     let env = make_global_env();
-    warmup_with_maglev(&ba, &env, "object_creation");
+    if matches_bench_filter("object_creation_1k_precompiled") {
+        warmup_with_maglev(&ba, &env, "object_creation");
+    }
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     let stubs_before = stub_deopt_counts();
@@ -297,7 +360,9 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
         ba.bytecodes().len()
     );
     let env = make_global_env();
-    warmup_with_maglev(&ba, &env, "array_push_sum");
+    if matches_bench_filter("array_push_sum_1k_precompiled") {
+        warmup_with_maglev(&ba, &env, "array_push_sum");
+    }
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     let stubs_before = stub_deopt_counts();
@@ -342,7 +407,9 @@ fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
         ba.bytecodes().len()
     );
     let env = make_global_env();
-    warmup_with_maglev(&ba, &env, "closure_counter");
+    if matches_bench_filter("closure_counter_1k_precompiled") {
+        warmup_with_maglev(&ba, &env, "closure_counter");
+    }
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     let stubs_before = stub_deopt_counts();
@@ -389,7 +456,9 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
         ba.bytecodes().len()
     );
     let env = make_global_env();
-    warmup_with_maglev(&ba, &env, "prototype_chain");
+    if matches_bench_filter("prototype_chain_1k_precompiled") {
+        warmup_with_maglev(&ba, &env, "prototype_chain");
+    }
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     let stubs_before = stub_deopt_counts();
@@ -441,7 +510,9 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
         ba.bytecodes().len()
     );
     let env = make_global_env();
-    warmup_with_maglev(&ba, &env, "sieve_primes");
+    if matches_bench_filter("sieve_primes_1k_precompiled") {
+        warmup_with_maglev(&ba, &env, "sieve_primes");
+    }
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     let stubs_before = stub_deopt_counts();
@@ -482,7 +553,9 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
         ba.bytecodes().len()
     );
     let env = make_global_env();
-    warmup_with_maglev(&ba, &env, "deep_object");
+    if matches_bench_filter("deep_object_access_1k_precompiled") {
+        warmup_with_maglev(&ba, &env, "deep_object");
+    }
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
     let stubs_before = stub_deopt_counts();
