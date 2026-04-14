@@ -5081,7 +5081,7 @@ pub(crate) mod jit_runtime {
         cached_ctx_ptr: i64,
         ptrs: RtPtrs,
         callee_i64: i64,
-        reg_slots: usize,
+        _reg_slots: usize,
     ) -> i64 {
         // SAFETY: cached pointers set by cache_rt_ptrs; valid for thread
         // lifetime.  Single-threaded access guaranteed.
