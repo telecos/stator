@@ -22,6 +22,9 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use stator_core::compiler::baseline::compiler::{
+    STUB_DEOPT_SLOTS, STUB_NAMES, reset_stub_deopt_counts, stub_deopt_counts,
+};
 
 /// CI-friendly Criterion configuration with reduced samples to avoid timeouts.
 fn ci_config() -> Criterion {
@@ -603,6 +606,18 @@ fn bench_closure_counter_1k(c: &mut Criterion) {
         }
         result;
     "#;
+    reset_stub_deopt_counts();
+    for _ in 0..10 {
+        let _ = eval_js(source);
+    }
+    let counts = stub_deopt_counts();
+    eprintln!("CLOSURE_DIAG stub_deopts_after_10_runs:");
+    for i in 0..STUB_DEOPT_SLOTS {
+        if counts[i] > 0 {
+            eprintln!("  {}: {}", STUB_NAMES[i], counts[i]);
+        }
+    }
+    reset_stub_deopt_counts();
     c.bench_function("closure_counter_1k", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
@@ -625,6 +640,18 @@ fn bench_prototype_chain_1k(c: &mut Criterion) {
         }
         sum;
     "#;
+    reset_stub_deopt_counts();
+    for _ in 0..10 {
+        let _ = eval_js(source);
+    }
+    let counts = stub_deopt_counts();
+    eprintln!("PROTO_DIAG stub_deopts_after_10_runs:");
+    for i in 0..STUB_DEOPT_SLOTS {
+        if counts[i] > 0 {
+            eprintln!("  {}: {}", STUB_NAMES[i], counts[i]);
+        }
+    }
+    reset_stub_deopt_counts();
     c.bench_function("prototype_chain_1k", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
@@ -652,6 +679,19 @@ fn bench_sieve_primes_1k(c: &mut Criterion) {
         }
         count;
     "#;
+    // Print stub deopt diagnostics before and after for CI visibility.
+    reset_stub_deopt_counts();
+    for _ in 0..10 {
+        let _ = eval_js(source);
+    }
+    let counts = stub_deopt_counts();
+    eprintln!("SIEVE_DIAG stub_deopts_after_10_runs:");
+    for i in 0..STUB_DEOPT_SLOTS {
+        if counts[i] > 0 {
+            eprintln!("  {}: {}", STUB_NAMES[i], counts[i]);
+        }
+    }
+    reset_stub_deopt_counts();
     c.bench_function("sieve_primes_1k", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());

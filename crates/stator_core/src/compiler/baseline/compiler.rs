@@ -2251,7 +2251,7 @@ pub(crate) mod jit_runtime {
                 cache.proto[proto_slot]
             };
             if pe.receiver_handle == obj_i64 && pe.name_idx == name_idx {
-                let epoch = PropertyMap::global_proto_mutation_epoch();
+                let epoch = combined_ic_epoch();
                 if pe.global_epoch == epoch {
                     return Some(pe.cached_value);
                 }
@@ -2315,7 +2315,7 @@ pub(crate) mod jit_runtime {
                 if proto_entry.name_idx == name_idx && proto_entry.shape == shape {
                     // Re-stamp the entry with the current epoch so that
                     // Phase 0 will hit on the next access.
-                    let epoch = PropertyMap::global_proto_mutation_epoch();
+                    let epoch = combined_ic_epoch();
                     // SAFETY: scoped borrow dropped above; single-threaded.
                     let cache_mut = unsafe { &mut *ic_ref.as_ptr() };
                     let pe = &mut cache_mut.proto[proto_slot];
