@@ -5342,6 +5342,12 @@ impl<'a> MaglevCodegen<'a> {
         //   RDI = obj, RSI = name_idx, RDX = rt_ptrs (R15),
         //   RCX = &ic_slots
         self.emit_load(object, Reg64::Rdi);
+        // Save object for the generic fallback path.  The IC fill
+        // call clobbers caller-saved regs, and `object` may not be
+        // in the live set (last use) so restore_live_regs won't
+        // recover it.  Two pushes preserve 16-byte alignment.
+        self.masm.push(Reg64::Rdi);
+        self.masm.push(Reg64::R11); // alignment padding
         self.masm.mov_ri(Reg64::Rsi, i64::from(name));
         self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
         self.masm.lea_base_disp32(Reg64::Rcx, Reg64::Rbp, ic_base);
@@ -5354,26 +5360,25 @@ impl<'a> MaglevCodegen<'a> {
         let mut generic_label = Label::new();
         self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
         self.masm.je(&mut generic_label);
-        // IC-fill hit: RAX has the encoded value.
+        // IC-fill hit: discard saved obj + padding, restore regs.
+        self.masm.add_ri(Reg64::Rsp, 16);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
         self.masm.jmp(&mut done_label);
 
         // ── Generic fallback ────────────────────────────────────────
-        // The IC-fill call above clobbered caller-saved registers.
-        // Restore them so that `emit_load(object, ..)` reads the
-        // correct value, then save again for the generic stub call.
+        // Pop the saved object (safe even if it was a last-use reg)
+        // and reuse the original save_live_regs frame.
         self.masm.bind_label(&mut generic_label);
-        self.emit_restore_live_regs(saved);
-        let saved2 = self.emit_save_live_regs(id);
-        self.emit_load(object, Reg64::Rdi);
+        self.masm.pop(Reg64::R11); // discard alignment padding
+        self.masm.pop(Reg64::Rdi); // restore saved object
         self.masm.mov_ri(Reg64::Rsi, i64::from(name));
         self.masm.mov_ri(Reg64::Rdx, i64::from(feedback_slot));
         let stub_addr = jit_runtime::jit_runtime_lda_named_property as *const () as usize;
         self.masm.mov_ri(Reg64::R11, stub_addr as i64);
         self.masm.call_reg(Reg64::R11);
 
-        self.emit_restore_live_regs(saved2);
+        self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
 
         // ── Common exit ─────────────────────────────────────────────
@@ -5549,6 +5554,12 @@ impl<'a> MaglevCodegen<'a> {
         //   RDI = obj, RSI = key, RDX = rt_ptrs (R15), RCX = &ic_slots
         self.emit_load(object, Reg64::Rdi);
         self.emit_load(key, Reg64::Rsi);
+        // Save object and key for the generic fallback path.  The IC
+        // fill call clobbers caller-saved regs, and these inputs may
+        // not be in the live set (last use) so restore_live_regs
+        // won't recover them.  Two pushes preserve 16-byte alignment.
+        self.masm.push(Reg64::Rsi); // save key
+        self.masm.push(Reg64::Rdi); // save object
         self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
         self.masm.lea_base_disp32(Reg64::Rcx, Reg64::Rbp, ic_base);
 
@@ -5561,20 +5572,18 @@ impl<'a> MaglevCodegen<'a> {
         let mut generic_label = Label::new();
         self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
         self.masm.je(&mut generic_label);
-        // IC-fill hit: RAX has the encoded value, jump to exit.
+        // IC-fill hit: discard saved obj + key, restore regs.
+        self.masm.add_ri(Reg64::Rsp, 16);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
         self.masm.jmp(&mut done_label);
 
         // ── Generic fallback ────────────────────────────────────────
+        // Pop saved object+key (safe even if they were last-use regs)
+        // and reuse the original save_live_regs frame.
         self.masm.bind_label(&mut generic_label);
-        // The IC fill call above clobbered caller-saved regs (RCX, RDX,
-        // RSI, R8, R9).  Restore them so emit_load reads the correct
-        // object/key values, then re-save for the generic call.
-        self.emit_restore_live_regs(saved);
-        let saved2 = self.emit_save_live_regs(id);
-        self.emit_load(object, Reg64::Rdi);
-        self.emit_load(key, Reg64::Rsi);
+        self.masm.pop(Reg64::Rdi); // restore saved object
+        self.masm.pop(Reg64::Rsi); // restore saved key
         if self.needs_r15 {
             // Pass R15 (cached RT_PTRS cell) in RDX (3rd arg).
             self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
@@ -5586,7 +5595,7 @@ impl<'a> MaglevCodegen<'a> {
         }
         self.masm.call_reg(Reg64::R11);
 
-        self.emit_restore_live_regs(saved2);
+        self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
 
         // ── Common exit ─────────────────────────────────────────────
