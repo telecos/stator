@@ -1414,8 +1414,17 @@ impl PropertyMap {
             index.insert(key.clone(), pos);
         }
         Rc::make_mut(&mut self.keys).insert(pos, key);
+        // Defensive: ensure values vec can accommodate the insert position
+        // (template COW keys may leave values shorter than keys).
+        if pos > self.values.len() {
+            self.values.resize(pos, JsValue::Undefined);
+        }
         self.values.insert(pos, value);
-        Rc::make_mut(&mut self.attrs).insert(pos, attrs);
+        let attrs_vec = Rc::make_mut(&mut self.attrs);
+        if pos > attrs_vec.len() {
+            attrs_vec.resize(pos, DEFAULT_ATTRS);
+        }
+        attrs_vec.insert(pos, attrs);
         self.capacity_hint = self.capacity_hint.max(self.keys.len());
         if is_integer_key {
             self.integer_key_count += 1;
@@ -1585,9 +1594,14 @@ impl PropertyMap {
 
     /// Inserts a property using an already-interned key.
     pub fn insert_rc(&mut self, key: Rc<str>, value: JsValue) {
-        if let Some(i) = self.lookup_slot_cached(&key)
-            && i < self.values.len()
-        {
+        if let Some(i) = self.lookup_slot_cached(&key) {
+            // Key already exists — extend values vec if template left it
+            // shorter than keys (COW keys from object-literal templates
+            // can have more entries than the values vec).
+            if i >= self.values.len() {
+                self.values.resize(i + 1, JsValue::Undefined);
+                Rc::make_mut(&mut self.attrs).resize(i + 1, DEFAULT_ATTRS);
+            }
             self.values[i] = value;
             self.touch_proto_generation();
             return;
@@ -1619,9 +1633,12 @@ impl PropertyMap {
 
     /// Inserts a built-in property using an already-interned key.
     pub fn insert_builtin_rc(&mut self, key: Rc<str>, value: JsValue) {
-        if let Some(i) = self.lookup_slot_cached(&key)
-            && i < self.values.len()
-        {
+        if let Some(i) = self.lookup_slot_cached(&key) {
+            // Key already exists — extend values vec if needed (same as insert_rc).
+            if i >= self.values.len() {
+                self.values.resize(i + 1, JsValue::Undefined);
+                Rc::make_mut(&mut self.attrs).resize(i + 1, BUILTIN_ATTRS);
+            }
             self.values[i] = value;
             Rc::make_mut(&mut self.attrs)[i] = BUILTIN_ATTRS;
             self.touch_proto_generation();
@@ -1708,8 +1725,11 @@ impl PropertyMap {
 
     /// Returns the value and attribute flags for `key`.
     pub fn get_with_attrs(&self, key: &str) -> Option<(&JsValue, PropertyAttributes)> {
-        self.lookup_slot_cached(key)
-            .map(|slot| (&self.values[slot], self.attrs[slot]))
+        self.lookup_slot_cached(key).and_then(|slot| {
+            let v = self.values.get(slot)?;
+            let a = self.attrs.get(slot).copied()?;
+            Some((v, a))
+        })
     }
 
     /// Inserts a property with explicit attribute flags.
@@ -1728,6 +1748,11 @@ impl PropertyMap {
         attrs: PropertyAttributes,
     ) {
         if let Some(i) = self.lookup_slot_cached(&key) {
+            // Extend values/attrs if template left them shorter than keys.
+            if i >= self.values.len() {
+                self.values.resize(i + 1, JsValue::Undefined);
+                Rc::make_mut(&mut self.attrs).resize(i + 1, DEFAULT_ATTRS);
+            }
             self.values[i] = value;
             Rc::make_mut(&mut self.attrs)[i] = attrs;
             self.touch_proto_generation();
@@ -1746,7 +1771,11 @@ impl PropertyMap {
     /// Returns `true` if the property existed and was updated.
     pub fn set_attrs(&mut self, key: &str, attrs: PropertyAttributes) -> bool {
         if let Some(i) = self.lookup_slot_cached(key) {
-            Rc::make_mut(&mut self.attrs)[i] = attrs;
+            let attrs_vec = Rc::make_mut(&mut self.attrs);
+            if i >= attrs_vec.len() {
+                attrs_vec.resize(i + 1, DEFAULT_ATTRS);
+            }
+            attrs_vec[i] = attrs;
             self.bump_shape_id();
             self.touch_proto_generation();
             true
@@ -1757,34 +1786,42 @@ impl PropertyMap {
 
     /// Returns the attribute flags for `key`, or `None` if absent.
     pub fn attrs(&self, key: &str) -> Option<PropertyAttributes> {
-        self.lookup_slot_cached(key).map(|slot| self.attrs[slot])
+        self.lookup_slot_cached(key)
+            .and_then(|slot| self.attrs.get(slot).copied())
     }
 
     /// Returns `true` if the property exists and is writable.
     pub fn is_writable(&self, key: &str) -> bool {
         self.lookup_slot_cached(key)
-            .map(|i| self.attrs[i].contains(PropertyAttributes::WRITABLE))
+            .and_then(|i| self.attrs.get(i))
+            .map(|a| a.contains(PropertyAttributes::WRITABLE))
             .unwrap_or(false)
     }
 
     /// Returns `true` if the property exists and is configurable.
     pub fn is_configurable(&self, key: &str) -> bool {
         self.lookup_slot_cached(key)
-            .map(|i| self.attrs[i].contains(PropertyAttributes::CONFIGURABLE))
+            .and_then(|i| self.attrs.get(i))
+            .map(|a| a.contains(PropertyAttributes::CONFIGURABLE))
             .unwrap_or(false)
     }
 
     /// Returns `true` if the property exists and is enumerable.
     pub fn is_enumerable(&self, key: &str) -> bool {
         self.lookup_slot_cached(key)
-            .map(|i| self.attrs[i].contains(PropertyAttributes::ENUMERABLE))
+            .and_then(|i| self.attrs.get(i))
+            .map(|a| a.contains(PropertyAttributes::ENUMERABLE))
             .unwrap_or(false)
     }
 
     /// Set or clear the `WRITABLE` flag for an existing property.
     pub fn set_writable(&mut self, key: &str, writable: bool) {
         if let Some(i) = self.lookup_slot_cached(key) {
-            let a = &mut Rc::make_mut(&mut self.attrs)[i];
+            let attrs_vec = Rc::make_mut(&mut self.attrs);
+            if i >= attrs_vec.len() {
+                attrs_vec.resize(i + 1, DEFAULT_ATTRS);
+            }
+            let a = &mut attrs_vec[i];
             if writable {
                 a.insert(PropertyAttributes::WRITABLE);
             } else {
@@ -1798,7 +1835,11 @@ impl PropertyMap {
     /// Set or clear the `ENUMERABLE` flag for an existing property.
     pub fn set_enumerable(&mut self, key: &str, enumerable: bool) {
         if let Some(i) = self.lookup_slot_cached(key) {
-            let a = &mut Rc::make_mut(&mut self.attrs)[i];
+            let attrs_vec = Rc::make_mut(&mut self.attrs);
+            if i >= attrs_vec.len() {
+                attrs_vec.resize(i + 1, DEFAULT_ATTRS);
+            }
+            let a = &mut attrs_vec[i];
             if enumerable {
                 a.insert(PropertyAttributes::ENUMERABLE);
             } else {
@@ -1812,7 +1853,11 @@ impl PropertyMap {
     /// Set or clear the `CONFIGURABLE` flag for an existing property.
     pub fn set_configurable(&mut self, key: &str, configurable: bool) {
         if let Some(i) = self.lookup_slot_cached(key) {
-            let a = &mut Rc::make_mut(&mut self.attrs)[i];
+            let attrs_vec = Rc::make_mut(&mut self.attrs);
+            if i >= attrs_vec.len() {
+                attrs_vec.resize(i + 1, DEFAULT_ATTRS);
+            }
+            let a = &mut attrs_vec[i];
             if configurable {
                 a.insert(PropertyAttributes::CONFIGURABLE);
             } else {
