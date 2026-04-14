@@ -894,6 +894,17 @@ pub(crate) mod jit_runtime {
             drop_cached_ctx_rc_raw(old.ctx_rc_raw);
             c.set(CachedCalleeEntry::EMPTY);
         });
+        // The Maglev callee cache also holds a raw BA pointer and an
+        // Rc-reference-counted context pointer that are invalidated when
+        // the heap is cleared.  A stale `ba_ptr` is only used for
+        // equality checks (safe), but the `ctx_rc_raw` keeps the old
+        // context alive indefinitely and a stale `same_context` flag
+        // could cause incorrect context-swap decisions in edge cases.
+        MAGLEV_CALLEE_CACHE.with(|c| {
+            let old = c.get();
+            drop_cached_ctx_rc_raw(old.ctx_rc_raw);
+            c.set(MaglevCalleeCache::EMPTY);
+        });
         // Only reset the property and array-method ICs when the function
         // changes.  Re-entrant calls to the same BytecodeArray (e.g.
         // criterion iterations) keep warm IC state, saving ~190ns per
@@ -977,6 +988,14 @@ pub(crate) mod jit_runtime {
     pub fn jit_runtime_teardown() {
         RT_BYTECODE.with(|b| b.set(std::ptr::null()));
         recycle_and_clear_heap();
+        // Drop stale Rc held by the Maglev callee cache so the old
+        // closure context is freed promptly (its BA is already gone
+        // after heap recycling).
+        MAGLEV_CALLEE_CACHE.with(|c| {
+            let old = c.get();
+            drop_cached_ctx_rc_raw(old.ctx_rc_raw);
+            c.set(MaglevCalleeCache::EMPTY);
+        });
         // Property IC and array-method IC deliberately kept warm —
         // cleared only when the BytecodeArray changes in jit_runtime_setup.
         RT_PTRS.with(|p| p.set(RtPtrs::EMPTY));
