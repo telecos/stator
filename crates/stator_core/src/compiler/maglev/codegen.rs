@@ -2066,6 +2066,14 @@ impl<'a> MaglevCodegen<'a> {
                     self.masm.test_rr(Reg64::R11, Reg64::R11);
                     self.masm.je(&mut slow_label);
 
+                    // Bounds check: slot_idx < slots.len.
+                    self.masm.cmp_mi(
+                        Reg64::R11,
+                        ctx_layout.slots_len_offset as i32,
+                        (slot_idx as i32) + 1,
+                    );
+                    self.masm.jcc(CondCode::Below, &mut slow_label);
+
                     // R11 = Vec<JsValue> data pointer.
                     self.masm.mov_load_base_disp32(
                         Reg64::R11,
@@ -2140,6 +2148,14 @@ impl<'a> MaglevCodegen<'a> {
                         .mov_load_base_disp32(Reg64::R11, Reg64::R14, ctx_off);
                     self.masm.test_rr(Reg64::R11, Reg64::R11);
                     self.masm.je(&mut slow_label);
+
+                    // Bounds check: slot_idx < slots.len.
+                    self.masm.cmp_mi(
+                        Reg64::R11,
+                        ctx_layout.slots_len_offset as i32,
+                        (slot_idx as i32) + 1,
+                    );
+                    self.masm.jcc(CondCode::Below, &mut slow_label);
 
                     // R11 = Vec<JsValue> data pointer.
                     self.masm.mov_load_base_disp32(
@@ -3761,6 +3777,14 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.cmp_ri(Reg64::R11, 3);
         self.masm.jcc(CondCode::Below, &mut slow_label);
 
+        // Bounds check: slot_idx < slots.len (RDI still holds ctx_raw).
+        self.masm.cmp_mi(
+            Reg64::Rdi,
+            ctx_layout.slots_len_offset as i32,
+            (slot_idx as i32) + 1,
+        );
+        self.masm.jcc(CondCode::Below, &mut slow_label);
+
         // R11 = Vec<JsValue> data pointer (slots field).
         self.masm.mov_load_base_disp32(
             Reg64::R11,
@@ -3841,6 +3865,14 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.emit_byte(0xEB);
         self.masm.emit_byte(0x20);
         self.masm.cmp_ri(Reg64::R11, 3);
+        self.masm.jcc(CondCode::Below, &mut slow_label);
+
+        // Bounds check: slot_idx < slots.len (RDI still holds ctx_raw).
+        self.masm.cmp_mi(
+            Reg64::Rdi,
+            ctx_layout.slots_len_offset as i32,
+            (slot_idx as i32) + 1,
+        );
         self.masm.jcc(CondCode::Below, &mut slow_label);
 
         // R11 = Vec<JsValue> data pointer.

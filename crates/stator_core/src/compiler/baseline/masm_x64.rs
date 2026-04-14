@@ -779,6 +779,26 @@ impl MacroAssembler {
         self.emit_modrm_base_disp32(reg, base, disp);
     }
 
+    /// `CMP QWORD PTR [base + disp32], imm` — compare a 64-bit memory
+    /// operand against a sign-extended 32-bit immediate.
+    ///
+    /// Uses the short `83 /7 imm8` form when `imm` fits in a signed byte,
+    /// otherwise `81 /7 imm32`.
+    pub fn cmp_mi(&mut self, base: Reg64, disp: i32, imm: i32) {
+        // REX.W for 64-bit operand size; REX.B when base is R8–R15.
+        // Rdi.enc() == 7 serves as the /7 opcode extension (no REX.R needed).
+        self.emit_rex_wrb(Reg64::Rdi, base);
+        if (i8::MIN as i32..=i8::MAX as i32).contains(&imm) {
+            self.buf.push(0x83);
+            self.emit_modrm_base_disp32(Reg64::Rdi, base, disp);
+            self.buf.push(imm as i8 as u8);
+        } else {
+            self.buf.push(0x81);
+            self.emit_modrm_base_disp32(Reg64::Rdi, base, disp);
+            self.emit_i32(imm);
+        }
+    }
+
     /// `MOVSXD dst, src` — sign-extend the lower 32 bits of `src` into the
     /// 64-bit `dst`.
     ///
