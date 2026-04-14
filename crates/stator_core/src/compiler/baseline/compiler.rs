@@ -2174,9 +2174,77 @@ pub(crate) mod jit_runtime {
         _feedback_slot: u32,
     ) -> i64 {
         lda_named_property_inner(obj_i64, name_idx).unwrap_or_else(|| {
+            // Diagnostic: log first N failures to identify root cause.
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static DIAG_N: AtomicU32 = AtomicU32::new(0);
+            let n = DIAG_N.fetch_add(1, Ordering::Relaxed);
+            if n < 5 {
+                diag_lda_named_miss(obj_i64, name_idx, n);
+            }
             track_stub_deopt(STUB_LDA_NAMED);
             JIT_DEOPT
         })
+    }
+
+    /// Diagnostic helper: log why `lda_named_property_inner` returned `None`.
+    ///
+    /// Called only for the first few failures so we can inspect CI logs.
+    fn diag_lda_named_miss(obj_i64: i64, name_idx: u32, n: u32) {
+        let is_heap = is_heap_handle(obj_i64);
+        let ptrs = RT_PTRS.with(|p| p.get());
+        let cached = ptrs.is_cached();
+        let ba_null = if cached {
+            // SAFETY: cached pointer valid for thread lifetime.
+            unsafe { &*ptrs.bytecode }.get().is_null()
+        } else {
+            RT_BYTECODE.with(|b| b.get().is_null())
+        };
+        let (cp_len, const_desc) = if !ba_null {
+            let ptr = if cached {
+                unsafe { &*ptrs.bytecode }.get()
+            } else {
+                RT_BYTECODE.with(|b| b.get())
+            };
+            // SAFETY: BA pointer valid during JIT execution.
+            let ba = unsafe { &*ptr };
+            let cp = ba.constant_pool();
+            let desc = cp.get(name_idx as usize).map(|e| match e {
+                crate::bytecode::bytecode_array::ConstantPoolEntry::String(s) => {
+                    format!("Str(\"{}\")", &s[..s.len().min(30)])
+                }
+                other => format!("{other:?}"),
+            });
+            (cp.len(), desc)
+        } else {
+            (0, None)
+        };
+        let heap_desc = if is_heap && cached {
+            let idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+            // SAFETY: single-threaded JIT.
+            let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+            heap.get(idx).map(|v| match v {
+                JsValue::PlainObject(_) => "PlainObject",
+                JsValue::Array(_) => "Array",
+                JsValue::Function(_) => "Function",
+                JsValue::NativeFunction(_) => "NativeFunction",
+                JsValue::Smi(_) => "Smi",
+                JsValue::String(_) => "String",
+                _ => "Other",
+            })
+        } else {
+            None
+        };
+        let heap_len = if cached {
+            unsafe { &*(&*ptrs.heap).as_ptr() }.len()
+        } else {
+            0
+        };
+        eprintln!(
+            "LDA_NAMED_DIAG[{n}]: obj={obj_i64} name_idx={name_idx} \
+             is_heap={is_heap} cached={cached} ba_null={ba_null} \
+             cp_len={cp_len} const={const_desc:?} \
+             heap_type={heap_desc:?} heap_len={heap_len}"
+        );
     }
 
     /// Like [`jit_runtime_lda_named_property`] but accepts a pre-cached

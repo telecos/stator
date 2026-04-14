@@ -530,10 +530,18 @@ fn is_generic_property_load(node: &ValueNode) -> bool {
 
 /// Return `true` if the loop body contains any nodes that could modify
 /// arbitrary object properties: generic property stores, property deletion,
-/// or any kind of call / construct.  When this returns `true`,
+/// or any JavaScript-level call / construct.  When this returns `true`,
 /// [`LoadNamedGeneric`] and [`LoadKeyedGeneric`] must **not** be hoisted
 /// because the operation can mutate objects reachable from its arguments or
 /// from the global scope.
+///
+/// Engine-internal builtins ([`CallBuiltin`]) and runtime stubs
+/// ([`CallRuntime`]) are **not** included because they implement
+/// side-effect-free primitives (arithmetic, comparison, type conversion,
+/// etc.) that cannot modify user-visible object properties.  Similarly,
+/// [`StoreGlobal`] and [`LoadGlobal`] operate on the global variable
+/// bindings, not on object property slots, so they do not alias with
+/// named/keyed property loads.
 fn loop_has_property_side_effects(graph: &MaglevGraph, loop_body: &HashSet<u32>) -> bool {
     for block in graph.blocks() {
         if !loop_body.contains(&block.id) {
@@ -547,8 +555,6 @@ fn loop_has_property_side_effects(graph: &MaglevGraph, loop_body: &HashSet<u32>)
                     | ValueNode::DeleteProperty { .. }
                     | ValueNode::Call { .. }
                     | ValueNode::CallKnownFunction { .. }
-                    | ValueNode::CallBuiltin { .. }
-                    | ValueNode::CallRuntime { .. }
                     | ValueNode::CallWithSpread { .. }
                     | ValueNode::Construct { .. }
                     | ValueNode::ConstructWithSpread { .. }
@@ -1772,6 +1778,228 @@ mod tests {
                 .iter()
                 .any(|(_, n)| matches!(n, ValueNode::LoadNamedGeneric { .. })),
             "LoadNamedGeneric should NOT be hoisted when DeleteProperty exists in the loop"
+        );
+    }
+
+    // ── deep_object benchmark: LoadNamedGeneric hoisted despite StoreGlobal + CallBuiltin ──
+
+    /// Regression test for the `deep_object_access_1k` benchmark.  The loop
+    /// body contains `StoreGlobal` (for `sum`) and `CallBuiltin` (for the
+    /// generic comparison / increment), but neither of those can modify
+    /// object properties.  The `LoadNamedGeneric` chain must still be hoisted.
+    #[test]
+    fn test_hoist_load_named_generic_with_store_global_and_call_builtin() {
+        let mut graph = loop_graph();
+
+        let param_id = graph.blocks()[0].nodes[0].0;
+
+        // Simulate the deep_object benchmark pattern:
+        // LoadGlobal("obj") → LoadNamedGeneric(obj, "a") → LoadNamedGeneric(a, "b")
+        // ... → GenericAdd → StoreGlobal("sum")
+        // Plus a CallBuiltin for the loop comparison.
+
+        let obj_id = NodeId(500);
+        let a_id = NodeId(501);
+        let b_id = NodeId(502);
+        let c_id = NodeId(503);
+        let add_id = NodeId(504);
+        let store_id = NodeId(505);
+        let cmp_id = NodeId(506);
+
+        // LoadGlobal("obj") — not stored in the loop.
+        graph.blocks_mut()[2].nodes.push((
+            obj_id,
+            ValueNode::LoadGlobal {
+                name: 1,
+                feedback_slot: 0,
+            },
+        ));
+        // LoadNamedGeneric chain: obj.a.b.c
+        graph.blocks_mut()[2].nodes.push((
+            a_id,
+            ValueNode::LoadNamedGeneric {
+                object: obj_id,
+                name: 2,
+                feedback_slot: 1,
+            },
+        ));
+        graph.blocks_mut()[2].nodes.push((
+            b_id,
+            ValueNode::LoadNamedGeneric {
+                object: a_id,
+                name: 3,
+                feedback_slot: 2,
+            },
+        ));
+        graph.blocks_mut()[2].nodes.push((
+            c_id,
+            ValueNode::LoadNamedGeneric {
+                object: b_id,
+                name: 4,
+                feedback_slot: 3,
+            },
+        ));
+        // GenericAdd (pure — does not block hoisting).
+        graph.blocks_mut()[2].nodes.push((
+            add_id,
+            ValueNode::GenericAdd {
+                left: param_id,
+                right: c_id,
+                feedback_slot: 4,
+            },
+        ));
+        // StoreGlobal("sum") — impure but NOT a property side-effect.
+        graph.blocks_mut()[2].nodes.push((
+            store_id,
+            ValueNode::StoreGlobal {
+                name: 10,
+                value: add_id,
+                feedback_slot: 5,
+            },
+        ));
+        // CallBuiltin for loop comparison (e.g. LessThan) — NOT a property
+        // side-effect; should not block LoadNamedGeneric hoisting.
+        graph.blocks_mut()[2].nodes.push((
+            cmp_id,
+            ValueNode::CallBuiltin {
+                builtin_id: 0,
+                args: vec![param_id],
+            },
+        ));
+
+        assert_eq!(graph.blocks()[2].nodes.len(), 7);
+
+        hoist_loop_invariants(&mut graph);
+
+        // LoadGlobal + 3 LoadNamedGeneric should be hoisted (4 nodes).
+        // GenericAdd depends on c_id (hoisted) AND param_id (outside) → also hoisted.
+        // StoreGlobal is impure → stays.
+        // CallBuiltin depends on param_id (outside) but is impure → stays.
+        assert!(
+            graph.blocks()[0].nodes.iter().any(|(id, _)| *id == obj_id),
+            "LoadGlobal should be hoisted to preheader"
+        );
+        assert!(
+            graph.blocks()[0].nodes.iter().any(|(id, _)| *id == a_id),
+            "LoadNamedGeneric(a) should be hoisted to preheader"
+        );
+        assert!(
+            graph.blocks()[0].nodes.iter().any(|(id, _)| *id == b_id),
+            "LoadNamedGeneric(b) should be hoisted to preheader"
+        );
+        assert!(
+            graph.blocks()[0].nodes.iter().any(|(id, _)| *id == c_id),
+            "LoadNamedGeneric(c) should be hoisted to preheader"
+        );
+        // StoreGlobal and CallBuiltin must remain in the loop.
+        assert!(
+            graph.blocks()[2]
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::StoreGlobal { .. })),
+            "StoreGlobal must stay in the loop"
+        );
+        assert!(
+            graph.blocks()[2]
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::CallBuiltin { .. })),
+            "CallBuiltin must stay in the loop"
+        );
+    }
+
+    // ── CallBuiltin alone does NOT block LoadNamedGeneric hoisting ───────
+
+    #[test]
+    fn test_call_builtin_does_not_block_load_named_generic() {
+        let mut graph = loop_graph();
+
+        let param_id = graph.blocks()[0].nodes[0].0;
+
+        // LoadNamedGeneric whose object is defined outside the loop.
+        graph.blocks_mut()[2].nodes.push((
+            NodeId(700),
+            ValueNode::LoadNamedGeneric {
+                object: param_id,
+                name: 1,
+                feedback_slot: 0,
+            },
+        ));
+
+        // A CallBuiltin in the same loop body — engine-internal, cannot
+        // modify user-visible object properties.
+        graph.blocks_mut()[2].nodes.push((
+            NodeId(701),
+            ValueNode::CallBuiltin {
+                builtin_id: 0,
+                args: vec![],
+            },
+        ));
+
+        hoist_loop_invariants(&mut graph);
+
+        // LoadNamedGeneric SHOULD be hoisted — CallBuiltin is not a property
+        // side-effect.
+        assert!(
+            graph.blocks()[0]
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::LoadNamedGeneric { .. })),
+            "LoadNamedGeneric should be hoisted when only CallBuiltin exists in the loop"
+        );
+        // CallBuiltin must stay (impure).
+        assert!(
+            graph.blocks()[2]
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::CallBuiltin { .. })),
+        );
+    }
+
+    // ── CallRuntime alone does NOT block LoadNamedGeneric hoisting ───────
+
+    #[test]
+    fn test_call_runtime_does_not_block_load_named_generic() {
+        let mut graph = loop_graph();
+
+        let param_id = graph.blocks()[0].nodes[0].0;
+
+        // LoadNamedGeneric whose object is defined outside the loop.
+        graph.blocks_mut()[2].nodes.push((
+            NodeId(700),
+            ValueNode::LoadNamedGeneric {
+                object: param_id,
+                name: 1,
+                feedback_slot: 0,
+            },
+        ));
+
+        // A CallRuntime in the same loop body — engine-internal runtime stub.
+        graph.blocks_mut()[2].nodes.push((
+            NodeId(701),
+            ValueNode::CallRuntime {
+                function_id: 0,
+                args: vec![],
+            },
+        ));
+
+        hoist_loop_invariants(&mut graph);
+
+        // LoadNamedGeneric SHOULD be hoisted — CallRuntime is not a property
+        // side-effect.
+        assert!(
+            graph.blocks()[0]
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::LoadNamedGeneric { .. })),
+            "LoadNamedGeneric should be hoisted when only CallRuntime exists in the loop"
+        );
+        // CallRuntime must stay (impure).
+        assert!(
+            graph.blocks()[2]
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::CallRuntime { .. })),
         );
     }
 }
