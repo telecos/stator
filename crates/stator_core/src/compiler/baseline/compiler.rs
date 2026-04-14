@@ -1011,6 +1011,7 @@ pub(crate) mod jit_runtime {
     /// all reference-counted objects are dropped while the TLS variables
     /// they transitively reference are still alive — preventing
     /// use-after-free crashes during non-deterministic TLS destruction.
+    #[allow(dead_code)] // Called from bench binaries, not from the lib itself.
     pub fn jit_full_teardown() {
         // ── Standard teardown ──────────────────────────────────────
         RT_BYTECODE.with(|b| b.set(std::ptr::null()));
