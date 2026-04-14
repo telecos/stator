@@ -281,7 +281,7 @@ pub(crate) mod jit_runtime {
         /// which is critical for inline-cache stability on chained
         /// property accesses (e.g. `obj.a.b.c.d.e`).
         static RT_HANDLE_DEDUP: RefCell<HashMap<usize, usize>> =
-            const { RefCell::new(HashMap::new()) };
+            RefCell::new(HashMap::new());
 
         /// Combined own-property + prototype inline caches for
         /// `LdaNamedProperty` stubs.  Cleared by [`jit_runtime_setup`]
