@@ -84,8 +84,6 @@
 #[cfg(all(target_arch = "x86_64", unix))]
 use crate::bytecode::bytecodes::Opcode;
 #[cfg(all(target_arch = "x86_64", unix))]
-use crate::compiler::baseline::compiler::RTPTRS_BYTECODE_OFFSET;
-#[cfg(all(target_arch = "x86_64", unix))]
 use crate::compiler::baseline::compiler::jit_runtime;
 use crate::compiler::baseline::compiler::{
     DeoptEntry, JIT_DEOPT, JIT_FALSE, JIT_NULL, JIT_TRUE, JIT_UNDEFINED, METADATA_MAGIC,
@@ -6082,88 +6080,60 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, off_callee);
         self.masm.jne(&mut cache_miss);
 
-        // Closures now use the same mono-cache inline path as plain
-        // functions.  The cached ctx_ptr is safe because:
-        //   - callee_i64 matched → the heap handle is the same closure
-        //   - the closure's Rc<BytecodeArray> keeps the context Rc alive
-        //   - the callee receives context via RSI (direct context slot
-        //     stubs), NOT from the global TLS context cell
-        // No global context swap is needed: the callee's Maglev code
-        // only touches its own context through the RSI pointer.
+        // ── Mono HIT: dispatch via runtime helper ─────────────────
+        //
+        // The cached ctx_ptr may be stale if `set_closure_context`
+        // replaced the closure's inner Rc between the cache-miss
+        // (when the cache was populated) and this cache-hit.
+        //
+        // Re-read the context from the live BytecodeArray via
+        // `jit_runtime_read_ba_ctx`, then dispatch through
+        // `jit_runtime_mono_dispatch_call_0_r15` which handles the
+        // full protocol: BA save/restore, context comparison/swap,
+        // heap tracking, and register-file allocation.
 
-        // ── Mono HIT: inline JIT-to-JIT dispatch ─────────────────
-        //
-        // Instead of calling `jit_runtime_mono_dispatch_call_0_r15` (which
-        // does context swap, heap tracking, register-file alloc, etc. in
-        // Rust), we perform the critical operations directly in machine
-        // code:
-        //
-        //   1. Save/set the current BytecodeArray via R15→RtPtrs.bytecode
-        //   2. Allocate a 128-byte register file on the x86 stack
-        //   3. Direct `call` to the callee's Maglev entry point
-        //   4. Restore the BytecodeArray
-        //   5. Return (no context swap, no heap truncation)
-        //
-        // This eliminates ALL Rust FFI overhead on the hot path.  Context
-        // is passed to the callee via RSI (the standard Maglev parameter),
-        // so no global context swap is needed.  Heap cleanup is deferred
-        // to the caller's own finish path.
-        //
-        // Stack layout at the point of `call entry_point`:
-        //   RSP+0       128-byte register file  (callee's RDI)
-        //   RSP+128     saved old BA             (pushed second)
-        //   RSP+136     saved bytecode Cell ptr  (pushed first)
-        //   RSP+144...  saved live regs from emit_save_live_regs
-        //
-        // RSP ≡ 0 mod 16 before `call` (2 pushes + sub 128 = -144 from
-        // the aligned post-save_live_regs state).
+        // Save callee_i64 (R11) across the helper call.
+        // Two pushes keep RSP ≡ 0 mod 16 for the upcoming `call`.
+        self.masm.push(Reg64::R11); // saved callee_i64
+        self.masm.push(Reg64::R11); // padding
 
-        // 1. BA save/swap via R15 → RtPtrs.bytecode (repr(C) offset 16).
-        //    RAX = bytecode Cell ptr, R10 = current BA (to save).
+        // Read fresh context from the BytecodeArray.
         self.masm
-            .mov_load_base_disp32(Reg64::Rax, Reg64::R15, RTPTRS_BYTECODE_OFFSET);
-        // RAX = *const Cell<*const BytecodeArray>
-        self.masm.mov_load_base_disp32(Reg64::R10, Reg64::Rax, 0); // R10 = current BA
-        self.masm
-            .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_ba); // RCX = callee BA
-        self.masm.mov_store_base_disp32(Reg64::Rax, 0, Reg64::Rcx); // set callee BA
-
-        // Push saved BA + Cell ptr (2 pushes → RSP -= 16, stays aligned).
-        self.masm.push(Reg64::Rax); // bytecode Cell ptr
-        self.masm.push(Reg64::R10); // old BA
-
-        // 2. Allocate register file on the stack.
-        self.masm.sub_ri(Reg64::Rsp, 128);
-        // RSP ≡ 0 mod 16 (was 0, -16 from pushes, -128 from sub = -144).
-
-        // Zero register file using rep stosq.
-        // RAX, RCX, RDI are dead here (saved values already pushed),
-        // so no save/restore is needed.
-        self.masm.xor_rr(Reg64::Rax, Reg64::Rax); // RAX = 0
-        self.masm.mov_ri(Reg64::Rcx, 16); // RCX = 16 (qwords)
-        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
-        self.masm.rep_stosq(); // Zero 128 bytes
-
-        // 3. Set up call: RDI = register file, RSI = cached context.
-        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
-        self.masm
-            .mov_load_base_disp32(Reg64::Rsi, Reg64::Rbp, off_ctx);
-
-        // 5. Direct CALL to callee's Maglev entry point.
-        self.masm
-            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, off_entry);
+            .mov_load_base_disp32(Reg64::Rdi, Reg64::Rbp, off_ba);
+        let read_ctx_addr = jit_runtime::jit_runtime_read_ba_ctx as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, read_ctx_addr as i64);
         self.masm.call_reg(Reg64::R11);
+        // RAX = fresh ctx_ptr.
 
-        // 6. Deallocate register file.
-        self.masm.add_ri(Reg64::Rsp, 128);
+        // Update mono-cache ctx for future hits.
+        self.masm
+            .mov_store_base_disp32(Reg64::Rbp, off_ctx, Reg64::Rax);
 
-        // 7. Restore BA: pop saved values and write back.
-        self.masm.pop(Reg64::Rcx); // RCX = saved old BA
-        self.masm.pop(Reg64::Rdx); // RDX = bytecode Cell ptr
-        self.masm.mov_store_base_disp32(Reg64::Rdx, 0, Reg64::Rcx); // restore BA
+        // Restore callee_i64 and remove padding.
+        self.masm.add_ri(Reg64::Rsp, 8); // discard padding
+        self.masm.pop(Reg64::R9); // R9 = callee_i64
+        // RSP ≡ 0 mod 16 again.
 
-        // 8. Deopt check: if result < i32::MIN (signed), the callee
-        //    deopted — fall back to the runtime stub.
+        // Set up arguments for jit_runtime_mono_dispatch_call_0_r15:
+        //   RDI = entry_point, RSI = ba_ptr, RDX = fresh ctx,
+        //   RCX = R15 (rt_ptrs_cell), R8 = reg_slots, R9 = callee_i64.
+        self.masm.mov_rr(Reg64::Rdx, Reg64::Rax); // fresh ctx
+        self.masm
+            .mov_load_base_disp32(Reg64::Rdi, Reg64::Rbp, off_entry);
+        self.masm
+            .mov_load_base_disp32(Reg64::Rsi, Reg64::Rbp, off_ba);
+        self.masm.mov_rr(Reg64::Rcx, Reg64::R15);
+        self.masm
+            .mov_load_base_disp32(Reg64::R8, Reg64::Rbp, off_regslots);
+        // R9 already set to callee_i64 above.
+
+        let dispatch_addr = jit_runtime::jit_runtime_mono_dispatch_call_0_r15 as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, dispatch_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        // RAX = callee result or JIT_DEOPT.
+
+        // Deopt check: if callee JIT returned JIT_DEOPT, fall back to
+        // the runtime stub instead of deopting the CALLER.
         self.masm.cmp_ri(Reg64::Rax, i32::MIN);
         self.masm.jcc(CondCode::GreaterEq, &mut done_label);
 

@@ -5108,6 +5108,28 @@ pub(crate) mod jit_runtime {
         slots.clamp(1, 16)
     }
 
+    /// Re-read the closure context pointer from a [`BytecodeArray`].
+    ///
+    /// Used by the inline mono-cache hit path to ensure the context
+    /// pointer is fresh — `set_closure_context` may have replaced the
+    /// inner `Rc`, making a previously cached raw pointer dangling.
+    ///
+    /// Returns the raw `*const RefCell<JsContext>` as `i64`, or `0` if
+    /// `ba_ptr` is null or the function has no closure context.
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    pub extern "C" fn jit_runtime_read_ba_ctx(ba_ptr: i64) -> i64 {
+        if ba_ptr == 0 {
+            return 0;
+        }
+        // SAFETY: caller guarantees ba_ptr points to a live
+        // BytecodeArray (the callee's Rc<BytecodeArray> keeps it
+        // alive while the heap handle exists).
+        let ba = unsafe { &*(ba_ptr as *const BytecodeArray) };
+        ba.closure_context()
+            .map(|rc| Rc::as_ptr(rc) as i64)
+            .unwrap_or(0)
+    }
+
     /// Returns the address of the `RT_PTRS` TLS `Cell` so Maglev-compiled
     /// code can cache it in a callee-saved register (R15) and pass it to
     /// `_r15` variants of prepare/finish, eliminating per-call TLS lookups.
