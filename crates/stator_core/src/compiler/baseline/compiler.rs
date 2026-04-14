@@ -5657,7 +5657,7 @@ pub(crate) mod jit_runtime {
     /// Handles the hole-check and encoding in a single match, eliminating
     /// one branch per element access on the hot path.
     #[inline(always)]
-    fn encode_array_element(v: &JsValue) -> Option<i64> {
+    pub(super) fn encode_array_element(v: &JsValue) -> Option<i64> {
         match v {
             JsValue::Boolean(b) => Some(if *b { JIT_TRUE } else { JIT_FALSE }),
             JsValue::Smi(n) => Some(i64::from(*n)),
@@ -5671,7 +5671,7 @@ pub(crate) mod jit_runtime {
     /// first (hot for sieve-like benchmarks), then Smi range, then
     /// other constants.  Returns `None` if the encoding is unrecognised.
     #[inline(always)]
-    fn decode_non_heap_value_fast(value_i64: i64) -> Option<JsValue> {
+    pub(super) fn decode_non_heap_value_fast(value_i64: i64) -> Option<JsValue> {
         // Boolean constants are the hottest values in sieve-style
         // benchmarks — check them before the wider Smi range test.
         if value_i64 == JIT_TRUE {
@@ -13637,6 +13637,76 @@ mod tests {
                 assert!((n - sum_result as f64).abs() < 1.0);
             }
             other => panic!("expected HeapNumber for large sum, got {:?}", other),
+        }
+    }
+
+    /// `jit_to_jsvalue` must decode `JIT_TRUE` and `JIT_FALSE` to
+    /// `JsValue::Boolean` so that boolean stores through keyed stubs
+    /// do not deoptimize.
+    #[test]
+    fn test_jit_to_jsvalue_booleans() {
+        assert_eq!(jit_to_jsvalue(JIT_TRUE), Some(JsValue::Boolean(true)));
+        assert_eq!(jit_to_jsvalue(JIT_FALSE), Some(JsValue::Boolean(false)));
+    }
+
+    /// `decode_non_heap_value_fast` must handle `JIT_TRUE` / `JIT_FALSE`
+    /// as booleans — this is the hot path for sieve-style benchmarks
+    /// where `sta_keyed` stores booleans into arrays.
+    #[test]
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn test_decode_non_heap_value_fast_booleans() {
+        use super::jit_runtime::decode_non_heap_value_fast;
+        assert_eq!(
+            decode_non_heap_value_fast(JIT_TRUE),
+            Some(JsValue::Boolean(true))
+        );
+        assert_eq!(
+            decode_non_heap_value_fast(JIT_FALSE),
+            Some(JsValue::Boolean(false))
+        );
+    }
+
+    /// `decode_non_heap_value_fast` must still handle Smi and Undefined.
+    #[test]
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn test_decode_non_heap_value_fast_smi_and_undefined() {
+        use super::jit_runtime::decode_non_heap_value_fast;
+        assert_eq!(decode_non_heap_value_fast(0), Some(JsValue::Smi(0)));
+        assert_eq!(decode_non_heap_value_fast(42), Some(JsValue::Smi(42)));
+        assert_eq!(decode_non_heap_value_fast(-1), Some(JsValue::Smi(-1)));
+        assert_eq!(
+            decode_non_heap_value_fast(JIT_UNDEFINED),
+            Some(JsValue::Undefined)
+        );
+    }
+
+    /// `encode_array_element` must roundtrip booleans through the JIT
+    /// encoding so that `lda_keyed` returns the correct boolean values.
+    #[test]
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn test_encode_array_element_booleans() {
+        use super::jit_runtime::encode_array_element;
+        assert_eq!(
+            encode_array_element(&JsValue::Boolean(true)),
+            Some(JIT_TRUE)
+        );
+        assert_eq!(
+            encode_array_element(&JsValue::Boolean(false)),
+            Some(JIT_FALSE)
+        );
+    }
+
+    /// Boolean JIT roundtrip: encoding then decoding must recover the
+    /// original `JsValue::Boolean`.
+    #[test]
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn test_boolean_jit_roundtrip() {
+        use super::jit_runtime::{decode_non_heap_value_fast, encode_array_element};
+        for b in [true, false] {
+            let original = JsValue::Boolean(b);
+            let encoded = encode_array_element(&original).expect("encode boolean");
+            let decoded = decode_non_heap_value_fast(encoded).expect("decode boolean");
+            assert_eq!(decoded, original);
         }
     }
 }
