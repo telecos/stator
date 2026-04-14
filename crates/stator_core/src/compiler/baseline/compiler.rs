@@ -152,6 +152,11 @@ pub fn jit_to_jsvalue(v: i64) -> Option<crate::objects::value::JsValue> {
 // Runtime call-stub infrastructure (x86-64 + Unix only)
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Re-export `jit_full_teardown` so benchmark crates can access it as
+// `compiler::baseline::compiler::jit_full_teardown()`.
+#[cfg(all(target_arch = "x86_64", unix))]
+pub use jit_runtime::jit_full_teardown;
+
 /// Thread-local state used by the JIT runtime trampoline to access the
 /// constant pool and to store heap-allocated JavaScript objects that cannot
 /// be encoded as plain `i64` values.

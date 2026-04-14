@@ -1119,6 +1119,34 @@ impl MacroAssembler {
         self.emit_modrm_base_disp32(src, base, disp);
     }
 
+    /// `MOV BYTE PTR [base + disp32], src_low8` — store a register's low
+    /// byte to memory (no REX.W → 8-bit operand size).
+    ///
+    /// Encoding: `[REX] 88 /r` with ModRM mod=10.
+    ///
+    /// A REX prefix is always emitted when `src` or `base` has encoding
+    /// ≥ 4 so that byte-register names are the "new" set (SPL/BPL/SIL/DIL)
+    /// rather than the legacy AH/CH/DH/BH.
+    pub fn mov_store_byte_base_disp32(&mut self, base: Reg64, disp: i32, src: Reg64) {
+        // Byte-register encoding requires REX when either register has
+        // encoding ≥ 4 (to access the "new" byte regs).  For R8-R15 this
+        // is already handled by emit_rex_rb_if_needed; for RSP/RBP/RSI/RDI
+        // we must force REX so the encoding maps to SPL/BPL/SIL/DIL.
+        let r = if src.needs_rex() { 4u8 } else { 0 };
+        let b = if base.needs_rex() { 1u8 } else { 0 };
+        let force = if src.enc() >= 4 || base.enc() >= 4 {
+            0x40u8
+        } else {
+            0
+        };
+        let rex = 0x40 | r | b;
+        if rex != 0x40 || force != 0 {
+            self.buf.push(rex);
+        }
+        self.buf.push(0x88); // MOV r/m8, r8
+        self.emit_modrm_base_disp32(src, base, disp);
+    }
+
     /// `MOV BYTE PTR [base + disp32], imm8` — store an immediate byte
     /// to memory.
     ///

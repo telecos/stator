@@ -4246,7 +4246,7 @@ impl<'a> MaglevCodegen<'a> {
 
     /// Inline Smi fast path for `GenericMultiply`.  Uses 64-bit `IMUL` so
     /// the product of two i32 values fits in i64; the result is then
-    /// range-checked back to i32.
+    /// range-checked back to i32 (deopt on overflow).
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_mul(&mut self, id: NodeId, left: NodeId, right: NodeId) {
         if self.i32_range.contains(&left) && self.i32_range.contains(&right) {
@@ -4266,11 +4266,18 @@ impl<'a> MaglevCodegen<'a> {
                         let dst = phys_reg(n);
                         self.emit_load(var, dst);
                         self.masm.add_rr(dst, dst);
+                        // i32 overflow guard: deopt if result > i32::MAX
+                        self.masm.movsxd_rr(Reg64::R11, dst);
+                        self.masm.cmp_rr(Reg64::R11, dst);
+                        self.masm.jne(&mut self.deopt_stub_label);
                         self.note_reg_holds(dst, id);
                     }
                     _ => {
                         self.emit_load(var, Reg64::Rax);
                         self.masm.add_rr(Reg64::Rax, Reg64::Rax);
+                        self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+                        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+                        self.masm.jne(&mut self.deopt_stub_label);
                         self.emit_store(id, Reg64::Rax);
                         self.rax_holds = Some(id);
                     }
@@ -4303,12 +4310,19 @@ impl<'a> MaglevCodegen<'a> {
                             }
                         }
                     }
+                    // i32 overflow guard: deopt if result > i32::MAX
+                    self.masm.movsxd_rr(Reg64::R11, dst);
+                    self.masm.cmp_rr(Reg64::R11, dst);
+                    self.masm.jne(&mut self.deopt_stub_label);
                     self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.emit_load(left, Reg64::Rax);
                     self.emit_load(right, Reg64::R10);
                     self.masm.imul_rr(Reg64::Rax, Reg64::R10);
+                    self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+                    self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+                    self.masm.jne(&mut self.deopt_stub_label);
                     self.emit_store(id, Reg64::Rax);
                     self.rax_holds = Some(id);
                 }
@@ -5776,7 +5790,7 @@ impl<'a> MaglevCodegen<'a> {
             layout.disc_offset as i32,
             layout.bool_disc,
         );
-        self.masm.mov_store_dword_base_disp32(
+        self.masm.mov_store_byte_base_disp32(
             Reg64::R10,
             layout.bool_payload_offset as i32,
             Reg64::R11,
@@ -5874,7 +5888,7 @@ impl<'a> MaglevCodegen<'a> {
                 layout.disc_offset as i32,
                 layout.bool_disc,
             );
-            self.masm.mov_store_dword_base_disp32(
+            self.masm.mov_store_byte_base_disp32(
                 Reg64::R10,
                 layout.bool_payload_offset as i32,
                 Reg64::R11,
@@ -7428,13 +7442,13 @@ impl<'a> MaglevCodegen<'a> {
                         // loop-counter Phis (0, i++) converge to i32_range.
                         ValueNode::GenericIncrement { value, .. }
                         | ValueNode::GenericDecrement { value, .. } => i32_range.contains(value),
-                        // GenericAdd/Subtract of two i32-range values also
-                        // stay within the 64-bit-safe range (bare ADD/SUB).
-                        // This is consistent with GenericIncrement, which
-                        // is effectively GenericAdd(x, 1).  Lets patterns
-                        // like `count = count + 1` converge to i32_range.
+                        // GenericAdd/Subtract/Multiply of two i32-range
+                        // values: the 64-bit result always fits in i64.
+                        // Multiply gets an overflow guard in codegen (deopt
+                        // if i32×i32 overflows i32), so this is safe.
                         ValueNode::GenericAdd { left, right, .. }
-                        | ValueNode::GenericSubtract { left, right, .. } => {
+                        | ValueNode::GenericSubtract { left, right, .. }
+                        | ValueNode::GenericMultiply { left, right, .. } => {
                             i32_range.contains(left) && i32_range.contains(right)
                         }
                         _ => false,
@@ -7506,7 +7520,8 @@ impl<'a> MaglevCodegen<'a> {
                         | ValueNode::GenericIncrement { value, .. }
                         | ValueNode::GenericDecrement { value, .. } => i32_range.contains(value),
                         ValueNode::GenericAdd { left, right, .. }
-                        | ValueNode::GenericSubtract { left, right, .. } => {
+                        | ValueNode::GenericSubtract { left, right, .. }
+                        | ValueNode::GenericMultiply { left, right, .. } => {
                             i32_range.contains(left) && i32_range.contains(right)
                         }
                         _ => true,
