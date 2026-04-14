@@ -60,6 +60,8 @@ use crate::error::{StatorError, StatorResult};
 #[cfg(all(target_arch = "x86_64", unix))]
 use std::cell::{Cell, RefCell};
 #[cfg(all(target_arch = "x86_64", unix))]
+use std::collections::HashMap;
+#[cfg(all(target_arch = "x86_64", unix))]
 use std::rc::Rc;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -270,6 +272,16 @@ pub(crate) mod jit_runtime {
         /// Instead, they are pushed into this table and the register file
         /// stores `JIT_HEAP_TAG + index` as a handle.
         static RT_HEAP: RefCell<Vec<JsValue>> = const { RefCell::new(Vec::new()) };
+
+        /// Identity-based handle deduplication map.
+        ///
+        /// Maps `Rc::as_ptr()` identity (as `usize`) to the heap index
+        /// returned by [`alloc_heap_handle`].  Ensures that the same
+        /// reference-counted object always gets the same JIT handle,
+        /// which is critical for inline-cache stability on chained
+        /// property accesses (e.g. `obj.a.b.c.d.e`).
+        static RT_HANDLE_DEDUP: RefCell<HashMap<usize, usize>> =
+            const { RefCell::new(HashMap::new()) };
 
         /// Combined own-property + prototype inline caches for
         /// `LdaNamedProperty` stubs.  Cleared by [`jit_runtime_setup`]
@@ -1080,6 +1092,7 @@ pub(crate) mod jit_runtime {
 
         // ── Clear heap so recycled PlainObjects don't linger ───────
         RT_HEAP.with(|h| h.borrow_mut().clear());
+        RT_HANDLE_DEDUP.with(|m| m.borrow_mut().clear());
 
         // ── Drain property-map pools that may hold Rc/JsValue ──────
         crate::objects::property_map::clear_property_map_pools();
@@ -1112,6 +1125,7 @@ pub(crate) mod jit_runtime {
                 heap.reserve(256);
             }
         });
+        RT_HANDLE_DEDUP.with(|m| m.borrow_mut().clear());
     }
 
     /// Truncate the JIT heap back to `base`, recycling `PlainObject` `Rc`
@@ -1125,6 +1139,7 @@ pub(crate) mod jit_runtime {
                 }
             }
         });
+        RT_HANDLE_DEDUP.with(|m| m.borrow_mut().retain(|_, idx| *idx < base));
     }
 
     /// Returns `true` if `v` is a heap-object handle.
@@ -1176,27 +1191,63 @@ pub(crate) mod jit_runtime {
         alloc_heap_handle_with_ptrs(val, &ptrs)
     }
 
+    /// Extract a stable pointer identity from reference-counted JsValue
+    /// variants.  Returns `None` for inline types (Smi, bool, etc.)
+    /// that don't carry a heap pointer.
+    #[inline]
+    fn jsvalue_rc_identity(val: &JsValue) -> Option<usize> {
+        match val {
+            JsValue::PlainObject(rc) => Some(Rc::as_ptr(rc) as usize),
+            JsValue::Array(rc) => Some(Rc::as_ptr(rc) as usize),
+            JsValue::Function(rc) => Some(Rc::as_ptr(rc) as usize),
+            JsValue::String(rc) => Some(Rc::as_ptr(rc) as *const str as *const () as usize),
+            JsValue::Error(rc) => Some(Rc::as_ptr(rc) as usize),
+            JsValue::Generator(rc) => Some(Rc::as_ptr(rc) as usize),
+            JsValue::Iterator(rc) => Some(Rc::as_ptr(rc) as usize),
+            _ => None,
+        }
+    }
+
     /// Allocate a heap handle using pre-fetched [`RtPtrs`].
     ///
-    /// Avoids a redundant `RT_PTRS.with()` call when the caller has
-    /// already obtained the cached pointers (e.g. in the hot path of
-    /// `fast_create_object_literal_inner`).
+    /// Deduplicates by `Rc` pointer identity so that the same
+    /// reference-counted object always receives the same handle.
+    /// This is critical for inline-cache stability on chained property
+    /// accesses (e.g. `obj.a.b.c.d.e`).
     #[inline]
     fn alloc_heap_handle_with_ptrs(val: JsValue, ptrs: &RtPtrs) -> i64 {
-        if ptrs.is_cached() {
+        // Fast path: check dedup map for existing handle.
+        if let Some(identity) = jsvalue_rc_identity(&val) {
+            let hit = RT_HANDLE_DEDUP.with(|m| m.borrow().get(&identity).copied());
+            if let Some(idx) = hit {
+                return JIT_HEAP_TAG + idx as i64;
+            }
+        }
+
+        let identity = jsvalue_rc_identity(&val);
+
+        let idx = if ptrs.is_cached() {
             // SAFETY: cached pointer valid for thread lifetime; no concurrent borrows.
             let heap = unsafe { &mut *(&*ptrs.heap).as_ptr() };
             let idx = heap.len();
             heap.push(val);
-            JIT_HEAP_TAG + idx as i64
+            idx
         } else {
             RT_HEAP.with(|heap| {
                 let mut heap = heap.borrow_mut();
                 let idx = heap.len();
                 heap.push(val);
-                JIT_HEAP_TAG + idx as i64
+                idx
             })
+        };
+
+        if let Some(key) = identity {
+            RT_HANDLE_DEDUP.with(|m| {
+                m.borrow_mut().insert(key, idx);
+            });
         }
+
+        JIT_HEAP_TAG + idx as i64
     }
 
     /// Public entry point for allocating a JIT heap handle.
