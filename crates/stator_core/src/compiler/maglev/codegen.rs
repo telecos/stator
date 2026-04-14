@@ -7373,6 +7373,15 @@ impl<'a> MaglevCodegen<'a> {
                         // loop-counter Phis (0, i++) converge to i32_range.
                         ValueNode::GenericIncrement { value, .. }
                         | ValueNode::GenericDecrement { value, .. } => i32_range.contains(value),
+                        // GenericAdd/Subtract of two i32-range values also
+                        // stay within the 64-bit-safe range (bare ADD/SUB).
+                        // This is consistent with GenericIncrement, which
+                        // is effectively GenericAdd(x, 1).  Lets patterns
+                        // like `count = count + 1` converge to i32_range.
+                        ValueNode::GenericAdd { left, right, .. }
+                        | ValueNode::GenericSubtract { left, right, .. } => {
+                            i32_range.contains(left) && i32_range.contains(right)
+                        }
                         _ => false,
                     };
                     if derived {
@@ -7441,6 +7450,10 @@ impl<'a> MaglevCodegen<'a> {
                         | ValueNode::CheckedSmiDecrement { value }
                         | ValueNode::GenericIncrement { value, .. }
                         | ValueNode::GenericDecrement { value, .. } => i32_range.contains(value),
+                        ValueNode::GenericAdd { left, right, .. }
+                        | ValueNode::GenericSubtract { left, right, .. } => {
+                            i32_range.contains(left) && i32_range.contains(right)
+                        }
                         _ => true,
                     };
                     if !ok {
@@ -7552,6 +7565,17 @@ impl<'a> MaglevCodegen<'a> {
 
         // Fixed-point propagation through GenericAdd/Sub/Mul/Inc/Dec/Negate
         // and Phi.
+        //
+        // For Phi nodes, the derivation includes two conditions:
+        //   1. Standard convergence: all inputs are in the set.
+        //   2. Optimistic seeding: at least one input is in the set AND
+        //      all consumers are arithmetic-compatible.  This breaks
+        //      circular dependencies (e.g. Phi ↔ GenericAdd) on the first
+        //      iteration where a Phi's preheader input becomes available
+        //      (which may happen AFTER other nodes enter the set during
+        //      an earlier fixed-point iteration).  A subsequent
+        //      verification pass removes any Phis that were not fully
+        //      confirmed.
         loop {
             let mut changed = false;
             for block in graph.blocks() {
@@ -7572,7 +7596,23 @@ impl<'a> MaglevCodegen<'a> {
                         | ValueNode::GenericDecrement { value, .. }
                         | ValueNode::GenericNegate { value, .. }
                         | ValueNode::GenericBitwiseNot { value, .. } => set.contains(value),
-                        ValueNode::Phi { inputs } => inputs.iter().all(|inp| set.contains(inp)),
+                        ValueNode::Phi { inputs } => {
+                            // Standard: all inputs confirmed.
+                            inputs.iter().all(|inp| set.contains(inp))
+                            // OR optimistic seeding (integrated into
+                            // the fixed-point so it fires as soon as a
+                            // Phi input enters the set via derivation).
+                            || (!branch_conditions.contains(id)
+                                && inputs.iter().any(|inp| set.contains(inp))
+                                && consumers_of.get(id).is_some_and(|cs| {
+                                    !cs.is_empty()
+                                        && cs.iter().all(|c| {
+                                            node_lookup.get(c).is_some_and(|n| {
+                                                Self::is_arithmetic_compatible_consumer(n)
+                                            })
+                                        })
+                                }))
+                        }
                         _ => false,
                     };
                     if derived && !branch_conditions.contains(id) {
@@ -7657,6 +7697,13 @@ impl<'a> MaglevCodegen<'a> {
                 | ValueNode::TaggedNotEqual { .. }
                 | ValueNode::StoreGlobal { .. }
                 | ValueNode::Phi { .. }
+                // Keyed array accesses consume their index as a Smi, so
+                // a Phi used as an array index is arithmetic-compatible.
+                | ValueNode::LoadFixedArrayElement { .. }
+                | ValueNode::StoreFixedArrayElement { .. }
+                | ValueNode::LoadFixedDoubleArrayElement { .. }
+                | ValueNode::StoreFixedDoubleArrayElement { .. }
+                | ValueNode::LoadHoleyFixedDoubleArrayElement { .. }
         )
     }
 
