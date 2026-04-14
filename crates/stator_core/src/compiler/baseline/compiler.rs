@@ -3646,16 +3646,7 @@ pub(crate) mod jit_runtime {
                     if skip_args {
                         ptrs.set_skip_mapped_args(true);
                     }
-                    let mut reg_file = std::mem::MaybeUninit::<[i64; 16]>::uninit();
-                    if cached_entry.maglev_reg_slots > 4 {
-                        unsafe {
-                            std::ptr::write_bytes(
-                                reg_file.as_mut_ptr() as *mut i64,
-                                0,
-                                cached_entry.maglev_reg_slots.min(16),
-                            );
-                        }
-                    }
+                    let mut reg_file = [0i64; 16];
                     // SAFETY: Maglev entry is valid x86-64 with signature
                     // `extern "C" fn(*mut i64, i64) -> i64`.
                     let f: extern "C" fn(*mut i64, i64) -> i64 =
@@ -3927,16 +3918,7 @@ pub(crate) mod jit_runtime {
                         if skip_args {
                             ptrs.set_skip_mapped_args(true);
                         }
-                        let mut reg_file = std::mem::MaybeUninit::<[i64; 16]>::uninit();
-                        if entry.reg_slots > 4 {
-                            unsafe {
-                                std::ptr::write_bytes(
-                                    reg_file.as_mut_ptr() as *mut i64,
-                                    0,
-                                    entry.reg_slots.min(16),
-                                );
-                            }
-                        }
+                        let mut reg_file = [0i64; 16];
                         let f: extern "C" fn(*mut i64, i64) -> i64 =
                             unsafe { std::mem::transmute(entry.entry_fn as *const ()) };
                         let jit_result = f(reg_file.as_mut_ptr() as *mut i64, entry.ctx_ptr);
@@ -5138,18 +5120,8 @@ pub(crate) mod jit_runtime {
         };
 
         // ── Call ─────────────────────────────────────────────────
-        // Allocate a register file on the Rust stack.  For small
-        // frames (≤ 4 slots, e.g. closures), skip zeroing — the
-        // callee overwrites all slots before reading.  For larger
-        // frames, zero only the slots the callee actually uses
-        // instead of the full 16-slot array.
-        let mut reg_file = std::mem::MaybeUninit::<[i64; 16]>::uninit();
-        if reg_slots > 4 {
-            // SAFETY: writing zeroes into MaybeUninit memory is valid.
-            unsafe {
-                std::ptr::write_bytes(reg_file.as_mut_ptr() as *mut i64, 0, reg_slots.min(16));
-            }
-        }
+        // Allocate a zero-initialized register file on the Rust stack.
+        let mut reg_file = [0i64; 16];
         // SAFETY: entry_point is a valid JIT code pointer produced by
         // the baseline or Maglev compiler.
         let f: extern "C" fn(*mut i64, i64) -> i64 =
