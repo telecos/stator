@@ -689,9 +689,13 @@ impl ObjectLiteralTemplate {
     ///
     /// `values` must contain exactly `self.keys.len()` elements in
     /// template order.
-    pub(crate) fn instantiate_with_values(&self, values: Vec<JsValue>) -> PropertyMap {
+    pub(crate) fn instantiate_with_values(&self, mut values: Vec<JsValue>) -> PropertyMap {
         let cap = self.keys.len();
-        debug_assert_eq!(values.len(), cap);
+        let filled = values.len().min(cap);
+        // Pad values if the fused stub supplied fewer than the template expects.
+        if values.len() < cap {
+            values.resize(cap, JsValue::Undefined);
+        }
         let capacity_hint = self.capacity_hint.max(cap);
         PropertyMap {
             keys: Rc::clone(&self.keys),
@@ -711,7 +715,7 @@ impl ObjectLiteralTemplate {
             proto_global_epoch: Cell::new(0),
             extensible: self.extensible,
             has_accessors: self.has_accessors,
-            template_next_slot: cap,
+            template_next_slot: filled,
             capacity_hint,
         }
     }
@@ -863,25 +867,33 @@ impl PropertyMap {
         values: &[JsValue],
     ) {
         let cap = template.keys.len();
-        debug_assert_eq!(values.len(), cap);
+        // The fused CreateObjectLiteralWithProperties stub may supply
+        // fewer values than the template has keys.
+        let filled = values.len().min(cap);
 
-        // Ultra-fast path: same template — delegate to the values-only
-        // reinitializer which skips Rc refcount ops entirely.
+        // Ultra-fast path: same template — overwrite values in place,
+        // skipping Rc refcount ops.
         if Rc::ptr_eq(&self.keys, &template.keys) && self.values.len() == cap {
-            self.reinitialize_values_inplace(values);
+            self.values[..filled].clone_from_slice(&values[..filled]);
+            for slot in &mut self.values[filled..cap] {
+                *slot = JsValue::Undefined;
+            }
+            self.template_next_slot = filled;
             return;
         }
 
         let capacity_hint = template.capacity_hint.max(cap);
 
-        // When the vec already has the right length, overwrite in place
-        // to avoid the clear()+extend_from_slice() overhead (no Vec
-        // metadata manipulation, no capacity check).
+        // When the vec already has the right length, overwrite in place.
         if self.values.len() == cap {
-            self.values[..cap].clone_from_slice(&values[..cap]);
+            self.values[..filled].clone_from_slice(&values[..filled]);
+            for slot in &mut self.values[filled..cap] {
+                *slot = JsValue::Undefined;
+            }
         } else {
             self.values.clear();
-            self.values.extend_from_slice(values);
+            self.values.extend_from_slice(&values[..filled]);
+            self.values.resize(cap, JsValue::Undefined);
         }
         self.keys = Rc::clone(&template.keys);
         self.attrs = Rc::clone(&template.attrs);
@@ -899,7 +911,7 @@ impl PropertyMap {
         self.proto_global_epoch.set(0);
         self.extensible = template.extensible;
         self.has_accessors = template.has_accessors;
-        self.template_next_slot = cap;
+        self.template_next_slot = filled;
         self.capacity_hint = capacity_hint;
     }
 
