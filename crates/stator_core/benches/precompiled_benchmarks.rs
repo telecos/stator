@@ -30,16 +30,17 @@ use stator_core::parser::recursive_descent;
 fn install_sigsegv_handler() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
-    ONCE.call_once(|| unsafe {
+    ONCE.call_once(|| {
         extern "C" fn handler(
             sig: libc::c_int,
             info: *mut libc::siginfo_t,
             _ctx: *mut libc::c_void,
         ) {
+            // SAFETY: reading si_addr from a valid siginfo_t in signal context.
             let fault_addr = if info.is_null() {
                 0usize
             } else {
-                (*info).si_addr() as usize
+                unsafe { (*info).si_addr() as usize }
             };
             // Print to stderr — CI captures this.
             let msg = format!(
@@ -47,15 +48,20 @@ fn install_sigsegv_handler() {
                  backtrace:\n{}\n=== END SIGSEGV ===\n",
                 std::backtrace::Backtrace::force_capture()
             );
-            // Use write(2) directly to avoid stdio buffering issues in signal handler.
-            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-            libc::_exit(11);
+            // SAFETY: write(2) is async-signal-safe; _exit terminates immediately.
+            unsafe {
+                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+                libc::_exit(11);
+            }
         }
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = handler as usize;
-        sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESETHAND;
-        libc::sigemptyset(&mut sa.sa_mask);
-        libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+        // SAFETY: installing a signal handler with valid sigaction struct.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = handler as usize;
+            sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESETHAND;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+        }
     });
 }
 
