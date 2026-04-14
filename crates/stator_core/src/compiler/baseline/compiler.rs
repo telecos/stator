@@ -306,6 +306,11 @@ pub(crate) mod jit_runtime {
         /// after nested JIT execution re-initialises thread-local state.
         static RT_SETUP_GEN: Cell<u64> = const { Cell::new(0) };
 
+        /// Monotonically increasing counter bumped by every named-property
+        /// store (STA) in JIT stubs.  Combined with the prototype-mutation
+        /// epoch to guard proto-IC entries that cache own-property values.
+        static RT_VALUE_WRITE_EPOCH: Cell<u64> = const { Cell::new(0) };
+
         /// Last [`BytecodeArray`] pointer **and bytecodes length** passed
         /// to [`jit_runtime_setup`].  Used to skip IC reset when the same
         /// function re-enters (e.g. criterion iterations measuring the
@@ -1024,6 +1029,30 @@ pub(crate) mod jit_runtime {
     #[inline]
     fn is_heap_handle(v: i64) -> bool {
         (JIT_HEAP_TAG..JIT_HEAP_TAG + 0x1_0000_0000).contains(&v)
+    }
+
+    /// Bump the value-write epoch.  Called on every named-property store
+    /// so that proto-IC entries caching own-property values are
+    /// invalidated.
+    #[inline(always)]
+    fn bump_value_write_epoch() {
+        RT_VALUE_WRITE_EPOCH.with(|e| e.set(e.get().wrapping_add(1)));
+    }
+
+    /// Read the current value-write epoch.
+    #[inline(always)]
+    fn current_value_write_epoch() -> u64 {
+        RT_VALUE_WRITE_EPOCH.with(Cell::get)
+    }
+
+    /// Compute a combined epoch from the prototype-mutation counter and
+    /// the value-write counter.  Used as a single guard for proto-IC
+    /// entries that may cache own-property values.
+    #[inline(always)]
+    fn combined_ic_epoch() -> u64 {
+        let proto = crate::objects::property_map::PropertyMap::global_proto_mutation_epoch();
+        let value = current_value_write_epoch();
+        proto.wrapping_add(value)
     }
 
     /// Returns `true` when `v` is a Smi (fits in i32 range).
@@ -2342,7 +2371,7 @@ pub(crate) mod jit_runtime {
                         name_idx,
                         shape,
                         receiver_handle: obj_i64,
-                        global_epoch: PropertyMap::global_proto_mutation_epoch(),
+                        global_epoch: combined_ic_epoch(),
                         cached_value: result,
                     };
                     return Some(result);
@@ -2468,7 +2497,7 @@ pub(crate) mod jit_runtime {
                                 name_idx,
                                 shape,
                                 receiver_handle: obj_i64,
-                                global_epoch: PropertyMap::global_proto_mutation_epoch(),
+                                global_epoch: combined_ic_epoch(),
                                 cached_value: result,
                             };
                         });
@@ -2580,7 +2609,7 @@ pub(crate) mod jit_runtime {
                         name_idx,
                         shape,
                         receiver_handle: obj_i64,
-                        global_epoch: PropertyMap::global_proto_mutation_epoch(),
+                        global_epoch: combined_ic_epoch(),
                         cached_value: result,
                     };
                     if ptrs.is_cached() {
@@ -6497,7 +6526,7 @@ pub(crate) mod jit_runtime {
             let cache = unsafe { &*ic_ref.as_ptr() };
             let pe = cache.proto[proto_slot];
             if pe.receiver_handle == obj_i64 && pe.name_idx == name_idx {
-                let epoch = PropertyMap::global_proto_mutation_epoch();
+                let epoch = combined_ic_epoch();
                 if pe.global_epoch == epoch {
                     return InlineNamedResult {
                         value: pe.cached_value,
@@ -6542,6 +6571,17 @@ pub(crate) mod jit_runtime {
                 if let Some(result) =
                     try_encode_ic_inline(val, ic_entry.cached_ptr, ic_entry.cached_handle)
                 {
+                    // Promote to proto IC so the next access for the
+                    // same handle skips the heap dereference entirely.
+                    let epoch = combined_ic_epoch();
+                    let cache_mut = unsafe { &mut *ic_ref.as_ptr() };
+                    let pe = &mut cache_mut.proto[proto_slot];
+                    pe.name_idx = name_idx;
+                    pe.shape = shape;
+                    pe.receiver_handle = obj_i64;
+                    pe.global_epoch = epoch;
+                    pe.cached_value = result;
+
                     return InlineNamedResult {
                         value: result,
                         hit: 1,
@@ -6552,7 +6592,7 @@ pub(crate) mod jit_runtime {
             // ── Prototype IC hit (shape-based fallback) ────────────
             if proto_entry.name_idx == name_idx && proto_entry.shape == shape {
                 // Re-stamp the entry so handle+epoch check hits next time.
-                let epoch = PropertyMap::global_proto_mutation_epoch();
+                let epoch = combined_ic_epoch();
                 let cache_mut = unsafe { &mut *ic_ref.as_ptr() };
                 let pe = &mut cache_mut.proto[proto_slot];
                 pe.receiver_handle = obj_i64;
@@ -7231,6 +7271,10 @@ pub(crate) mod jit_runtime {
     /// from the heap (avoiding an Rc clone) and tries the template-fill
     /// fast path before falling back to a full `insert`.
     fn sta_named_property_inner(obj_i64: i64, name_idx: u32, value_i64: i64) -> Option<i64> {
+        // Bump the value-write epoch so proto-IC entries caching
+        // own-property values are invalidated.
+        bump_value_write_epoch();
+
         if !is_heap_handle(obj_i64) {
             return None;
         }
