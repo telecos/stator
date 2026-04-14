@@ -414,6 +414,16 @@ pub(crate) mod jit_runtime {
         static RT_STUB_DEOPT_COUNTS: Cell<[u64; STUB_DEOPT_SLOTS]> =
             const { Cell::new([0; STUB_DEOPT_SLOTS]) };
 
+        /// Whether the first deopt in the current invocation has already
+        /// been recorded.  Reset to `false` by [`jit_runtime_setup`].
+        static RT_FIRST_DEOPT_REPORTED: Cell<bool> = const { Cell::new(false) };
+
+        /// Per-stub *first*-deopt counts.  Like `RT_STUB_DEOPT_COUNTS`,
+        /// but only incremented for the very first deopt in each
+        /// invocation (i.e. after each [`jit_runtime_setup`] call).
+        static RT_FIRST_DEOPT_COUNTS: Cell<[u64; STUB_DEOPT_SLOTS]> =
+            const { Cell::new([0; STUB_DEOPT_SLOTS]) };
+
         /// Repeat-callee cache for [`exec_maglev_callee`].
         ///
         /// When a tight loop calls the same closure repeatedly, this cache
@@ -460,6 +470,17 @@ pub(crate) mod jit_runtime {
             arr[idx] = arr[idx].saturating_add(1);
             c.set(arr);
         });
+        // Track first-deopt-per-invocation.
+        RT_FIRST_DEOPT_REPORTED.with(|reported| {
+            if !reported.get() {
+                reported.set(true);
+                RT_FIRST_DEOPT_COUNTS.with(|c| {
+                    let mut arr = c.get();
+                    arr[idx] = arr[idx].saturating_add(1);
+                    c.set(arr);
+                });
+            }
+        });
     }
 
     /// Return the current per-stub deopt counts.
@@ -470,6 +491,16 @@ pub(crate) mod jit_runtime {
     /// Reset all per-stub deopt counts to zero.
     pub fn reset_stub_deopt_counts() {
         RT_STUB_DEOPT_COUNTS.with(|c| c.set([0; STUB_DEOPT_SLOTS]));
+    }
+
+    /// Return the current per-stub *first*-deopt counts.
+    pub fn first_deopt_counts() -> [u64; STUB_DEOPT_SLOTS] {
+        RT_FIRST_DEOPT_COUNTS.with(|c| c.get())
+    }
+
+    /// Reset all per-stub first-deopt counts to zero.
+    pub fn reset_first_deopt_counts() {
+        RT_FIRST_DEOPT_COUNTS.with(|c| c.set([0; STUB_DEOPT_SLOTS]));
     }
 
     /// Extended single-entry callee cache entry.
@@ -878,6 +909,8 @@ pub(crate) mod jit_runtime {
         // Bump the generation counter so that stale cached pointers from
         // a previous setup epoch are detected and re-cached.
         RT_SETUP_GEN.with(|g| g.set(g.get().wrapping_add(1)));
+        // Reset the first-deopt flag so the next deopt is recorded.
+        RT_FIRST_DEOPT_REPORTED.with(|r| r.set(false));
         cache_rt_ptrs();
         let ba_ptr = ba as *const BytecodeArray;
         RT_BYTECODE.with(|b| b.set(ba_ptr));
@@ -9781,6 +9814,34 @@ pub fn reset_stub_deopt_counts() {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
         jit_runtime::reset_stub_deopt_counts();
+    }
+}
+
+/// Return per-stub *first*-deopt-per-invocation counts.
+///
+/// Each slot counts how many times the corresponding stub was the
+/// **first** stub to deopt in a given invocation (i.e. since the
+/// last [`jit_runtime_setup`] call).
+///
+/// On platforms without the JIT (non-x86-64/non-Unix), returns all zeros.
+pub fn first_deopt_counts() -> [u64; STUB_DEOPT_SLOTS] {
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        jit_runtime::first_deopt_counts()
+    }
+    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    {
+        [0; STUB_DEOPT_SLOTS]
+    }
+}
+
+/// Reset all per-stub first-deopt counts to zero.
+///
+/// On platforms without the JIT this is a no-op.
+pub fn reset_first_deopt_counts() {
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        jit_runtime::reset_first_deopt_counts();
     }
 }
 
