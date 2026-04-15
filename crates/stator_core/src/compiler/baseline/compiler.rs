@@ -1200,7 +1200,7 @@ pub(crate) mod jit_runtime {
             JsValue::PlainObject(rc) => Some(Rc::as_ptr(rc) as usize),
             JsValue::Array(rc) => Some(Rc::as_ptr(rc) as usize),
             JsValue::Function(rc) => Some(Rc::as_ptr(rc) as usize),
-            JsValue::String(rc) => Some(Rc::as_ptr(rc) as *const str as *const () as usize),
+            JsValue::String(rc) => Some(Rc::as_ptr(rc) as *const () as usize),
             JsValue::Error(rc) => Some(Rc::as_ptr(rc) as usize),
             JsValue::Generator(rc) => Some(Rc::as_ptr(rc) as usize),
             JsValue::Iterator(rc) => Some(Rc::as_ptr(rc) as usize),
