@@ -3155,14 +3155,11 @@ pub(crate) mod jit_runtime {
 
             let skip_args = ba.parameter_count() == 0;
 
-            // Defer heap_base for 0-param closures — on the Smi
-            // fast path the read and truncation are both skipped.
-            let heap_base = if skip_args {
-                0usize
-            } else {
-                // SAFETY: no active borrows; read length via raw pointer.
-                unsafe { (*heap_ref.as_ptr()).len() }
-            };
+            // Always read heap length so we can truncate after the
+            // callee returns — even 0-param closures may allocate
+            // heap handles (context loads, intermediate values).
+            // SAFETY: no active borrows; read length via raw pointer.
+            let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
 
             // Compare callee context with current context — if they're
             // the same (common for closures in tight loops), skip the
@@ -3208,11 +3205,10 @@ pub(crate) mod jit_runtime {
             if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
                 // SAFETY: no active borrows; skip truncation when the
                 // callee allocated no heap handles.
-                if !skip_args {
-                    unsafe {
-                        if (*heap_ref.as_ptr()).len() != heap_base {
-                            (*heap_ref.as_ptr()).truncate(heap_base);
-                        }
+                // SAFETY: truncate heap handles allocated by callee.
+                unsafe {
+                    if (*heap_ref.as_ptr()).len() != heap_base {
+                        (*heap_ref.as_ptr()).truncate(heap_base);
                     }
                 }
                 if let Some(ctx) = saved_ctx {
@@ -3221,12 +3217,8 @@ pub(crate) mod jit_runtime {
                 return Some(jit_result);
             }
 
-            // Slow paths need the real heap_base.
-            let heap_base = if skip_args {
-                unsafe { (*heap_ref.as_ptr()).len() }
-            } else {
-                heap_base
-            };
+            // heap_base was read before the callee executed (always
+            // valid — no deferred sentinel).
 
             // Heap handle or deopt: resolve the handle before truncation
             // destroys it, then re-encode after cleanup.
@@ -3380,14 +3372,11 @@ pub(crate) mod jit_runtime {
                 (skip_args, ctx_raw, same_context)
             };
 
-            // Defer heap_base for 0-param closures — on the Smi
-            // fast path the read and truncation are both skipped.
-            let heap_base = if skip_args {
-                0usize
-            } else {
-                // SAFETY: no active borrows; read length via raw pointer.
-                unsafe { (*heap_ref.as_ptr()).len() }
-            };
+            // Always read heap length so we can truncate after the
+            // callee returns — even 0-param closures may allocate
+            // heap handles (context loads, intermediate values).
+            // SAFETY: no active borrows; read length via raw pointer.
+            let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
 
             let saved_ctx = if same_context {
                 None
@@ -3410,16 +3399,13 @@ pub(crate) mod jit_runtime {
 
             // ── Fast return for Smi results ───────────────────────
             if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
-                // Skip heap truncation for 0-param closures (heap_base
-                // was never read) and skip context restore when
-                // same_context is true (no swap occurred).
-                if !skip_args {
-                    // SAFETY: no active borrows; truncate only when the
-                    // callee allocated heap handles.
-                    unsafe {
-                        if (*heap_ref.as_ptr()).len() != heap_base {
-                            (*heap_ref.as_ptr()).truncate(heap_base);
-                        }
+                // Always truncate heap — even 0-param closures may
+                // allocate handles that must be cleaned up.
+                // SAFETY: no active borrows; truncate only when the
+                // callee allocated heap handles.
+                unsafe {
+                    if (*heap_ref.as_ptr()).len() != heap_base {
+                        (*heap_ref.as_ptr()).truncate(heap_base);
                     }
                 }
                 if let Some(ctx) = saved_ctx {
@@ -3428,12 +3414,8 @@ pub(crate) mod jit_runtime {
                 return Some(jit_result);
             }
 
-            // Slow paths need the real heap_base.
-            let heap_base = if skip_args {
-                unsafe { (*heap_ref.as_ptr()).len() }
-            } else {
-                heap_base
-            };
+            // heap_base was read before the callee executed (always
+            // valid — no deferred sentinel).
 
             let result_val = if is_jit_deopt(jit_result) {
                 // Callee deopted — invalidate the repeat-callee cache
@@ -3829,11 +3811,10 @@ pub(crate) mod jit_runtime {
                     // (common: `count = count + 1; return count`), defer
                     // the heap-length snapshot until we actually need it.
                     // On the Smi fast path this read is skipped entirely.
-                    let heap_base = if skip_args {
-                        0usize // sentinel — unused on the fast path
-                    } else {
-                        unsafe { (*heap_ref.as_ptr()).len() }
-                    };
+                    // SAFETY: always snapshot heap length before calling the callee
+                    // so we can truncate afterwards — even 0-param closures
+                    // may allocate heap handles.
+                    let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
 
                     // Repeat-callee cache: reuse the context comparison
                     // result when the same callee is called again.
@@ -3937,11 +3918,10 @@ pub(crate) mod jit_runtime {
                     if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
                         // Smi result — skip heap truncation entirely for
                         // 0-param closures (heap_base was never read).
-                        if !skip_args {
-                            unsafe {
-                                if (*heap_ref.as_ptr()).len() != heap_base {
-                                    (*heap_ref.as_ptr()).truncate(heap_base);
-                                }
+                        // SAFETY: truncate heap handles allocated by callee.
+                        unsafe {
+                            if (*heap_ref.as_ptr()).len() != heap_base {
+                                (*heap_ref.as_ptr()).truncate(heap_base);
                             }
                         }
                         if let Some(saved) = saved_ctx {
@@ -3956,12 +3936,7 @@ pub(crate) mod jit_runtime {
                         return Some(jit_result);
                     }
 
-                    // Slow paths need the real heap_base.
-                    let heap_base = if skip_args {
-                        unsafe { (*heap_ref.as_ptr()).len() }
-                    } else {
-                        heap_base
-                    };
+                    // heap_base was always read before callee execution.
 
                     if is_jit_deopt(jit_result) {
                         ba.mark_jit_maglev_deopted();
@@ -4042,12 +4017,8 @@ pub(crate) mod jit_runtime {
                         ptrs.set_cached_callee(entry);
 
                         let ctx_ref = unsafe { &*ptrs.context };
-                        // Defer heap_base read for 0-param closures.
-                        let heap_base = if skip_args {
-                            0usize
-                        } else {
-                            unsafe { (*heap_ref.as_ptr()).len() }
-                        };
+                        // SAFETY: always read heap length before callee execution.
+                        let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
 
                         let callee_ctx_raw = ba.closure_context();
                         let callee_ctx_ptr =
@@ -4083,11 +4054,10 @@ pub(crate) mod jit_runtime {
                         }
 
                         if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
-                            if !skip_args {
-                                unsafe {
-                                    if (*heap_ref.as_ptr()).len() != heap_base {
-                                        (*heap_ref.as_ptr()).truncate(heap_base);
-                                    }
+                            // SAFETY: truncate heap handles allocated by callee.
+                            unsafe {
+                                if (*heap_ref.as_ptr()).len() != heap_base {
+                                    (*heap_ref.as_ptr()).truncate(heap_base);
                                 }
                             }
                             if let Some(saved) = saved_ctx {
@@ -4100,12 +4070,7 @@ pub(crate) mod jit_runtime {
                             return Some(jit_result);
                         }
 
-                        // Slow paths need the real heap_base.
-                        let heap_base = if skip_args {
-                            unsafe { (*heap_ref.as_ptr()).len() }
-                        } else {
-                            heap_base
-                        };
+                        // heap_base was always read before callee execution.
 
                         if is_jit_deopt(jit_result) {
                             // Callee Maglev deopted — mark + invalidate,
@@ -4169,12 +4134,8 @@ pub(crate) mod jit_runtime {
 
                     if entry.entry_fn != 0 {
                         let ctx_ref = unsafe { &*ptrs.context };
-                        // Defer heap_base for 0-param closures.
-                        let heap_base = if skip_args {
-                            0usize
-                        } else {
-                            unsafe { (*heap_ref.as_ptr()).len() }
-                        };
+                        // SAFETY: always read heap length before callee execution.
+                        let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
 
                         let callee_ctx_ptr = entry.ctx_ptr as *const RefCell<JsContext>;
                         let current_ctx_ptr = unsafe {
@@ -4209,11 +4170,10 @@ pub(crate) mod jit_runtime {
                         }
 
                         if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
-                            if !skip_args {
-                                unsafe {
-                                    if (*heap_ref.as_ptr()).len() != heap_base {
-                                        (*heap_ref.as_ptr()).truncate(heap_base);
-                                    }
+                            // SAFETY: truncate heap handles allocated by callee.
+                            unsafe {
+                                if (*heap_ref.as_ptr()).len() != heap_base {
+                                    (*heap_ref.as_ptr()).truncate(heap_base);
                                 }
                             }
                             if let Some(saved) = saved_ctx {
@@ -4226,12 +4186,7 @@ pub(crate) mod jit_runtime {
                             return Some(jit_result);
                         }
 
-                        // Slow paths need the real heap_base.
-                        let heap_base = if skip_args {
-                            unsafe { (*heap_ref.as_ptr()).len() }
-                        } else {
-                            heap_base
-                        };
+                        // heap_base was always read before callee execution.
 
                         if is_jit_deopt(jit_result) {
                             ba.mark_jit_baseline_deopted();
@@ -4276,15 +4231,10 @@ pub(crate) mod jit_runtime {
                 let cache_ref = unsafe { &*exec_cache.as_ptr() };
                 if let Some(exec) = cache_ref.as_ref() {
                     let ctx_ref = unsafe { &*ptrs.context };
-                    // Defer heap_base for 0-param closures — on the Smi
-                    // fast path the read and truncation are both skipped.
-                    let heap_base = if skip_args {
-                        0usize
-                    } else {
-                        // SAFETY: no active heap borrows; read length
-                        // via temporary raw-pointer dereference.
-                        unsafe { (*heap_ref.as_ptr()).len() }
-                    };
+                    // SAFETY: always snapshot heap length before calling the
+                    // callee so we can truncate afterwards — even 0-param
+                    // closures may allocate heap handles.
+                    let heap_base = unsafe { (*heap_ref.as_ptr()).len() };
 
                     let callee_ctx_raw = ba.closure_context();
                     let callee_ctx_ptr = callee_ctx_raw.map(Rc::as_ptr).unwrap_or(std::ptr::null());
@@ -4327,11 +4277,10 @@ pub(crate) mod jit_runtime {
                     if !is_jit_deopt(jit_result) && jit_result < JIT_HEAP_TAG {
                         // SAFETY: no active heap borrows; skip truncation
                         // when the callee allocated no heap handles.
-                        if !skip_args {
-                            unsafe {
-                                if (*heap_ref.as_ptr()).len() != heap_base {
-                                    (*heap_ref.as_ptr()).truncate(heap_base);
-                                }
+                        // SAFETY: truncate heap handles allocated by callee.
+                        unsafe {
+                            if (*heap_ref.as_ptr()).len() != heap_base {
+                                (*heap_ref.as_ptr()).truncate(heap_base);
                             }
                         }
                         if let Some(saved) = saved_ctx {
@@ -4344,12 +4293,7 @@ pub(crate) mod jit_runtime {
                         return Some(jit_result);
                     }
 
-                    // Slow paths need the real heap_base.
-                    let heap_base = if skip_args {
-                        unsafe { (*heap_ref.as_ptr()).len() }
-                    } else {
-                        heap_base
-                    };
+                    // heap_base was always read before callee execution.
 
                     if is_jit_deopt(jit_result) {
                         // Callee baseline JIT deopted — mark it and
