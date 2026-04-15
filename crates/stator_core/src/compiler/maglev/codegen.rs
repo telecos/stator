@@ -7890,19 +7890,44 @@ impl<'a> MaglevCodegen<'a> {
             }
         }
 
-        // NOTE: LoadNamedGeneric seeding into smi_guarded is DISABLED.
+        // Seed LoadNamedGeneric and LoadGlobal into smi_guarded when they
+        // feed exclusively into arithmetic-compatible consumers.
         //
-        // The speculative Smi guard (MOVSXD + CMP + JNE deopt) caused 100%
-        // deopt for property_access and array_push_sum benchmarks.  The
-        // exact root cause is unclear — Smi(1..5) values should pass the
-        // guard.  Disabling the seeding means LoadNamedGeneric results won't
-        // enter smi_guarded, so downstream GenericAdd/Sub/Mul use the
-        // generic tier (~13 instructions with dual Smi checks) instead of
-        // the fast smi_guarded tier (~7 instructions).  This is correct and
-        // safe; re-enable once the guard-failure root cause is diagnosed.
+        // At codegen time, each seeded node gets a Smi deopt guard
+        // (MOVSXD + CMP + JNE deopt) that safely bails to the interpreter
+        // if the runtime value is not a Smi.  The payoff is that downstream
+        // GenericAdd/Sub/Mul can use the smi_guarded tier (~7 insns) instead
+        // of the generic tier (~13 insns with dual input Smi checks).
         //
-        // History: ed049403 fixed register-clobber, 1c1fbf6c re-enabled,
-        // but CI still shows 100% deopt (stub=50/43, no stub_deopts).
+        // Previously disabled due to 100% deopt (history: ed049403,
+        // 1c1fbf6c), likely caused by inline IC register corruption.
+        // Re-enabled now that inline ICs are bypassed with simple stub
+        // calls that return correct Smi values.
+        for block in graph.blocks() {
+            for (id, node) in &block.nodes {
+                if set.contains(id) || branch_conditions.contains(id) {
+                    continue;
+                }
+                let is_load = matches!(
+                    node,
+                    ValueNode::LoadNamedGeneric { .. } | ValueNode::LoadGlobal { .. }
+                );
+                if !is_load {
+                    continue;
+                }
+                let all_arith = consumers_of.get(id).is_some_and(|cs| {
+                    !cs.is_empty()
+                        && cs.iter().all(|c| {
+                            node_lookup
+                                .get(c)
+                                .is_some_and(|n| Self::is_arithmetic_compatible_consumer(n))
+                        })
+                });
+                if all_arith {
+                    set.insert(*id);
+                }
+            }
+        }
 
         // Optimistic Phi seeding for loop-carried Smi values.
         //
