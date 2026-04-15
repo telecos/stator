@@ -3662,9 +3662,14 @@ impl<'a> MaglevCodegen<'a> {
     fn emit_save_live_regs(&mut self, at_node: NodeId) -> u8 {
         // A stub call clobbers RAX (return value), so invalidate forwarding.
         self.clear_reg_forwarding();
-        // Intersect per-call-site liveness with the function-wide mask
-        // as a safety belt.
-        let mask = self.alloc.live_caller_saved_at(at_node) & self.used_caller_saved;
+        // Save ALL caller-saved registers that are allocated anywhere in the
+        // function.  The previous per-node liveness mask (`live_caller_saved_at`)
+        // excluded registers at their "last use" program-point, but in loops the
+        // value is still needed on the next iteration.  Unconditionally saving
+        // every used caller-saved register is a few extra push/pop instructions
+        // but eliminates an entire class of register-corruption bugs.
+        let _at = at_node;
+        let mask = self.used_caller_saved;
         let count = mask.count_ones();
         // Need an odd number of pushes for 16-byte stack alignment
         // before the CALL instruction.  After prologue, RSP ≡ 8 mod 16,
