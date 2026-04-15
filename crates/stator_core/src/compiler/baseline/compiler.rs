@@ -1296,7 +1296,27 @@ pub(crate) mod jit_runtime {
     /// Convert a JIT `i64` (possibly a heap handle) to a [`JsValue`].
     fn jit_i64_to_jsvalue(v: i64) -> JsValue {
         if is_heap_handle(v) {
-            get_heap_object(v).unwrap_or(JsValue::Undefined)
+            match get_heap_object(v) {
+                Some(val) => val,
+                None => {
+                    // Diagnostic: log stale/invalid heap handle resolution.
+                    static STALE_HANDLE_DIAG: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let n = STALE_HANDLE_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 10 {
+                        let idx = (v - JIT_HEAP_TAG) as usize;
+                        let heap_len = RT_HEAP.with(|h| h.borrow().len());
+                        eprintln!(
+                            "STALE_HANDLE: v=0x{:x} idx={} heap_len={} (occurrence #{})",
+                            v as u64,
+                            idx,
+                            heap_len,
+                            n + 1
+                        );
+                    }
+                    JsValue::Undefined
+                }
+            }
         } else {
             super::jit_to_jsvalue(v).unwrap_or(JsValue::Undefined)
         }
