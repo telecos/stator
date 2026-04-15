@@ -9581,6 +9581,21 @@ pub(crate) mod jit_runtime {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a + *b as f64))
             }
             _ => {
+                // Diagnostic: log generic_add deopt values to trace
+                // register corruption or unsupported type combinations.
+                static DIAG_COUNT: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let n = DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 10 {
+                    eprintln!(
+                        "GENERIC_ADD_DEOPT: left=0x{:x} right=0x{:x} l_type={:?} r_type={:?} (#{})",
+                        left as u64,
+                        right as u64,
+                        std::mem::discriminant(&l),
+                        std::mem::discriminant(&r),
+                        n + 1
+                    );
+                }
                 track_stub_deopt(STUB_GENERIC_ARITH);
                 JIT_DEOPT
             }
@@ -9622,6 +9637,19 @@ pub(crate) mod jit_runtime {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a - *b as f64))
             }
             _ => {
+                static DIAG_SUB: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let n = DIAG_SUB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 5 {
+                    eprintln!(
+                        "GENERIC_SUB_DEOPT: left=0x{:x} right=0x{:x} l={:?} r={:?} (#{})",
+                        left as u64,
+                        right as u64,
+                        std::mem::discriminant(&l),
+                        std::mem::discriminant(&r),
+                        n + 1
+                    );
+                }
                 track_stub_deopt(STUB_GENERIC_ARITH);
                 JIT_DEOPT
             }
@@ -9663,6 +9691,19 @@ pub(crate) mod jit_runtime {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a * *b as f64))
             }
             _ => {
+                static DIAG_MUL: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let n = DIAG_MUL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 5 {
+                    eprintln!(
+                        "GENERIC_MUL_DEOPT: left=0x{:x} right=0x{:x} l={:?} r={:?} (#{})",
+                        left as u64,
+                        right as u64,
+                        std::mem::discriminant(&l),
+                        std::mem::discriminant(&r),
+                        n + 1
+                    );
+                }
                 track_stub_deopt(STUB_GENERIC_ARITH);
                 JIT_DEOPT
             }
