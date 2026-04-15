@@ -6339,34 +6339,6 @@ pub(crate) mod jit_runtime {
             }
         }
         result.unwrap_or_else(|| {
-            // Diagnostic: log first few IC-stub deopts with values.
-            static KEYED_IC_DIAG: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
-            let n = KEYED_IC_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 5 {
-                eprintln!(
-                    "STA_KEYED_IC_DEOPT: obj=0x{:x} key={} val=0x{:x} heap={}",
-                    obj_i64 as u64,
-                    key_i64,
-                    value_i64 as u64,
-                    if ptrs.is_cached() {
-                        let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
-                        if is_heap_handle(obj_i64) {
-                            let idx = (obj_i64 - JIT_HEAP_TAG) as usize;
-                            format!(
-                                "len={} obj_idx={} type={:?}",
-                                heap.len(),
-                                idx,
-                                heap.get(idx).map(std::mem::discriminant)
-                            )
-                        } else {
-                            format!("len={} obj_not_heap", heap.len())
-                        }
-                    } else {
-                        "ptrs_not_cached".to_string()
-                    }
-                );
-            }
             track_stub_deopt(STUB_STA_KEYED);
             JIT_DEOPT
         })
@@ -7116,18 +7088,6 @@ pub(crate) mod jit_runtime {
         ic_ptr: i64,
         rt_ptrs_cell: i64,
     ) -> InlineKeyedResult {
-        // Diagnostic: trace the first few calls to identify corruption.
-        {
-            static GROW_IC_DIAG: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
-            let n = GROW_IC_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 8 {
-                eprintln!(
-                    "GROW_IC_R15: obj=0x{:x} key={} val=0x{:x} ic_ptr=0x{:x} rt=0x{:x}",
-                    obj_i64 as u64, smi_key, value_i64 as u64, ic_ptr as u64, rt_ptrs_cell as u64,
-                );
-            }
-        }
         // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
         // TLS slot lives for the thread's entire lifetime.
         let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
@@ -9546,16 +9506,6 @@ pub(crate) mod jit_runtime {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a + *b as f64))
             }
             _ => {
-                // Diagnostic: log first few unhandled type pairs.
-                static ADD_DIAG: std::sync::atomic::AtomicU32 =
-                    std::sync::atomic::AtomicU32::new(0);
-                let n = ADD_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 5 {
-                    eprintln!(
-                        "GENERIC_ADD_DEOPT: left=0x{:x} right=0x{:x} L={:?} R={:?}",
-                        left as u64, right as u64, l, r
-                    );
-                }
                 track_stub_deopt(STUB_GENERIC_ARITH);
                 JIT_DEOPT
             }

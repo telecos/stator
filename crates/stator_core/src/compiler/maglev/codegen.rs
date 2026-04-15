@@ -5796,24 +5796,6 @@ impl<'a> MaglevCodegen<'a> {
         let mut store_bool = Label::new();
         let mut check_grow = Label::new();
 
-        // ── Compile-time diagnostic: allocation info ────────────────
-        {
-            static DIAG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let n = DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 5 {
-                eprintln!(
-                    "STA_KEYED_COMPILE: id={:?} obj=({:?}, loc={:?}) key=({:?}, loc={:?}) val=({:?}, loc={:?})",
-                    id,
-                    object,
-                    self.alloc.location(object),
-                    key,
-                    self.alloc.location(key),
-                    value,
-                    self.alloc.location(value),
-                );
-            }
-        }
-
         // ── Fast path (scratch regs only: R11, R10, RAX) ────────────
 
         // Load object, key, and value into scratch registers.

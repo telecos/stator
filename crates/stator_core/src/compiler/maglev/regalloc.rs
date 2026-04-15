@@ -736,6 +736,37 @@ pub fn allocate(graph: &MaglevGraph, num_regs: u32) -> AllocationResult {
     // the loop back-edge.
     coalesce_loop_phis(&mut assignments, graph, &intervals);
 
+    // ── Operand-conflict fixup ──────────────────────────────────────────────
+    //
+    // Safety net: ensure that no non-Phi instruction has two *different*
+    // input NodeIds allocated to the same physical register.  This can
+    // happen when interval computation is slightly conservative or when
+    // Phi coalescing reassigns a back-edge input to a register that
+    // conflicts with a co-operand of the same instruction.  When detected,
+    // the second operand is demoted to a fresh stack slot.
+    for block in graph.blocks() {
+        for (_, node) in &block.nodes {
+            if matches!(node, ValueNode::Phi { .. }) {
+                continue;
+            }
+            let mut seen: Vec<(u32, NodeId)> = Vec::new();
+            collect_inputs(node, &mut |inp| {
+                if let Some(&Location::Register(r)) = assignments.get(&inp) {
+                    let dominated = seen.iter().any(|&(sr, sid)| sr == r && sid != inp);
+                    if dominated {
+                        // Conflict: a previous input already occupies this
+                        // register.  Spill this operand.
+                        let slot = next_spill;
+                        next_spill += 1;
+                        assignments.insert(inp, Location::StackSlot(slot));
+                    } else if !seen.iter().any(|&(_, sid)| sid == inp) {
+                        seen.push((r, inp));
+                    }
+                }
+            });
+        }
+    }
+
     // ── Per-node caller-saved liveness ──────────────────────────────────────
     //
     // For each node at program point P, compute a bitmask of caller-saved
