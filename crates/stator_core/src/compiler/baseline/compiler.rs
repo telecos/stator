@@ -2976,6 +2976,17 @@ pub(crate) mod jit_runtime {
     /// Returns the call result as `i64` in `RAX`, or [`JIT_DEOPT`].
     pub extern "C" fn jit_runtime_call_undefined_receiver0(callee_i64: i64) -> i64 {
         call_undefined_receiver0_inner(callee_i64).unwrap_or_else(|| {
+            // Diagnostic: log first few call_undef0 deopts.
+            static CALL_DIAG_COUNT: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let n = CALL_DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 10 {
+                eprintln!(
+                    "CALL_UNDEF0_DEOPT: callee=0x{:x} (occurrence #{})",
+                    callee_i64 as u64,
+                    n + 1
+                );
+            }
             track_stub_deopt(STUB_CALL_UNDEF0);
             JIT_DEOPT
         })
@@ -5860,6 +5871,19 @@ pub(crate) mod jit_runtime {
         // TLS slot lives for the thread's entire lifetime.
         let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
         sta_keyed_property_with_ptrs(obj_i64, key_i64, value_i64, ptrs).unwrap_or_else(|| {
+            // Diagnostic: log first few sta_keyed deopts with values.
+            static STA_DIAG_COUNT: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let n = STA_DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 10 {
+                eprintln!(
+                    "STA_KEYED_DEOPT: obj=0x{:x} key=0x{:x} val=0x{:x} (occurrence #{})",
+                    obj_i64 as u64,
+                    key_i64 as u64,
+                    value_i64 as u64,
+                    n + 1
+                );
+            }
             track_stub_deopt(STUB_STA_KEYED);
             JIT_DEOPT
         })
@@ -9248,6 +9272,20 @@ pub(crate) mod jit_runtime {
     /// Generic Add: handles Smi + Smi (with overflow), HeapNumber, and
     /// string concatenation.  Deopts on complex cases.
     pub extern "C" fn jit_runtime_generic_add(left: i64, right: i64) -> i64 {
+        // Diagnostic: log first few calls where either operand is not Smi.
+        if !is_smi(left) || !is_smi(right) {
+            static ADD_DIAG_COUNT: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let n = ADD_DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 10 {
+                eprintln!(
+                    "ADD_DEOPT_DIAG: left=0x{:x} right=0x{:x} (occurrence #{})",
+                    left as u64,
+                    right as u64,
+                    n + 1
+                );
+            }
+        }
         // Fast path: both operands are Smi (i32 range).  Uses sign-
         // extension check (single comparison per operand) and i32
         // checked_add (single overflow-flag test) for a tighter code
@@ -9278,6 +9316,18 @@ pub(crate) mod jit_runtime {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a + *b as f64))
             }
             _ => {
+                // Diagnostic: log the JsValue types that cause deopt.
+                static ADD_SLOW_DIAG: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let n = ADD_SLOW_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 10 {
+                    eprintln!(
+                        "ADD_SLOW_DEOPT: left_type={:?} right_type={:?} (occurrence #{})",
+                        std::mem::discriminant(&l),
+                        std::mem::discriminant(&r),
+                        n + 1
+                    );
+                }
                 track_stub_deopt(STUB_GENERIC_ARITH);
                 JIT_DEOPT
             }

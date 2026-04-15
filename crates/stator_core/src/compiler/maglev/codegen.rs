@@ -3027,6 +3027,19 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.mov_load_base_disp32(dst, Reg64::R14, off);
             }
             None => {
+                // Diagnostic: emit_load with no allocation — this should
+                // not happen for well-formed operand references.
+                static EMIT_LOAD_NONE_COUNT: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let n = EMIT_LOAD_NONE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 20 {
+                    eprintln!(
+                        "EMIT_LOAD_NONE: id={:?} dst={:?} (occurrence #{})",
+                        id,
+                        dst,
+                        n + 1
+                    );
+                }
                 self.masm.mov_ri(dst, JIT_UNDEFINED);
             }
         }
