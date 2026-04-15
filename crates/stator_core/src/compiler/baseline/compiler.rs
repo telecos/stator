@@ -478,6 +478,7 @@ pub(crate) mod jit_runtime {
     pub const STUB_FAST_ARRAY_STORE: usize = 19;
     pub const STUB_FAST_ARRAY_PUSH: usize = 20;
     pub const STUB_TRAMPOLINE: usize = 21;
+    pub const STUB_GENERIC_ARITH: usize = 22;
 
     /// Record a deopt for the stub at the given index.
     #[inline]
@@ -9330,7 +9331,10 @@ pub(crate) mod jit_runtime {
             (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a + *b as f64))
             }
-            _ => JIT_DEOPT,
+            _ => {
+                track_stub_deopt(STUB_GENERIC_ARITH);
+                JIT_DEOPT
+            }
         }
     }
 
@@ -9361,7 +9365,10 @@ pub(crate) mod jit_runtime {
             (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a - *b as f64))
             }
-            _ => JIT_DEOPT,
+            _ => {
+                track_stub_deopt(STUB_GENERIC_ARITH);
+                JIT_DEOPT
+            }
         }
     }
 
@@ -9392,7 +9399,10 @@ pub(crate) mod jit_runtime {
             (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a * *b as f64))
             }
-            _ => JIT_DEOPT,
+            _ => {
+                track_stub_deopt(STUB_GENERIC_ARITH);
+                JIT_DEOPT
+            }
         }
     }
 
@@ -9544,7 +9554,10 @@ pub(crate) mod jit_runtime {
         let v = jit_i64_to_jsvalue(value);
         match &v {
             JsValue::HeapNumber(f) => jsvalue_to_jit_i64(JsValue::HeapNumber(*f + 1.0)),
-            _ => JIT_DEOPT,
+            _ => {
+                track_stub_deopt(STUB_GENERIC_ARITH);
+                JIT_DEOPT
+            }
         }
     }
 
@@ -9559,7 +9572,10 @@ pub(crate) mod jit_runtime {
         let v = jit_i64_to_jsvalue(value);
         match &v {
             JsValue::HeapNumber(f) => jsvalue_to_jit_i64(JsValue::HeapNumber(*f - 1.0)),
-            _ => JIT_DEOPT,
+            _ => {
+                track_stub_deopt(STUB_GENERIC_ARITH);
+                JIT_DEOPT
+            }
         }
     }
 
@@ -9886,7 +9902,7 @@ pub const STUB_NAMES: [&str; STUB_DEOPT_SLOTS] = [
     "fast_array_store",
     "fast_array_push",
     "trampoline",
-    "_reserved22",
+    "generic_arith",
     "_reserved23",
 ];
 
