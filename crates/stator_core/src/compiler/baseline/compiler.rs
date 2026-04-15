@@ -1221,7 +1221,24 @@ pub(crate) mod jit_runtime {
         if let Some(identity) = jsvalue_rc_identity(&val) {
             let hit = RT_HANDLE_DEDUP.with(|m| m.borrow().get(&identity).copied());
             if let Some(idx) = hit {
-                return JIT_HEAP_TAG + idx as i64;
+                // Validate: the dedup entry may be stale if a raw
+                // `truncate()` shortened the heap without pruning
+                // the dedup map.
+                let valid = if ptrs.is_cached() {
+                    // SAFETY: cached pointer valid for thread lifetime.
+                    let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+                    idx < heap.len()
+                } else {
+                    RT_HEAP.with(|h| idx < h.borrow().len())
+                };
+                if valid {
+                    return JIT_HEAP_TAG + idx as i64;
+                }
+                // Stale entry — remove it and fall through to allocate
+                // a fresh handle.
+                RT_HANDLE_DEDUP.with(|m| {
+                    m.borrow_mut().remove(&identity);
+                });
             }
         }
 
@@ -6302,6 +6319,34 @@ pub(crate) mod jit_runtime {
             }
         }
         result.unwrap_or_else(|| {
+            // Diagnostic: log first few IC-stub deopts with values.
+            static KEYED_IC_DIAG: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let n = KEYED_IC_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 5 {
+                eprintln!(
+                    "STA_KEYED_IC_DEOPT: obj=0x{:x} key={} val=0x{:x} heap={}",
+                    obj_i64 as u64,
+                    key_i64,
+                    value_i64 as u64,
+                    if ptrs.is_cached() {
+                        let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+                        if is_heap_handle(obj_i64) {
+                            let idx = (obj_i64 - JIT_HEAP_TAG) as usize;
+                            format!(
+                                "len={} obj_idx={} type={:?}",
+                                heap.len(),
+                                idx,
+                                heap.get(idx).map(std::mem::discriminant)
+                            )
+                        } else {
+                            format!("len={} obj_not_heap", heap.len())
+                        }
+                    } else {
+                        "ptrs_not_cached".to_string()
+                    }
+                );
+            }
             track_stub_deopt(STUB_STA_KEYED);
             JIT_DEOPT
         })
@@ -7209,9 +7254,26 @@ pub(crate) mod jit_runtime {
                     hit: 1,
                 }
             }
-            _ => InlineKeyedResult::from_generic(sta_keyed_property_with_ptrs(
-                obj_i64, smi_key, value_i64, ptrs,
-            )),
+            _ => {
+                // Diagnostic: log why the grow-IC fell through.
+                static GROW_IC_DIAG: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let n = GROW_IC_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 5 {
+                    eprintln!(
+                        "STA_KEYED_GROW_IC_MISS: obj=0x{:x} key={} val=0x{:x} heap_len={} obj_idx={} type={:?}",
+                        obj_i64 as u64,
+                        smi_key,
+                        value_i64 as u64,
+                        heap.len(),
+                        obj_idx,
+                        heap.get(obj_idx).map(std::mem::discriminant)
+                    );
+                }
+                InlineKeyedResult::from_generic(sta_keyed_property_with_ptrs(
+                    obj_i64, smi_key, value_i64, ptrs,
+                ))
+            }
         }
     }
 
@@ -9418,6 +9480,16 @@ pub(crate) mod jit_runtime {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a + *b as f64))
             }
             _ => {
+                // Diagnostic: log first few unhandled type pairs.
+                static ADD_DIAG: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let n = ADD_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 5 {
+                    eprintln!(
+                        "GENERIC_ADD_DEOPT: left=0x{:x} right=0x{:x} L={:?} R={:?}",
+                        left as u64, right as u64, l, r
+                    );
+                }
                 track_stub_deopt(STUB_GENERIC_ARITH);
                 JIT_DEOPT
             }
