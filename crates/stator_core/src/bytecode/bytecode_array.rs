@@ -1675,11 +1675,11 @@ impl BytecodeArray {
             return false;
         }
         for entry in self.constant_pool() {
-            if let ConstantPoolEntry::Function(nested_ba) = entry
-                && !nested_ba.has_maglev_jit_code()
-                && !nested_ba.maglev_compile_attempted()
-            {
-                return false;
+            if let ConstantPoolEntry::Function(nested_ba) = entry {
+                // Recursively check nested functions at all depths.
+                if !nested_ba.has_all_maglev_jit_code() && !nested_ba.maglev_compile_attempted() {
+                    return false;
+                }
             }
         }
         true
@@ -1855,6 +1855,13 @@ impl BytecodeArray {
     pub fn reset_maglev_deopt_count(&self) {
         self.jit_maglev_deopt_count.set(0);
         self.maglev_next_try_at.set(0);
+        // Recursively reset nested functions so inner closures can
+        // also retry JIT execution after warmup.
+        for entry in self.constant_pool() {
+            if let ConstantPoolEntry::Function(nested_ba) = entry {
+                nested_ba.reset_maglev_deopt_count();
+            }
+        }
     }
 
     /// Returns the current `next_try_at` value for diagnostics.

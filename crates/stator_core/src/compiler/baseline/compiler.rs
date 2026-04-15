@@ -2474,6 +2474,37 @@ pub(crate) mod jit_runtime {
         // TLS slot lives for the thread's entire lifetime.
         let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
         lda_named_property_inner_with_ptrs(obj_i64, name_idx, ptrs).unwrap_or_else(|| {
+            // Diagnostic: log first few lda_named_r15 deopts to trace
+            // register corruption or unsupported object types.
+            static DIAG_COUNT: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let n = DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 10 {
+                let obj_idx = if is_heap_handle(obj_i64) {
+                    (obj_i64 - JIT_HEAP_TAG) as usize
+                } else {
+                    usize::MAX
+                };
+                let heap_len = RT_HEAP.with(|h| h.borrow().len());
+                let heap_type = if obj_idx < heap_len {
+                    RT_HEAP.with(|h| {
+                        h.borrow()
+                            .get(obj_idx)
+                            .map(std::mem::discriminant)
+                    })
+                } else {
+                    None
+                };
+                eprintln!(
+                    "LDA_NAMED_R15_DEOPT: obj=0x{:x} name_idx={} obj_idx={} heap_len={} type={:?} (#{})",
+                    obj_i64 as u64,
+                    name_idx,
+                    obj_idx,
+                    heap_len,
+                    heap_type,
+                    n + 1
+                );
+            }
             track_stub_deopt(STUB_LDA_NAMED);
             JIT_DEOPT
         })
@@ -6290,6 +6321,18 @@ pub(crate) mod jit_runtime {
             }
         }
         result.unwrap_or_else(|| {
+            // Diagnostic: log first few sta_keyed_with_ic (non-R15) deopts.
+            static DIAG_COUNT2: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = DIAG_COUNT2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 5 {
+                eprintln!(
+                    "STA_KEYED_IC_DEOPT(noR15): obj=0x{:x} key={} val=0x{:x} (#{})",
+                    obj_i64 as u64,
+                    key_i64,
+                    value_i64 as u64,
+                    n + 1
+                );
+            }
             track_stub_deopt(STUB_STA_KEYED);
             JIT_DEOPT
         })
@@ -6339,6 +6382,38 @@ pub(crate) mod jit_runtime {
             }
         }
         result.unwrap_or_else(|| {
+            // Diagnostic: log first few sta_keyed_with_ic deopts with full
+            // argument values to trace register corruption.
+            static DIAG_COUNT: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let n = DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 10 {
+                let obj_idx = if is_heap_handle(obj_i64) {
+                    (obj_i64 - JIT_HEAP_TAG) as usize
+                } else {
+                    usize::MAX
+                };
+                let heap_len = RT_HEAP.with(|h| h.borrow().len());
+                let heap_type = if obj_idx < heap_len {
+                    RT_HEAP.with(|h| {
+                        h.borrow()
+                            .get(obj_idx)
+                            .map(std::mem::discriminant)
+                    })
+                } else {
+                    None
+                };
+                eprintln!(
+                    "STA_KEYED_IC_DEOPT: obj=0x{:x} key={} val=0x{:x} obj_idx={} heap_len={} type={:?} (#{})",
+                    obj_i64 as u64,
+                    key_i64,
+                    value_i64 as u64,
+                    obj_idx,
+                    heap_len,
+                    heap_type,
+                    n + 1
+                );
+            }
             track_stub_deopt(STUB_STA_KEYED);
             JIT_DEOPT
         })
