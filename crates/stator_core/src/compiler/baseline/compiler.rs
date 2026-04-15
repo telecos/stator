@@ -2320,10 +2320,98 @@ pub(crate) mod jit_runtime {
         name_idx: u32,
         _feedback_slot: u32,
     ) -> i64 {
-        lda_named_property_inner(obj_i64, name_idx).unwrap_or_else(|| {
+        let result = lda_named_property_inner(obj_i64, name_idx).unwrap_or_else(|| {
             track_stub_deopt(STUB_LDA_NAMED);
             JIT_DEOPT
-        })
+        });
+        // Log results that look problematic (undefined or deopt).
+        if result == JIT_UNDEFINED || result == JIT_DEOPT {
+            log_lda_named_result(
+                obj_i64,
+                name_idx,
+                result,
+                if result == JIT_UNDEFINED {
+                    "generic_undef"
+                } else {
+                    "generic_deopt"
+                },
+            );
+        }
+        result
+    }
+
+    /// Diagnostic: log why the IC fill returned MISS.
+    fn log_ic_fill_miss(reason: &str, obj_i64: i64, name_idx: u32) {
+        static IC_FILL_MISS_COUNT: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0);
+        let n = IC_FILL_MISS_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 20 {
+            eprintln!(
+                "IC_FILL_MISS: obj=0x{:x} name_idx={} reason={} (#{})",
+                obj_i64 as u64,
+                name_idx,
+                reason,
+                n + 1
+            );
+        }
+    }
+
+    /// Diagnostic: log IC fill MISS with property name and map size.
+    fn log_ic_fill_miss_with_name(
+        reason: &str,
+        obj_i64: i64,
+        name_idx: u32,
+        prop_name: &str,
+        map_len: usize,
+    ) {
+        static IC_FILL_NAME_COUNT: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0);
+        let n = IC_FILL_NAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 20 {
+            eprintln!(
+                "IC_FILL_MISS: obj=0x{:x} name_idx={} prop='{}' map_len={} reason={} (#{})",
+                obj_i64 as u64,
+                name_idx,
+                prop_name,
+                map_len,
+                reason,
+                n + 1
+            );
+        }
+    }
+
+    /// Diagnostic: log IC fill MISS with heap value type.
+    fn log_ic_fill_miss_with_type(reason: &str, obj_i64: i64, name_idx: u32, val: &JsValue) {
+        static IC_FILL_TYPE_COUNT: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0);
+        let n = IC_FILL_TYPE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 20 {
+            eprintln!(
+                "IC_FILL_MISS: obj=0x{:x} name_idx={} heap_type={:?} reason={} (#{})",
+                obj_i64 as u64,
+                name_idx,
+                std::mem::discriminant(val),
+                reason,
+                n + 1
+            );
+        }
+    }
+
+    /// Diagnostic: log the return value of `jit_runtime_lda_named_property`.
+    fn log_lda_named_result(obj_i64: i64, name_idx: u32, result: i64, path: &str) {
+        static LDA_NAMED_DIAG_COUNT: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0);
+        let n = LDA_NAMED_DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 20 {
+            eprintln!(
+                "LDA_NAMED: obj=0x{:x} name_idx={} result=0x{:x} path={} (#{})",
+                obj_i64 as u64,
+                name_idx,
+                result as u64,
+                path,
+                n + 1
+            );
+        }
     }
 
     /// Like [`jit_runtime_lda_named_property`] but accepts a pre-cached
@@ -2511,6 +2599,14 @@ pub(crate) mod jit_runtime {
                             };
                             return Some(result);
                         }
+                        // Property slot exists in shape but value is None
+                        // — structural inconsistency.
+                        log_lda_named_result(
+                            obj_i64,
+                            name_idx,
+                            JIT_UNDEFINED,
+                            "offset_found_but_no_value",
+                        );
                         return Some(JIT_UNDEFINED);
                     }
 
@@ -7498,6 +7594,7 @@ pub(crate) mod jit_runtime {
         ic_slots: *mut [i64; 4],
     ) -> NamedIcResult {
         if !is_heap_handle(obj_i64) {
+            log_ic_fill_miss("not_heap_handle", obj_i64, name_idx);
             return NamedIcResult::MISS;
         }
         let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
@@ -7505,19 +7602,26 @@ pub(crate) mod jit_runtime {
         // TLS slot lives for the thread's entire lifetime.
         let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
         if !ptrs.is_cached() {
+            log_ic_fill_miss("ptrs_not_cached", obj_i64, name_idx);
             return NamedIcResult::MISS;
         }
         // SAFETY: cached pointers valid for thread lifetime.
         let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
         let heap_val = match heap.get(obj_idx) {
             Some(v) => v,
-            None => return NamedIcResult::MISS,
+            None => {
+                log_ic_fill_miss("heap_idx_oob", obj_i64, name_idx);
+                return NamedIcResult::MISS;
+            }
         };
 
         if let JsValue::PlainObject(map_rc) = heap_val {
             let prop_name = match get_rt_string_constant_ref(name_idx) {
                 Some(n) => n,
-                None => return NamedIcResult::MISS,
+                None => {
+                    log_ic_fill_miss("name_idx_invalid", obj_i64, name_idx);
+                    return NamedIcResult::MISS;
+                }
             };
             // SAFETY: single-threaded JIT; no concurrent borrows.
             let map = unsafe { &*map_rc.as_ptr() };
@@ -7548,6 +7652,9 @@ pub(crate) mod jit_runtime {
                     hit: 1,
                 };
             }
+            log_ic_fill_miss_with_name("offset_not_found", obj_i64, name_idx, prop_name, map.len());
+        } else {
+            log_ic_fill_miss_with_type("not_plain_object", obj_i64, name_idx, heap_val);
         }
 
         // Fall back to the existing inline helper (probes proto IC too).
@@ -9272,20 +9379,6 @@ pub(crate) mod jit_runtime {
     /// Generic Add: handles Smi + Smi (with overflow), HeapNumber, and
     /// string concatenation.  Deopts on complex cases.
     pub extern "C" fn jit_runtime_generic_add(left: i64, right: i64) -> i64 {
-        // Diagnostic: log first few calls where either operand is not Smi.
-        if !is_smi(left) || !is_smi(right) {
-            static ADD_DIAG_COUNT: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
-            let n = ADD_DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 10 {
-                eprintln!(
-                    "ADD_DEOPT_DIAG: left=0x{:x} right=0x{:x} (occurrence #{})",
-                    left as u64,
-                    right as u64,
-                    n + 1
-                );
-            }
-        }
         // Fast path: both operands are Smi (i32 range).  Uses sign-
         // extension check (single comparison per operand) and i32
         // checked_add (single overflow-flag test) for a tighter code
@@ -9306,6 +9399,15 @@ pub(crate) mod jit_runtime {
         let l = jit_i64_to_jsvalue(left);
         let r = jit_i64_to_jsvalue(right);
         match (&l, &r) {
+            // Smi+Smi: happens when one/both operands arrive as heap handles
+            // that resolve to Smi after jit_i64_to_jsvalue.
+            (JsValue::Smi(a), JsValue::Smi(b)) => {
+                if let Some(sum) = a.checked_add(*b) {
+                    jsvalue_to_jit_i64(JsValue::Smi(sum))
+                } else {
+                    jsvalue_to_jit_i64(JsValue::HeapNumber(*a as f64 + *b as f64))
+                }
+            }
             (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a + *b))
             }
@@ -9316,18 +9418,6 @@ pub(crate) mod jit_runtime {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a + *b as f64))
             }
             _ => {
-                // Diagnostic: log the JsValue types that cause deopt.
-                static ADD_SLOW_DIAG: std::sync::atomic::AtomicU32 =
-                    std::sync::atomic::AtomicU32::new(0);
-                let n = ADD_SLOW_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 10 {
-                    eprintln!(
-                        "ADD_SLOW_DEOPT: left_type={:?} right_type={:?} (occurrence #{})",
-                        std::mem::discriminant(&l),
-                        std::mem::discriminant(&r),
-                        n + 1
-                    );
-                }
                 track_stub_deopt(STUB_GENERIC_ARITH);
                 JIT_DEOPT
             }
@@ -9352,6 +9442,13 @@ pub(crate) mod jit_runtime {
         let l = jit_i64_to_jsvalue(left);
         let r = jit_i64_to_jsvalue(right);
         match (&l, &r) {
+            (JsValue::Smi(a), JsValue::Smi(b)) => {
+                if let Some(diff) = a.checked_sub(*b) {
+                    jsvalue_to_jit_i64(JsValue::Smi(diff))
+                } else {
+                    jsvalue_to_jit_i64(JsValue::HeapNumber(*a as f64 - *b as f64))
+                }
+            }
             (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a - *b))
             }
@@ -9386,6 +9483,13 @@ pub(crate) mod jit_runtime {
         let l = jit_i64_to_jsvalue(left);
         let r = jit_i64_to_jsvalue(right);
         match (&l, &r) {
+            (JsValue::Smi(a), JsValue::Smi(b)) => {
+                if let Some(product) = a.checked_mul(*b) {
+                    jsvalue_to_jit_i64(JsValue::Smi(product))
+                } else {
+                    jsvalue_to_jit_i64(JsValue::HeapNumber(*a as f64 * *b as f64))
+                }
+            }
             (JsValue::HeapNumber(a), JsValue::HeapNumber(b)) => {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a * *b))
             }
