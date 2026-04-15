@@ -5007,13 +5007,6 @@ impl<'a> MaglevCodegen<'a> {
     /// Inline Smi fast path for `GenericIncrement` (`value + 1`).
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_inc(&mut self, id: NodeId, value: NodeId) {
-        eprintln!(
-            "CODEGEN_INC: id={:?} value={:?} in_i32_range={} in_smi_guarded={}",
-            id,
-            value,
-            self.i32_range.contains(&value),
-            self.smi_guarded.contains(&value)
-        );
         if self.i32_range.contains(&value) {
             match self.alloc.location(id) {
                 Some(Location::Register(n)) => {
@@ -5946,9 +5939,16 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
 
-        self.emit_load(object, Reg64::Rdi);
-        self.emit_load(key, Reg64::Rsi);
-        self.emit_load(value, Reg64::Rdx);
+        // Load all node args into non-allocatable scratch regs first
+        // to avoid ABI-register clobbering.  RSI (phys_reg 3) and
+        // RDX (phys_reg 2) are allocatable, so loading `key` → RSI
+        // can clobber `value` if the allocator placed it in RSI.
+        self.emit_load(object, Reg64::R11);
+        self.emit_load(key, Reg64::R10);
+        self.emit_load(value, Reg64::Rax);
+        self.masm.mov_rr(Reg64::Rdi, Reg64::R11);
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+        self.masm.mov_rr(Reg64::Rdx, Reg64::Rax);
 
         if self.needs_r15 {
             // Fast path: merged grow + IC update in a single FFI call.
@@ -6075,9 +6075,16 @@ impl<'a> MaglevCodegen<'a> {
         stub_addr: usize,
     ) {
         let saved = self.emit_save_live_regs(id);
-        self.emit_load(arg0, Reg64::Rdi);
-        self.emit_load(arg1, Reg64::Rsi);
-        self.emit_load(arg2, Reg64::Rdx);
+        // Load all node args into non-allocatable scratch regs first
+        // to avoid ABI-register clobbering.  RSI (phys_reg 3) and
+        // RDX (phys_reg 2) are allocatable, so loading `arg1` → RSI
+        // can clobber `arg2` if the allocator placed it in RSI.
+        self.emit_load(arg0, Reg64::R11);
+        self.emit_load(arg1, Reg64::R10);
+        self.emit_load(arg2, Reg64::Rax);
+        self.masm.mov_rr(Reg64::Rdi, Reg64::R11);
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+        self.masm.mov_rr(Reg64::Rdx, Reg64::Rax);
         self.masm.mov_ri(Reg64::R11, stub_addr as i64);
         self.masm.call_reg(Reg64::R11);
         self.emit_restore_live_regs(saved);
