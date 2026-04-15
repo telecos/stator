@@ -357,10 +357,11 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
         // hoisted per loop to avoid register-pressure explosions.  Each
         // hoisted generic load occupies one register for the entire loop
         // body, plus a caller-saved IC-fill call in the preheader.
-        // With 8 allocatable registers (R15 reserved), hoisting more
-        // than 2 generic loads risks spills that interact badly with
-        // the IC-fill save/restore paths.
-        const MAX_GENERIC_LOADS_HOISTED: usize = 2;
+        // With 9 allocatable registers, hoisting up to 5 generic loads
+        // leaves room for the loop counter and accumulator.  Chained
+        // accesses (a.b.c.d.e) only keep the final result live, so the
+        // effective pressure is lower than the cap suggests.
+        const MAX_GENERIC_LOADS_HOISTED: usize = 5;
         let mut generic_loads_in_hoist = 0usize;
 
         for block in graph.blocks() {

@@ -4299,6 +4299,45 @@ impl<'a> MaglevCodegen<'a> {
                     return;
                 }
 
+                // Strength-reduce *3, *5, *9: LEA [base+base*scale] is
+                // 1-cycle latency vs IMUL's 3 cycles.  The 64-bit LEA
+                // may overflow i32, so verify with MOVSXD+CMP+JNE.
+                let lea_scale: Option<u8> = match imm {
+                    3 => Some(2),
+                    5 => Some(4),
+                    9 => Some(8),
+                    _ => None,
+                };
+                if let Some(scale) = lea_scale {
+                    match self.alloc.location(id) {
+                        Some(Location::Register(n)) => {
+                            let dst = phys_reg(n);
+                            let src_reg = match self.alloc.location(var) {
+                                Some(Location::Register(sn)) => phys_reg(sn),
+                                _ => {
+                                    self.emit_load(var, Reg64::R10);
+                                    Reg64::R10
+                                }
+                            };
+                            self.masm.lea_scaled(dst, src_reg, src_reg, scale);
+                            self.masm.movsxd_sign_extend(Reg64::R11, dst);
+                            self.masm.cmp_rr(Reg64::R11, dst);
+                            self.masm.jne(&mut self.deopt_overflow_label);
+                            self.note_reg_holds(dst, id);
+                        }
+                        _ => {
+                            self.emit_load(var, Reg64::R11);
+                            self.masm
+                                .lea_scaled(Reg64::R11, Reg64::R11, Reg64::R11, scale);
+                            self.masm.movsxd_sign_extend(Reg64::R10, Reg64::R11);
+                            self.masm.cmp_rr(Reg64::R10, Reg64::R11);
+                            self.masm.jne(&mut self.deopt_overflow_label);
+                            self.emit_store(id, Reg64::R11);
+                        }
+                    }
+                    return;
+                }
+
                 // Other constants: IMUL32-immediate + JO + MOVSXD.
                 match self.alloc.location(id) {
                     Some(Location::Register(n)) => {
