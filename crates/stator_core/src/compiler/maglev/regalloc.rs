@@ -163,6 +163,68 @@ fn compute_live_intervals(graph: &MaglevGraph) -> Vec<LiveInterval> {
         }
     }
 
+    // ── Pass 3: Extend intervals across loop back-edges ────────────────
+    //
+    // The forward-only passes above miss values that are live across a loop
+    // back-edge.  Example: a value defined in a loop preheader and used at
+    // program point 3 in the loop body has interval [def, 4).  But the loop
+    // body continues to pp 6 (the branch).  If a stub call at pp 4 or 5
+    // clobbers the caller-saved register holding this value, the allocator
+    // won't save it because it appears dead — causing corruption next iter.
+    //
+    // Fix: for each loop, extend any interval that has a use inside the
+    // loop so that it covers the entire loop body (up to the back-edge).
+    // This makes `live_caller_saved_at` correctly include these registers.
+
+    // Compute per-block program-point ranges: (first_pp, one_past_last_pp).
+    let mut block_pp_ranges: Vec<(u32, u32)> = Vec::new();
+    {
+        let mut bp: u32 = 0;
+        for block in graph.blocks() {
+            let first = bp;
+            bp += block.nodes.len() as u32;
+            if block.control.is_some() {
+                bp += 1;
+            }
+            block_pp_ranges.push((first, bp));
+        }
+    }
+
+    // For each loop header, find the back-edge source and extend intervals.
+    let blocks = graph.blocks();
+    for block in blocks {
+        if !block.is_loop_header {
+            continue;
+        }
+        // Find the back-edge predecessor: a predecessor whose block id >= header id.
+        let back_edge_src = block
+            .predecessors
+            .iter()
+            .copied()
+            .filter(|&pred| pred >= block.id)
+            .max();
+        let Some(src_id) = back_edge_src else {
+            continue;
+        };
+        // Loop body spans from header's first pp to back-edge source's last pp.
+        let loop_start_pp = block_pp_ranges[block.id as usize].0;
+        let loop_end_pp = block_pp_ranges[src_id as usize].1;
+
+        // Extend any interval whose last use falls inside the loop body.
+        for (id, end) in end_point.iter_mut() {
+            // Only extend if the value has a use inside the loop range.
+            if *end >= loop_start_pp && *end < loop_end_pp {
+                // And the value is defined before the end of the loop
+                // (i.e., it's reachable from the loop body).
+                if let Some(&start) = def_point.get(id)
+                    && start < loop_end_pp
+                {
+                    *end = loop_end_pp.saturating_sub(1);
+                }
+            }
+        }
+    }
+
     // Build the interval list from the definition map.
     def_point
         .into_iter()

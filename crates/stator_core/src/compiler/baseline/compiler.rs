@@ -9211,11 +9211,27 @@ pub(crate) mod jit_runtime {
     #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
     #[inline(never)]
     pub extern "C" fn jit_runtime_load_context_slot_lean(ctx_i64: i64, slot_idx: i64) -> i64 {
-        // Only handle raw pointer contexts — reject null and heap handles.
-        if ctx_i64 == 0 || is_heap_handle(ctx_i64) {
+        if ctx_i64 == 0 {
             return JIT_DEOPT;
         }
         let slot = slot_idx as usize;
+
+        // Path 1: heap handle (from CreateFunctionContext in closures).
+        if is_heap_handle(ctx_i64) {
+            let ctx_val = jit_i64_to_jsvalue(ctx_i64);
+            return match ctx_val {
+                JsValue::Context(ctx_rc) => {
+                    let ctx = ctx_rc.borrow();
+                    ctx.slots
+                        .get(slot)
+                        .map(jsvalue_ref_to_jit_i64)
+                        .unwrap_or(JIT_UNDEFINED)
+                }
+                _ => JIT_DEOPT,
+            };
+        }
+
+        // Path 2: raw pointer (from direct-call closure context cache).
         // SAFETY: ctx_i64 is `Rc::as_ptr(rc) as usize` where `rc` is held
         // alive by the callee's BytecodeArray.  Single-threaded JIT
         // guarantees no concurrent borrows.
@@ -9229,8 +9245,9 @@ pub(crate) mod jit_runtime {
 
     /// Lean context-slot **store** for Maglev codegen.
     ///
-    /// Writes `value` into `ctx.slots[slot]` of a raw-pointer context.
-    /// Returns [`JIT_DEOPT`] for heap-handle or null contexts.
+    /// Writes `value` into `ctx.slots[slot]`.  Handles both raw-pointer
+    /// and heap-handle contexts (closures use heap handles).
+    /// Returns [`JIT_DEOPT`] for null contexts.
     ///
     /// # Calling convention (SysV AMD64)
     ///
@@ -9246,8 +9263,7 @@ pub(crate) mod jit_runtime {
         slot_idx: i64,
         value_i64: i64,
     ) -> i64 {
-        // Only handle raw pointer contexts.
-        if ctx_i64 == 0 || is_heap_handle(ctx_i64) {
+        if ctx_i64 == 0 {
             return JIT_DEOPT;
         }
         let slot = slot_idx as usize;
@@ -9256,6 +9272,24 @@ pub(crate) mod jit_runtime {
         } else {
             jit_i64_to_jsvalue(value_i64)
         };
+
+        // Path 1: heap handle (from CreateFunctionContext in closures).
+        if is_heap_handle(ctx_i64) {
+            let ctx_val = jit_i64_to_jsvalue(ctx_i64);
+            return match ctx_val {
+                JsValue::Context(ctx_rc) => {
+                    let mut ctx = ctx_rc.borrow_mut();
+                    if slot >= ctx.slots.len() {
+                        ctx.slots.resize(slot + 1, JsValue::Undefined);
+                    }
+                    ctx.slots[slot] = value;
+                    value_i64
+                }
+                _ => JIT_DEOPT,
+            };
+        }
+
+        // Path 2: raw pointer.
         // SAFETY: ctx_i64 is `Rc::as_ptr(rc) as usize` where `rc` is held
         // alive by the callee's BytecodeArray.  Single-threaded JIT
         // guarantees no concurrent borrows.
