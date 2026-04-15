@@ -353,6 +353,16 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
         // of which block they reside in.
         let mut to_hoist: Vec<(u32, usize, NodeId, ValueNode)> = Vec::new();
 
+        // Cap the number of LoadNamedGeneric / LoadKeyedGeneric nodes
+        // hoisted per loop to avoid register-pressure explosions.  Each
+        // hoisted generic load occupies one register for the entire loop
+        // body, plus a caller-saved IC-fill call in the preheader.
+        // With 8 allocatable registers (R15 reserved), hoisting more
+        // than 2 generic loads risks spills that interact badly with
+        // the IC-fill save/restore paths.
+        const MAX_GENERIC_LOADS_HOISTED: usize = 2;
+        let mut generic_loads_in_hoist = 0usize;
+
         for block in graph.blocks() {
             if !lp.body.contains(&block.id) {
                 continue;
@@ -368,12 +378,19 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
                 let alias_glob = global_load_aliases_store(node, &mutated_globals);
                 let blocked_by_side_effects_flag =
                     is_generic_property_load(node) && has_property_side_effects;
+                // Enforce the register-pressure cap on generic loads.
+                let over_generic_load_cap = is_generic_property_load(node)
+                    && generic_loads_in_hoist >= MAX_GENERIC_LOADS_HOISTED;
                 if pure
                     && inputs_out
                     && !alias_store
                     && !alias_glob
                     && !blocked_by_side_effects_flag
+                    && !over_generic_load_cap
                 {
+                    if is_generic_property_load(node) {
+                        generic_loads_in_hoist += 1;
+                    }
                     to_hoist.push((block.id, pos, *id, node.clone()));
                     // Eagerly mark as outside so later nodes in this same
                     // block can see the dependency as satisfied.
