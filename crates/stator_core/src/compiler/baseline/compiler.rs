@@ -3777,6 +3777,15 @@ pub(crate) mod jit_runtime {
                                 };
                             }
                             _ => {
+                                use std::sync::atomic::{AtomicUsize, Ordering};
+                                static CALL0_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
+                                if CALL0_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < 5 {
+                                    eprintln!(
+                                        "CALL0_DEOPT_DIAG: callee_i64=0x{:016x} is_heap={}",
+                                        callee_i64 as u64,
+                                        is_heap_handle(callee_i64)
+                                    );
+                                }
                                 bc_ref.set(saved_ba);
                                 return None;
                             }
@@ -6081,7 +6090,21 @@ pub(crate) mod jit_runtime {
             (JsValue::PlainObject(map_rc), JsValue::String(s)) => {
                 map_rc.borrow_mut().insert(s.to_string(), value);
             }
-            _ => return None,
+            _ => {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static STA_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
+                if STA_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < 5 {
+                    eprintln!(
+                        "STA_KEYED_DEOPT_DIAG: obj=0x{:016x} key=0x{:016x} val=0x{:016x} obj_smi={} key_smi={}",
+                        obj_i64 as u64,
+                        key_i64 as u64,
+                        value_i64 as u64,
+                        is_smi(obj_i64),
+                        is_smi(key_i64)
+                    );
+                }
+                return None;
+            }
         }
         Some(value_i64)
     }
@@ -9276,6 +9299,17 @@ pub(crate) mod jit_runtime {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a + *b as f64))
             }
             _ => {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static ADD_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
+                if ADD_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < 5 {
+                    eprintln!(
+                        "ADD_DEOPT_DIAG: left=0x{:016x} right=0x{:016x} left_smi={} right_smi={}",
+                        left as u64,
+                        right as u64,
+                        is_smi(left),
+                        is_smi(right)
+                    );
+                }
                 track_stub_deopt(STUB_GENERIC_ARITH);
                 JIT_DEOPT
             }
@@ -9499,6 +9533,16 @@ pub(crate) mod jit_runtime {
         match &v {
             JsValue::HeapNumber(f) => jsvalue_to_jit_i64(JsValue::HeapNumber(*f + 1.0)),
             _ => {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static INC_DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
+                if INC_DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < 5 {
+                    eprintln!(
+                        "INC_DEOPT_DIAG: value=0x{:016x} is_smi={} jit_to_jsvalue={:?}",
+                        value as u64,
+                        is_smi(value),
+                        jit_i64_to_jsvalue(value)
+                    );
+                }
                 track_stub_deopt(STUB_GENERIC_ARITH);
                 JIT_DEOPT
             }

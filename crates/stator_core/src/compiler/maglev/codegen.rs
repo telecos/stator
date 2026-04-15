@@ -5007,6 +5007,13 @@ impl<'a> MaglevCodegen<'a> {
     /// Inline Smi fast path for `GenericIncrement` (`value + 1`).
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_inc(&mut self, id: NodeId, value: NodeId) {
+        eprintln!(
+            "CODEGEN_INC: id={:?} value={:?} in_i32_range={} in_smi_guarded={}",
+            id,
+            value,
+            self.i32_range.contains(&value),
+            self.smi_guarded.contains(&value)
+        );
         if self.i32_range.contains(&value) {
             match self.alloc.location(id) {
                 Some(Location::Register(n)) => {
