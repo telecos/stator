@@ -7116,6 +7116,18 @@ pub(crate) mod jit_runtime {
         ic_ptr: i64,
         rt_ptrs_cell: i64,
     ) -> InlineKeyedResult {
+        // Diagnostic: trace the first few calls to identify corruption.
+        {
+            static GROW_IC_DIAG: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let n = GROW_IC_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 {
+                eprintln!(
+                    "GROW_IC_R15: obj=0x{:x} key={} val=0x{:x} ic_ptr=0x{:x} rt=0x{:x}",
+                    obj_i64 as u64, smi_key, value_i64 as u64, ic_ptr as u64, rt_ptrs_cell as u64,
+                );
+            }
+        }
         // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
         // TLS slot lives for the thread's entire lifetime.
         let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
