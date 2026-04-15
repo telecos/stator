@@ -7586,36 +7586,19 @@ impl<'a> MaglevCodegen<'a> {
             }
         }
 
-        // Seed LoadNamedGeneric into smi_guarded when ALL consumers are
-        // arithmetic-compatible.  A Smi deopt guard (MOVSXD + CMP + JNE)
-        // is emitted at the load site; the payoff is that every downstream
-        // GenericAdd/Sub/Mul can use the fast smi_guarded tier (bare ADD +
-        // JO, ~7 instructions) instead of the generic tier (~13 instructions
-        // with dual Smi checks).
+        // NOTE: LoadNamedGeneric seeding into smi_guarded is DISABLED.
         //
-        // Previously this caused 100% deopt because a register-clobber bug
-        // in the IC fill path corrupted the loaded values.  That bug was
-        // fixed in ed049403/bd5e9b74.
-        for block in graph.blocks() {
-            for (id, node) in &block.nodes {
-                if matches!(node, ValueNode::LoadNamedGeneric { .. })
-                    && !set.contains(id)
-                    && !branch_conditions.contains(id)
-                {
-                    let all_arith = consumers_of.get(id).is_some_and(|cs| {
-                        !cs.is_empty()
-                            && cs.iter().all(|c| {
-                                node_lookup
-                                    .get(c)
-                                    .is_some_and(|n| Self::is_arithmetic_compatible_consumer(n))
-                            })
-                    });
-                    if all_arith {
-                        set.insert(*id);
-                    }
-                }
-            }
-        }
+        // The speculative Smi guard (MOVSXD + CMP + JNE deopt) caused 100%
+        // deopt for property_access and array_push_sum benchmarks.  The
+        // exact root cause is unclear — Smi(1..5) values should pass the
+        // guard.  Disabling the seeding means LoadNamedGeneric results won't
+        // enter smi_guarded, so downstream GenericAdd/Sub/Mul use the
+        // generic tier (~13 instructions with dual Smi checks) instead of
+        // the fast smi_guarded tier (~7 instructions).  This is correct and
+        // safe; re-enable once the guard-failure root cause is diagnosed.
+        //
+        // History: ed049403 fixed register-clobber, 1c1fbf6c re-enabled,
+        // but CI still shows 100% deopt (stub=50/43, no stub_deopts).
 
         // Optimistic Phi seeding for loop-carried Smi values.
         //
