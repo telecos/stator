@@ -63,6 +63,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 #[cfg(all(target_arch = "x86_64", unix))]
 use std::rc::Rc;
+#[cfg(all(target_arch = "x86_64", unix))]
+use std::sync::atomic::{AtomicU32, Ordering};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Table serialization constants
@@ -5855,6 +5857,14 @@ pub(crate) mod jit_runtime {
         value_i64: i64,
     ) -> i64 {
         sta_keyed_property_inner(obj_i64, key_i64, value_i64).unwrap_or_else(|| {
+            static STA_DEOPT_COUNT: AtomicU32 = AtomicU32::new(0);
+            let n = STA_DEOPT_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 5 {
+                eprintln!(
+                    "[diag:sta_keyed] #{n} obj=0x{obj_i64:016x} key=0x{key_i64:016x} \
+                     val=0x{value_i64:016x}"
+                );
+            }
             track_stub_deopt(STUB_STA_KEYED);
             JIT_DEOPT
         })
@@ -5883,6 +5893,14 @@ pub(crate) mod jit_runtime {
         // TLS slot lives for the thread's entire lifetime.
         let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
         sta_keyed_property_with_ptrs(obj_i64, key_i64, value_i64, ptrs).unwrap_or_else(|| {
+            static STA_R15_DEOPT_COUNT: AtomicU32 = AtomicU32::new(0);
+            let n = STA_R15_DEOPT_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 5 {
+                eprintln!(
+                    "[diag:sta_keyed_r15] #{n} obj=0x{obj_i64:016x} key=0x{key_i64:016x} \
+                     val=0x{value_i64:016x}"
+                );
+            }
             track_stub_deopt(STUB_STA_KEYED);
             JIT_DEOPT
         })
@@ -6162,6 +6180,14 @@ pub(crate) mod jit_runtime {
             }
         }
         result.unwrap_or_else(|| {
+            static STA_IC_DEOPT_COUNT: AtomicU32 = AtomicU32::new(0);
+            let n = STA_IC_DEOPT_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 5 {
+                eprintln!(
+                    "[diag:sta_keyed_ic] #{n} obj=0x{obj_i64:016x} key=0x{key_i64:016x} \
+                     val=0x{value_i64:016x}"
+                );
+            }
             track_stub_deopt(STUB_STA_KEYED);
             JIT_DEOPT
         })
@@ -6211,6 +6237,14 @@ pub(crate) mod jit_runtime {
             }
         }
         result.unwrap_or_else(|| {
+            static STA_IC_R15_DEOPT_COUNT: AtomicU32 = AtomicU32::new(0);
+            let n = STA_IC_R15_DEOPT_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 5 {
+                eprintln!(
+                    "[diag:sta_keyed_ic_r15] #{n} obj=0x{obj_i64:016x} key=0x{key_i64:016x} \
+                     val=0x{value_i64:016x}"
+                );
+            }
             track_stub_deopt(STUB_STA_KEYED);
             JIT_DEOPT
         })
@@ -9365,6 +9399,14 @@ pub(crate) mod jit_runtime {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a + *b as f64))
             }
             _ => {
+                static ADD_DEOPT_COUNT: AtomicU32 = AtomicU32::new(0);
+                let n = ADD_DEOPT_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < 5 {
+                    eprintln!(
+                        "[diag:generic_add] #{n} left=0x{left:016x} right=0x{right:016x} \
+                         l={l:?} r={r:?}"
+                    );
+                }
                 track_stub_deopt(STUB_GENERIC_ARITH);
                 JIT_DEOPT
             }
@@ -9406,6 +9448,14 @@ pub(crate) mod jit_runtime {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a - *b as f64))
             }
             _ => {
+                static SUB_DEOPT_COUNT: AtomicU32 = AtomicU32::new(0);
+                let n = SUB_DEOPT_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < 5 {
+                    eprintln!(
+                        "[diag:generic_sub] #{n} left=0x{left:016x} right=0x{right:016x} \
+                         l={l:?} r={r:?}"
+                    );
+                }
                 track_stub_deopt(STUB_GENERIC_ARITH);
                 JIT_DEOPT
             }
@@ -9447,6 +9497,14 @@ pub(crate) mod jit_runtime {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a * *b as f64))
             }
             _ => {
+                static MUL_DEOPT_COUNT: AtomicU32 = AtomicU32::new(0);
+                let n = MUL_DEOPT_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n < 5 {
+                    eprintln!(
+                        "[diag:generic_mul] #{n} left=0x{left:016x} right=0x{right:016x} \
+                         l={l:?} r={r:?}"
+                    );
+                }
                 track_stub_deopt(STUB_GENERIC_ARITH);
                 JIT_DEOPT
             }
