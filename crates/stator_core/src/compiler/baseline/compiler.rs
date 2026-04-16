@@ -10505,7 +10505,7 @@ impl CompiledCode {
             libc::munmap(mem, code_size);
         }
 
-        if result == JIT_DEOPT {
+        if is_jit_deopt(result) {
             Err(StatorError::Internal("jit deopt".into()))
         } else {
             Ok(result)
@@ -10657,7 +10657,7 @@ impl CachedExecutableCode {
 
         let result = (self.func)(regs.as_mut_ptr());
 
-        if result == JIT_DEOPT {
+        if is_jit_deopt(result) {
             Err(StatorError::Internal("jit deopt".into()))
         } else {
             Ok(result)

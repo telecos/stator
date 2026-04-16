@@ -1552,6 +1552,30 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
                 }
                 c.set(cats);
             });
+            // Diagnostic output for deopt events (limited to first 30 occurrences)
+            static DEOPT_DIAG_COUNT: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let n = DEOPT_DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 30 {
+                let cat_name = match deopt_offset {
+                    0 => "generic",
+                    1 => "overflow",
+                    2 => "stub",
+                    3 => "global",
+                    4 => "divzero",
+                    _ => "unknown",
+                };
+                let func_name = ba.function_name();
+                let deopt_count = ba.maglev_deopt_count();
+                eprintln!(
+                    "MAGLEV_DEOPT: func='{}' cat={} deopt_count={} result=0x{:x} (#{})",
+                    func_name,
+                    cat_name,
+                    deopt_count,
+                    result as u64,
+                    n + 1,
+                );
+            }
             ba.mark_jit_maglev_deopted();
             None
         } else {
