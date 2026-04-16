@@ -7496,70 +7496,90 @@ impl<'a> MaglevCodegen<'a> {
             }
         }
 
-        // Phase 1.5: optimistic Phi seeding for loop-counter patterns.
+        // Phases 1.5 + 2: fixed-point iteration with optimistic Phi seeding.
         //
-        // In `for (var i = 0; i < N; i++) { ... (i * 3) | 0 ... }`, the
-        // Phi for `i` has a SmiConstant preheader input and a
-        // GenericIncrement body input.  Neither can enter i32_range
-        // without the other (circular dependency).  We break the tie by
-        // optimistically adding Phis that have at least one i32_range
-        // input.  The fixed-point then confirms via GenericIncrement.
-        // A verification pass afterwards removes any unconfirmed Phis.
-        for block in graph.blocks() {
-            for (id, node) in &block.nodes {
-                if let ValueNode::Phi { inputs } = node
-                    && !i32_range.contains(id)
-                {
-                    let any_in_set = inputs.iter().any(|inp| i32_range.contains(inp));
-                    if any_in_set {
-                        i32_range.insert(*id);
-                    }
-                }
-            }
-        }
+        // Loop-carried Phi nodes like `sum_phi = Phi(0, GenericAdd(sum_phi, ...))`
+        // have a circular dependency: GenericAdd needs sum_phi in i32_range,
+        // but sum_phi needs GenericAdd in i32_range.  We break the cycle by
+        // repeating two sub-phases until convergence:
+        //
+        //   Phase 1.5 — optimistically seed Phis that have ANY i32_range input.
+        //   Phase 2   — propagate through arithmetic (GenericAdd, etc.).
+        //
+        // After Phase 2 marks GenericAdd as i32_range (because sum_phi was
+        // seeded), the NEXT iteration of Phase 1.5 confirms sum_phi because
+        // its GenericAdd input is now in i32_range.  A verification pass
+        // (Phase 3) afterwards removes any Phis that remain unconfirmed.
+        //
+        // Max iterations prevents pathological cases from looping forever.
+        // In practice, convergence happens in 2–3 iterations.
+        for _outer in 0..10 {
+            let prev_size = i32_range.len();
 
-        // Phase 2: fixed-point iteration for Phi and CheckedSmi nodes.
-        loop {
-            let mut changed = false;
+            // Phase 1.5: optimistic Phi seeding.
             for block in graph.blocks() {
                 for (id, node) in &block.nodes {
-                    if i32_range.contains(id) {
-                        continue;
-                    }
-                    let derived = match node {
-                        ValueNode::Phi { inputs } => {
-                            inputs.iter().all(|inp| i32_range.contains(inp))
+                    if let ValueNode::Phi { inputs } = node
+                        && !i32_range.contains(id)
+                    {
+                        let any_in_set = inputs.iter().any(|inp| i32_range.contains(inp));
+                        if any_in_set {
+                            i32_range.insert(*id);
                         }
-                        ValueNode::CheckedSmiAdd { left, right }
-                        | ValueNode::CheckedSmiSubtract { left, right }
-                        | ValueNode::CheckedSmiMultiply { left, right } => {
-                            i32_range.contains(left) && i32_range.contains(right)
-                        }
-                        ValueNode::CheckedSmiIncrement { value }
-                        | ValueNode::CheckedSmiDecrement { value } => i32_range.contains(value),
-                        // GenericIncrement/Decrement of an i32-range value
-                        // produce i32 (with overflow deopt).  This lets
-                        // loop-counter Phis (0, i++) converge to i32_range.
-                        ValueNode::GenericIncrement { value, .. }
-                        | ValueNode::GenericDecrement { value, .. } => i32_range.contains(value),
-                        // GenericAdd/Subtract/Multiply of two i32-range
-                        // values: the 64-bit result always fits in i64.
-                        // Multiply gets an overflow guard in codegen (deopt
-                        // if i32×i32 overflows i32), so this is safe.
-                        ValueNode::GenericAdd { left, right, .. }
-                        | ValueNode::GenericSubtract { left, right, .. }
-                        | ValueNode::GenericMultiply { left, right, .. } => {
-                            i32_range.contains(left) && i32_range.contains(right)
-                        }
-                        _ => false,
-                    };
-                    if derived {
-                        i32_range.insert(*id);
-                        changed = true;
                     }
                 }
             }
-            if !changed {
+
+            // Phase 2: propagate through arithmetic and Phi nodes.
+            loop {
+                let mut changed = false;
+                for block in graph.blocks() {
+                    for (id, node) in &block.nodes {
+                        if i32_range.contains(id) {
+                            continue;
+                        }
+                        let derived = match node {
+                            ValueNode::Phi { inputs } => {
+                                inputs.iter().all(|inp| i32_range.contains(inp))
+                            }
+                            ValueNode::CheckedSmiAdd { left, right }
+                            | ValueNode::CheckedSmiSubtract { left, right }
+                            | ValueNode::CheckedSmiMultiply { left, right } => {
+                                i32_range.contains(left) && i32_range.contains(right)
+                            }
+                            ValueNode::CheckedSmiIncrement { value }
+                            | ValueNode::CheckedSmiDecrement { value } => i32_range.contains(value),
+                            // GenericIncrement/Decrement of an i32-range value
+                            // produce i32 (with overflow deopt).  This lets
+                            // loop-counter Phis (0, i++) converge to i32_range.
+                            ValueNode::GenericIncrement { value, .. }
+                            | ValueNode::GenericDecrement { value, .. } => {
+                                i32_range.contains(value)
+                            }
+                            // GenericAdd/Subtract/Multiply of two i32-range
+                            // values: the 64-bit result always fits in i64.
+                            // Multiply gets an overflow guard in codegen (deopt
+                            // if i32×i32 overflows i32), so this is safe.
+                            ValueNode::GenericAdd { left, right, .. }
+                            | ValueNode::GenericSubtract { left, right, .. }
+                            | ValueNode::GenericMultiply { left, right, .. } => {
+                                i32_range.contains(left) && i32_range.contains(right)
+                            }
+                            _ => false,
+                        };
+                        if derived {
+                            i32_range.insert(*id);
+                            changed = true;
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+
+            // Converged when no new nodes were added this outer iteration.
+            if i32_range.len() == prev_size {
                 break;
             }
         }
