@@ -7698,31 +7698,47 @@ impl<'a> MaglevCodegen<'a> {
         // GenericAdd/Sub/Mul can use the smi_guarded tier (~7 insns) instead
         // of the generic tier (~13 insns with dual input Smi checks).
         //
-        // Previously disabled due to 100% deopt (history: ed049403,
-        // 1c1fbf6c), caused by register corruption from the regalloc's
-        // nested loop interval bug.  Safe now with natural loop detection.
-        for block in graph.blocks() {
-            for (id, node) in &block.nodes {
-                if set.contains(id) || branch_conditions.contains(id) {
-                    continue;
-                }
-                let is_load = matches!(
-                    node,
-                    ValueNode::LoadNamedGeneric { .. } | ValueNode::LoadGlobal { .. }
-                );
-                if !is_load {
-                    continue;
-                }
-                let all_arith = consumers_of.get(id).is_some_and(|cs| {
-                    !cs.is_empty()
-                        && cs.iter().all(|c| {
-                            node_lookup
-                                .get(c)
-                                .is_some_and(|n| Self::is_arithmetic_compatible_consumer(n))
-                        })
-                });
-                if all_arith {
-                    set.insert(*id);
+        // DISABLED: LoadNamedGeneric / LoadGlobal smi_guard seeding.
+        //
+        // History: enabled after ed049403/1c1fbf6c regalloc fix, but still
+        // causes 100% deopt on property_access and deep_object benchmarks
+        // (CI run bc404220: tried=5, deopted=5, category=generic).  The
+        // guard sequence (MOVSXD R11,EAX; CMP R11,RAX; JNE deopt) should
+        // pass for Smi values 1–5, but fails every time on Linux CI.  Root
+        // cause under investigation (SMI_GUARD_FAIL diagnostic in e9a9f0c2).
+        //
+        // With this disabled, downstream GenericAdd/Sub/Mul fall back to
+        // the generic tier (inline MOVSXD+CMP per input, ~13 insns) instead
+        // of the smi_guarded tier (~7 insns).  The trade-off is ~6 extra
+        // instructions per arithmetic op vs. permanent JIT blacklisting on
+        // deopt — a huge net win until the guard bug is found.
+        //
+        // TODO: re-enable once the smi_guard deopt root cause is fixed.
+        #[allow(clippy::overly_complex_bool_expr)]
+        if false {
+            for block in graph.blocks() {
+                for (id, node) in &block.nodes {
+                    if set.contains(id) || branch_conditions.contains(id) {
+                        continue;
+                    }
+                    let is_load = matches!(
+                        node,
+                        ValueNode::LoadNamedGeneric { .. } | ValueNode::LoadGlobal { .. }
+                    );
+                    if !is_load {
+                        continue;
+                    }
+                    let all_arith = consumers_of.get(id).is_some_and(|cs| {
+                        !cs.is_empty()
+                            && cs.iter().all(|c| {
+                                node_lookup
+                                    .get(c)
+                                    .is_some_and(|n| Self::is_arithmetic_compatible_consumer(n))
+                            })
+                    });
+                    if all_arith {
+                        set.insert(*id);
+                    }
                 }
             }
         }
