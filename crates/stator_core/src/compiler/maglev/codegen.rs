@@ -2748,6 +2748,7 @@ impl<'a> MaglevCodegen<'a> {
             // ── Unsupported nodes → unconditional deopt ───────────────────────
             #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(unused_variables))]
             _other => {
+                eprintln!("CODEGEN_UNSUPPORTED_NODE: id={id:?} node={_other:?}");
                 self.emit_deopt_unconditional(0);
                 // Satisfy the allocation invariant: write a placeholder.
                 self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
@@ -5521,6 +5522,7 @@ impl<'a> MaglevCodegen<'a> {
         // Cost: 3 instructions; saves 6+ instructions per downstream
         // GenericAdd that can now use the bare smi_guarded tier.
         if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
+            eprintln!("SMI_GUARD_EMIT: id={id:?} name_idx={name} feedback_slot={feedback_slot}");
             self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
             self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
             self.masm.jne(&mut self.deopt_label);
