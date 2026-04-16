@@ -163,18 +163,20 @@ fn compute_live_intervals(graph: &MaglevGraph) -> Vec<LiveInterval> {
         }
     }
 
-    // ── Pass 3: Extend intervals across loop back-edges ────────────────
+    // ── Pass 2.5: Fix Phi intervals for reversed-order loop headers ────
     //
-    // The forward-only passes above miss values that are live across a loop
-    // back-edge.  Example: a value defined in a loop preheader and used at
-    // program point 3 in the loop body has interval [def, 4).  But the loop
-    // body continues to pp 6 (the branch).  If a stub call at pp 4 or 5
-    // clobbers the caller-saved register holding this value, the allocator
-    // won't save it because it appears dead — causing corruption next iter.
+    // When the block ordering puts a loop body *before* its header
+    // (e.g. body=Block2, header=Block3), Phi definitions at the header
+    // have a higher program point than their uses in the body.  This
+    // creates degenerate intervals (end < start) that the linear-scan
+    // allocator treats as immediately-expired, freeing the register and
+    // allowing a second Phi to reuse it — corrupting the first Phi's
+    // value.
     //
-    // Fix: for each loop, extend any interval that has a use inside the
-    // loop so that it covers the entire loop body (up to the back-edge).
-    // This makes `live_caller_saved_at` correctly include these registers.
+    // Fix: for each Phi at a loop header, extend its def_point backward
+    // to the start of the earliest back-edge source block.  The Phi's
+    // register must be reserved throughout the body since the value
+    // persists across the loop iteration.
 
     // Compute per-block program-point ranges: (first_pp, one_past_last_pp).
     let mut block_pp_ranges: Vec<(u32, u32)> = Vec::new();
@@ -190,25 +192,88 @@ fn compute_live_intervals(graph: &MaglevGraph) -> Vec<LiveInterval> {
         }
     }
 
+    // For loop headers, the first predecessor is the preheader; remaining
+    // predecessors are back-edge sources (loop body blocks).
+    let blocks = graph.blocks();
+    for block in blocks {
+        if !block.is_loop_header || block.predecessors.len() < 2 {
+            continue;
+        }
+        // Earliest back-edge source block start pp.
+        let back_edge_min_pp = block
+            .predecessors
+            .iter()
+            .copied()
+            .skip(1) // skip preheader (first predecessor)
+            .filter_map(|p| block_pp_ranges.get(p as usize).map(|&(start, _)| start))
+            .min();
+
+        if let Some(min_pp) = back_edge_min_pp {
+            for (phi_id, node) in &block.nodes {
+                if let ValueNode::Phi { .. } = node
+                    && let Some(def) = def_point.get_mut(phi_id)
+                    && min_pp < *def
+                {
+                    *def = min_pp;
+                }
+            }
+        }
+    }
+
+    // ── Pass 3: Extend intervals across loop back-edges ────────────────
+    //
+    // The forward-only passes above miss values that are live across a loop
+    // back-edge.  Example: a value defined in a loop preheader and used at
+    // program point 3 in the loop body has interval [def, 4).  But the loop
+    // body continues to pp 6 (the branch).  If a stub call at pp 4 or 5
+    // clobbers the caller-saved register holding this value, the allocator
+    // won't save it because it appears dead — causing corruption next iter.
+    //
+    // Fix: for each loop, extend any interval that has a use inside the
+    // loop so that it covers the entire loop body (up to the back-edge).
+    // This makes `live_caller_saved_at` correctly include these registers.
+
     // For each loop header, find the back-edge source and extend intervals.
     let blocks = graph.blocks();
     for block in blocks {
-        if !block.is_loop_header {
+        if !block.is_loop_header || block.predecessors.len() < 2 {
             continue;
         }
-        // Find the back-edge predecessor: a predecessor whose block id >= header id.
+        // Back-edge source: max block id among non-preheader predecessors.
+        // Use both the old heuristic (pred >= header) and the convention
+        // (skip first predecessor) to handle all orderings.
         let back_edge_src = block
             .predecessors
             .iter()
             .copied()
-            .filter(|&pred| pred >= block.id)
-            .max();
+            .skip(1) // skip preheader (first predecessor)
+            .max()
+            .or_else(|| {
+                block
+                    .predecessors
+                    .iter()
+                    .copied()
+                    .filter(|&pred| pred >= block.id)
+                    .max()
+            });
         let Some(src_id) = back_edge_src else {
             continue;
         };
-        // Loop body spans from header's first pp to back-edge source's last pp.
-        let loop_start_pp = block_pp_ranges[block.id as usize].0;
-        let loop_end_pp = block_pp_ranges[src_id as usize].1;
+        // Loop body spans from the earliest body block to the back-edge source.
+        // Include the header itself to cover both orderings.
+        let header_start = block_pp_ranges[block.id as usize].0;
+        let src_end = block_pp_ranges[src_id as usize].1;
+        let loop_start_pp = header_start.min(
+            block
+                .predecessors
+                .iter()
+                .copied()
+                .skip(1)
+                .filter_map(|p| block_pp_ranges.get(p as usize).map(|&(s, _)| s))
+                .min()
+                .unwrap_or(header_start),
+        );
+        let loop_end_pp = src_end.max(block_pp_ranges[block.id as usize].1);
 
         // Extend any interval whose last use falls inside the loop body.
         for (id, end) in end_point.iter_mut() {
