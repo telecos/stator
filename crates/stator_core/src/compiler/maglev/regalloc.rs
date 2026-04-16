@@ -50,9 +50,10 @@
 //! assert_eq!(result.spill_count(), 0);
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::compiler::maglev::ir::{ControlNode, MaglevGraph, NodeId, ValueNode};
+use crate::compiler::maglev::licm::detect_loops;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -117,6 +118,11 @@ struct LiveInterval {
     id: NodeId,
     start: u32,
     end: u32,
+    /// For loop-header Phi values whose intervals were extended to cover
+    /// the full loop body: the end point *before* the extension.
+    /// The coalescing pass uses this to allow Phi/back-edge-input
+    /// coalescing even though the Phi's `end` was artificially enlarged.
+    pre_ext_end: Option<u32>,
 }
 
 /// Compute a live interval for every value-producing node in `graph`.
@@ -163,21 +169,6 @@ fn compute_live_intervals(graph: &MaglevGraph) -> Vec<LiveInterval> {
         }
     }
 
-    // ── Pass 2.5: Fix Phi intervals for reversed-order loop headers ────
-    //
-    // When the block ordering puts a loop body *before* its header
-    // (e.g. body=Block2, header=Block3), Phi definitions at the header
-    // have a higher program point than their uses in the body.  This
-    // creates degenerate intervals (end < start) that the linear-scan
-    // allocator treats as immediately-expired, freeing the register and
-    // allowing a second Phi to reuse it — corrupting the first Phi's
-    // value.
-    //
-    // Fix: for each Phi at a loop header, extend its def_point backward
-    // to the start of the earliest back-edge source block.  The Phi's
-    // register must be reserved throughout the body since the value
-    // persists across the loop iteration.
-
     // Compute per-block program-point ranges: (first_pp, one_past_last_pp).
     let mut block_pp_ranges: Vec<(u32, u32)> = Vec::new();
     {
@@ -192,24 +183,35 @@ fn compute_live_intervals(graph: &MaglevGraph) -> Vec<LiveInterval> {
         }
     }
 
-    // For loop headers, the first predecessor is the preheader; remaining
-    // predecessors are back-edge sources (loop body blocks).
-    let blocks = graph.blocks();
-    for block in blocks {
-        if !block.is_loop_header || block.predecessors.len() < 2 {
-            continue;
-        }
-        // Earliest back-edge source block start pp.
-        let back_edge_min_pp = block
-            .predecessors
+    // ── Natural loop detection ────────────────────────────────────────
+    //
+    // Reuse the LICM module's `detect_loops` to correctly identify all
+    // natural loops and their full body block sets.  This handles nested
+    // loops, reversed block ordering (body before header), and
+    // multi-back-edge loops — all of which the previous ad-hoc
+    // predecessor-skip heuristic missed.
+    let loops = detect_loops(graph);
+
+    // ── Pass 2.5: Fix Phi intervals for reversed-order loop headers ──
+    //
+    // When the block ordering puts a loop body *before* its header,
+    // Phi definitions at the header have a higher program point than
+    // their uses in the body.  Extend Phi def_points backward to the
+    // earliest body block's start pp.
+    for lp in &loops {
+        let header_pp = block_pp_ranges[lp.header as usize].0;
+        let earliest_body_pp = lp
+            .body
             .iter()
-            .copied()
-            .skip(1) // skip preheader (first predecessor)
-            .filter_map(|p| block_pp_ranges.get(p as usize).map(|&(start, _)| start))
+            .filter(|&&b| b != lp.header)
+            .filter_map(|&b| block_pp_ranges.get(b as usize).map(|&(s, _)| s))
             .min();
 
-        if let Some(min_pp) = back_edge_min_pp {
-            for (phi_id, node) in &block.nodes {
+        if let Some(min_pp) = earliest_body_pp
+            && min_pp < header_pp
+            && let Some(header_block) = graph.block(lp.header)
+        {
+            for (phi_id, node) in &header_block.nodes {
                 if let ValueNode::Phi { .. } = node
                     && let Some(def) = def_point.get_mut(phi_id)
                     && min_pp < *def
@@ -220,73 +222,100 @@ fn compute_live_intervals(graph: &MaglevGraph) -> Vec<LiveInterval> {
         }
     }
 
-    // ── Pass 3: Extend intervals across loop back-edges ────────────────
+    // ── Pass 3: Extend intervals across loop back-edges ──────────────
     //
-    // The forward-only passes above miss values that are live across a loop
-    // back-edge.  Example: a value defined in a loop preheader and used at
-    // program point 3 in the loop body has interval [def, 4).  But the loop
-    // body continues to pp 6 (the branch).  If a stub call at pp 4 or 5
-    // clobbers the caller-saved register holding this value, the allocator
-    // won't save it because it appears dead — causing corruption next iter.
+    // For each natural loop, extend any interval whose last use falls
+    // inside the loop body so it covers the entire loop.  This prevents
+    // the allocator from freeing a register mid-loop when the value is
+    // still needed on the next iteration.
     //
-    // Fix: for each loop, extend any interval that has a use inside the
-    // loop so that it covers the entire loop body (up to the back-edge).
-    // This makes `live_caller_saved_at` correctly include these registers.
-
-    // For each loop header, find the back-edge source and extend intervals.
-    let blocks = graph.blocks();
-    for block in blocks {
-        if !block.is_loop_header || block.predecessors.len() < 2 {
-            continue;
-        }
-        // Back-edge source: max block id among non-preheader predecessors.
-        // Use both the old heuristic (pred >= header) and the convention
-        // (skip first predecessor) to handle all orderings.
-        let back_edge_src = block
-            .predecessors
-            .iter()
-            .copied()
-            .skip(1) // skip preheader (first predecessor)
-            .max()
-            .or_else(|| {
-                block
-                    .predecessors
-                    .iter()
-                    .copied()
-                    .filter(|&pred| pred >= block.id)
-                    .max()
-            });
-        let Some(src_id) = back_edge_src else {
-            continue;
-        };
-        // Loop body spans from the earliest body block to the back-edge source.
-        // Include the header itself to cover both orderings.
-        let header_start = block_pp_ranges[block.id as usize].0;
-        let src_end = block_pp_ranges[src_id as usize].1;
-        let loop_start_pp = header_start.min(
-            block
-                .predecessors
-                .iter()
-                .copied()
-                .skip(1)
-                .filter_map(|p| block_pp_ranges.get(p as usize).map(|&(s, _)| s))
-                .min()
-                .unwrap_or(header_start),
-        );
-        let loop_end_pp = src_end.max(block_pp_ranges[block.id as usize].1);
-
-        // Extend any interval whose last use falls inside the loop body.
-        for (id, end) in end_point.iter_mut() {
-            // Only extend if the value has a use inside the loop range.
-            if *end >= loop_start_pp && *end < loop_end_pp {
-                // And the value is defined before the end of the loop
-                // (i.e., it's reachable from the loop body).
-                if let Some(&start) = def_point.get(id)
-                    && start < loop_end_pp
-                {
-                    *end = loop_end_pp.saturating_sub(1);
+    // For Phi values defined at loop headers we record the pre-extension
+    // end so the coalescing pass can still coalesce the Phi with its
+    // back-edge input (the extension is for register preservation, not a
+    // genuine use).
+    //
+    // Iterate to a fixed point so that nested loop extensions propagate
+    // outward: an inner loop extension may push an interval's end into
+    // the range of an enclosing outer loop.
+    let mut header_phi_ids: HashSet<NodeId> = HashSet::new();
+    for lp in &loops {
+        if let Some(header_block) = graph.block(lp.header) {
+            for (phi_id, node) in &header_block.nodes {
+                if let ValueNode::Phi { .. } = node {
+                    header_phi_ids.insert(*phi_id);
                 }
             }
+        }
+    }
+    let mut pre_ext_ends: HashMap<NodeId, u32> = HashMap::new();
+    loop {
+        let mut changed = false;
+        for lp in &loops {
+            let loop_start_pp = lp
+                .body
+                .iter()
+                .filter_map(|&b| block_pp_ranges.get(b as usize).map(|&(s, _)| s))
+                .min()
+                .unwrap_or(0);
+            let loop_end_pp = lp
+                .body
+                .iter()
+                .filter_map(|&b| block_pp_ranges.get(b as usize).map(|&(_, e)| e))
+                .max()
+                .unwrap_or(0);
+
+            if loop_start_pp >= loop_end_pp {
+                continue;
+            }
+
+            let target_end = loop_end_pp.saturating_sub(1);
+
+            // Collect Phi inputs from the preheader that are NOT used
+            // elsewhere in the loop body.  These "entry-only" values are
+            // consumed once on loop entry and don't need their intervals
+            // extended across the full loop.
+            let header_first_pp = block_pp_ranges[lp.header as usize].0;
+            let mut phi_entry_only: HashSet<NodeId> = HashSet::new();
+            if let Some(header_block) = graph.block(lp.header) {
+                let preheader_pos = header_block
+                    .predecessors
+                    .iter()
+                    .position(|&p| p == lp.preheader);
+                if let Some(pos) = preheader_pos {
+                    for (_, node) in &header_block.nodes {
+                        if let ValueNode::Phi { inputs, .. } = node
+                            && let Some(&entry_id) = inputs.get(pos)
+                            && end_point
+                                .get(&entry_id)
+                                .is_none_or(|&e| e <= header_first_pp)
+                        {
+                            phi_entry_only.insert(entry_id);
+                        }
+                    }
+                }
+            }
+
+            for (id, end) in end_point.iter_mut() {
+                if phi_entry_only.contains(id) {
+                    continue;
+                }
+                if *end >= loop_start_pp
+                    && *end < loop_end_pp
+                    && let Some(&start) = def_point.get(id)
+                    && start < loop_end_pp
+                    && *end < target_end
+                {
+                    // Record original end for header Phis before extending.
+                    if header_phi_ids.contains(id) && !pre_ext_ends.contains_key(id) {
+                        pre_ext_ends.insert(*id, *end);
+                    }
+                    *end = target_end;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
         }
     }
 
@@ -296,7 +325,13 @@ fn compute_live_intervals(graph: &MaglevGraph) -> Vec<LiveInterval> {
         .map(|(id, start)| {
             // end is one past the last use; if never used, [start, start+1).
             let end = end_point.get(&id).map_or(start + 1, |&e| e + 1);
-            LiveInterval { id, start, end }
+            let pre_ext_end = pre_ext_ends.get(&id).map(|&e| e + 1);
+            LiveInterval {
+                id,
+                start,
+                end,
+                pre_ext_end,
+            }
         })
         .collect()
 }
@@ -915,11 +950,9 @@ fn coalesce_loop_phis(
     graph: &MaglevGraph,
     intervals: &[LiveInterval],
 ) {
-    // Build a map from NodeId to its live interval endpoints for O(1) lookup.
-    let interval_map: HashMap<NodeId, (u32, u32)> = intervals
-        .iter()
-        .map(|iv| (iv.id, (iv.start, iv.end)))
-        .collect();
+    // Build a map from NodeId to its live interval for O(1) lookup.
+    let interval_map: HashMap<NodeId, &LiveInterval> =
+        intervals.iter().map(|iv| (iv.id, iv)).collect();
 
     for block in graph.blocks() {
         // A loop header has at least one *back-edge*: a predecessor whose
@@ -948,10 +981,15 @@ fn coalesce_loop_phis(
                 _ => continue,
             };
 
-            let (_, phi_end) = match interval_map.get(phi_id) {
-                Some(&range) => range,
+            let phi_iv = match interval_map.get(phi_id) {
+                Some(iv) => iv,
                 None => continue,
             };
+            // Use the pre-extension end for Phis whose intervals were
+            // artificially extended to cover the loop body.  The extension
+            // prevents register reuse but doesn't represent a genuine use,
+            // so it should not block coalescing.
+            let phi_effective_end = phi_iv.pre_ext_end.unwrap_or(phi_iv.end);
 
             for &pos in &back_edge_positions {
                 let back_input = match inputs.get(pos) {
@@ -974,8 +1012,8 @@ fn coalesce_loop_phis(
                     continue;
                 }
 
-                let (back_start, back_end) = match interval_map.get(&back_input) {
-                    Some(&range) => range,
+                let back_iv = match interval_map.get(&back_input) {
+                    Some(iv) => iv,
                     None => continue,
                 };
 
@@ -984,7 +1022,7 @@ fn coalesce_loop_phis(
                 // exactly one program point is acceptable — that is the point
                 // where the defining instruction reads the Phi and writes the
                 // result into the same register.
-                if phi_end > back_start + 1 {
+                if phi_effective_end > back_iv.start + 1 {
                     continue;
                 }
 
@@ -997,7 +1035,7 @@ fn coalesce_loop_phis(
                         return false;
                     }
                     // Intervals overlap when a.start < b.end && b.start < a.end.
-                    if iv.start < back_end && back_start < iv.end {
+                    if iv.start < back_iv.end && back_iv.start < iv.end {
                         matches!(
                             assignments.get(&iv.id),
                             Some(Location::Register(r)) if *r == phi_reg
