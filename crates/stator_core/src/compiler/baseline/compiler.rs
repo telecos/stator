@@ -1182,7 +1182,7 @@ pub(crate) mod jit_runtime {
     /// Returns `true` when `v` is any JIT deopt sentinel
     /// (`JIT_DEOPT` through `JIT_DEOPT_DIVZERO`).
     #[inline]
-    fn is_jit_deopt(v: i64) -> bool {
+    pub(crate) fn is_jit_deopt(v: i64) -> bool {
         (v as u64).wrapping_sub(JIT_DEOPT as u64) <= 5
     }
 
@@ -10230,7 +10230,7 @@ impl CompiledCode {
             libc::munmap(mem, code_size);
         }
 
-        if is_jit_deopt(result) {
+        if jit_runtime::is_jit_deopt(result) {
             Err(StatorError::Internal("jit deopt".into()))
         } else {
             Ok(result)
@@ -10238,8 +10238,6 @@ impl CompiledCode {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CachedExecutableCode
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Persistent JIT code page that caches the `mmap`'d executable memory.
@@ -10382,7 +10380,7 @@ impl CachedExecutableCode {
 
         let result = (self.func)(regs.as_mut_ptr());
 
-        if is_jit_deopt(result) {
+        if jit_runtime::is_jit_deopt(result) {
             Err(StatorError::Internal("jit deopt".into()))
         } else {
             Ok(result)
