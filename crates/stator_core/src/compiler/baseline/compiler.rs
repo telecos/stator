@@ -6404,13 +6404,14 @@ pub(crate) mod jit_runtime {
                     None
                 };
                 eprintln!(
-                    "STA_KEYED_IC_DEOPT: obj=0x{:x} key={} val=0x{:x} obj_idx={} heap_len={} type={:?} (#{})",
+                    "STA_KEYED_IC_DEOPT: obj=0x{:x} key={} val=0x{:x} obj_idx={} heap_len={} type={:?} ic_handle=0x{:x} (#{})",
                     obj_i64 as u64,
                     key_i64,
                     value_i64 as u64,
                     obj_idx,
                     heap_len,
                     heap_type,
+                    if ic_slots.is_null() { 0u64 } else { unsafe { *ic_slots } as u64 },
                     n + 1
                 );
             }
