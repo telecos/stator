@@ -9373,8 +9373,29 @@ pub(crate) mod jit_runtime {
         generic_add_slow(left, right)
     }
 
-    /// Slow path for [`jit_runtime_generic_add`] — HeapNumber and mixed
-    /// Smi/HeapNumber operands.
+    /// Convert a [`JsValue`] to an `f64` following ECMAScript `ToNumber` semantics.
+    fn js_to_number(v: &JsValue) -> f64 {
+        match v {
+            JsValue::Smi(n) => *n as f64,
+            JsValue::HeapNumber(f) => *f,
+            JsValue::Boolean(true) => 1.0,
+            JsValue::Boolean(false) => 0.0,
+            JsValue::Null => 0.0,
+            JsValue::Undefined => f64::NAN,
+            JsValue::String(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    0.0
+                } else {
+                    trimmed.parse::<f64>().unwrap_or(f64::NAN)
+                }
+            }
+            _ => f64::NAN, // Object, Function, Array, etc.
+        }
+    }
+
+    /// Slow path for [`jit_runtime_generic_add`] — handles all JS type
+    /// combinations using ToNumber / string-concatenation semantics.
     #[cold]
     fn generic_add_slow(left: i64, right: i64) -> i64 {
         let l = jit_i64_to_jsvalue(left);
@@ -9398,17 +9419,31 @@ pub(crate) mod jit_runtime {
             (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a + *b as f64))
             }
+            // String + anything → string concatenation (add only)
+            (JsValue::String(s), other) => {
+                let rhs = other.to_js_string().unwrap_or_else(|_| String::new());
+                let result: Rc<str> = format!("{s}{rhs}").into();
+                jsvalue_to_jit_i64(JsValue::String(result))
+            }
+            (other, JsValue::String(s)) => {
+                let lhs = other.to_js_string().unwrap_or_else(|_| String::new());
+                let result: Rc<str> = format!("{lhs}{s}").into();
+                jsvalue_to_jit_i64(JsValue::String(result))
+            }
+            // All other types: ToNumber on both operands, then add as f64.
             _ => {
-                static ADD_DEOPT_COUNT: AtomicU32 = AtomicU32::new(0);
-                let n = ADD_DEOPT_COUNT.fetch_add(1, Ordering::Relaxed);
-                if n < 5 {
-                    eprintln!(
-                        "[diag:generic_add] #{n} left=0x{left:016x} right=0x{right:016x} \
-                         l={l:?} r={r:?}"
-                    );
+                let a = js_to_number(&l);
+                let b = js_to_number(&r);
+                let result = a + b;
+                if result.is_finite()
+                    && result.fract() == 0.0
+                    && result >= i32::MIN as f64
+                    && result <= i32::MAX as f64
+                {
+                    jsvalue_to_jit_i64(JsValue::Smi(result as i32))
+                } else {
+                    jsvalue_to_jit_i64(JsValue::HeapNumber(result))
                 }
-                track_stub_deopt(STUB_GENERIC_ARITH);
-                JIT_DEOPT
             }
         }
     }
@@ -9447,17 +9482,20 @@ pub(crate) mod jit_runtime {
             (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a - *b as f64))
             }
+            // All other types: ToNumber on both operands, then subtract as f64.
             _ => {
-                static SUB_DEOPT_COUNT: AtomicU32 = AtomicU32::new(0);
-                let n = SUB_DEOPT_COUNT.fetch_add(1, Ordering::Relaxed);
-                if n < 5 {
-                    eprintln!(
-                        "[diag:generic_sub] #{n} left=0x{left:016x} right=0x{right:016x} \
-                         l={l:?} r={r:?}"
-                    );
+                let a = js_to_number(&l);
+                let b = js_to_number(&r);
+                let result = a - b;
+                if result.is_finite()
+                    && result.fract() == 0.0
+                    && result >= i32::MIN as f64
+                    && result <= i32::MAX as f64
+                {
+                    jsvalue_to_jit_i64(JsValue::Smi(result as i32))
+                } else {
+                    jsvalue_to_jit_i64(JsValue::HeapNumber(result))
                 }
-                track_stub_deopt(STUB_GENERIC_ARITH);
-                JIT_DEOPT
             }
         }
     }
@@ -9496,17 +9534,20 @@ pub(crate) mod jit_runtime {
             (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a * *b as f64))
             }
+            // All other types: ToNumber on both operands, then multiply as f64.
             _ => {
-                static MUL_DEOPT_COUNT: AtomicU32 = AtomicU32::new(0);
-                let n = MUL_DEOPT_COUNT.fetch_add(1, Ordering::Relaxed);
-                if n < 5 {
-                    eprintln!(
-                        "[diag:generic_mul] #{n} left=0x{left:016x} right=0x{right:016x} \
-                         l={l:?} r={r:?}"
-                    );
+                let a = js_to_number(&l);
+                let b = js_to_number(&r);
+                let result = a * b;
+                if result.is_finite()
+                    && result.fract() == 0.0
+                    && result >= i32::MIN as f64
+                    && result <= i32::MAX as f64
+                {
+                    jsvalue_to_jit_i64(JsValue::Smi(result as i32))
+                } else {
+                    jsvalue_to_jit_i64(JsValue::HeapNumber(result))
                 }
-                track_stub_deopt(STUB_GENERIC_ARITH);
-                JIT_DEOPT
             }
         }
     }
