@@ -2838,6 +2838,7 @@ impl<'a> MaglevCodegen<'a> {
                 bytecode_offset,
                 reason: _,
             } => {
+                eprintln!("DEOPT_NODE: block={block_idx} bytecode_offset={bytecode_offset}");
                 self.emit_deopt_unconditional(*bytecode_offset);
             }
         }
@@ -5525,7 +5526,20 @@ impl<'a> MaglevCodegen<'a> {
             eprintln!("SMI_GUARD_EMIT: id={id:?} name_idx={name} feedback_slot={feedback_slot}");
             self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
             self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
-            self.masm.jne(&mut self.deopt_label);
+            // On success, skip the diagnostic trampoline.
+            let mut smi_ok = Label::new();
+            self.masm.je(&mut smi_ok);
+            // ── Diagnostic trampoline: log the failing value before deopt ──
+            // PUSH RAX to align stack (RSP was ≡ 8 mod 16 → 0 mod 16).
+            self.masm.push(Reg64::Rax);
+            self.masm.mov_rr(Reg64::Rdi, Reg64::Rax); // arg1 = value
+            self.masm.mov_ri(Reg64::Rsi, id.0 as i64); // arg2 = node_id
+            let diag_addr = jit_runtime::jit_smi_guard_fail_log as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, diag_addr as i64);
+            self.masm.call_reg(Reg64::R11);
+            self.masm.pop(Reg64::Rax);
+            self.masm.jmp(&mut self.deopt_label);
+            self.masm.bind_label(&mut smi_ok);
         }
         self.emit_store(id, Reg64::Rax);
     }

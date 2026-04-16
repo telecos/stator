@@ -6020,7 +6020,16 @@ pub(crate) mod jit_runtime {
             && !is_heap_handle(value_i64)
         {
             // Decode value: booleans first (hot for sieve-like patterns).
-            let value = decode_non_heap_value_fast(value_i64)?;
+            let value = match decode_non_heap_value_fast(value_i64) {
+                Some(v) => v,
+                None => {
+                    eprintln!(
+                        "STA_KEYED_DECODE_FAIL: val={:#018x} obj={:#018x} key={}",
+                        value_i64 as u64, obj_i64 as u64, key_i64,
+                    );
+                    return None;
+                }
+            };
             let smi_key = key_i64 as usize;
             let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
             let fast = if ptrs.is_cached() {
@@ -6087,6 +6096,15 @@ pub(crate) mod jit_runtime {
             if fast.is_some() {
                 return Some(value_i64);
             }
+        } else {
+            eprintln!(
+                "STA_KEYED_GUARD_FAIL: obj={:#018x}(heap={}) key={:#018x} val={:#018x}(heap={})",
+                obj_i64 as u64,
+                is_heap_handle(obj_i64),
+                key_i64 as u64,
+                value_i64 as u64,
+                is_heap_handle(value_i64),
+            );
         }
 
         // Slow path: clone-based fallback.
@@ -7572,10 +7590,15 @@ pub(crate) mod jit_runtime {
 
         // Fall back to the existing inline helper (probes proto IC too).
         let result = inline_lda_named_with_ptrs(obj_i64, name_idx, ptrs);
-        NamedIcResult {
+        let r = NamedIcResult {
             value: result.value,
             hit: result.hit,
-        }
+        };
+        eprintln!(
+            "IC_FILL_FALLBACK: name_idx={} value={:#018x} hit={} obj={:#018x}",
+            name_idx, r.value as u64, r.hit, obj_i64 as u64,
+        );
+        r
     }
 
     /// Try to encode a property value as a JIT i64 without allocating.
@@ -7619,6 +7642,20 @@ pub(crate) mod jit_runtime {
         // SAFETY: caller guarantees jsvalue_ptr is a valid &JsValue.
         let val: &JsValue = unsafe { &*(jsvalue_ptr as *const JsValue) };
         alloc_heap_handle(val.clone())
+    }
+
+    /// Diagnostic: called from JIT when smi_guard fails at done_label.
+    ///
+    /// Prints the failing value and node ID so CI logs reveal the root cause.
+    #[allow(dead_code)]
+    pub extern "C" fn jit_smi_guard_fail_log(value: i64, node_id: i64) {
+        eprintln!(
+            "SMI_GUARD_FAIL: value={:#018x} node_id={} is_heap={} low32={:#010x}",
+            value as u64,
+            node_id,
+            is_heap_handle(value),
+            (value as u32) as u64,
+        );
     }
 
     // ── Array inline-cache fill + load ──────────────────────────────────
