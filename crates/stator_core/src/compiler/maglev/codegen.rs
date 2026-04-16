@@ -1202,7 +1202,9 @@ impl<'a> MaglevCodegen<'a> {
             // ── Constants ────────────────────────────────────────────────────
             ValueNode::SmiConstant { value } => match self.alloc.location(id) {
                 Some(Location::Register(n)) => {
-                    self.masm.mov_ri(phys_reg(n), *value as i64);
+                    let dst = phys_reg(n);
+                    self.masm.mov_ri(dst, *value as i64);
+                    self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.masm.mov_ri(Reg64::R11, *value as i64);
@@ -1211,7 +1213,9 @@ impl<'a> MaglevCodegen<'a> {
             },
             ValueNode::Int32Constant { value } => match self.alloc.location(id) {
                 Some(Location::Register(n)) => {
-                    self.masm.mov_ri(phys_reg(n), *value as i64);
+                    let dst = phys_reg(n);
+                    self.masm.mov_ri(dst, *value as i64);
+                    self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.masm.mov_ri(Reg64::R11, *value as i64);
@@ -1220,7 +1224,9 @@ impl<'a> MaglevCodegen<'a> {
             },
             ValueNode::Uint32Constant { value } => match self.alloc.location(id) {
                 Some(Location::Register(n)) => {
-                    self.masm.mov_ri(phys_reg(n), *value as i64);
+                    let dst = phys_reg(n);
+                    self.masm.mov_ri(dst, *value as i64);
+                    self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.masm.mov_ri(Reg64::R11, *value as i64);
@@ -1231,7 +1237,9 @@ impl<'a> MaglevCodegen<'a> {
                 // Store the f64 bit pattern as an i64.
                 match self.alloc.location(id) {
                     Some(Location::Register(n)) => {
-                        self.masm.mov_ri(phys_reg(n), value.to_bits() as i64);
+                        let dst = phys_reg(n);
+                        self.masm.mov_ri(dst, value.to_bits() as i64);
+                        self.note_reg_holds(dst, id);
                     }
                     _ => {
                         self.masm.mov_ri(Reg64::R11, value.to_bits() as i64);
@@ -1241,7 +1249,9 @@ impl<'a> MaglevCodegen<'a> {
             }
             ValueNode::TrueConstant => match self.alloc.location(id) {
                 Some(Location::Register(n)) => {
-                    self.masm.mov_ri(phys_reg(n), JIT_TRUE);
+                    let dst = phys_reg(n);
+                    self.masm.mov_ri(dst, JIT_TRUE);
+                    self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.masm.mov_ri(Reg64::R11, JIT_TRUE);
@@ -1250,7 +1260,9 @@ impl<'a> MaglevCodegen<'a> {
             },
             ValueNode::FalseConstant => match self.alloc.location(id) {
                 Some(Location::Register(n)) => {
-                    self.masm.mov_ri(phys_reg(n), JIT_FALSE);
+                    let dst = phys_reg(n);
+                    self.masm.mov_ri(dst, JIT_FALSE);
+                    self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.masm.mov_ri(Reg64::R11, JIT_FALSE);
@@ -1259,7 +1271,9 @@ impl<'a> MaglevCodegen<'a> {
             },
             ValueNode::NullConstant => match self.alloc.location(id) {
                 Some(Location::Register(n)) => {
-                    self.masm.mov_ri(phys_reg(n), JIT_NULL);
+                    let dst = phys_reg(n);
+                    self.masm.mov_ri(dst, JIT_NULL);
+                    self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.masm.mov_ri(Reg64::R11, JIT_NULL);
@@ -1268,7 +1282,9 @@ impl<'a> MaglevCodegen<'a> {
             },
             ValueNode::UndefinedConstant => match self.alloc.location(id) {
                 Some(Location::Register(n)) => {
-                    self.masm.mov_ri(phys_reg(n), JIT_UNDEFINED);
+                    let dst = phys_reg(n);
+                    self.masm.mov_ri(dst, JIT_UNDEFINED);
+                    self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
@@ -1281,7 +1297,9 @@ impl<'a> MaglevCodegen<'a> {
                 let off = (*index * 8) as i32;
                 match self.alloc.location(id) {
                     Some(Location::Register(n)) => {
-                        self.masm.mov_load_base_disp32(phys_reg(n), Reg64::R14, off);
+                        let dst = phys_reg(n);
+                        self.masm.mov_load_base_disp32(dst, Reg64::R14, off);
+                        self.note_reg_holds(dst, id);
                     }
                     _ => {
                         self.masm.mov_load_base_disp32(Reg64::R11, Reg64::R14, off);
@@ -1893,6 +1911,7 @@ impl<'a> MaglevCodegen<'a> {
                                 self.masm.xor_rr(dst, dst);
                                 self.masm.bind_label(&mut smi_ok);
                             }
+                            self.note_reg_holds(dst, id);
                         }
                         _ => {
                             self.masm.mov_load_base_disp32(Reg64::R11, Reg64::R14, off);

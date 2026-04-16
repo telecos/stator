@@ -1,4 +1,7 @@
 #![allow(clippy::collapsible_match)]
+#![allow(clippy::let_and_return)]
+#![allow(clippy::needless_else)]
+#![allow(clippy::unnecessary_sort_by)]
 //! `stator_core` — the foundational engine library for the Stator JavaScript
 //! engine.
 //!
