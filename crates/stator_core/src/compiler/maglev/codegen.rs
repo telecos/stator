@@ -512,142 +512,7 @@ pub fn compile(graph: &MaglevGraph, param_count: u32) -> StatorResult<MaglevComp
         NUM_PHYS_REGS
     };
     let alloc = allocate(graph, num_regs);
-    dump_alloc_diagnostic(graph, &alloc, num_regs);
     MaglevCodegen::new(graph, &alloc, param_count).compile()
-}
-
-/// Dump the allocation map for the first few Maglev-compiled functions
-/// that contain keyed or named property access nodes (the ones that deopt).
-fn dump_alloc_diagnostic(graph: &MaglevGraph, alloc: &AllocationResult, num_regs: u32) {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static DUMP_COUNT: AtomicU32 = AtomicU32::new(0);
-    let n = DUMP_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n >= 10 {
-        return;
-    }
-    let reg_name = |r: u32| -> &'static str {
-        match r {
-            0 => "RBX",
-            1 => "RCX",
-            2 => "RDX",
-            3 => "RSI",
-            4 => "R8",
-            5 => "R9",
-            6 => "R13",
-            7 => "R12",
-            8 => "R15",
-            _ => "???",
-        }
-    };
-    let loc_str = |nid: &NodeId| -> String {
-        match alloc.location(*nid) {
-            Some(Location::Register(r)) => format!("Reg({}={})", r, reg_name(r)),
-            Some(Location::StackSlot(s)) => format!("Stack({})", s),
-            None => "NONE".to_string(),
-        }
-    };
-    let node_name = |node: &ValueNode| -> &'static str {
-        match node {
-            ValueNode::Phi { .. } => "Phi",
-            ValueNode::SmiConstant { .. } => "SmiConst",
-            ValueNode::GenericAdd { .. } => "GenericAdd",
-            ValueNode::GenericSubtract { .. } => "GenericSub",
-            ValueNode::GenericMultiply { .. } => "GenericMul",
-            ValueNode::LoadKeyedGeneric { .. } => "LoadKeyed",
-            ValueNode::StoreKeyedGeneric { .. } => "StoreKeyed",
-            ValueNode::LoadNamedGeneric { .. } => "LoadNamed",
-            ValueNode::GenericIncrement { .. } => "GenInc",
-            ValueNode::GenericDecrement { .. } => "GenDec",
-            ValueNode::CheckedSmiIncrement { .. } => "SmiInc",
-            ValueNode::CheckedSmiDecrement { .. } => "SmiDec",
-            ValueNode::Parameter { .. } => "Param",
-            ValueNode::LoadContextSlot { .. } | ValueNode::LoadCurrentContextSlot { .. } => {
-                "LoadCtxSlot"
-            }
-            ValueNode::Call { .. } | ValueNode::CallKnownFunction { .. } => "Call",
-            ValueNode::Int32LessThan { .. } | ValueNode::Int32LessThanOrEqual { .. } => "TestLT",
-            ValueNode::Int32GreaterThan { .. } | ValueNode::Int32GreaterThanOrEqual { .. } => {
-                "TestGT"
-            }
-            ValueNode::Int32Equal { .. } | ValueNode::Int32StrictEqual { .. } => "TestEq",
-            ValueNode::CreateEmptyArrayLiteral { .. } => "CreateArr",
-            _ => "Other",
-        }
-    };
-    eprintln!(
-        "MAGLEV_ALLOC_DUMP #{} (num_regs={}, spills={})",
-        n,
-        num_regs,
-        alloc.spill_count()
-    );
-    for block in graph.blocks() {
-        eprintln!(
-            "  Block {} (preds={:?}, loop={})",
-            block.id, block.predecessors, block.is_loop_header
-        );
-        for (nid, node) in &block.nodes {
-            let name = node_name(node);
-            let loc = loc_str(nid);
-            // Print inputs for key node types.
-            let extra = match node {
-                ValueNode::Phi { inputs } => {
-                    let inp_strs: Vec<String> = inputs
-                        .iter()
-                        .map(|i| format!("{:?}@{}", i, loc_str(i)))
-                        .collect();
-                    format!(" inputs=[{}]", inp_strs.join(", "))
-                }
-                ValueNode::GenericAdd { left, right, .. } => {
-                    format!(
-                        " l={:?}@{} r={:?}@{}",
-                        left,
-                        loc_str(left),
-                        right,
-                        loc_str(right)
-                    )
-                }
-                ValueNode::LoadKeyedGeneric { object, key, .. } => {
-                    format!(
-                        " obj={:?}@{} key={:?}@{}",
-                        object,
-                        loc_str(object),
-                        key,
-                        loc_str(key)
-                    )
-                }
-                ValueNode::StoreKeyedGeneric {
-                    object, key, value, ..
-                } => {
-                    format!(
-                        " obj={:?}@{} key={:?}@{} val={:?}@{}",
-                        object,
-                        loc_str(object),
-                        key,
-                        loc_str(key),
-                        value,
-                        loc_str(value)
-                    )
-                }
-                _ => String::new(),
-            };
-            eprintln!("    {:?} = {} @ {}{}", nid, name, loc, extra);
-        }
-        if let Some(ctrl) = &block.control {
-            let ctrl_name = match ctrl {
-                ControlNode::Return { .. } => "Return",
-                ControlNode::Branch { .. } => "Branch",
-                ControlNode::Jump { target } => {
-                    if *target <= block.id {
-                        "JumpLoop"
-                    } else {
-                        "Jump"
-                    }
-                }
-                ControlNode::Deoptimize { .. } => "Deopt",
-            };
-            eprintln!("    ctrl = {}", ctrl_name);
-        }
-    }
 }
 
 /// Count the number of direct-call-0 sites (CallUndefinedReceiver0) in the graph.
@@ -5500,28 +5365,6 @@ impl<'a> MaglevCodegen<'a> {
         name: u32,
         feedback_slot: u32,
     ) {
-        // ── Diagnostic bypass: use simple stub call to isolate inline IC bugs ──
-        {
-            let saved = self.emit_save_live_regs(id);
-            self.emit_load(object, Reg64::Rdi);
-            self.masm.mov_ri(Reg64::Rsi, i64::from(name));
-            self.masm.mov_ri(Reg64::Rdx, i64::from(feedback_slot));
-            let addr = jit_runtime::jit_runtime_lda_named_property as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, addr as i64);
-            self.masm.call_reg(Reg64::R11);
-            self.emit_restore_live_regs(saved);
-            self.emit_deopt_check_rax();
-            // Keep the Smi guard for smi_guarded downstream consumers.
-            if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
-                self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-                self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
-                self.masm.jne(&mut self.deopt_label);
-            }
-            self.emit_store(id, Reg64::Rax);
-            return;
-        }
-
-        #[allow(unreachable_code)]
         let jv_layout = cached_jsvalue_layout();
         let pm_layout = cached_propertymap_layout();
 
@@ -5751,27 +5594,6 @@ impl<'a> MaglevCodegen<'a> {
     /// ```
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_load_keyed_smi(&mut self, id: NodeId, object: NodeId, key: NodeId) {
-        // ── Diagnostic bypass: use simple stub call to isolate inline IC bugs ──
-        {
-            let saved = self.emit_save_live_regs(id);
-            self.emit_load(object, Reg64::Rdi);
-            self.emit_load(key, Reg64::Rsi);
-            if self.needs_r15 {
-                self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
-                let addr = jit_runtime::jit_runtime_lda_keyed_property_r15 as *const () as usize;
-                self.masm.mov_ri(Reg64::R11, addr as i64);
-            } else {
-                let addr = jit_runtime::jit_runtime_lda_keyed_property as *const () as usize;
-                self.masm.mov_ri(Reg64::R11, addr as i64);
-            }
-            self.masm.call_reg(Reg64::R11);
-            self.emit_restore_live_regs(saved);
-            self.emit_deopt_check_rax();
-            self.emit_store(id, Reg64::Rax);
-            return;
-        }
-
-        #[allow(unreachable_code)]
         let layout = cached_jsvalue_layout();
         let ic_base = self.array_ic_base;
         let ic_off_handle = ic_base;
@@ -5960,32 +5782,6 @@ impl<'a> MaglevCodegen<'a> {
         key: NodeId,
         value: NodeId,
     ) {
-        // ── Diagnostic bypass: use simple stub call to isolate inline IC bugs ──
-        {
-            let saved = self.emit_save_live_regs(id);
-            // Load all 3 args into scratch regs first to avoid clobbering.
-            self.emit_load(object, Reg64::R11);
-            self.emit_load(key, Reg64::R10);
-            self.emit_load(value, Reg64::Rax);
-            self.masm.mov_rr(Reg64::Rdi, Reg64::R11);
-            self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
-            self.masm.mov_rr(Reg64::Rdx, Reg64::Rax);
-            if self.needs_r15 {
-                self.masm.mov_rr(Reg64::Rcx, Reg64::R15);
-                let addr = jit_runtime::jit_runtime_sta_keyed_property_r15 as *const () as usize;
-                self.masm.mov_ri(Reg64::R11, addr as i64);
-            } else {
-                let addr = jit_runtime::jit_runtime_sta_keyed_property as *const () as usize;
-                self.masm.mov_ri(Reg64::R11, addr as i64);
-            }
-            self.masm.call_reg(Reg64::R11);
-            self.emit_restore_live_regs(saved);
-            self.emit_deopt_check_rax();
-            self.emit_store(id, Reg64::Rax);
-            return;
-        }
-
-        #[allow(unreachable_code)]
         let layout = cached_jsvalue_layout();
         let vec_layout = cached_vec_jsvalue_layout();
         let ic_base = self.array_ic_base;
@@ -7900,9 +7696,8 @@ impl<'a> MaglevCodegen<'a> {
         // of the generic tier (~13 insns with dual input Smi checks).
         //
         // Previously disabled due to 100% deopt (history: ed049403,
-        // 1c1fbf6c), likely caused by inline IC register corruption.
-        // Re-enabled now that inline ICs are bypassed with simple stub
-        // calls that return correct Smi values.
+        // 1c1fbf6c), caused by register corruption from the regalloc's
+        // nested loop interval bug.  Safe now with natural loop detection.
         for block in graph.blocks() {
             for (id, node) in &block.nodes {
                 if set.contains(id) || branch_conditions.contains(id) {
