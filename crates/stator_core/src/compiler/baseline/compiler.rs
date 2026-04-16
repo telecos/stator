@@ -1298,24 +1298,7 @@ pub(crate) mod jit_runtime {
         if is_heap_handle(v) {
             match get_heap_object(v) {
                 Some(val) => val,
-                None => {
-                    // Diagnostic: log stale/invalid heap handle resolution.
-                    static STALE_HANDLE_DIAG: std::sync::atomic::AtomicU32 =
-                        std::sync::atomic::AtomicU32::new(0);
-                    let n = STALE_HANDLE_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if n < 10 {
-                        let idx = (v - JIT_HEAP_TAG) as usize;
-                        let heap_len = RT_HEAP.with(|h| h.borrow().len());
-                        eprintln!(
-                            "STALE_HANDLE: v=0x{:x} idx={} heap_len={} (occurrence #{})",
-                            v as u64,
-                            idx,
-                            heap_len,
-                            n + 1
-                        );
-                    }
-                    JsValue::Undefined
-                }
+                None => JsValue::Undefined,
             }
         } else {
             super::jit_to_jsvalue(v).unwrap_or(JsValue::Undefined)
@@ -2361,94 +2344,7 @@ pub(crate) mod jit_runtime {
             track_stub_deopt(STUB_LDA_NAMED);
             JIT_DEOPT
         });
-        // Log results that look problematic (undefined or deopt).
-        if result == JIT_UNDEFINED || result == JIT_DEOPT {
-            log_lda_named_result(
-                obj_i64,
-                name_idx,
-                result,
-                if result == JIT_UNDEFINED {
-                    "generic_undef"
-                } else {
-                    "generic_deopt"
-                },
-            );
-        }
         result
-    }
-
-    /// Diagnostic: log why the IC fill returned MISS.
-    fn log_ic_fill_miss(reason: &str, obj_i64: i64, name_idx: u32) {
-        static IC_FILL_MISS_COUNT: std::sync::atomic::AtomicU32 =
-            std::sync::atomic::AtomicU32::new(0);
-        let n = IC_FILL_MISS_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n < 20 {
-            eprintln!(
-                "IC_FILL_MISS: obj=0x{:x} name_idx={} reason={} (#{})",
-                obj_i64 as u64,
-                name_idx,
-                reason,
-                n + 1
-            );
-        }
-    }
-
-    /// Diagnostic: log IC fill MISS with property name and map size.
-    fn log_ic_fill_miss_with_name(
-        reason: &str,
-        obj_i64: i64,
-        name_idx: u32,
-        prop_name: &str,
-        map_len: usize,
-    ) {
-        static IC_FILL_NAME_COUNT: std::sync::atomic::AtomicU32 =
-            std::sync::atomic::AtomicU32::new(0);
-        let n = IC_FILL_NAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n < 20 {
-            eprintln!(
-                "IC_FILL_MISS: obj=0x{:x} name_idx={} prop='{}' map_len={} reason={} (#{})",
-                obj_i64 as u64,
-                name_idx,
-                prop_name,
-                map_len,
-                reason,
-                n + 1
-            );
-        }
-    }
-
-    /// Diagnostic: log IC fill MISS with heap value type.
-    fn log_ic_fill_miss_with_type(reason: &str, obj_i64: i64, name_idx: u32, val: &JsValue) {
-        static IC_FILL_TYPE_COUNT: std::sync::atomic::AtomicU32 =
-            std::sync::atomic::AtomicU32::new(0);
-        let n = IC_FILL_TYPE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n < 20 {
-            eprintln!(
-                "IC_FILL_MISS: obj=0x{:x} name_idx={} heap_type={:?} reason={} (#{})",
-                obj_i64 as u64,
-                name_idx,
-                std::mem::discriminant(val),
-                reason,
-                n + 1
-            );
-        }
-    }
-
-    /// Diagnostic: log the return value of `jit_runtime_lda_named_property`.
-    fn log_lda_named_result(obj_i64: i64, name_idx: u32, result: i64, path: &str) {
-        static LDA_NAMED_DIAG_COUNT: std::sync::atomic::AtomicU32 =
-            std::sync::atomic::AtomicU32::new(0);
-        let n = LDA_NAMED_DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n < 20 {
-            eprintln!(
-                "LDA_NAMED: obj=0x{:x} name_idx={} result=0x{:x} path={} (#{})",
-                obj_i64 as u64,
-                name_idx,
-                result as u64,
-                path,
-                n + 1
-            );
-        }
     }
 
     /// Like [`jit_runtime_lda_named_property`] but accepts a pre-cached
@@ -2474,37 +2370,6 @@ pub(crate) mod jit_runtime {
         // TLS slot lives for the thread's entire lifetime.
         let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
         lda_named_property_inner_with_ptrs(obj_i64, name_idx, ptrs).unwrap_or_else(|| {
-            // Diagnostic: log first few lda_named_r15 deopts to trace
-            // register corruption or unsupported object types.
-            static DIAG_COUNT: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
-            let n = DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 10 {
-                let obj_idx = if is_heap_handle(obj_i64) {
-                    (obj_i64 - JIT_HEAP_TAG) as usize
-                } else {
-                    usize::MAX
-                };
-                let heap_len = RT_HEAP.with(|h| h.borrow().len());
-                let heap_type = if obj_idx < heap_len {
-                    RT_HEAP.with(|h| {
-                        h.borrow()
-                            .get(obj_idx)
-                            .map(std::mem::discriminant)
-                    })
-                } else {
-                    None
-                };
-                eprintln!(
-                    "LDA_NAMED_R15_DEOPT: obj=0x{:x} name_idx={} obj_idx={} heap_len={} type={:?} (#{})",
-                    obj_i64 as u64,
-                    name_idx,
-                    obj_idx,
-                    heap_len,
-                    heap_type,
-                    n + 1
-                );
-            }
             track_stub_deopt(STUB_LDA_NAMED);
             JIT_DEOPT
         })
@@ -2669,12 +2534,6 @@ pub(crate) mod jit_runtime {
                         }
                         // Property slot exists in shape but value is None
                         // — structural inconsistency.
-                        log_lda_named_result(
-                            obj_i64,
-                            name_idx,
-                            JIT_UNDEFINED,
-                            "offset_found_but_no_value",
-                        );
                         return Some(JIT_UNDEFINED);
                     }
 
@@ -3140,17 +2999,6 @@ pub(crate) mod jit_runtime {
     /// Returns the call result as `i64` in `RAX`, or [`JIT_DEOPT`].
     pub extern "C" fn jit_runtime_call_undefined_receiver0(callee_i64: i64) -> i64 {
         call_undefined_receiver0_inner(callee_i64).unwrap_or_else(|| {
-            // Diagnostic: log first few call_undef0 deopts.
-            static CALL_DIAG_COUNT: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
-            let n = CALL_DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 10 {
-                eprintln!(
-                    "CALL_UNDEF0_DEOPT: callee=0x{:x} (occurrence #{})",
-                    callee_i64 as u64,
-                    n + 1
-                );
-            }
             track_stub_deopt(STUB_CALL_UNDEF0);
             JIT_DEOPT
         })
@@ -6035,19 +5883,6 @@ pub(crate) mod jit_runtime {
         // TLS slot lives for the thread's entire lifetime.
         let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
         sta_keyed_property_with_ptrs(obj_i64, key_i64, value_i64, ptrs).unwrap_or_else(|| {
-            // Diagnostic: log first few sta_keyed deopts with values.
-            static STA_DIAG_COUNT: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
-            let n = STA_DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 10 {
-                eprintln!(
-                    "STA_KEYED_DEOPT: obj=0x{:x} key=0x{:x} val=0x{:x} (occurrence #{})",
-                    obj_i64 as u64,
-                    key_i64 as u64,
-                    value_i64 as u64,
-                    n + 1
-                );
-            }
             track_stub_deopt(STUB_STA_KEYED);
             JIT_DEOPT
         })
@@ -6321,18 +6156,6 @@ pub(crate) mod jit_runtime {
             }
         }
         result.unwrap_or_else(|| {
-            // Diagnostic: log first few sta_keyed_with_ic (non-R15) deopts.
-            static DIAG_COUNT2: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let n = DIAG_COUNT2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 5 {
-                eprintln!(
-                    "STA_KEYED_IC_DEOPT(noR15): obj=0x{:x} key={} val=0x{:x} (#{})",
-                    obj_i64 as u64,
-                    key_i64,
-                    value_i64 as u64,
-                    n + 1
-                );
-            }
             track_stub_deopt(STUB_STA_KEYED);
             JIT_DEOPT
         })
@@ -6382,39 +6205,6 @@ pub(crate) mod jit_runtime {
             }
         }
         result.unwrap_or_else(|| {
-            // Diagnostic: log first few sta_keyed_with_ic deopts with full
-            // argument values to trace register corruption.
-            static DIAG_COUNT: std::sync::atomic::AtomicU32 =
-                std::sync::atomic::AtomicU32::new(0);
-            let n = DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 10 {
-                let obj_idx = if is_heap_handle(obj_i64) {
-                    (obj_i64 - JIT_HEAP_TAG) as usize
-                } else {
-                    usize::MAX
-                };
-                let heap_len = RT_HEAP.with(|h| h.borrow().len());
-                let heap_type = if obj_idx < heap_len {
-                    RT_HEAP.with(|h| {
-                        h.borrow()
-                            .get(obj_idx)
-                            .map(std::mem::discriminant)
-                    })
-                } else {
-                    None
-                };
-                eprintln!(
-                    "STA_KEYED_IC_DEOPT: obj=0x{:x} key={} val=0x{:x} obj_idx={} heap_len={} type={:?} ic_handle=0x{:x} (#{})",
-                    obj_i64 as u64,
-                    key_i64,
-                    value_i64 as u64,
-                    obj_idx,
-                    heap_len,
-                    heap_type,
-                    if ic_slots.is_null() { 0u64 } else { unsafe { *ic_slots } as u64 },
-                    n + 1
-                );
-            }
             track_stub_deopt(STUB_STA_KEYED);
             JIT_DEOPT
         })
@@ -7322,26 +7112,9 @@ pub(crate) mod jit_runtime {
                     hit: 1,
                 }
             }
-            _ => {
-                // Diagnostic: log why the grow-IC fell through.
-                static GROW_IC_DIAG: std::sync::atomic::AtomicU32 =
-                    std::sync::atomic::AtomicU32::new(0);
-                let n = GROW_IC_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 5 {
-                    eprintln!(
-                        "STA_KEYED_GROW_IC_MISS: obj=0x{:x} key={} val=0x{:x} heap_len={} obj_idx={} type={:?}",
-                        obj_i64 as u64,
-                        smi_key,
-                        value_i64 as u64,
-                        heap.len(),
-                        obj_idx,
-                        heap.get(obj_idx).map(std::mem::discriminant)
-                    );
-                }
-                InlineKeyedResult::from_generic(sta_keyed_property_with_ptrs(
-                    obj_i64, smi_key, value_i64, ptrs,
-                ))
-            }
+            _ => InlineKeyedResult::from_generic(sta_keyed_property_with_ptrs(
+                obj_i64, smi_key, value_i64, ptrs,
+            )),
         }
     }
 
@@ -7724,7 +7497,6 @@ pub(crate) mod jit_runtime {
         ic_slots: *mut [i64; 4],
     ) -> NamedIcResult {
         if !is_heap_handle(obj_i64) {
-            log_ic_fill_miss("not_heap_handle", obj_i64, name_idx);
             return NamedIcResult::MISS;
         }
         let obj_idx = (obj_i64 - JIT_HEAP_TAG) as usize;
@@ -7732,7 +7504,6 @@ pub(crate) mod jit_runtime {
         // TLS slot lives for the thread's entire lifetime.
         let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
         if !ptrs.is_cached() {
-            log_ic_fill_miss("ptrs_not_cached", obj_i64, name_idx);
             return NamedIcResult::MISS;
         }
         // SAFETY: cached pointers valid for thread lifetime.
@@ -7740,7 +7511,6 @@ pub(crate) mod jit_runtime {
         let heap_val = match heap.get(obj_idx) {
             Some(v) => v,
             None => {
-                log_ic_fill_miss("heap_idx_oob", obj_i64, name_idx);
                 return NamedIcResult::MISS;
             }
         };
@@ -7749,7 +7519,6 @@ pub(crate) mod jit_runtime {
             let prop_name = match get_rt_string_constant_ref(name_idx) {
                 Some(n) => n,
                 None => {
-                    log_ic_fill_miss("name_idx_invalid", obj_i64, name_idx);
                     return NamedIcResult::MISS;
                 }
             };
@@ -7782,9 +7551,6 @@ pub(crate) mod jit_runtime {
                     hit: 1,
                 };
             }
-            log_ic_fill_miss_with_name("offset_not_found", obj_i64, name_idx, prop_name, map.len());
-        } else {
-            log_ic_fill_miss_with_type("not_plain_object", obj_i64, name_idx, heap_val);
         }
 
         // Fall back to the existing inline helper (probes proto IC too).
@@ -9582,21 +9348,6 @@ pub(crate) mod jit_runtime {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a + *b as f64))
             }
             _ => {
-                // Diagnostic: log generic_add deopt values to trace
-                // register corruption or unsupported type combinations.
-                static DIAG_COUNT: std::sync::atomic::AtomicU32 =
-                    std::sync::atomic::AtomicU32::new(0);
-                let n = DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 10 {
-                    eprintln!(
-                        "GENERIC_ADD_DEOPT: left=0x{:x} right=0x{:x} l_type={:?} r_type={:?} (#{})",
-                        left as u64,
-                        right as u64,
-                        std::mem::discriminant(&l),
-                        std::mem::discriminant(&r),
-                        n + 1
-                    );
-                }
                 track_stub_deopt(STUB_GENERIC_ARITH);
                 JIT_DEOPT
             }
@@ -9638,19 +9389,6 @@ pub(crate) mod jit_runtime {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a - *b as f64))
             }
             _ => {
-                static DIAG_SUB: std::sync::atomic::AtomicU32 =
-                    std::sync::atomic::AtomicU32::new(0);
-                let n = DIAG_SUB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 5 {
-                    eprintln!(
-                        "GENERIC_SUB_DEOPT: left=0x{:x} right=0x{:x} l={:?} r={:?} (#{})",
-                        left as u64,
-                        right as u64,
-                        std::mem::discriminant(&l),
-                        std::mem::discriminant(&r),
-                        n + 1
-                    );
-                }
                 track_stub_deopt(STUB_GENERIC_ARITH);
                 JIT_DEOPT
             }
@@ -9692,19 +9430,6 @@ pub(crate) mod jit_runtime {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a * *b as f64))
             }
             _ => {
-                static DIAG_MUL: std::sync::atomic::AtomicU32 =
-                    std::sync::atomic::AtomicU32::new(0);
-                let n = DIAG_MUL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 5 {
-                    eprintln!(
-                        "GENERIC_MUL_DEOPT: left=0x{:x} right=0x{:x} l={:?} r={:?} (#{})",
-                        left as u64,
-                        right as u64,
-                        std::mem::discriminant(&l),
-                        std::mem::discriminant(&r),
-                        n + 1
-                    );
-                }
                 track_stub_deopt(STUB_GENERIC_ARITH);
                 JIT_DEOPT
             }

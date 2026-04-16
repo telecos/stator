@@ -836,97 +836,6 @@ impl<'a> MaglevCodegen<'a> {
         let spill_count = self.alloc.spill_count();
         let base_slots = (self.param_count + spill_count) as usize;
 
-        // Diagnostic: dump full allocation map for functions with IC nodes.
-        {
-            let has_ic = self.graph.blocks().iter().any(|b| {
-                b.nodes.iter().any(|(_, n)| {
-                    matches!(
-                        n,
-                        ValueNode::StoreKeyedGeneric { .. }
-                            | ValueNode::LoadKeyedGeneric { .. }
-                            | ValueNode::LoadNamedGeneric { .. }
-                    )
-                })
-            });
-            if has_ic {
-                static ALLOC_DUMP_COUNT: std::sync::atomic::AtomicU32 =
-                    std::sync::atomic::AtomicU32::new(0);
-                let dump_n = ALLOC_DUMP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if dump_n < 5 {
-                    eprintln!("=== ALLOC_DUMP #{} (spills={}) ===", dump_n, spill_count);
-                    for block in self.graph.blocks() {
-                        eprintln!(
-                            "  Block {} (loop_header={} preds={:?}):",
-                            block.id, block.is_loop_header, block.predecessors
-                        );
-                        for (nid, node) in &block.nodes {
-                            let loc = self.alloc.location(*nid);
-                            let kind = match node {
-                                ValueNode::Phi { inputs } => {
-                                    format!("Phi({:?})", inputs)
-                                }
-                                ValueNode::StoreKeyedGeneric {
-                                    object, key, value, ..
-                                } => format!(
-                                    "StoreKeyed(obj={:?}→{:?}, key={:?}→{:?}, val={:?}→{:?})",
-                                    object,
-                                    self.alloc.location(*object),
-                                    key,
-                                    self.alloc.location(*key),
-                                    value,
-                                    self.alloc.location(*value),
-                                ),
-                                ValueNode::LoadKeyedGeneric { object, key, .. } => format!(
-                                    "LoadKeyed(obj={:?}→{:?}, key={:?}→{:?})",
-                                    object,
-                                    self.alloc.location(*object),
-                                    key,
-                                    self.alloc.location(*key),
-                                ),
-                                ValueNode::LoadNamedGeneric { object, name, .. } => format!(
-                                    "LoadNamed(obj={:?}→{:?}, name={})",
-                                    object,
-                                    self.alloc.location(*object),
-                                    name,
-                                ),
-                                ValueNode::GenericAdd { left, right, .. } => format!(
-                                    "Add({:?}→{:?}, {:?}→{:?})",
-                                    left,
-                                    self.alloc.location(*left),
-                                    right,
-                                    self.alloc.location(*right),
-                                ),
-                                ValueNode::GenericSubtract { left, right, .. } => format!(
-                                    "Sub({:?}→{:?}, {:?}→{:?})",
-                                    left,
-                                    self.alloc.location(*left),
-                                    right,
-                                    self.alloc.location(*right),
-                                ),
-                                ValueNode::GenericMultiply { left, right, .. } => format!(
-                                    "Mul({:?}→{:?}, {:?}→{:?})",
-                                    left,
-                                    self.alloc.location(*left),
-                                    right,
-                                    self.alloc.location(*right),
-                                ),
-                                ValueNode::SmiConstant { value } => {
-                                    format!("SmiConst({})", value)
-                                }
-                                ValueNode::CreateEmptyArrayLiteral { .. } => {
-                                    "CreateEmptyArray".to_string()
-                                }
-                                _ => format!("{:?}", std::mem::discriminant(node)),
-                            };
-                            eprintln!("    {:?} → {:?}: {}", nid, loc, kind);
-                        }
-                        eprintln!("    control: {:?}", std::mem::discriminant(&block.control));
-                    }
-                    eprintln!("=== END ALLOC_DUMP ===");
-                }
-            }
-        }
-
         // Scan the IR graph and promote every unique global name into an
         // extra register-file slot beyond the allocator's spill area.
         self.scan_and_promote_globals(base_slots);
@@ -2071,20 +1980,6 @@ impl<'a> MaglevCodegen<'a> {
                 name,
                 feedback_slot,
             } => {
-                // Diagnostic: dump IC operand allocations at compile time.
-                static IC_DIAG_LN: std::sync::atomic::AtomicU32 =
-                    std::sync::atomic::AtomicU32::new(0);
-                let n = IC_DIAG_LN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 30 {
-                    eprintln!(
-                        "IC_ALLOC[LoadNamed#{}]: id={:?} obj={:?}→{:?} out→{:?}",
-                        n,
-                        id,
-                        object,
-                        self.alloc.location(*object),
-                        self.alloc.location(id),
-                    );
-                }
                 self.emit_inline_load_named(id, *object, *name, *feedback_slot);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
@@ -2113,23 +2008,6 @@ impl<'a> MaglevCodegen<'a> {
             ValueNode::StoreKeyedGeneric {
                 object, key, value, ..
             } => {
-                // Diagnostic: dump IC operand allocations at compile time.
-                static IC_DIAG_SK: std::sync::atomic::AtomicU32 =
-                    std::sync::atomic::AtomicU32::new(0);
-                let n = IC_DIAG_SK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 30 {
-                    eprintln!(
-                        "IC_ALLOC[StoreKeyed#{}]: id={:?} obj={:?}→{:?} key={:?}→{:?} val={:?}→{:?}",
-                        n,
-                        id,
-                        object,
-                        self.alloc.location(*object),
-                        key,
-                        self.alloc.location(*key),
-                        value,
-                        self.alloc.location(*value),
-                    );
-                }
                 self.emit_inline_store_keyed_smi(id, *object, *key, *value);
             }
 
@@ -3149,19 +3027,6 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.mov_load_base_disp32(dst, Reg64::R14, off);
             }
             None => {
-                // Diagnostic: emit_load with no allocation — this should
-                // not happen for well-formed operand references.
-                static EMIT_LOAD_NONE_COUNT: std::sync::atomic::AtomicU32 =
-                    std::sync::atomic::AtomicU32::new(0);
-                let n = EMIT_LOAD_NONE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 20 {
-                    eprintln!(
-                        "EMIT_LOAD_NONE: id={:?} dst={:?} (occurrence #{})",
-                        id,
-                        dst,
-                        n + 1
-                    );
-                }
                 self.masm.mov_ri(dst, JIT_UNDEFINED);
             }
         }
