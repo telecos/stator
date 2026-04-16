@@ -156,15 +156,14 @@ impl<'src> PreParser<'src> {
                 TokenKind::Function => {
                     self.scan_function(None)?;
                 }
-                TokenKind::Async => {
+                TokenKind::Async
                     // `async function …` or `async (…) => …`
-                    if self.peek()?.kind == TokenKind::Function {
+                    if self.peek()?.kind == TokenKind::Function => {
                         self.next()?; // consume `function`
                         self.scan_function(None)?;
                     }
                     // Standalone `async` identifier or `async () =>` — not a
                     // named function declaration; skip.
-                }
                 // Opening delimiters: validate matching.
                 TokenKind::LeftBrace => {
                     self.skip_block(tok.span)?;
@@ -360,20 +359,14 @@ impl<'src> PreParser<'src> {
                         };
                     }
                 }
-                TokenKind::LeftParen => {
-                    if prev_was_eval {
-                        uses_eval = true;
-                    }
+                TokenKind::LeftParen if prev_was_eval => {
+                    uses_eval = true;
                 }
-                TokenKind::This => {
-                    if depth == 1 {
-                        uses_this = true;
-                    }
+                TokenKind::This if depth == 1 => {
+                    uses_this = true;
                 }
-                TokenKind::Super => {
-                    if depth == 1 {
-                        uses_super = true;
-                    }
+                TokenKind::Super if depth == 1 => {
+                    uses_super = true;
                 }
                 TokenKind::Identifier => {
                     // Identifier tokens always carry a Str value; the pattern
@@ -397,12 +390,10 @@ impl<'src> PreParser<'src> {
                     self.skip_function()?;
                 }
                 // `async function …` — skip and count; plain `async` is ignored.
-                TokenKind::Async => {
-                    if self.peek()?.kind == TokenKind::Function {
-                        self.next()?; // consume `function`
-                        inner_count += 1;
-                        self.skip_function()?;
-                    }
+                TokenKind::Async if self.peek()?.kind == TokenKind::Function => {
+                    self.next()?; // consume `function`
+                    inner_count += 1;
+                    self.skip_function()?;
                 }
                 TokenKind::Eof => {
                     return Err(StatorError::SyntaxError(format!(

@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_match)]
 //! `stator_core` — the foundational engine library for the Stator JavaScript
 //! engine.
 //!
