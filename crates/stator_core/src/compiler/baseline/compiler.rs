@@ -2341,15 +2341,6 @@ pub(crate) mod jit_runtime {
         _feedback_slot: u32,
     ) -> i64 {
         let result = lda_named_property_inner(obj_i64, name_idx).unwrap_or_else(|| {
-            let name = get_rt_string_constant_ref(name_idx)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("?idx={name_idx}"));
-            eprintln!(
-                "LDA_NAMED_DEOPT: obj={:#x} name=\"{}\" (heap={})",
-                obj_i64 as u64,
-                name,
-                is_heap_handle(obj_i64),
-            );
             track_stub_deopt(STUB_LDA_NAMED);
             JIT_DEOPT
         });
@@ -6023,10 +6014,6 @@ pub(crate) mod jit_runtime {
             let value = match decode_non_heap_value_fast(value_i64) {
                 Some(v) => v,
                 None => {
-                    eprintln!(
-                        "STA_KEYED_DECODE_FAIL: val={:#018x} obj={:#018x} key={}",
-                        value_i64 as u64, obj_i64 as u64, key_i64,
-                    );
                     return None;
                 }
             };
@@ -6097,14 +6084,6 @@ pub(crate) mod jit_runtime {
                 return Some(value_i64);
             }
         } else {
-            eprintln!(
-                "STA_KEYED_GUARD_FAIL: obj={:#018x}(heap={}) key={:#018x} val={:#018x}(heap={})",
-                obj_i64 as u64,
-                is_heap_handle(obj_i64),
-                key_i64 as u64,
-                value_i64 as u64,
-                is_heap_handle(value_i64),
-            );
         }
 
         // Slow path: clone-based fallback.
@@ -6420,14 +6399,6 @@ pub(crate) mod jit_runtime {
     /// Inner implementation for [`jit_runtime_fast_array_store`].
     fn fast_array_store_inner(obj_handle: i64, index: i64, value_i64: i64) -> Option<i64> {
         if !is_heap_handle(obj_handle) || index < 0 || index > i32::MAX as i64 {
-            eprintln!(
-                "STORE_KEYED_DEOPT: heap={} idx={} val={:#x} (heap_check={}, idx_check={})",
-                is_heap_handle(obj_handle),
-                index,
-                value_i64 as u64,
-                is_heap_handle(obj_handle),
-                index >= 0 && index <= i32::MAX as i64,
-            );
             return None;
         }
         let smi_key = index as usize;
@@ -7594,10 +7565,6 @@ pub(crate) mod jit_runtime {
             value: result.value,
             hit: result.hit,
         };
-        eprintln!(
-            "IC_FILL_FALLBACK: name_idx={} value={:#018x} hit={} obj={:#018x}",
-            name_idx, r.value as u64, r.hit, obj_i64 as u64,
-        );
         r
     }
 
@@ -7648,14 +7615,10 @@ pub(crate) mod jit_runtime {
     ///
     /// Prints the failing value and node ID so CI logs reveal the root cause.
     #[allow(dead_code)]
-    pub extern "C" fn jit_smi_guard_fail_log(value: i64, node_id: i64) {
-        eprintln!(
-            "SMI_GUARD_FAIL: value={:#018x} node_id={} is_heap={} low32={:#010x}",
-            value as u64,
-            node_id,
-            is_heap_handle(value),
-            (value as u32) as u64,
-        );
+    pub extern "C" fn jit_smi_guard_fail_log(_value: i64, _node_id: i64) {
+        // Diagnostic stub — kept as a trampoline target for smi guard failures.
+        // The smi_guard codegen calls this before deopting so it can be used
+        // as a breakpoint target in gdb/lldb.
     }
 
     // ── Array inline-cache fill + load ──────────────────────────────────
@@ -8512,14 +8475,6 @@ pub(crate) mod jit_runtime {
         arg0_i64: i64,
     ) -> i64 {
         call_property1_inner(callee_i64, receiver_i64, arg0_i64).unwrap_or_else(|| {
-            eprintln!(
-                "CALL_PROP1_DEOPT: callee={:#x} recv={:#x} arg0={:#x} (callee_heap={} recv_heap={})",
-                callee_i64 as u64,
-                receiver_i64 as u64,
-                arg0_i64 as u64,
-                is_heap_handle(callee_i64),
-                is_heap_handle(receiver_i64),
-            );
             track_stub_deopt(STUB_CALL_PROP1);
             JIT_DEOPT
         })
