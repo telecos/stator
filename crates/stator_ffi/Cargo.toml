@@ -2,6 +2,11 @@
 name = "stator_ffi"
 version = "0.1.0"
 edition = "2024"
+description = "Stator JavaScript engine — stable C FFI layer for embedding"
+license = "MIT"
+repository = "https://github.com/telecos/stator"
+keywords = ["javascript", "engine", "ffi", "embedding"]
+categories = ["compilers", "external-ffi-bindings"]
 
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]

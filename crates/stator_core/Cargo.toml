@@ -2,6 +2,13 @@
 name = "stator_core"
 version = "0.1.0"
 edition = "2024"
+description = "Stator JavaScript engine core — parser, bytecode compiler, Maglev JIT, interpreter, GC"
+license = "MIT"
+repository = "https://github.com/telecos/stator"
+homepage = "https://github.com/telecos/stator"
+keywords = ["javascript", "engine", "jit", "ecmascript", "interpreter"]
+categories = ["compilers", "wasm"]
+readme = "../../README.md"
 
 [lib]
 crate-type = ["rlib"]

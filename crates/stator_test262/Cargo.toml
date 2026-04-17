@@ -2,6 +2,10 @@
 name = "stator_test262"
 version = "0.1.0"
 edition = "2024"
+description = "ECMA-262 Test262 conformance harness for the Stator JavaScript engine"
+license = "MIT"
+repository = "https://github.com/telecos/stator"
+publish = false
 
 [[bin]]
 name = "stator_test262"

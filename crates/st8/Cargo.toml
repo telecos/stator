@@ -2,6 +2,11 @@
 name = "st8"
 version = "0.1.0"
 edition = "2024"
+description = "Stator JavaScript shell — interactive JS REPL and script runner (like V8's d8)"
+license = "MIT"
+repository = "https://github.com/telecos/stator"
+keywords = ["javascript", "shell", "repl", "ecmascript"]
+categories = ["command-line-utilities", "compilers"]
 
 [[bin]]
 name = "st8"
