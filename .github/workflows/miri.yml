@@ -3,11 +3,11 @@ name: Miri
 on:
   pull_request:
     paths:
-      - 'crates/stator_core/src/gc/**'
-      - 'crates/stator_core/src/objects/**'
-      - 'crates/stator_core/src/bytecode/**'
+      - 'crates/stator_jse/src/gc/**'
+      - 'crates/stator_jse/src/objects/**'
+      - 'crates/stator_jse/src/bytecode/**'
       - '.github/workflows/miri.yml'
-      - 'crates/stator_core/Cargo.toml'
+      - 'crates/stator_jse/Cargo.toml'
       - 'Cargo.lock'
 
 permissions:

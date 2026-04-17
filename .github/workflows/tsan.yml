@@ -3,7 +3,7 @@ name: ThreadSanitizer
 on:
   pull_request:
     paths:
-      - 'crates/stator_core/src/gc/**'
+      - 'crates/stator_jse/src/gc/**'
       - '.github/workflows/tsan.yml'
       - 'Cargo.lock'
 

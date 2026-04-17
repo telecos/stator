@@ -4,7 +4,7 @@ on:
   pull_request:
     paths:
       - 'crates/stator_ffi/src/**'
-      - 'crates/stator_core/src/**'
+      - 'crates/stator_jse/src/**'
       - '.github/workflows/asan.yml'
       - 'Cargo.lock'
 

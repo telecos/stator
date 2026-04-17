@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "crates/stator_core",
+    "crates/stator_jse",
     "crates/stator_ffi",
     "crates/stator_test262",
     "crates/st8",
@@ -12,7 +12,7 @@ unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
 
 [workspace.dependencies]
-stator_jse = { path = "crates/stator_core" }
+stator_jse = { path = "crates/stator_jse" }
 bumpalo = "3.20.2"
 log = "0.4.29"
 env_logger = "0.11.9"
