@@ -84,6 +84,8 @@
 #[cfg(all(target_arch = "x86_64", unix))]
 use crate::bytecode::bytecodes::Opcode;
 #[cfg(all(target_arch = "x86_64", unix))]
+use crate::compiler::baseline::compiler::JIT_HEAP_TAG;
+#[cfg(all(target_arch = "x86_64", unix))]
 use crate::compiler::baseline::compiler::jit_runtime;
 use crate::compiler::baseline::compiler::{
     DeoptEntry, JIT_DEOPT, JIT_FALSE, JIT_NULL, JIT_TRUE, JIT_UNDEFINED, METADATA_MAGIC,
@@ -5756,6 +5758,13 @@ impl<'a> MaglevCodegen<'a> {
         self.emit_load(object, Reg64::R11);
         self.emit_load(key, Reg64::R10);
 
+        // Heap-handle guard: non-heap values (Smi, JIT_UNDEFINED,
+        // JIT_FALSE, etc.) cannot be arrays.  Return undefined
+        // instead of falling to the slow path which may deopt.
+        self.masm.mov_ri(Reg64::Rax, JIT_HEAP_TAG);
+        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+        self.masm.jcc(CondCode::Below, &mut load_undef);
+
         // IC hit check: is this the same array handle?
         self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, ic_off_handle);
         self.masm.jne(&mut slow_label);
@@ -5933,9 +5942,18 @@ impl<'a> MaglevCodegen<'a> {
 
         // ── Fast path (scratch regs only: R11, R10, RAX) ────────────
 
-        // Load object, key, and value into scratch registers.
+        // Load object and key into scratch registers.
         self.emit_load(object, Reg64::R11);
         self.emit_load(key, Reg64::R10);
+
+        // Heap-handle guard: non-heap values cannot be arrays.
+        // Skip the store silently (JS ignores property assignment
+        // on non-object primitives in sloppy mode).
+        self.masm.mov_ri(Reg64::Rax, JIT_HEAP_TAG);
+        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+        self.masm.jcc(CondCode::Below, &mut done_label);
+
+        // Load value now that we know the receiver is valid.
         self.emit_load(value, Reg64::Rax);
 
         // IC hit check: is this the same array handle?

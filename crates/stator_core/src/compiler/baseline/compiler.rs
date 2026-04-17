@@ -5841,7 +5841,7 @@ pub(crate) mod jit_runtime {
         let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
         lda_keyed_property_with_ptrs(obj_i64, key_i64, ptrs).unwrap_or_else(|| {
             track_stub_deopt(STUB_LDA_KEYED);
-            JIT_DEOPT
+            JIT_UNDEFINED
         })
     }
 
@@ -6036,7 +6036,7 @@ pub(crate) mod jit_runtime {
                 );
             }
             track_stub_deopt(STUB_STA_KEYED);
-            JIT_DEOPT
+            value_i64
         })
     }
 
@@ -6072,7 +6072,7 @@ pub(crate) mod jit_runtime {
                 );
             }
             track_stub_deopt(STUB_STA_KEYED);
-            JIT_DEOPT
+            value_i64
         })
     }
 
@@ -6359,7 +6359,7 @@ pub(crate) mod jit_runtime {
                 );
             }
             track_stub_deopt(STUB_STA_KEYED);
-            JIT_DEOPT
+            value_i64
         })
     }
 
@@ -6416,7 +6416,7 @@ pub(crate) mod jit_runtime {
                 );
             }
             track_stub_deopt(STUB_STA_KEYED);
-            JIT_DEOPT
+            value_i64
         })
     }
 

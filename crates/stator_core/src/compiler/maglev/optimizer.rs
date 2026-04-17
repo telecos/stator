@@ -2355,6 +2355,13 @@ fn compute_store_to_load_subst_with_map(
     store_map: &mut HashMap<(NodeId, u32), NodeId>,
 ) -> HashMap<NodeId, NodeId> {
     let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
+    // Track global variable store/load forwarding:
+    // StoreGlobal(name, value) → LoadGlobal(name) resolves to value.
+    let mut global_map: HashMap<u32, NodeId> = HashMap::new();
+    // Track NodeId aliases from global forwarding so that property
+    // lookups on a LoadGlobal result can find stores on the original
+    // object.  alias_map[LoadGlobal_id] = original_value_id.
+    let mut alias_map: HashMap<NodeId, NodeId> = HashMap::new();
 
     for (id, node) in &block.nodes {
         match node {
@@ -2366,26 +2373,49 @@ fn compute_store_to_load_subst_with_map(
                 }
             }
 
-            // Track stores.
+            // Track global stores for global forwarding.
+            ValueNode::StoreGlobal { name, value, .. } => {
+                global_map.insert(*name, *value);
+            }
+
+            // Forward global loads.
+            ValueNode::LoadGlobal { name, .. } => {
+                if let Some(&stored_value) = global_map.get(name) {
+                    subst.insert(*id, stored_value);
+                    alias_map.insert(*id, stored_value);
+                }
+            }
+
+            // Track named property stores.
             ValueNode::StoreNamedGeneric {
                 object,
                 name,
                 value,
                 ..
             } => {
-                store_map.insert((*object, *name), *value);
+                // Resolve aliases: if object was a forwarded LoadGlobal,
+                // use the original value for the store_map key.
+                let resolved_obj = alias_map.get(object).copied().unwrap_or(*object);
+                store_map.insert((resolved_obj, *name), *value);
             }
 
-            // Forward loads.
+            // Forward named property loads.
             ValueNode::LoadNamedGeneric { object, name, .. } => {
-                if let Some(&stored_value) = store_map.get(&(*object, *name)) {
+                // Resolve aliases: if object was a forwarded LoadGlobal,
+                // look up properties on the original object.
+                let resolved_obj = alias_map.get(object).copied().unwrap_or(*object);
+                if let Some(&stored_value) = store_map.get(&(resolved_obj, *name)) {
                     subst.insert(*id, stored_value);
                 }
             }
 
             // Any other side-effecting node invalidates the map conservatively.
+            // StoreGlobal is already handled above, so exclude it from clearing.
             other if has_side_effects(other) => {
                 store_map.clear();
+                global_map.clear();
+                // Keep alias_map — aliases are structural, not invalidated
+                // by side effects.
             }
 
             _ => {}
