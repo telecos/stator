@@ -15,12 +15,32 @@ permissions:
 
 jobs:
   miri:
-    name: Miri (unsafe code validation)
+    name: Miri (${{ matrix.target }}, ${{ matrix.label }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # Known issue: GcPtr unsafe operations cause Miri timeouts.
     # Tracked for fix when the GC subsystem is refactored.
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Primary target – x86-64 Linux (Stacked Borrows)
+          - target: x86_64-unknown-linux-gnu
+            miriflags: "-Zmiri-preemption-rate=0.1"
+            label: "Stacked Borrows"
+          # Primary target – x86-64 Linux (Tree Borrows)
+          - target: x86_64-unknown-linux-gnu
+            miriflags: "-Zmiri-tree-borrows -Zmiri-preemption-rate=0.1"
+            label: "Tree Borrows"
+          # 32-bit target – catch pointer-size-dependent bugs in GC / objects
+          - target: i686-unknown-linux-gnu
+            miriflags: "-Zmiri-preemption-rate=0.1"
+            label: "Stacked Borrows"
+          # AArch64 target – exercise interpreter + GC on a second architecture
+          - target: aarch64-unknown-linux-gnu
+            miriflags: "-Zmiri-preemption-rate=0.1"
+            label: "Stacked Borrows"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -34,29 +54,23 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-miri-registry-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-miri-${{ matrix.target }}-registry-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-miri-registry-
+            ${{ runner.os }}-cargo-miri-${{ matrix.target }}-registry-
 
       - name: Cache cargo index
         uses: actions/cache@v4
         with:
           path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-miri-git-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-miri-${{ matrix.target }}-git-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-miri-git-
+            ${{ runner.os }}-cargo-miri-${{ matrix.target }}-git-
 
       - name: Set up Miri sysroot
-        run: cargo +nightly miri setup
+        run: cargo +nightly miri setup --target ${{ matrix.target }}
 
-      - name: Run Miri tests – Stacked Borrows (default)
+      - name: Run Miri tests
         env:
-          MIRIFLAGS: "-Zmiri-preemption-rate=0.1"
+          MIRIFLAGS: "${{ matrix.miriflags }}"
         run: |
-          cargo +nightly miri test -p stator_js -- gc:: objects:: bytecode::
-
-      - name: Run Miri tests – Tree Borrows
-        env:
-          MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-preemption-rate=0.1"
-        run: |
-          cargo +nightly miri test -p stator_js -- gc:: objects:: bytecode::
+          cargo +nightly miri test -p stator_js --target ${{ matrix.target }} -- gc:: objects:: bytecode::
