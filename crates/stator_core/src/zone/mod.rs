@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```
-//! use stator_js::zone::Zone;
+//! use stator_jse::zone::Zone;
 //!
 //! let zone = Zone::new();
 //! let x: &u64 = zone.alloc(42_u64);

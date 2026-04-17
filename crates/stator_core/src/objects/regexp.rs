@@ -210,7 +210,7 @@ pub struct MatchIndices {
 /// # Example
 ///
 /// ```rust
-/// use stator_js::objects::regexp::JsRegExp;
+/// use stator_jse::objects::regexp::JsRegExp;
 ///
 /// let re = JsRegExp::new(r"\d+", "g").unwrap();
 /// assert!(re.test("foo 42 bar"));
@@ -252,7 +252,7 @@ impl JsRegExp {
     /// # Example
     ///
     /// ```rust
-    /// use stator_js::objects::regexp::JsRegExp;
+    /// use stator_jse::objects::regexp::JsRegExp;
     ///
     /// let re = JsRegExp::new(r"(?<year>\d{4})-(?<month>\d{2})", "u").unwrap();
     /// assert!(re.test("2024-07"));

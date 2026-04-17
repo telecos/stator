@@ -63,8 +63,8 @@ pub enum SetIteratorKind {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_new, set_add, set_has, set_size};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::set::{set_new, set_add, set_has, set_size};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut s = set_new();
 /// set_add(&mut s, JsValue::Smi(1));
@@ -124,7 +124,7 @@ pub fn set_next_iteration_item(
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_new, set_size};
+/// use stator_jse::builtins::set::{set_new, set_size};
 ///
 /// let s = set_new();
 /// assert_eq!(set_size(&s), 0);
@@ -141,8 +141,8 @@ pub fn set_new() -> JsSet {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_from_iterable, set_has, set_size};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::set::{set_from_iterable, set_has, set_size};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let items = vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(1)];
 /// let s = set_from_iterable(items);
@@ -167,8 +167,8 @@ pub fn set_from_iterable(items: Vec<JsValue>) -> JsSet {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_new, set_add, set_size};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::set::{set_new, set_add, set_size};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut s = set_new();
 /// set_add(&mut s, JsValue::Smi(5));
@@ -193,8 +193,8 @@ pub fn set_add(set: &mut JsSet, value: JsValue) {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_new, set_add, set_has};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::set::{set_new, set_add, set_has};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut s = set_new();
 /// set_add(&mut s, JsValue::Boolean(true));
@@ -218,8 +218,8 @@ pub fn set_has(set: &JsSet, value: &JsValue) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_new, set_add, set_delete, set_size};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::set::{set_new, set_add, set_delete, set_size};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut s = set_new();
 /// set_add(&mut s, JsValue::Smi(3));
@@ -246,8 +246,8 @@ pub fn set_delete(set: &mut JsSet, value: &JsValue) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_new, set_add, set_clear, set_size};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::set::{set_new, set_add, set_clear, set_size};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut s = set_new();
 /// set_add(&mut s, JsValue::Smi(1));
@@ -270,8 +270,8 @@ pub fn set_clear(set: &mut JsSet) {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_new, set_add, set_size};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::set::{set_new, set_add, set_size};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut s = set_new();
 /// set_add(&mut s, JsValue::Smi(10));
@@ -290,8 +290,8 @@ pub fn set_size(set: &JsSet) -> usize {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_new, set_add, set_for_each};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::set::{set_new, set_add, set_for_each};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut s = set_new();
 /// set_add(&mut s, JsValue::Smi(1));
@@ -315,8 +315,8 @@ pub fn set_for_each(set: &JsSet, mut callback: impl FnMut(&JsValue)) {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_new, set_add, set_values};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::set::{set_new, set_add, set_values};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut s = set_new();
 /// set_add(&mut s, JsValue::Smi(7));
@@ -335,8 +335,8 @@ pub fn set_values(set: &JsSet) -> Vec<JsValue> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_new, set_add, set_keys};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::set::{set_new, set_add, set_keys};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut s = set_new();
 /// set_add(&mut s, JsValue::Smi(7));
@@ -357,8 +357,8 @@ pub fn set_keys(set: &JsSet) -> Vec<JsValue> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_new, set_add, set_entries};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::set::{set_new, set_add, set_entries};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut s = set_new();
 /// set_add(&mut s, JsValue::Smi(1));
@@ -382,8 +382,8 @@ pub fn set_entries(set: &JsSet) -> Vec<(JsValue, JsValue)> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_new, set_add, set_iter};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::set::{set_new, set_add, set_iter};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut s = set_new();
 /// set_add(&mut s, JsValue::Smi(5));
@@ -408,9 +408,9 @@ pub fn set_iter(set: &JsSet) -> Vec<JsValue> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_new, set_add, set_create_iterator, SetIteratorKind};
-/// use stator_js::builtins::iterator::iterator_next;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::set::{set_new, set_add, set_create_iterator, SetIteratorKind};
+/// use stator_jse::builtins::iterator::iterator_next;
+/// use stator_jse::objects::value::JsValue;
 /// use std::rc::Rc;
 ///
 /// let mut s = set_new();
@@ -454,8 +454,8 @@ pub fn set_create_iterator(set: &JsSet, kind: SetIteratorKind) -> JsValue {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_new, set_add, set_union, set_size, set_has};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::set::{set_new, set_add, set_union, set_size, set_has};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut a = set_new();
 /// set_add(&mut a, JsValue::Smi(1));
@@ -486,8 +486,8 @@ pub fn set_union(a: &JsSet, b: &JsSet) -> JsSet {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_new, set_add, set_intersection, set_size};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::set::{set_new, set_add, set_intersection, set_size};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut a = set_new();
 /// set_add(&mut a, JsValue::Smi(1));
@@ -516,8 +516,8 @@ pub fn set_intersection(a: &JsSet, b: &JsSet) -> JsSet {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_new, set_add, set_difference, set_size, set_has};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::set::{set_new, set_add, set_difference, set_size, set_has};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut a = set_new();
 /// set_add(&mut a, JsValue::Smi(1));
@@ -546,8 +546,8 @@ pub fn set_difference(a: &JsSet, b: &JsSet) -> JsSet {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_new, set_add, set_symmetric_difference, set_size};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::set::{set_new, set_add, set_symmetric_difference, set_size};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut a = set_new();
 /// set_add(&mut a, JsValue::Smi(1));
@@ -582,8 +582,8 @@ pub fn set_symmetric_difference(a: &JsSet, b: &JsSet) -> JsSet {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_new, set_add, set_is_subset_of};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::set::{set_new, set_add, set_is_subset_of};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut a = set_new();
 /// set_add(&mut a, JsValue::Smi(1));
@@ -604,8 +604,8 @@ pub fn set_is_subset_of(a: &JsSet, b: &JsSet) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_new, set_add, set_is_superset_of};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::set::{set_new, set_add, set_is_superset_of};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut a = set_new();
 /// set_add(&mut a, JsValue::Smi(1));
@@ -626,8 +626,8 @@ pub fn set_is_superset_of(a: &JsSet, b: &JsSet) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::set::{set_new, set_add, set_is_disjoint_from};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::set::{set_new, set_add, set_is_disjoint_from};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut a = set_new();
 /// set_add(&mut a, JsValue::Smi(1));

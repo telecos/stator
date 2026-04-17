@@ -52,12 +52,12 @@
 //! # Example
 //!
 //! ```
-//! use stator_js::ic::PropertyLoadIc;
-//! use stator_js::bytecode::feedback::{FeedbackMetadata, FeedbackSlotKind, FeedbackVector};
-//! use stator_js::objects::js_object::JsObject;
-//! use stator_js::objects::shapes::ShapeTable;
-//! use stator_js::objects::map::PropertyAttributes;
-//! use stator_js::objects::value::JsValue;
+//! use stator_jse::ic::PropertyLoadIc;
+//! use stator_jse::bytecode::feedback::{FeedbackMetadata, FeedbackSlotKind, FeedbackVector};
+//! use stator_jse::objects::js_object::JsObject;
+//! use stator_jse::objects::shapes::ShapeTable;
+//! use stator_jse::objects::map::PropertyAttributes;
+//! use stator_jse::objects::value::JsValue;
 //!
 //! let meta = FeedbackMetadata::new(vec![FeedbackSlotKind::LoadProperty]);
 //! let mut feedback = FeedbackVector::new(&meta);

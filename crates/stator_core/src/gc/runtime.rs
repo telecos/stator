@@ -7,7 +7,7 @@
 //! # Usage
 //!
 //! ```rust,ignore
-//! use stator_js::gc::runtime::{gc_alloc, gc_collect, gc_stats};
+//! use stator_jse::gc::runtime::{gc_alloc, gc_collect, gc_stats};
 //!
 //! let ptr = gc_alloc::<MyGcType>();
 //! // ... use the allocated object ...

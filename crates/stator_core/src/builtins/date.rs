@@ -400,7 +400,7 @@ fn local_to_utc(t: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::date::date_now;
+/// use stator_jse::builtins::date::date_now;
 ///
 /// let now = date_now();
 /// assert!(now > 0.0);
@@ -426,7 +426,7 @@ pub fn date_now() -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::date::date_parse;
+/// use stator_jse::builtins::date::date_parse;
 ///
 /// let t = date_parse("2024-01-15T12:30:00.000Z");
 /// assert!(!t.is_nan());
@@ -820,7 +820,7 @@ fn extract_time_from_string(s: &str) -> (f64, f64, f64) {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::date::date_utc;
+/// use stator_jse::builtins::date::date_utc;
 ///
 /// let t = date_utc(2024.0, 0.0, 15.0, 12.0, 30.0, 0.0, 0.0);
 /// assert!(!t.is_nan());
@@ -901,7 +901,7 @@ pub fn date_construct_components(
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::date::date_get_full_year;
+/// use stator_jse::builtins::date::date_get_full_year;
 ///
 /// // 2024-01-15T00:00:00Z in local time — exact year depends on timezone
 /// let t = 1705276800000.0;
@@ -1252,7 +1252,7 @@ const MONTH_NAMES: [&str; 12] = [
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::date::date_to_iso_string;
+/// use stator_jse::builtins::date::date_to_iso_string;
 ///
 /// let s = date_to_iso_string(0.0).unwrap();
 /// assert_eq!(s, "1970-01-01T00:00:00.000Z");
@@ -1303,7 +1303,7 @@ pub fn date_to_json(t: f64) -> Option<String> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::date::date_to_utc_string;
+/// use stator_jse::builtins::date::date_to_utc_string;
 ///
 /// let s = date_to_utc_string(0.0);
 /// assert_eq!(s, "Thu, 01 Jan 1970 00:00:00 GMT");

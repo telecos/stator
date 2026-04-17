@@ -66,10 +66,10 @@
 //! # Example
 //!
 //! ```
-//! use stator_js::compiler::maglev::ir::{
+//! use stator_jse::compiler::maglev::ir::{
 //!     BasicBlock, ControlNode, MaglevGraph, ValueNode,
 //! };
-//! use stator_js::compiler::maglev::codegen::compile;
+//! use stator_jse::compiler::maglev::codegen::compile;
 //!
 //! let mut graph = MaglevGraph::new(0);
 //! let mut block = BasicBlock::new(0);

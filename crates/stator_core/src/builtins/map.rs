@@ -63,8 +63,8 @@ pub enum MapIteratorKind {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::map::{map_new, map_set, map_get, map_size};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::map::{map_new, map_set, map_get, map_size};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut m = map_new();
 /// map_set(&mut m, JsValue::String("key".into()), JsValue::Smi(42));
@@ -123,7 +123,7 @@ pub fn map_next_iteration_item(
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::map::{map_new, map_size};
+/// use stator_jse::builtins::map::{map_new, map_size};
 ///
 /// let m = map_new();
 /// assert_eq!(map_size(&m), 0);
@@ -140,8 +140,8 @@ pub fn map_new() -> JsMap {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::map::{map_from_iterable, map_get, map_size};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::map::{map_from_iterable, map_get, map_size};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let pairs = vec![
 ///     (JsValue::Smi(1), JsValue::String("one".into())),
@@ -170,8 +170,8 @@ pub fn map_from_iterable(pairs: Vec<(JsValue, JsValue)>) -> JsMap {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::map::{map_new, map_set, map_get, map_size};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::map::{map_new, map_set, map_get, map_size};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut m = map_new();
 /// map_set(&mut m, JsValue::Smi(1), JsValue::Boolean(true));
@@ -203,8 +203,8 @@ pub fn map_set(map: &mut JsMap, key: JsValue, value: JsValue) {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::map::{map_new, map_set, map_get};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::map::{map_new, map_set, map_get};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut m = map_new();
 /// assert_eq!(map_get(&m, &JsValue::Smi(99)), JsValue::Undefined);
@@ -230,8 +230,8 @@ pub fn map_get(map: &JsMap, key: &JsValue) -> JsValue {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::map::{map_new, map_set, map_has};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::map::{map_new, map_set, map_has};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut m = map_new();
 /// assert!(!map_has(&m, &JsValue::Null));
@@ -255,8 +255,8 @@ pub fn map_has(map: &JsMap, key: &JsValue) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::map::{map_new, map_set, map_delete, map_size};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::map::{map_new, map_set, map_delete, map_size};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut m = map_new();
 /// map_set(&mut m, JsValue::Smi(1), JsValue::Smi(10));
@@ -283,8 +283,8 @@ pub fn map_delete(map: &mut JsMap, key: &JsValue) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::map::{map_new, map_set, map_clear, map_size};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::map::{map_new, map_set, map_clear, map_size};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut m = map_new();
 /// map_set(&mut m, JsValue::Smi(1), JsValue::Smi(2));
@@ -307,8 +307,8 @@ pub fn map_clear(map: &mut JsMap) {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::map::{map_new, map_set, map_size};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::map::{map_new, map_set, map_size};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut m = map_new();
 /// assert_eq!(map_size(&m), 0);
@@ -328,8 +328,8 @@ pub fn map_size(map: &JsMap) -> usize {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::map::{map_new, map_set, map_for_each};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::map::{map_new, map_set, map_for_each};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut m = map_new();
 /// map_set(&mut m, JsValue::Smi(1), JsValue::String("one".into()));
@@ -352,8 +352,8 @@ pub fn map_for_each(map: &JsMap, mut callback: impl FnMut(&JsValue, &JsValue)) {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::map::{map_new, map_set, map_keys};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::map::{map_new, map_set, map_keys};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut m = map_new();
 /// map_set(&mut m, JsValue::Smi(1), JsValue::Undefined);
@@ -376,8 +376,8 @@ pub fn map_keys(map: &JsMap) -> Vec<JsValue> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::map::{map_new, map_set, map_values};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::map::{map_new, map_set, map_values};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut m = map_new();
 /// map_set(&mut m, JsValue::Smi(0), JsValue::String("a".into()));
@@ -403,8 +403,8 @@ pub fn map_values(map: &JsMap) -> Vec<JsValue> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::map::{map_new, map_set, map_entries};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::map::{map_new, map_set, map_entries};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut m = map_new();
 /// map_set(&mut m, JsValue::Boolean(true), JsValue::Smi(1));
@@ -425,8 +425,8 @@ pub fn map_entries(map: &JsMap) -> Vec<(JsValue, JsValue)> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::map::{map_new, map_set, map_iter};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::map::{map_new, map_set, map_iter};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut m = map_new();
 /// map_set(&mut m, JsValue::Smi(1), JsValue::Boolean(true));
@@ -452,9 +452,9 @@ pub fn map_iter(map: &JsMap) -> Vec<(JsValue, JsValue)> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::map::{map_new, map_set, map_create_iterator, MapIteratorKind};
-/// use stator_js::builtins::iterator::iterator_next;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::map::{map_new, map_set, map_create_iterator, MapIteratorKind};
+/// use stator_jse::builtins::iterator::iterator_next;
+/// use stator_jse::objects::value::JsValue;
 /// use std::rc::Rc;
 ///
 /// let mut m = map_new();
@@ -512,8 +512,8 @@ pub fn map_create_iterator(map: &JsMap, kind: MapIteratorKind) -> JsValue {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::map::{map_group_by, map_size, map_get};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::map::{map_group_by, map_size, map_get};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let items = vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)];
 /// let m = map_group_by(&items, |v, _idx| {

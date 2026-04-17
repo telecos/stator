@@ -47,8 +47,8 @@ jobs:
         with:
           shared-key: "test262"
 
-      - name: Build stator_js_test262 (release)
-        run: cargo build --package stator_js_test262 --release
+      - name: Build stator_jse_test262 (release)
+        run: cargo build --package stator_jse_test262 --release
 
       - name: Run Test262 suite
         # Stack: 64 MiB, no core dumps (instant crash recovery).
@@ -64,7 +64,7 @@ jobs:
           MAX_RESTARTS=1000
           for attempt in $(seq 1 $MAX_RESTARTS); do
             set +e
-            timeout 300 ./target/release/stator_js_test262 \
+            timeout 300 ./target/release/stator_jse_test262 \
               --test262-dir test262 \
               --threshold 25.0 \
               --progress-file "$PROGRESS_FILE" \

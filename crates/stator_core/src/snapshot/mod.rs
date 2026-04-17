@@ -91,8 +91,8 @@
 //!
 //! ```
 //! use std::collections::HashMap;
-//! use stator_js::objects::value::JsValue;
-//! use stator_js::snapshot::{StartupSnapshot, serialize_globals, deserialize_globals};
+//! use stator_jse::objects::value::JsValue;
+//! use stator_jse::snapshot::{StartupSnapshot, serialize_globals, deserialize_globals};
 //!
 //! let mut globals: HashMap<String, JsValue> = HashMap::new();
 //! globals.insert("answer".to_string(), JsValue::Smi(42));
@@ -333,8 +333,8 @@ impl DeserContext {
 ///
 /// ```
 /// use std::collections::HashMap;
-/// use stator_js::objects::value::JsValue;
-/// use stator_js::snapshot::serialize_globals;
+/// use stator_jse::objects::value::JsValue;
+/// use stator_jse::snapshot::serialize_globals;
 ///
 /// let mut globals = HashMap::new();
 /// globals.insert("x".to_string(), JsValue::Smi(7));
@@ -371,8 +371,8 @@ pub fn serialize_globals(globals: &HashMap<String, JsValue>) -> StartupSnapshot 
 ///
 /// ```
 /// use std::collections::HashMap;
-/// use stator_js::objects::value::JsValue;
-/// use stator_js::snapshot::{serialize_globals, deserialize_globals};
+/// use stator_jse::objects::value::JsValue;
+/// use stator_jse::snapshot::{serialize_globals, deserialize_globals};
 ///
 /// let mut globals = HashMap::new();
 /// globals.insert("pi".to_string(), JsValue::HeapNumber(3.14));

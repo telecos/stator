@@ -59,10 +59,10 @@
 //! # Example
 //!
 //! ```
-//! use stator_js::compiler::maglev::ir::{
+//! use stator_jse::compiler::maglev::ir::{
 //!     BasicBlock, ControlNode, MaglevGraph, ValueNode,
 //! };
-//! use stator_js::compiler::turbofan::compile;
+//! use stator_jse::compiler::turbofan::compile;
 //!
 //! // Build a trivial graph: return the Int32 constant 42.
 //! let mut graph = MaglevGraph::new(0);

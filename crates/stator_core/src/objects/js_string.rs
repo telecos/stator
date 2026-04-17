@@ -162,7 +162,7 @@ impl Trace for ThinString {
 /// # Examples
 ///
 /// ```
-/// use stator_js::objects::js_string::{InternalizedString, StringTable};
+/// use stator_jse::objects::js_string::{InternalizedString, StringTable};
 ///
 /// let mut table = StringTable::new();
 /// let a = table.intern_str("hello");

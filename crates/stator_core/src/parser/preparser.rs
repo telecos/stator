@@ -74,7 +74,7 @@ pub struct PreParseResult {
 /// # Example
 ///
 /// ```
-/// use stator_js::parser::preparser::preparse;
+/// use stator_jse::parser::preparser::preparse;
 ///
 /// let src = "function add(a, b) { return a + b; }";
 /// let result = preparse(src).unwrap();

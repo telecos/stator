@@ -31,10 +31,10 @@
 //! ```no_run
 //! use std::rc::Rc;
 //! use std::cell::RefCell;
-//! use stator_js::inspector::debugger::{DebugAction, Debugger, PauseReason};
-//! use stator_js::interpreter::{attach_debugger, detach_debugger, Interpreter, InterpreterFrame};
-//! use stator_js::error::StatorError;
-//! use stator_js::bytecode::bytecode_array::BytecodeArray;
+//! use stator_jse::inspector::debugger::{DebugAction, Debugger, PauseReason};
+//! use stator_jse::interpreter::{attach_debugger, detach_debugger, Interpreter, InterpreterFrame};
+//! use stator_jse::error::StatorError;
+//! use stator_jse::bytecode::bytecode_array::BytecodeArray;
 //!
 //! fn run_with_debugger(bytecodes: BytecodeArray) {
 //!     let dbg = Rc::new(RefCell::new(Debugger::new()));

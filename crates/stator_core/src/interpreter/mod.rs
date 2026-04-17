@@ -207,7 +207,7 @@ use crate::objects::string_intern::intern;
 use crate::objects::value::{JsContext, JsValue};
 
 // Re-export generator types and bring them into scope so external code can
-// import them from `stator_js::interpreter` (backwards-compatible path).
+// import them from `stator_jse::interpreter` (backwards-compatible path).
 pub use crate::objects::value::{
     GeneratorResumeMode, GeneratorState, GeneratorStatus, GeneratorStep, NativeIterator,
 };

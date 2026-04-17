@@ -36,10 +36,10 @@
 //! # Usage
 //!
 //! ```
-//! use stator_js::compiler::maglev::ir::{
+//! use stator_jse::compiler::maglev::ir::{
 //!     BasicBlock, ControlNode, MaglevGraph, ValueNode,
 //! };
-//! use stator_js::compiler::maglev::type_guards::insert_type_guards;
+//! use stator_jse::compiler::maglev::type_guards::insert_type_guards;
 //!
 //! let mut graph = MaglevGraph::new(2);
 //! let mut block = BasicBlock::new(0);

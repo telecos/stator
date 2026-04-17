@@ -89,7 +89,7 @@ const INTEGER_THRESHOLD: f64 = 1e15;
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::json::{json_parse, json_stringify, JsonValue, JsonSpace};
+/// use stator_jse::builtins::json::{json_parse, json_stringify, JsonValue, JsonSpace};
 ///
 /// let v = json_parse(r#"{"x": 1}"#, None).unwrap();
 /// let s = json_stringify(&v, None, None, None).unwrap().unwrap();
@@ -253,7 +253,7 @@ pub enum JsonSpace {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::json::{json_parse, JsonValue};
+/// use stator_jse::builtins::json::{json_parse, JsonValue};
 ///
 /// let v = json_parse("[1, true, null]", None).unwrap();
 /// if let JsonValue::Array(arr) = &v {
@@ -318,7 +318,7 @@ pub fn json_parse(text: &str, reviver: Option<ReviverFn<'_>>) -> StatorResult<Js
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::json::{json_stringify, json_parse, JsonValue, JsonSpace};
+/// use stator_jse::builtins::json::{json_stringify, json_parse, JsonValue, JsonSpace};
 ///
 /// let v = json_parse(r#"{"a":1,"b":[2,3]}"#, None).unwrap();
 /// let s = json_stringify(&v, None, None, None).unwrap().unwrap();

@@ -4,7 +4,7 @@ use std::mem::align_of;
 use std::mem::size_of;
 
 use libfuzzer_sys::fuzz_target;
-use stator_js::gc::heap::{Heap, HeapObject};
+use stator_jse::gc::heap::{Heap, HeapObject};
 
 fuzz_target!(|data: &[u8]| {
     // Each pair of bytes encodes one allocation request:

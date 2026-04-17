@@ -68,7 +68,7 @@ pub const GLOBAL_INFINITY: f64 = f64::INFINITY;
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::global::global_is_nan;
+/// use stator_jse::builtins::global::global_is_nan;
 ///
 /// assert!(global_is_nan(f64::NAN));
 /// assert!(!global_is_nan(1.0));
@@ -94,7 +94,7 @@ pub fn global_is_nan(value: f64) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::global::global_is_finite;
+/// use stator_jse::builtins::global::global_is_finite;
 ///
 /// assert!(global_is_finite(42.0));
 /// assert!(!global_is_finite(f64::INFINITY));
@@ -121,7 +121,7 @@ pub fn global_is_finite(value: f64) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::global::global_parse_int;
+/// use stator_jse::builtins::global::global_parse_int;
 ///
 /// assert_eq!(global_parse_int("42", 10), 42.0);
 /// assert_eq!(global_parse_int("0xff", 0), 255.0);
@@ -146,7 +146,7 @@ pub fn global_parse_int(string: &str, radix: i32) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::global::global_parse_float;
+/// use stator_jse::builtins::global::global_parse_float;
 ///
 /// assert_eq!(global_parse_float("3.14"), 3.14);
 /// assert_eq!(global_parse_float("  -2.5  "), -2.5);
@@ -176,7 +176,7 @@ pub fn global_parse_float(string: &str) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::global::global_encode_uri;
+/// use stator_jse::builtins::global::global_encode_uri;
 ///
 /// assert_eq!(global_encode_uri("https://example.com/path?q=hello world"),
 ///            "https://example.com/path?q=hello%20world");
@@ -199,7 +199,7 @@ pub fn global_encode_uri(uri: &str) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::global::global_decode_uri;
+/// use stator_jse::builtins::global::global_decode_uri;
 ///
 /// assert_eq!(global_decode_uri("hello%20world").unwrap(), "hello world");
 /// assert_eq!(global_decode_uri("http://a/b#c").unwrap(), "http://a/b#c");
@@ -219,7 +219,7 @@ pub fn global_decode_uri(encoded_uri: &str) -> StatorResult<String> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::global::global_encode_uri_component;
+/// use stator_jse::builtins::global::global_encode_uri_component;
 ///
 /// assert_eq!(global_encode_uri_component("hello world"), "hello%20world");
 /// assert_eq!(global_encode_uri_component("a=1&b=2"), "a%3D1%26b%3D2");
@@ -240,7 +240,7 @@ pub fn global_encode_uri_component(component: &str) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::global::global_decode_uri_component;
+/// use stator_jse::builtins::global::global_decode_uri_component;
 ///
 /// assert_eq!(global_decode_uri_component("hello%20world").unwrap(), "hello world");
 /// assert_eq!(global_decode_uri_component("a%3D1%26b%3D2").unwrap(), "a=1&b=2");
@@ -262,7 +262,7 @@ pub fn global_decode_uri_component(encoded_component: &str) -> StatorResult<Stri
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::global::global_escape;
+/// use stator_jse::builtins::global::global_escape;
 ///
 /// assert_eq!(global_escape("abc"), "abc");
 /// assert_eq!(global_escape("hello world"), "hello%20world");
@@ -299,7 +299,7 @@ pub fn global_escape(s: &str) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::global::global_unescape;
+/// use stator_jse::builtins::global::global_unescape;
 ///
 /// assert_eq!(global_unescape("hello%20world"), "hello world");
 /// assert_eq!(global_unescape("%A9"), "©");
@@ -383,8 +383,8 @@ type DirectEvalCapture = (JsValue, Rc<RefCell<GlobalEnv>>, bool);
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::global::global_eval;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::global::global_eval;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let result = global_eval("1 + 2").unwrap();
 /// assert_eq!(result, JsValue::Smi(3));
@@ -406,9 +406,9 @@ pub fn global_eval(source: &str) -> StatorResult<JsValue> {
 /// ```
 /// use std::cell::RefCell;
 /// use std::rc::Rc;
-/// use stator_js::builtins::global::global_eval_direct;
-/// use stator_js::interpreter::GlobalEnv;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::global::global_eval_direct;
+/// use stator_jse::interpreter::GlobalEnv;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let env = Rc::new(RefCell::new(GlobalEnv::new()));
 /// let result = global_eval_direct("1 + 2", Rc::clone(&env)).unwrap();
@@ -429,8 +429,8 @@ pub fn global_eval_direct(
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::global::global_eval_indirect;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::global::global_eval_indirect;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let result = global_eval_indirect("1 + 2").unwrap();
 /// assert_eq!(result, JsValue::Smi(3));
@@ -447,9 +447,9 @@ pub fn global_eval_indirect(source: &str) -> StatorResult<JsValue> {
 /// ```
 /// use std::cell::RefCell;
 /// use std::rc::Rc;
-/// use stator_js::builtins::global::global_eval_strict;
-/// use stator_js::interpreter::GlobalEnv;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::global::global_eval_strict;
+/// use stator_jse::interpreter::GlobalEnv;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let env = Rc::new(RefCell::new(GlobalEnv::new()));
 /// let result = global_eval_strict("var x = 42; x", Rc::clone(&env)).unwrap();

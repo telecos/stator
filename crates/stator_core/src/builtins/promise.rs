@@ -133,7 +133,7 @@ pub fn clear_active_microtask_queue() {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::promise::MicrotaskQueue;
+/// use stator_jse::builtins::promise::MicrotaskQueue;
 ///
 /// let queue = MicrotaskQueue::new();
 /// let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::<i32>::new()));
@@ -237,10 +237,10 @@ pub enum PromiseState {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::promise::{
+/// use stator_jse::builtins::promise::{
 ///     MicrotaskQueue, promise_resolve, promise_then,
 /// };
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let queue = MicrotaskQueue::new();
 /// let p = promise_resolve(JsValue::Smi(42), &queue);
@@ -543,8 +543,8 @@ fn rejection_reason_from_error(error: &StatorError) -> JsValue {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::promise::{MicrotaskQueue, promise_new};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::promise::{MicrotaskQueue, promise_new};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let queue = MicrotaskQueue::new();
 /// let p = promise_new(|resolve, _reject| resolve(JsValue::Smi(1)), &queue);
@@ -590,8 +590,8 @@ where
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::promise::{MicrotaskQueue, promise_resolve};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::promise::{MicrotaskQueue, promise_resolve};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let queue = MicrotaskQueue::new();
 /// let p = promise_resolve(JsValue::Smi(42), &queue);
@@ -614,8 +614,8 @@ pub fn promise_resolve(value: JsValue, queue: &MicrotaskQueue) -> JsPromise {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::promise::{MicrotaskQueue, promise_reject};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::promise::{MicrotaskQueue, promise_reject};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let queue = MicrotaskQueue::new();
 /// let p = promise_reject(JsValue::String("oops".to_string().into()), &queue);
@@ -653,8 +653,8 @@ pub(crate) fn promise_pending() -> JsPromise {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::promise::{MicrotaskQueue, promise_resolve, promise_then};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::promise::{MicrotaskQueue, promise_resolve, promise_then};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let queue = MicrotaskQueue::new();
 /// let p = promise_resolve(JsValue::Smi(5), &queue);
@@ -728,8 +728,8 @@ pub(crate) fn promise_then_with_result(
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::promise::{MicrotaskQueue, promise_reject, promise_catch};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::promise::{MicrotaskQueue, promise_reject, promise_catch};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let queue = MicrotaskQueue::new();
 /// let p = promise_reject(JsValue::String("err".to_string().into()), &queue);
@@ -768,8 +768,8 @@ pub(crate) fn promise_catch_with_result(
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::promise::{MicrotaskQueue, promise_resolve, promise_finally};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::promise::{MicrotaskQueue, promise_resolve, promise_finally};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let queue = MicrotaskQueue::new();
 /// let ran = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -881,8 +881,8 @@ fn settle_promise_finally(
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::promise::{MicrotaskQueue, promise_resolve, promise_all};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::promise::{MicrotaskQueue, promise_resolve, promise_all};
+/// use stator_jse::objects::value::JsValue;
 /// use std::rc::Rc;
 ///
 /// let queue = MicrotaskQueue::new();
@@ -1168,8 +1168,8 @@ pub struct PromiseWithResolvers {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::promise::{MicrotaskQueue, promise_with_resolvers};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::promise::{MicrotaskQueue, promise_with_resolvers};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let queue = MicrotaskQueue::new();
 /// let wr = promise_with_resolvers(&queue);
@@ -1203,10 +1203,10 @@ pub fn promise_with_resolvers(queue: &MicrotaskQueue) -> PromiseWithResolvers {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::promise::{
+/// use stator_jse::builtins::promise::{
 ///     MicrotaskQueue, UnhandledRejectionTracker, promise_reject, promise_catch,
 /// };
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let queue = MicrotaskQueue::new();
 /// let mut tracker = UnhandledRejectionTracker::new();

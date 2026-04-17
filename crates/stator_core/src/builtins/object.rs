@@ -41,7 +41,7 @@ fn is_internal_accessor_key(key: &str) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::object::object_create;
+/// use stator_jse::builtins::object::object_create;
 ///
 /// let child = object_create(None);
 /// assert!(child.prototype().is_none());
@@ -631,8 +631,8 @@ pub fn object_get_own_property_descriptor_as_object(obj: &JsObject, key: &str) -
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::object::object_group_by;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::object::object_group_by;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let items = vec![JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3), JsValue::Smi(4)];
 /// let groups = object_group_by(&items, |v, _idx| {

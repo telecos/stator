@@ -46,8 +46,8 @@ pub const SYMBOL_ASYNC_ITERATOR: u64 = 2;
 /// # Example
 ///
 /// ```
-/// use stator_js::builtins::iterator::{make_array_iterator, iterator_next};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::iterator::{make_array_iterator, iterator_next};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let iter = make_array_iterator(vec![JsValue::Smi(1), JsValue::Smi(2)]);
 /// let r = iterator_next(&iter).unwrap();
@@ -90,8 +90,8 @@ impl IteratorRecord {
 /// # Example
 ///
 /// ```
-/// use stator_js::builtins::iterator::{make_array_iterator, iterator_next};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::iterator::{make_array_iterator, iterator_next};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let iter = make_array_iterator(vec![JsValue::Smi(10), JsValue::Smi(20)]);
 /// assert_eq!(iterator_next(&iter).unwrap().value, JsValue::Smi(10));
@@ -109,8 +109,8 @@ pub fn make_array_iterator(items: Vec<JsValue>) -> JsValue {
 /// # Example
 ///
 /// ```
-/// use stator_js::builtins::iterator::{make_string_iterator, iterator_next};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::iterator::{make_string_iterator, iterator_next};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let iter = make_string_iterator("hi");
 /// assert_eq!(
@@ -131,8 +131,8 @@ pub fn make_string_iterator(s: &str) -> JsValue {
 ///
 /// ```
 /// use std::rc::Rc;
-/// use stator_js::builtins::iterator::{make_map_iterator, iterator_next};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::iterator::{make_map_iterator, iterator_next};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let entries = vec![
 ///     (JsValue::String("a".into()), JsValue::Smi(1)),
@@ -159,8 +159,8 @@ pub fn make_map_iterator(entries: Vec<(JsValue, JsValue)>) -> JsValue {
 /// # Example
 ///
 /// ```
-/// use stator_js::builtins::iterator::{make_set_iterator, iterator_next};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::iterator::{make_set_iterator, iterator_next};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let iter = make_set_iterator(vec![JsValue::Smi(3), JsValue::Smi(7)]);
 /// assert_eq!(iterator_next(&iter).unwrap().value, JsValue::Smi(3));

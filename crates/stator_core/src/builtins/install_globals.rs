@@ -9,8 +9,8 @@
 //!
 //! ```rust,ignore
 //! use std::collections::HashMap;
-//! use stator_js::builtins::install_globals::install_globals;
-//! use stator_js::objects::value::JsValue;
+//! use stator_jse::builtins::install_globals::install_globals;
+//! use stator_jse::objects::value::JsValue;
 //!
 //! let mut globals = HashMap::new();
 //! install_globals(&mut globals);

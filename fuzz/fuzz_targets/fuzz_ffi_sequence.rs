@@ -15,7 +15,7 @@
 use std::ffi::{CStr, CString};
 
 use libfuzzer_sys::fuzz_target;
-use stator_js_ffi::{
+use stator_jse_ffi::{
     StatorContext, StatorIsolate, StatorObject, StatorScript, StatorValue,
     stator_context_destroy, stator_context_enter, stator_context_exit, stator_context_new,
     stator_gc_collect,
@@ -60,7 +60,7 @@ struct State {
     objects: Vec<*mut StatorObject>,
     scripts: Vec<*mut StatorScript>,
     /// Currently open handle scope, or null.
-    handle_scope: *mut stator_js_ffi::StatorHandleScope,
+    handle_scope: *mut stator_jse_ffi::StatorHandleScope,
 }
 
 impl State {

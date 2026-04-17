@@ -9,7 +9,7 @@
 //! # Example
 //!
 //! ```
-//! use stator_js::inspector::console::{push_console_message, drain_messages, ConsoleMessage, MessageLevel};
+//! use stator_jse::inspector::console::{push_console_message, drain_messages, ConsoleMessage, MessageLevel};
 //!
 //! push_console_message(ConsoleMessage {
 //!     level: MessageLevel::Log,

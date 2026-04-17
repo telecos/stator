@@ -14,17 +14,17 @@ use std::rc::Rc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use stator_js::bytecode::bytecode_generator::BytecodeGenerator;
-use stator_js::compiler::baseline::compiler::{
+use stator_jse::bytecode::bytecode_generator::BytecodeGenerator;
+use stator_jse::compiler::baseline::compiler::{
     STUB_DEOPT_SLOTS, STUB_NAMES, first_deopt_counts, reset_first_deopt_counts,
     reset_stub_deopt_counts, stub_deopt_counts,
 };
-use stator_js::interpreter::{
+use stator_jse::interpreter::{
     GlobalEnv, Interpreter, InterpreterFrame, dispatch_entry_diagnostics,
     globals_promotion_diagnostics, jit_entry_diagnostics, licm_diagnostics,
     maglev_deopt_categories, maglev_diagnostics,
 };
-use stator_js::parser::recursive_descent;
+use stator_jse::parser::recursive_descent;
 
 /// Install a SIGSEGV handler that prints diagnostic info before aborting.
 #[cfg(unix)]
@@ -97,7 +97,7 @@ fn ci_config() -> Criterion {
 /// Create a shared [`GlobalEnv`] with builtins pre-installed.
 fn make_global_env() -> Rc<RefCell<GlobalEnv>> {
     let mut env = GlobalEnv::new();
-    stator_js::builtins::install_globals::install_globals(&mut env.vars);
+    stator_jse::builtins::install_globals::install_globals(&mut env.vars);
     env.rebuild_slots();
     env.globals_installed = true;
     Rc::new(RefCell::new(env))
@@ -106,7 +106,7 @@ fn make_global_env() -> Rc<RefCell<GlobalEnv>> {
 /// Print deopt state after reset — helps diagnose why Maglev may be blocked.
 fn print_deopt_state(
     name: &str,
-    ba: &std::rc::Rc<stator_js::bytecode::bytecode_array::BytecodeArray>,
+    ba: &std::rc::Rc<stator_jse::bytecode::bytecode_array::BytecodeArray>,
 ) {
     eprintln!(
         "DEOPT_STATE[{name}]: has_deopted={} count={} next_try={} inv={} cache_populated={}",
@@ -124,7 +124,7 @@ fn print_deopt_state(
 /// the first JIT execution (cold JIT ICs) and exponential backoff blocks
 /// it permanently during Criterion measurement.
 fn warmup_with_maglev(
-    ba: &Rc<stator_js::bytecode::bytecode_array::BytecodeArray>,
+    ba: &Rc<stator_jse::bytecode::bytecode_array::BytecodeArray>,
     env: &Rc<RefCell<GlobalEnv>>,
     name: &str,
 ) {

@@ -292,8 +292,8 @@ fn make_instance_object(module: &WasmModule, engine: &WasmEngine) -> StatorResul
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::wasm::wasm_validate;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::wasm::wasm_validate;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// // Minimal Wasm binary (magic + version).
 /// let bytes: Vec<JsValue> = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]
@@ -326,8 +326,8 @@ pub fn wasm_validate(args: Vec<JsValue>) -> StatorResult<JsValue> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::wasm::wasm_compile;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::wasm::wasm_compile;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let wat = JsValue::String(r#"(module)"#.to_string().into());
 /// let module = wasm_compile(vec![wat]).unwrap();
@@ -407,8 +407,8 @@ pub fn wasm_instantiate(args: Vec<JsValue>) -> StatorResult<JsValue> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::wasm::wasm_module_ctor;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::wasm::wasm_module_ctor;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let wat = JsValue::String("(module)".to_string().into());
 /// let m = wasm_module_ctor(vec![wat]).unwrap();
@@ -463,11 +463,11 @@ pub fn wasm_instance_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::objects::property_map::PropertyMap;
+/// use stator_jse::objects::property_map::PropertyMap;
 /// use std::cell::RefCell;
 /// use std::rc::Rc;
-/// use stator_js::builtins::wasm::wasm_memory_ctor;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::wasm::wasm_memory_ctor;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let desc: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
 /// desc.borrow_mut().insert("initial".to_string(), JsValue::Smi(1));
@@ -699,11 +699,11 @@ pub fn wasm_table_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::objects::property_map::PropertyMap;
+/// use stator_jse::objects::property_map::PropertyMap;
 /// use std::cell::RefCell;
 /// use std::rc::Rc;
-/// use stator_js::builtins::wasm::wasm_global_ctor;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::wasm::wasm_global_ctor;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let desc: Rc<RefCell<PropertyMap>> = Rc::new(RefCell::new(PropertyMap::new()));
 /// desc.borrow_mut().insert("value".to_string(), JsValue::String("i32".to_string().into()));
@@ -780,8 +780,8 @@ pub fn wasm_global_ctor(args: Vec<JsValue>) -> StatorResult<JsValue> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::wasm::make_webassembly_object;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::wasm::make_webassembly_object;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let wasm_obj = make_webassembly_object();
 /// assert!(matches!(wasm_obj, JsValue::PlainObject(_)));

@@ -1,8 +1,8 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use stator_js::bytecode::bytecode_generator::BytecodeGenerator;
-use stator_js::bytecode::bytecodes::encode;
+use stator_jse::bytecode::bytecode_generator::BytecodeGenerator;
+use stator_jse::bytecode::bytecodes::encode;
 use stator_fuzz::program_from_bytes;
 
 fuzz_target!(|data: &[u8]| {

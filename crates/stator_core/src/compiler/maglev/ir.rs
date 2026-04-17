@@ -15,7 +15,7 @@
 //! # Example
 //!
 //! ```
-//! use stator_js::compiler::maglev::ir::{
+//! use stator_jse::compiler::maglev::ir::{
 //!     BasicBlock, ControlNode, MaglevGraph, ValueNode,
 //! };
 //!
@@ -1858,7 +1858,7 @@ impl BasicBlock {
 /// # Example
 ///
 /// ```
-/// use stator_js::compiler::maglev::ir::{
+/// use stator_jse::compiler::maglev::ir::{
 ///     BasicBlock, ControlNode, MaglevGraph, ValueNode,
 /// };
 ///

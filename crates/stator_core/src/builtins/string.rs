@@ -195,7 +195,7 @@ const UTF16_LOW_SURROGATE_END: u16 = 0xDFFF;
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_from_char_code;
+/// use stator_jse::builtins::string::string_from_char_code;
 ///
 /// assert_eq!(string_from_char_code(&[72, 101, 108, 108, 111]), "Hello");
 /// // Values outside 0..=0xFFFF are masked to their lower 16 bits.
@@ -221,7 +221,7 @@ pub fn string_from_char_code(codes: &[u32]) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_from_code_point;
+/// use stator_jse::builtins::string::string_from_code_point;
 ///
 /// assert_eq!(string_from_code_point(&[0x1F600]).unwrap(), "😀");
 /// assert!(string_from_code_point(&[0x110000]).is_err());
@@ -246,7 +246,7 @@ pub fn string_from_code_point(code_points: &[u32]) -> StatorResult<String> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_char_at;
+/// use stator_jse::builtins::string::string_char_at;
 ///
 /// assert_eq!(string_char_at("Hello", 1), "e");
 /// assert_eq!(string_char_at("Hello", 10), "");
@@ -273,7 +273,7 @@ pub fn string_char_at(s: &str, pos: i64) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_char_code_at;
+/// use stator_jse::builtins::string::string_char_code_at;
 ///
 /// assert_eq!(string_char_code_at("ABC", 0), 65.0);
 /// assert!(string_char_code_at("ABC", 5).is_nan());
@@ -303,7 +303,7 @@ pub fn string_char_code_at(s: &str, pos: i64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_code_point_at;
+/// use stator_jse::builtins::string::string_code_point_at;
 ///
 /// assert_eq!(string_code_point_at("😀", 0), Some(0x1F600));
 /// assert_eq!(string_code_point_at("A", 0), Some(65));
@@ -342,7 +342,7 @@ pub fn string_code_point_at(s: &str, pos: i64) -> Option<u32> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_concat;
+/// use stator_jse::builtins::string::string_concat;
 ///
 /// assert_eq!(string_concat("Hello", &[", ", "world", "!"]), "Hello, world!");
 /// assert_eq!(string_concat("a", &[]), "a");
@@ -369,7 +369,7 @@ pub fn string_concat(s: &str, others: &[&str]) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_slice;
+/// use stator_jse::builtins::string::string_slice;
 ///
 /// assert_eq!(string_slice("Hello", 1, Some(4)), "ell");
 /// assert_eq!(string_slice("Hello", -3, None), "llo");
@@ -400,7 +400,7 @@ pub fn string_slice(s: &str, start: i64, end: Option<i64>) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_substring;
+/// use stator_jse::builtins::string::string_substring;
 ///
 /// assert_eq!(string_substring("Hello", 1, Some(3)), "el");
 /// assert_eq!(string_substring("Hello", 3, Some(1)), "el"); // swapped
@@ -429,7 +429,7 @@ pub fn string_substring(s: &str, start: i64, end: Option<i64>) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_index_of;
+/// use stator_jse::builtins::string::string_index_of;
 ///
 /// assert_eq!(string_index_of("hello world", "world", None), 6);
 /// assert_eq!(string_index_of("hello world", "xyz", None), -1);
@@ -467,7 +467,7 @@ pub fn string_index_of(s: &str, search: &str, from_index: Option<i64>) -> i64 {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_last_index_of;
+/// use stator_jse::builtins::string::string_last_index_of;
 ///
 /// assert_eq!(string_last_index_of("hello world hello", "hello", None), 12);
 /// assert_eq!(string_last_index_of("hello", "xyz", None), -1);
@@ -510,7 +510,7 @@ pub fn string_last_index_of(s: &str, search: &str, from_index: Option<i64>) -> i
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_includes;
+/// use stator_jse::builtins::string::string_includes;
 ///
 /// assert!(string_includes("hello world", "world", None));
 /// assert!(!string_includes("hello world", "xyz", None));
@@ -531,7 +531,7 @@ pub fn string_includes(s: &str, search: &str, from_index: Option<i64>) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_starts_with;
+/// use stator_jse::builtins::string::string_starts_with;
 ///
 /// assert!(string_starts_with("Hello", "Hel", None));
 /// assert!(!string_starts_with("Hello", "ello", None));
@@ -558,7 +558,7 @@ pub fn string_starts_with(s: &str, search: &str, position: Option<i64>) -> bool 
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_ends_with;
+/// use stator_jse::builtins::string::string_ends_with;
 ///
 /// assert!(string_ends_with("Hello", "llo", None));
 /// assert!(!string_ends_with("Hello", "Hel", None));
@@ -588,7 +588,7 @@ pub fn string_ends_with(s: &str, search: &str, end_position: Option<i64>) -> boo
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_to_upper_case;
+/// use stator_jse::builtins::string::string_to_upper_case;
 ///
 /// assert_eq!(string_to_upper_case("hello"), "HELLO");
 /// assert_eq!(string_to_upper_case("café"), "CAFÉ");
@@ -605,7 +605,7 @@ pub fn string_to_upper_case(s: &str) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_to_lower_case;
+/// use stator_jse::builtins::string::string_to_lower_case;
 ///
 /// assert_eq!(string_to_lower_case("HELLO"), "hello");
 /// assert_eq!(string_to_lower_case("CAFÉ"), "café");
@@ -624,7 +624,7 @@ pub fn string_to_lower_case(s: &str) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_trim;
+/// use stator_jse::builtins::string::string_trim;
 ///
 /// assert_eq!(string_trim("  hello  "), "hello");
 /// assert_eq!(string_trim("\t\nhello\r\n"), "hello");
@@ -642,7 +642,7 @@ pub fn string_trim(s: &str) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_trim_start;
+/// use stator_jse::builtins::string::string_trim_start;
 ///
 /// assert_eq!(string_trim_start("  hello  "), "hello  ");
 /// ```
@@ -657,7 +657,7 @@ pub fn string_trim_start(s: &str) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_trim_end;
+/// use stator_jse::builtins::string::string_trim_end;
 ///
 /// assert_eq!(string_trim_end("  hello  "), "  hello");
 /// ```
@@ -680,7 +680,7 @@ pub fn string_trim_end(s: &str) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_split;
+/// use stator_jse::builtins::string::string_split;
 ///
 /// assert_eq!(string_split("a,b,c", Some(","), None), vec!["a", "b", "c"]);
 /// assert_eq!(string_split("abc", Some(""), None), vec!["a", "b", "c"]);
@@ -718,7 +718,7 @@ pub fn string_split(s: &str, separator: Option<&str>, limit: Option<u32>) -> Vec
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_replace;
+/// use stator_jse::builtins::string::string_replace;
 ///
 /// assert_eq!(string_replace("aabbcc", "bb", "XX"), "aaXXcc");
 /// assert_eq!(string_replace("hello", "x", "y"), "hello");
@@ -750,7 +750,7 @@ pub fn string_replace(s: &str, search: &str, replacement: &str) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_replace_all;
+/// use stator_jse::builtins::string::string_replace_all;
 ///
 /// assert_eq!(string_replace_all("aabbaa", "aa", "X"), "XbbX");
 /// assert_eq!(string_replace_all("hello", "x", "y"), "hello");
@@ -801,7 +801,7 @@ pub fn string_replace_all(s: &str, search: &str, replacement: &str) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_replace_all_checked;
+/// use stator_jse::builtins::string::string_replace_all_checked;
 ///
 /// // String pattern — no flag check needed.
 /// assert_eq!(
@@ -843,7 +843,7 @@ pub fn string_replace_all_checked(
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_replace_all_functional;
+/// use stator_jse::builtins::string::string_replace_all_functional;
 ///
 /// let result = string_replace_all_functional("aXbXc", "X", |matched, pos, _whole| {
 ///     format!("[{matched}@{pos}]")
@@ -906,7 +906,7 @@ where
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_match;
+/// use stator_jse::builtins::string::string_match;
 ///
 /// let m = string_match("hello world", r"(\w+)\s(\w+)").unwrap();
 /// assert_eq!(m[0], "hello world");
@@ -939,7 +939,7 @@ pub fn string_match(s: &str, pattern: &str) -> Option<Vec<String>> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_match_all;
+/// use stator_jse::builtins::string::string_match_all;
 ///
 /// let matches = string_match_all("test 1 and 2 and 3", r"\d+").unwrap();
 /// assert_eq!(matches, vec!["1", "2", "3"]);
@@ -968,7 +968,7 @@ pub fn string_match_all(s: &str, pattern: &str) -> Option<Vec<String>> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_repeat;
+/// use stator_jse::builtins::string::string_repeat;
 ///
 /// assert_eq!(string_repeat("ab", 3).unwrap(), "ababab");
 /// assert_eq!(string_repeat("x", 0).unwrap(), "");
@@ -1005,7 +1005,7 @@ pub fn string_repeat(s: &str, count: i64) -> StatorResult<String> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_repeat_f64;
+/// use stator_jse::builtins::string::string_repeat_f64;
 ///
 /// assert_eq!(string_repeat_f64("ab", 3.0).unwrap(), "ababab");
 /// assert_eq!(string_repeat_f64("x", f64::NAN).unwrap(), "");
@@ -1037,7 +1037,7 @@ pub fn string_repeat_f64(s: &str, count: f64) -> StatorResult<String> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_pad_start;
+/// use stator_jse::builtins::string::string_pad_start;
 ///
 /// assert_eq!(string_pad_start("5", 3, None).unwrap(), "  5");
 /// assert_eq!(string_pad_start("5", 3, Some("0")).unwrap(), "005");
@@ -1085,7 +1085,7 @@ pub fn string_pad_start(
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_pad_end;
+/// use stator_jse::builtins::string::string_pad_end;
 ///
 /// assert_eq!(string_pad_end("5", 3, None).unwrap(), "5  ");
 /// assert_eq!(string_pad_end("5", 3, Some("0")).unwrap(), "500");
@@ -1134,7 +1134,7 @@ pub fn string_pad_end(
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_at;
+/// use stator_jse::builtins::string::string_at;
 ///
 /// assert_eq!(string_at("Hello", 0), Some("H".to_string()));
 /// assert_eq!(string_at("Hello", -1), Some("o".to_string()));
@@ -1169,7 +1169,7 @@ pub fn string_at(s: &str, index: i64) -> Option<String> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_normalize;
+/// use stator_jse::builtins::string::string_normalize;
 ///
 /// assert_eq!(string_normalize("hello", None).unwrap(), "hello");
 /// assert_eq!(string_normalize("hello", Some("NFC")).unwrap(), "hello");
@@ -1201,7 +1201,7 @@ pub fn string_normalize(s: &str, form: Option<&str>) -> StatorResult<String> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_iter;
+/// use stator_jse::builtins::string::string_iter;
 ///
 /// assert_eq!(string_iter("abc"), vec!["a", "b", "c"]);
 /// // The emoji is a single element even though it is two UTF-16 code units.
@@ -1224,7 +1224,7 @@ pub fn string_iter(s: &str) -> Vec<String> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_raw;
+/// use stator_jse::builtins::string::string_raw;
 ///
 /// assert_eq!(string_raw(&["hello\\n", "world"], &["!"]), "hello\\n!world");
 /// assert_eq!(string_raw(&["a", "b", "c"], &["1", "2"]), "a1b2c");
@@ -1257,7 +1257,7 @@ pub fn string_raw(raw_strings: &[&str], substitutions: &[&str]) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_raw_checked;
+/// use stator_jse::builtins::string::string_raw_checked;
 ///
 /// assert_eq!(
 ///     string_raw_checked(Some(&["a", "b"][..]), &["1"]).unwrap(),
@@ -1293,7 +1293,7 @@ pub fn string_raw_checked(
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_is_well_formed;
+/// use stator_jse::builtins::string::string_is_well_formed;
 ///
 /// assert!(string_is_well_formed("Hello 😀"));
 /// assert!(string_is_well_formed(""));
@@ -1340,7 +1340,7 @@ pub fn string_is_well_formed(s: &str) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_to_well_formed;
+/// use stator_jse::builtins::string::string_to_well_formed;
 ///
 /// assert_eq!(string_to_well_formed("Hello"), "Hello");
 /// assert_eq!(string_to_well_formed(""), "");
@@ -1387,7 +1387,7 @@ pub fn string_to_well_formed(s: &str) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_search;
+/// use stator_jse::builtins::string::string_search;
 ///
 /// assert_eq!(string_search("hello world", r"\d+"), -1);
 /// assert_eq!(string_search("abc123", r"\d+"), 3);
@@ -1420,7 +1420,7 @@ pub fn string_search(s: &str, pattern: &str) -> i64 {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_substr;
+/// use stator_jse::builtins::string::string_substr;
 ///
 /// assert_eq!(string_substr("hello", 1, Some(3)), "ell");
 /// assert_eq!(string_substr("hello", -3, Some(2)), "ll");
@@ -1548,7 +1548,7 @@ pub fn string_sup(s: &str) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_locale_compare;
+/// use stator_jse::builtins::string::string_locale_compare;
 ///
 /// assert!(string_locale_compare("a", "b") < 0);
 /// assert_eq!(string_locale_compare("abc", "abc"), 0);
@@ -1572,7 +1572,7 @@ pub fn string_locale_compare(s: &str, that: &str) -> i32 {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_to_locale_lower_case;
+/// use stator_jse::builtins::string::string_to_locale_lower_case;
 ///
 /// assert_eq!(string_to_locale_lower_case("HELLO"), "hello");
 /// ```
@@ -1590,7 +1590,7 @@ pub fn string_to_locale_lower_case(s: &str) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::string::string_to_locale_upper_case;
+/// use stator_jse::builtins::string::string_to_locale_upper_case;
 ///
 /// assert_eq!(string_to_locale_upper_case("hello"), "HELLO");
 /// ```

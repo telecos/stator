@@ -52,9 +52,9 @@ use crate::objects::value::JsValue;
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::weak_map::{weak_map_new, weak_map_set, weak_map_has};
-/// use stator_js::objects::heap_object::HeapObject;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::weak_map::{weak_map_new, weak_map_set, weak_map_has};
+/// use stator_jse::objects::heap_object::HeapObject;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut wm = weak_map_new();
 /// let mut obj = HeapObject::new_null();
@@ -77,7 +77,7 @@ pub struct JsWeakMap {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::weak_map::weak_map_new;
+/// use stator_jse::builtins::weak_map::weak_map_new;
 ///
 /// let wm = weak_map_new();
 /// ```
@@ -116,9 +116,9 @@ pub fn weak_map_from_iterable(entries: Vec<(*mut HeapObject, JsValue)>) -> Stato
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::weak_map::{weak_map_new, weak_map_set, weak_map_get};
-/// use stator_js::objects::heap_object::HeapObject;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::weak_map::{weak_map_new, weak_map_set, weak_map_get};
+/// use stator_jse::objects::heap_object::HeapObject;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut wm = weak_map_new();
 /// let mut obj = HeapObject::new_null();
@@ -146,9 +146,9 @@ pub fn weak_map_set(map: &mut JsWeakMap, key: *mut HeapObject, value: JsValue) -
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::weak_map::{weak_map_new, weak_map_get};
-/// use stator_js::objects::heap_object::HeapObject;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::weak_map::{weak_map_new, weak_map_get};
+/// use stator_jse::objects::heap_object::HeapObject;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let wm = weak_map_new();
 /// let mut obj = HeapObject::new_null();
@@ -174,9 +174,9 @@ pub fn weak_map_get(map: &JsWeakMap, key: *mut HeapObject) -> JsValue {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::weak_map::{weak_map_new, weak_map_set, weak_map_has};
-/// use stator_js::objects::heap_object::HeapObject;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::weak_map::{weak_map_new, weak_map_set, weak_map_has};
+/// use stator_jse::objects::heap_object::HeapObject;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut wm = weak_map_new();
 /// let mut obj = HeapObject::new_null();
@@ -202,9 +202,9 @@ pub fn weak_map_has(map: &JsWeakMap, key: *mut HeapObject) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::weak_map::{weak_map_new, weak_map_set, weak_map_delete};
-/// use stator_js::objects::heap_object::HeapObject;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::weak_map::{weak_map_new, weak_map_set, weak_map_delete};
+/// use stator_jse::objects::heap_object::HeapObject;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut wm = weak_map_new();
 /// let mut obj = HeapObject::new_null();
@@ -234,11 +234,11 @@ pub fn weak_map_delete(map: &mut JsWeakMap, key: *mut HeapObject) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::weak_map::{
+/// use stator_jse::builtins::weak_map::{
 ///     weak_map_new, weak_map_set, weak_map_has, weak_map_remove_object,
 /// };
-/// use stator_js::objects::heap_object::HeapObject;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::objects::heap_object::HeapObject;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut wm = weak_map_new();
 /// let mut obj = HeapObject::new_null();

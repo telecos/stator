@@ -18,7 +18,7 @@
 //! # Example
 //!
 //! ```
-//! use stator_js::bytecode::register::{Register, RegisterAllocator};
+//! use stator_jse::bytecode::register::{Register, RegisterAllocator};
 //!
 //! let mut alloc = RegisterAllocator::new(2); // 2 formal parameters
 //!
@@ -82,7 +82,7 @@ impl Register {
     /// # Example
     ///
     /// ```
-    /// use stator_js::bytecode::register::Register;
+    /// use stator_jse::bytecode::register::Register;
     /// assert_eq!(Register::parameter(0), Register(-1));
     /// assert_eq!(Register::parameter(2), Register(-3));
     /// ```
@@ -96,7 +96,7 @@ impl Register {
     /// # Example
     ///
     /// ```
-    /// use stator_js::bytecode::register::Register;
+    /// use stator_jse::bytecode::register::Register;
     /// assert_eq!(Register::local(0), Register(0));
     /// assert_eq!(Register::local(3), Register(3));
     /// ```
@@ -127,7 +127,7 @@ impl Register {
     /// # Example
     ///
     /// ```
-    /// use stator_js::bytecode::register::Register;
+    /// use stator_jse::bytecode::register::Register;
     /// assert_eq!(Register::parameter(1).parameter_index(), Some(1));
     /// assert_eq!(Register::local(0).parameter_index(), None);
     /// ```
@@ -145,7 +145,7 @@ impl Register {
     /// # Example
     ///
     /// ```
-    /// use stator_js::bytecode::register::Register;
+    /// use stator_jse::bytecode::register::Register;
     /// assert_eq!(Register::local(5).local_index(), Some(5));
     /// assert_eq!(Register::parameter(0).local_index(), None);
     /// ```

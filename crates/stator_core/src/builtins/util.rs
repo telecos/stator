@@ -85,7 +85,7 @@ pub(crate) fn checked_f64_to_index(n: f64) -> StatorResult<usize> {
 /// # Examples
 ///
 /// ```
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// // NaN equals itself under SameValueZero.
 /// // (Tested indirectly through Map/Set APIs.)

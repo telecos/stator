@@ -17,14 +17,14 @@
 //! use std::cell::RefCell;
 //! use std::rc::Rc;
 //!
-//! use stator_js::bytecode::bytecode_array::BytecodeArray;
-//! use stator_js::bytecode::bytecodes::{Instruction, Opcode, Operand, encode};
-//! use stator_js::bytecode::feedback::{
+//! use stator_jse::bytecode::bytecode_array::BytecodeArray;
+//! use stator_jse::bytecode::bytecodes::{Instruction, Opcode, Operand, encode};
+//! use stator_jse::bytecode::feedback::{
 //!     FeedbackMetadata, FeedbackSlotKind, FeedbackVector, InlineCacheState,
 //! };
-//! use stator_js::compiler::maglev::deopt::{DeoptInfo, DeoptReason, FrameState, deoptimize};
-//! use stator_js::interpreter::GlobalEnv;
-//! use stator_js::objects::value::JsValue;
+//! use stator_jse::compiler::maglev::deopt::{DeoptInfo, DeoptReason, FrameState, deoptimize};
+//! use stator_jse::interpreter::GlobalEnv;
+//! use stator_jse::objects::value::JsValue;
 //!
 //! // Bytecode: LdaSmi 0, Return  (a trivial function that returns 0).
 //! let instrs = vec![

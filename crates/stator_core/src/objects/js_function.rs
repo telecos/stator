@@ -280,12 +280,12 @@ impl std::fmt::Debug for FunctionKind {
 /// # Example — wrapping a native function
 ///
 /// ```rust
-/// use stator_js::objects::js_function::{
+/// use stator_jse::objects::js_function::{
 ///     JsFunction, LanguageMode, NativeFn, SharedFunctionInfo,
 /// };
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::objects::value::JsValue;
 ///
-/// fn add(args: &[JsValue]) -> stator_js::error::StatorResult<JsValue> {
+/// fn add(args: &[JsValue]) -> stator_jse::error::StatorResult<JsValue> {
 ///     // args[0] is `this`; args[1] and args[2] are the two operands.
 ///     let a = args.get(1).cloned().unwrap_or(JsValue::Smi(0));
 ///     let b = args.get(2).cloned().unwrap_or(JsValue::Smi(0));

@@ -17,7 +17,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use stator_js::sandbox::Sandbox;
+//! use stator_jse::sandbox::Sandbox;
 //!
 //! let sandbox = Sandbox::new(64 * 1024 * 1024).expect("sandbox creation");
 //! let ptr: *const u8 = std::ptr::null();

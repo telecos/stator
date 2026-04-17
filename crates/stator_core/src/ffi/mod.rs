@@ -14,8 +14,8 @@
 //! # Example
 //!
 //! ```
-//! use stator_js::ffi::{V8Number, V8String, V8Object, V8Array, V8Promise, PromiseState};
-//! use stator_js::objects::value::JsValue;
+//! use stator_jse::ffi::{V8Number, V8String, V8Object, V8Array, V8Promise, PromiseState};
+//! use stator_jse::objects::value::JsValue;
 //!
 //! let num = V8Number::new(3.14);
 //! assert_eq!(num.value(), 3.14);
@@ -796,8 +796,8 @@ impl From<V8Function> for JsValue {
 /// # Example
 ///
 /// ```
-/// use stator_js::ffi::V8TryCatch;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::ffi::V8TryCatch;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut tc = V8TryCatch::new();
 /// assert!(!tc.has_caught());
@@ -893,8 +893,8 @@ pub enum PromiseState {
 /// # Example
 ///
 /// ```
-/// use stator_js::ffi::{V8Promise, PromiseState};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::ffi::{V8Promise, PromiseState};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut p = V8Promise::new();
 /// assert_eq!(*p.state(), PromiseState::Pending);
@@ -969,8 +969,8 @@ pub type NamedGetterCb = Box<dyn Fn(&str) -> JsValue>;
 /// # Example
 ///
 /// ```
-/// use stator_js::ffi::V8ObjectTemplate;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::ffi::V8ObjectTemplate;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let mut tmpl = V8ObjectTemplate::new();
 /// tmpl.set("x", JsValue::Smi(10));
@@ -1068,8 +1068,8 @@ impl std::fmt::Debug for V8ObjectTemplate {
 /// # Example
 ///
 /// ```
-/// use stator_js::ffi::V8FunctionTemplate;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::ffi::V8FunctionTemplate;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let tmpl = V8FunctionTemplate::new(|args| {
 ///     let sum: i32 = args.iter().filter_map(|v| match v {

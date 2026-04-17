@@ -26,10 +26,10 @@
 //! # Usage
 //!
 //! ```
-//! use stator_js::compiler::maglev::ir::{
+//! use stator_jse::compiler::maglev::ir::{
 //!     BasicBlock, ControlNode, MaglevGraph, NodeId, ValueNode,
 //! };
-//! use stator_js::compiler::maglev::type_specialization::{
+//! use stator_jse::compiler::maglev::type_specialization::{
 //!     specialize_types, FeedbackMap, SpeculatedType,
 //! };
 //!

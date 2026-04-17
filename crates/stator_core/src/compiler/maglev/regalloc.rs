@@ -33,10 +33,10 @@
 //! # Example
 //!
 //! ```
-//! use stator_js::compiler::maglev::ir::{
+//! use stator_jse::compiler::maglev::ir::{
 //!     BasicBlock, ControlNode, MaglevGraph, ValueNode,
 //! };
-//! use stator_js::compiler::maglev::regalloc::{allocate, Location};
+//! use stator_jse::compiler::maglev::regalloc::{allocate, Location};
 //!
 //! let mut graph = MaglevGraph::new(1);
 //! let mut block = BasicBlock::new(0);

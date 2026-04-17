@@ -37,13 +37,13 @@ use crate::objects::value::JsValue;
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::array::array_is_array;
-/// use stator_js::objects::js_array::JsArray;
+/// use stator_jse::builtins::array::array_is_array;
+/// use stator_jse::objects::js_array::JsArray;
 ///
 /// let arr = JsArray::new();
 /// assert!(array_is_array(arr.as_object()));
 ///
-/// use stator_js::objects::js_object::JsObject;
+/// use stator_jse::objects::js_object::JsObject;
 /// let obj = JsObject::new();
 /// assert!(!array_is_array(&obj));
 /// ```
@@ -61,8 +61,8 @@ pub fn array_is_array(obj: &JsObject) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::array::array_from;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::array::array_from;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let arr = array_from([JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)]);
 /// assert_eq!(arr.length(), 3);
@@ -86,8 +86,8 @@ pub fn array_from(items: impl IntoIterator<Item = JsValue>) -> JsArray {
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::array::array_from_with_map_fn;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::array::array_from_with_map_fn;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let arr = array_from_with_map_fn(
 ///     [JsValue::Smi(1), JsValue::Smi(2), JsValue::Smi(3)],
@@ -124,9 +124,9 @@ pub fn array_from_with_map_fn(
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::array::array_from_async;
-/// use stator_js::builtins::promise::{MicrotaskQueue, PromiseState};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::array::array_from_async;
+/// use stator_jse::builtins::promise::{MicrotaskQueue, PromiseState};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let queue = MicrotaskQueue::new();
 /// let p = array_from_async(
@@ -163,8 +163,8 @@ pub fn array_from_async(
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::array::array_of;
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::array::array_of;
+/// use stator_jse::objects::value::JsValue;
 ///
 /// let arr = array_of(&[JsValue::Smi(7), JsValue::Boolean(true)]);
 /// assert_eq!(arr.length(), 2);
@@ -689,8 +689,8 @@ pub fn array_sort(
 /// # Examples
 ///
 /// ```
-/// use stator_js::builtins::array::{array_flat, array_of};
-/// use stator_js::objects::value::JsValue;
+/// use stator_jse::builtins::array::{array_flat, array_of};
+/// use stator_jse::objects::value::JsValue;
 ///
 /// // Build outer = [1, [2, 3], 4].  The inner array is kept as a pre-built
 /// // JsArray; the expand callback recognises it by a sentinel string value.

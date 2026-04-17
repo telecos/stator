@@ -3,7 +3,7 @@
 use std::ptr::NonNull;
 
 use libfuzzer_sys::fuzz_target;
-use stator_js::gc::handle::HandleScope;
+use stator_jse::gc::handle::HandleScope;
 
 fuzz_target!(|data: &[u8]| {
     // Interpret the fuzz bytes as a sequence of operations on HandleScopes:

@@ -55,13 +55,13 @@
 //! # Example
 //!
 //! ```
-//! use stator_js::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
-//! use stator_js::bytecode::bytecodes::{encode, Instruction, Opcode, Operand};
-//! use stator_js::bytecode::feedback::{
+//! use stator_jse::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
+//! use stator_jse::bytecode::bytecodes::{encode, Instruction, Opcode, Operand};
+//! use stator_jse::bytecode::feedback::{
 //!     FeedbackMetadata, FeedbackSlotKind, FeedbackVector, InlineCacheState,
 //! };
-//! use stator_js::compiler::maglev::graph_builder::GraphBuilder;
-//! use stator_js::compiler::maglev::ir::ControlNode;
+//! use stator_jse::compiler::maglev::graph_builder::GraphBuilder;
+//! use stator_jse::compiler::maglev::ir::ControlNode;
 //!
 //! // Build a tiny function: load Smi 1, return.
 //! let instrs = vec![
@@ -3304,6 +3304,97 @@ mod tests {
         }
 
         eprintln!("All allocation checks passed ✓");
+    }
+
+    /// Diagnostic: dump the full optimized graph to detect store-to-load
+    /// forwarding replacing LoadNamedGeneric with UndefinedConstant.
+    #[test]
+    fn test_property_access_no_undefined_constants_in_preheader() {
+        let source = r#"
+            var obj = { a: 1, b: 2, c: 3, d: 4, e: 5 };
+            var sum = 0;
+            for (var i = 0; i < 1000; i++) {
+                sum = sum + obj.a + obj.b + obj.c + obj.d + obj.e;
+            }
+            sum;
+        "#;
+        let graph = compile_and_optimize(source, "undef_check");
+
+        // Dump ALL blocks with node types
+        let mut undef_ids = Vec::new();
+        let mut load_named_ids = Vec::new();
+        for (bi, block) in graph.blocks().iter().enumerate() {
+            eprintln!(
+                "Block {bi}: {} nodes, is_loop_header={}, control={:?}",
+                block.nodes.len(),
+                block.is_loop_header,
+                block.control
+            );
+            for (id, node) in &block.nodes {
+                let desc = match node {
+                    ValueNode::UndefinedConstant => {
+                        undef_ids.push((*id, bi));
+                        "UndefinedConstant".to_string()
+                    }
+                    ValueNode::LoadNamedGeneric { object, name, .. } => {
+                        load_named_ids.push((*id, bi));
+                        format!("LoadNamedGeneric(object={object:?}, name={name})")
+                    }
+                    ValueNode::LoadGlobal { name, .. } => {
+                        format!("LoadGlobal(name={name})")
+                    }
+                    ValueNode::GenericAdd { left, right, .. } => {
+                        format!("GenericAdd(left={left:?}, right={right:?})")
+                    }
+                    ValueNode::Phi { inputs } => {
+                        format!("Phi(inputs={inputs:?})")
+                    }
+                    ValueNode::SmiConstant { value } => {
+                        format!("SmiConstant({value})")
+                    }
+                    ValueNode::GenericIncrement { value, .. } => {
+                        format!("GenericIncrement(value={value:?})")
+                    }
+                    ValueNode::StoreGlobal { name, value, .. } => {
+                        format!("StoreGlobal(name={name}, value={value:?})")
+                    }
+                    other => format!("{other:?}").chars().take(80).collect(),
+                };
+                eprintln!("  {id:?}: {desc}");
+            }
+        }
+
+        eprintln!("\nUndefinedConstant nodes: {undef_ids:?}");
+        eprintln!("LoadNamedGeneric nodes: {load_named_ids:?}");
+
+        // The preheader should contain LoadNamedGeneric, NOT UndefinedConstant
+        // replacing forwarded loads.
+        assert!(
+            !load_named_ids.is_empty(),
+            "No LoadNamedGeneric nodes found — store-to-load forwarding may have \
+             replaced all of them with UndefinedConstant"
+        );
+
+        // Check that GenericAdd nodes in the loop body reference
+        // LoadNamedGeneric nodes (not UndefinedConstant nodes).
+        let undef_node_ids: std::collections::HashSet<_> =
+            undef_ids.iter().map(|(id, _)| *id).collect();
+        for block in graph.blocks() {
+            for (id, node) in &block.nodes {
+                if let ValueNode::GenericAdd { left, right, .. } = node {
+                    assert!(
+                        !undef_node_ids.contains(left),
+                        "GenericAdd {id:?} left input {left:?} references an UndefinedConstant!"
+                    );
+                    assert!(
+                        !undef_node_ids.contains(right),
+                        "GenericAdd {id:?} right input {right:?} references an UndefinedConstant!"
+                    );
+                }
+            }
+        }
+
+        eprintln!("No UndefinedConstant references from GenericAdd ✓");
     }
 
     #[test]

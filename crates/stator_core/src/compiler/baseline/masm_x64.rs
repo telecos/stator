@@ -19,7 +19,7 @@
 //! # Example
 //!
 //! ```
-//! use stator_js::compiler::baseline::masm_x64::{MacroAssembler, Reg64, Label};
+//! use stator_jse::compiler::baseline::masm_x64::{MacroAssembler, Reg64, Label};
 //!
 //! // Emit: fn identity(x: i64) -> i64 { x }
 //! // (SysV AMD64: first arg in RDI, return value in RAX)
@@ -218,7 +218,7 @@ impl fmt::Display for Reg64 {
 /// # Example — forward jump
 ///
 /// ```
-/// use stator_js::compiler::baseline::masm_x64::{MacroAssembler, Reg64, Label};
+/// use stator_jse::compiler::baseline::masm_x64::{MacroAssembler, Reg64, Label};
 ///
 /// let mut masm = MacroAssembler::new();
 /// let mut done = Label::new();
@@ -233,7 +233,7 @@ impl fmt::Display for Reg64 {
 /// # Example — backward jump (loop)
 ///
 /// ```
-/// use stator_js::compiler::baseline::masm_x64::{MacroAssembler, Reg64, Label};
+/// use stator_jse::compiler::baseline::masm_x64::{MacroAssembler, Reg64, Label};
 ///
 /// let mut masm = MacroAssembler::new();
 /// let mut loop_top = Label::new();
@@ -284,7 +284,7 @@ impl Label {
 /// # Usage
 ///
 /// ```
-/// use stator_js::compiler::baseline::masm_x64::{MacroAssembler, Reg64, Label};
+/// use stator_jse::compiler::baseline::masm_x64::{MacroAssembler, Reg64, Label};
 ///
 /// // Emit: fn add(a: i64, b: i64) -> i64 { a + b }
 /// // (SysV AMD64: a in RDI, b in RSI, result in RAX)
