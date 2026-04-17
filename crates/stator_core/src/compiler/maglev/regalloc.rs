@@ -114,10 +114,10 @@ impl AllocationResult {
 /// `start` is the program point at which the value is *defined*; `end` is one
 /// past the last program point at which the value is *used* as an input.
 #[derive(Debug, Clone, Copy)]
-struct LiveInterval {
-    id: NodeId,
-    start: u32,
-    end: u32,
+pub(crate) struct LiveInterval {
+    pub(crate) id: NodeId,
+    pub(crate) start: u32,
+    pub(crate) end: u32,
     /// For loop-header Phi values whose intervals were extended to cover
     /// the full loop body: the end point *before* the extension.
     /// The coalescing pass uses this to allow Phi/back-edge-input
@@ -130,7 +130,7 @@ struct LiveInterval {
 /// Program points are assigned by visiting blocks in index order; within each
 /// block value nodes are visited in their stored order and the control node
 /// occupies the next program point after the last value node.
-fn compute_live_intervals(graph: &MaglevGraph) -> Vec<LiveInterval> {
+pub(crate) fn compute_live_intervals(graph: &MaglevGraph) -> Vec<LiveInterval> {
     // Pass 1: assign a definition program point to every node.
     let mut def_point: HashMap<NodeId, u32> = HashMap::new();
     let mut pp: u32 = 0;

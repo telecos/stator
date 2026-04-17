@@ -3165,6 +3165,147 @@ mod tests {
         );
     }
 
+    /// Verify that every hoisted LoadNamedGeneric node and the LoadGlobal
+    /// it depends on get valid register/stack-slot allocations (never None).
+    /// Also check for register conflicts among overlapping live intervals.
+    /// A None allocation would cause `emit_load` to produce JIT_UNDEFINED,
+    /// which breaks downstream GenericAdd Smi checks and forces the slow
+    /// runtime path every iteration.
+    #[test]
+    fn test_property_access_regalloc_allocations_valid() {
+        use crate::compiler::maglev::regalloc::{Location, allocate};
+
+        let source = r#"
+            var obj = { a: 1, b: 2, c: 3, d: 4, e: 5 };
+            var sum = 0;
+            for (var i = 0; i < 1000; i++) {
+                sum = sum + obj.a + obj.b + obj.c + obj.d + obj.e;
+            }
+            sum;
+        "#;
+        let graph = compile_and_optimize(source, "regalloc_check");
+
+        // With named property sites, R15 is reserved → 8 registers.
+        let num_regs = 8u32;
+        let alloc = allocate(&graph, num_regs);
+
+        // Collect all LoadNamedGeneric and LoadGlobal nodes.
+        let mut load_globals = Vec::new();
+        let mut load_named_generics = Vec::new();
+        let mut generic_adds = Vec::new();
+        let mut phis = Vec::new();
+        for block in graph.blocks() {
+            for (id, node) in &block.nodes {
+                match node {
+                    ValueNode::LoadGlobal { .. } => load_globals.push(*id),
+                    ValueNode::LoadNamedGeneric { .. } => load_named_generics.push(*id),
+                    ValueNode::GenericAdd { .. } => generic_adds.push(*id),
+                    ValueNode::Phi { .. } => phis.push(*id),
+                    _ => {}
+                }
+            }
+        }
+
+        eprintln!("LoadGlobal nodes: {load_globals:?}");
+        eprintln!("LoadNamedGeneric nodes: {load_named_generics:?}");
+        eprintln!("GenericAdd nodes: {generic_adds:?}");
+        eprintln!("Phi nodes: {phis:?}");
+        eprintln!("Spill count: {}", alloc.spill_count());
+
+        // Every LoadGlobal must have a valid allocation.
+        for id in &load_globals {
+            let loc = alloc.location(*id);
+            eprintln!("  LoadGlobal {id:?} → {loc:?}");
+            assert!(
+                matches!(
+                    loc,
+                    Some(Location::Register(_)) | Some(Location::StackSlot(_))
+                ),
+                "LoadGlobal {id:?} has no allocation (None) — emit_load would return JIT_UNDEFINED"
+            );
+        }
+
+        // Every LoadNamedGeneric must have a valid allocation.
+        for id in &load_named_generics {
+            let loc = alloc.location(*id);
+            eprintln!("  LoadNamedGeneric {id:?} → {loc:?}");
+            assert!(
+                matches!(
+                    loc,
+                    Some(Location::Register(_)) | Some(Location::StackSlot(_))
+                ),
+                "LoadNamedGeneric {id:?} has no allocation (None) — emit_load would return JIT_UNDEFINED"
+            );
+        }
+
+        // Every GenericAdd must have a valid allocation.
+        for id in &generic_adds {
+            let loc = alloc.location(*id);
+            eprintln!("  GenericAdd {id:?} → {loc:?}");
+            assert!(
+                matches!(
+                    loc,
+                    Some(Location::Register(_)) | Some(Location::StackSlot(_))
+                ),
+                "GenericAdd {id:?} has no allocation (None)"
+            );
+        }
+
+        // Every Phi must have a valid allocation.
+        for id in &phis {
+            let loc = alloc.location(*id);
+            eprintln!("  Phi {id:?} → {loc:?}");
+            assert!(
+                matches!(
+                    loc,
+                    Some(Location::Register(_)) | Some(Location::StackSlot(_))
+                ),
+                "Phi {id:?} has no allocation (None)"
+            );
+        }
+
+        // Also verify GenericAdd inputs are allocated.
+        for block in graph.blocks() {
+            for (id, node) in &block.nodes {
+                if let ValueNode::GenericAdd { left, right, .. } = node {
+                    let ll = alloc.location(*left);
+                    let rl = alloc.location(*right);
+                    assert!(
+                        ll.is_some(),
+                        "GenericAdd {id:?} left input {left:?} has None allocation"
+                    );
+                    assert!(
+                        rl.is_some(),
+                        "GenericAdd {id:?} right input {right:?} has None allocation"
+                    );
+                }
+            }
+        }
+
+        // No register conflicts among overlapping live intervals.
+        let intervals = crate::compiler::maglev::regalloc::compute_live_intervals(&graph);
+        for i in 0..intervals.len() {
+            for j in (i + 1)..intervals.len() {
+                let a = &intervals[i];
+                let b = &intervals[j];
+                if a.start < b.end && b.start < a.end {
+                    if let (Some(Location::Register(ra)), Some(Location::Register(rb))) =
+                        (alloc.location(a.id), alloc.location(b.id))
+                    {
+                        assert_ne!(
+                            ra, rb,
+                            "REGISTER CONFLICT: {:?} and {:?} both in reg {} \
+                             (intervals [{},{}) and [{},{}))",
+                            a.id, b.id, ra, a.start, a.end, b.start, b.end
+                        );
+                    }
+                }
+            }
+        }
+
+        eprintln!("All allocation checks passed ✓");
+    }
+
     #[test]
     fn test_prototype_chain_benchmark_not_degenerate() {
         let source = r#"

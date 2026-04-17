@@ -2297,12 +2297,37 @@ fn fuse_object_literal_stores_in_block(block: &mut BasicBlock) {
 /// not itself a `StoreNamedGeneric` or `CreateObjectLiteralWithProperties`,
 /// since calls, other stores, etc. may mutate arbitrary object properties.
 fn eliminate_store_to_load(graph: &mut MaglevGraph) {
+    // Collect substitutions from ALL blocks first, then apply globally.
+    // This is critical because LICM may have hoisted LoadNamedGeneric nodes
+    // to a preheader while their consumers remain in the loop body (a
+    // different block).  The old per-block apply missed those cross-block
+    // references, leaving consumers pointing at a dead UndefinedConstant.
+    let mut global_subst: HashMap<NodeId, NodeId> = HashMap::new();
+
     for block in graph.blocks_mut() {
-        eliminate_store_to_load_in_block(block);
+        let subst = compute_store_to_load_subst(block);
+        if !subst.is_empty() {
+            // Replace forwarded loads with dead placeholders in this block.
+            for (id, node) in &mut block.nodes {
+                if subst.contains_key(id) {
+                    *node = ValueNode::UndefinedConstant;
+                }
+            }
+            global_subst.extend(subst);
+        }
+    }
+
+    // Apply substitutions to ALL blocks so cross-block references are updated.
+    if !global_subst.is_empty() {
+        for block in graph.blocks_mut() {
+            apply_subst_to_block(block, &global_subst);
+        }
     }
 }
 
-fn eliminate_store_to_load_in_block(block: &mut BasicBlock) {
+/// Compute store-to-load forwarding substitutions within a single block.
+/// Returns a map from forwarded LoadNamedGeneric NodeId → stored value NodeId.
+fn compute_store_to_load_subst(block: &BasicBlock) -> HashMap<NodeId, NodeId> {
     // Map from (object NodeId, property name index) → most recently stored value NodeId.
     let mut store_map: HashMap<(NodeId, u32), NodeId> = HashMap::new();
     // Substitutions: load NodeId → forwarded value NodeId.
@@ -2346,15 +2371,7 @@ fn eliminate_store_to_load_in_block(block: &mut BasicBlock) {
         }
     }
 
-    if !subst.is_empty() {
-        // Replace forwarded loads with dead placeholders.
-        for (id, node) in &mut block.nodes {
-            if subst.contains_key(id) {
-                *node = ValueNode::UndefinedConstant;
-            }
-        }
-        apply_subst_to_block(block, &subst);
-    }
+    subst
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

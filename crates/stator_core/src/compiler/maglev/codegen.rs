@@ -3055,7 +3055,6 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.mov_load_base_disp32(dst, Reg64::R14, off);
             }
             None => {
-                eprintln!("EMIT_LOAD_NONE: id={} dst={:?}", id.0, dst);
                 self.masm.mov_ri(dst, JIT_UNDEFINED);
             }
         }
@@ -3082,7 +3081,6 @@ impl<'a> MaglevCodegen<'a> {
                 // Node has no allocated location — the register allocator
                 // determined its value is unused (dead).  This is expected
                 // for side-effect-only stub calls.
-                eprintln!("EMIT_STORE_NONE: id={} src={:?}", id.0, src);
             }
         }
     }
@@ -5472,16 +5470,6 @@ impl<'a> MaglevCodegen<'a> {
         name: u32,
         feedback_slot: u32,
     ) {
-        // Compile-time diagnostic: check if object or result have allocations.
-        let obj_loc = self.alloc.location(object);
-        let id_loc = self.alloc.location(id);
-        if obj_loc.is_none() || id_loc.is_none() {
-            eprintln!(
-                "LOAD_NAMED_DIAG: id={} object={} name={} obj_loc={:?} id_loc={:?}",
-                id.0, object.0, name, obj_loc, id_loc
-            );
-        }
-
         let jv_layout = cached_jsvalue_layout();
         let pm_layout = cached_propertymap_layout();
 
