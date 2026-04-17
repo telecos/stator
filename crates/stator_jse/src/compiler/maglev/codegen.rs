@@ -688,18 +688,6 @@ struct MaglevCodegen<'a> {
     /// any operation that may clobber allocatable registers.
     #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
     reg_holds: [Option<NodeId>; NUM_REG_FWD],
-    /// IC guard coalescing: tracks the object whose IC handle + shape were
-    /// last verified in the current block.  Subsequent `LoadNamedGeneric`
-    /// on the same object skip the full IC guard and use the stashed
-    /// values-data pointer cached at [`Self::values_ptr_cache_offset`].
-    /// Cleared at block boundaries and after any side-effecting node.
-    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
-    ic_guarded_object: Option<NodeId>,
-    /// RBP-relative offset of the 8-byte values-pointer cache slot used
-    /// by IC guard coalescing.  Zero when the function has fewer than 2
-    /// named-property access sites (nothing to coalesce).
-    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
-    values_ptr_cache_offset: i32,
 }
 
 /// A deferred cold-path branch emitted out-of-line after all blocks.
@@ -779,13 +767,8 @@ impl<'a> MaglevCodegen<'a> {
         // Named property IC: 32 bytes per site (4 x i64: handle,
         // map_ptr, shape_id, offset).
         let named_ic_bytes: i32 = named_site_count.saturating_mul(32);
-        // IC guard coalescing: when there are ≥2 named-property access
-        // sites, reserve 8 bytes to cache the verified values-data pointer
-        // across consecutive loads on the same object.
-        let values_ptr_cache_bytes: i32 = if named_site_count >= 2 { 8 } else { 0 };
         let total_cache_bytes = {
-            let raw = mono_call_cache_bytes + array_ic_bytes + named_ic_bytes
-                + values_ptr_cache_bytes;
+            let raw = mono_call_cache_bytes + array_ic_bytes + named_ic_bytes;
             if raw == 0 { 0 } else { (raw + 15) & !15 }
         };
         // IC base is addressed relative to RBP.  After 5 callee-saved
@@ -812,13 +795,6 @@ impl<'a> MaglevCodegen<'a> {
         let named_ic_base: i32 = if named_site_count > 0 {
             let array_overhead = if has_keyed_sites { 32 } else { 0 };
             -(40 + total_cache_bytes) + array_overhead
-        } else {
-            0
-        };
-        // Values-pointer cache: 8 bytes placed after all named IC slots.
-        let values_ptr_cache_offset: i32 = if named_site_count >= 2 {
-            let array_overhead = if has_keyed_sites { 32 } else { 0 };
-            -(40 + total_cache_bytes) + array_overhead + named_ic_bytes
         } else {
             0
         };
@@ -854,8 +830,6 @@ impl<'a> MaglevCodegen<'a> {
             ctx_regfile_offset: None,
             rax_holds: None,
             reg_holds: [None; NUM_REG_FWD],
-            ic_guarded_object: None,
-            values_ptr_cache_offset,
         }
     }
 
@@ -2083,7 +2057,6 @@ impl<'a> MaglevCodegen<'a> {
                 value,
                 feedback_slot: _,
             } => {
-                self.ic_guarded_object = None;
                 self.emit_stub_call_3arg(
                     id,
                     *object,
@@ -2103,7 +2076,6 @@ impl<'a> MaglevCodegen<'a> {
             ValueNode::StoreKeyedGeneric {
                 object, key, value, ..
             } => {
-                self.ic_guarded_object = None;
                 self.emit_inline_store_keyed_smi(id, *object, *key, *value);
             }
 
@@ -3081,7 +3053,6 @@ impl<'a> MaglevCodegen<'a> {
     fn clear_reg_forwarding(&mut self) {
         self.rax_holds = None;
         self.reg_holds = [None; NUM_REG_FWD];
-        self.ic_guarded_object = None;
     }
 
     /// Record that physical register `reg` now holds the value of `id`.
@@ -4143,32 +4114,6 @@ impl<'a> MaglevCodegen<'a> {
         // overflow (i32 + i32 fits in i64) — emit bare ADD with no
         // Smi checks, overflow guard, or slow path.
         if self.i32_range.contains(&left) && self.i32_range.contains(&right) {
-            // ADD is commutative — check both sides for a constant.
-            let const_pair = self
-                .try_get_i32_constant(right)
-                .map(|imm| (left, imm))
-                .or_else(|| self.try_get_i32_constant(left).map(|imm| (right, imm)));
-
-            if let Some((var, imm)) = const_pair {
-                // Constant-immediate path: ADD-imm avoids a MOV to
-                // load the constant into a register.
-                match self.alloc.location(id) {
-                    Some(Location::Register(n)) => {
-                        let dst = phys_reg(n);
-                        self.emit_load(var, dst);
-                        self.masm.add_ri(dst, imm);
-                        self.note_reg_holds(dst, id);
-                    }
-                    _ => {
-                        self.emit_load(var, Reg64::Rax);
-                        self.masm.add_ri(Reg64::Rax, imm);
-                        self.emit_store(id, Reg64::Rax);
-                        self.rax_holds = Some(id);
-                    }
-                }
-                return;
-            }
-
             match self.alloc.location(id) {
                 Some(Location::Register(n)) => {
                     let dst = phys_reg(n);
@@ -4427,27 +4372,6 @@ impl<'a> MaglevCodegen<'a> {
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_generic_sub(&mut self, id: NodeId, left: NodeId, right: NodeId) {
         if self.i32_range.contains(&left) && self.i32_range.contains(&right) {
-            // Constant-immediate path: SUB-imm avoids a MOV to load
-            // the constant into a register.  SUB is not commutative, so
-            // only the right operand can be an immediate.
-            if let Some(imm) = self.try_get_i32_constant(right) {
-                match self.alloc.location(id) {
-                    Some(Location::Register(n)) => {
-                        let dst = phys_reg(n);
-                        self.emit_load(left, dst);
-                        self.masm.sub_ri(dst, imm);
-                        self.note_reg_holds(dst, id);
-                    }
-                    _ => {
-                        self.emit_load(left, Reg64::Rax);
-                        self.masm.sub_ri(Reg64::Rax, imm);
-                        self.emit_store(id, Reg64::Rax);
-                        self.rax_holds = Some(id);
-                    }
-                }
-                return;
-            }
-
             match self.alloc.location(id) {
                 Some(Location::Register(n)) => {
                     let dst = phys_reg(n);
@@ -4489,35 +4413,6 @@ impl<'a> MaglevCodegen<'a> {
             let narrow = self.narrow_int32.contains(&id);
 
             'smi_body: {
-                // Constant-immediate path for smi_guarded SUB.
-                if let Some(imm) = self.try_get_i32_constant(right) {
-                    match self.alloc.location(id) {
-                        Some(Location::Register(n)) => {
-                            let dst = phys_reg(n);
-                            self.emit_load(left, dst);
-                            self.masm.sub32_ri(dst, imm);
-                            if !narrow {
-                                self.masm
-                                    .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
-                                self.masm.movsxd_sign_extend(dst, dst);
-                            }
-                            self.note_reg_holds(dst, id);
-                        }
-                        _ => {
-                            self.emit_load(left, Reg64::Rax);
-                            self.masm.sub32_ri(Reg64::Rax, imm);
-                            if !narrow {
-                                self.masm
-                                    .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
-                                self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
-                            }
-                            self.emit_store(id, Reg64::Rax);
-                            self.rax_holds = Some(id);
-                        }
-                    }
-                    break 'smi_body;
-                }
-
                 match self.alloc.location(id) {
                     Some(Location::Register(n)) => {
                         let dst = phys_reg(n);
@@ -4561,6 +4456,7 @@ impl<'a> MaglevCodegen<'a> {
                         }
                         self.emit_store(id, Reg64::Rax);
                         self.rax_holds = Some(id);
+                        break 'smi_body;
                     }
                 }
             }
@@ -5203,42 +5099,23 @@ impl<'a> MaglevCodegen<'a> {
             let is_zero = |n: NodeId| self.try_get_i32_constant(n) == Some(0);
             if is_zero(right) {
                 if self.alloc.location(id) != self.alloc.location(left) {
-                    // Load directly into destination to avoid an extra MOV
-                    // through a temporary register.
-                    match self.alloc.location(id) {
-                        Some(Location::Register(n)) => {
-                            let dst = phys_reg(n);
-                            self.emit_load(left, dst);
-                            self.note_reg_holds(dst, id);
-                        }
-                        _ => {
-                            self.emit_load(left, Reg64::R11);
-                            self.emit_store(id, Reg64::R11);
-                            if matches!(self.alloc.location(id), Some(Location::Register(n)) if phys_reg(n) == Reg64::Rax)
-                            {
-                                self.rax_holds = Some(id);
-                            }
-                        }
+                    self.emit_load(left, Reg64::R11);
+                    self.emit_store(id, Reg64::R11);
+                    // emit_store may have moved R11 into RAX.
+                    if matches!(self.alloc.location(id), Some(Location::Register(n)) if phys_reg(n) == Reg64::Rax)
+                    {
+                        self.rax_holds = Some(id);
                     }
                 }
                 return;
             }
             if is_zero(left) {
                 if self.alloc.location(id) != self.alloc.location(right) {
-                    match self.alloc.location(id) {
-                        Some(Location::Register(n)) => {
-                            let dst = phys_reg(n);
-                            self.emit_load(right, dst);
-                            self.note_reg_holds(dst, id);
-                        }
-                        _ => {
-                            self.emit_load(right, Reg64::R11);
-                            self.emit_store(id, Reg64::R11);
-                            if matches!(self.alloc.location(id), Some(Location::Register(n)) if phys_reg(n) == Reg64::Rax)
-                            {
-                                self.rax_holds = Some(id);
-                            }
-                        }
+                    self.emit_load(right, Reg64::R11);
+                    self.emit_store(id, Reg64::R11);
+                    if matches!(self.alloc.location(id), Some(Location::Register(n)) if phys_reg(n) == Reg64::Rax)
+                    {
+                        self.rax_holds = Some(id);
                     }
                 }
                 return;
@@ -5803,65 +5680,42 @@ impl<'a> MaglevCodegen<'a> {
         self.next_named_ic_site += 1;
         let ic_base = self.named_ic_base + site * 32;
         let ic_off_handle = ic_base; // +0
-        let _ic_off_map_ptr = ic_base + 8; // +8
-        let _ic_off_shape = ic_base + 16; // +16
+        let ic_off_map_ptr = ic_base + 8; // +8
+        let ic_off_shape = ic_base + 16; // +16
         let ic_off_offset = ic_base + 24; // +24
-
-        // IC guard coalescing: if we already verified this object's handle
-        // + shape in the current block (no intervening side effects), skip
-        // the full IC guard and use the stashed values-data pointer.
-        let coalesced = self.ic_guarded_object == Some(object)
-            && self.values_ptr_cache_offset != 0;
 
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
+        let mut load_smi = Label::new();
+        let mut load_bool = Label::new();
+        let mut load_undef = Label::new();
 
         // ── Fast path (scratch regs only: R11, R10, RAX) ────────────
 
-        if coalesced {
-            // Abbreviated path: only verify this site's IC handle matches
-            // (ensures the IC slot was filled for this property).
-            self.emit_load(object, Reg64::R11);
-            self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, ic_off_handle);
-            self.masm.jne(&mut slow_label);
+        // Load receiver into scratch register.
+        self.emit_load(object, Reg64::R11);
 
-            // Load stashed values-data pointer (verified by first access).
-            self.masm.mov_load_base_disp32(
-                Reg64::R11,
-                Reg64::Rbp,
-                self.values_ptr_cache_offset,
-            );
-        } else {
-            // Full IC check: handle + shape.
-            self.emit_load(object, Reg64::R11);
-            self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, ic_off_handle);
-            self.masm.jne(&mut slow_label);
+        // IC handle check: same object?
+        self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, ic_off_handle);
+        self.masm.jne(&mut slow_label);
 
-            self.masm
-                .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, _ic_off_map_ptr);
-            self.masm
-                .mov_load_base_disp32(Reg64::Rax, Reg64::R10, pm_layout.shape_id_offset as i32);
-            self.masm.cmp_rm(Reg64::Rax, Reg64::Rbp, _ic_off_shape);
-            self.masm.jne(&mut slow_label);
+        // Load cached PropertyMap pointer.
+        self.masm
+            .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, ic_off_map_ptr);
+        // Read LIVE shape_id from PropertyMap.
+        self.masm
+            .mov_load_base_disp32(Reg64::Rax, Reg64::R10, pm_layout.shape_id_offset as i32);
+        // Compare with cached shape_id.
+        self.masm.cmp_rm(Reg64::Rax, Reg64::Rbp, ic_off_shape);
+        self.masm.jne(&mut slow_label);
 
-            // Shape matches → re-derive LIVE values data pointer.
-            self.masm.mov_load_base_disp32(
-                Reg64::R11,
-                Reg64::R10,
-                pm_layout.values_data_ptr_offset as i32,
-            );
-
-            // Stash the verified values-data pointer for subsequent
-            // coalesced loads on the same object.
-            if self.values_ptr_cache_offset != 0 {
-                self.masm.mov_store_base_disp32(
-                    Reg64::Rbp,
-                    self.values_ptr_cache_offset,
-                    Reg64::R11,
-                );
-                self.ic_guarded_object = Some(object);
-            }
-        }
+        // Shape matches → property at same offset.
+        // Re-derive LIVE values data pointer from PropertyMap.
+        self.masm.mov_load_base_disp32(
+            Reg64::R11,
+            Reg64::R10,
+            pm_layout.values_data_ptr_offset as i32,
+        );
         // R11 = values data pointer (current, not stale).
 
         // Load cached field offset.
@@ -5882,87 +5736,59 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.emit_byte(0x03); // shift count = 3
         self.masm.add_rr(Reg64::R11, Reg64::R10);
 
-        // Smi-specialised discriminant check: when the downstream IR
-        // already speculates this load returns a Smi (smi_guarded), emit
-        // only the Smi branch and deopt on anything else.  This avoids
-        // the bool/undef/heap dispatch and the separate post-load Smi
-        // guard (saves ~4 hot-path instructions).
-        let smi_only = self.smi_guarded.contains(&id) && !self.i32_range.contains(&id);
+        // Load discriminant byte.
+        self.masm
+            .movzx_byte_base_disp32(Reg64::Rax, Reg64::R11, jv_layout.disc_offset as i32);
 
-        if smi_only {
-            // Load discriminant byte.
-            self.masm
-                .movzx_byte_base_disp32(Reg64::Rax, Reg64::R11, jv_layout.disc_offset as i32);
-            self.masm.cmp_ri(Reg64::Rax, jv_layout.smi_disc as i32);
-            self.masm.jne(&mut self.deopt_label);
-            // Sign-extend i32 payload → RAX.
-            self.masm
-                .movsxd_base_disp32(Reg64::Rax, Reg64::R11, jv_layout.smi_payload_offset as i32);
-        } else {
-            let mut load_smi = Label::new();
-            let mut load_bool = Label::new();
-            let mut load_undef = Label::new();
-
-            // Load discriminant byte.
-            self.masm
-                .movzx_byte_base_disp32(Reg64::Rax, Reg64::R11, jv_layout.disc_offset as i32);
-
-            // Dispatch on type.
-            self.masm.cmp_ri(Reg64::Rax, jv_layout.smi_disc as i32);
-            self.masm.je(&mut load_smi);
-            self.masm.cmp_ri(Reg64::Rax, jv_layout.bool_disc as i32);
-            self.masm.je(&mut load_bool);
-            self.masm.cmp_ri(Reg64::Rax, jv_layout.undef_disc as i32);
-            self.masm.je(&mut load_undef);
-            // Other types (String, Object, …): R11 still holds the element
-            // address.  Allocate a heap handle via a lightweight runtime
-            // call (just clone + push to heap, no property lookup needed).
-            {
-                let saved = self.emit_save_live_regs(id);
-                // RDI = element address (R11 is caller-saved, so move it)
-                self.masm.mov_rr(Reg64::Rdi, Reg64::R11);
-                let alloc_addr =
-                    jit_runtime::jit_runtime_alloc_handle_for_jsvalue as *const () as usize;
-                self.masm.mov_ri(Reg64::R11, alloc_addr as i64);
-                self.masm.call_reg(Reg64::R11);
-                self.emit_restore_live_regs(saved);
-                // alloc_heap_handle always succeeds — no deopt check needed.
-                self.masm.jmp(&mut done_label);
-            }
-
-            // ── load_smi: sign-extend i32 payload ───────────────────────
-            self.masm.bind_label(&mut load_smi);
-            self.masm
-                .movsxd_base_disp32(Reg64::Rax, Reg64::R11, jv_layout.smi_payload_offset as i32);
-            self.masm.jmp(&mut done_label);
-
-            // ── load_bool: encode as JIT_FALSE/JIT_TRUE ─────────────────
-            self.masm.bind_label(&mut load_bool);
-            self.masm.movzx_byte_base_disp32(
-                Reg64::Rax,
-                Reg64::R11,
-                jv_layout.bool_payload_offset as i32,
-            );
-            self.masm.and_ri(Reg64::Rax, 1);
-            self.masm.mov_ri(Reg64::R11, JIT_FALSE);
-            self.masm.add_rr(Reg64::Rax, Reg64::R11);
-            self.masm.jmp(&mut done_label);
-
-            // ── load_undef: → JIT_UNDEFINED ─────────────────────────────
-            self.masm.bind_label(&mut load_undef);
-            self.masm.mov_ri(Reg64::Rax, JIT_UNDEFINED);
-            self.rax_holds = None; // RAX no longer holds a forwarded value
+        // Dispatch on type.
+        self.masm.cmp_ri(Reg64::Rax, jv_layout.smi_disc as i32);
+        self.masm.je(&mut load_smi);
+        self.masm.cmp_ri(Reg64::Rax, jv_layout.bool_disc as i32);
+        self.masm.je(&mut load_bool);
+        self.masm.cmp_ri(Reg64::Rax, jv_layout.undef_disc as i32);
+        self.masm.je(&mut load_undef);
+        // Other types (String, Object, …): R11 still holds the element
+        // address.  Allocate a heap handle via a lightweight runtime
+        // call (just clone + push to heap, no property lookup needed).
+        {
+            let saved = self.emit_save_live_regs(id);
+            // RDI = element address (R11 is caller-saved, so move it)
+            self.masm.mov_rr(Reg64::Rdi, Reg64::R11);
+            let alloc_addr =
+                jit_runtime::jit_runtime_alloc_handle_for_jsvalue as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, alloc_addr as i64);
+            self.masm.call_reg(Reg64::R11);
+            self.emit_restore_live_regs(saved);
+            // alloc_heap_handle always succeeds — no deopt check needed.
             self.masm.jmp(&mut done_label);
         }
+
+        // ── load_smi: sign-extend i32 payload ───────────────────────
+        self.masm.bind_label(&mut load_smi);
+        self.masm
+            .movsxd_base_disp32(Reg64::Rax, Reg64::R11, jv_layout.smi_payload_offset as i32);
+        self.masm.jmp(&mut done_label);
+
+        // ── load_bool: encode as JIT_FALSE/JIT_TRUE ─────────────────
+        self.masm.bind_label(&mut load_bool);
+        self.masm.movzx_byte_base_disp32(
+            Reg64::Rax,
+            Reg64::R11,
+            jv_layout.bool_payload_offset as i32,
+        );
+        self.masm.and_ri(Reg64::Rax, 1);
+        self.masm.mov_ri(Reg64::R11, JIT_FALSE);
+        self.masm.add_rr(Reg64::Rax, Reg64::R11);
+        self.masm.jmp(&mut done_label);
+
+        // ── load_undef: → JIT_UNDEFINED ─────────────────────────────
+        self.masm.bind_label(&mut load_undef);
+        self.masm.mov_ri(Reg64::Rax, JIT_UNDEFINED);
+        self.rax_holds = None; // RAX no longer holds a forwarded value
+        self.masm.jmp(&mut done_label);
 
         // ── Slow path: IC miss / non-inlineable type ────────────────
         self.masm.bind_label(&mut slow_label);
-        // If we were on a coalesced path, the guard assumption failed.
-        // Invalidate so subsequent loads on the same object do the full
-        // IC check (conservative recovery).
-        if coalesced {
-            self.ic_guarded_object = None;
-        }
         let saved = self.emit_save_live_regs(id);
 
         // Set up ABI args for jit_runtime_fill_named_ic_r15:
@@ -6015,10 +5841,7 @@ impl<'a> MaglevCodegen<'a> {
         // (booleans, heap handles, undefined) trigger deopt to interpreter.
         // Cost: 3 instructions; saves 6+ instructions per downstream
         // GenericAdd that can now use the bare smi_guarded tier.
-        //
-        // Skip when the smi-only fast path already verified the
-        // discriminant — the post-load guard would be redundant.
-        if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) && !smi_only {
+        if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
             self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
             self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
             self.masm.jne(&mut self.deopt_label);
