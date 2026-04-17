@@ -2298,48 +2298,61 @@ fn fuse_object_literal_stores_in_block(block: &mut BasicBlock) {
 /// not itself a `StoreNamedGeneric` or `CreateObjectLiteralWithProperties`,
 /// since calls, other stores, etc. may mutate arbitrary object properties.
 fn eliminate_store_to_load(graph: &mut MaglevGraph) {
-    // Collect substitutions from ALL blocks first, then apply globally.
-    // This is critical because LICM may have hoisted LoadNamedGeneric nodes
-    // to a preheader while their consumers remain in the loop body (a
-    // different block).  The old per-block apply missed those cross-block
-    // references, leaving consumers pointing at a dead UndefinedConstant.
     let mut global_subst: HashMap<NodeId, NodeId> = HashMap::new();
 
-    for block in graph.blocks_mut() {
-        let subst = compute_store_to_load_subst(block);
-        if !subst.is_empty() {
-            // Replace forwarded loads with dead placeholders in this block.
-            for (id, node) in &mut block.nodes {
-                if subst.contains_key(id) {
-                    *node = ValueNode::UndefinedConstant;
-                }
-            }
-            global_subst.extend(subst);
-        }
+    // Propagate store maps across blocks for cross-block forwarding.
+    // For single-predecessor blocks we inherit the predecessor's final
+    // store map, enabling stores in the entry block to be forwarded to
+    // loads in the loop body/preheader.  For merge points (multiple
+    // predecessors) we conservatively start empty.
+    let mut block_store_maps: HashMap<u32, HashMap<(NodeId, u32), NodeId>> = HashMap::new();
+
+    // Phase 1: compute substitutions (read-only access to blocks).
+    for block in graph.blocks() {
+        let mut store_map: HashMap<(NodeId, u32), NodeId> = if block.predecessors.len() == 1 {
+            block_store_maps
+                .get(&block.predecessors[0])
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
+        let subst = compute_store_to_load_subst_with_map(block, &mut store_map);
+        block_store_maps.insert(block.id, store_map);
+        global_subst.extend(subst);
     }
 
-    // Apply substitutions to ALL blocks so cross-block references are updated.
-    if !global_subst.is_empty() {
-        for block in graph.blocks_mut() {
-            apply_subst_to_block(block, &global_subst);
+    if global_subst.is_empty() {
+        return;
+    }
+
+    // Phase 2: replace forwarded loads with dead placeholders and apply
+    // substitutions to ALL blocks so cross-block references are updated.
+    for block in graph.blocks_mut() {
+        for (id, node) in &mut block.nodes {
+            if global_subst.contains_key(id) {
+                *node = ValueNode::UndefinedConstant;
+            }
         }
+        apply_subst_to_block(block, &global_subst);
     }
 }
 
-/// Compute store-to-load forwarding substitutions within a single block.
-/// Returns a map from forwarded LoadNamedGeneric NodeId → stored value NodeId.
-fn compute_store_to_load_subst(block: &BasicBlock) -> HashMap<NodeId, NodeId> {
-    // Map from (object NodeId, property name index) → most recently stored value NodeId.
-    let mut store_map: HashMap<(NodeId, u32), NodeId> = HashMap::new();
-    // Substitutions: load NodeId → forwarded value NodeId.
+/// Compute store-to-load forwarding substitutions for a block, using the
+/// supplied `store_map` (which may be pre-seeded with entries from dominating
+/// blocks).  The map is updated in place so callers can propagate it to
+/// successor blocks.
+fn compute_store_to_load_subst_with_map(
+    block: &BasicBlock,
+    store_map: &mut HashMap<(NodeId, u32), NodeId>,
+) -> HashMap<NodeId, NodeId> {
     let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
 
     for (id, node) in &block.nodes {
         match node {
             // Seed the map from fused object creation.
             ValueNode::CreateObjectLiteralWithProperties { names, values, .. } => {
-                // The fused node creates the object (its NodeId is the object)
-                // and pre-sets all properties.
                 let obj_id = *id;
                 for (name, value) in names.iter().zip(values.iter()) {
                     store_map.insert((obj_id, *name), *value);
@@ -4430,5 +4443,140 @@ mod tests {
             ),
             "Live allocation should be preserved"
         );
+    }
+
+    #[test]
+    fn test_store_to_load_cross_block_forwarding() {
+        // Store in block 0 (entry), load in block 1 (single predecessor).
+        // Cross-block forwarding should forward the load to the stored value.
+        //
+        //   Block 0:
+        //     obj = Parameter(0)
+        //     val = SmiConstant(42)
+        //     StoreNamedGeneric(obj, "x", val)
+        //     → Jump to block 1
+        //
+        //   Block 1 (predecessors: [0]):
+        //     load = LoadNamedGeneric(obj, "x")
+        //     → Return load
+        //
+        // After forwarding, the return should reference val directly.
+        let mut graph = MaglevGraph::new(0);
+
+        let mut b0 = BasicBlock::new(0);
+        let obj = graph.alloc_node_id();
+        b0.push_with_id(obj, ValueNode::Parameter { index: 0 });
+        let val = graph.alloc_node_id();
+        b0.push_with_id(val, ValueNode::SmiConstant { value: 42 });
+        let store = graph.alloc_node_id();
+        b0.push_with_id(
+            store,
+            ValueNode::StoreNamedGeneric {
+                object: obj,
+                name: 5,
+                value: val,
+                feedback_slot: 0,
+            },
+        );
+        b0.set_control(ControlNode::Jump { target: 1 });
+        graph.add_block(b0);
+
+        let mut b1 = BasicBlock::new(1);
+        b1.predecessors = vec![0];
+        let load = graph.alloc_node_id();
+        b1.push_with_id(
+            load,
+            ValueNode::LoadNamedGeneric {
+                object: obj,
+                name: 5,
+                feedback_slot: 1,
+            },
+        );
+        b1.set_control(ControlNode::Return { value: load });
+        graph.add_block(b1);
+
+        eliminate_store_to_load(&mut graph);
+
+        // The return in block 1 should now reference val directly.
+        match &graph.blocks()[1].control {
+            Some(ControlNode::Return { value }) => {
+                assert_eq!(
+                    *value, val,
+                    "Cross-block load should be forwarded to stored value"
+                );
+            }
+            other => panic!("Expected Return, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_store_to_load_cross_block_merge_conservative() {
+        // Stores in two predecessors should NOT be forwarded at a merge point.
+        //
+        //   Block 0: Store(obj, "x", val_a) → Jump 2
+        //   Block 1: Store(obj, "x", val_b) → Jump 2
+        //   Block 2 (predecessors: [0, 1]): Load(obj, "x") → Return
+        //
+        // At the merge point we cannot know which predecessor ran, so the
+        // load must NOT be forwarded.
+        let mut graph = MaglevGraph::new(0);
+
+        let mut b0 = BasicBlock::new(0);
+        let obj = graph.alloc_node_id();
+        b0.push_with_id(obj, ValueNode::Parameter { index: 0 });
+        let val_a = graph.alloc_node_id();
+        b0.push_with_id(val_a, ValueNode::SmiConstant { value: 1 });
+        let store_a = graph.alloc_node_id();
+        b0.push_with_id(
+            store_a,
+            ValueNode::StoreNamedGeneric {
+                object: obj,
+                name: 5,
+                value: val_a,
+                feedback_slot: 0,
+            },
+        );
+        b0.set_control(ControlNode::Jump { target: 2 });
+        graph.add_block(b0);
+
+        let mut b1 = BasicBlock::new(1);
+        let val_b = graph.alloc_node_id();
+        b1.push_with_id(val_b, ValueNode::SmiConstant { value: 2 });
+        let store_b = graph.alloc_node_id();
+        b1.push_with_id(
+            store_b,
+            ValueNode::StoreNamedGeneric {
+                object: obj,
+                name: 5,
+                value: val_b,
+                feedback_slot: 0,
+            },
+        );
+        b1.set_control(ControlNode::Jump { target: 2 });
+        graph.add_block(b1);
+
+        let mut b2 = BasicBlock::new(2);
+        b2.predecessors = vec![0, 1];
+        let load = graph.alloc_node_id();
+        b2.push_with_id(
+            load,
+            ValueNode::LoadNamedGeneric {
+                object: obj,
+                name: 5,
+                feedback_slot: 1,
+            },
+        );
+        b2.set_control(ControlNode::Return { value: load });
+        graph.add_block(b2);
+
+        eliminate_store_to_load(&mut graph);
+
+        // The return in block 2 should still reference the load (not forwarded).
+        match &graph.blocks()[2].control {
+            Some(ControlNode::Return { value }) => {
+                assert_eq!(*value, load, "Load at merge point should NOT be forwarded");
+            }
+            other => panic!("Expected Return, got {:?}", other),
+        }
     }
 }

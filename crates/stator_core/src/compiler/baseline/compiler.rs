@@ -4710,7 +4710,53 @@ pub(crate) mod jit_runtime {
                                 as *const JitExecutableCode;
                             (exec_raw, maglev_exec.register_file_slots, ba_raw, ctx)
                         } else {
-                            return null_info;
+                            // ── Eager baseline compile for inner closures ──
+                            // Neither baseline nor Maglev cache has code.
+                            // Compile the callee inline so closures run as
+                            // JIT code after the first invocation.
+                            let ba_ref: &BytecodeArray = unsafe { &*ba_raw };
+                            if !ba_ref.jit_baseline_has_deopted() {
+                                if let Ok(cc) = BaselineCompiler::compile(ba_ref) {
+                                    if let Ok(cached) = (unsafe {
+                                        CachedExecutableCode::from_compiled(
+                                            &cc.code,
+                                            cc.register_file_slots,
+                                        )
+                                    }) {
+                                        ba_ref.store_jit_code(cached);
+                                        let jit_ref = ba_ref.try_get_jit_code();
+                                        if let Some(cached) = jit_ref.as_ref() {
+                                            let exec = unsafe {
+                                                JitExecutableCode::new(
+                                                    cached.code_bytes(),
+                                                    cached.register_file_slots,
+                                                )
+                                            };
+                                            *exec_cache.borrow_mut() = exec;
+                                            let cache_ref = unsafe { &*exec_cache.as_ptr() };
+                                            if let Some(exec) = cache_ref
+                                                .as_ref()
+                                                .filter(|e| e.register_file_slots <= 16)
+                                            {
+                                                let exec_raw = exec as *const JitExecutableCode;
+                                                (exec_raw, exec.register_file_slots, ba_raw, ctx)
+                                            } else {
+                                                return null_info;
+                                            }
+                                        } else {
+                                            return null_info;
+                                        }
+                                    } else {
+                                        ba_ref.mark_jit_baseline_deopted();
+                                        return null_info;
+                                    }
+                                } else {
+                                    ba_ref.mark_jit_baseline_deopted();
+                                    return null_info;
+                                }
+                            } else {
+                                return null_info;
+                            }
                         }
                     }
                 }
