@@ -8338,6 +8338,65 @@ impl<'a> MaglevCodegen<'a> {
             }
         }
 
+        // Step 3b: backward propagation from `Int32BitwiseOr(x, 0)`.
+        //
+        // `x | 0` is identity — the result is always a valid i32 and the
+        // upper 32 bits of `x` are irrelevant.  Propagate this backward:
+        // mark Phi nodes on the backward path as narrow-transparent so
+        // their MOVSXD can be elided.  Int32Add/Sub/Mul are already
+        // candidates via `is_wrapping_int32_producer`; we just ensure
+        // transitive Phis (e.g. loop-carried accumulators) are included.
+        let mut backward_worklist: Vec<NodeId> = Vec::new();
+        for block in graph.blocks() {
+            for (_id, node) in &block.nodes {
+                let truncated_input = match node {
+                    ValueNode::Int32BitwiseOr { left, right } => {
+                        let right_is_zero = matches!(
+                            node_lookup.get(right),
+                            Some(ValueNode::Int32Constant { value: 0 })
+                                | Some(ValueNode::SmiConstant { value: 0 })
+                        );
+                        if right_is_zero {
+                            Some(*left)
+                        } else {
+                            let left_is_zero = matches!(
+                                node_lookup.get(left),
+                                Some(ValueNode::Int32Constant { value: 0 })
+                                    | Some(ValueNode::SmiConstant { value: 0 })
+                            );
+                            if left_is_zero { Some(*right) } else { None }
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(inp) = truncated_input {
+                    backward_worklist.push(inp);
+                }
+            }
+        }
+        while let Some(nid) = backward_worklist.pop() {
+            if narrow_transparent.contains(&nid) || !node_lookup.contains_key(&nid) {
+                continue;
+            }
+            match node_lookup.get(&nid) {
+                Some(ValueNode::Phi { inputs }) => {
+                    narrow_transparent.insert(nid);
+                    for inp in inputs {
+                        backward_worklist.push(*inp);
+                    }
+                }
+                Some(
+                    ValueNode::Int32Add { left, right }
+                    | ValueNode::Int32Subtract { left, right }
+                    | ValueNode::Int32Multiply { left, right },
+                ) => {
+                    backward_worklist.push(*left);
+                    backward_worklist.push(*right);
+                }
+                _ => {}
+            }
+        }
+
         // Step 4: build the non-narrow set.  Narrow consumers, i32-range
         // checked ops, and narrow-transparent nodes are skipped — their
         // inputs can have garbage upper bits without affecting correctness.
