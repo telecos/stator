@@ -1418,6 +1418,7 @@ impl<'a> MaglevCodegen<'a> {
                         if !narrow {
                             self.masm.movsxd_sign_extend(dst, dst);
                         }
+                        self.note_reg_holds(dst, id);
                     }
                     _ => {
                         self.emit_load(*value, Reg64::R11);
@@ -1439,6 +1440,7 @@ impl<'a> MaglevCodegen<'a> {
                         if !narrow {
                             self.masm.movsxd_sign_extend(dst, dst);
                         }
+                        self.note_reg_holds(dst, id);
                     }
                     _ => {
                         self.emit_load(*value, Reg64::R11);
@@ -1460,6 +1462,7 @@ impl<'a> MaglevCodegen<'a> {
                         if !narrow {
                             self.masm.movsxd_sign_extend(dst, dst);
                         }
+                        self.note_reg_holds(dst, id);
                     }
                     _ => {
                         self.emit_load(*value, Reg64::R11);
@@ -1498,6 +1501,7 @@ impl<'a> MaglevCodegen<'a> {
                                 self.masm.add_ri(dst, imm);
                             }
                             self.emit_deopt_on_i64_overflow(0);
+                            self.note_reg_holds(dst, id);
                         }
                         _ => {
                             self.emit_load(*left, Reg64::R11);
@@ -1529,6 +1533,7 @@ impl<'a> MaglevCodegen<'a> {
                                 self.masm.sub_ri(dst, imm);
                             }
                             self.emit_deopt_on_i64_overflow(0);
+                            self.note_reg_holds(dst, id);
                         }
                         _ => {
                             self.emit_load(*left, Reg64::R11);
@@ -1591,6 +1596,7 @@ impl<'a> MaglevCodegen<'a> {
                         match self.alloc.location(id) {
                             Some(Location::Register(n)) => {
                                 self.masm.lea_scaled(phys_reg(n), src, src, scale);
+                                self.note_reg_holds(phys_reg(n), id);
                             }
                             _ => {
                                 self.masm.lea_scaled(Reg64::R11, src, src, scale);
@@ -1608,6 +1614,7 @@ impl<'a> MaglevCodegen<'a> {
                                     self.masm.imul_rri(dst, dst, imm);
                                 }
                                 self.emit_deopt_on_i64_overflow(0);
+                                self.note_reg_holds(dst, id);
                             }
                             _ => {
                                 self.emit_load(*left, Reg64::R11);
@@ -1639,6 +1646,7 @@ impl<'a> MaglevCodegen<'a> {
                             self.masm.add_ri(dst, 1);
                         }
                         self.emit_deopt_on_i64_overflow(0);
+                        self.note_reg_holds(dst, id);
                     }
                     _ => {
                         self.emit_load(*value, Reg64::R11);
@@ -1664,6 +1672,7 @@ impl<'a> MaglevCodegen<'a> {
                             self.masm.sub_ri(dst, 1);
                         }
                         self.emit_deopt_on_i64_overflow(0);
+                        self.note_reg_holds(dst, id);
                     }
                     _ => {
                         self.emit_load(*value, Reg64::R11);
@@ -3196,6 +3205,7 @@ impl<'a> MaglevCodegen<'a> {
                         }
                     }
                 }
+                self.note_reg_holds(dst, result);
             }
             _ => {
                 self.emit_load(left, Reg64::R11);
@@ -3223,6 +3233,7 @@ impl<'a> MaglevCodegen<'a> {
                 let dst = phys_reg(n);
                 self.emit_load(src, dst);
                 op(&mut self.masm, dst, imm);
+                self.note_reg_holds(dst, result);
             }
             _ => {
                 self.emit_load(src, Reg64::R11);
@@ -3273,6 +3284,7 @@ impl<'a> MaglevCodegen<'a> {
                 if !narrow {
                     self.masm.movsxd_sign_extend(dst, dst);
                 }
+                self.note_reg_holds(dst, result);
             }
             _ => {
                 self.emit_load(left, Reg64::R11);
@@ -3303,6 +3315,7 @@ impl<'a> MaglevCodegen<'a> {
                 if !narrow {
                     self.masm.movsxd_sign_extend(dst, dst);
                 }
+                self.note_reg_holds(dst, result);
             }
             _ => {
                 self.emit_load(src, Reg64::R11);
@@ -3337,6 +3350,7 @@ impl<'a> MaglevCodegen<'a> {
                     if !narrow {
                         self.masm.movsxd_sign_extend(dst, dst);
                     }
+                    self.note_reg_holds(dst, result);
                 }
                 _ => {
                     self.emit_load(src, Reg64::R11);
@@ -3383,6 +3397,7 @@ impl<'a> MaglevCodegen<'a> {
                 if !narrow {
                     self.masm.movsxd_sign_extend(dst, dst);
                 }
+                self.note_reg_holds(dst, result);
             }
             _ => {
                 self.emit_load(src, Reg64::R11);
@@ -3442,6 +3457,7 @@ impl<'a> MaglevCodegen<'a> {
                 }
                 // JO deopt — 64-bit overflow from the preceding ADD/SUB/IMUL.
                 self.emit_deopt_on_i64_overflow(0);
+                self.note_reg_holds(dst, result);
             }
             _ => {
                 self.emit_load(left, Reg64::R11);
