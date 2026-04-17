@@ -4026,24 +4026,29 @@ impl<'a> MaglevCodegen<'a> {
             match self.alloc.location(id) {
                 Some(Location::Register(n)) => {
                     let dst = phys_reg(n);
-                    let right_in_dst = left != right
-                        && matches!(
+                    if left == right {
+                        // Self-add (x + x): emit ADD dst, dst.
+                        self.emit_load(left, dst);
+                        self.masm.add_rr(dst, dst);
+                    } else {
+                        let right_in_dst = matches!(
                             self.alloc.location(right),
                             Some(Location::Register(rn)) if phys_reg(rn) == dst
                         );
-                    if right_in_dst {
-                        self.emit_load(right, Reg64::R10);
-                        self.emit_load(left, dst);
-                        self.masm.add_rr(dst, Reg64::R10);
-                    } else {
-                        self.emit_load(left, dst);
-                        match self.alloc.location(right) {
-                            Some(Location::Register(rn)) if phys_reg(rn) != dst => {
-                                self.masm.add_rr(dst, phys_reg(rn));
-                            }
-                            _ => {
-                                self.emit_load(right, Reg64::R10);
-                                self.masm.add_rr(dst, Reg64::R10);
+                        if right_in_dst {
+                            self.emit_load(right, Reg64::R10);
+                            self.emit_load(left, dst);
+                            self.masm.add_rr(dst, Reg64::R10);
+                        } else {
+                            self.emit_load(left, dst);
+                            match self.alloc.location(right) {
+                                Some(Location::Register(rn)) if phys_reg(rn) != dst => {
+                                    self.masm.add_rr(dst, phys_reg(rn));
+                                }
+                                _ => {
+                                    self.emit_load(right, Reg64::R10);
+                                    self.masm.add_rr(dst, Reg64::R10);
+                                }
                             }
                         }
                     }
@@ -4051,8 +4056,12 @@ impl<'a> MaglevCodegen<'a> {
                 }
                 _ => {
                     self.emit_load(left, Reg64::Rax);
-                    self.emit_load(right, Reg64::R10);
-                    self.masm.add_rr(Reg64::Rax, Reg64::R10);
+                    if left == right {
+                        self.masm.add_rr(Reg64::Rax, Reg64::Rax);
+                    } else {
+                        self.emit_load(right, Reg64::R10);
+                        self.masm.add_rr(Reg64::Rax, Reg64::R10);
+                    }
                     self.emit_store(id, Reg64::Rax);
                     self.rax_holds = Some(id);
                 }
@@ -5857,20 +5866,7 @@ impl<'a> MaglevCodegen<'a> {
         if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
             self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
             self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
-            // On success, skip the diagnostic trampoline.
-            let mut smi_ok = Label::new();
-            self.masm.je(&mut smi_ok);
-            // ── Diagnostic trampoline: log the failing value before deopt ──
-            // PUSH RAX to align stack (RSP was ≡ 8 mod 16 → 0 mod 16).
-            self.masm.push(Reg64::Rax);
-            self.masm.mov_rr(Reg64::Rdi, Reg64::Rax); // arg1 = value
-            self.masm.mov_ri(Reg64::Rsi, id.0 as i64); // arg2 = node_id
-            let diag_addr = jit_runtime::jit_smi_guard_fail_log as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, diag_addr as i64);
-            self.masm.call_reg(Reg64::R11);
-            self.masm.pop(Reg64::Rax);
-            self.masm.jmp(&mut self.deopt_label);
-            self.masm.bind_label(&mut smi_ok);
+            self.masm.jne(&mut self.deopt_label);
         }
         self.emit_store(id, Reg64::Rax);
     }
@@ -8066,6 +8062,33 @@ impl<'a> MaglevCodegen<'a> {
     /// inputs can skip both input Smi checks (6 instructions) and emit a
     /// bare ADD + single result guard (7 instructions total, down from 13).
     fn compute_smi_guarded(graph: &MaglevGraph, i32_range: &HashSet<NodeId>) -> HashSet<NodeId> {
+        // DISABLED: speculative smi_guarded derivation beyond i32_range.
+        //
+        // The analysis below adds Phi nodes, GenericAdd/Sub/Mul with
+        // half-known inputs, and propagates through arithmetic chains.
+        // On Linux x86_64 CI this causes the sieve benchmark to hang:
+        // the speculative Smi guard (MOVSXD+CMP+JNE deopt) fires
+        // spuriously when a value that is statically i32-range at
+        // compile time turns out to hold a non-Smi encoding at runtime
+        // (e.g. JIT_TRUE=0x1_0000_0001 routed through a Phi whose
+        // other arm is Smi).  The resulting deopt cascade permanently
+        // blacklists the JIT code, forcing every subsequent call into
+        // the interpreter — slow enough to exceed the benchmark timeout.
+        //
+        // With this disabled, GenericAdd/Sub/Mul fall back to the
+        // generic inline tier (~13 insns with per-input Smi checks)
+        // instead of the smi_guarded tier (~7 insns).  The ~6 extra
+        // instructions per arithmetic op are a small price compared to
+        // permanent JIT blacklisting on deopt.
+        //
+        // Everything provably i32 (SmiConstant, Int32* ops, bitwise
+        // ops) remains in the set — those never need a runtime guard.
+        //
+        // TODO: re-enable once the underlying runtime value mismatch
+        //       is root-caused on Linux x86_64 (use jit_smi_guard_fail_log).
+        #[allow(clippy::overly_complex_bool_expr)]
+        if false {
+            let _ = {
         // Start as a clone of i32_range (everything provably i32 is
         // trivially smi-guarded).
         let mut set: HashSet<NodeId> = i32_range.clone();
@@ -8099,17 +8122,6 @@ impl<'a> MaglevCodegen<'a> {
             }
         }
 
-        // Seed LoadNamedGeneric and LoadGlobal into smi_guarded when they
-        // feed exclusively into arithmetic-compatible consumers.
-        //
-        // At codegen time, each seeded node gets a Smi deopt guard
-        // (MOVSXD + CMP + JNE deopt) that safely bails to the interpreter
-        // if the runtime value is not a Smi.  The payoff is that downstream
-        // GenericAdd/Sub/Mul can use the smi_guarded tier (~7 insns) instead
-        // of the generic tier (~13 insns with dual input Smi checks).
-        //
-        // LoadNamedGeneric / LoadGlobal smi_guard seeding.
-        //
         // Seed LoadNamedGeneric and LoadGlobal into smi_guarded when they
         // feed exclusively into arithmetic-compatible consumers.  At codegen
         // time, each seeded node gets a Smi deopt guard (MOVSXD + CMP + JNE
@@ -8320,6 +8332,10 @@ impl<'a> MaglevCodegen<'a> {
         }
 
         set
+            }; // end disabled smi_guarded analysis
+        }
+
+        i32_range.clone()
     }
 
     /// Returns `true` if a consumer node is arithmetic-compatible for the
