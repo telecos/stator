@@ -7548,7 +7548,21 @@ pub(crate) mod jit_runtime {
     ///
     /// Uses distinctive sentinel values to locate each field by scanning
     /// the raw bytes of a stack-allocated PropertyMap.
+    ///
+    /// **Important:** creates a throwaway `PropertyMap` first to advance
+    /// the thread-local shape counter.  Without this, `shape_id` and
+    /// `values.len()` can have identical byte patterns (both equal the
+    /// number of inserts) — causing the scan to pick the wrong offset
+    /// and panicking on the Maglev compilation thread.
     pub fn probe_propertymap_layout() -> PropertyMapLayout {
+        // Burn one shape_id so the counter is non-zero when the probe
+        // map is constructed.  This breaks the lock-step between
+        // shape_id (= S0 + num_inserts) and values.len (= num_inserts)
+        // that occurs when S0 = 0 on a fresh thread.
+        {
+            let _burn = PropertyMap::with_capacity(0);
+        }
+
         // Create a PropertyMap with a distinctive shape_id.
         let mut map = PropertyMap::with_capacity(4);
         // Insert properties so the values Vec has a non-null data ptr.
@@ -7566,18 +7580,42 @@ pub(crate) mod jit_runtime {
         let map_size = std::mem::size_of::<PropertyMap>();
 
         // ── Find shape_id offset ──
+        // Collect ALL candidate offsets that match the current shape_id
+        // byte pattern — even with the burn above, small counter values
+        // could still alias with other fields on some platforms.
         let shape_bytes = shape.to_ne_bytes();
-        let mut shape_id_offset = None;
+        let mut shape_candidates: Vec<usize> = Vec::new();
         for i in 0..=(map_size.saturating_sub(8)) {
             // SAFETY: reading bytes of a stack-allocated PropertyMap.
             let matches = (0..8).all(|j| unsafe { *map_ptr.add(i + j) } == shape_bytes[j]);
             if matches {
-                shape_id_offset = Some(i);
-                break;
+                shape_candidates.push(i);
             }
         }
-        let shape_id_offset = shape_id_offset
-            .expect("PropertyMap: cannot find shape_id field in byte representation");
+        assert!(
+            !shape_candidates.is_empty(),
+            "PropertyMap: cannot find shape_id field in byte representation"
+        );
+
+        // If there's only one candidate, use it directly.  Otherwise,
+        // insert another property and use the mutation to disambiguate.
+        let shape_id_offset = if shape_candidates.len() == 1 {
+            shape_candidates[0]
+        } else {
+            map.insert("__probe_c__".to_string(), JsValue::Smi(0));
+            let new_shape = map.shape_id();
+            shape_candidates
+                .iter()
+                .copied()
+                .find(|&offset| {
+                    let probed = unsafe { *(map_ptr.add(offset) as *const u64) };
+                    probed == new_shape
+                })
+                .expect(
+                    "PropertyMap: shape_id offset ambiguous — none of the \
+                     candidate offsets track shape_id after mutation",
+                )
+        };
 
         // ── Find values Vec data-pointer offset ──
         let ptr_bytes = data_ptr.to_ne_bytes();
@@ -7593,12 +7631,11 @@ pub(crate) mod jit_runtime {
         let values_data_ptr_offset = values_data_ptr_offset
             .expect("PropertyMap: cannot find values Vec data pointer in byte representation");
 
-        // Cross-check: insert another property and verify shape_id changed.
-        map.insert("__probe_c__".to_string(), JsValue::Smi(0));
-        let new_shape = map.shape_id();
-        let probed_shape = unsafe { *(map_ptr.add(shape_id_offset) as *const u64) };
+        // Final cross-check: verify shape_id reads correctly.
+        let final_probed = unsafe { *(map_ptr.add(shape_id_offset) as *const u64) };
         assert_eq!(
-            probed_shape, new_shape,
+            final_probed,
+            map.shape_id(),
             "PropertyMap: shape_id field not at expected offset"
         );
 
@@ -7771,11 +7808,15 @@ pub(crate) mod jit_runtime {
     /// Diagnostic: called from JIT when smi_guard fails at done_label.
     ///
     /// Prints the failing value and node ID so CI logs reveal the root cause.
+    /// The value is the raw i64 in RAX at the point of failure.  Known
+    /// encodings: Smi = sign-extended i32, JIT_UNDEFINED = 0x1_0000_0002,
+    /// JIT_FALSE/TRUE = 0x1_0000_000{0,1}, heap handle = 0x2_0000_0000+idx.
     #[allow(dead_code)]
-    pub extern "C" fn jit_smi_guard_fail_log(_value: i64, _node_id: i64) {
-        // Diagnostic stub — kept as a trampoline target for smi guard failures.
-        // The smi_guard codegen calls this before deopting so it can be used
-        // as a breakpoint target in gdb/lldb.
+    pub extern "C" fn jit_smi_guard_fail_log(value: i64, node_id: i64) {
+        eprintln!(
+            "[SMI_GUARD_FAIL] node={} value=0x{:016x} ({})",
+            node_id, value as u64, value
+        );
     }
 
     // ── Array inline-cache fill + load ──────────────────────────────────
