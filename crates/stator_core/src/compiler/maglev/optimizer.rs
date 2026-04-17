@@ -156,6 +156,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     remove_redundant_check_maps(graph);
     fuse_object_literal_stores(graph);
     eliminate_store_to_load(graph);
+    eliminate_dead_allocations(graph);
     replace_dead_arguments(graph);
     eliminate_dead_code(graph);
 }
@@ -2375,6 +2376,41 @@ fn compute_store_to_load_subst(block: &BasicBlock) -> HashMap<NodeId, NodeId> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Pass 2c — Dead allocation elimination (escape analysis lite)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Eliminate object/array literal allocations whose results are never used.
+///
+/// After store-to-load forwarding, property loads from short-lived objects are
+/// replaced with the stored values directly.  If the allocation's [`NodeId`]
+/// is no longer referenced by any live node, the object never "escapes" and
+/// the allocation is dead.  This pass replaces such allocations with cheap
+/// [`ValueNode::UndefinedConstant`] placeholders (in-place, to preserve graph
+/// structure for the register allocator).
+fn eliminate_dead_allocations(graph: &mut MaglevGraph) {
+    let live = collect_live_ids(graph);
+
+    for block in graph.blocks_mut() {
+        for (id, node) in &mut block.nodes {
+            let is_dead_alloc = matches!(
+                node,
+                ValueNode::CreateObjectLiteral { .. }
+                    | ValueNode::CreateObjectLiteralWithProperties { .. }
+                    | ValueNode::CreateEmptyObjectLiteral
+                    | ValueNode::CreateArrayLiteral { .. }
+                    | ValueNode::CreateEmptyArrayLiteral { .. }
+                    | ValueNode::CreateShallowObjectLiteral { .. }
+                    | ValueNode::CreateShallowArrayLiteral { .. }
+            ) && !live.contains(id);
+
+            if is_dead_alloc {
+                *node = ValueNode::UndefinedConstant;
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Pass 3 — Dead-code elimination
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -4317,5 +4353,82 @@ mod tests {
             }
             other => panic!("Expected Return, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_dead_allocation_elimination_after_forwarding() {
+        // After store-to-load forwarding eliminates all loads from an object,
+        // the allocation itself becomes dead and should be replaced.
+        let mut graph = MaglevGraph::new(0);
+        let mut block = BasicBlock::new(0);
+        let val_x = block.push_value(ValueNode::SmiConstant { value: 10 });
+        let val_y = block.push_value(ValueNode::SmiConstant { value: 20 });
+        let obj = block.push_value(ValueNode::CreateObjectLiteralWithProperties {
+            feedback_slot: 0,
+            flags: 0,
+            names: vec![1, 2],
+            values: vec![val_x, val_y],
+        });
+        let load_x = block.push_value(ValueNode::LoadNamedGeneric {
+            object: obj,
+            name: 1,
+            feedback_slot: 1,
+        });
+        let load_y = block.push_value(ValueNode::LoadNamedGeneric {
+            object: obj,
+            name: 2,
+            feedback_slot: 2,
+        });
+        let sum = block.push_value(ValueNode::Int32Add {
+            left: load_x,
+            right: load_y,
+        });
+        block.set_control(ControlNode::Return { value: sum });
+        graph.add_block(block);
+
+        // Forward loads first.
+        eliminate_store_to_load(&mut graph);
+        // Now the allocation should be dead (only loads referenced it).
+        eliminate_dead_allocations(&mut graph);
+
+        // The CreateObjectLiteralWithProperties should be replaced with
+        // UndefinedConstant since nothing references it anymore.
+        let obj_node = graph.blocks()[0].nodes.iter().find(|(id, _)| *id == obj);
+        match obj_node {
+            Some((_, ValueNode::UndefinedConstant)) => {} // expected
+            other => panic!(
+                "Expected dead allocation to be replaced with UndefinedConstant, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_live_allocation_preserved() {
+        // If the object escapes (e.g., returned), the allocation must stay.
+        let mut graph = MaglevGraph::new(0);
+        let mut block = BasicBlock::new(0);
+        let val = block.push_value(ValueNode::SmiConstant { value: 42 });
+        let obj = block.push_value(ValueNode::CreateObjectLiteralWithProperties {
+            feedback_slot: 0,
+            flags: 0,
+            names: vec![1],
+            values: vec![val],
+        });
+        // Object escapes via return.
+        block.set_control(ControlNode::Return { value: obj });
+        graph.add_block(block);
+
+        eliminate_dead_allocations(&mut graph);
+
+        // Allocation should NOT be replaced.
+        let obj_node = graph.blocks()[0].nodes.iter().find(|(id, _)| *id == obj);
+        assert!(
+            matches!(
+                obj_node,
+                Some((_, ValueNode::CreateObjectLiteralWithProperties { .. }))
+            ),
+            "Live allocation should be preserved"
+        );
     }
 }

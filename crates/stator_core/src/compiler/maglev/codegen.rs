@@ -6750,17 +6750,14 @@ impl<'a> MaglevCodegen<'a> {
 
         self.masm.sub_ri(Reg64::Rsp, 128);
 
-        // Zero register file using rep stosq.
-        self.masm.push(Reg64::R10);
-        self.masm.push(Reg64::R11);
-        self.masm.xor_rr(Reg64::Rax, Reg64::Rax); // RAX = 0
-        self.masm.mov_ri(Reg64::Rcx, 16); // RCX = 16 (qwords)
-        // RDI points to the register file at [RSP + 16] (after two pushes)
-        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
-        self.masm.add_ri(Reg64::Rdi, 16);
-        self.masm.rep_stosq(); // Zero 128 bytes (~2-3 cycles)
-        self.masm.pop(Reg64::R11);
-        self.masm.pop(Reg64::R10);
+        // Zero register file with unrolled stores (no RDI/RCX
+        // clobber, avoids rep stosq startup overhead and eliminates
+        // the push/pop of R10/R11).
+        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+        for i in 0..16i32 {
+            self.masm
+                .mov_store_base_disp32(Reg64::Rsp, i * 8, Reg64::Rax);
+        }
 
         // Store args into register file.
         // Stack after sub 128: [regfile(128), padding(8), callee(8), arg0(8), arg1(8)]
