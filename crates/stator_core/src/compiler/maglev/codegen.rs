@@ -4117,6 +4117,39 @@ impl<'a> MaglevCodegen<'a> {
             return;
         }
 
+        // Half-known smi_guarded: this GenericAdd was marked smi_guarded
+        // because one input is provably i32 and all consumers are
+        // arithmetic-compatible (e.g. `(sum + loaded_e) | 0`).  Skip the
+        // Smi check on the known input; Smi-check only the unknown input.
+        // On Smi-check failure or overflow, deopt to the interpreter.
+        if self.smi_guarded.contains(&id) {
+            let narrow = self.narrow_int32.contains(&id);
+            let left_known = self.i32_range.contains(&left) || self.smi_guarded.contains(&left);
+
+            self.clear_reg_forwarding();
+            self.emit_load(left, Reg64::Rdi);
+            self.emit_load(right, Reg64::R10);
+
+            // Smi check only the unknown input.
+            let check_reg = if left_known { Reg64::R10 } else { Reg64::Rdi };
+            self.masm.movsxd_rr(Reg64::Rax, check_reg);
+            self.masm.cmp_rr(Reg64::Rax, check_reg);
+            self.masm.jne(&mut self.deopt_label);
+
+            // 32-bit ADD + JO deopt.
+            self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
+            self.masm.add32_rr(Reg64::Rax, Reg64::R10);
+            self.masm
+                .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
+            if !narrow {
+                self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+            }
+
+            self.emit_store(id, Reg64::Rax);
+            self.rax_holds = Some(id);
+            return;
+        }
+
         // Load into non-allocated registers — no save needed on fast path.
         // Generic path clobbers RAX in both fast + slow branches, so
         // invalidate the forwarding cache.
@@ -4246,6 +4279,34 @@ impl<'a> MaglevCodegen<'a> {
                     self.rax_holds = Some(id);
                 }
             }
+            return;
+        }
+
+        // Half-known smi_guarded: same as GenericAdd tier 2.5 but with SUB.
+        // Note: SUB is not commutative, so operand order is preserved.
+        if self.smi_guarded.contains(&id) {
+            let narrow = self.narrow_int32.contains(&id);
+            let left_known = self.i32_range.contains(&left) || self.smi_guarded.contains(&left);
+
+            self.clear_reg_forwarding();
+            self.emit_load(left, Reg64::Rdi);
+            self.emit_load(right, Reg64::R10);
+
+            let check_reg = if left_known { Reg64::R10 } else { Reg64::Rdi };
+            self.masm.movsxd_rr(Reg64::Rax, check_reg);
+            self.masm.cmp_rr(Reg64::Rax, check_reg);
+            self.masm.jne(&mut self.deopt_label);
+
+            self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
+            self.masm.sub32_rr(Reg64::Rax, Reg64::R10);
+            self.masm
+                .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
+            if !narrow {
+                self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+            }
+
+            self.emit_store(id, Reg64::Rax);
+            self.rax_holds = Some(id);
             return;
         }
 
@@ -7996,8 +8057,7 @@ impl<'a> MaglevCodegen<'a> {
                             // Both inputs smi_guarded OR half-known
                             // (one i32_range + arithmetic consumers).
                             (set.contains(left) && set.contains(right))
-                                || ((i32_range.contains(left)
-                                    || i32_range.contains(right))
+                                || ((i32_range.contains(left) || i32_range.contains(right))
                                     && consumers_of.get(id).is_some_and(|cs| {
                                         !cs.is_empty()
                                             && cs.iter().all(|c| {
