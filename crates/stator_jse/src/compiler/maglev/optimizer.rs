@@ -165,6 +165,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     eliminate_dead_object_stores(graph);
     eliminate_dead_allocations(graph);
     replace_dead_arguments(graph);
+    unroll_simple_loops(graph);
     eliminate_dead_code(graph);
 }
 
@@ -3534,6 +3535,287 @@ fn apply_subst_to_control_node(ctrl: &mut ControlNode, resolve: &impl Fn(NodeId)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Pass 10 — Simple counted-loop unrolling (2×)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Unroll simple counted for-loops by a factor of 2.
+///
+/// The pass targets loops with the following shape:
+///
+/// ```text
+///   header:  Phi_i, Phi_n, …  |  cmp Phi_i < LIMIT  |  branch(body, exit)
+///   body:    … new_i = Phi_i + 1 …  |  jump(header)
+/// ```
+///
+/// When the trip count (`LIMIT − init`) is even, the body block is duplicated
+/// inline: the second copy uses the first copy's outputs as inputs, halving
+/// the number of back-edge comparisons.
+fn unroll_simple_loops(graph: &mut MaglevGraph) {
+    let loops = licm::detect_loops(graph);
+    for lp in &loops {
+        try_unroll_counted_loop(graph, lp, 2);
+    }
+}
+
+/// Attempt to unroll a single natural loop by the given `factor`.
+///
+/// Returns `true` if the loop was successfully unrolled.
+fn try_unroll_counted_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop, factor: u32) -> bool {
+    if factor < 2 {
+        return false;
+    }
+
+    let header_idx = lp.header;
+    let header = match graph.block(header_idx) {
+        Some(b) => b,
+        None => return false,
+    };
+
+    // ── 1. The header must end with a Branch on an Int32 comparison ──────
+    let (condition_id, body_block_idx, _exit_block_idx) = match &header.control {
+        Some(ControlNode::Branch {
+            condition,
+            if_true,
+            if_false,
+        }) => (*condition, *if_true, *if_false),
+        _ => return false,
+    };
+
+    // The body block must be inside the loop.
+    if !lp.body.contains(&body_block_idx) {
+        return false;
+    }
+
+    // ── 2. Simple loop: body is a single block jumping back to header ────
+    if lp.body.len() != 2 || !lp.body.contains(&header_idx) {
+        return false;
+    }
+
+    let body = match graph.block(body_block_idx) {
+        Some(b) => b,
+        None => return false,
+    };
+
+    // Body must jump back to the header (back-edge).
+    match &body.control {
+        Some(ControlNode::Jump { target }) if *target == header_idx => {}
+        _ => return false,
+    }
+
+    // ── 3. Find the comparison and its operands ─────────────────────────
+    let (cmp_left, cmp_right) = {
+        let mut found = None;
+        for (nid, node) in &header.nodes {
+            if *nid == condition_id {
+                found = Some(node.clone());
+                break;
+            }
+        }
+        match found {
+            Some(ValueNode::Int32LessThan { left, right }) => (left, right),
+            _ => return false,
+        }
+    };
+
+    // ── 4. Identify Phi nodes, induction variable, and constants ─────────
+    let back_edge_pred_pos = {
+        let h = graph.block(header_idx).unwrap();
+        match h.predecessors.iter().position(|&p| p == body_block_idx) {
+            Some(pos) => pos,
+            None => return false,
+        }
+    };
+
+    let preheader_pred_pos = {
+        let h = graph.block(header_idx).unwrap();
+        match h.predecessors.iter().position(|&p| p == lp.preheader) {
+            Some(pos) => pos,
+            None => return false,
+        }
+    };
+
+    // Check that cmp_left is a Phi in the header (the induction variable).
+    let induction_phi_inputs = {
+        let h = graph.block(header_idx).unwrap();
+        let mut found = None;
+        for (nid, node) in &h.nodes {
+            if *nid == cmp_left {
+                if let ValueNode::Phi { inputs } = node {
+                    found = Some(inputs.clone());
+                }
+                break;
+            }
+        }
+        match found {
+            Some(inputs) => inputs,
+            None => return false,
+        }
+    };
+
+    // Get the initial value and the limit as constants.
+    let init_id = induction_phi_inputs[preheader_pred_pos];
+    let limit_id = cmp_right;
+
+    let init_value = find_i32_constant(graph, init_id);
+    let limit_value = find_i32_constant(graph, limit_id);
+
+    let (init_val, limit_val) = match (init_value, limit_value) {
+        (Some(i), Some(l)) => (i, l),
+        _ => return false,
+    };
+
+    // ── 5. Find the induction variable increment in the body ────────────
+    let back_edge_input = induction_phi_inputs[back_edge_pred_pos];
+    let step = find_increment_step(graph, back_edge_input, cmp_left);
+    let step_val = match step {
+        Some(s) if s > 0 => s,
+        _ => return false,
+    };
+
+    // ── 6. Check trip count divisibility ─────────────────────────────────
+    let trip_count = (limit_val - init_val) as i64;
+    if trip_count <= 0 {
+        return false;
+    }
+    let effective_step = (step_val as i64) * (factor as i64);
+    if trip_count % effective_step != 0 {
+        return false;
+    }
+
+    // Don't unroll very small loops (< 2*factor iterations).
+    if trip_count < effective_step * 2 {
+        return false;
+    }
+
+    // ── 7. Collect Phi → back-edge-input mappings ────────────────────────
+    let header_phis: Vec<(NodeId, Vec<NodeId>)> = {
+        let h = graph.block(header_idx).unwrap();
+        h.nodes
+            .iter()
+            .filter_map(|(nid, node)| {
+                if let ValueNode::Phi { inputs } = node {
+                    Some((*nid, inputs.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
+    let phi_to_back_input: HashMap<NodeId, NodeId> = header_phis
+        .iter()
+        .filter_map(|(phi_id, inputs)| {
+            inputs
+                .get(back_edge_pred_pos)
+                .map(|&back_input| (*phi_id, back_input))
+        })
+        .collect();
+
+    // ── 8. Clone the body nodes for additional unrolled copies ───────────
+    let body_nodes: Vec<(NodeId, ValueNode)> = graph.block(body_block_idx).unwrap().nodes.clone();
+
+    let mut prev_phi_to_output = phi_to_back_input.clone();
+
+    for _copy in 1..factor {
+        let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
+        for (phi_id, output_id) in &prev_phi_to_output {
+            subst.insert(*phi_id, *output_id);
+        }
+
+        let mut old_to_new: HashMap<NodeId, NodeId> = HashMap::new();
+        for (old_id, _node) in &body_nodes {
+            let new_id = graph.alloc_node_id();
+            old_to_new.insert(*old_id, new_id);
+        }
+
+        let resolve = |id: NodeId| -> NodeId {
+            if let Some(&new_id) = old_to_new.get(&id) {
+                new_id
+            } else if let Some(&output_id) = subst.get(&id) {
+                output_id
+            } else {
+                id
+            }
+        };
+
+        let mut cloned_nodes: Vec<(NodeId, ValueNode)> = Vec::new();
+        for (old_id, node) in &body_nodes {
+            let new_id = old_to_new[old_id];
+            let mut cloned = node.clone();
+            apply_subst_to_value_node(&mut cloned, &resolve);
+            cloned_nodes.push((new_id, cloned));
+        }
+
+        let body_block = graph.block_mut(body_block_idx).unwrap();
+        for (id, node) in &cloned_nodes {
+            body_block.push_with_id(*id, node.clone());
+        }
+
+        let mut new_phi_to_output: HashMap<NodeId, NodeId> = HashMap::new();
+        for (phi_id, back_input) in &phi_to_back_input {
+            if let Some(&new_id) = old_to_new.get(back_input) {
+                new_phi_to_output.insert(*phi_id, new_id);
+            } else {
+                new_phi_to_output.insert(*phi_id, *back_input);
+            }
+        }
+        prev_phi_to_output = new_phi_to_output;
+    }
+
+    // ── 9. Update header Phi back-edge inputs to last copy's outputs ─────
+    let header_block = graph.block_mut(header_idx).unwrap();
+    for (nid, node) in &mut header_block.nodes {
+        if let ValueNode::Phi { inputs } = node
+            && let Some(&new_output) = prev_phi_to_output.get(nid)
+            && let Some(back_input) = inputs.get_mut(back_edge_pred_pos)
+        {
+            *back_input = new_output;
+        }
+    }
+
+    true
+}
+
+/// Find the compile-time i32 constant value for a [`NodeId`], if any.
+fn find_i32_constant(graph: &MaglevGraph, id: NodeId) -> Option<i32> {
+    for block in graph.blocks() {
+        for (nid, node) in &block.nodes {
+            if *nid == id {
+                return match node {
+                    ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } => {
+                        Some(*value)
+                    }
+                    _ => None,
+                };
+            }
+        }
+    }
+    None
+}
+
+/// Determine the increment step of an induction variable.
+///
+/// Returns `Some(step)` if `result_id` is computed as `base_id + step`.
+fn find_increment_step(graph: &MaglevGraph, result_id: NodeId, base_id: NodeId) -> Option<i32> {
+    let node = graph.node(result_id)?;
+    match node {
+        ValueNode::Int32Increment { value } | ValueNode::CheckedSmiIncrement { value } => {
+            if *value == base_id { Some(1) } else { None }
+        }
+        ValueNode::Int32Add { left, right } | ValueNode::CheckedSmiAdd { left, right } => {
+            if *left == base_id {
+                find_i32_constant(graph, *right)
+            } else if *right == base_id {
+                find_i32_constant(graph, *left)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -4802,5 +5084,218 @@ mod tests {
             }
             other => panic!("Expected Return, got {:?}", other),
         }
+    }
+
+    // ── Loop unrolling ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_loop_unroll_even_trip_count() {
+        // for (var i = 0; i < 10; i++) { n = n + i; }
+        // Use graph-global NodeIds to avoid block-local ID collisions.
+        let mut graph = MaglevGraph::new(0);
+
+        // block 0 (preheader)
+        graph.add_block(BasicBlock::new(0));
+        let init_i = graph
+            .add_value_node(0, ValueNode::Int32Constant { value: 0 })
+            .unwrap();
+        let init_n = graph
+            .add_value_node(0, ValueNode::Int32Constant { value: 0 })
+            .unwrap();
+        let limit = graph
+            .add_value_node(0, ValueNode::Int32Constant { value: 10 })
+            .unwrap();
+        graph
+            .block_mut(0)
+            .unwrap()
+            .set_control(ControlNode::Jump { target: 1 });
+
+        // block 1 (header) — Phi back-edge inputs patched below
+        let mut b1 = BasicBlock::new(1);
+        b1.is_loop_header = true;
+        b1.predecessors = vec![0, 2];
+        graph.add_block(b1);
+        let phi_i = graph
+            .add_value_node(
+                1,
+                ValueNode::Phi {
+                    inputs: vec![init_i, NodeId(999)],
+                },
+            )
+            .unwrap();
+        let phi_n = graph
+            .add_value_node(
+                1,
+                ValueNode::Phi {
+                    inputs: vec![init_n, NodeId(999)],
+                },
+            )
+            .unwrap();
+        let cmp = graph
+            .add_value_node(
+                1,
+                ValueNode::Int32LessThan {
+                    left: phi_i,
+                    right: limit,
+                },
+            )
+            .unwrap();
+        graph
+            .block_mut(1)
+            .unwrap()
+            .set_control(ControlNode::Branch {
+                condition: cmp,
+                if_true: 2,
+                if_false: 3,
+            });
+
+        // block 2 (body)
+        let mut b2 = BasicBlock::new(2);
+        b2.predecessors = vec![1];
+        graph.add_block(b2);
+        let new_n = graph
+            .add_value_node(
+                2,
+                ValueNode::Int32Add {
+                    left: phi_n,
+                    right: phi_i,
+                },
+            )
+            .unwrap();
+        let new_i = graph
+            .add_value_node(2, ValueNode::Int32Increment { value: phi_i })
+            .unwrap();
+        graph
+            .block_mut(2)
+            .unwrap()
+            .set_control(ControlNode::Jump { target: 1 });
+
+        // block 3 (exit)
+        let mut b3 = BasicBlock::new(3);
+        b3.predecessors = vec![1];
+        graph.add_block(b3);
+        graph
+            .block_mut(3)
+            .unwrap()
+            .set_control(ControlNode::Return { value: phi_n });
+
+        // Patch Phi back-edge inputs.
+        if let ValueNode::Phi { inputs } = &mut graph.block_mut(1).unwrap().nodes[0].1 {
+            inputs[1] = new_i;
+        }
+        if let ValueNode::Phi { inputs } = &mut graph.block_mut(1).unwrap().nodes[1].1 {
+            inputs[1] = new_n;
+        }
+
+        let body_nodes_before = graph.block(2).unwrap().nodes.len();
+        unroll_simple_loops(&mut graph);
+        let body_nodes_after = graph.block(2).unwrap().nodes.len();
+        assert_eq!(body_nodes_after, body_nodes_before * 2);
+
+        // Phi back-edge inputs should point to cloned nodes.
+        if let ValueNode::Phi { inputs } = &graph.block(1).unwrap().nodes[0].1 {
+            assert_ne!(inputs[1], new_i);
+        }
+        if let ValueNode::Phi { inputs } = &graph.block(1).unwrap().nodes[1].1 {
+            assert_ne!(inputs[1], new_n);
+        }
+    }
+
+    #[test]
+    fn test_loop_unroll_skips_odd_trip() {
+        // Trip count 7 — not divisible by 2, should skip unrolling.
+        let mut graph = MaglevGraph::new(0);
+
+        graph.add_block(BasicBlock::new(0));
+        let init_i = graph
+            .add_value_node(0, ValueNode::Int32Constant { value: 0 })
+            .unwrap();
+        let init_n = graph
+            .add_value_node(0, ValueNode::Int32Constant { value: 0 })
+            .unwrap();
+        let limit = graph
+            .add_value_node(0, ValueNode::Int32Constant { value: 7 })
+            .unwrap();
+        graph
+            .block_mut(0)
+            .unwrap()
+            .set_control(ControlNode::Jump { target: 1 });
+
+        let mut b1 = BasicBlock::new(1);
+        b1.is_loop_header = true;
+        b1.predecessors = vec![0, 2];
+        graph.add_block(b1);
+        let phi_i = graph
+            .add_value_node(
+                1,
+                ValueNode::Phi {
+                    inputs: vec![init_i, NodeId(999)],
+                },
+            )
+            .unwrap();
+        let phi_n = graph
+            .add_value_node(
+                1,
+                ValueNode::Phi {
+                    inputs: vec![init_n, NodeId(999)],
+                },
+            )
+            .unwrap();
+        let cmp = graph
+            .add_value_node(
+                1,
+                ValueNode::Int32LessThan {
+                    left: phi_i,
+                    right: limit,
+                },
+            )
+            .unwrap();
+        graph
+            .block_mut(1)
+            .unwrap()
+            .set_control(ControlNode::Branch {
+                condition: cmp,
+                if_true: 2,
+                if_false: 3,
+            });
+
+        let mut b2 = BasicBlock::new(2);
+        b2.predecessors = vec![1];
+        graph.add_block(b2);
+        let new_n = graph
+            .add_value_node(
+                2,
+                ValueNode::Int32Add {
+                    left: phi_n,
+                    right: phi_i,
+                },
+            )
+            .unwrap();
+        let new_i = graph
+            .add_value_node(2, ValueNode::Int32Increment { value: phi_i })
+            .unwrap();
+        graph
+            .block_mut(2)
+            .unwrap()
+            .set_control(ControlNode::Jump { target: 1 });
+
+        let mut b3 = BasicBlock::new(3);
+        b3.predecessors = vec![1];
+        graph.add_block(b3);
+        graph
+            .block_mut(3)
+            .unwrap()
+            .set_control(ControlNode::Return { value: phi_n });
+
+        if let ValueNode::Phi { inputs } = &mut graph.block_mut(1).unwrap().nodes[0].1 {
+            inputs[1] = new_i;
+        }
+        if let ValueNode::Phi { inputs } = &mut graph.block_mut(1).unwrap().nodes[1].1 {
+            inputs[1] = new_n;
+        }
+
+        let body_before = graph.block(2).unwrap().nodes.len();
+        unroll_simple_loops(&mut graph);
+        assert_eq!(graph.block(2).unwrap().nodes.len(), body_before);
     }
 }
