@@ -7115,6 +7115,19 @@ impl<'a> MaglevCodegen<'a> {
             return false;
         }
 
+        // Safety: each comparison operand must be valid at the back-edge.
+        // Phi nodes (updated by phi copies) and constants (rematerialised
+        // by emit_load) are safe.  Any other node was computed in the
+        // header and its register/stack slot may have been clobbered by
+        // the loop body — reading it at the back-edge would produce a
+        // stale value, potentially causing an infinite loop (e.g. the
+        // sieve benchmark's `i * i <= n` outer loop).
+        if !self.is_back_edge_safe_operand(left, header_idx)
+            || !self.is_back_edge_safe_operand(right, header_idx)
+        {
+            return false;
+        }
+
         // Emit the duplicated comparison + conditional back-edge to body.
         self.emit_cmp32(left, right);
         let body_target = if_true as usize;
@@ -7129,6 +7142,33 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.jmp(&mut self.block_labels[exit_target]);
         }
         true
+    }
+
+    /// Check whether a comparison operand is safe to read at a loop
+    /// back-edge (i.e. after the body has executed).
+    ///
+    /// *Safe* operands:
+    /// - **Constants** — always rematerialised by [`emit_load`].
+    /// - **Phi nodes in the header** — their locations are written by the
+    ///   phi-copy pass *before* the rotated comparison.
+    ///
+    /// Any other node (e.g. `GenericMul` computed in the header) may have
+    /// its register/stack slot reused by the loop body, so reading from
+    /// its allocator location would yield a stale value.
+    fn is_back_edge_safe_operand(&self, id: NodeId, header_idx: u32) -> bool {
+        // Constants can always be rematerialised.
+        if self.try_materialise_constant(id).is_some() {
+            return true;
+        }
+        // Phi nodes in the header are updated by phi copies.
+        if let Some(header) = self.graph.block(header_idx) {
+            for (nid, node) in &header.nodes {
+                if *nid == id {
+                    return matches!(node, ValueNode::Phi { .. });
+                }
+            }
+        }
+        false
     }
 
     /// Negate a condition code (for compare-branch fusion: jump on the
