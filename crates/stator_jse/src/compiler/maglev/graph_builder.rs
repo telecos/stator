@@ -81,7 +81,6 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 
 use crate::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
@@ -534,22 +533,6 @@ impl<'a> GraphBuilder<'a> {
             Opcode::LdaFalse => {
                 let id = self.emit(ValueNode::FalseConstant)?;
                 self.env.set_accumulator(id);
-            }
-            // LdaTheHole is emitted for `let`/`const` TDZ initialization.
-            // At JIT level the hole is treated as undefined; the
-            // ThrowReferenceErrorIfHole bytecode (if present) guards
-            // actual TDZ violations at runtime and will deopt if hit.
-            Opcode::LdaTheHole => {
-                let id = self.emit(ValueNode::UndefinedConstant)?;
-                self.env.set_accumulator(id);
-            }
-            // ThrowReferenceErrorIfHole checks whether the accumulator is
-            // "the hole" (TDZ sentinel).  In well-formed code the variable
-            // is always initialized before use, so this is effectively a
-            // no-op.  If the hole reaches here at runtime the JIT code
-            // will deopt back to the interpreter which throws the error.
-            Opcode::ThrowReferenceErrorIfHole => {
-                // No-op: the variable is assumed to be initialized.
             }
             Opcode::Nop => {}
             Opcode::LdaConstant => {
@@ -3123,52 +3106,6 @@ mod tests {
             deopt_blocks.is_empty(),
             "graph has Deoptimize control in blocks {deopt_blocks:?} — \
              indicates unhandled bytecodes"
-        );
-    }
-
-    /// Same as `test_object_creation_benchmark_no_deopt` but uses `let`
-    /// bindings.  Before the fix for `LdaTheHole` the graph would degenerate
-    /// to a single `Deoptimize` because the TDZ initialisation bytecode was
-    /// unhandled.
-    #[test]
-    fn test_object_creation_benchmark_let_no_deopt() {
-        use crate::bytecode::bytecode_generator::BytecodeGenerator;
-        use crate::parser::recursive_descent;
-
-        let source = r#"
-            let last;
-            for (let i = 0; i < 1000; i++) {
-                last = { x: i, y: i + 1, z: i * 2 };
-            }
-            last.x + last.y + last.z;
-        "#;
-
-        let program = recursive_descent::parse(source).unwrap();
-        let ba = BytecodeGenerator::compile_program(&program).unwrap();
-
-        let instructions = ba.instructions().unwrap();
-        eprintln!(
-            "object_creation_let: {} bytecodes, {} raw bytes",
-            instructions.len(),
-            ba.bytecodes().len()
-        );
-        for (idx, instr) in instructions.iter().enumerate() {
-            eprintln!("  [{idx:3}] {:?}", instr.opcode);
-        }
-
-        let feedback = FeedbackVector::new(ba.feedback_metadata());
-        let graph = GraphBuilder::build(&ba, &feedback).unwrap();
-
-        let mut deopt_blocks = Vec::new();
-        for (block_idx, block) in graph.blocks().iter().enumerate() {
-            if matches!(block.control, Some(ControlNode::Deoptimize { .. })) {
-                deopt_blocks.push(block_idx);
-            }
-        }
-        assert!(
-            deopt_blocks.is_empty(),
-            "graph has Deoptimize control in blocks {deopt_blocks:?} — \
-             LdaTheHole or ThrowReferenceErrorIfHole likely unhandled"
         );
     }
 
