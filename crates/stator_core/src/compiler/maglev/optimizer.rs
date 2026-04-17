@@ -155,6 +155,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
     fuse_object_literal_stores(graph);
+    eliminate_store_to_load(graph);
     replace_dead_arguments(graph);
     eliminate_dead_code(graph);
 }
@@ -2279,6 +2280,84 @@ fn fuse_object_literal_stores_in_block(block: &mut BasicBlock) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Pass 2b — Store-to-load forwarding
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Forward values from `StoreNamedGeneric` (and `CreateObjectLiteralWithProperties`)
+/// to subsequent `LoadNamedGeneric` on the same object and property name,
+/// eliminating redundant FFI round-trips.
+///
+/// Within a single basic block, we track the most recent value stored to each
+/// `(object, name)` pair.  When a `LoadNamedGeneric` is encountered whose
+/// `(object, name)` is in the map, the load is replaced with an
+/// `UndefinedConstant` placeholder and all references to its result are
+/// redirected to the stored value.
+///
+/// The map is conservatively invalidated on any side-effecting node that is
+/// not itself a `StoreNamedGeneric` or `CreateObjectLiteralWithProperties`,
+/// since calls, other stores, etc. may mutate arbitrary object properties.
+fn eliminate_store_to_load(graph: &mut MaglevGraph) {
+    for block in graph.blocks_mut() {
+        eliminate_store_to_load_in_block(block);
+    }
+}
+
+fn eliminate_store_to_load_in_block(block: &mut BasicBlock) {
+    // Map from (object NodeId, property name index) → most recently stored value NodeId.
+    let mut store_map: HashMap<(NodeId, u32), NodeId> = HashMap::new();
+    // Substitutions: load NodeId → forwarded value NodeId.
+    let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
+
+    for (id, node) in &block.nodes {
+        match node {
+            // Seed the map from fused object creation.
+            ValueNode::CreateObjectLiteralWithProperties { names, values, .. } => {
+                // The fused node creates the object (its NodeId is the object)
+                // and pre-sets all properties.
+                let obj_id = *id;
+                for (name, value) in names.iter().zip(values.iter()) {
+                    store_map.insert((obj_id, *name), *value);
+                }
+            }
+
+            // Track stores.
+            ValueNode::StoreNamedGeneric {
+                object,
+                name,
+                value,
+                ..
+            } => {
+                store_map.insert((*object, *name), *value);
+            }
+
+            // Forward loads.
+            ValueNode::LoadNamedGeneric { object, name, .. } => {
+                if let Some(&stored_value) = store_map.get(&(*object, *name)) {
+                    subst.insert(*id, stored_value);
+                }
+            }
+
+            // Any other side-effecting node invalidates the map conservatively.
+            other if has_side_effects(other) => {
+                store_map.clear();
+            }
+
+            _ => {}
+        }
+    }
+
+    if !subst.is_empty() {
+        // Replace forwarded loads with dead placeholders.
+        for (id, node) in &mut block.nodes {
+            if subst.contains_key(id) {
+                *node = ValueNode::UndefinedConstant;
+            }
+        }
+        apply_subst_to_block(block, &subst);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Pass 3 — Dead-code elimination
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -4100,5 +4179,126 @@ mod tests {
             .flat_map(|b| b.nodes.iter())
             .any(|(_, n)| matches!(n, ValueNode::Phi { .. }));
         assert!(phi_exists, "Non-trivial Phi should be preserved");
+    }
+
+    // ── Store-to-load forwarding ──────────────────────────────────────────────
+
+    #[test]
+    fn test_store_to_load_forwarding_basic() {
+        // StoreNamedGeneric(obj, "x", val) followed by LoadNamedGeneric(obj, "x")
+        // should forward val, eliminating the load.
+        let mut graph = MaglevGraph::new(0);
+        let mut block = BasicBlock::new(0);
+        let obj = block.push_value(ValueNode::Parameter { index: 0 });
+        let val = block.push_value(ValueNode::SmiConstant { value: 42 });
+        let _store = block.push_value(ValueNode::StoreNamedGeneric {
+            object: obj,
+            name: 5,
+            value: val,
+            feedback_slot: 0,
+        });
+        let load = block.push_value(ValueNode::LoadNamedGeneric {
+            object: obj,
+            name: 5,
+            feedback_slot: 1,
+        });
+        block.set_control(ControlNode::Return { value: load });
+        graph.add_block(block);
+
+        eliminate_store_to_load(&mut graph);
+
+        // The return should now reference val directly, not the load.
+        match &graph.blocks()[0].control {
+            Some(ControlNode::Return { value }) => {
+                assert_eq!(*value, val, "Load should be forwarded to stored value");
+            }
+            other => panic!("Expected Return, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_store_to_load_forwarding_fused_create() {
+        // CreateObjectLiteralWithProperties seeds the map so subsequent loads
+        // are forwarded.
+        let mut graph = MaglevGraph::new(0);
+        let mut block = BasicBlock::new(0);
+        let val_x = block.push_value(ValueNode::SmiConstant { value: 10 });
+        let val_y = block.push_value(ValueNode::SmiConstant { value: 20 });
+        let obj = block.push_value(ValueNode::CreateObjectLiteralWithProperties {
+            feedback_slot: 0,
+            flags: 0,
+            names: vec![1, 2],
+            values: vec![val_x, val_y],
+        });
+        let load_x = block.push_value(ValueNode::LoadNamedGeneric {
+            object: obj,
+            name: 1,
+            feedback_slot: 1,
+        });
+        let load_y = block.push_value(ValueNode::LoadNamedGeneric {
+            object: obj,
+            name: 2,
+            feedback_slot: 2,
+        });
+        let sum = block.push_value(ValueNode::Int32Add {
+            left: load_x,
+            right: load_y,
+        });
+        block.set_control(ControlNode::Return { value: sum });
+        graph.add_block(block);
+
+        eliminate_store_to_load(&mut graph);
+
+        // The Int32Add should now reference val_x and val_y directly.
+        let add_node = graph.blocks()[0]
+            .nodes
+            .iter()
+            .find(|(_, n)| matches!(n, ValueNode::Int32Add { .. }));
+        match add_node {
+            Some((_, ValueNode::Int32Add { left, right })) => {
+                assert_eq!(*left, val_x, "load_x should be forwarded to val_x");
+                assert_eq!(*right, val_y, "load_y should be forwarded to val_y");
+            }
+            other => panic!("Expected Int32Add, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_store_to_load_invalidated_by_call() {
+        // A Call between store and load should prevent forwarding.
+        let mut graph = MaglevGraph::new(0);
+        let mut block = BasicBlock::new(0);
+        let obj = block.push_value(ValueNode::Parameter { index: 0 });
+        let val = block.push_value(ValueNode::SmiConstant { value: 42 });
+        let _store = block.push_value(ValueNode::StoreNamedGeneric {
+            object: obj,
+            name: 5,
+            value: val,
+            feedback_slot: 0,
+        });
+        // A call could mutate obj's properties.
+        let _call = block.push_value(ValueNode::Call {
+            callee: obj,
+            args: vec![],
+            receiver: obj,
+            feedback_slot: 0,
+        });
+        let load = block.push_value(ValueNode::LoadNamedGeneric {
+            object: obj,
+            name: 5,
+            feedback_slot: 1,
+        });
+        block.set_control(ControlNode::Return { value: load });
+        graph.add_block(block);
+
+        eliminate_store_to_load(&mut graph);
+
+        // The return should still reference the load (not forwarded).
+        match &graph.blocks()[0].control {
+            Some(ControlNode::Return { value }) => {
+                assert_eq!(*value, load, "Load should NOT be forwarded past a call");
+            }
+            other => panic!("Expected Return, got {:?}", other),
+        }
     }
 }
