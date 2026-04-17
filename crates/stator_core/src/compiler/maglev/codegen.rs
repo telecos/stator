@@ -3072,7 +3072,35 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.mov_load_base_disp32(dst, Reg64::R14, off);
             }
             None => {
-                self.masm.mov_ri(dst, JIT_UNDEFINED);
+                // No allocation — materialise constants directly so that
+                // store-to-load forwarded SmiConstants (and other constant
+                // nodes) produce the correct value instead of JIT_UNDEFINED.
+                match self.graph.node(id) {
+                    Some(ValueNode::SmiConstant { value }) => {
+                        self.masm.mov_ri(dst, *value as i64);
+                    }
+                    Some(ValueNode::Int32Constant { value }) => {
+                        self.masm.mov_ri(dst, *value as i64);
+                    }
+                    Some(ValueNode::Uint32Constant { value }) => {
+                        self.masm.mov_ri(dst, *value as i64);
+                    }
+                    Some(ValueNode::Float64Constant { value }) => {
+                        self.masm.mov_ri(dst, value.to_bits() as i64);
+                    }
+                    Some(ValueNode::TrueConstant) => {
+                        self.masm.mov_ri(dst, JIT_TRUE);
+                    }
+                    Some(ValueNode::FalseConstant) => {
+                        self.masm.mov_ri(dst, JIT_FALSE);
+                    }
+                    Some(ValueNode::NullConstant) => {
+                        self.masm.mov_ri(dst, JIT_NULL);
+                    }
+                    _ => {
+                        self.masm.mov_ri(dst, JIT_UNDEFINED);
+                    }
+                }
             }
         }
     }
