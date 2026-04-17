@@ -37,13 +37,19 @@ jobs:
           - target: i686-unknown-linux-gnu
             miriflags: "-Zmiri-preemption-rate=0.1"
             label: "Stacked Borrows"
+            packages: "gcc-multilib"
           # AArch64 target – exercise interpreter + GC on a second architecture
           - target: aarch64-unknown-linux-gnu
             miriflags: "-Zmiri-preemption-rate=0.1"
             label: "Stacked Borrows"
+            packages: "gcc-aarch64-linux-gnu libc6-dev-arm64-cross"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Install cross-compilation toolchain
+        if: ${{ matrix.packages != '' && matrix.packages != null }}
+        run: sudo apt-get update -q && sudo apt-get install -y ${{ matrix.packages }}
 
       - name: Install Rust nightly with Miri
         uses: dtolnay/rust-toolchain@nightly
