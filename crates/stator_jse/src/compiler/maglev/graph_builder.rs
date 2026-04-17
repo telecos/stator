@@ -3532,11 +3532,7 @@ mod tests {
         let mut fused_slots = Vec::new();
         for block in graph.blocks() {
             for (_id, node) in &block.nodes {
-                if let ValueNode::CreateObjectLiteralWithProperties {
-                    feedback_slot,
-                    ..
-                } = node
-                {
+                if let ValueNode::CreateObjectLiteralWithProperties { feedback_slot, .. } = node {
                     fused_slots.push(*feedback_slot);
                 }
             }

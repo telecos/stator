@@ -1960,8 +1960,7 @@ impl<'a> MaglevCodegen<'a> {
                             jit_runtime::jit_runtime_lda_global_fast as *const () as usize as i64;
                         self.masm.mov_ri(Reg64::R11, addr);
                     } else {
-                        let addr =
-                            jit_runtime::jit_runtime_lda_global as *const () as usize as i64;
+                        let addr = jit_runtime::jit_runtime_lda_global as *const () as usize as i64;
                         self.masm.mov_ri(Reg64::R11, addr);
                     }
                     self.masm.call_reg(Reg64::R11);
@@ -2025,8 +2024,7 @@ impl<'a> MaglevCodegen<'a> {
                             jit_runtime::jit_runtime_sta_global_fast as *const () as usize as i64;
                         self.masm.mov_ri(Reg64::R11, addr);
                     } else {
-                        let addr =
-                            jit_runtime::jit_runtime_sta_global as *const () as usize as i64;
+                        let addr = jit_runtime::jit_runtime_sta_global as *const () as usize as i64;
                         self.masm.mov_ri(Reg64::R11, addr);
                     }
                     self.masm.call_reg(Reg64::R11);

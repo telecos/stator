@@ -1488,10 +1488,7 @@ pub fn compile_maglev_sync(ba: &BytecodeArray) -> bool {
     for slot in 0..ba.feedback_metadata().slot_count() {
         if matches!(
             ba.feedback_metadata().kind_of(slot),
-            Some(
-                FeedbackSlotKind::KeyedLoadProperty
-                    | FeedbackSlotKind::KeyedStoreProperty
-            )
+            Some(FeedbackSlotKind::KeyedLoadProperty | FeedbackSlotKind::KeyedStoreProperty)
         ) {
             let _ = feedback.set_state(slot, InlineCacheState::Monomorphic);
         }

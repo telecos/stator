@@ -4737,8 +4737,7 @@ pub(crate) mod jit_runtime {
                         if let Some((code, register_file_slots)) = cached_data {
                             use crate::compiler::maglev::codegen::CachedMaglevCode;
                             // SAFETY: `code` from `maglev_codegen::compile`.
-                            let exec =
-                                unsafe { CachedMaglevCode::new(&code, register_file_slots) };
+                            let exec = unsafe { CachedMaglevCode::new(&code, register_file_slots) };
                             *maglev_cache.borrow_mut() = exec;
                         }
                     }
@@ -4758,7 +4757,9 @@ pub(crate) mod jit_runtime {
                         // SAFETY: single-threaded; exec cache is not being
                         // mutated during JIT execution.
                         let cache_ref = unsafe { &*exec_cache.as_ptr() };
-                        if let Some(exec) = cache_ref.as_ref().filter(|e| e.register_file_slots <= 16) {
+                        if let Some(exec) =
+                            cache_ref.as_ref().filter(|e| e.register_file_slots <= 16)
+                        {
                             let exec_raw = exec as *const JitExecutableCode;
                             (exec_raw, exec.register_file_slots, ba_raw, ctx)
                         } else {
@@ -7700,6 +7701,7 @@ pub(crate) mod jit_runtime {
         /// Byte offset of the `values` Vec data-pointer field within
         /// `PropertyMap`.  The Vec layout is `[ptr, len, cap]`; this
         /// offset points to the `ptr` field.
+        #[allow(dead_code)]
         pub values_data_ptr_offset: usize,
     }
 

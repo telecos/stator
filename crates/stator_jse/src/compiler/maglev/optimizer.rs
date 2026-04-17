@@ -1355,17 +1355,13 @@ fn try_reassociate(
                     && base_l == base_r
                     && k_l >= k_r
                 {
-                    return build_add_mul_reassoc(
-                        pos, *add_a, base_r, k_l - k_r, consts, next_id,
-                    );
+                    return build_add_mul_reassoc(pos, *add_a, base_r, k_l - k_r, consts, next_id);
                 }
                 if let Some(&(base_l, k_l)) = mul_info.get(add_a)
                     && base_l == base_r
                     && k_l >= k_r
                 {
-                    return build_add_mul_reassoc(
-                        pos, *add_b, base_r, k_l - k_r, consts, next_id,
-                    );
+                    return build_add_mul_reassoc(pos, *add_b, base_r, k_l - k_r, consts, next_id);
                 }
             }
             None
