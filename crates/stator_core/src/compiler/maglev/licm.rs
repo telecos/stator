@@ -35,10 +35,10 @@
 //! # Usage
 //!
 //! ```
-//! use stator_core::compiler::maglev::ir::{
+//! use stator_js::compiler::maglev::ir::{
 //!     BasicBlock, ControlNode, MaglevGraph, NodeId, ValueNode,
 //! };
-//! use stator_core::compiler::maglev::licm::hoist_loop_invariants;
+//! use stator_js::compiler::maglev::licm::hoist_loop_invariants;
 //!
 //! // Build a small diamond + loop CFG:
 //! //   block 0 (preheader): jump → 1

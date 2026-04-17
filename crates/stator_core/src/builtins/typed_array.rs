@@ -98,7 +98,7 @@ impl TypedArrayKind {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::typed_array::{arraybuffer_new, arraybuffer_byte_length};
+/// use stator_js::builtins::typed_array::{arraybuffer_new, arraybuffer_byte_length};
 ///
 /// let buf = arraybuffer_new(16);
 /// assert_eq!(arraybuffer_byte_length(&buf), 16);
@@ -122,7 +122,7 @@ pub struct JsArrayBuffer {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::typed_array::arraybuffer_new;
+/// use stator_js::builtins::typed_array::arraybuffer_new;
 ///
 /// let buf = arraybuffer_new(8);
 /// assert_eq!(buf.data.len(), 8);
@@ -176,7 +176,7 @@ pub fn shared_arraybuffer_new_growable(
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::typed_array::{arraybuffer_new, arraybuffer_byte_length};
+/// use stator_js::builtins::typed_array::{arraybuffer_new, arraybuffer_byte_length};
 ///
 /// let buf = arraybuffer_new(32);
 /// assert_eq!(arraybuffer_byte_length(&buf), 32);
@@ -314,7 +314,7 @@ pub fn arraybuffer_transfer(
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::typed_array::{arraybuffer_new, arraybuffer_slice};
+/// use stator_js::builtins::typed_array::{arraybuffer_new, arraybuffer_slice};
 ///
 /// let mut buf = arraybuffer_new(4);
 /// buf.data[0] = 10;
@@ -344,8 +344,8 @@ pub fn arraybuffer_slice(buf: &JsArrayBuffer, begin: i64, end: i64) -> JsArrayBu
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::typed_array::arraybuffer_is_view;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::typed_array::arraybuffer_is_view;
+/// use stator_js::objects::value::JsValue;
 ///
 /// assert!(!arraybuffer_is_view(&JsValue::Smi(42)));
 /// ```
@@ -539,9 +539,9 @@ dataview_set!(dataview_set_biguint64, u64, to_le_bytes, to_be_bytes, 8);
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::typed_array::{TypedArrayKind, typed_array_new_from_length,
+/// use stator_js::builtins::typed_array::{TypedArrayKind, typed_array_new_from_length,
 ///     typed_array_length, typed_array_get, typed_array_set};
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let ta = typed_array_new_from_length(TypedArrayKind::Int32, 4);
 /// assert_eq!(typed_array_length(&ta), 4);
@@ -589,7 +589,7 @@ impl JsTypedArray {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::typed_array::{TypedArrayKind, typed_array_new_from_length,
+/// use stator_js::builtins::typed_array::{TypedArrayKind, typed_array_new_from_length,
 ///     typed_array_length};
 ///
 /// let ta = typed_array_new_from_length(TypedArrayKind::Float64, 8);

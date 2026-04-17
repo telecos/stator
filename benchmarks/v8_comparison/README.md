@@ -36,7 +36,7 @@ node benchmarks/v8_comparison/benchmarks.js
 ### Stator only (via Criterion)
 
 ```bash
-cargo bench --package stator_core --bench engine_benchmarks
+cargo bench --package stator_js --bench engine_benchmarks
 ```
 
 ## How it works

@@ -32,7 +32,7 @@ jobs:
           shared-key: "bench"
 
       - name: Build benchmarks
-        run: cargo bench --package stator_core --no-run --jobs 1 2>&1 | tail -50
+        run: cargo bench --package stator_js --no-run --jobs 1 2>&1 | tail -50
         env:
           CARGO_INCREMENTAL: "0"
 
@@ -56,7 +56,7 @@ jobs:
                        sieve_primes_1k_precompiled \
                        deep_object_access_1k_precompiled; do
             echo "--- $bench ---"
-            if timeout 300 cargo bench --package stator_core --bench precompiled_benchmarks -- "^${bench}$" 2>&1; then
+            if timeout 300 cargo bench --package stator_js --bench precompiled_benchmarks -- "^${bench}$" 2>&1; then
               echo "OK: $bench"
               passed=$((passed + 1))
             else
@@ -84,7 +84,7 @@ jobs:
                        sieve_primes_1k \
                        deep_object_access_1k; do
             echo "--- $bench ---"
-            timeout 300 cargo bench --package stator_core --bench engine_benchmarks -- "^${bench}$" 2>&1 || echo "FAILED: $bench"
+            timeout 300 cargo bench --package stator_js --bench engine_benchmarks -- "^${bench}$" 2>&1 || echo "FAILED: $bench"
             echo ""
           done
         continue-on-error: true

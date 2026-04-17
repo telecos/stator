@@ -48,7 +48,7 @@ pub const MATH_SQRT2: f64 = std::f64::consts::SQRT_2;
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_abs;
+/// use stator_js::builtins::math::math_abs;
 ///
 /// assert_eq!(math_abs(-5.0), 5.0);
 /// assert_eq!(math_abs(3.0), 3.0);
@@ -67,7 +67,7 @@ pub fn math_abs(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_ceil;
+/// use stator_js::builtins::math::math_ceil;
 ///
 /// assert_eq!(math_ceil(1.2), 2.0);
 /// assert_eq!(math_ceil(-1.2), -1.0);
@@ -86,7 +86,7 @@ pub fn math_ceil(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_floor;
+/// use stator_js::builtins::math::math_floor;
 ///
 /// assert_eq!(math_floor(1.9), 1.0);
 /// assert_eq!(math_floor(-1.1), -2.0);
@@ -106,7 +106,7 @@ pub fn math_floor(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_round;
+/// use stator_js::builtins::math::math_round;
 ///
 /// assert_eq!(math_round(1.5), 2.0);
 /// assert_eq!(math_round(-1.5), -1.0);
@@ -131,7 +131,7 @@ pub fn math_round(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_trunc;
+/// use stator_js::builtins::math::math_trunc;
 ///
 /// assert_eq!(math_trunc(1.9), 1.0);
 /// assert_eq!(math_trunc(-1.9), -1.0);
@@ -151,7 +151,7 @@ pub fn math_trunc(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_sign;
+/// use stator_js::builtins::math::math_sign;
 ///
 /// assert_eq!(math_sign(5.0), 1.0);
 /// assert_eq!(math_sign(-3.0), -1.0);
@@ -181,7 +181,7 @@ pub fn math_sign(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_max;
+/// use stator_js::builtins::math::math_max;
 ///
 /// assert_eq!(math_max(&[1.0, 3.0, 2.0]), 3.0);
 /// assert_eq!(math_max(&[]), f64::NEG_INFINITY);
@@ -209,7 +209,7 @@ pub fn math_max(values: &[f64]) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_min;
+/// use stator_js::builtins::math::math_min;
 ///
 /// assert_eq!(math_min(&[1.0, 3.0, 2.0]), 1.0);
 /// assert_eq!(math_min(&[]), f64::INFINITY);
@@ -240,7 +240,7 @@ pub fn math_min(values: &[f64]) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_pow;
+/// use stator_js::builtins::math::math_pow;
 ///
 /// assert!((math_pow(2.0, 10.0) - 1024.0).abs() < 1e-10);
 /// assert_eq!(math_pow(4.0, 0.5), 2.0);
@@ -266,7 +266,7 @@ pub fn math_pow(base: f64, exponent: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_sqrt;
+/// use stator_js::builtins::math::math_sqrt;
 ///
 /// assert_eq!(math_sqrt(4.0), 2.0);
 /// assert!(math_sqrt(-1.0).is_nan());
@@ -284,7 +284,7 @@ pub fn math_sqrt(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_cbrt;
+/// use stator_js::builtins::math::math_cbrt;
 ///
 /// assert_eq!(math_cbrt(27.0), 3.0);
 /// assert_eq!(math_cbrt(-8.0), -2.0);
@@ -303,7 +303,7 @@ pub fn math_cbrt(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_hypot;
+/// use stator_js::builtins::math::math_hypot;
 ///
 /// assert_eq!(math_hypot(&[3.0, 4.0]), 5.0);
 /// assert_eq!(math_hypot(&[]), 0.0);
@@ -355,7 +355,7 @@ pub fn math_hypot(values: &[f64]) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_log;
+/// use stator_js::builtins::math::math_log;
 ///
 /// assert!((math_log(std::f64::consts::E) - 1.0).abs() < 1e-15);
 /// assert!(math_log(-1.0).is_nan());
@@ -372,7 +372,7 @@ pub fn math_log(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_log2;
+/// use stator_js::builtins::math::math_log2;
 ///
 /// assert!((math_log2(8.0) - 3.0).abs() < 1e-10);
 /// assert!(math_log2(-1.0).is_nan());
@@ -388,7 +388,7 @@ pub fn math_log2(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_log10;
+/// use stator_js::builtins::math::math_log10;
 ///
 /// assert_eq!(math_log10(1000.0), 3.0);
 /// assert!(math_log10(-1.0).is_nan());
@@ -406,7 +406,7 @@ pub fn math_log10(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_sin;
+/// use stator_js::builtins::math::math_sin;
 ///
 /// assert!((math_sin(0.0) - 0.0).abs() < 1e-15);
 /// ```
@@ -421,7 +421,7 @@ pub fn math_sin(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_cos;
+/// use stator_js::builtins::math::math_cos;
 ///
 /// assert!((math_cos(0.0) - 1.0).abs() < 1e-15);
 /// ```
@@ -436,7 +436,7 @@ pub fn math_cos(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_tan;
+/// use stator_js::builtins::math::math_tan;
 ///
 /// assert!((math_tan(0.0) - 0.0).abs() < 1e-15);
 /// ```
@@ -475,7 +475,7 @@ pub fn math_atan(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_atan2;
+/// use stator_js::builtins::math::math_atan2;
 ///
 /// assert!((math_atan2(1.0, 1.0) - std::f64::consts::FRAC_PI_4).abs() < 1e-15);
 /// ```
@@ -498,7 +498,7 @@ pub fn math_atan2(y: f64, x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_random;
+/// use stator_js::builtins::math::math_random;
 ///
 /// let v = math_random();
 /// assert!((0.0..1.0).contains(&v));
@@ -553,7 +553,7 @@ pub fn math_random() -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_clz32;
+/// use stator_js::builtins::math::math_clz32;
 ///
 /// assert_eq!(math_clz32(1.0), 31);
 /// assert_eq!(math_clz32(1000.0), 22);
@@ -573,7 +573,7 @@ pub fn math_clz32(x: f64) -> u32 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_imul;
+/// use stator_js::builtins::math::math_imul;
 ///
 /// assert_eq!(math_imul(3.0, 4.0), 12);
 /// assert_eq!(math_imul(-5.0, 3.0), -15);
@@ -594,7 +594,7 @@ pub fn math_imul(a: f64, b: f64) -> i32 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_fround;
+/// use stator_js::builtins::math::math_fround;
 ///
 /// assert_eq!(math_fround(1.337), 1.337_f32 as f64);
 /// assert!(math_fround(f64::NAN).is_nan());
@@ -619,7 +619,7 @@ fn to_uint32_number(n: f64) -> u32 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_exp;
+/// use stator_js::builtins::math::math_exp;
 ///
 /// assert!((math_exp(0.0) - 1.0).abs() < 1e-15);
 /// assert!((math_exp(1.0) - std::f64::consts::E).abs() < 1e-14);
@@ -639,7 +639,7 @@ pub fn math_exp(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_expm1;
+/// use stator_js::builtins::math::math_expm1;
 ///
 /// assert!((math_expm1(0.0) - 0.0).abs() < 1e-15);
 /// assert!(math_expm1(f64::NAN).is_nan());
@@ -658,7 +658,7 @@ pub fn math_expm1(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_log1p;
+/// use stator_js::builtins::math::math_log1p;
 ///
 /// assert!((math_log1p(0.0) - 0.0).abs() < 1e-15);
 /// assert_eq!(math_log1p(-1.0), f64::NEG_INFINITY);
@@ -677,7 +677,7 @@ pub fn math_log1p(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_sinh;
+/// use stator_js::builtins::math::math_sinh;
 ///
 /// assert!((math_sinh(0.0) - 0.0).abs() < 1e-15);
 /// ```
@@ -692,7 +692,7 @@ pub fn math_sinh(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_cosh;
+/// use stator_js::builtins::math::math_cosh;
 ///
 /// assert!((math_cosh(0.0) - 1.0).abs() < 1e-15);
 /// ```
@@ -707,7 +707,7 @@ pub fn math_cosh(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_tanh;
+/// use stator_js::builtins::math::math_tanh;
 ///
 /// assert!((math_tanh(0.0) - 0.0).abs() < 1e-15);
 /// ```
@@ -724,7 +724,7 @@ pub fn math_tanh(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_asinh;
+/// use stator_js::builtins::math::math_asinh;
 ///
 /// assert!((math_asinh(0.0) - 0.0).abs() < 1e-15);
 /// ```
@@ -740,7 +740,7 @@ pub fn math_asinh(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_acosh;
+/// use stator_js::builtins::math::math_acosh;
 ///
 /// assert!((math_acosh(1.0) - 0.0).abs() < 1e-15);
 /// assert!(math_acosh(0.5).is_nan());
@@ -757,7 +757,7 @@ pub fn math_acosh(x: f64) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::math::math_atanh;
+/// use stator_js::builtins::math::math_atanh;
 ///
 /// assert!((math_atanh(0.0) - 0.0).abs() < 1e-15);
 /// assert!(math_atanh(2.0).is_nan());

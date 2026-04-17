@@ -1,4 +1,4 @@
-//! `stator_test262` — Test262 conformance runner for the Stator engine.
+//! `stator_js_test262` — Test262 conformance runner for the Stator engine.
 //!
 //! Runs the [tc39/test262](https://github.com/tc39/test262) ECMAScript
 //! conformance suite against the Stator engine and reports pass / fail / skip
@@ -8,7 +8,7 @@
 //! # Usage
 //!
 //! ```text
-//! stator_test262 [OPTIONS]
+//! stator_js_test262 [OPTIONS]
 //!
 //! Options:
 //!   --test262-dir <PATH>   Path to a tc39/test262 checkout [env: TEST262_DIR]
@@ -24,18 +24,18 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use stator_core::builtins::error::clear_call_stack;
-use stator_core::builtins::install_globals::install_globals;
-use stator_core::builtins::promise::drain_active_microtask_queue;
-use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
-use stator_core::error::StatorError;
-use stator_core::interpreter::{
+use stator_js::builtins::error::clear_call_stack;
+use stator_js::builtins::install_globals::install_globals;
+use stator_js::builtins::promise::drain_active_microtask_queue;
+use stator_js::bytecode::bytecode_generator::BytecodeGenerator;
+use stator_js::error::StatorError;
+use stator_js::interpreter::{
     GlobalEnv, Interpreter, InterpreterFrame, clear_interpreter_state, set_execution_deadline,
 };
-use stator_core::objects::property_map::PropertyMap;
-use stator_core::objects::string_intern::clear_intern_pool;
-use stator_core::objects::value::JsValue;
-use stator_core::parser;
+use stator_js::objects::property_map::PropertyMap;
+use stator_js::objects::string_intern::clear_intern_pool;
+use stator_js::objects::value::JsValue;
+use stator_js::parser;
 
 // ─── Guarded global allocator ────────────────────────────────────────────────
 
@@ -741,7 +741,7 @@ fn make_test_globals() -> HashMap<String, JsValue> {
                         JsValue::NativeFunction(f) => f(vec![]),
                         JsValue::PlainObject(map) => {
                             if let Some(call_fn) = map.borrow().get("__call__").cloned() {
-                                stator_core::interpreter::dispatch_call_value(&call_fn, vec![])
+                                stator_js::interpreter::dispatch_call_value(&call_fn, vec![])
                             } else {
                                 Ok(JsValue::Undefined)
                             }
@@ -1250,7 +1250,7 @@ fn parse_args() -> CliArgs {
                         Ok(v) => threshold = v,
                         Err(_) => {
                             eprintln!(
-                                "stator_test262: invalid --threshold value '{}', using 0.0",
+                                "stator_js_test262: invalid --threshold value '{}', using 0.0",
                                 args[i]
                             );
                         }
@@ -1284,7 +1284,9 @@ fn parse_args() -> CliArgs {
                 match raw.parse::<f64>() {
                     Ok(v) => threshold = v,
                     Err(_) => {
-                        eprintln!("stator_test262: invalid --threshold value '{raw}', using 0.0");
+                        eprintln!(
+                            "stator_js_test262: invalid --threshold value '{raw}', using 0.0"
+                        );
                     }
                 }
             }
@@ -1328,11 +1330,11 @@ fn main_inner() {
     // Diagnostic: report stacker's view of remaining stack at startup.
     match stacker::remaining_stack() {
         Some(remaining) => eprintln!(
-            "stator_test262: remaining stack at startup: {} bytes ({:.1} MiB)",
+            "stator_js_test262: remaining stack at startup: {} bytes ({:.1} MiB)",
             remaining,
             remaining as f64 / (1024.0 * 1024.0)
         ),
-        None => eprintln!("stator_test262: remaining_stack() returned None (unknown platform)"),
+        None => eprintln!("stator_js_test262: remaining_stack() returned None (unknown platform)"),
     }
 
     let cli = parse_args();
@@ -1340,7 +1342,7 @@ fn main_inner() {
     let base_dir = match cli.test262_dir {
         Some(d) => d,
         None => {
-            eprintln!("stator_test262: no test262 directory specified.");
+            eprintln!("stator_js_test262: no test262 directory specified.");
             eprintln!("  Use --test262-dir <PATH> or set the TEST262_DIR env var.");
             std::process::exit(1);
         }
@@ -1348,7 +1350,7 @@ fn main_inner() {
 
     if !base_dir.is_dir() {
         eprintln!(
-            "stator_test262: test262 directory not found: {}",
+            "stator_js_test262: test262 directory not found: {}",
             base_dir.display()
         );
         std::process::exit(1);
@@ -1359,7 +1361,7 @@ fn main_inner() {
 
     if !test_dir.is_dir() {
         eprintln!(
-            "stator_test262: 'test' subdirectory not found inside: {}",
+            "stator_js_test262: 'test' subdirectory not found inside: {}",
             base_dir.display()
         );
         std::process::exit(1);
@@ -1368,7 +1370,7 @@ fn main_inner() {
     // ── Collect test files ────────────────────────────────────────────────────
     let mut test_files: Vec<PathBuf> = Vec::new();
     if let Err(e) = collect_tests(&test_dir, &test_dir, &mut test_files) {
-        eprintln!("stator_test262: error reading test directory: {e}");
+        eprintln!("stator_js_test262: error reading test directory: {e}");
         std::process::exit(1);
     }
 
@@ -1378,7 +1380,7 @@ fn main_inner() {
     }
 
     let total = test_files.len();
-    println!("stator_test262: running {total} tests …");
+    println!("stator_js_test262: running {total} tests …");
     let _ = io::stdout().flush();
 
     let mut pass: u64 = 0;
@@ -1397,7 +1399,7 @@ fn main_inner() {
             pass = parts[1].parse().unwrap_or(0);
             fail = parts[2].parse().unwrap_or(0);
             skip = parts[3].parse().unwrap_or(0);
-            println!("stator_test262: resuming with pass={pass} fail={fail} skip={skip}");
+            println!("stator_js_test262: resuming with pass={pass} fail={fail} skip={skip}");
         }
     }
     let run_start = std::time::Instant::now();
@@ -1410,14 +1412,14 @@ fn main_inner() {
     let template_globals = make_test_globals();
     let init_elapsed = run_start.elapsed();
     println!(
-        "stator_test262: globals initialized in {:.1}s",
+        "stator_js_test262: globals initialized in {:.1}s",
         init_elapsed.as_secs_f64()
     );
     let _ = io::stdout().flush();
 
     if cli.skip_first > 0 {
         println!(
-            "stator_test262: skipping first {} tests (crash recovery)",
+            "stator_js_test262: skipping first {} tests (crash recovery)",
             cli.skip_first
         );
     }
@@ -1955,7 +1957,7 @@ mod tests {
 
     #[test]
     fn test_collect_tests_empty_dir() {
-        let tmp = std::env::temp_dir().join("stator_test262_empty_collect_test");
+        let tmp = std::env::temp_dir().join("stator_js_test262_empty_collect_test");
         let _ = std::fs::create_dir_all(&tmp);
         let mut out: Vec<PathBuf> = Vec::new();
         collect_tests(&tmp, &tmp, &mut out).unwrap();
@@ -1965,7 +1967,7 @@ mod tests {
 
     #[test]
     fn test_collect_tests_finds_js() {
-        let tmp = std::env::temp_dir().join("stator_test262_collect_test_finds_js");
+        let tmp = std::env::temp_dir().join("stator_js_test262_collect_test_finds_js");
         let _ = std::fs::create_dir_all(&tmp);
         std::fs::write(tmp.join("a.js"), "var a;").unwrap();
         std::fs::write(tmp.join("b.txt"), "not js").unwrap();

@@ -1,5 +1,5 @@
 [package]
-name = "stator_test262"
+name = "stator_js_test262"
 version = "0.1.0"
 edition = "2024"
 description = "ECMA-262 Test262 conformance harness for the Stator JavaScript engine"
@@ -8,11 +8,11 @@ repository = "https://github.com/telecos/stator"
 publish = false
 
 [[bin]]
-name = "stator_test262"
+name = "stator_js_test262"
 path = "src/main.rs"
 
 [dependencies]
-stator_core.workspace = true
+stator_js.workspace = true
 env_logger.workspace = true
 log.workspace = true
 stacker.workspace = true

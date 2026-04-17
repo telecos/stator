@@ -55,13 +55,13 @@
 //! # Example
 //!
 //! ```
-//! use stator_core::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
-//! use stator_core::bytecode::bytecodes::{encode, Instruction, Opcode, Operand};
-//! use stator_core::bytecode::feedback::{
+//! use stator_js::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
+//! use stator_js::bytecode::bytecodes::{encode, Instruction, Opcode, Operand};
+//! use stator_js::bytecode::feedback::{
 //!     FeedbackMetadata, FeedbackSlotKind, FeedbackVector, InlineCacheState,
 //! };
-//! use stator_core::compiler::maglev::graph_builder::GraphBuilder;
-//! use stator_core::compiler::maglev::ir::ControlNode;
+//! use stator_js::compiler::maglev::graph_builder::GraphBuilder;
+//! use stator_js::compiler::maglev::ir::ControlNode;
 //!
 //! // Build a tiny function: load Smi 1, return.
 //! let instrs = vec![

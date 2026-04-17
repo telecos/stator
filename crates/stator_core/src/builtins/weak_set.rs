@@ -50,8 +50,8 @@ use crate::objects::heap_object::HeapObject;
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::weak_set::{weak_set_new, weak_set_add, weak_set_has};
-/// use stator_core::objects::heap_object::HeapObject;
+/// use stator_js::builtins::weak_set::{weak_set_new, weak_set_add, weak_set_has};
+/// use stator_js::objects::heap_object::HeapObject;
 ///
 /// let mut ws = weak_set_new();
 /// let mut obj = HeapObject::new_null();
@@ -74,7 +74,7 @@ pub struct JsWeakSet {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::weak_set::weak_set_new;
+/// use stator_js::builtins::weak_set::weak_set_new;
 ///
 /// let ws = weak_set_new();
 /// ```
@@ -107,8 +107,8 @@ pub fn weak_set_from_iterable(values: Vec<*mut HeapObject>) -> StatorResult<JsWe
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::weak_set::{weak_set_new, weak_set_add, weak_set_has};
-/// use stator_core::objects::heap_object::HeapObject;
+/// use stator_js::builtins::weak_set::{weak_set_new, weak_set_add, weak_set_has};
+/// use stator_js::objects::heap_object::HeapObject;
 ///
 /// let mut ws = weak_set_new();
 /// let mut obj = HeapObject::new_null();
@@ -136,8 +136,8 @@ pub fn weak_set_add(set: &mut JsWeakSet, value: *mut HeapObject) -> StatorResult
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::weak_set::{weak_set_new, weak_set_add, weak_set_has};
-/// use stator_core::objects::heap_object::HeapObject;
+/// use stator_js::builtins::weak_set::{weak_set_new, weak_set_add, weak_set_has};
+/// use stator_js::objects::heap_object::HeapObject;
 ///
 /// let mut ws = weak_set_new();
 /// let mut obj = HeapObject::new_null();
@@ -163,8 +163,8 @@ pub fn weak_set_has(set: &JsWeakSet, value: *mut HeapObject) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::weak_set::{weak_set_new, weak_set_add, weak_set_delete};
-/// use stator_core::objects::heap_object::HeapObject;
+/// use stator_js::builtins::weak_set::{weak_set_new, weak_set_add, weak_set_delete};
+/// use stator_js::objects::heap_object::HeapObject;
 ///
 /// let mut ws = weak_set_new();
 /// let mut obj = HeapObject::new_null();
@@ -194,10 +194,10 @@ pub fn weak_set_delete(set: &mut JsWeakSet, value: *mut HeapObject) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::weak_set::{
+/// use stator_js::builtins::weak_set::{
 ///     weak_set_new, weak_set_add, weak_set_has, weak_set_remove_object,
 /// };
-/// use stator_core::objects::heap_object::HeapObject;
+/// use stator_js::objects::heap_object::HeapObject;
 ///
 /// let mut ws = weak_set_new();
 /// let mut obj = HeapObject::new_null();

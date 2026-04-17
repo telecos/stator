@@ -1,9 +1,9 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
-use stator_core::interpreter::{Interpreter, InterpreterFrame};
-use stator_core::parser::parse;
+use stator_js::bytecode::bytecode_generator::BytecodeGenerator;
+use stator_js::interpreter::{Interpreter, InterpreterFrame};
+use stator_js::parser::parse;
 
 fuzz_target!(|data: &[u8]| {
     // Accept arbitrary bytes as UTF-8 source (replace invalid sequences).

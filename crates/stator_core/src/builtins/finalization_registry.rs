@@ -88,12 +88,12 @@ struct PlainRegistration {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::finalization_registry::{
+/// use stator_js::builtins::finalization_registry::{
 ///     finalization_registry_new, finalization_registry_register,
 ///     finalization_registry_notify, finalization_registry_drain,
 /// };
-/// use stator_core::objects::heap_object::HeapObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::objects::heap_object::HeapObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut fr = finalization_registry_new();
 /// let mut obj = HeapObject::new_null();
@@ -125,7 +125,7 @@ pub struct JsFinalizationRegistry {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::finalization_registry::finalization_registry_new;
+/// use stator_js::builtins::finalization_registry::finalization_registry_new;
 ///
 /// let fr = finalization_registry_new();
 /// ```
@@ -155,11 +155,11 @@ pub fn finalization_registry_new() -> JsFinalizationRegistry {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::finalization_registry::{
+/// use stator_js::builtins::finalization_registry::{
 ///     finalization_registry_new, finalization_registry_register,
 /// };
-/// use stator_core::objects::heap_object::HeapObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::objects::heap_object::HeapObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut fr = finalization_registry_new();
 /// let mut obj = HeapObject::new_null();
@@ -210,12 +210,12 @@ pub fn finalization_registry_register(
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::finalization_registry::{
+/// use stator_js::builtins::finalization_registry::{
 ///     finalization_registry_new, finalization_registry_register,
 ///     finalization_registry_unregister,
 /// };
-/// use stator_core::objects::heap_object::HeapObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::objects::heap_object::HeapObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut fr = finalization_registry_new();
 /// let mut obj = HeapObject::new_null();
@@ -332,12 +332,12 @@ pub fn finalization_registry_unregister_by_key(
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::finalization_registry::{
+/// use stator_js::builtins::finalization_registry::{
 ///     finalization_registry_new, finalization_registry_register,
 ///     finalization_registry_notify, finalization_registry_drain,
 /// };
-/// use stator_core::objects::heap_object::HeapObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::objects::heap_object::HeapObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut fr = finalization_registry_new();
 /// let mut obj = HeapObject::new_null();
@@ -375,7 +375,7 @@ pub fn finalization_registry_notify(
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::finalization_registry::{
+/// use stator_js::builtins::finalization_registry::{
 ///     finalization_registry_new, finalization_registry_drain,
 /// };
 ///
@@ -402,12 +402,12 @@ pub fn finalization_registry_drain(registry: &mut JsFinalizationRegistry) -> Vec
 /// ```
 /// use std::cell::RefCell;
 /// use std::rc::Rc;
-/// use stator_core::builtins::finalization_registry::{
+/// use stator_js::builtins::finalization_registry::{
 ///     finalization_registry_new, finalization_registry_register_plain,
 ///     finalization_registry_sweep_plain, finalization_registry_drain,
 /// };
-/// use stator_core::objects::property_map::PropertyMap;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::objects::property_map::PropertyMap;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut fr = finalization_registry_new();
 /// let obj = Rc::new(RefCell::new(PropertyMap::new()));
@@ -446,12 +446,12 @@ pub fn finalization_registry_register_plain(
 /// ```
 /// use std::cell::RefCell;
 /// use std::rc::Rc;
-/// use stator_core::builtins::finalization_registry::{
+/// use stator_js::builtins::finalization_registry::{
 ///     finalization_registry_new, finalization_registry_register_plain,
 ///     finalization_registry_unregister_plain,
 /// };
-/// use stator_core::objects::property_map::PropertyMap;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::objects::property_map::PropertyMap;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut fr = finalization_registry_new();
 /// let obj = Rc::new(RefCell::new(PropertyMap::new()));
@@ -485,12 +485,12 @@ pub fn finalization_registry_unregister_plain(
 /// ```
 /// use std::cell::RefCell;
 /// use std::rc::Rc;
-/// use stator_core::builtins::finalization_registry::{
+/// use stator_js::builtins::finalization_registry::{
 ///     finalization_registry_new, finalization_registry_register_plain,
 ///     finalization_registry_sweep_plain, finalization_registry_drain,
 /// };
-/// use stator_core::objects::property_map::PropertyMap;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::objects::property_map::PropertyMap;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut fr = finalization_registry_new();
 /// let obj = Rc::new(RefCell::new(PropertyMap::new()));
@@ -518,7 +518,7 @@ pub fn finalization_registry_sweep_plain(registry: &mut JsFinalizationRegistry) 
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::finalization_registry::{
+/// use stator_js::builtins::finalization_registry::{
 ///     finalization_registry_new, finalization_registry_has_registrations,
 /// };
 ///

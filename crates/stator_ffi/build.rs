@@ -1,4 +1,4 @@
-//! build.rs — cbindgen pipeline for `stator_ffi`.
+//! build.rs — cbindgen pipeline for `stator_js_ffi`.
 //!
 //! Generates `include/stator.h` from the `extern "C"` surface in
 //! `src/lib.rs`.  The header is written to the crate root (not `$OUT_DIR`)

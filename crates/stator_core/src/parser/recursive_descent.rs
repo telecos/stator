@@ -4843,8 +4843,8 @@ impl<'src> Parser<'src> {
 /// # Example
 ///
 /// ```
-/// use stator_core::parser::parse;
-/// use stator_core::parser::ast::{ProgramItem, Stmt};
+/// use stator_js::parser::parse;
+/// use stator_js::parser::ast::{ProgramItem, Stmt};
 ///
 /// let prog = parse("var x = 1 + 2;").unwrap();
 /// assert_eq!(prog.body.len(), 1);
@@ -4873,8 +4873,8 @@ pub fn parse(source: &str) -> StatorResult<Program> {
 /// # Example
 ///
 /// ```
-/// use stator_core::parser::parse_module;
-/// use stator_core::parser::ast::SourceType;
+/// use stator_js::parser::parse_module;
+/// use stator_js::parser::ast::SourceType;
 ///
 /// let prog = parse_module("const x = await fetch('/api');").unwrap();
 /// assert_eq!(prog.source_type, SourceType::Module);
@@ -4903,8 +4903,8 @@ pub fn parse_module(source: &str) -> StatorResult<Program> {
 /// # Example
 ///
 /// ```
-/// use stator_core::parser::parse_script;
-/// use stator_core::parser::ast::SourceType;
+/// use stator_js::parser::parse_script;
+/// use stator_js::parser::ast::SourceType;
 ///
 /// let prog = parse_script("var x = 42;").unwrap();
 /// assert_eq!(prog.source_type, SourceType::Script);

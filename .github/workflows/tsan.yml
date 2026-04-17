@@ -35,11 +35,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-tsan-registry-
 
-      - name: Run TSAN tests – stator_core
+      - name: Run TSAN tests – stator_js
         env:
           TSAN_OPTIONS: "suppressions=${{ github.workspace }}/scripts/tsan.supp"
         run: >
           cargo +nightly test
-          -p stator_core
+          -p stator_js
           -Z build-std
           --target x86_64-unknown-linux-gnu

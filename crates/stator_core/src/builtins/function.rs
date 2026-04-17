@@ -32,15 +32,15 @@ use crate::objects::value::{JsValue, NativeFn};
 ///
 /// ```
 /// use std::rc::Rc;
-/// use stator_core::builtins::function::function_call;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::function::function_call;
+/// use stator_js::objects::value::JsValue;
 ///
 /// // args[0] = thisArg (prepended by function_call), args[1..] = call args
 /// let add = Rc::new(|args: Vec<JsValue>| {
 ///     let a = args.get(1).unwrap_or(&JsValue::Smi(0)).to_number().unwrap();
 ///     let b = args.get(2).unwrap_or(&JsValue::Smi(0)).to_number().unwrap();
 ///     Ok(JsValue::Smi((a + b) as i32))
-/// }) as Rc<dyn Fn(Vec<JsValue>) -> stator_core::error::StatorResult<JsValue>>;
+/// }) as Rc<dyn Fn(Vec<JsValue>) -> stator_js::error::StatorResult<JsValue>>;
 /// let result = function_call(&add, &JsValue::Undefined, &[JsValue::Smi(1), JsValue::Smi(2)]).unwrap();
 /// assert_eq!(result, JsValue::Smi(3));
 /// ```
@@ -67,15 +67,15 @@ pub fn function_call(
 ///
 /// ```
 /// use std::rc::Rc;
-/// use stator_core::builtins::function::function_apply;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::function::function_apply;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let sum = Rc::new(|args: Vec<JsValue>| {
 ///     // args[0] is this_arg, args[1..] are the actual values
 ///     let mut total = 0i32;
 ///     for a in args.iter().skip(1) { total += a.to_number().unwrap() as i32; }
 ///     Ok(JsValue::Smi(total))
-/// }) as Rc<dyn Fn(Vec<JsValue>) -> stator_core::error::StatorResult<JsValue>>;
+/// }) as Rc<dyn Fn(Vec<JsValue>) -> stator_js::error::StatorResult<JsValue>>;
 /// let arr = vec![JsValue::Smi(10), JsValue::Smi(20)];
 /// let result = function_apply(&sum, &JsValue::Undefined, &Some(arr)).unwrap();
 /// assert_eq!(result, JsValue::Smi(30));
@@ -111,14 +111,14 @@ pub fn function_apply(
 ///
 /// ```
 /// use std::rc::Rc;
-/// use stator_core::builtins::function::function_bind;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::function::function_bind;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let add = Rc::new(|args: Vec<JsValue>| {
 ///     let a = args.first().unwrap_or(&JsValue::Smi(0)).to_number().unwrap();
 ///     let b = args.get(1).unwrap_or(&JsValue::Smi(0)).to_number().unwrap();
 ///     Ok(JsValue::Smi((a + b) as i32))
-/// }) as Rc<dyn Fn(Vec<JsValue>) -> stator_core::error::StatorResult<JsValue>>;
+/// }) as Rc<dyn Fn(Vec<JsValue>) -> stator_js::error::StatorResult<JsValue>>;
 /// let bound = function_bind(&add, &JsValue::Undefined, &[JsValue::Smi(10)]);
 /// let result = bound(vec![JsValue::Smi(5)]).unwrap();
 /// assert_eq!(result, JsValue::Smi(15));
@@ -144,7 +144,7 @@ pub fn function_bind(func: &NativeFn, _this_arg: &JsValue, bound_args: &[JsValue
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::function::function_length;
+/// use stator_js::builtins::function::function_length;
 ///
 /// assert_eq!(function_length(3, 1), 2);
 /// assert_eq!(function_length(1, 5), 0);
@@ -162,7 +162,7 @@ pub fn function_length(target_length: u32, bound_arg_count: u32) -> u32 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::function::function_bound_name;
+/// use stator_js::builtins::function::function_bound_name;
 ///
 /// assert_eq!(function_bound_name("foo"), "bound foo");
 /// assert_eq!(function_bound_name(""), "bound ");
@@ -183,8 +183,8 @@ pub fn function_bound_name(target_name: &str) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::function::function_has_instance;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::function::function_has_instance;
+/// use stator_js::objects::value::JsValue;
 ///
 /// assert!(!function_has_instance(&JsValue::Undefined, &JsValue::Smi(42)));
 /// ```
@@ -225,7 +225,7 @@ pub fn function_has_instance(constructor: &JsValue, value: &JsValue) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::function::function_to_string;
+/// use stator_js::builtins::function::function_to_string;
 ///
 /// assert_eq!(function_to_string("foo"), "function foo() { [native code] }");
 /// assert_eq!(function_to_string(""), "function () { [native code] }");
@@ -246,7 +246,7 @@ pub fn function_to_string(name: &str) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::function::function_dynamic_to_string;
+/// use stator_js::builtins::function::function_dynamic_to_string;
 ///
 /// assert_eq!(
 ///     function_dynamic_to_string(&["a", "b"], "return a+b"),
@@ -269,8 +269,8 @@ pub fn function_dynamic_to_string(params: &[&str], body: &str) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::function::function_constructor;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::function::function_constructor;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let result = function_constructor(&[
 ///     JsValue::String("a".into()),

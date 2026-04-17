@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use stator_core::parser::scanner::Scanner;
+use stator_js::parser::scanner::Scanner;
 
 fuzz_target!(|data: &[u8]| {
     // Convert raw bytes to a string — invalid UTF-8 is silently replaced so
@@ -12,7 +12,7 @@ fuzz_target!(|data: &[u8]| {
     // panic regardless of the input.
     let mut scanner = Scanner::new(&source);
     while let Ok(tok) = scanner.next_token() {
-        use stator_core::parser::scanner::TokenKind;
+        use stator_js::parser::scanner::TokenKind;
         if tok.kind == TokenKind::Eof {
             break;
         }

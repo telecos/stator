@@ -1,5 +1,5 @@
 [package]
-name = "stator_ffi"
+name = "stator_js_ffi"
 version = "0.1.0"
 edition = "2024"
 description = "Stator JavaScript engine — stable C FFI layer for embedding"
@@ -12,7 +12,7 @@ categories = ["compilers", "external-ffi-bindings"]
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-stator_core.workspace = true
+stator_js.workspace = true
 log.workspace = true
 
 [build-dependencies]

@@ -1,6 +1,6 @@
-use stator_core::bytecode::bytecodes::{Instruction, Operand};
-use stator_core::interpreter::InterpreterFrame;
-use stator_core::objects::value::JsValue;
+use stator_js::bytecode::bytecodes::{Instruction, Operand};
+use stator_js::interpreter::InterpreterFrame;
+use stator_js::objects::value::JsValue;
 use std::mem::size_of;
 
 fn main() {

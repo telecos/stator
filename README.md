@@ -49,13 +49,13 @@ it already **beats V8 (Node.js)** while maintaining full spec compliance:
 └───────────────────┬──────────────────────┘
                     │  C ABI  (stator.h)
 ┌───────────────────▼──────────────────────┐
-│              stator_ffi                  │
+│              stator_js_ffi                  │
 │  cdylib / staticlib — opaque C handles   │
 │  stator_isolate_create / _gc / _destroy  │
 └───────────────────┬──────────────────────┘
                     │  Rust rlib
 ┌───────────────────▼──────────────────────┐
-│             stator_core                  │
+│             stator_js                  │
 │  Parser · Bytecode · Maglev JIT · GC     │
 │  Interpreter · IC · Objects · Heap       │
 └──────────────────────────────────────────┘
@@ -65,10 +65,10 @@ it already **beats V8 (Node.js)** while maintaining full spec compliance:
 
 | Crate              | Type               | Purpose                                          |
 |--------------------|--------------------|--------------------------------------------------|
-| `stator_core`      | rlib               | Engine internals — parser, bytecode compiler, Maglev JIT, interpreter, GC, heap, objects |
-| `stator_ffi`       | cdylib + staticlib | Stable C API for embedders                       |
+| `stator_js`      | rlib               | Engine internals — parser, bytecode compiler, Maglev JIT, interpreter, GC, heap, objects |
+| `stator_js_ffi`       | cdylib + staticlib | Stable C API for embedders                       |
 | `st8`              | bin                | Interactive JavaScript shell (like V8's `d8`)    |
-| `stator_test262`   | bin                | ECMA-262 Test262 conformance harness             |
+| `stator_js_test262`   | bin                | ECMA-262 Test262 conformance harness             |
 
 ### Execution pipeline
 
@@ -113,9 +113,9 @@ cargo build --release
 
 The C FFI artifacts are written to:
 
-- `target/release/libstator_ffi.a` — static library (Linux / macOS)
-- `target/release/libstator_ffi.so` — shared library (Linux)
-- `target/release/stator_ffi.lib` / `stator_ffi.dll` — Windows equivalents
+- `target/release/libstator_js_ffi.a` — static library (Linux / macOS)
+- `target/release/libstator_js_ffi.so` — shared library (Linux)
+- `target/release/stator_js_ffi.lib` / `stator_js_ffi.dll` — Windows equivalents
 
 ## Test
 
@@ -124,14 +124,14 @@ The C FFI artifacts are written to:
 cargo test
 
 # Run ECMA-262 Test262 conformance suite
-cargo run --release --bin stator_test262
+cargo run --release --bin stator_js_test262
 ```
 
 ## Benchmarks
 
 ```sh
 # Run the benchmark suite (requires release mode)
-cargo bench -p stator_core
+cargo bench -p stator_js
 ```
 
 Benchmarks compare Stator's JIT output against V8 (Node.js) on the same

@@ -1702,7 +1702,7 @@ dependencies = [
  "env_logger",
  "log",
  "serde_json",
- "stator_core",
+ "stator_js",
  "tungstenite",
 ]
 
@@ -1726,7 +1726,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "stator_core"
+name = "stator_js"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
@@ -1754,22 +1754,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "stator_ffi"
+name = "stator_js_ffi"
 version = "0.1.0"
 dependencies = [
  "cbindgen",
  "log",
- "stator_core",
+ "stator_js",
 ]
 
 [[package]]
-name = "stator_test262"
+name = "stator_js_test262"
 version = "0.1.0"
 dependencies = [
  "env_logger",
  "log",
  "stacker",
- "stator_core",
+ "stator_js",
 ]
 
 [[package]]

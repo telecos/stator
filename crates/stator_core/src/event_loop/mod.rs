@@ -181,8 +181,8 @@ impl EmbedderCallbacks for DefaultCallbacks {
 /// # Example
 ///
 /// ```
-/// use stator_core::builtins::promise::MicrotaskQueue;
-/// use stator_core::event_loop::{DefaultCallbacks, EventLoop};
+/// use stator_js::builtins::promise::MicrotaskQueue;
+/// use stator_js::event_loop::{DefaultCallbacks, EventLoop};
 ///
 /// let mtq = MicrotaskQueue::new();
 /// let mut el = EventLoop::new(mtq.clone(), Box::new(DefaultCallbacks));

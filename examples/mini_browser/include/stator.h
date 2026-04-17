@@ -1,8 +1,8 @@
 /**
  * stator.h — Public C API for the Stator JavaScript engine.
  *
- * This header mirrors the symbols exported by `crates/stator_ffi`.  Link
- * against `libstator_ffi.a` (static) or `libstator_ffi.so` / `stator_ffi.dll`
+ * This header mirrors the symbols exported by `crates/stator_js_ffi`.  Link
+ * against `libstator_js_ffi.a` (static) or `libstator_js_ffi.so` / `stator_js_ffi.dll`
  * (dynamic) to use this API.
  *
  * Ownership model

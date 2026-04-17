@@ -102,8 +102,8 @@ type IndexedSetterRef<'a> = Option<&'a dyn Fn(u32, &JsValue, *mut c_void) -> Ind
 /// # Example
 ///
 /// ```
-/// use stator_core::dom::NamedPropertyHandlerConfig;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::dom::NamedPropertyHandlerConfig;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let cfg = NamedPropertyHandlerConfig::builder()
 ///     .getter(|name, _data| {
@@ -234,8 +234,8 @@ impl NamedPropertyHandlerConfigBuilder {
 /// # Example
 ///
 /// ```
-/// use stator_core::dom::IndexedPropertyHandlerConfig;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::dom::IndexedPropertyHandlerConfig;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let cfg = IndexedPropertyHandlerConfig::builder()
 ///     .getter(|index, _data| {
@@ -375,8 +375,8 @@ pub const MAX_INTERNAL_FIELDS: usize = 16;
 /// # Example
 ///
 /// ```
-/// use stator_core::dom::DomObjectWrap;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::dom::DomObjectWrap;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut wrap = DomObjectWrap::new(2); // 2 internal fields
 /// assert_eq!(wrap.internal_field_count(), 2);
@@ -652,7 +652,7 @@ pub type DomWeakCallback = Box<dyn FnOnce(*mut c_void)>;
 /// ```
 /// use std::cell::Cell;
 /// use std::rc::Rc;
-/// use stator_core::dom::{DomObjectWrap, DomWeakRef};
+/// use stator_js::dom::{DomObjectWrap, DomWeakRef};
 ///
 /// let wrap = DomObjectWrap::new(1);
 /// let invoked = Rc::new(Cell::new(false));

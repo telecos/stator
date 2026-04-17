@@ -1,8 +1,8 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use stator_core::objects::js_object::JsObject;
-use stator_core::objects::value::JsValue;
+use stator_js::objects::js_object::JsObject;
+use stator_js::objects::value::JsValue;
 
 fuzz_target!(|data: &[u8]| {
     // Drive random property set/get/delete operations on a JsObject and verify:
@@ -93,7 +93,7 @@ fuzz_target!(|data: &[u8]| {
         if obj.is_fast_mode() {
             assert!(
                 obj.map().descriptors().len()
-                    <= stator_core::objects::js_object::MAX_FAST_PROPERTIES,
+                    <= stator_js::objects::js_object::MAX_FAST_PROPERTIES,
                 "fast-mode map must not exceed MAX_FAST_PROPERTIES descriptors"
             );
         }

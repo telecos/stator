@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use stator_core::builtins::global::global_eval;
+use stator_js::builtins::global::global_eval;
 
 fuzz_target!(|data: &[u8]| {
     // Accept arbitrary bytes as UTF-8 source (replace invalid sequences).

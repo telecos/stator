@@ -22,7 +22,7 @@
 use std::ffi::{CStr, CString};
 
 use libfuzzer_sys::fuzz_target;
-use stator_ffi::{
+use stator_js_ffi::{
     stator_context_destroy, stator_context_new,
     stator_isolate_dispose, stator_isolate_new,
     stator_object_delete, stator_object_get, stator_object_get_property_names,
@@ -200,10 +200,10 @@ fuzz_target!(|data: &[u8]| {
 /// Create a `StatorValue` of the given type.  Returns the pointer and a
 /// string representation of the value for round-trip verification.
 fn make_value(
-    iso: *mut stator_ffi::StatorIsolate,
+    iso: *mut stator_js_ffi::StatorIsolate,
     sel: u8,
     payload: u8,
-) -> (*mut stator_ffi::StatorValue, String) {
+) -> (*mut stator_js_ffi::StatorValue, String) {
     unsafe {
         match sel {
             0 => (stator_value_new_undefined(iso), String::new()),

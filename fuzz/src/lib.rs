@@ -1,13 +1,13 @@
 //! Shared helpers for parser and bytecode fuzz targets.
 //!
 //! This library is only compiled as part of the `stator-fuzz` package and must
-//! not be used from the main `stator_core` crate.
+//! not be used from the main `stator_js` crate.
 
-use stator_core::parser::ast::{
+use stator_js::parser::ast::{
     BinaryExpr, BinaryOp, BoolLit, Expr, ExprStmt, Ident, IfStmt, NullLit, NumLit, Pat, Program,
     ProgramItem, ReturnStmt, SourceType, Stmt, StringLit, VarDecl, VarDeclarator, VarKind,
 };
-use stator_core::parser::scanner::{Position, Span};
+use stator_js::parser::scanner::{Position, Span};
 
 /// Returns a zero-offset dummy [`Span`] suitable for all AST node `loc` fields
 /// in synthesised programs.

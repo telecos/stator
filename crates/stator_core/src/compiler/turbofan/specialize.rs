@@ -57,13 +57,13 @@
 //! # Usage
 //!
 //! ```
-//! use stator_core::bytecode::feedback::{
+//! use stator_js::bytecode::feedback::{
 //!     FeedbackMetadata, FeedbackSlotKind, FeedbackVector, InlineCacheState,
 //! };
-//! use stator_core::compiler::maglev::ir::{
+//! use stator_js::compiler::maglev::ir::{
 //!     BasicBlock, ControlNode, MaglevGraph, ValueNode,
 //! };
-//! use stator_core::compiler::turbofan::specialize::run_pre_clif_passes;
+//! use stator_js::compiler::turbofan::specialize::run_pre_clif_passes;
 //!
 //! // Build a graph with a GenericAdd at feedback slot 0.
 //! let mut graph = MaglevGraph::new(0);

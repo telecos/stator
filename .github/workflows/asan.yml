@@ -39,9 +39,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-asan-registry-
 
-      - name: Run ASAN tests – stator_ffi
+      - name: Run ASAN tests – stator_js_ffi
         run: >
           cargo +nightly test
-          -p stator_ffi
+          -p stator_js_ffi
           -Z build-std
           --target x86_64-unknown-linux-gnu

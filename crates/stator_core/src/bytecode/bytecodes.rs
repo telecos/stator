@@ -36,7 +36,7 @@
 //! # Example
 //!
 //! ```
-//! use stator_core::bytecode::bytecodes::{
+//! use stator_js::bytecode::bytecodes::{
 //!     Instruction, Operand, Opcode, encode, decode,
 //! };
 //!

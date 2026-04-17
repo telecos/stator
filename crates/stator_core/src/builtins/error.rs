@@ -255,8 +255,8 @@ pub fn capture_stack_trace(error_name: &str, message: &str) -> String {
 /// # Example
 ///
 /// ```
-/// use stator_core::builtins::error::{error_capture_stack_trace, JsError};
-/// let mut err = JsError::new(stator_core::builtins::error::ErrorKind::Error, "oops".to_string());
+/// use stator_js::builtins::error::{error_capture_stack_trace, JsError};
+/// let mut err = JsError::new(stator_js::builtins::error::ErrorKind::Error, "oops".to_string());
 /// error_capture_stack_trace(&mut err, None);
 /// assert!(err.stack().starts_with("Error: oops"));
 /// ```
@@ -296,7 +296,7 @@ impl ErrorKind {
     /// Return the ECMAScript `name` property string for this error kind.
     ///
     /// ```
-    /// use stator_core::builtins::error::ErrorKind;
+    /// use stator_js::builtins::error::ErrorKind;
     /// assert_eq!(ErrorKind::TypeError.as_name(), "TypeError");
     /// assert_eq!(ErrorKind::AggregateError.as_name(), "AggregateError");
     /// ```
@@ -370,7 +370,7 @@ impl JsError {
     /// # Examples
     ///
     /// ```
-    /// use stator_core::builtins::error::{JsError, ErrorKind};
+    /// use stator_js::builtins::error::{JsError, ErrorKind};
     ///
     /// let e = JsError::new(ErrorKind::TypeError, "not a function".to_string());
     /// assert_eq!(e.name(), "TypeError");
@@ -398,8 +398,8 @@ impl JsError {
     ///
     /// ```
     /// use std::rc::Rc;
-    /// use stator_core::builtins::error::{JsError, ErrorKind};
-    /// use stator_core::objects::value::JsValue;
+    /// use stator_js::builtins::error::{JsError, ErrorKind};
+    /// use stator_js::objects::value::JsValue;
     ///
     /// let e1 = JsValue::Error(Rc::new(JsError::new(ErrorKind::TypeError, "bad type".to_string())));
     /// let e2 = JsValue::Smi(42);
@@ -446,8 +446,8 @@ impl JsError {
     /// # Examples
     ///
     /// ```
-    /// use stator_core::builtins::error::{JsError, ErrorKind};
-    /// use stator_core::objects::value::JsValue;
+    /// use stator_js::builtins::error::{JsError, ErrorKind};
+    /// use stator_js::objects::value::JsValue;
     ///
     /// let inner = JsValue::String("disk full".to_string().into());
     /// let e = JsError::new(ErrorKind::Error, "write failed".to_string())
@@ -466,7 +466,7 @@ impl JsError {
     /// Respects user-set overrides in the property overlay.
     ///
     /// ```
-    /// use stator_core::builtins::error::{JsError, ErrorKind};
+    /// use stator_js::builtins::error::{JsError, ErrorKind};
     ///
     /// let e = JsError::new(ErrorKind::RangeError, "index out of bounds".to_string());
     /// assert_eq!(e.to_error_string(), "RangeError: index out of bounds");
@@ -507,7 +507,7 @@ impl JsError {
 /// Create a new `Error` object.
 ///
 /// ```
-/// use stator_core::builtins::error::{error_new, ErrorKind};
+/// use stator_js::builtins::error::{error_new, ErrorKind};
 /// let e = error_new("something went wrong".to_string());
 /// assert_eq!(e.kind, ErrorKind::Error);
 /// ```
@@ -518,7 +518,7 @@ pub fn error_new(message: String) -> JsError {
 /// Create a new `TypeError` object.
 ///
 /// ```
-/// use stator_core::builtins::error::{type_error_new, ErrorKind};
+/// use stator_js::builtins::error::{type_error_new, ErrorKind};
 /// let e = type_error_new("not a function".to_string());
 /// assert_eq!(e.kind, ErrorKind::TypeError);
 /// ```
@@ -529,7 +529,7 @@ pub fn type_error_new(message: String) -> JsError {
 /// Create a new `RangeError` object.
 ///
 /// ```
-/// use stator_core::builtins::error::{range_error_new, ErrorKind};
+/// use stator_js::builtins::error::{range_error_new, ErrorKind};
 /// let e = range_error_new("stack overflow".to_string());
 /// assert_eq!(e.kind, ErrorKind::RangeError);
 /// ```
@@ -540,7 +540,7 @@ pub fn range_error_new(message: String) -> JsError {
 /// Create a new `ReferenceError` object.
 ///
 /// ```
-/// use stator_core::builtins::error::{reference_error_new, ErrorKind};
+/// use stator_js::builtins::error::{reference_error_new, ErrorKind};
 /// let e = reference_error_new("x is not defined".to_string());
 /// assert_eq!(e.kind, ErrorKind::ReferenceError);
 /// ```
@@ -551,7 +551,7 @@ pub fn reference_error_new(message: String) -> JsError {
 /// Create a new `SyntaxError` object.
 ///
 /// ```
-/// use stator_core::builtins::error::{syntax_error_new, ErrorKind};
+/// use stator_js::builtins::error::{syntax_error_new, ErrorKind};
 /// let e = syntax_error_new("unexpected token '}'".to_string());
 /// assert_eq!(e.kind, ErrorKind::SyntaxError);
 /// ```
@@ -562,7 +562,7 @@ pub fn syntax_error_new(message: String) -> JsError {
 /// Create a new `URIError` object.
 ///
 /// ```
-/// use stator_core::builtins::error::{uri_error_new, ErrorKind};
+/// use stator_js::builtins::error::{uri_error_new, ErrorKind};
 /// let e = uri_error_new("malformed URI sequence".to_string());
 /// assert_eq!(e.kind, ErrorKind::URIError);
 /// ```
@@ -573,7 +573,7 @@ pub fn uri_error_new(message: String) -> JsError {
 /// Create a new `EvalError` object.
 ///
 /// ```
-/// use stator_core::builtins::error::{eval_error_new, ErrorKind};
+/// use stator_js::builtins::error::{eval_error_new, ErrorKind};
 /// let e = eval_error_new("eval is not supported".to_string());
 /// assert_eq!(e.kind, ErrorKind::EvalError);
 /// ```
@@ -585,8 +585,8 @@ pub fn eval_error_new(message: String) -> JsError {
 ///
 /// ```
 /// use std::rc::Rc;
-/// use stator_core::builtins::error::{aggregate_error_new, type_error_new, ErrorKind};
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::error::{aggregate_error_new, type_error_new, ErrorKind};
+/// use stator_js::objects::value::JsValue;
 /// let inner = JsValue::Error(Rc::new(type_error_new("bad type".to_string())));
 /// let e = aggregate_error_new(vec![inner], "All promises rejected".to_string());
 /// assert_eq!(e.kind, ErrorKind::AggregateError);

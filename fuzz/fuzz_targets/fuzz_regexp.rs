@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use stator_core::builtins::string::{string_match, string_match_all};
+use stator_js::builtins::string::{string_match, string_match_all};
 
 fuzz_target!(|data: &[u8]| {
     // Need at least 2 bytes: one length byte for the pattern, then the rest.

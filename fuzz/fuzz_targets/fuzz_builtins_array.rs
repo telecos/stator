@@ -1,14 +1,14 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use stator_core::builtins::array::{
+use stator_js::builtins::array::{
     array_concat, array_every, array_filter, array_find, array_find_index, array_for_each,
     array_from, array_includes, array_index_of, array_join, array_map, array_pop, array_push,
     array_reduce, array_reverse, array_shift, array_slice, array_some, array_sort, array_splice,
     array_unshift,
 };
-use stator_core::objects::js_array::JsArray;
-use stator_core::objects::value::JsValue;
+use stator_js::objects::js_array::JsArray;
+use stator_js::objects::value::JsValue;
 
 /// Build a [`JsValue`] leaf from a single byte selector.
 fn make_value(sel: u8) -> JsValue {

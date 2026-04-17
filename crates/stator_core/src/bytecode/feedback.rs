@@ -22,7 +22,7 @@
 //! # Example
 //!
 //! ```
-//! use stator_core::bytecode::feedback::{
+//! use stator_js::bytecode::feedback::{
 //!     FeedbackMetadata, FeedbackSlotKind, FeedbackVector, InlineCacheState,
 //! };
 //!

@@ -12,7 +12,7 @@
 //! for any valid operation ordering.
 
 use libfuzzer_sys::fuzz_target;
-use stator_ffi::{
+use stator_js_ffi::{
     stator_context_destroy, stator_context_enter, stator_context_exit, stator_context_new,
     stator_isolate_dispose, stator_isolate_enter, stator_isolate_exit, stator_isolate_gc,
     stator_isolate_get_current_context, stator_isolate_get_data, stator_isolate_new,
@@ -41,7 +41,7 @@ fuzz_target!(|data: &[u8]| {
 
     let mut isolates = Vec::new();
     // index of "current" isolate (last created)
-    let mut ctx_stack: Vec<*mut stator_ffi::StatorContext> = Vec::new();
+    let mut ctx_stack: Vec<*mut stator_js_ffi::StatorContext> = Vec::new();
 
     for &byte in data {
         let op = byte & 0x0f;

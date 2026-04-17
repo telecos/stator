@@ -57,9 +57,9 @@ pub(crate) enum WeakTarget {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::weak_ref::{weak_ref_new, weak_ref_deref};
-/// use stator_core::objects::heap_object::HeapObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::weak_ref::{weak_ref_new, weak_ref_deref};
+/// use stator_js::objects::heap_object::HeapObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut obj = HeapObject::new_null();
 /// let wr = weak_ref_new(&raw mut obj).unwrap();
@@ -83,8 +83,8 @@ pub struct JsWeakRef {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::weak_ref::weak_ref_new;
-/// use stator_core::objects::heap_object::HeapObject;
+/// use stator_js::builtins::weak_ref::weak_ref_new;
+/// use stator_js::objects::heap_object::HeapObject;
 ///
 /// let mut obj = HeapObject::new_null();
 /// let wr = weak_ref_new(&raw mut obj).unwrap();
@@ -112,9 +112,9 @@ pub fn weak_ref_new(target: *mut HeapObject) -> StatorResult<JsWeakRef> {
 /// ```
 /// use std::cell::RefCell;
 /// use std::rc::Rc;
-/// use stator_core::builtins::weak_ref::{weak_ref_new_plain, weak_ref_deref};
-/// use stator_core::objects::property_map::PropertyMap;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::weak_ref::{weak_ref_new_plain, weak_ref_deref};
+/// use stator_js::objects::property_map::PropertyMap;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let obj = Rc::new(RefCell::new(PropertyMap::new()));
 /// let wr = weak_ref_new_plain(&obj);
@@ -137,9 +137,9 @@ pub fn weak_ref_new_plain(rc: &Rc<RefCell<PropertyMap>>) -> JsWeakRef {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::symbol::symbol_create;
-/// use stator_core::builtins::weak_ref::{weak_ref_deref, weak_ref_new_symbol};
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::symbol::symbol_create;
+/// use stator_js::builtins::weak_ref::{weak_ref_deref, weak_ref_new_symbol};
+/// use stator_js::objects::value::JsValue;
 ///
 /// let symbol_id = symbol_create(Some("local".into()));
 /// let wr = weak_ref_new_symbol(symbol_id).unwrap();
@@ -170,9 +170,9 @@ pub fn weak_ref_new_symbol(symbol_id: u64) -> StatorResult<JsWeakRef> {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::weak_ref::{weak_ref_new, weak_ref_deref};
-/// use stator_core::objects::heap_object::HeapObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::weak_ref::{weak_ref_new, weak_ref_deref};
+/// use stator_js::objects::heap_object::HeapObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut obj = HeapObject::new_null();
 /// let wr = weak_ref_new(&raw mut obj).unwrap();
@@ -202,9 +202,9 @@ pub fn weak_ref_deref(wr: &JsWeakRef) -> JsValue {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::weak_ref::{weak_ref_new, weak_ref_deref, weak_ref_clear};
-/// use stator_core::objects::heap_object::HeapObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::weak_ref::{weak_ref_new, weak_ref_deref, weak_ref_clear};
+/// use stator_js::objects::heap_object::HeapObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut obj = HeapObject::new_null();
 /// let mut wr = weak_ref_new(&raw mut obj).unwrap();
@@ -234,8 +234,8 @@ pub fn weak_ref_clear(wr: &mut JsWeakRef) {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::weak_ref::{weak_ref_new, weak_ref_has_target, weak_ref_clear};
-/// use stator_core::objects::heap_object::HeapObject;
+/// use stator_js::builtins::weak_ref::{weak_ref_new, weak_ref_has_target, weak_ref_clear};
+/// use stator_js::objects::heap_object::HeapObject;
 ///
 /// let mut obj = HeapObject::new_null();
 /// let mut wr = weak_ref_new(&raw mut obj).unwrap();

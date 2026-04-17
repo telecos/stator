@@ -1,6 +1,6 @@
 //! Criterion benchmarks for core engine operations.
 //!
-//! Run with: `cargo bench --package stator_core`
+//! Run with: `cargo bench --package stator_js`
 //!
 //! ## Benchmark categories
 //!
@@ -22,7 +22,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 
 use criterion::{Criterion, criterion_group};
-use stator_core::compiler::baseline::compiler::{
+use stator_js::compiler::baseline::compiler::{
     STUB_DEOPT_SLOTS, STUB_NAMES, reset_stub_deopt_counts, stub_deopt_counts,
 };
 
@@ -34,16 +34,16 @@ fn ci_config() -> Criterion {
         .sample_size(10)
 }
 
-use stator_core::bytecode::bytecode_array::BytecodeArray;
-use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
-use stator_core::error::StatorResult;
-use stator_core::gc::handle::HandleScope;
-use stator_core::gc::heap::{Heap, HeapObject};
-use stator_core::interpreter::{GlobalEnv, Interpreter, InterpreterFrame};
-use stator_core::objects::property_map::PropertyMap;
-use stator_core::objects::tagged::TaggedValue;
-use stator_core::objects::value::JsValue;
-use stator_core::parser::recursive_descent;
+use stator_js::bytecode::bytecode_array::BytecodeArray;
+use stator_js::bytecode::bytecode_generator::BytecodeGenerator;
+use stator_js::error::StatorResult;
+use stator_js::gc::handle::HandleScope;
+use stator_js::gc::heap::{Heap, HeapObject};
+use stator_js::interpreter::{GlobalEnv, Interpreter, InterpreterFrame};
+use stator_js::objects::property_map::PropertyMap;
+use stator_js::objects::tagged::TaggedValue;
+use stator_js::objects::value::JsValue;
+use stator_js::parser::recursive_descent;
 
 /// Create a shared [`GlobalEnv`] with builtins pre-installed.
 ///
@@ -53,7 +53,7 @@ use stator_core::parser::recursive_descent;
 /// the ~3 ms cost of `install_globals()` on every iteration.
 fn make_global_env() -> Rc<RefCell<GlobalEnv>> {
     let mut env = GlobalEnv::new();
-    stator_core::builtins::install_globals::install_globals(&mut env.vars);
+    stator_js::builtins::install_globals::install_globals(&mut env.vars);
     env.rebuild_slots();
     env.globals_installed = true;
     Rc::new(RefCell::new(env))
@@ -805,9 +805,9 @@ fn main() {
     clear_eval_cache();
 
     // Drain interpreter pools (FRAME_POOL, REGISTER_POOL, etc.)
-    stator_core::interpreter::clear_interpreter_state();
+    stator_js::interpreter::clear_interpreter_state();
 
     // Full JIT teardown: releases leaked Rc in callee caches,
     // clears RT_CONTEXT/RT_GLOBAL, and drains property-map pools.
-    stator_core::compiler::baseline::compiler::jit_full_teardown();
+    stator_js::compiler::baseline::compiler::jit_full_teardown();
 }

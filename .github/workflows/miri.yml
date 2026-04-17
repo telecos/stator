@@ -53,10 +53,10 @@ jobs:
         env:
           MIRIFLAGS: "-Zmiri-preemption-rate=0.1"
         run: |
-          cargo +nightly miri test -p stator_core -- gc:: objects:: bytecode::
+          cargo +nightly miri test -p stator_js -- gc:: objects:: bytecode::
 
       - name: Run Miri tests – Tree Borrows
         env:
           MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-preemption-rate=0.1"
         run: |
-          cargo +nightly miri test -p stator_core -- gc:: objects:: bytecode::
+          cargo +nightly miri test -p stator_js -- gc:: objects:: bytecode::

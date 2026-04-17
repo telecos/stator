@@ -22,7 +22,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use stator_core::inspector::profiler::CpuProfiler;
+//! use stator_js::inspector::profiler::CpuProfiler;
 //!
 //! let mut profiler = CpuProfiler::new();
 //! profiler.start(1_000).unwrap(); // sample every 1 ms

@@ -476,7 +476,7 @@ fn slash_is_regexp(last: Option<&TokenKind>) -> bool {
 /// # Example
 ///
 /// ```
-/// use stator_core::parser::scanner::{Scanner, TokenKind};
+/// use stator_js::parser::scanner::{Scanner, TokenKind};
 ///
 /// let mut sc = Scanner::new("let x = 42;");
 /// loop {

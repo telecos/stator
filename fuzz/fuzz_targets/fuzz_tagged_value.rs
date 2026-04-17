@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use stator_core::objects::tagged::TaggedValue;
+use stator_js::objects::tagged::TaggedValue;
 
 fuzz_target!(|data: &[u8]| {
     // We need at least 1 byte to drive the test.

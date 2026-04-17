@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use stator_core::builtins::json::{json_parse, json_stringify, JsonSpace};
+use stator_js::builtins::json::{json_parse, json_stringify, JsonSpace};
 
 fuzz_target!(|data: &[u8]| {
     // Treat the raw bytes as a JSON text candidate (RFC 8259 §8.1 allows UTF-8).

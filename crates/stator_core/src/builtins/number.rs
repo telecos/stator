@@ -56,7 +56,7 @@ pub const NUMBER_NAN: f64 = f64::NAN;
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::number::number_is_finite;
+/// use stator_js::builtins::number::number_is_finite;
 ///
 /// assert!(number_is_finite(42.0));
 /// assert!(!number_is_finite(f64::INFINITY));
@@ -76,7 +76,7 @@ pub fn number_is_finite(value: f64) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::number::number_is_integer;
+/// use stator_js::builtins::number::number_is_integer;
 ///
 /// assert!(number_is_integer(42.0));
 /// assert!(number_is_integer(-7.0));
@@ -99,7 +99,7 @@ pub fn number_is_integer(value: f64) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::number::number_is_nan;
+/// use stator_js::builtins::number::number_is_nan;
 ///
 /// assert!(number_is_nan(f64::NAN));
 /// assert!(!number_is_nan(42.0));
@@ -119,7 +119,7 @@ pub fn number_is_nan(value: f64) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::number::{number_is_safe_integer, NUMBER_MAX_SAFE_INTEGER};
+/// use stator_js::builtins::number::{number_is_safe_integer, NUMBER_MAX_SAFE_INTEGER};
 ///
 /// assert!(number_is_safe_integer(0.0));
 /// assert!(number_is_safe_integer(NUMBER_MAX_SAFE_INTEGER));
@@ -141,7 +141,7 @@ pub fn number_is_safe_integer(value: f64) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::number::number_parse_int;
+/// use stator_js::builtins::number::number_parse_int;
 ///
 /// assert_eq!(number_parse_int("42", 10), 42.0);
 /// assert_eq!(number_parse_int("0xff", 0), 255.0);
@@ -206,7 +206,7 @@ pub fn number_parse_int(string: &str, radix: i32) -> f64 {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::number::number_parse_float;
+/// use stator_js::builtins::number::number_parse_float;
 ///
 /// assert_eq!(number_parse_float("3.14"), 3.14);
 /// assert_eq!(number_parse_float("  -2.5  "), -2.5);
@@ -298,7 +298,7 @@ fn float_prefix_end(s: &str) -> usize {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::number::number_to_fixed;
+/// use stator_js::builtins::number::number_to_fixed;
 ///
 /// assert_eq!(number_to_fixed(3.14159, 2).unwrap(), "3.14");
 /// assert_eq!(number_to_fixed(1.0, 0).unwrap(), "1");
@@ -504,7 +504,7 @@ fn format_fixed_digits(integer: BigUint, digits: u32) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::number::number_to_precision;
+/// use stator_js::builtins::number::number_to_precision;
 ///
 /// assert_eq!(number_to_precision(123.456, 5).unwrap(), "123.46");
 /// assert_eq!(number_to_precision(0.000123, 2).unwrap(), "0.00012");
@@ -549,7 +549,7 @@ pub fn number_to_precision(value: f64, precision: u32) -> StatorResult<String> {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::number::number_to_exponential;
+/// use stator_js::builtins::number::number_to_exponential;
 ///
 /// assert_eq!(number_to_exponential(123456.0, 3).unwrap(), "1.235e+5");
 /// assert_eq!(number_to_exponential(0.0, 2).unwrap(), "0.00e+0");
@@ -613,7 +613,7 @@ pub fn number_reformat_exponential(s: &str) -> String {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::number::number_to_string_radix;
+/// use stator_js::builtins::number::number_to_string_radix;
 ///
 /// assert_eq!(number_to_string_radix(255.0, 16).unwrap(), "ff");
 /// assert_eq!(number_to_string_radix(10.0, 2).unwrap(), "1010");

@@ -15,7 +15,7 @@
 use std::ffi::CStr;
 
 use libfuzzer_sys::fuzz_target;
-use stator_ffi::{
+use stator_js_ffi::{
     stator_context_destroy, stator_context_new,
     stator_isolate_dispose, stator_isolate_new,
     stator_script_bytecode_count, stator_script_compile, stator_script_free,

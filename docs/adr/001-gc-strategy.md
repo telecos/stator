@@ -16,7 +16,7 @@ a stable C FFI.  A correct and efficient garbage collector is a hard
 requirement for any production-grade JavaScript engine.
 
 At the time this decision was made the repository already contains a
-hand-written GC skeleton (`crates/stator_core/src/gc/`):
+hand-written GC skeleton (`crates/stator_js/src/gc/`):
 
 * **`heap.rs`** — two-generation heap (8 MiB nursery + 64 MiB tenured space)
   backed by bump-pointer allocation.
@@ -82,7 +82,7 @@ repository.
 * **Full control over object layout.**  Stator can adopt the exact same
   pointer-tagging and in-object metadata layout as V8/SpiderMonkey, which
   simplifies future JIT-compiler work (hidden classes, inline caches, etc.).
-* **Minimal dependencies.**  The GC stays inside `stator_core` with no
+* **Minimal dependencies.**  The GC stays inside `stator_js` with no
   additional crates, keeping the dependency graph small and cross-compilation
   straightforward.
 * **Incremental risk.**  Each GC phase (minor collection, major

@@ -13,7 +13,7 @@
 //! # Example
 //!
 //! ```
-//! use stator_core::bytecode::source_positions::{SourcePositionEntry, SourcePositionTable};
+//! use stator_js::bytecode::source_positions::{SourcePositionEntry, SourcePositionTable};
 //!
 //! let mut table = SourcePositionTable::new();
 //! table.add_entry(SourcePositionEntry::new(0,  1, 1, true));

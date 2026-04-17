@@ -16,9 +16,9 @@
 //! # Example
 //!
 //! ```
-//! use stator_core::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
-//! use stator_core::bytecode::bytecodes::{Instruction, Operand, Opcode, encode};
-//! use stator_core::bytecode::feedback::FeedbackMetadata;
+//! use stator_js::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
+//! use stator_js::bytecode::bytecodes::{Instruction, Operand, Opcode, encode};
+//! use stator_js::bytecode::feedback::FeedbackMetadata;
 //!
 //! // Build a tiny function: load constant 0 (42.0), return.
 //! let instructions = vec![
@@ -785,8 +785,8 @@ impl BytecodeArray {
     ///
     /// Returns `self` so this can be chained onto [`BytecodeArray::new`]:
     /// ```
-    /// # use stator_core::bytecode::bytecode_array::BytecodeArray;
-    /// # use stator_core::bytecode::feedback::FeedbackMetadata;
+    /// # use stator_js::bytecode::bytecode_array::BytecodeArray;
+    /// # use stator_js::bytecode::feedback::FeedbackMetadata;
     /// let ba = BytecodeArray::new(vec![], vec![], 0, 0, vec![], FeedbackMetadata::empty(), vec![])
     ///     .with_generator_flag(true);
     /// assert!(ba.is_generator());

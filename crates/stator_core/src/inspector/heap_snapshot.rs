@@ -21,10 +21,10 @@
 //!
 //! ```
 //! use std::collections::HashMap;
-//! use stator_core::inspector::heap_snapshot::{HeapSnapshotBuilder, start_tracking, stop_tracking, record_allocation};
+//! use stator_js::inspector::heap_snapshot::{HeapSnapshotBuilder, start_tracking, stop_tracking, record_allocation};
 //!
 //! // Build a snapshot from an empty globals map.
-//! let globals: HashMap<String, stator_core::objects::value::JsValue> = HashMap::new();
+//! let globals: HashMap<String, stator_js::objects::value::JsValue> = HashMap::new();
 //! let snapshot = HeapSnapshotBuilder::build(&globals);
 //! assert!(snapshot.snapshot.node_count >= 1); // at least the root node
 //! ```

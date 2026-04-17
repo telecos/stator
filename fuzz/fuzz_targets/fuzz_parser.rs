@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use stator_core::parser::preparser::preparse;
+use stator_js::parser::preparser::preparse;
 
 fuzz_target!(|data: &[u8]| {
     // Convert raw bytes to a string — invalid UTF-8 is silently replaced so

@@ -5,7 +5,7 @@
 ///
 /// Embedders implement this trait to provide custom threading, timing, and
 /// task-scheduling behaviour.  The vtable-backed implementation in
-/// `stator_ffi` wraps C function pointers into this interface.
+/// `stator_js_ffi` wraps C function pointers into this interface.
 pub trait Platform: Send {
     /// Return the number of worker threads the platform makes available to the
     /// engine for background work (compilation, GC helpers, etc.).

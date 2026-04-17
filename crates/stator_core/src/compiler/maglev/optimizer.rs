@@ -60,10 +60,10 @@
 //! # Usage
 //!
 //! ```
-//! use stator_core::compiler::maglev::ir::{
+//! use stator_js::compiler::maglev::ir::{
 //!     BasicBlock, ControlNode, MaglevGraph, ValueNode,
 //! };
-//! use stator_core::compiler::maglev::optimizer::optimize;
+//! use stator_js::compiler::maglev::optimizer::optimize;
 //!
 //! let mut graph = MaglevGraph::new(0);
 //! let mut block = BasicBlock::new(0);

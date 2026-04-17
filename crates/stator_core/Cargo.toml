@@ -1,5 +1,5 @@
 [package]
-name = "stator_core"
+name = "stator_js"
 version = "0.1.0"
 edition = "2024"
 description = "Stator JavaScript engine core — parser, bytecode compiler, Maglev JIT, interpreter, GC"

@@ -31,10 +31,10 @@
 //! # Usage
 //!
 //! ```
-//! use stator_core::compiler::maglev::ir::{
+//! use stator_js::compiler::maglev::ir::{
 //!     BasicBlock, ControlNode, MaglevGraph, ValueNode,
 //! };
-//! use stator_core::compiler::maglev::range_analysis::eliminate_overflow_checks;
+//! use stator_js::compiler::maglev::range_analysis::eliminate_overflow_checks;
 //!
 //! let mut graph = MaglevGraph::new(0);
 //! let mut block = BasicBlock::new(0);

@@ -39,9 +39,9 @@ use crate::objects::value::JsValue;
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::reflect::reflect_get;
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::reflect::reflect_get;
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut target = JsObject::new();
 /// target.set_property("x", JsValue::Smi(42)).unwrap();
@@ -76,9 +76,9 @@ pub fn reflect_get_with_receiver(target: &JsObject, key: &str, _receiver: &JsVal
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::reflect::reflect_set;
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::reflect::reflect_set;
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut target = JsObject::new();
 /// assert!(reflect_set(&mut target, "x", JsValue::Smi(1)).unwrap());
@@ -112,9 +112,9 @@ pub fn reflect_set_with_receiver(
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::reflect::reflect_has;
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::reflect::reflect_has;
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut target = JsObject::new();
 /// target.set_property("y", JsValue::Boolean(true)).unwrap();
@@ -135,9 +135,9 @@ pub fn reflect_has(target: &JsObject, key: &str) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::reflect::reflect_delete_property;
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::reflect::reflect_delete_property;
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut target = JsObject::new();
 /// target.set_property("p", JsValue::Smi(1)).unwrap();
@@ -158,10 +158,10 @@ pub fn reflect_delete_property(target: &mut JsObject, key: &str) -> StatorResult
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::reflect::reflect_define_property;
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::map::PropertyAttributes;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::reflect::reflect_define_property;
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::map::PropertyAttributes;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut target = JsObject::new();
 /// assert!(reflect_define_property(
@@ -188,10 +188,10 @@ pub fn reflect_define_property(
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::reflect::reflect_get_own_property_descriptor;
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::map::PropertyAttributes;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::reflect::reflect_get_own_property_descriptor;
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::map::PropertyAttributes;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut target = JsObject::new();
 /// target.set_property("k", JsValue::Smi(7)).unwrap();
@@ -217,8 +217,8 @@ pub fn reflect_get_own_property_descriptor(
 /// ```
 /// use std::cell::RefCell;
 /// use std::rc::Rc;
-/// use stator_core::builtins::reflect::reflect_get_prototype_of;
-/// use stator_core::objects::js_object::JsObject;
+/// use stator_js::builtins::reflect::reflect_get_prototype_of;
+/// use stator_js::objects::js_object::JsObject;
 ///
 /// let target = JsObject::new();
 /// assert!(reflect_get_prototype_of(&target).is_none());
@@ -240,8 +240,8 @@ pub fn reflect_get_prototype_of(target: &JsObject) -> Option<Rc<RefCell<JsObject
 /// ```
 /// use std::cell::RefCell;
 /// use std::rc::Rc;
-/// use stator_core::builtins::reflect::reflect_set_prototype_of;
-/// use stator_core::objects::js_object::JsObject;
+/// use stator_js::builtins::reflect::reflect_set_prototype_of;
+/// use stator_js::objects::js_object::JsObject;
 ///
 /// let proto = Rc::new(RefCell::new(JsObject::new()));
 /// let mut target = JsObject::new();
@@ -264,8 +264,8 @@ pub fn reflect_set_prototype_of(
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::reflect::reflect_is_extensible;
-/// use stator_core::objects::js_object::JsObject;
+/// use stator_js::builtins::reflect::reflect_is_extensible;
+/// use stator_js::objects::js_object::JsObject;
 ///
 /// let mut target = JsObject::new();
 /// assert!(reflect_is_extensible(&target));
@@ -285,8 +285,8 @@ pub fn reflect_is_extensible(target: &JsObject) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::reflect::reflect_prevent_extensions;
-/// use stator_core::objects::js_object::JsObject;
+/// use stator_js::builtins::reflect::reflect_prevent_extensions;
+/// use stator_js::objects::js_object::JsObject;
 ///
 /// let mut target = JsObject::new();
 /// assert!(reflect_prevent_extensions(&mut target));
@@ -306,9 +306,9 @@ pub fn reflect_prevent_extensions(target: &mut JsObject) -> bool {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::reflect::reflect_own_keys;
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::reflect::reflect_own_keys;
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut target = JsObject::new();
 /// target.set_property("a", JsValue::Smi(1)).unwrap();
@@ -335,8 +335,8 @@ pub fn reflect_own_keys(target: &JsObject) -> Vec<String> {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::reflect::reflect_apply;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::reflect::reflect_apply;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let result = reflect_apply(
 ///     |_this, args| Ok(args.first().cloned().unwrap_or(JsValue::Undefined)),
@@ -365,9 +365,9 @@ pub fn reflect_apply(
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::reflect::reflect_construct;
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::reflect::reflect_construct;
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let obj = reflect_construct(
 ///     |args| {
@@ -427,9 +427,9 @@ pub fn reflect_construct_with_new_target(
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::reflect::reflect_get_prototype_of_value;
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::reflect::reflect_get_prototype_of_value;
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let target = JsObject::new();
 /// assert_eq!(reflect_get_prototype_of_value(&target), JsValue::Null);
@@ -464,9 +464,9 @@ pub fn reflect_get_prototype_of_value(target: &JsObject) -> JsValue {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::reflect::reflect_set_prototype_of_value;
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::reflect::reflect_set_prototype_of_value;
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut target = JsObject::new();
 /// assert!(reflect_set_prototype_of_value(&mut target, JsValue::Null).unwrap());
@@ -504,9 +504,9 @@ pub fn reflect_set_prototype_of_value(target: &mut JsObject, proto: JsValue) -> 
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::reflect::reflect_own_keys_values;
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::reflect::reflect_own_keys_values;
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut target = JsObject::new();
 /// target.set_property("a", JsValue::Smi(1)).unwrap();

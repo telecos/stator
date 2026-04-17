@@ -29,7 +29,7 @@
 //! # Example
 //!
 //! ```rust
-//! use stator_core::wasm::{WasmEngine, WasmInstance, WasmModule};
+//! use stator_js::wasm::{WasmEngine, WasmInstance, WasmModule};
 //!
 //! let engine = WasmEngine::new();
 //! let wat = r#"

@@ -20,19 +20,19 @@
 //!   newline, to standard output.
 //! - `console.log(...args)` — alias for `print`.
 
-use stator_core::interpreter::GlobalEnv;
-use stator_core::objects::property_map::PropertyMap;
+use stator_js::interpreter::GlobalEnv;
+use stator_js::objects::property_map::PropertyMap;
 use std::cell::RefCell;
 use std::process;
 use std::rc::Rc;
 use std::thread;
 
-use stator_core::builtins::wasm::make_webassembly_object;
-use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
-use stator_core::inspector::cdp::CdpServer;
-use stator_core::interpreter::{Interpreter, InterpreterFrame};
-use stator_core::objects::value::JsValue;
-use stator_core::parser;
+use stator_js::builtins::wasm::make_webassembly_object;
+use stator_js::bytecode::bytecode_generator::BytecodeGenerator;
+use stator_js::inspector::cdp::CdpServer;
+use stator_js::interpreter::{Interpreter, InterpreterFrame};
+use stator_js::objects::value::JsValue;
+use stator_js::parser;
 
 /// Parsed command-line options.
 struct Options {
@@ -198,7 +198,7 @@ fn main() {
 /// execute the script.  The inspector thread stays alive until the client
 /// disconnects.
 fn run_with_inspector(
-    bytecodes: stator_core::bytecode::bytecode_array::BytecodeArray,
+    bytecodes: stator_js::bytecode::bytecode_array::BytecodeArray,
     globals: Rc<RefCell<GlobalEnv>>,
     _source: &str,
     source_name: &str,
@@ -241,7 +241,7 @@ fn run_with_inspector(
 /// Emits a human-readable breakdown of the number of functions and total
 /// native-code bytes produced by each JIT tier (Baseline, Maglev, Turbofan).
 fn print_jit_stats() {
-    use stator_core::interpreter::{jit_stats, maglev_stats, turbofan_stats};
+    use stator_js::interpreter::{jit_stats, maglev_stats, turbofan_stats};
 
     let (baseline_fns, baseline_bytes) = jit_stats();
     let (maglev_fns, maglev_bytes) = maglev_stats();
@@ -261,7 +261,7 @@ fn print_jit_stats() {
 
 /// Serialize the engine's built-in globals to a snapshot file and exit.
 fn emit_startup_snapshot(path: &str) {
-    use stator_core::snapshot::serialize_globals;
+    use stator_js::snapshot::serialize_globals;
 
     let globals = build_globals();
     let map = globals.borrow();
@@ -281,7 +281,7 @@ fn emit_startup_snapshot(path: &str) {
 ///
 /// Falls back to `build_globals()` if the snapshot is invalid.
 fn load_globals_from_snapshot(path: &str) -> Rc<RefCell<GlobalEnv>> {
-    use stator_core::snapshot::{StartupSnapshot, deserialize_globals};
+    use stator_js::snapshot::{StartupSnapshot, deserialize_globals};
 
     let snap = match StartupSnapshot::read_from_file(std::path::Path::new(path)) {
         Ok(s) => s,
@@ -340,7 +340,7 @@ fn build_globals() -> Rc<RefCell<GlobalEnv>> {
 ///
 /// This implements the behaviour of both `print()` and `console.log()` in the
 /// st8 shell.
-fn print_args(args: Vec<JsValue>) -> stator_core::error::StatorResult<JsValue> {
+fn print_args(args: Vec<JsValue>) -> stator_js::error::StatorResult<JsValue> {
     let parts: Vec<String> = args
         .iter()
         .map(|v| v.to_js_string().unwrap_or_else(|_| "undefined".to_string()))
@@ -352,15 +352,15 @@ fn print_args(args: Vec<JsValue>) -> stator_core::error::StatorResult<JsValue> {
 #[cfg(test)]
 mod tests {
     use super::build_globals;
-    use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
-    use stator_core::interpreter::{Interpreter, InterpreterFrame};
-    use stator_core::objects::value::JsValue;
-    use stator_core::parser;
-    use stator_core::parser::scanner::{Scanner, TokenKind};
+    use stator_js::bytecode::bytecode_generator::BytecodeGenerator;
+    use stator_js::interpreter::{Interpreter, InterpreterFrame};
+    use stator_js::objects::value::JsValue;
+    use stator_js::parser;
+    use stator_js::parser::scanner::{Scanner, TokenKind};
     use std::rc::Rc;
 
     /// Helper: parse, compile, and run `src` with the shell globals.
-    fn run(src: &str) -> Result<JsValue, stator_core::error::StatorError> {
+    fn run(src: &str) -> Result<JsValue, stator_js::error::StatorError> {
         let bytecodes = parser::parse(src).and_then(|p| BytecodeGenerator::compile_program(&p))?;
         let globals = build_globals();
         let mut frame = InterpreterFrame::new_with_globals(Rc::new(bytecodes), vec![], globals);
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn test_inspector_server_binds_and_accepts() {
-        use stator_core::inspector::cdp::CdpServer;
+        use stator_js::inspector::cdp::CdpServer;
 
         // Verify the CDP server can bind to a random port.
         let server = CdpServer::bind("127.0.0.1:0").expect("bind");
@@ -437,7 +437,7 @@ mod tests {
 
     #[test]
     fn test_inspector_server_evaluate_via_websocket() {
-        use stator_core::inspector::cdp::CdpServer;
+        use stator_js::inspector::cdp::CdpServer;
         use std::thread;
         use std::time::Duration;
 

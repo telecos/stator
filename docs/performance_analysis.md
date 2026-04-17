@@ -322,7 +322,7 @@ concurrent sweeping to reduce GC pause times from stop-the-world to
 ## 5. Benchmark Coverage
 
 The following benchmarks have been added to
-`crates/stator_core/benches/engine_benchmarks.rs` to track progress on
+`crates/stator_js/benches/engine_benchmarks.rs` to track progress on
 the optimizations above:
 
 ### Infrastructure Benchmarks (existing)

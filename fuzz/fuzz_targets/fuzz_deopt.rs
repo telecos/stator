@@ -11,9 +11,9 @@
 
 use libfuzzer_sys::fuzz_target;
 use stator_fuzz::program_from_bytes;
-use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
-use stator_core::interpreter::{Interpreter, InterpreterFrame};
-use stator_core::parser::ast::{
+use stator_js::bytecode::bytecode_generator::BytecodeGenerator;
+use stator_js::interpreter::{Interpreter, InterpreterFrame};
+use stator_js::parser::ast::{
     BoolLit, Expr, ExprStmt, Ident, NullLit, NumLit, Pat, ProgramItem, ReturnStmt, Stmt,
     StringLit, VarDecl, VarDeclarator, VarKind,
 };
@@ -127,7 +127,7 @@ fuzz_target!(|data: &[u8]| {
     // ── JIT path + deopt verification (x86-64 Unix only) ─────────────────
     #[cfg(all(target_arch = "x86_64", unix))]
     {
-        use stator_core::compiler::baseline::compiler::{
+        use stator_js::compiler::baseline::compiler::{
             BaselineCompiler, JIT_DEOPT, JIT_UNDEFINED, jit_to_jsvalue,
         };
 

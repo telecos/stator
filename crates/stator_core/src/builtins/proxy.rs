@@ -101,9 +101,9 @@ pub type ConstructTrap = Box<dyn Fn(Vec<JsValue>, JsValue) -> StatorResult<JsVal
 /// # Examples
 ///
 /// ```ignore
-/// use stator_core::builtins::proxy::{ProxyHandler, proxy_new, proxy_get};
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::proxy::{ProxyHandler, proxy_new, proxy_get};
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut handler = ProxyHandler::default();
 /// // Install a get-trap that intercepts every property read.
@@ -160,9 +160,9 @@ pub struct ProxyHandler {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::proxy::{ProxyHandler, proxy_new, proxy_get, proxy_set};
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::proxy::{ProxyHandler, proxy_new, proxy_get, proxy_set};
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut target = JsObject::new();
 /// target.set_property("x", JsValue::Smi(1)).unwrap();
@@ -194,8 +194,8 @@ pub struct JsProxy {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::proxy::{ProxyHandler, proxy_new};
-/// use stator_core::objects::js_object::JsObject;
+/// use stator_js::builtins::proxy::{ProxyHandler, proxy_new};
+/// use stator_js::objects::js_object::JsObject;
 ///
 /// let p = proxy_new(JsObject::new(), ProxyHandler::default());
 /// assert!(!p.is_revoked());
@@ -233,11 +233,11 @@ pub fn proxy_new_callable(target: JsObject, handler: ProxyHandler) -> JsProxy {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::proxy::{
+/// use stator_js::builtins::proxy::{
 ///     ProxyHandler, proxy_revocable, proxy_revoke, proxy_get,
 /// };
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut target = JsObject::new();
 /// target.set_property("k", JsValue::Smi(1)).unwrap();
@@ -418,9 +418,9 @@ fn plain_visible_own_property_keys(map: &PropertyMap) -> Vec<String> {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::proxy::{ProxyHandler, proxy_new, proxy_get};
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::proxy::{ProxyHandler, proxy_new, proxy_get};
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut target = JsObject::new();
 /// target.set_property("x", JsValue::Smi(3)).unwrap();
@@ -468,9 +468,9 @@ pub fn proxy_get_with_receiver(
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::proxy::{ProxyHandler, proxy_new, proxy_set, proxy_get};
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::proxy::{ProxyHandler, proxy_new, proxy_set, proxy_get};
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let target = JsObject::new();
 /// let mut proxy = proxy_new(target, ProxyHandler::default());
@@ -524,9 +524,9 @@ pub fn proxy_set_with_receiver(
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::proxy::{ProxyHandler, proxy_new, proxy_has};
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::proxy::{ProxyHandler, proxy_new, proxy_has};
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut target = JsObject::new();
 /// target.set_property("p", JsValue::Null).unwrap();
@@ -572,9 +572,9 @@ pub fn proxy_has(proxy: &JsProxy, key: &str) -> StatorResult<bool> {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::proxy::{ProxyHandler, proxy_new, proxy_delete_property};
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::proxy::{ProxyHandler, proxy_new, proxy_delete_property};
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut target = JsObject::new();
 /// target.set_property("d", JsValue::Smi(1)).unwrap();
@@ -610,10 +610,10 @@ pub fn proxy_delete_property(proxy: &mut JsProxy, key: &str) -> StatorResult<boo
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::proxy::{ProxyHandler, proxy_new, proxy_define_property};
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::map::PropertyAttributes;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::proxy::{ProxyHandler, proxy_new, proxy_define_property};
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::map::PropertyAttributes;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let target = JsObject::new();
 /// let mut proxy = proxy_new(target, ProxyHandler::default());
@@ -681,10 +681,10 @@ pub fn proxy_define_property(
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::proxy::{ProxyHandler, proxy_new, proxy_get_own_property_descriptor};
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::map::PropertyAttributes;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::proxy::{ProxyHandler, proxy_new, proxy_get_own_property_descriptor};
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::map::PropertyAttributes;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut target = JsObject::new();
 /// target.set_property("k", JsValue::Smi(1)).unwrap();
@@ -750,9 +750,9 @@ pub fn proxy_get_own_property_descriptor(
 /// # Examples
 ///
 /// ```ignore
-/// use stator_core::builtins::proxy::{ProxyHandler, proxy_new, proxy_get_prototype_of};
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::proxy::{ProxyHandler, proxy_new, proxy_get_prototype_of};
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let target = JsObject::new();
 /// let proxy = proxy_new(target, ProxyHandler::default());
@@ -791,9 +791,9 @@ pub fn proxy_get_prototype_of(proxy: &JsProxy) -> StatorResult<JsValue> {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::proxy::{ProxyHandler, proxy_new, proxy_set_prototype_of};
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::proxy::{ProxyHandler, proxy_new, proxy_set_prototype_of};
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let target = JsObject::new();
 /// let mut proxy = proxy_new(target, ProxyHandler::default());
@@ -849,8 +849,8 @@ pub fn proxy_set_prototype_of(proxy: &mut JsProxy, proto: JsValue) -> StatorResu
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::proxy::{ProxyHandler, proxy_new, proxy_is_extensible};
-/// use stator_core::objects::js_object::JsObject;
+/// use stator_js::builtins::proxy::{ProxyHandler, proxy_new, proxy_is_extensible};
+/// use stator_js::objects::js_object::JsObject;
 ///
 /// let target = JsObject::new();
 /// let proxy = proxy_new(target, ProxyHandler::default());
@@ -885,8 +885,8 @@ pub fn proxy_is_extensible(proxy: &JsProxy) -> StatorResult<bool> {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::proxy::{ProxyHandler, proxy_new, proxy_prevent_extensions, proxy_is_extensible};
-/// use stator_core::objects::js_object::JsObject;
+/// use stator_js::builtins::proxy::{ProxyHandler, proxy_new, proxy_prevent_extensions, proxy_is_extensible};
+/// use stator_js::objects::js_object::JsObject;
 ///
 /// let target = JsObject::new();
 /// let mut proxy = proxy_new(target, ProxyHandler::default());
@@ -922,9 +922,9 @@ pub fn proxy_prevent_extensions(proxy: &mut JsProxy) -> StatorResult<bool> {
 /// # Examples
 ///
 /// ```ignore
-/// use stator_core::builtins::proxy::{ProxyHandler, proxy_new, proxy_own_keys};
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::proxy::{ProxyHandler, proxy_new, proxy_own_keys};
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut target = JsObject::new();
 /// target.set_property("a", JsValue::Smi(1)).unwrap();
@@ -1013,9 +1013,9 @@ pub fn proxy_own_keys(proxy: &JsProxy) -> StatorResult<Vec<JsValue>> {
 /// # Examples
 ///
 /// ```
-/// use stator_core::builtins::proxy::{ProxyHandler, proxy_new, proxy_apply};
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::proxy::{ProxyHandler, proxy_new, proxy_apply};
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut handler = ProxyHandler::default();
 /// handler.apply = Some(Box::new(|_this, args| {
@@ -1051,9 +1051,9 @@ pub fn proxy_apply(
 /// # Examples
 ///
 /// ```ignore
-/// use stator_core::builtins::proxy::{ProxyHandler, proxy_new, proxy_construct};
-/// use stator_core::objects::js_object::JsObject;
-/// use stator_core::objects::value::JsValue;
+/// use stator_js::builtins::proxy::{ProxyHandler, proxy_new, proxy_construct};
+/// use stator_js::objects::js_object::JsObject;
+/// use stator_js::objects::value::JsValue;
 ///
 /// let mut handler = ProxyHandler::default();
 /// handler.construct = Some(Box::new(|args, _new_target| {

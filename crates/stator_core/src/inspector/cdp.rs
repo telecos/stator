@@ -35,7 +35,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use stator_core::inspector::cdp::CdpServer;
+//! use stator_js::inspector::cdp::CdpServer;
 //!
 //! let server = CdpServer::bind("127.0.0.1:9229").unwrap();
 //! // Accept one connection, process all messages, then return.

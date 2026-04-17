@@ -1,4 +1,4 @@
-//! `stator_ffi` — C-ABI FFI surface for the Stator JavaScript engine.
+//! `stator_js_ffi` — C-ABI FFI surface for the Stator JavaScript engine.
 //!
 //! This crate exposes a stable C API (`extern "C"`, `#[no_mangle]`) so that
 //! embedders (e.g. Chromium's content layer) can link against Stator without
@@ -16,19 +16,19 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::io::Write as _;
 use std::rc::Rc;
 
-use stator_core::bytecode::bytecode_array::BytecodeArray;
-use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
-use stator_core::bytecode::bytecodes::{Operand, decode};
-use stator_core::dom::{
+use stator_js::bytecode::bytecode_array::BytecodeArray;
+use stator_js::bytecode::bytecode_generator::BytecodeGenerator;
+use stator_js::bytecode::bytecodes::{Operand, decode};
+use stator_js::dom::{
     DomObjectWrap, DomWeakRef, IndexedPropertyHandlerConfig, NamedPropertyHandlerConfig,
 };
-use stator_core::gc::heap::Heap;
-use stator_core::interpreter::{GlobalEnv, Interpreter, InterpreterFrame};
-use stator_core::objects::js_object::JsObject;
-use stator_core::objects::property_map::PropertyMap;
-use stator_core::objects::value::{JsValue, NativeFn};
-use stator_core::parser;
-use stator_core::wasm::{WasmEngine, WasmInstance, WasmModule};
+use stator_js::gc::heap::Heap;
+use stator_js::interpreter::{GlobalEnv, Interpreter, InterpreterFrame};
+use stator_js::objects::js_object::JsObject;
+use stator_js::objects::property_map::PropertyMap;
+use stator_js::objects::value::{JsValue, NativeFn};
+use stator_js::parser;
+use stator_js::wasm::{WasmEngine, WasmInstance, WasmModule};
 
 /// An opaque isolate handle.
 ///
@@ -342,7 +342,7 @@ pub unsafe extern "C" fn stator_isolate_get_stats(
     if stats.is_null() {
         return;
     }
-    let (count, bytes) = stator_core::interpreter::jit_stats();
+    let (count, bytes) = stator_js::interpreter::jit_stats();
     // SAFETY: caller guarantees `stats` is valid for writes.
     unsafe {
         (*stats).jit_functions_compiled = count;
@@ -3467,7 +3467,7 @@ pub struct StatorPlatformVTable {
 }
 
 /// Rust-side wrapper around a [`StatorPlatformVTable`] that implements the
-/// [`stator_core::platform::Platform`] trait.
+/// [`stator_js::platform::Platform`] trait.
 struct VTablePlatformImpl {
     vtable: StatorPlatformVTable,
 }
@@ -3477,7 +3477,7 @@ struct VTablePlatformImpl {
 // for ensuring any global state they access is thread-safe.
 unsafe impl Send for VTablePlatformImpl {}
 
-impl stator_core::platform::Platform for VTablePlatformImpl {
+impl stator_js::platform::Platform for VTablePlatformImpl {
     fn number_of_worker_threads(&self) -> u32 {
         // SAFETY: The vtable pointer is valid for the lifetime of the platform.
         self.vtable
@@ -3513,7 +3513,7 @@ impl stator_core::platform::Platform for VTablePlatformImpl {
 /// Created by [`stator_platform_new`] and destroyed by
 /// [`stator_platform_destroy`].
 pub struct StatorPlatform {
-    inner: Box<dyn stator_core::platform::Platform>,
+    inner: Box<dyn stator_js::platform::Platform>,
 }
 
 /// Create a new platform from an embedder-supplied vtable.
@@ -3896,9 +3896,9 @@ pub unsafe extern "C" fn stator_wasm_instance_call(
 // CDP WebSocket server
 // ─────────────────────────────────────────────────────────────────────────────
 
-use stator_core::inspector::cdp::CdpServer;
-use stator_core::inspector::debugger::{DebugAction, Debugger};
-use stator_core::interpreter::{attach_debugger, detach_debugger};
+use stator_js::inspector::cdp::CdpServer;
+use stator_js::inspector::debugger::{DebugAction, Debugger};
+use stator_js::interpreter::{attach_debugger, detach_debugger};
 /// An opaque handle to a CDP WebSocket server.
 ///
 /// Created with [`stator_cdp_server_create`] and freed with
@@ -4109,7 +4109,7 @@ pub unsafe extern "C" fn stator_debug_session_run(session: *mut StatorDebugSessi
     detach_debugger();
 
     match outcome {
-        Err(stator_core::error::StatorError::DebuggerPaused { .. }) => {
+        Err(stator_js::error::StatorError::DebuggerPaused { .. }) => {
             s.paused = true;
             // Record the 1-based line from the debugger's last pause location.
             s.pause_line = s.dbg.borrow().last_pause_line();
@@ -4350,7 +4350,7 @@ pub unsafe extern "C" fn stator_dom_object_wrap_new(
     isolate: *mut StatorIsolate,
     field_count: u32,
 ) -> *mut StatorDomObjectWrap {
-    if isolate.is_null() || field_count as usize > stator_core::dom::MAX_INTERNAL_FIELDS {
+    if isolate.is_null() || field_count as usize > stator_js::dom::MAX_INTERNAL_FIELDS {
         return std::ptr::null_mut();
     }
     // SAFETY: caller guarantees `isolate` is valid.
@@ -4686,8 +4686,8 @@ pub unsafe extern "C" fn stator_dom_weak_ref_destroy(weak: *mut StatorDomWeakRef
 
 // ── Event loop FFI ─────────────────────────────────────────────────────────────
 
-use stator_core::builtins::promise::MicrotaskQueue;
-use stator_core::event_loop::{DefaultCallbacks, EmbedderCallbacks, EventLoop, TimerHandle};
+use stator_js::builtins::promise::MicrotaskQueue;
+use stator_js::event_loop::{DefaultCallbacks, EmbedderCallbacks, EventLoop, TimerHandle};
 
 /// Opaque event loop handle.
 pub struct StatorEventLoop {

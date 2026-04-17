@@ -11,8 +11,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-stator_core = { path = "../crates/stator_core" }
-stator_ffi = { path = "../crates/stator_ffi" }
+stator_js = { path = "../crates/stator_core" }
+stator_js_ffi = { path = "../crates/stator_ffi" }
 
 [[bin]]
 name = "fuzz_tagged_value"

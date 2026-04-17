@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use stator_core::builtins::string::{
+use stator_js::builtins::string::{
     string_char_at, string_char_code_at, string_code_point_at, string_concat, string_ends_with,
     string_from_char_code, string_includes, string_index_of, string_last_index_of,
     string_match, string_match_all, string_replace, string_replace_all, string_repeat,

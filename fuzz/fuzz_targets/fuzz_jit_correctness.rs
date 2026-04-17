@@ -11,9 +11,9 @@
 //! Any divergence between interpreter and JIT is a bug.
 
 use libfuzzer_sys::fuzz_target;
-use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
-use stator_core::interpreter::{Interpreter, InterpreterFrame};
-use stator_core::parser::parse;
+use stator_js::bytecode::bytecode_generator::BytecodeGenerator;
+use stator_js::interpreter::{Interpreter, InterpreterFrame};
+use stator_js::parser::parse;
 
 fuzz_target!(|data: &[u8]| {
     // Accept arbitrary bytes as UTF-8 source (replace invalid sequences).
@@ -47,7 +47,7 @@ fuzz_target!(|data: &[u8]| {
     // On other platforms the JIT is not available and we skip the comparison.
     #[cfg(all(target_arch = "x86_64", unix))]
     {
-        use stator_core::compiler::baseline::compiler::{
+        use stator_js::compiler::baseline::compiler::{
             BaselineCompiler, JIT_UNDEFINED, jit_to_jsvalue,
         };
 

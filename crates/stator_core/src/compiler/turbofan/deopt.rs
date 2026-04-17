@@ -30,14 +30,14 @@
 //! use std::cell::RefCell;
 //! use std::rc::Rc;
 //!
-//! use stator_core::bytecode::bytecode_array::BytecodeArray;
-//! use stator_core::bytecode::bytecodes::{Instruction, Opcode, Operand, encode};
-//! use stator_core::bytecode::feedback::{FeedbackMetadata, FeedbackVector};
-//! use stator_core::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, ValueNode};
-//! use stator_core::compiler::turbofan::compile;
-//! use stator_core::compiler::turbofan::deopt::{TurbofanFrameState, deoptimize_turbofan};
-//! use stator_core::interpreter::GlobalEnv;
-//! use stator_core::objects::value::JsValue;
+//! use stator_js::bytecode::bytecode_array::BytecodeArray;
+//! use stator_js::bytecode::bytecodes::{Instruction, Opcode, Operand, encode};
+//! use stator_js::bytecode::feedback::{FeedbackMetadata, FeedbackVector};
+//! use stator_js::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, ValueNode};
+//! use stator_js::compiler::turbofan::compile;
+//! use stator_js::compiler::turbofan::deopt::{TurbofanFrameState, deoptimize_turbofan};
+//! use stator_js::interpreter::GlobalEnv;
+//! use stator_js::objects::value::JsValue;
 //!
 //! // Build a trivial graph: return the Int32 constant 0.
 //! let mut graph = MaglevGraph::new(0);

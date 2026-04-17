@@ -7942,9 +7942,9 @@ fn compile_function_inner(
 /// # Example
 ///
 /// ```
-/// use stator_core::bytecode::bytecode_generator::BytecodeGenerator;
-/// use stator_core::parser::ast::{Program, SourceType};
-/// use stator_core::parser::scanner::{Position, Span};
+/// use stator_js::bytecode::bytecode_generator::BytecodeGenerator;
+/// use stator_js::parser::ast::{Program, SourceType};
+/// use stator_js::parser::scanner::{Position, Span};
 ///
 /// let p = Position { offset: 0, line: 1, column: 1 };
 /// let loc = Span { start: p, end: p };
