@@ -5266,40 +5266,16 @@ pub(crate) mod jit_runtime {
 
     /// Read the register file slot count from a [`BytecodeArray`] pointer.
     ///
-    /// Returns `parameter_count + frame_size`, clamped to `[1, 16]`.
-    /// If the callee's Maglev code is "BA-free" (does not use R15 / TLS
-    /// bytecode pointer), bit 63 of the return value is set so the
-    /// caller's MIC hit path can skip the BA set/restore instructions.
+    /// Returns `parameter_count + frame_size`, clamped to `[0, 16]`.
     #[allow(dead_code)]
     pub extern "C" fn jit_runtime_read_reg_slots(ba_ptr: i64) -> i64 {
-        use crate::bytecode::feedback::FeedbackSlotKind;
-
         if ba_ptr == 0 {
             return 16;
         }
         // SAFETY: caller guarantees ba_ptr is valid.
         let ba = unsafe { &*(ba_ptr as *const BytecodeArray) };
         let slots = (ba.parameter_count() + ba.frame_size()) as i64;
-        let slots = slots.clamp(1, 16);
-
-        // Check if the callee is BA-free by scanning its feedback metadata.
-        // A function is BA-free when its Maglev code does not reserve R15
-        // for RT_PTRS TLS caching — i.e. it has no call sites, keyed
-        // accesses, or named property loads.
-        let ba_free = ba.feedback_metadata().slot_kinds().iter().all(|k| {
-            !matches!(
-                k,
-                FeedbackSlotKind::Call
-                    | FeedbackSlotKind::KeyedLoadProperty
-                    | FeedbackSlotKind::KeyedStoreProperty
-                    | FeedbackSlotKind::LoadProperty
-            )
-        });
-        if ba_free {
-            slots | (1i64 << 63)
-        } else {
-            slots
-        }
+        slots.clamp(1, 16)
     }
 
     /// Re-read the closure context pointer from a [`BytecodeArray`].
