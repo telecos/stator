@@ -1270,41 +1270,6 @@ pub(crate) mod jit_runtime {
         JIT_HEAP_TAG + idx as i64
     }
 
-    /// Allocate a heap handle for a freshly created object, skipping the
-    /// [`RT_HANDLE_DEDUP`] map entirely.
-    ///
-    /// This is safe for objects returned by `CreateObjectLiteral` /
-    /// `CreateObjectLiteralWithProperties` because:
-    ///
-    /// * The `Rc` was just popped from the pool or freshly allocated, so
-    ///   it cannot already be in the dedup map under a *valid* index.
-    /// * The caller's handle is the only reference that JIT code uses;
-    ///   no other code path will call `alloc_heap_handle` with the same
-    ///   `Rc` identity during this JIT execution.
-    ///
-    /// Eliminating the dedup map avoids two TLS lookups and two
-    /// `HashMap` operations (get + insert) per object creation — the
-    /// dominant cost on the IC-hit hot path.
-    #[inline(always)]
-    fn alloc_heap_handle_no_dedup(val: JsValue, ptrs: &RtPtrs) -> i64 {
-        let idx = if ptrs.is_cached() {
-            // SAFETY: cached pointer valid for thread lifetime; no
-            // concurrent borrows.
-            let heap = unsafe { &mut *(&*ptrs.heap).as_ptr() };
-            let idx = heap.len();
-            heap.push(val);
-            idx
-        } else {
-            RT_HEAP.with(|heap| {
-                let mut heap = heap.borrow_mut();
-                let idx = heap.len();
-                heap.push(val);
-                idx
-            })
-        };
-        JIT_HEAP_TAG + idx as i64
-    }
-
     /// Public entry point for allocating a JIT heap handle.
     ///
     /// Used by the interpreter's JIT entry path to convert non-primitive
@@ -8314,7 +8279,7 @@ pub(crate) mod jit_runtime {
                     let template = unsafe { &*ic.template };
                     let rc = acquire_object_rc_from_template_cached(template, ptrs.object_rc_pool);
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
                 }
 
                 // Fast path: template cached in BA — populate the IC.
@@ -8328,7 +8293,7 @@ pub(crate) mod jit_runtime {
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
                 }
 
                 // Second execution: promote pending → cached, then
@@ -8343,7 +8308,7 @@ pub(crate) mod jit_runtime {
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
                 }
 
                 // First execution: create fresh and register as
@@ -8352,7 +8317,7 @@ pub(crate) mod jit_runtime {
                 let rc = Rc::new(RefCell::new(map));
                 ba_ref.set_object_literal_pending(slot, Rc::clone(&rc));
                 let obj = JsValue::PlainObject(rc);
-                return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
             }
         }
 
@@ -8454,7 +8419,7 @@ pub(crate) mod jit_runtime {
                         ptrs.object_rc_pool,
                     );
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
                 }
 
                 // ── Hot path: template cached in BA — populate IC ──
@@ -8470,7 +8435,7 @@ pub(crate) mod jit_runtime {
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
                 }
 
                 // ── Promote path (second execution) ──
@@ -8486,7 +8451,7 @@ pub(crate) mod jit_runtime {
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
                 }
 
                 // ── First execution: create fresh and fill via property stores ──
@@ -8510,7 +8475,7 @@ pub(crate) mod jit_runtime {
                     }
                 }
                 let obj = JsValue::PlainObject(rc);
-                return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
             }
         }
 
@@ -8533,7 +8498,7 @@ pub(crate) mod jit_runtime {
             }
         }
         let obj = JsValue::PlainObject(map_rc);
-        Some(alloc_heap_handle_no_dedup(obj, &ptrs))
+        Some(alloc_heap_handle_with_ptrs(obj, &ptrs))
     }
 
     /// Decode a single JIT `i64` register value into a [`JsValue`].

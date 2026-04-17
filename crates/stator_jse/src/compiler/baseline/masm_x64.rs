@@ -477,42 +477,6 @@ impl MacroAssembler {
         self.buf.push((ss << 6) | (index.enc() << 3) | base.enc());
     }
 
-    /// `LEA dst, [base + index*scale + disp32]` — scaled index with 32-bit
-    /// displacement.
-    ///
-    /// Useful for fusing multiply-by-{3,5,9} with a constant add/subtract
-    /// into a single instruction, e.g. `i*3 - 1` → `LEA dst, [i + i*2 - 1]`.
-    pub fn lea_scaled_disp32(
-        &mut self,
-        dst: Reg64,
-        base: Reg64,
-        index: Reg64,
-        scale: u8,
-        disp: i32,
-    ) {
-        debug_assert!(
-            matches!(scale, 1 | 2 | 4 | 8),
-            "LEA scale must be 1, 2, 4, or 8"
-        );
-        let ss = match scale {
-            1 => 0b00,
-            2 => 0b01,
-            4 => 0b10,
-            8 => 0b11,
-            _ => unreachable!(),
-        };
-        let r_bit = if dst.needs_rex() { 0x04 } else { 0 };
-        let x_bit = if index.needs_rex() { 0x02 } else { 0 };
-        let b_bit = if base.needs_rex() { 0x01 } else { 0 };
-        self.buf.push(0x48 | r_bit | x_bit | b_bit);
-        self.buf.push(0x8D);
-        // ModRM: mod=10 (disp32), reg=dst, r/m=100 (SIB follows)
-        self.buf.push(0x80 | (dst.enc() << 3) | 0x04);
-        // SIB: scale=ss, index=index, base=base
-        self.buf.push((ss << 6) | (index.enc() << 3) | base.enc());
-        self.emit_i32(disp);
-    }
-
     /// Emit a signed 32-bit integer in little-endian byte order.
     fn emit_i32(&mut self, v: i32) {
         self.buf.extend_from_slice(&v.to_le_bytes());
