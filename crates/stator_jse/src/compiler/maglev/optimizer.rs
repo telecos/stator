@@ -162,6 +162,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     remove_redundant_check_maps(graph);
     fuse_object_literal_stores(graph);
     eliminate_store_to_load(graph);
+    eliminate_dead_object_stores(graph);
     eliminate_dead_allocations(graph);
     replace_dead_arguments(graph);
     eliminate_dead_code(graph);
@@ -2472,7 +2473,7 @@ fn compute_store_to_load_subst_with_map(
 
             // Any other side-effecting node invalidates the map conservatively.
             // StoreGlobal is already handled above, so exclude it from clearing.
-            other if has_side_effects(other) => {
+            other if can_invalidate_named_stores(other) => {
                 store_map.clear();
                 global_map.clear();
                 // Keep alias_map — aliases are structural, not invalidated
@@ -2489,6 +2490,93 @@ fn compute_store_to_load_subst_with_map(
 // ─────────────────────────────────────────────────────────────────────────────
 // Pass 2c — Dead allocation elimination (escape analysis lite)
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Eliminate stores to non-escaping objects.
+///
+/// After store-to-load forwarding eliminates property loads, an allocation may
+/// only be referenced by `StoreNamedGeneric` nodes.  These stores are dead
+/// because the object never escapes.  This pass replaces such stores with
+/// `UndefinedConstant` placeholders so the subsequent dead-allocation pass can
+/// remove the allocation itself.
+fn eliminate_dead_object_stores(graph: &mut MaglevGraph) {
+    // Step 1: Find all allocation NodeIds.
+    let mut alloc_ids: HashSet<NodeId> = HashSet::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            if matches!(
+                node,
+                ValueNode::CreateObjectLiteral { .. }
+                    | ValueNode::CreateObjectLiteralWithProperties { .. }
+                    | ValueNode::CreateEmptyObjectLiteral
+                    | ValueNode::CreateArrayLiteral { .. }
+                    | ValueNode::CreateEmptyArrayLiteral { .. }
+                    | ValueNode::CreateShallowObjectLiteral { .. }
+                    | ValueNode::CreateShallowArrayLiteral { .. }
+            ) {
+                alloc_ids.insert(*id);
+            }
+        }
+    }
+    if alloc_ids.is_empty() {
+        return;
+    }
+
+    // Step 2: For each allocation, collect which nodes reference it and
+    // determine if it "escapes" (referenced by anything other than
+    // StoreNamedGeneric targeting it as the object).
+    let mut escapes: HashSet<NodeId> = HashSet::new();
+    let mut stores_per_alloc: HashMap<NodeId, Vec<(u32, usize)>> = HashMap::new();
+
+    for block in graph.blocks() {
+        for (idx, (_id, node)) in block.nodes.iter().enumerate() {
+            match node {
+                ValueNode::StoreNamedGeneric { object, .. } if alloc_ids.contains(object) => {
+                    stores_per_alloc
+                        .entry(*object)
+                        .or_default()
+                        .push((block.id, idx));
+                    // The store's value operand doesn't count as an escape
+                    // of the allocation (it's the value being stored, not
+                    // the object).  But check if *id* itself is an alloc
+                    // used elsewhere — handled by other branches.
+                }
+                _ => {
+                    // Check if this node references any allocation in a
+                    // non-store capacity (load, call arg, return, etc.).
+                    visit_value_node_inputs(node, &mut |input| {
+                        if alloc_ids.contains(&input) {
+                            // If this node is a StoreNamedGeneric targeting
+                            // this alloc, it was handled above.  Otherwise
+                            // the alloc escapes.
+                            escapes.insert(input);
+                        }
+                    });
+                    // If the node IS a StoreNamedGeneric but its object is
+                    // not an allocation, inputs were already visited above.
+                }
+            }
+        }
+        // Also check control nodes for escaping allocations.
+        if let Some(ctrl) = &block.control {
+            collect_control_node_inputs(ctrl, &mut escapes);
+        }
+    }
+
+    // Step 3: For non-escaping allocations, replace their stores with
+    // UndefinedConstant.
+    for (alloc_id, store_locs) in &stores_per_alloc {
+        if escapes.contains(alloc_id) {
+            continue;
+        }
+        // All references to this allocation are StoreNamedGeneric — safe to
+        // eliminate both the stores and (later) the allocation.
+        for &(block_id, node_idx) in store_locs {
+            if let Some(block) = graph.blocks_mut().iter_mut().find(|b| b.id == block_id) {
+                block.nodes[node_idx].1 = ValueNode::UndefinedConstant;
+            }
+        }
+    }
+}
 
 /// Eliminate object/array literal allocations whose results are never used.
 ///
@@ -3042,6 +3130,41 @@ fn has_side_effects(node: &ValueNode) -> bool {
             // Property mutation.
             | ValueNode::DeleteProperty { .. }
             // For-in side-effects (cache invalidation).
+            | ValueNode::ForInPrepare { .. }
+            | ValueNode::ForInNext { .. }
+    )
+}
+
+/// Return `true` for nodes that may mutate named properties of heap objects,
+/// requiring the store-to-load forwarding map to be invalidated.
+///
+/// This is more targeted than [`has_side_effects`]: guards and checked
+/// arithmetic can deopt but never mutate object properties, so they do NOT
+/// invalidate the store/global maps.  Only memory-writing operations (stores,
+/// calls, constructs, property deletion) require invalidation.
+fn can_invalidate_named_stores(node: &ValueNode) -> bool {
+    matches!(
+        node,
+        // Stores write to heap memory.
+        ValueNode::StoreField { .. }
+            | ValueNode::StoreFixedArrayElement { .. }
+            | ValueNode::StoreFixedDoubleArrayElement { .. }
+            | ValueNode::StoreNamedGeneric { .. }
+            | ValueNode::StoreKeyedGeneric { .. }
+            | ValueNode::StoreGlobal { .. }
+            | ValueNode::StoreContextSlot { .. }
+            | ValueNode::StoreCurrentContextSlot { .. }
+            // Calls may execute arbitrary JS that mutates properties.
+            | ValueNode::Call { .. }
+            | ValueNode::CallKnownFunction { .. }
+            | ValueNode::CallBuiltin { .. }
+            | ValueNode::CallRuntime { .. }
+            | ValueNode::CallWithSpread { .. }
+            | ValueNode::Construct { .. }
+            | ValueNode::ConstructWithSpread { .. }
+            // Property deletion mutates objects.
+            | ValueNode::DeleteProperty { .. }
+            // For-in can invalidate caches.
             | ValueNode::ForInPrepare { .. }
             | ValueNode::ForInNext { .. }
     )
