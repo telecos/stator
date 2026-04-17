@@ -2312,26 +2312,41 @@ fn fuse_object_literal_stores_in_block(block: &mut BasicBlock) {
 fn eliminate_store_to_load(graph: &mut MaglevGraph) {
     let mut global_subst: HashMap<NodeId, NodeId> = HashMap::new();
 
-    // Propagate store maps across blocks for cross-block forwarding.
-    // For single-predecessor blocks we inherit the predecessor's final
-    // store map, enabling stores in the entry block to be forwarded to
-    // loads in the loop body/preheader.  For merge points (multiple
-    // predecessors) we conservatively start empty.
+    // Propagate store maps, global maps, and alias maps across blocks for
+    // cross-block forwarding.  For single-predecessor blocks we inherit
+    // the predecessor's final maps, enabling stores in the entry block to
+    // be forwarded to loads in the preheader/loop body.  For merge points
+    // (multiple predecessors) we conservatively start empty.
     let mut block_store_maps: HashMap<u32, HashMap<(NodeId, u32), NodeId>> = HashMap::new();
+    let mut block_global_maps: HashMap<u32, HashMap<u32, NodeId>> = HashMap::new();
+    let mut block_alias_maps: HashMap<u32, HashMap<NodeId, NodeId>> = HashMap::new();
 
     // Phase 1: compute substitutions (read-only access to blocks).
     for block in graph.blocks() {
-        let mut store_map: HashMap<(NodeId, u32), NodeId> = if block.predecessors.len() == 1 {
-            block_store_maps
-                .get(&block.predecessors[0])
-                .cloned()
-                .unwrap_or_default()
+        let single_pred = if block.predecessors.len() == 1 {
+            Some(block.predecessors[0])
         } else {
-            HashMap::new()
+            None
         };
+        let mut store_map: HashMap<(NodeId, u32), NodeId> = single_pred
+            .and_then(|p| block_store_maps.get(&p).cloned())
+            .unwrap_or_default();
+        let mut global_map: HashMap<u32, NodeId> = single_pred
+            .and_then(|p| block_global_maps.get(&p).cloned())
+            .unwrap_or_default();
+        let mut alias_map: HashMap<NodeId, NodeId> = single_pred
+            .and_then(|p| block_alias_maps.get(&p).cloned())
+            .unwrap_or_default();
 
-        let subst = compute_store_to_load_subst_with_map(block, &mut store_map);
+        let subst = compute_store_to_load_subst_with_map(
+            block,
+            &mut store_map,
+            &mut global_map,
+            &mut alias_map,
+        );
         block_store_maps.insert(block.id, store_map);
+        block_global_maps.insert(block.id, global_map);
+        block_alias_maps.insert(block.id, alias_map);
         global_subst.extend(subst);
     }
 
@@ -2358,15 +2373,10 @@ fn eliminate_store_to_load(graph: &mut MaglevGraph) {
 fn compute_store_to_load_subst_with_map(
     block: &BasicBlock,
     store_map: &mut HashMap<(NodeId, u32), NodeId>,
+    global_map: &mut HashMap<u32, NodeId>,
+    alias_map: &mut HashMap<NodeId, NodeId>,
 ) -> HashMap<NodeId, NodeId> {
     let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
-    // Track global variable store/load forwarding:
-    // StoreGlobal(name, value) → LoadGlobal(name) resolves to value.
-    let mut global_map: HashMap<u32, NodeId> = HashMap::new();
-    // Track NodeId aliases from global forwarding so that property
-    // lookups on a LoadGlobal result can find stores on the original
-    // object.  alias_map[LoadGlobal_id] = original_value_id.
-    let mut alias_map: HashMap<NodeId, NodeId> = HashMap::new();
 
     for (id, node) in &block.nodes {
         match node {

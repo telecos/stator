@@ -3060,6 +3060,17 @@ impl<'a> MaglevCodegen<'a> {
         if let Some(di) = Self::reg_holds_index(dst) {
             self.reg_holds[di] = None;
         }
+        // Constants are always rematerialised (cheap MOV-immediate) rather
+        // than relying on the register allocator's location.  A constant
+        // allocated to a register in the entry block can be clobbered by
+        // later blocks (the linear-scan allocator may not fully account
+        // for cross-block live ranges of constants), leading to stale
+        // values — e.g. sieve's TrueConstant reading 0 instead of
+        // JIT_TRUE.
+        if let Some(imm) = self.try_materialise_constant(id) {
+            self.masm.mov_ri(dst, imm);
+            return;
+        }
         match self.alloc.location(id) {
             Some(Location::Register(n)) => {
                 let src = phys_reg(n);
@@ -3072,35 +3083,9 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.mov_load_base_disp32(dst, Reg64::R14, off);
             }
             None => {
-                // No allocation — materialise constants directly so that
-                // store-to-load forwarded SmiConstants (and other constant
-                // nodes) produce the correct value instead of JIT_UNDEFINED.
-                match self.graph.node(id) {
-                    Some(ValueNode::SmiConstant { value }) => {
-                        self.masm.mov_ri(dst, *value as i64);
-                    }
-                    Some(ValueNode::Int32Constant { value }) => {
-                        self.masm.mov_ri(dst, *value as i64);
-                    }
-                    Some(ValueNode::Uint32Constant { value }) => {
-                        self.masm.mov_ri(dst, *value as i64);
-                    }
-                    Some(ValueNode::Float64Constant { value }) => {
-                        self.masm.mov_ri(dst, value.to_bits() as i64);
-                    }
-                    Some(ValueNode::TrueConstant) => {
-                        self.masm.mov_ri(dst, JIT_TRUE);
-                    }
-                    Some(ValueNode::FalseConstant) => {
-                        self.masm.mov_ri(dst, JIT_FALSE);
-                    }
-                    Some(ValueNode::NullConstant) => {
-                        self.masm.mov_ri(dst, JIT_NULL);
-                    }
-                    _ => {
-                        self.masm.mov_ri(dst, JIT_UNDEFINED);
-                    }
-                }
+                // No allocation and not a recognised constant — fall back to
+                // JIT_UNDEFINED (shouldn't happen for well-formed graphs).
+                self.masm.mov_ri(dst, JIT_UNDEFINED);
             }
         }
     }
@@ -3138,6 +3123,23 @@ impl<'a> MaglevCodegen<'a> {
     /// If `id` refers to a `SmiConstant` or `Int32Constant` node whose value
     /// fits in an i32, return that value.  Used to emit `CMP reg, imm` and
     /// `ADD reg, imm` instead of loading the constant into a scratch register.
+    /// Try to materialise a constant node as an immediate i64 value.
+    /// Returns `Some(imm)` for all constant IR nodes (SmiConstant,
+    /// Int32Constant, TrueConstant, etc.), `None` for non-constants.
+    fn try_materialise_constant(&self, id: NodeId) -> Option<i64> {
+        match self.graph.node(id)? {
+            ValueNode::SmiConstant { value } => Some(*value as i64),
+            ValueNode::Int32Constant { value } => Some(*value as i64),
+            ValueNode::Uint32Constant { value } => Some(*value as i64),
+            ValueNode::Float64Constant { value } => Some(value.to_bits() as i64),
+            ValueNode::TrueConstant => Some(JIT_TRUE),
+            ValueNode::FalseConstant => Some(JIT_FALSE),
+            ValueNode::NullConstant => Some(JIT_NULL),
+            ValueNode::UndefinedConstant => Some(JIT_UNDEFINED),
+            _ => None,
+        }
+    }
+
     fn try_get_i32_constant(&self, id: NodeId) -> Option<i32> {
         match self.graph.node(id)? {
             ValueNode::SmiConstant { value } => {
@@ -7216,9 +7218,9 @@ impl<'a> MaglevCodegen<'a> {
             _ => return false,
         };
 
-        // Don't rotate if the body end is also the header's true target
-        // (single-block loop with no separate body).
-        if body_end_idx == if_true {
+        // Don't rotate a single-block loop (header IS the body) — the
+        // comparison at the header already serves as the back-edge test.
+        if body_end_idx == header_idx {
             return false;
         }
 
@@ -8106,41 +8108,26 @@ impl<'a> MaglevCodegen<'a> {
         // GenericAdd/Sub/Mul can use the smi_guarded tier (~7 insns) instead
         // of the generic tier (~13 insns with dual input Smi checks).
         //
-        // DISABLED: LoadNamedGeneric / LoadGlobal smi_guard seeding.
+        // LoadNamedGeneric / LoadGlobal smi_guard seeding.
         //
-        // History: enabled after ed049403/1c1fbf6c regalloc fix, but still
-        // causes 100% deopt on property_access and deep_object benchmarks
-        // (CI run bc404220: tried=5, deopted=5, category=generic).  The
-        // guard sequence (MOVSXD R11,EAX; CMP R11,RAX; JNE deopt) should
-        // pass for Smi values 1–5, but fails every time on Linux CI.
+        // Seed LoadNamedGeneric and LoadGlobal into smi_guarded when they
+        // feed exclusively into arithmetic-compatible consumers.  At codegen
+        // time, each seeded node gets a Smi deopt guard (MOVSXD + CMP + JNE
+        // deopt) that safely bails to the interpreter if the runtime value
+        // is not a Smi.  Downstream GenericAdd/Sub/Mul can then use the
+        // smi_guarded tier (~7 insns) instead of the generic tier (~13 insns
+        // with dual input Smi checks).
         //
-        // Analysis (exhaustive static review):
-        //  - Register allocator: CONFIRMED CORRECT — all LoadNamedGeneric
-        //    nodes get valid Register/StackSlot assignments.
-        //  - Graph structure: CONFIRMED CORRECT — LoadNamedGeneric nodes
-        //    present in preheader, correctly referenced by GenericAdd.
-        //  - Store-to-load forwarding: produces ZERO substitutions for
-        //    property_access (StoreGlobal clears the store_map before
-        //    LoadNamedGeneric, and receiver NodeIds don't match).  The
-        //    cross-block fix (5b3c885a) was NOT the actual root cause.
-        //  - IC fill / slow path: returns correctly encoded Smi values
-        //    (i64::from(n)) in static analysis; no register clobbering.
-        //  - Root cause: runtime-only — RAX holds a non-Smi value at
-        //    done_label despite all static paths producing Smi.  Requires
-        //    Linux x86_64 debugging (gdb breakpoint on jit_smi_guard_fail_log)
-        //    to inspect the actual RAX value and call stack.
-        //
-        // With this disabled, downstream GenericAdd/Sub/Mul fall back to
-        // the generic tier (inline MOVSXD+CMP per input, ~13 insns) instead
-        // of the smi_guarded tier (~7 insns).  The trade-off is ~6 extra
-        // instructions per arithmetic op vs. permanent JIT blacklisting on
-        // deopt — a huge net win until the guard bug is found.
-        //
-        // TODO: re-enable once the smi_guard deopt root cause is fixed.
-        //       Use `jit_smi_guard_fail_log` diagnostic to identify the
-        //       failing value on Linux CI.
-        #[allow(clippy::overly_complex_bool_expr)]
-        if false {
+        // Previously disabled because store-to-load forwarding did not
+        // propagate global_map across blocks, leaving LoadNamedGeneric IC
+        // nodes live.  The IC produced JIT_UNDEFINED for the object handle,
+        // causing 100% deopt.  Now that global_map and alias_map are
+        // propagated across single-predecessor blocks, the forwarding chain
+        // (CreateObjectLiteralWithProperties → StoreGlobal → LoadGlobal →
+        // LoadNamedGeneric) resolves correctly, eliminating the IC calls.
+        // For any remaining un-forwarded loads, the has_undef_guard in
+        // GenericAdd smi_guarded tier provides a runtime safety net.
+        {
             for block in graph.blocks() {
                 for (id, node) in &block.nodes {
                     if set.contains(id) || branch_conditions.contains(id) {
