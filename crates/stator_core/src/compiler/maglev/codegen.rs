@@ -4293,6 +4293,11 @@ impl<'a> MaglevCodegen<'a> {
             // i32 × i32 always fits in i64, but we need the result to
             // remain i32-representable.  Use 32-bit ops + JO (3 insn)
             // instead of 64-bit IMUL + MOVSXD + CMP + JNE (4 insn).
+            //
+            // When narrow (all consumers only read low 32 bits), the
+            // overflow guard and sign-extension are dead — wrapping
+            // 32-bit semantics are correct (e.g. `(a * 3) | 0`).
+            let narrow = self.narrow_int32.contains(&id);
 
             // Check for a constant operand (multiply is commutative).
             let const_pair = self
@@ -4308,17 +4313,21 @@ impl<'a> MaglevCodegen<'a> {
                             let dst = phys_reg(n);
                             self.emit_load(var, dst);
                             self.masm.add32_rr(dst, dst);
-                            self.masm
-                                .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
-                            self.masm.movsxd_sign_extend(dst, dst);
+                            if !narrow {
+                                self.masm
+                                    .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
+                                self.masm.movsxd_sign_extend(dst, dst);
+                            }
                             self.note_reg_holds(dst, id);
                         }
                         _ => {
                             self.emit_load(var, Reg64::Rax);
                             self.masm.add32_rr(Reg64::Rax, Reg64::Rax);
-                            self.masm
-                                .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
-                            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+                            if !narrow {
+                                self.masm
+                                    .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
+                                self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+                            }
                             self.emit_store(id, Reg64::Rax);
                             self.rax_holds = Some(id);
                         }
@@ -4328,7 +4337,8 @@ impl<'a> MaglevCodegen<'a> {
 
                 // Strength-reduce *3, *5, *9: LEA [base+base*scale] is
                 // 1-cycle latency vs IMUL's 3 cycles.  The 64-bit LEA
-                // may overflow i32, so verify with MOVSXD+CMP+JNE.
+                // may overflow i32, so verify with MOVSXD+CMP+JNE
+                // (unless narrow — wrapping semantics are correct).
                 let lea_scale: Option<u8> = match imm {
                     3 => Some(2),
                     5 => Some(4),
@@ -4347,18 +4357,22 @@ impl<'a> MaglevCodegen<'a> {
                                 }
                             };
                             self.masm.lea_scaled(dst, src_reg, src_reg, scale);
-                            self.masm.movsxd_sign_extend(Reg64::R11, dst);
-                            self.masm.cmp_rr(Reg64::R11, dst);
-                            self.masm.jne(&mut self.deopt_overflow_label);
+                            if !narrow {
+                                self.masm.movsxd_sign_extend(Reg64::R11, dst);
+                                self.masm.cmp_rr(Reg64::R11, dst);
+                                self.masm.jne(&mut self.deopt_overflow_label);
+                            }
                             self.note_reg_holds(dst, id);
                         }
                         _ => {
                             self.emit_load(var, Reg64::R11);
                             self.masm
                                 .lea_scaled(Reg64::R11, Reg64::R11, Reg64::R11, scale);
-                            self.masm.movsxd_sign_extend(Reg64::R10, Reg64::R11);
-                            self.masm.cmp_rr(Reg64::R10, Reg64::R11);
-                            self.masm.jne(&mut self.deopt_overflow_label);
+                            if !narrow {
+                                self.masm.movsxd_sign_extend(Reg64::R10, Reg64::R11);
+                                self.masm.cmp_rr(Reg64::R10, Reg64::R11);
+                                self.masm.jne(&mut self.deopt_overflow_label);
+                            }
                             self.emit_store(id, Reg64::R11);
                         }
                     }
@@ -4377,17 +4391,21 @@ impl<'a> MaglevCodegen<'a> {
                             }
                         };
                         self.masm.imul32_rri(dst, src_reg, imm);
-                        self.masm
-                            .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
-                        self.masm.movsxd_sign_extend(dst, dst);
+                        if !narrow {
+                            self.masm
+                                .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
+                            self.masm.movsxd_sign_extend(dst, dst);
+                        }
                         self.note_reg_holds(dst, id);
                     }
                     _ => {
                         self.emit_load(var, Reg64::R11);
                         self.masm.imul32_rri(Reg64::R11, Reg64::R11, imm);
-                        self.masm
-                            .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
-                        self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
+                        if !narrow {
+                            self.masm
+                                .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
+                            self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
+                        }
                         self.emit_store(id, Reg64::R11);
                     }
                 }
@@ -4419,18 +4437,22 @@ impl<'a> MaglevCodegen<'a> {
                             }
                         }
                     }
-                    self.masm
-                        .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
-                    self.masm.movsxd_sign_extend(dst, dst);
+                    if !narrow {
+                        self.masm
+                            .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
+                        self.masm.movsxd_sign_extend(dst, dst);
+                    }
                     self.note_reg_holds(dst, id);
                 }
                 _ => {
                     self.emit_load(left, Reg64::Rax);
                     self.emit_load(right, Reg64::R10);
                     self.masm.imul32_rr(Reg64::Rax, Reg64::R10);
-                    self.masm
-                        .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
-                    self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+                    if !narrow {
+                        self.masm
+                            .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
+                        self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+                    }
                     self.emit_store(id, Reg64::Rax);
                     self.rax_holds = Some(id);
                 }
@@ -7113,6 +7135,22 @@ impl<'a> MaglevCodegen<'a> {
         }
     }
 
+    /// Returns `true` when `node` is an i32_range Generic arithmetic op
+    /// (Add/Sub/Mul with both inputs in i32_range).  These nodes are
+    /// "narrow-transparent": their lower 32 result bits depend only on the
+    /// lower 32 bits of their inputs (modular arithmetic property), so they
+    /// propagate narrowness from consumers to producers.
+    fn is_i32_range_generic_arith(node: &ValueNode, i32_range: &HashSet<NodeId>) -> bool {
+        match node {
+            ValueNode::GenericAdd { left, right, .. }
+            | ValueNode::GenericSubtract { left, right, .. }
+            | ValueNode::GenericMultiply { left, right, .. } => {
+                i32_range.contains(left) && i32_range.contains(right)
+            }
+            _ => false,
+        }
+    }
+
     /// Returns `true` when `node` only reads the lower 32 bits of its
     /// `NodeId` operands, meaning upstream producers can skip sign-extension.
     ///
@@ -8033,13 +8071,23 @@ impl<'a> MaglevCodegen<'a> {
     ) -> HashSet<NodeId> {
         // Step 1: collect all wrapping Int32 producer IDs AND i32-range
         // CheckedSmi operations AND smi_guarded Generic ops (they all
-        // produce 32-bit results when narrowed).
+        // produce 32-bit results when narrowed).  Also include i32-range
+        // GenericMul which emits 32-bit IMUL/LEA + overflow guard; when
+        // narrow, the overflow guard can be elided entirely.
         let mut candidates: HashSet<NodeId> = HashSet::new();
         for block in graph.blocks() {
             for (id, node) in &block.nodes {
                 if Self::is_wrapping_int32_producer(node)
                     || Self::is_i32_range_checked_producer(node, i32_range)
                     || Self::is_smi_guarded_producer(node, smi_guarded)
+                {
+                    candidates.insert(*id);
+                }
+                // i32-range GenericMul uses 32-bit IMUL/LEA + MOVSXD overflow
+                // check.  When narrow, the check and sign-extension are dead.
+                if let ValueNode::GenericMultiply { left, right, .. } = node
+                    && i32_range.contains(left)
+                    && i32_range.contains(right)
                 {
                     candidates.insert(*id);
                 }
@@ -8078,34 +8126,42 @@ impl<'a> MaglevCodegen<'a> {
             }
         }
 
-        // Step 3: determine narrow-transparent Phis.
+        // Step 3: determine narrow-transparent nodes.
         //
-        // Start optimistic: ALL Phis are initially narrow-transparent.
-        // The convergence loop (below) prunes Phis whose consumers are
-        // non-narrow or whose inputs are non-i32 when consumed by
-        // Return/Branch.  This handles transitive Phi chains: Phi_A
-        // feeding Phi_B (both Return-consumed) is correctly narrowed
-        // because the convergence sees Phi_A in narrow_phi when
-        // validating Phi_B's inputs, and vice-versa.
+        // Start optimistic: ALL Phis and i32-range Generic Add/Sub/Mul are
+        // initially narrow-transparent.  The convergence loop prunes nodes
+        // whose consumers are non-narrow or (for Phis) whose inputs are
+        // non-i32 when consumed by Return/Branch.
+        //
+        // i32-range Generic Add/Sub/Mul qualify because their lower 32
+        // result bits depend only on the lower 32 bits of their inputs
+        // (modular arithmetic).  When narrow-transparent, they propagate
+        // narrowness from consumers to producers: if `(a + b) | 0` makes
+        // the Add narrow, then `a` (e.g. a GenericMul) can skip its
+        // overflow guard.
         //
         // Phis consumed by Return with non-i32 inputs (e.g.
         // UndefinedConstant, heap handles) must NOT be marked narrow
         // because MOVSXD would corrupt the sentinel/pointer value —
         // the convergence loop removes those.
-        let mut narrow_phi: HashSet<NodeId> = HashSet::new();
+        let mut narrow_transparent: HashSet<NodeId> = HashSet::new();
         for block in graph.blocks() {
             for (id, node) in &block.nodes {
-                if matches!(node, ValueNode::Phi { .. }) {
-                    narrow_phi.insert(*id);
+                if matches!(node, ValueNode::Phi { .. })
+                    || Self::is_i32_range_generic_arith(node, i32_range)
+                {
+                    narrow_transparent.insert(*id);
                 }
             }
         }
 
         loop {
             let mut changed = false;
-            for phi_id in narrow_phi.clone() {
+            for nt_id in narrow_transparent.clone() {
+                let node = node_lookup.get(&nt_id);
+
                 // Check 1: all value-consumers must be narrow-compatible.
-                let consumers_ok = consumers_of.get(&phi_id).is_none_or(|cs| {
+                let consumers_ok = consumers_of.get(&nt_id).is_none_or(|cs| {
                     cs.iter().all(|c| {
                         node_lookup
                             .get(c)
@@ -8116,21 +8172,23 @@ impl<'a> MaglevCodegen<'a> {
                             || node_lookup
                                 .get(c)
                                 .is_some_and(|n| Self::is_smi_guarded_consumer(n, smi_guarded))
-                            || narrow_phi.contains(c)
-                            // StoreGlobal is narrow-compatible for Phis:
-                            // codegen sign-extends on the cold exit path.
+                            || narrow_transparent.contains(c)
+                            // StoreGlobal is narrow-compatible: codegen
+                            // sign-extends on the cold exit path.
                             || node_lookup
                                 .get(c)
                                 .is_some_and(|n| matches!(n, ValueNode::StoreGlobal { .. }))
                     })
                 });
 
-                // Check 2: ctrl-consumed Phis (Return/Branch) need all
-                // inputs to be provably i32-valued so that MOVSXD at the
-                // use site produces the correct value.
-                let inputs_ok = if ctrl_consumed.contains(&phi_id) {
+                // Check 2 (Phis only): ctrl-consumed Phis (Return/Branch)
+                // need all inputs to be provably i32-valued so that MOVSXD
+                // at the use site produces the correct value.
+                let inputs_ok = if ctrl_consumed.contains(&nt_id)
+                    && node.is_some_and(|n| matches!(n, ValueNode::Phi { .. }))
+                {
                     node_lookup
-                        .get(&phi_id)
+                        .get(&nt_id)
                         .and_then(|n| {
                             if let ValueNode::Phi { inputs } = n {
                                 Some(inputs)
@@ -8143,7 +8201,7 @@ impl<'a> MaglevCodegen<'a> {
                                 candidates.contains(inp)
                                     || i32_range.contains(inp)
                                     || smi_guarded.contains(inp)
-                                    || narrow_phi.contains(inp)
+                                    || narrow_transparent.contains(inp)
                             })
                         })
                 } else {
@@ -8151,7 +8209,7 @@ impl<'a> MaglevCodegen<'a> {
                 };
 
                 if !consumers_ok || !inputs_ok {
-                    narrow_phi.remove(&phi_id);
+                    narrow_transparent.remove(&nt_id);
                     changed = true;
                 }
             }
@@ -8161,9 +8219,9 @@ impl<'a> MaglevCodegen<'a> {
         }
 
         // Step 4: build the non-narrow set.  Narrow consumers, i32-range
-        // checked ops, and narrow-transparent Phis are skipped — their
+        // checked ops, and narrow-transparent nodes are skipped — their
         // inputs can have garbage upper bits without affecting correctness.
-        // StoreGlobal whose value is a narrow-transparent Phi is also
+        // StoreGlobal whose value is a narrow-transparent node is also
         // skipped: codegen sign-extends on the cold exit path.
         let mut non_narrow: HashSet<NodeId> = HashSet::new();
         for block in graph.blocks() {
@@ -8171,9 +8229,9 @@ impl<'a> MaglevCodegen<'a> {
                 let skip = Self::is_narrow_int32_consumer(node)
                     || Self::is_i32_range_checked_producer(node, i32_range)
                     || Self::is_smi_guarded_consumer(node, smi_guarded)
-                    || narrow_phi.contains(id)
+                    || narrow_transparent.contains(id)
                     || matches!(node, ValueNode::StoreGlobal { value, .. }
-                        if narrow_phi.contains(value));
+                        if narrow_transparent.contains(value));
                 if !skip {
                     Self::collect_node_inputs(node, &mut non_narrow);
                 }
@@ -8182,9 +8240,9 @@ impl<'a> MaglevCodegen<'a> {
                 match ctrl {
                     ControlNode::Return { value } => {
                         // Don't mark Return values as non-narrow if they are
-                        // narrow-transparent Phis — we sign-extend once at the
+                        // narrow-transparent — we sign-extend once at the
                         // Return site instead of per-iteration in the loop.
-                        if !narrow_phi.contains(value) {
+                        if !narrow_transparent.contains(value) {
                             non_narrow.insert(*value);
                         }
                     }
@@ -8202,10 +8260,11 @@ impl<'a> MaglevCodegen<'a> {
         // consumers of narrow values use only those lower 32 bits.
         candidates.retain(|id| !non_narrow.contains(id));
 
-        // Step 6: add narrow-transparent Phis to the result set.
-        // These Phis pass through narrow values (garbage upper 32 bits)
-        // so consumers like StoreGlobal can detect them and sign-extend.
-        for id in &narrow_phi {
+        // Step 6: add narrow-transparent nodes to the result set.
+        // These nodes pass through narrow values (garbage upper 32 bits)
+        // so consumers like StoreGlobal and Return can detect them and
+        // sign-extend.
+        for id in &narrow_transparent {
             candidates.insert(*id);
         }
 
