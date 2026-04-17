@@ -5150,6 +5150,7 @@ pub(crate) mod jit_runtime {
     /// Read the register file slot count from a [`BytecodeArray`] pointer.
     ///
     /// Returns `parameter_count + frame_size`, clamped to `[0, 16]`.
+    #[allow(dead_code)]
     pub extern "C" fn jit_runtime_read_reg_slots(ba_ptr: i64) -> i64 {
         if ba_ptr == 0 {
             return 16;
