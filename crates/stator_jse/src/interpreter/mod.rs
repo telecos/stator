@@ -1464,6 +1464,70 @@ pub fn maybe_compile_maglev(ba: &BytecodeArray) {
     let _ = ba;
 }
 
+/// Compile Maglev JIT code for `ba` **synchronously** on the current thread
+/// and store the result directly into the `maglev_executable_cache`
+/// (`Rc<RefCell>`), bypassing the `Arc<Mutex>` background-thread path.
+///
+/// Returns `true` if compilation succeeded and the executable cache was
+/// populated.  This is used by the MIC (Mono-Call Cache) miss path so that
+/// the very first call to a closure already caches the Maglev entry point
+/// instead of falling back to baseline JIT (which uses per-access FFI
+/// stubs for context slots).
+#[cfg(all(target_arch = "x86_64", unix))]
+pub fn compile_maglev_sync(ba: &BytecodeArray) -> bool {
+    use crate::bytecode::feedback::{FeedbackSlotKind, FeedbackVector, InlineCacheState};
+    use crate::compiler::maglev::codegen as maglev_codegen;
+    use crate::compiler::maglev::graph_builder::GraphBuilder;
+    use crate::compiler::maglev::optimizer::optimize;
+
+    // Prevent duplicate compilation via the background path.
+    let _ = ba.try_start_maglev_compile();
+
+    // Seed feedback: mark keyed-access and arithmetic slots as Monomorphic.
+    let mut feedback = FeedbackVector::new(ba.feedback_metadata());
+    for slot in 0..ba.feedback_metadata().slot_count() {
+        if matches!(
+            ba.feedback_metadata().kind_of(slot),
+            Some(
+                FeedbackSlotKind::KeyedLoadProperty
+                    | FeedbackSlotKind::KeyedStoreProperty
+            )
+        ) {
+            let _ = feedback.set_state(slot, InlineCacheState::Monomorphic);
+        }
+    }
+
+    let param_count = ba.parameter_count();
+    let graph = match GraphBuilder::build(ba, &feedback) {
+        Ok(mut g) => {
+            optimize(&mut g);
+            if g.is_degenerate() {
+                return false;
+            }
+            g
+        }
+        Err(_) => return false,
+    };
+
+    let cc = match maglev_codegen::compile(&graph, param_count) {
+        Ok(cc) => cc,
+        Err(_) => return false,
+    };
+
+    // Store directly into the Rc<RefCell> executable cache so the caller
+    // can read it immediately without Arc<Mutex> indirection.
+    use crate::compiler::maglev::codegen::CachedMaglevCode;
+    let maglev_cache = ba.maglev_executable_cache();
+    // SAFETY: `cc.code` was produced by `maglev_codegen::compile`.
+    match unsafe { CachedMaglevCode::new(&cc.code, cc.register_file_slots) } {
+        Some(exec) => {
+            *maglev_cache.borrow_mut() = Some(exec);
+            true
+        }
+        None => false,
+    }
+}
+
 /// Try to execute `ba` via the cached Maglev JIT code.
 ///
 /// Returns `Some(result)` when execution succeeds or returns an error;

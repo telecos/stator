@@ -4718,56 +4718,73 @@ pub(crate) mod jit_runtime {
                         .unwrap_or(0);
                     let ba_raw = &**ba as *const BytecodeArray;
 
-                    // Try baseline JIT cache first.
-                    let exec_cache = ba.jit_executable_cache();
-                    // SAFETY: single-threaded; exec cache is not being
-                    // mutated during JIT execution.
-                    let cache_ref = unsafe { &*exec_cache.as_ptr() };
-                    if let Some(exec) = cache_ref.as_ref().filter(|e| e.register_file_slots <= 16) {
-                        let exec_raw = exec as *const JitExecutableCode;
-                        (exec_raw, exec.register_file_slots, ba_raw, ctx)
-                    } else {
-                        // Fallback: try Maglev executable cache.
-                        // CachedMaglevCode has identical memory layout to
-                        // JitExecutableCode (ptr, size, register_file_slots),
-                        // so the pointer extraction in the caller works.
-                        let maglev_cache = ba.maglev_executable_cache();
-                        // SAFETY: single-threaded; no concurrent mutation.
-                        let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
-                        if maglev_ref.is_none() {
-                            // Lazy transfer from Arc<Mutex> (background
-                            // compilation) to Rc<RefCell> (JIT fast path).
-                            let jit_cache = ba.maglev_jit_cache_arc();
-                            let cached_data = jit_cache.lock().ok().and_then(|guard| {
-                                guard
-                                    .as_ref()
-                                    .map(|c| (c.as_bytes().to_vec(), c.register_file_slots))
-                            });
-                            if let Some((code, register_file_slots)) = cached_data {
-                                use crate::compiler::maglev::codegen::CachedMaglevCode;
-                                // SAFETY: `code` from `maglev_codegen::compile`.
-                                let exec =
-                                    unsafe { CachedMaglevCode::new(&code, register_file_slots) };
-                                *maglev_cache.borrow_mut() = exec;
-                            }
+                    // Try Maglev executable cache first (preferred).
+                    // CachedMaglevCode has identical memory layout to
+                    // JitExecutableCode (ptr, size, register_file_slots),
+                    // so the pointer extraction in the caller works.
+                    let maglev_cache = ba.maglev_executable_cache();
+                    // SAFETY: single-threaded; no concurrent mutation.
+                    let maglev_ref_init = unsafe { &*maglev_cache.as_ptr() };
+                    if maglev_ref_init.is_none() {
+                        // Lazy transfer from Arc<Mutex> (background
+                        // compilation) to Rc<RefCell> (JIT fast path).
+                        let jit_cache = ba.maglev_jit_cache_arc();
+                        let cached_data = jit_cache.lock().ok().and_then(|guard| {
+                            guard
+                                .as_ref()
+                                .map(|c| (c.as_bytes().to_vec(), c.register_file_slots))
+                        });
+                        if let Some((code, register_file_slots)) = cached_data {
+                            use crate::compiler::maglev::codegen::CachedMaglevCode;
+                            // SAFETY: `code` from `maglev_codegen::compile`.
+                            let exec =
+                                unsafe { CachedMaglevCode::new(&code, register_file_slots) };
+                            *maglev_cache.borrow_mut() = exec;
                         }
-                        let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
-                        if let Some(maglev_exec) =
-                            maglev_ref.as_ref().filter(|e| e.register_file_slots <= 16)
-                        {
-                            // SAFETY: CachedMaglevCode layout matches
-                            // JitExecutableCode (ptr, size, register_file_slots).
-                            let exec_raw = maglev_exec
-                                as *const crate::compiler::maglev::codegen::CachedMaglevCode
-                                as *const JitExecutableCode;
-                            (exec_raw, maglev_exec.register_file_slots, ba_raw, ctx)
+                    }
+                    let maglev_ref = unsafe { &*maglev_cache.as_ptr() };
+                    if let Some(maglev_exec) =
+                        maglev_ref.as_ref().filter(|e| e.register_file_slots <= 16)
+                    {
+                        // SAFETY: CachedMaglevCode layout matches
+                        // JitExecutableCode (ptr, size, register_file_slots).
+                        let exec_raw = maglev_exec
+                            as *const crate::compiler::maglev::codegen::CachedMaglevCode
+                            as *const JitExecutableCode;
+                        (exec_raw, maglev_exec.register_file_slots, ba_raw, ctx)
+                    } else {
+                        // Fallback: try baseline JIT cache.
+                        let exec_cache = ba.jit_executable_cache();
+                        // SAFETY: single-threaded; exec cache is not being
+                        // mutated during JIT execution.
+                        let cache_ref = unsafe { &*exec_cache.as_ptr() };
+                        if let Some(exec) = cache_ref.as_ref().filter(|e| e.register_file_slots <= 16) {
+                            let exec_raw = exec as *const JitExecutableCode;
+                            (exec_raw, exec.register_file_slots, ba_raw, ctx)
                         } else {
-                            // ── Eager baseline compile for inner closures ──
-                            // Neither baseline nor Maglev cache has code.
-                            // Compile the callee inline so closures run as
-                            // JIT code after the first invocation.
+                            // ── Eager compile for inner closures ──
+                            // Neither Maglev nor baseline cache has code.
+                            // Compile Maglev synchronously so the MIC caches
+                            // the optimised entry point from the very first
+                            // call (inline Smi paths for context slots
+                            // instead of per-access FFI stubs).
                             let ba_ref: &BytecodeArray = unsafe { &*ba_raw };
-                            if !ba_ref.jit_baseline_has_deopted() {
+
+                            // Synchronous Maglev compilation (fast for small
+                            // closure bodies like `count = count + 1`).
+                            if !ba_ref.jit_maglev_has_deopted() {
+                                crate::interpreter::compile_maglev_sync(ba_ref);
+                            }
+                            let maglev_ref2 = unsafe { &*maglev_cache.as_ptr() };
+                            if let Some(maglev_exec) =
+                                maglev_ref2.as_ref().filter(|e| e.register_file_slots <= 16)
+                            {
+                                let exec_raw = maglev_exec
+                                    as *const crate::compiler::maglev::codegen::CachedMaglevCode
+                                    as *const JitExecutableCode;
+                                (exec_raw, maglev_exec.register_file_slots, ba_raw, ctx)
+                            } else if !ba_ref.jit_baseline_has_deopted() {
+                                // Maglev failed — fall back to eager baseline.
                                 if let Ok(cc) = BaselineCompiler::compile(ba_ref) {
                                     if let Ok(cached) = unsafe {
                                         CachedExecutableCode::from_compiled(
@@ -4776,11 +4793,6 @@ pub(crate) mod jit_runtime {
                                         )
                                     } {
                                         ba_ref.store_jit_code(cached);
-                                        // Trigger Maglev compilation in the
-                                        // background so the closure body gets
-                                        // optimised JIT code on subsequent
-                                        // invocations (the mono cache will
-                                        // pick it up on the next frame).
                                         crate::interpreter::maybe_compile_maglev(ba_ref);
                                         let jit_ref = ba_ref.try_get_jit_code();
                                         if let Some(cached) = jit_ref.as_ref() {
