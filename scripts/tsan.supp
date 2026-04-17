@@ -1,4 +1,4 @@
-# ThreadSanitizer suppressions for stator_js
+# ThreadSanitizer suppressions for stator_jse
 #
 # Wasmtime's concurrent module compilation pipeline (wasmtime 42.x) has
 # internal races between the write path (build_module_artifacts writing an ELF

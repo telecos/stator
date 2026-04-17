@@ -11,82 +11,82 @@
 #
 # The two targets provided here are consumed by gin/BUILD.gn:
 #
-#   rust_library("stator_js")  — compiles crates/stator_js (rlib)
-#   rust_library("stator")       — compiles crates/stator_js_ffi  (staticlib)
+#   rust_library("stator_jse")  — compiles crates/stator_jse (rlib)
+#   rust_library("stator")       — compiles crates/stator_jse_ffi  (staticlib)
 #   source_set("stator_bridge")  — C++17 shim: v8:: namespace over stator.h
 
 import("//build/rust/rust_library.gni")
 
 # ---------------------------------------------------------------------------
-# stator_js — pure Rust interpreter, bytecode compiler, GC, and builtins.
+# stator_jse — pure Rust interpreter, bytecode compiler, GC, and builtins.
 # ---------------------------------------------------------------------------
-rust_library("stator_js") {
-  crate_name = "stator_js"
-  crate_root = "//third_party/stator/crates/stator_js/src/lib.rs"
+rust_library("stator_jse") {
+  crate_name = "stator_jse"
+  crate_root = "//third_party/stator/crates/stator_jse/src/lib.rs"
   edition = "2024"
 
   sources = [
-    "//third_party/stator/crates/stator_js/src/builtins/array.rs",
-    "//third_party/stator/crates/stator_js/src/builtins/error.rs",
-    "//third_party/stator/crates/stator_js/src/builtins/global.rs",
-    "//third_party/stator/crates/stator_js/src/builtins/iterator.rs",
-    "//third_party/stator/crates/stator_js/src/builtins/json.rs",
-    "//third_party/stator/crates/stator_js/src/builtins/map.rs",
-    "//third_party/stator/crates/stator_js/src/builtins/math.rs",
-    "//third_party/stator/crates/stator_js/src/builtins/mod.rs",
-    "//third_party/stator/crates/stator_js/src/builtins/number.rs",
-    "//third_party/stator/crates/stator_js/src/builtins/object.rs",
-    "//third_party/stator/crates/stator_js/src/builtins/promise.rs",
-    "//third_party/stator/crates/stator_js/src/builtins/proxy.rs",
-    "//third_party/stator/crates/stator_js/src/builtins/reflect.rs",
-    "//third_party/stator/crates/stator_js/src/builtins/set.rs",
-    "//third_party/stator/crates/stator_js/src/builtins/string.rs",
-    "//third_party/stator/crates/stator_js/src/builtins/util.rs",
-    "//third_party/stator/crates/stator_js/src/builtins/weak_map.rs",
-    "//third_party/stator/crates/stator_js/src/builtins/weak_set.rs",
-    "//third_party/stator/crates/stator_js/src/bytecode/bytecode_array.rs",
-    "//third_party/stator/crates/stator_js/src/bytecode/bytecode_generator.rs",
-    "//third_party/stator/crates/stator_js/src/bytecode/bytecodes.rs",
-    "//third_party/stator/crates/stator_js/src/bytecode/feedback.rs",
-    "//third_party/stator/crates/stator_js/src/bytecode/mod.rs",
-    "//third_party/stator/crates/stator_js/src/bytecode/register.rs",
-    "//third_party/stator/crates/stator_js/src/bytecode/source_positions.rs",
-    "//third_party/stator/crates/stator_js/src/compiler/baseline/compiler.rs",
-    "//third_party/stator/crates/stator_js/src/compiler/baseline/masm_x64.rs",
-    "//third_party/stator/crates/stator_js/src/compiler/baseline/mod.rs",
-    "//third_party/stator/crates/stator_js/src/compiler/mod.rs",
-    "//third_party/stator/crates/stator_js/src/error.rs",
-    "//third_party/stator/crates/stator_js/src/gc/handle.rs",
-    "//third_party/stator/crates/stator_js/src/gc/heap.rs",
-    "//third_party/stator/crates/stator_js/src/gc/mark_sweep_compact.rs",
-    "//third_party/stator/crates/stator_js/src/gc/mod.rs",
-    "//third_party/stator/crates/stator_js/src/gc/scavenger.rs",
-    "//third_party/stator/crates/stator_js/src/gc/trace.rs",
-    "//third_party/stator/crates/stator_js/src/gc/write_barrier.rs",
-    "//third_party/stator/crates/stator_js/src/ic/mod.rs",
-    "//third_party/stator/crates/stator_js/src/interpreter/mod.rs",
-    "//third_party/stator/crates/stator_js/src/lib.rs",
-    "//third_party/stator/crates/stator_js/src/objects/heap_object.rs",
-    "//third_party/stator/crates/stator_js/src/objects/js_array.rs",
-    "//third_party/stator/crates/stator_js/src/objects/js_function.rs",
-    "//third_party/stator/crates/stator_js/src/objects/js_object.rs",
-    "//third_party/stator/crates/stator_js/src/objects/map.rs",
-    "//third_party/stator/crates/stator_js/src/objects/mod.rs",
-    "//third_party/stator/crates/stator_js/src/objects/regexp.rs",
-    "//third_party/stator/crates/stator_js/src/objects/string.rs",
-    "//third_party/stator/crates/stator_js/src/objects/tagged.rs",
-    "//third_party/stator/crates/stator_js/src/objects/value.rs",
-    "//third_party/stator/crates/stator_js/src/parser/ast.rs",
-    "//third_party/stator/crates/stator_js/src/parser/mod.rs",
-    "//third_party/stator/crates/stator_js/src/parser/preparser.rs",
-    "//third_party/stator/crates/stator_js/src/parser/recursive_descent.rs",
-    "//third_party/stator/crates/stator_js/src/parser/scanner.rs",
-    "//third_party/stator/crates/stator_js/src/parser/scope.rs",
-    "//third_party/stator/crates/stator_js/src/platform.rs",
-    "//third_party/stator/crates/stator_js/src/zone/mod.rs",
+    "//third_party/stator/crates/stator_jse/src/builtins/array.rs",
+    "//third_party/stator/crates/stator_jse/src/builtins/error.rs",
+    "//third_party/stator/crates/stator_jse/src/builtins/global.rs",
+    "//third_party/stator/crates/stator_jse/src/builtins/iterator.rs",
+    "//third_party/stator/crates/stator_jse/src/builtins/json.rs",
+    "//third_party/stator/crates/stator_jse/src/builtins/map.rs",
+    "//third_party/stator/crates/stator_jse/src/builtins/math.rs",
+    "//third_party/stator/crates/stator_jse/src/builtins/mod.rs",
+    "//third_party/stator/crates/stator_jse/src/builtins/number.rs",
+    "//third_party/stator/crates/stator_jse/src/builtins/object.rs",
+    "//third_party/stator/crates/stator_jse/src/builtins/promise.rs",
+    "//third_party/stator/crates/stator_jse/src/builtins/proxy.rs",
+    "//third_party/stator/crates/stator_jse/src/builtins/reflect.rs",
+    "//third_party/stator/crates/stator_jse/src/builtins/set.rs",
+    "//third_party/stator/crates/stator_jse/src/builtins/string.rs",
+    "//third_party/stator/crates/stator_jse/src/builtins/util.rs",
+    "//third_party/stator/crates/stator_jse/src/builtins/weak_map.rs",
+    "//third_party/stator/crates/stator_jse/src/builtins/weak_set.rs",
+    "//third_party/stator/crates/stator_jse/src/bytecode/bytecode_array.rs",
+    "//third_party/stator/crates/stator_jse/src/bytecode/bytecode_generator.rs",
+    "//third_party/stator/crates/stator_jse/src/bytecode/bytecodes.rs",
+    "//third_party/stator/crates/stator_jse/src/bytecode/feedback.rs",
+    "//third_party/stator/crates/stator_jse/src/bytecode/mod.rs",
+    "//third_party/stator/crates/stator_jse/src/bytecode/register.rs",
+    "//third_party/stator/crates/stator_jse/src/bytecode/source_positions.rs",
+    "//third_party/stator/crates/stator_jse/src/compiler/baseline/compiler.rs",
+    "//third_party/stator/crates/stator_jse/src/compiler/baseline/masm_x64.rs",
+    "//third_party/stator/crates/stator_jse/src/compiler/baseline/mod.rs",
+    "//third_party/stator/crates/stator_jse/src/compiler/mod.rs",
+    "//third_party/stator/crates/stator_jse/src/error.rs",
+    "//third_party/stator/crates/stator_jse/src/gc/handle.rs",
+    "//third_party/stator/crates/stator_jse/src/gc/heap.rs",
+    "//third_party/stator/crates/stator_jse/src/gc/mark_sweep_compact.rs",
+    "//third_party/stator/crates/stator_jse/src/gc/mod.rs",
+    "//third_party/stator/crates/stator_jse/src/gc/scavenger.rs",
+    "//third_party/stator/crates/stator_jse/src/gc/trace.rs",
+    "//third_party/stator/crates/stator_jse/src/gc/write_barrier.rs",
+    "//third_party/stator/crates/stator_jse/src/ic/mod.rs",
+    "//third_party/stator/crates/stator_jse/src/interpreter/mod.rs",
+    "//third_party/stator/crates/stator_jse/src/lib.rs",
+    "//third_party/stator/crates/stator_jse/src/objects/heap_object.rs",
+    "//third_party/stator/crates/stator_jse/src/objects/js_array.rs",
+    "//third_party/stator/crates/stator_jse/src/objects/js_function.rs",
+    "//third_party/stator/crates/stator_jse/src/objects/js_object.rs",
+    "//third_party/stator/crates/stator_jse/src/objects/map.rs",
+    "//third_party/stator/crates/stator_jse/src/objects/mod.rs",
+    "//third_party/stator/crates/stator_jse/src/objects/regexp.rs",
+    "//third_party/stator/crates/stator_jse/src/objects/string.rs",
+    "//third_party/stator/crates/stator_jse/src/objects/tagged.rs",
+    "//third_party/stator/crates/stator_jse/src/objects/value.rs",
+    "//third_party/stator/crates/stator_jse/src/parser/ast.rs",
+    "//third_party/stator/crates/stator_jse/src/parser/mod.rs",
+    "//third_party/stator/crates/stator_jse/src/parser/preparser.rs",
+    "//third_party/stator/crates/stator_jse/src/parser/recursive_descent.rs",
+    "//third_party/stator/crates/stator_jse/src/parser/scanner.rs",
+    "//third_party/stator/crates/stator_jse/src/parser/scope.rs",
+    "//third_party/stator/crates/stator_jse/src/platform.rs",
+    "//third_party/stator/crates/stator_jse/src/zone/mod.rs",
   ]
 
-  # Chromium's vendored copies of stator_js's dependencies.  Adjust these
+  # Chromium's vendored copies of stator_jse's dependencies.  Adjust these
   # paths to match wherever the crates are vendored in //third_party.
   deps = [
     "//third_party/rust/bumpalo/v3:lib",
@@ -100,28 +100,28 @@ rust_library("stator_js") {
 }
 
 # ---------------------------------------------------------------------------
-# stator — C-ABI FFI surface (stator_js_ffi crate).  Links stator_js and
+# stator — C-ABI FFI surface (stator_jse_ffi crate).  Links stator_jse and
 # exposes the stable C API used by stator_bridge.
 #
 # The GN target is named "stator" (the public-facing engine name); the Rust
-# crate is named "stator_js_ffi" (set via crate_name below) to match the Cargo
+# crate is named "stator_jse_ffi" (set via crate_name below) to match the Cargo
 # workspace.
 # ---------------------------------------------------------------------------
 rust_library("stator") {
-  crate_name = "stator_js_ffi"
-  crate_root = "//third_party/stator/crates/stator_js_ffi/src/lib.rs"
+  crate_name = "stator_jse_ffi"
+  crate_root = "//third_party/stator/crates/stator_jse_ffi/src/lib.rs"
   edition = "2024"
 
   sources = [
-    "//third_party/stator/crates/stator_js_ffi/src/lib.rs",
+    "//third_party/stator/crates/stator_jse_ffi/src/lib.rs",
   ]
 
   deps = [
-    ":stator_js",
+    ":stator_jse",
     "//third_party/rust/log/v0_4:lib",
   ]
 
-  # stator_js_ffi contains unsafe blocks required by the C FFI boundary.
+  # stator_jse_ffi contains unsafe blocks required by the C FFI boundary.
   allow_unsafe = true
 }
 
@@ -140,5 +140,5 @@ source_set("stator_bridge") {
 }
 
 config("stator_bridge_include") {
-  include_dirs = [ "//third_party/stator/crates/stator_js_ffi/include" ]
+  include_dirs = [ "//third_party/stator/crates/stator_jse_ffi/include" ]
 }
