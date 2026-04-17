@@ -117,7 +117,7 @@ pub const NUM_PHYS_REGS: u32 = 9;
 /// cache: RBX(0), RCX(1), RDX(2), RSI(3), R8(4), R9(5).
 const NUM_REG_FWD: usize = 6;
 
-/// Bytes per monomorphic call-site cache slot (5 × i64 = 40 bytes).
+/// Bytes per monomorphic call-site cache slot (6 × i64 = 48 bytes).
 ///
 /// ```text
 /// [RBP - base - 0]   cached callee i64 (0 = empty)
@@ -125,9 +125,10 @@ const NUM_REG_FWD: usize = 6;
 /// [RBP - base - 16]  cached context pointer
 /// [RBP - base - 24]  cached BA pointer
 /// [RBP - base - 32]  cached caller BA pointer
+/// [RBP - base - 40]  cached register file slot count (1–16)
 /// ```
 #[cfg(all(target_arch = "x86_64", unix))]
-const MONO_CACHE_SLOT_BYTES: i32 = 40;
+const MONO_CACHE_SLOT_BYTES: i32 = 48;
 
 /// Offset from the start of a mono-cache slot to each field.
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -140,6 +141,8 @@ const MONO_OFF_CTX: i32 = 16;
 const MONO_OFF_BA: i32 = 24;
 #[cfg(all(target_arch = "x86_64", unix))]
 const MONO_OFF_CALLER_BA: i32 = 32;
+#[cfg(all(target_arch = "x86_64", unix))]
+const MONO_OFF_REG_SLOTS: i32 = 40;
 
 /// Lazily probed [`JsValue`] byte layout, cached for the lifetime of the
 /// process.  Used by the inline array-access fast path.
@@ -6625,6 +6628,7 @@ impl<'a> MaglevCodegen<'a> {
         //   +16 ctx_ptr
         //   +24 callee_ba_ptr
         //   +32 caller_ba_ptr
+        //   +40 reg_slots (1–16)
         let site = self.next_mono_cache_site;
         self.next_mono_cache_site += 1;
         // Base offset from RBP to the start of all cache slots.
@@ -6635,6 +6639,7 @@ impl<'a> MaglevCodegen<'a> {
         let off_ctx = slot_base - MONO_OFF_CTX;
         let off_ba = slot_base - MONO_OFF_BA;
         let off_caller_ba = slot_base - MONO_OFF_CALLER_BA;
+        let off_reg_slots = slot_base - MONO_OFF_REG_SLOTS;
 
         let saved = self.emit_save_live_regs(id);
         // After save_live_regs: RSP ≡ 0 mod 16.
@@ -6682,15 +6687,26 @@ impl<'a> MaglevCodegen<'a> {
         // preserves alignment).
         self.masm.sub_ri(Reg64::Rsp, 128);
 
-        // Zero register file with unrolled stores.  This avoids the
-        // startup overhead of `rep stosq` and doesn't clobber
-        // RDI/RCX, so we can load entry/ctx directly from the mono
-        // cache after zeroing (no push/pop needed).
+        // Zero only the register slots the callee actually uses
+        // (cached in the MIC slot, clamped to 1–16).  This avoids
+        // 13-14 wasted stores for small closures.
         self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
-        for i in 0..16i32 {
-            self.masm
-                .mov_store_base_disp32(Reg64::Rsp, i * 8, Reg64::Rax);
-        }
+        self.masm
+            .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_reg_slots);
+        // RDI will be set to RSP after zeroing, so reuse it as the
+        // store pointer during the loop.
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
+        // Guard: skip loop if reg_slots == 0 (defensive; should be ≥ 1).
+        self.masm.test_rr(Reg64::Rcx, Reg64::Rcx);
+        let mut skip_zero = Label::new();
+        self.masm.je(&mut skip_zero);
+        let mut zero_loop = Label::new();
+        self.masm.bind_label(&mut zero_loop);
+        self.masm.mov_store_base_disp32(Reg64::Rdi, 0, Reg64::Rax);
+        self.masm.add_ri(Reg64::Rdi, 8);
+        self.masm.sub_ri(Reg64::Rcx, 1);
+        self.masm.jne(&mut zero_loop);
+        self.masm.bind_label(&mut skip_zero);
 
         // Load entry + ctx directly from mono cache.
         self.masm
@@ -6773,6 +6789,17 @@ impl<'a> MaglevCodegen<'a> {
         self.masm
             .mov_store_base_disp32(Reg64::Rbp, off_ba, Reg64::Rax);
 
+        // Read the callee's register file slot count from the BA and
+        // cache it in the MIC slot for subsequent mono-hit zeroing.
+        // RAX = ba_ptr (from jit_runtime_read_current_ba above).
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
+        let reg_slots_addr = jit_runtime::jit_runtime_read_reg_slots as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, reg_slots_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        // RAX = reg_slots (1–16).
+        self.masm
+            .mov_store_base_disp32(Reg64::Rbp, off_reg_slots, Reg64::Rax);
+
         self.masm.pop(Reg64::R10);
         self.masm.pop(Reg64::R11);
 
@@ -6783,13 +6810,23 @@ impl<'a> MaglevCodegen<'a> {
         // Allocate 128-byte register file (fixed size for ABI compat).
         self.masm.sub_ri(Reg64::Rsp, 128);
 
-        // Zero register file with unrolled stores (no RDI/RCX
-        // clobber, avoids rep stosq startup overhead).
+        // Zero only the callee's actual register slots (cached in
+        // off_reg_slots).  The miss path is cold so the extra load is
+        // negligible, but it keeps the fast-path MIC slot populated.
         self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
-        for i in 0..16i32 {
-            self.masm
-                .mov_store_base_disp32(Reg64::Rsp, i * 8, Reg64::Rax);
-        }
+        self.masm
+            .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_reg_slots);
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
+        self.masm.test_rr(Reg64::Rcx, Reg64::Rcx);
+        let mut miss_skip_zero = Label::new();
+        self.masm.je(&mut miss_skip_zero);
+        let mut miss_zero_loop = Label::new();
+        self.masm.bind_label(&mut miss_zero_loop);
+        self.masm.mov_store_base_disp32(Reg64::Rdi, 0, Reg64::Rax);
+        self.masm.add_ri(Reg64::Rdi, 8);
+        self.masm.sub_ri(Reg64::Rcx, 1);
+        self.masm.jne(&mut miss_zero_loop);
+        self.masm.bind_label(&mut miss_skip_zero);
 
         // RDI = register file, RSI = ctx_ptr.
         self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
