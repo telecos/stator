@@ -5463,6 +5463,129 @@ pub(crate) mod jit_runtime {
         result_val.map(jsvalue_to_jit_i64).unwrap_or(JIT_DEOPT)
     }
 
+    /// Lightweight prepare for inline monomorphic 0-arg calls.
+    ///
+    /// Combines the `read_ba_ctx` context refresh with the full
+    /// prepare sequence (BA save/set, MaglevCalleeCache, context
+    /// swap) in a single FFI call.  The caller then allocates the
+    /// register file on the JIT stack and calls the entry point
+    /// directly, followed by [`jit_runtime_finish_direct_call_r15`].
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`ba_ptr`)       – cached BA pointer for callee
+    /// * `RSI` (`rt_ptrs_cell`) – raw pointer to `Cell<RtPtrs>` (R15)
+    /// * `RDX` (`callee_i64`)   – JIT i64 encoding of the callee
+    ///
+    /// Returns the fresh `ctx_ptr` in `RAX` on success, or
+    /// [`JIT_DEOPT`] on failure (caller should fall back to stub).
+    #[allow(dead_code)] // Called from JIT-generated machine code.
+    pub extern "C" fn jit_runtime_mono_inline_prepare_r15(
+        ba_ptr: i64,
+        rt_ptrs_cell: i64,
+        callee_i64: i64,
+    ) -> i64 {
+        let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
+        if !ptrs.is_cached() {
+            return JIT_DEOPT;
+        }
+        mono_inline_prepare_inner(ba_ptr, ptrs, callee_i64)
+    }
+
+    /// Inner implementation for [`jit_runtime_mono_inline_prepare_r15`].
+    fn mono_inline_prepare_inner(ba_ptr: i64, ptrs: RtPtrs, callee_i64: i64) -> i64 {
+        // SAFETY: cached pointers set by cache_rt_ptrs; valid for thread
+        // lifetime.  Single-threaded access guaranteed.
+        let bc_ref = unsafe { &*ptrs.bytecode };
+        let heap_ref = unsafe { &*ptrs.heap };
+        let ctx_ref = unsafe { &*ptrs.context };
+
+        // Read fresh context from the BytecodeArray.
+        let cached_ctx_ptr = if ba_ptr != 0 {
+            let ba = unsafe { &*(ba_ptr as *const BytecodeArray) };
+            ba.closure_context()
+                .map(|rc| Rc::as_ptr(rc) as i64)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Save current BA and set callee's BA.
+        let saved_ba = bc_ref.get();
+        bc_ref.set(ba_ptr as *const BytecodeArray);
+
+        // Use MaglevCalleeCache for repeat-callee optimization.
+        let ba_raw = ba_ptr as *const BytecodeArray;
+        let mcache = ptrs.get_maglev_callee_cache();
+        let same_context = if mcache.ba_ptr == ba_raw && mcache.ctx_ptr == cached_ctx_ptr {
+            mcache.same_context
+        } else {
+            drop_cached_ctx_rc_raw(mcache.ctx_rc_raw);
+            let callee_ctx_raw = cached_ctx_ptr as *const RefCell<JsContext>;
+            let current_ctx = unsafe {
+                (*ctx_ref.as_ptr())
+                    .as_ref()
+                    .map(Rc::as_ptr)
+                    .unwrap_or(std::ptr::null())
+            };
+            let same = std::ptr::eq(callee_ctx_raw, current_ctx);
+            let ctx_rc_raw = if cached_ctx_ptr != 0 {
+                unsafe {
+                    Rc::increment_strong_count(callee_ctx_raw);
+                }
+                callee_ctx_raw
+            } else {
+                std::ptr::null()
+            };
+            ptrs.set_maglev_callee_cache(MaglevCalleeCache {
+                ba_ptr: ba_raw,
+                ctx_ptr: cached_ctx_ptr,
+                same_context: same,
+                skip_args: true,
+                ctx_rc_raw,
+            });
+            same
+        };
+
+        // Heap base snapshot (deferred for same-context Smi results).
+        let heap_base = if same_context {
+            0usize
+        } else {
+            unsafe { (*heap_ref.as_ptr()).len() }
+        };
+
+        // Context swap for different-context calls.
+        let ctx_changed = if same_context {
+            false
+        } else {
+            let idx = (callee_i64 - JIT_HEAP_TAG) as usize;
+            let callee_ctx = {
+                let heap = unsafe { &*heap_ref.as_ptr() };
+                match heap.get(idx) {
+                    Some(JsValue::Function(ba)) => ba.closure_context().cloned(),
+                    _ => {
+                        bc_ref.set(saved_ba);
+                        return JIT_DEOPT;
+                    }
+                }
+            };
+            let old_ctx = unsafe { std::mem::replace(&mut *ctx_ref.as_ptr(), callee_ctx) };
+            DIRECT_CALL_OLD_CTX.with(|c| {
+                *c.borrow_mut() = old_ctx;
+            });
+            true
+        };
+
+        // Store state for finish_direct_call_r15.
+        ptrs.set_direct_call(DirectCallState {
+            saved_ba,
+            heap_base,
+            ctx_changed,
+        });
+
+        cached_ctx_ptr
+    }
+
     /// Specialized runtime stub for `LdaGlobal`.
     ///
     /// Avoids the generic opcode dispatch overhead of

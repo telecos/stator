@@ -6311,64 +6311,97 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, off_callee);
         self.masm.jne(&mut cache_miss);
 
-        // ── Mono HIT: dispatch via runtime helper ─────────────────
+        // ── Mono HIT: inline dispatch ─────────────────────────────
         //
-        // The cached ctx_ptr may be stale if `set_closure_context`
-        // replaced the closure's inner Rc between the cache-miss
-        // (when the cache was populated) and this cache-hit.
+        // Instead of calling jit_runtime_mono_dispatch_call_0_r15
+        // (which allocates the register file on the Rust stack and
+        // calls the entry point through FFI), we:
+        //   1. Call a lean prepare helper that saves BA, swaps ctx,
+        //      and stores DirectCallState (one FFI call).
+        //   2. Allocate + zero the register file on the JIT stack.
+        //   3. CALL the cached entry point directly.
+        //   4. Call finish_direct_call_r15 to restore BA/ctx/heap.
         //
-        // Re-read the context from the live BytecodeArray via
-        // `jit_runtime_read_ba_ctx`, then dispatch through
-        // `jit_runtime_mono_dispatch_call_0_r15` which handles the
-        // full protocol: BA save/restore, context comparison/swap,
-        // heap tracking, and register-file allocation.
+        // This eliminates the Rust-side register-file allocation,
+        // the transmute, and one function-call frame from the hot
+        // path.
 
-        // Save callee_i64 (R11) across the helper call.
-        // Two pushes keep RSP ≡ 0 mod 16 for the upcoming `call`.
-        self.masm.push(Reg64::R11); // saved callee_i64
-        self.masm.push(Reg64::R11); // padding
+        let mut mono_hit_prepare_fail = Label::new();
+        let mut mono_hit_deopt = Label::new();
 
-        // Read fresh context from the BytecodeArray.
+        // Save callee_i64 (R11) across the prepare call.
+        // Two pushes keep RSP ≡ 0 mod 16.
+        self.masm.push(Reg64::R11); // [RSP+8] = callee_i64
+        self.masm.push(Reg64::R11); // [RSP+0] = padding
+
+        // Prepare: RDI = ba_ptr, RSI = rt_ptrs_cell, RDX = callee_i64.
         self.masm
             .mov_load_base_disp32(Reg64::Rdi, Reg64::Rbp, off_ba);
-        let read_ctx_addr = jit_runtime::jit_runtime_read_ba_ctx as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, read_ctx_addr as i64);
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R15);
+        self.masm.mov_rr(Reg64::Rdx, Reg64::R11); // callee_i64
+        let prepare_addr = jit_runtime::jit_runtime_mono_inline_prepare_r15 as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, prepare_addr as i64);
         self.masm.call_reg(Reg64::R11);
-        // RAX = fresh ctx_ptr.
+        // RAX = fresh ctx_ptr, or JIT_DEOPT on failure.
 
-        // Update mono-cache ctx for future hits.
-        self.masm
-            .mov_store_base_disp32(Reg64::Rbp, off_ctx, Reg64::Rax);
+        self.masm.cmp_ri(Reg64::Rax, i32::MIN);
+        self.masm.jcc(CondCode::Less, &mut mono_hit_prepare_fail);
 
-        // Restore callee_i64 and remove padding.
-        self.masm.add_ri(Reg64::Rsp, 8); // discard padding
-        self.masm.pop(Reg64::R9); // R9 = callee_i64
-        // RSP ≡ 0 mod 16 again.
+        // RAX = ctx_ptr for the callee. Save it (R10 is caller-saved
+        // but we control the code between here and the CALL).
+        // Push ctx + entry to preserve across rep stosq.
+        self.masm.push(Reg64::Rax); // ctx_ptr
+        self.masm
+            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, off_entry);
+        self.masm.push(Reg64::R11); // entry_point
+        // RSP ≡ 0 mod 16 (2 earlier pushes + 2 here = 4 pushes).
 
-        // Set up arguments for jit_runtime_mono_dispatch_call_0_r15:
-        //   RDI = entry_point, RSI = ba_ptr, RDX = fresh ctx,
-        //   RCX = R15 (rt_ptrs_cell), R8 = reg_slots, R9 = callee_i64.
-        self.masm.mov_rr(Reg64::Rdx, Reg64::Rax); // fresh ctx
-        self.masm
-            .mov_load_base_disp32(Reg64::Rdi, Reg64::Rbp, off_entry);
-        self.masm
-            .mov_load_base_disp32(Reg64::Rsi, Reg64::Rbp, off_ba);
-        self.masm.mov_rr(Reg64::Rcx, Reg64::R15);
-        self.masm
-            .mov_load_base_disp32(Reg64::R8, Reg64::Rbp, off_regslots);
-        // R9 already set to callee_i64 above.
+        // Allocate 128-byte register file on the JIT stack.
+        self.masm.sub_ri(Reg64::Rsp, 128);
 
-        let dispatch_addr = jit_runtime::jit_runtime_mono_dispatch_call_0_r15 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, dispatch_addr as i64);
+        // Zero register file using rep stosq.
+        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+        self.masm.mov_ri(Reg64::Rcx, 16);
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
+        self.masm.rep_stosq();
+
+        // Restore entry_point and ctx_ptr from above the reg file.
+        self.masm.mov_load_base_disp32(Reg64::R11, Reg64::Rsp, 128); // entry
+        self.masm
+            .mov_load_base_disp32(Reg64::Rsi, Reg64::Rsp, 128 + 8); // ctx
+
+        // CALL entry point: RDI = register file, RSI = ctx_ptr.
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
         self.masm.call_reg(Reg64::R11);
         // RAX = callee result or JIT_DEOPT.
 
-        // Deopt check: if callee JIT returned JIT_DEOPT, fall back to
-        // the runtime stub instead of deopting the CALLER.
+        // Deallocate register file + saved entry + saved ctx.
+        self.masm.add_ri(Reg64::Rsp, 128 + 16);
+        // RSP now points to [padding, callee_i64] (2 items).
+
+        // Finish: RDI = result, RSI = rt_ptrs_cell (R15).
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R15);
+        let finish_addr = jit_runtime::jit_runtime_finish_direct_call_r15 as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, finish_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+        // RAX = final result or JIT_DEOPT.
+
+        // Discard saved callee + padding.
+        self.masm.add_ri(Reg64::Rsp, 16);
+
+        // Deopt check.
         self.masm.cmp_ri(Reg64::Rax, i32::MIN);
         self.masm.jcc(CondCode::GreaterEq, &mut done_label);
 
-        // Callee deopt: reload callee from mono cache and call stub.
+        // Callee deopt after inline dispatch: fall back to stub.
+        self.masm.jmp(&mut mono_hit_deopt);
+
+        // Prepare failed: pop saved callee + padding, fall back.
+        self.masm.bind_label(&mut mono_hit_prepare_fail);
+        self.masm.add_ri(Reg64::Rsp, 16); // discard padding + callee
+
+        self.masm.bind_label(&mut mono_hit_deopt);
         self.masm
             .mov_load_base_disp32(Reg64::Rdi, Reg64::Rbp, off_callee);
         let mono_retry_addr =
