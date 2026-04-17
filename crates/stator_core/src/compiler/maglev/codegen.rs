@@ -6451,37 +6451,34 @@ impl<'a> MaglevCodegen<'a> {
             .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_ba);
         self.masm.mov_store_base_disp32(Reg64::R10, 0, Reg64::Rcx);
 
-        // Push ctx + entry to preserve across rep stosq.
-        // (2 more pushes → 4 total from aligned start → aligned)
-        self.masm
-            .mov_load_base_disp32(Reg64::Rax, Reg64::Rbp, off_ctx);
-        self.masm.push(Reg64::Rax); // ctx_ptr
-        self.masm
-            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, off_entry);
-        self.masm.push(Reg64::R11); // entry_point
-        // RSP ≡ 0 mod 16 (4 pushes above initial alignment).
-
         // Allocate 128-byte register file on the JIT stack.
+        // RSP ≡ 0 mod 16 (2 pushes above initial alignment, sub
+        // 128 preserves alignment).
         self.masm.sub_ri(Reg64::Rsp, 128);
 
-        // Zero register file using rep stosq.
+        // Zero register file with unrolled stores.  This avoids the
+        // ~15-cycle startup overhead of `rep stosq` and doesn't
+        // clobber RDI/RCX, so we can load entry/ctx directly from
+        // the mono cache after zeroing (no push/pop needed).
         self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
-        self.masm.mov_ri(Reg64::Rcx, 16);
-        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
-        self.masm.rep_stosq();
+        for i in 0..16i32 {
+            self.masm
+                .mov_store_base_disp32(Reg64::Rsp, i * 8, Reg64::Rax);
+        }
 
-        // Restore entry_point and ctx_ptr from above the reg file.
-        self.masm.mov_load_base_disp32(Reg64::R11, Reg64::Rsp, 128); // entry
+        // Load entry + ctx directly from mono cache.
         self.masm
-            .mov_load_base_disp32(Reg64::Rsi, Reg64::Rsp, 128 + 8); // ctx
+            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, off_entry);
+        self.masm
+            .mov_load_base_disp32(Reg64::Rsi, Reg64::Rbp, off_ctx);
 
         // CALL entry point: RDI = register file, RSI = ctx_ptr.
         self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
         self.masm.call_reg(Reg64::R11);
         // RAX = callee result or JIT_DEOPT.
 
-        // Deallocate register file + saved entry + saved ctx.
-        self.masm.add_ri(Reg64::Rsp, 128 + 16);
+        // Deallocate register file.
+        self.masm.add_ri(Reg64::Rsp, 128);
         // RSP now points to [old_ba, callee_i64] (2 items).
 
         // ── Inline BA restore ───────────────────────────────────
@@ -6567,17 +6564,13 @@ impl<'a> MaglevCodegen<'a> {
         // Allocate 128-byte register file (fixed size for ABI compat).
         self.masm.sub_ri(Reg64::Rsp, 128);
 
-        // Zero register file using rep stosq.
-        self.masm.push(Reg64::R10);
-        self.masm.push(Reg64::R11);
-        self.masm.xor_rr(Reg64::Rax, Reg64::Rax); // RAX = 0
-        self.masm.mov_ri(Reg64::Rcx, 16); // RCX = 16 (qwords)
-        // RDI points to the register file at [RSP + 16] (after two pushes)
-        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
-        self.masm.add_ri(Reg64::Rdi, 16);
-        self.masm.rep_stosq(); // Zero 128 bytes
-        self.masm.pop(Reg64::R11);
-        self.masm.pop(Reg64::R10);
+        // Zero register file with unrolled stores (no RDI/RCX
+        // clobber, avoids rep stosq startup overhead).
+        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+        for i in 0..16i32 {
+            self.masm
+                .mov_store_base_disp32(Reg64::Rsp, i * 8, Reg64::Rax);
+        }
 
         // RDI = register file, RSI = ctx_ptr.
         self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
@@ -6661,17 +6654,14 @@ impl<'a> MaglevCodegen<'a> {
         // Allocate register file (128 bytes).
         self.masm.sub_ri(Reg64::Rsp, 128);
 
-        // Zero register file using rep stosq.
-        self.masm.push(Reg64::R10);
-        self.masm.push(Reg64::R11);
-        self.masm.xor_rr(Reg64::Rax, Reg64::Rax); // RAX = 0
-        self.masm.mov_ri(Reg64::Rcx, 16); // RCX = 16 (qwords)
-        // RDI points to the register file at [RSP + 16] (after two pushes)
-        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
-        self.masm.add_ri(Reg64::Rdi, 16);
-        self.masm.rep_stosq(); // Zero 128 bytes (~2-3 cycles)
-        self.masm.pop(Reg64::R11);
-        self.masm.pop(Reg64::R10);
+        // Zero register file with unrolled stores (no RDI/RCX
+        // clobber, avoids rep stosq startup overhead and eliminates
+        // the push/pop of R10/R11).
+        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+        for i in 0..16i32 {
+            self.masm
+                .mov_store_base_disp32(Reg64::Rsp, i * 8, Reg64::Rax);
+        }
 
         // Store arg0 into register file slot 0.
         // arg0 is on the stack at RSP + 128 + 8 (callee at +128, arg0 at +136).

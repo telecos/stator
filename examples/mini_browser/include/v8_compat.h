@@ -11,7 +11,7 @@
  * - `v8::FunctionCallback` matches `StatorFunctionTemplateCallback` directly;
  *   use `v8::FunctionCallbackInfo` for convenient argument access.
  *
- * Link against `libstator_js_ffi.a` (or the dynamic variant).
+ * Link against `libstator_jse_ffi.a` (or the dynamic variant).
  */
 
 #ifndef V8_COMPAT_H
