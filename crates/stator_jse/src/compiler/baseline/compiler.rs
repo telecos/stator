@@ -1244,6 +1244,17 @@ pub(crate) mod jit_runtime {
             }
         }
 
+        alloc_heap_handle_no_dedup_lookup(val, ptrs)
+    }
+
+    /// Allocate a heap handle skipping the dedup map lookup.
+    ///
+    /// Used when we *know* the object is freshly created (no existing
+    /// handle can exist) — saves one TLS access + HashMap lookup per
+    /// allocation.  Still inserts into the dedup map so future
+    /// property-access stubs can find the handle.
+    #[inline]
+    fn alloc_heap_handle_no_dedup_lookup(val: JsValue, ptrs: &RtPtrs) -> i64 {
         let identity = jsvalue_rc_identity(&val);
 
         let idx = if ptrs.is_cached() {
@@ -7965,6 +7976,171 @@ pub(crate) mod jit_runtime {
         alloc_heap_handle(val.clone())
     }
 
+    // ── Property-chain load ─────────────────────────────────────────────
+
+    /// Maximum chain depth supported by `LoadNamedChain`.
+    const MAX_CHAIN_DEPTH: usize = 8;
+
+    /// Walk a property-access chain (`obj.a.b.c…`) in a single call,
+    /// avoiding intermediate heap-handle allocations.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`root_i64`)      – JIT i64 handle of the root object.
+    /// * `RSI` (`names_packed`)   – up to 5 name indices packed in 12-bit
+    ///   fields (bits 0–11 = name0, 12–23 = name1, …, 60–63 = count).
+    /// * `RDX` (`rt_ptrs_cell`)  – pointer to `Cell<RtPtrs>` TLS slot.
+    /// * `RCX` (`chain_ic`)      – pointer to chain IC slots on the
+    ///   JIT stack frame.  Layout: `[root_handle, (map_ptr, shape_id,
+    ///   offset) × N]` — 8 + N×24 bytes.
+    ///
+    /// Returns the final property value as JIT i64 in `RAX`, or
+    /// [`JIT_DEOPT`] on failure.
+    #[allow(dead_code)]
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub extern "C" fn jit_runtime_load_named_chain(
+        root_i64: i64,
+        names_packed: i64,
+        rt_ptrs_cell: i64,
+        chain_ic: *mut i64,
+    ) -> i64 {
+        load_named_chain_inner(root_i64, names_packed, rt_ptrs_cell, chain_ic)
+            .unwrap_or(JIT_DEOPT)
+    }
+
+    fn load_named_chain_inner(
+        root_i64: i64,
+        names_packed: i64,
+        rt_ptrs_cell: i64,
+        chain_ic: *mut i64,
+    ) -> Option<i64> {
+        if !is_heap_handle(root_i64) {
+            return None;
+        }
+
+        let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
+        if !ptrs.is_cached() {
+            return None;
+        }
+        let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+
+        let names_u64 = names_packed as u64;
+        let count = ((names_u64 >> 60) & 0xF) as usize;
+        if count == 0 || count > MAX_CHAIN_DEPTH {
+            return None;
+        }
+
+        // Decode name indices.
+        let mut name_indices = [0u32; MAX_CHAIN_DEPTH];
+        for i in 0..count {
+            name_indices[i] = ((names_u64 >> (i * 12)) & 0xFFF) as u32;
+        }
+
+        // ── Fast path: check chain IC ─────────────────────────────
+        // Layout: [root_handle(8), (map_ptr(8), shape(8), offset(8)) × N]
+        let cached_root = unsafe { *chain_ic };
+        if cached_root == root_i64 {
+            // Try the cached chain — all shapes must still match.
+            let mut current_map_rc: Option<&std::rc::Rc<std::cell::RefCell<crate::objects::property_map::PropertyMap>>> = None;
+            let root_idx = (root_i64 - JIT_HEAP_TAG) as usize;
+            if let Some(JsValue::PlainObject(rc)) = heap.get(root_idx) {
+                current_map_rc = Some(rc);
+            } else {
+                // IC stale — clear and fall through to slow path.
+                unsafe { *chain_ic = 0 };
+            }
+
+            if let Some(mut map_rc) = current_map_rc {
+                let mut ic_hit = true;
+                for step in 0..count {
+                    let slot_base = chain_ic.wrapping_add(1 + step * 3);
+                    let cached_map_ptr = unsafe { *slot_base } as *const std::cell::RefCell<crate::objects::property_map::PropertyMap>;
+                    let cached_shape = unsafe { *slot_base.wrapping_add(1) } as u64;
+                    let cached_offset = unsafe { *slot_base.wrapping_add(2) } as usize;
+
+                    let map = unsafe { &*map_rc.as_ptr() };
+                    if map_rc.as_ptr() as i64 != cached_map_ptr as i64
+                        || map.shape_id() != cached_shape
+                    {
+                        ic_hit = false;
+                        break;
+                    }
+
+                    let val = unsafe { map.get_by_offset_unchecked(cached_offset) };
+
+                    if step < count - 1 {
+                        // Intermediate step: must be a PlainObject.
+                        match val {
+                            JsValue::PlainObject(next_rc) => {
+                                map_rc = next_rc;
+                            }
+                            _ => {
+                                ic_hit = false;
+                                break;
+                            }
+                        }
+                    } else {
+                        // Final step: encode and return.
+                        if ic_hit {
+                            return Some(match try_encode_named_ic_value(val) {
+                                Some(enc) => enc,
+                                None => alloc_heap_handle_with_ptrs(val.clone(), &ptrs),
+                            });
+                        }
+                    }
+                }
+                if ic_hit {
+                    // Should not reach here, but guard.
+                    return None;
+                }
+            }
+        }
+
+        // ── Slow path: walk chain and populate IC ─────────────────
+        let root_idx = (root_i64 - JIT_HEAP_TAG) as usize;
+        let root_val = heap.get(root_idx)?;
+        let mut map_rc = match root_val {
+            JsValue::PlainObject(rc) => rc,
+            _ => return None,
+        };
+
+        // Fill IC root handle.
+        unsafe { *chain_ic = root_i64 };
+
+        for step in 0..count {
+            let name_idx = name_indices[step];
+            let prop_name = get_rt_string_constant_ref_with_ptrs(name_idx, &ptrs)?;
+            let map = unsafe { &*map_rc.as_ptr() };
+            let shape = map.shape_id();
+            let offset = map.offset_of(prop_name)?;
+            let val = unsafe { map.get_by_offset_unchecked(offset) };
+
+            // Fill IC for this step: [map_ptr, shape, offset]
+            let slot_base = chain_ic.wrapping_add(1 + step * 3);
+            unsafe {
+                *slot_base = map_rc.as_ptr() as i64;
+                *slot_base.wrapping_add(1) = shape as i64;
+                *slot_base.wrapping_add(2) = offset as i64;
+            }
+
+            if step < count - 1 {
+                match val {
+                    JsValue::PlainObject(next_rc) => {
+                        map_rc = next_rc;
+                    }
+                    _ => return None,
+                }
+            } else {
+                return Some(match try_encode_named_ic_value(val) {
+                    Some(enc) => enc,
+                    None => alloc_heap_handle_with_ptrs(val.clone(), &ptrs),
+                });
+            }
+        }
+
+        None
+    }
+
     /// Diagnostic: called from JIT when smi_guard fails at done_label.
     ///
     /// Prints the failing value and node ID so CI logs reveal the root cause.
@@ -8308,13 +8484,14 @@ pub(crate) mod jit_runtime {
                 let rc = Rc::new(RefCell::new(map));
                 ba_ref.set_object_literal_pending(slot, Rc::clone(&rc));
                 let obj = JsValue::PlainObject(rc);
-                return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
+                return Some(alloc_heap_handle_no_dedup_lookup(obj, &ptrs));
             }
         }
 
         // Fallback: no feedback slot or no BA pointer.
+        let ptrs = RT_PTRS.with(|p| p.get());
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::with_capacity(capacity))));
-        Some(alloc_heap_handle(obj))
+        Some(alloc_heap_handle_no_dedup_lookup(obj, &ptrs))
     }
 
     // ── Fused CreateObjectLiteral + StoreNamedGeneric stub ──────────────
@@ -8466,7 +8643,7 @@ pub(crate) mod jit_runtime {
                     }
                 }
                 let obj = JsValue::PlainObject(rc);
-                return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
+                return Some(alloc_heap_handle_no_dedup_lookup(obj, &ptrs));
             }
         }
 
@@ -8489,7 +8666,7 @@ pub(crate) mod jit_runtime {
             }
         }
         let obj = JsValue::PlainObject(map_rc);
-        Some(alloc_heap_handle_with_ptrs(obj, &ptrs))
+        Some(alloc_heap_handle_no_dedup_lookup(obj, &ptrs))
     }
 
     /// Decode a single JIT `i64` register value into a [`JsValue`].
@@ -9513,8 +9690,9 @@ pub(crate) mod jit_runtime {
     /// Replaces the trampoline dispatch for `CreateEmptyObjectLiteral` in
     /// Maglev — a zero-argument operation.
     pub extern "C" fn jit_runtime_create_empty_object() -> i64 {
+        let ptrs = RT_PTRS.with(|p| p.get());
         let obj = JsValue::PlainObject(Rc::new(RefCell::new(PropertyMap::new())));
-        alloc_heap_handle(obj)
+        alloc_heap_handle_no_dedup_lookup(obj, &ptrs)
     }
 
     /// Create an empty array.

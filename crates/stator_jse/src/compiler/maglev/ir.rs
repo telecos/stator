@@ -1243,6 +1243,16 @@ pub enum ValueNode {
         feedback_slot: u32,
     },
 
+    /// Fused property access chain (e.g. `obj.a.b.c.d.e`).
+    LoadNamedChain {
+        /// The root object to start the chain from.
+        root: NodeId,
+        /// Constant-pool indices of property names, in chain order.
+        names: Vec<u32>,
+        /// Feedback vector slot indices, one per step.
+        feedback_slots: Vec<u32>,
+    },
+
     /// Generic named property store with IC feedback.
     StoreNamedGeneric {
         /// The object to store into.

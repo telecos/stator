@@ -760,6 +760,8 @@ fn visit_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
         | ValueNode::StringLength { string: object }
         | ValueNode::LoadEnumCacheLength { map: object } => f(*object),
 
+        ValueNode::LoadNamedChain { root, .. } => f(*root),
+
         ValueNode::LoadKeyedGeneric { object, key, .. } => {
             f(*object);
             f(*key);

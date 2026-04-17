@@ -1055,6 +1055,8 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
         }
         | StringLength { string: object } => *object = resolve(*object),
 
+        LoadNamedChain { root, .. } => *root = resolve(*root),
+
         LoadEnumCacheLength { map } => *map = resolve(*map),
 
         LoadKeyedGeneric { object, key, .. } => {

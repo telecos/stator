@@ -661,6 +661,13 @@ struct MaglevCodegen<'a> {
     /// each `LoadNamedGeneric` site.
     #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
     next_named_ic_site: i32,
+    /// Byte offset from RBP of the chain-IC area.  Each chain gets
+    /// `8 + N*24` bytes (root_handle + N*(map_ptr, shape, offset)).
+    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
+    chain_ic_base: i32,
+    /// Running offset within the chain IC area for the next chain site.
+    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
+    chain_ic_offset: i32,
     /// Total extra stack bytes reserved for caches (mono call cache +
     /// array IC + alignment padding).  Used for the single `sub rsp, N`
     /// in the prologue and `add rsp, N` in epilogue.
@@ -712,6 +719,9 @@ impl<'a> MaglevCodegen<'a> {
         let mut has_keyed_sites = false;
         // Track whether any named property access nodes exist.
         let mut named_site_count: i32 = 0;
+        // Track chain IC stack bytes needed.
+        let mut chain_ic_bytes: i32 = 0;
+        let mut has_chain_sites = false;
         for block in graph.blocks() {
             for (node_id, _) in &block.nodes {
                 if let Some(Location::Register(n)) = alloc.location(*node_id) {
@@ -746,6 +756,11 @@ impl<'a> MaglevCodegen<'a> {
                 if matches!(node, ValueNode::LoadNamedGeneric { .. }) {
                     named_site_count += 1;
                 }
+                // Chain IC: 8 bytes root + N * 24 bytes per step.
+                if let ValueNode::LoadNamedChain { names, .. } = node {
+                    chain_ic_bytes += (8 + names.len() as i32 * 24 + 15) & !15;
+                    has_chain_sites = true;
+                }
             }
         }
         #[cfg(all(target_arch = "x86_64", unix))]
@@ -759,7 +774,7 @@ impl<'a> MaglevCodegen<'a> {
         } else {
             mono_call_cache_bytes
         };
-        let needs_r15 = mono_call_sites > 0 || has_keyed_sites || named_site_count > 0;
+        let needs_r15 = mono_call_sites > 0 || has_keyed_sites || named_site_count > 0 || has_chain_sites;
         // Array IC: 32 bytes (4 × i64: handle, data_ptr, len, vec_ptr).
         // Place it after the mono cache area on the stack.  Rounded up
         // so the combined reservation stays a multiple of 16.
@@ -768,7 +783,7 @@ impl<'a> MaglevCodegen<'a> {
         // map_ptr, shape_id, offset).
         let named_ic_bytes: i32 = named_site_count.saturating_mul(32);
         let total_cache_bytes = {
-            let raw = mono_call_cache_bytes + array_ic_bytes + named_ic_bytes;
+            let raw = mono_call_cache_bytes + array_ic_bytes + named_ic_bytes + chain_ic_bytes;
             if raw == 0 { 0 } else { (raw + 15) & !15 }
         };
         // IC base is addressed relative to RBP.  After 5 callee-saved
@@ -795,6 +810,14 @@ impl<'a> MaglevCodegen<'a> {
         let named_ic_base: i32 = if named_site_count > 0 {
             let array_overhead = if has_keyed_sites { 32 } else { 0 };
             -(40 + total_cache_bytes) + array_overhead
+        } else {
+            0
+        };
+        // Chain IC base: placed after named IC area.
+        let chain_ic_base: i32 = if has_chain_sites {
+            let array_overhead = if has_keyed_sites { 32 } else { 0 };
+            let named_overhead = named_ic_bytes;
+            -(40 + total_cache_bytes) + array_overhead + named_overhead
         } else {
             0
         };
@@ -826,6 +849,8 @@ impl<'a> MaglevCodegen<'a> {
             array_ic_base,
             named_ic_base,
             next_named_ic_site: 0,
+            chain_ic_base,
+            chain_ic_offset: 0,
             total_cache_bytes,
             ctx_regfile_offset: None,
             rax_holds: None,
@@ -2049,6 +2074,14 @@ impl<'a> MaglevCodegen<'a> {
                 feedback_slot,
             } => {
                 self.emit_inline_load_named(id, *object, *name, *feedback_slot);
+            }
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::LoadNamedChain {
+                root,
+                names,
+                feedback_slots: _,
+            } => {
+                self.emit_load_named_chain(id, *root, names);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::StoreNamedGeneric {
@@ -5849,6 +5882,58 @@ impl<'a> MaglevCodegen<'a> {
         self.emit_store(id, Reg64::Rax);
     }
 
+    /// Emit code for a fused property-chain load (`obj.a.b.c…`).
+    ///
+    /// Calls `jit_runtime_load_named_chain` which walks the entire chain
+    /// in a single call, using a chain IC on the stack frame to cache
+    /// `(map_ptr, shape_id, offset)` per step.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_load_named_chain(
+        &mut self,
+        id: NodeId,
+        root: NodeId,
+        names: &[u32],
+    ) {
+        let count = names.len();
+        // Allocate chain IC: 8 bytes root + count * 24 bytes per step.
+        let ic_size = (8 + count as i32 * 24 + 15) & !15;
+        let ic_base = self.chain_ic_base + self.chain_ic_offset;
+        self.chain_ic_offset += ic_size;
+
+        // Pack name indices using 12-bit encoding (same as object literal).
+        let mut packed: u64 = 0;
+        for (i, &n) in names.iter().enumerate() {
+            packed |= (u64::from(n) & 0xFFF) << (i * 12);
+        }
+        packed |= (count as u64) << 60;
+
+        let saved = self.emit_save_live_regs(id);
+
+        // RDI = root object
+        self.emit_load(root, Reg64::Rdi);
+        // RSI = names_packed
+        self.masm.mov_ri(Reg64::Rsi, packed as i64);
+        // RDX = rt_ptrs_cell (R15)
+        self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
+        // RCX = &chain_ic on stack
+        self.masm.lea_base_disp32(Reg64::Rcx, Reg64::Rbp, ic_base);
+
+        let stub_addr =
+            jit_runtime::jit_runtime_load_named_chain as *const () as usize as i64;
+        self.masm.mov_ri(Reg64::R11, stub_addr);
+        self.masm.call_reg(Reg64::R11);
+
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+
+        if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
+            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm.jne(&mut self.deopt_label);
+        }
+        self.emit_store(id, Reg64::Rax);
+    }
+
     /// Emit a **true-inline** fast path for keyed array load when the key
     /// is a non-negative Smi integer.
     ///
@@ -7613,6 +7698,9 @@ impl<'a> MaglevCodegen<'a> {
             | ValueNode::LoadDoubleField { object, .. }
             | ValueNode::LoadNamedGeneric { object, .. } => {
                 out.insert(*object);
+            }
+            ValueNode::LoadNamedChain { root, .. } => {
+                out.insert(*root);
             }
             ValueNode::LoadContextSlot { context, .. } => {
                 out.insert(*context);

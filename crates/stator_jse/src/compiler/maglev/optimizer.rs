@@ -155,6 +155,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
     fuse_object_literal_stores(graph);
+    fuse_named_load_chains(graph);
     eliminate_store_to_load(graph);
     eliminate_dead_allocations(graph);
     replace_dead_arguments(graph);
@@ -2298,6 +2299,107 @@ fn fuse_object_literal_stores_in_block(block: &mut BasicBlock) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Pass 2aa — Property-chain fusion
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Minimum chain length (number of property accesses) to trigger fusion.
+const MIN_CHAIN_LEN: usize = 2;
+
+/// Fuse consecutive `LoadNamedGeneric` chains into `LoadNamedChain`.
+fn fuse_named_load_chains(graph: &mut MaglevGraph) {
+    let mut use_counts: HashMap<NodeId, u32> = HashMap::new();
+    for block in graph.blocks() {
+        for (_id, node) in &block.nodes {
+            let mut set = HashSet::new();
+            collect_value_node_inputs(node, &mut set);
+            for nid in set {
+                *use_counts.entry(nid).or_insert(0) += 1;
+            }
+        }
+        if let Some(ctrl) = &block.control {
+            visit_control_inputs(ctrl, &mut |nid| {
+                *use_counts.entry(nid).or_insert(0) += 1;
+            });
+        }
+    }
+    for block in graph.blocks_mut() {
+        fuse_chains_in_block(block, &use_counts);
+    }
+}
+
+fn fuse_chains_in_block(block: &mut BasicBlock, use_counts: &HashMap<NodeId, u32>) {
+    let nodes = &block.nodes;
+    let len = nodes.len();
+    if len < MIN_CHAIN_LEN {
+        return;
+    }
+    let id_to_idx: HashMap<NodeId, usize> =
+        nodes.iter().enumerate().map(|(i, (nid, _))| (*nid, i)).collect();
+
+    let mut fused: HashSet<usize> = HashSet::new();
+    let mut replacements: Vec<(usize, ValueNode)> = Vec::new();
+    let mut dead_indices: Vec<usize> = Vec::new();
+
+    for i in (0..len).rev() {
+        if fused.contains(&i) {
+            continue;
+        }
+        let (tail_name, tail_slot, tail_obj) = match &nodes[i].1 {
+            ValueNode::LoadNamedGeneric { object, name, feedback_slot } => {
+                (*name, *feedback_slot, *object)
+            }
+            _ => continue,
+        };
+        let mut names = vec![tail_name];
+        let mut slots = vec![tail_slot];
+        let mut chain_indices = vec![i];
+        let mut cur_obj = tail_obj;
+
+        while let Some(&pred_idx) = id_to_idx.get(&cur_obj) {
+            if fused.contains(&pred_idx) {
+                break;
+            }
+            match &nodes[pred_idx].1 {
+                ValueNode::LoadNamedGeneric { object, name, feedback_slot } => {
+                    if use_counts.get(&cur_obj).copied().unwrap_or(0) != 1 {
+                        break;
+                    }
+                    names.push(*name);
+                    slots.push(*feedback_slot);
+                    chain_indices.push(pred_idx);
+                    cur_obj = *object;
+                }
+                _ => break,
+            }
+        }
+        if names.len() < MIN_CHAIN_LEN {
+            continue;
+        }
+        names.reverse();
+        slots.reverse();
+        chain_indices.reverse();
+
+        replacements.push((i, ValueNode::LoadNamedChain {
+            root: cur_obj,
+            names,
+            feedback_slots: slots,
+        }));
+        for &idx in &chain_indices[..chain_indices.len() - 1] {
+            dead_indices.push(idx);
+            fused.insert(idx);
+        }
+        fused.insert(i);
+    }
+
+    for (idx, new_node) in replacements {
+        block.nodes[idx].1 = new_node;
+    }
+    for idx in dead_indices {
+        block.nodes[idx].1 = ValueNode::UndefinedConstant;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Pass 2b — Store-to-load forwarding
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2667,6 +2769,10 @@ fn collect_value_node_inputs(node: &ValueNode, live: &mut HashSet<NodeId>) {
         }
         | ValueNode::StringLength { string: object } => {
             live.insert(*object);
+        }
+
+        ValueNode::LoadNamedChain { root, .. } => {
+            live.insert(*root);
         }
 
         ValueNode::LoadEnumCacheLength { map } => {
@@ -3133,6 +3239,8 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
         | ValueNode::LoadNamedGeneric { object, .. }
         | ValueNode::LoadEnumCacheLength { map: object }
         | ValueNode::StringLength { string: object } => *object = resolve(*object),
+
+        ValueNode::LoadNamedChain { root, .. } => *root = resolve(*root),
 
         ValueNode::LoadKeyedGeneric { object, key, .. } => {
             *object = resolve(*object);
