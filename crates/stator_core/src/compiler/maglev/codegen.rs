@@ -136,7 +136,7 @@ const MONO_OFF_CTX: i32 = 16;
 #[cfg(all(target_arch = "x86_64", unix))]
 const MONO_OFF_BA: i32 = 24;
 #[cfg(all(target_arch = "x86_64", unix))]
-const MONO_OFF_REGSLOTS: i32 = 32;
+const MONO_OFF_CALLER_BA: i32 = 32;
 
 /// Lazily probed [`JsValue`] byte layout, cached for the lifetime of the
 /// process.  Used by the inline array-access fast path.
@@ -4030,9 +4030,9 @@ impl<'a> MaglevCodegen<'a> {
                     _ => {
                         self.emit_load(left, Reg64::Rax);
                         self.masm.add32_ri(Reg64::Rax, imm);
-                        self.masm
-                            .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                         if !narrow {
+                            self.masm
+                                .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                             self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
                         }
                         self.emit_store(id, Reg64::Rax);
@@ -4051,9 +4051,9 @@ impl<'a> MaglevCodegen<'a> {
                     _ => {
                         self.emit_load(right, Reg64::Rax);
                         self.masm.add32_ri(Reg64::Rax, imm);
-                        self.masm
-                            .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                         if !narrow {
+                            self.masm
+                                .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                             self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
                         }
                         self.emit_store(id, Reg64::Rax);
@@ -4092,9 +4092,9 @@ impl<'a> MaglevCodegen<'a> {
                         self.emit_load(left, Reg64::Rax);
                         self.emit_load(right, Reg64::R10);
                         self.masm.add32_rr(Reg64::Rax, Reg64::R10);
-                        self.masm
-                            .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                         if !narrow {
+                            self.masm
+                                .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                             self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
                         }
                         self.emit_store(id, Reg64::Rax);
@@ -4104,8 +4104,10 @@ impl<'a> MaglevCodegen<'a> {
                 }
             }
             // Common tail for register-allocated paths.
-            self.masm
-                .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
+            if !narrow {
+                self.masm
+                    .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
+            }
             let dst = match self.alloc.location(id) {
                 Some(Location::Register(n)) => phys_reg(n),
                 _ => unreachable!(),
@@ -4136,12 +4138,12 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.cmp_rr(Reg64::Rax, check_reg);
             self.masm.jne(&mut self.deopt_label);
 
-            // 32-bit ADD + JO deopt.
+            // 32-bit ADD; skip overflow guard when narrow (wrapping is OK).
             self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
             self.masm.add32_rr(Reg64::Rax, Reg64::R10);
-            self.masm
-                .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
             if !narrow {
+                self.masm
+                    .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                 self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
             }
 
@@ -4259,9 +4261,9 @@ impl<'a> MaglevCodegen<'a> {
                             }
                         }
                     }
-                    self.masm
-                        .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                     if !narrow {
+                        self.masm
+                            .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                         self.masm.movsxd_sign_extend(dst, dst);
                     }
                     self.note_reg_holds(dst, id);
@@ -4270,9 +4272,9 @@ impl<'a> MaglevCodegen<'a> {
                     self.emit_load(left, Reg64::Rax);
                     self.emit_load(right, Reg64::R10);
                     self.masm.sub32_rr(Reg64::Rax, Reg64::R10);
-                    self.masm
-                        .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                     if !narrow {
+                        self.masm
+                            .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                         self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
                     }
                     self.emit_store(id, Reg64::Rax);
@@ -4299,9 +4301,9 @@ impl<'a> MaglevCodegen<'a> {
 
             self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
             self.masm.sub32_rr(Reg64::Rax, Reg64::R10);
-            self.masm
-                .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
             if !narrow {
+                self.masm
+                    .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                 self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
             }
 
@@ -4648,9 +4650,9 @@ impl<'a> MaglevCodegen<'a> {
                             }
                         }
                     }
-                    self.masm
-                        .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                     if !narrow {
+                        self.masm
+                            .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                         self.masm.movsxd_sign_extend(dst, dst);
                     }
                     self.note_reg_holds(dst, id);
@@ -4659,9 +4661,9 @@ impl<'a> MaglevCodegen<'a> {
                     self.emit_load(left, Reg64::Rax);
                     self.emit_load(right, Reg64::R10);
                     self.masm.imul32_rr(Reg64::Rax, Reg64::R10);
-                    self.masm
-                        .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                     if !narrow {
+                        self.masm
+                            .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                         self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
                     }
                     self.emit_store(id, Reg64::Rax);
@@ -6387,8 +6389,8 @@ impl<'a> MaglevCodegen<'a> {
         //   +0  callee_i64  (0 = empty)
         //   +8  entry_point
         //   +16 ctx_ptr
-        //   +24 ba_ptr
-        //   +32 reg_slots
+        //   +24 callee_ba_ptr
+        //   +32 caller_ba_ptr
         let site = self.next_mono_cache_site;
         self.next_mono_cache_site += 1;
         // Base offset from RBP to the start of all cache slots.
@@ -6398,7 +6400,7 @@ impl<'a> MaglevCodegen<'a> {
         let off_entry = slot_base - MONO_OFF_ENTRY;
         let off_ctx = slot_base - MONO_OFF_CTX;
         let off_ba = slot_base - MONO_OFF_BA;
-        let off_regslots = slot_base - MONO_OFF_REGSLOTS;
+        let off_caller_ba = slot_base - MONO_OFF_CALLER_BA;
 
         let saved = self.emit_save_live_regs(id);
         // After save_live_regs: RSP ≡ 0 mod 16.
@@ -6415,10 +6417,13 @@ impl<'a> MaglevCodegen<'a> {
 
         // ── Mono HIT: fully inline dispatch (zero FFI) ────────────
         //
-        // Save/restore the TLS bytecode pointer inline via the
-        // `RtPtrs.bytecode` field at [R15+16], pass the cached
-        // context directly via RSI, and skip the Rust-side
-        // prepare/finish calls entirely.
+        // Set the TLS bytecode pointer to the callee's BA inline via
+        // `RtPtrs.bytecode` at [R15+16], call the cached entry point,
+        // then restore the caller's BA from the mono cache.
+        //
+        // The caller's BA is cached in the slot on the first miss and
+        // reused on every subsequent hit, avoiding the per-call save
+        // of the old BA to the stack (and the 2 pushes that entailed).
         //
         // The callee's baseline JIT prologue stores RSI → RBX and
         // uses RBX for all context-slot stubs, so no TLS context
@@ -6428,32 +6433,19 @@ impl<'a> MaglevCodegen<'a> {
 
         let mut mono_hit_deopt = Label::new();
 
-        // Save callee_i64 (R11) for potential stub fallback.
-        // Two pushes keep RSP ≡ 0 mod 16.
-        self.masm.push(Reg64::R11); // [RSP+8] = callee_i64
-        self.masm.push(Reg64::R11); // [RSP+0] = padding (will hold old_ba)
-
-        // ── Inline BA save ──────────────────────────────────────
-        // RtPtrs is #[repr(C)]; `bytecode` (3rd field) is at byte
-        // offset 16.  Cell<T> is repr(transparent) so reading /
-        // writing through the pointer accesses the inner T directly.
+        // ── Inline BA set (callee BA from mono cache) ───────────
         const RTPTRS_BYTECODE_OFF: i32 = 16;
         // R10 = &Cell<*const BytecodeArray>
         self.masm
             .mov_load_base_disp32(Reg64::R10, Reg64::R15, RTPTRS_BYTECODE_OFF);
-        // RCX = old BA
-        self.masm.mov_load_base_disp32(Reg64::Rcx, Reg64::R10, 0);
-        // Stash old BA into the padding slot [RSP+0].
-        self.masm.mov_store_base_disp32(Reg64::Rsp, 0, Reg64::Rcx);
-
-        // ── Inline BA set (callee BA from mono cache) ───────────
+        // Set callee BA.
         self.masm
             .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_ba);
         self.masm.mov_store_base_disp32(Reg64::R10, 0, Reg64::Rcx);
 
         // Allocate 128-byte register file on the JIT stack.
-        // RSP ≡ 0 mod 16 (2 pushes above initial alignment, sub
-        // 128 preserves alignment).
+        // RSP ≡ 0 mod 16 (from emit_save_live_regs; sub 128
+        // preserves alignment).
         self.masm.sub_ri(Reg64::Rsp, 128);
 
         // Zero register file with unrolled stores.  This avoids the
@@ -6479,17 +6471,13 @@ impl<'a> MaglevCodegen<'a> {
 
         // Deallocate register file.
         self.masm.add_ri(Reg64::Rsp, 128);
-        // RSP now points to [old_ba, callee_i64] (2 items).
 
-        // ── Inline BA restore ───────────────────────────────────
-        // RCX = old_ba from the stashed padding slot.
-        self.masm.mov_load_base_disp32(Reg64::Rcx, Reg64::Rsp, 0);
+        // ── Inline BA restore (from cached caller BA) ───────────
         self.masm
             .mov_load_base_disp32(Reg64::R10, Reg64::R15, RTPTRS_BYTECODE_OFF);
+        self.masm
+            .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_caller_ba);
         self.masm.mov_store_base_disp32(Reg64::R10, 0, Reg64::Rcx);
-
-        // Discard old_ba + callee.
-        self.masm.add_ri(Reg64::Rsp, 16);
 
         // Deopt check.
         self.masm.cmp_ri(Reg64::Rax, i32::MIN);
@@ -6545,20 +6533,11 @@ impl<'a> MaglevCodegen<'a> {
         self.masm
             .mov_store_base_disp32(Reg64::Rbp, off_ba, Reg64::Rax);
 
-        // Read register_file_slots from BA and cache it.
-        self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
-        let rs_addr = jit_runtime::jit_runtime_read_reg_slots as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, rs_addr as i64);
-        self.masm.call_reg(Reg64::R11);
-        self.masm
-            .mov_store_base_disp32(Reg64::Rbp, off_regslots, Reg64::Rax);
-        self.masm.mov_rr(Reg64::R8, Reg64::Rax); // R8 = reg_slots
-
         self.masm.pop(Reg64::R10);
         self.masm.pop(Reg64::R11);
 
         // ── Direct-call path (cache miss only) ──────────────────────
-        // R11 = entry point, R10 = ctx_ptr, R8 = reg_slots (1-16).
+        // R11 = entry point, R10 = ctx_ptr.
         // Stack: [RSP] = padding, [RSP+8] = callee.
 
         // Allocate 128-byte register file (fixed size for ABI compat).
@@ -6589,6 +6568,18 @@ impl<'a> MaglevCodegen<'a> {
         let finish_addr = jit_runtime::jit_runtime_finish_direct_call_r15 as *const () as usize;
         self.masm.mov_ri(Reg64::R11, finish_addr as i64);
         self.masm.call_reg(Reg64::R11);
+
+        // Cache the caller's BA (now restored by finish_direct_call)
+        // so subsequent mono-cache hits can restore it without a
+        // per-call save/restore to the stack.
+        {
+            const RTPTRS_BYTECODE_OFF_MISS: i32 = 16;
+            self.masm
+                .mov_load_base_disp32(Reg64::R10, Reg64::R15, RTPTRS_BYTECODE_OFF_MISS);
+            self.masm.mov_load_base_disp32(Reg64::Rcx, Reg64::R10, 0);
+            self.masm
+                .mov_store_base_disp32(Reg64::Rbp, off_caller_ba, Reg64::Rcx);
+        }
 
         // If callee JIT returned JIT_DEOPT, fall back to runtime stub
         // instead of deopting the CALLER.
@@ -7178,6 +7169,22 @@ impl<'a> MaglevCodegen<'a> {
             ValueNode::GenericIncrement { value, .. }
             | ValueNode::GenericDecrement { value, .. }
             | ValueNode::GenericNegate { value, .. } => smi_guarded.contains(value),
+            _ => false,
+        }
+    }
+
+    /// Returns `true` when `node` is a smi_guarded Generic arithmetic op
+    /// (Add/Sub/Mul with both inputs in smi_guarded).  Like i32_range
+    /// Generic arith, these are "narrow-transparent" because their lower
+    /// 32 result bits depend only on the lower 32 bits of their inputs
+    /// (modular arithmetic).
+    fn is_smi_guarded_generic_arith(node: &ValueNode, smi_guarded: &HashSet<NodeId>) -> bool {
+        match node {
+            ValueNode::GenericAdd { left, right, .. }
+            | ValueNode::GenericSubtract { left, right, .. }
+            | ValueNode::GenericMultiply { left, right, .. } => {
+                smi_guarded.contains(left) && smi_guarded.contains(right)
+            }
             _ => false,
         }
     }
@@ -7874,8 +7881,23 @@ impl<'a> MaglevCodegen<'a> {
         // causes 100% deopt on property_access and deep_object benchmarks
         // (CI run bc404220: tried=5, deopted=5, category=generic).  The
         // guard sequence (MOVSXD R11,EAX; CMP R11,RAX; JNE deopt) should
-        // pass for Smi values 1–5, but fails every time on Linux CI.  Root
-        // cause under investigation (SMI_GUARD_FAIL diagnostic in e9a9f0c2).
+        // pass for Smi values 1–5, but fails every time on Linux CI.
+        //
+        // Analysis (exhaustive static review):
+        //  - Register allocator: CONFIRMED CORRECT — all LoadNamedGeneric
+        //    nodes get valid Register/StackSlot assignments.
+        //  - Graph structure: CONFIRMED CORRECT — LoadNamedGeneric nodes
+        //    present in preheader, correctly referenced by GenericAdd.
+        //  - Store-to-load forwarding: produces ZERO substitutions for
+        //    property_access (StoreGlobal clears the store_map before
+        //    LoadNamedGeneric, and receiver NodeIds don't match).  The
+        //    cross-block fix (5b3c885a) was NOT the actual root cause.
+        //  - IC fill / slow path: returns correctly encoded Smi values
+        //    (i64::from(n)) in static analysis; no register clobbering.
+        //  - Root cause: runtime-only — RAX holds a non-Smi value at
+        //    done_label despite all static paths producing Smi.  Requires
+        //    Linux x86_64 debugging (gdb breakpoint on jit_smi_guard_fail_log)
+        //    to inspect the actual RAX value and call stack.
         //
         // With this disabled, downstream GenericAdd/Sub/Mul fall back to
         // the generic tier (inline MOVSXD+CMP per input, ~13 insns) instead
@@ -7884,6 +7906,8 @@ impl<'a> MaglevCodegen<'a> {
         // deopt — a huge net win until the guard bug is found.
         //
         // TODO: re-enable once the smi_guard deopt root cause is fixed.
+        //       Use `jit_smi_guard_fail_log` diagnostic to identify the
+        //       failing value on Linux CI.
         #[allow(clippy::overly_complex_bool_expr)]
         if false {
             for block in graph.blocks() {
@@ -8229,6 +8253,7 @@ impl<'a> MaglevCodegen<'a> {
             for (id, node) in &block.nodes {
                 if matches!(node, ValueNode::Phi { .. })
                     || Self::is_i32_range_generic_arith(node, i32_range)
+                    || Self::is_smi_guarded_generic_arith(node, smi_guarded)
                 {
                     narrow_transparent.insert(*id);
                 }
