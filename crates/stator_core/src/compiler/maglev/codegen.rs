@@ -4063,104 +4063,150 @@ impl<'a> MaglevCodegen<'a> {
         // Skip input Smi checks; emit 32-bit ADD + JO overflow deopt.
         if self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right) {
             let narrow = self.narrow_int32.contains(&id);
-            // Try to operate directly in the destination register to avoid
-            // an extra MOV from RAX.
-            if let Some(imm) = self.try_get_i32_constant(right) {
-                match self.alloc.location(id) {
-                    Some(Location::Register(n)) => {
-                        let dst = phys_reg(n);
-                        self.emit_load(left, dst);
-                        self.masm.add32_ri(dst, imm);
-                    }
-                    _ => {
-                        self.emit_load(left, Reg64::Rax);
-                        self.masm.add32_ri(Reg64::Rax, imm);
-                        if !narrow {
-                            self.masm
-                                .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
-                            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
-                        }
-                        self.emit_store(id, Reg64::Rax);
-                        self.rax_holds = Some(id);
-                        return;
-                    }
+
+            // Guard against JIT_UNDEFINED operands that slip through on the
+            // first loop iteration (LoadNamedGeneric / LoadGlobal may return
+            // undefined before the property resolves to a Smi).
+            let left_const = self.try_get_i32_constant(left).is_some();
+            let right_const = self.try_get_i32_constant(right).is_some();
+            let has_undef_guard = !left_const || !right_const;
+            let mut undef_slow = Label::new();
+            let mut undef_done = Label::new();
+
+            if has_undef_guard {
+                self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
+                if !left_const {
+                    self.emit_load(left, Reg64::R10);
+                    self.masm.cmp_rr(Reg64::R10, Reg64::R11);
+                    self.masm.je(&mut undef_slow);
                 }
-            } else if let Some(imm) = self.try_get_i32_constant(left) {
-                // ADD is commutative
-                match self.alloc.location(id) {
-                    Some(Location::Register(n)) => {
-                        let dst = phys_reg(n);
-                        self.emit_load(right, dst);
-                        self.masm.add32_ri(dst, imm);
-                    }
-                    _ => {
-                        self.emit_load(right, Reg64::Rax);
-                        self.masm.add32_ri(Reg64::Rax, imm);
-                        if !narrow {
-                            self.masm
-                                .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
-                            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
-                        }
-                        self.emit_store(id, Reg64::Rax);
-                        self.rax_holds = Some(id);
-                        return;
-                    }
+                if !right_const {
+                    self.emit_load(right, Reg64::R10);
+                    self.masm.cmp_rr(Reg64::R10, Reg64::R11);
+                    self.masm.je(&mut undef_slow);
                 }
-            } else {
-                match self.alloc.location(id) {
-                    Some(Location::Register(n)) => {
-                        let dst = phys_reg(n);
-                        // Avoid clobbering right if it shares the dst register.
-                        let right_in_dst = left != right
-                            && matches!(
-                                self.alloc.location(right),
-                                Some(Location::Register(rn)) if phys_reg(rn) == dst
-                            );
-                        if right_in_dst {
-                            self.emit_load(right, Reg64::R10);
+            }
+
+            // ── Smi fast path (existing logic) ──
+            'smi_body: {
+                // Try to operate directly in the destination register to avoid
+                // an extra MOV from RAX.
+                if let Some(imm) = self.try_get_i32_constant(right) {
+                    match self.alloc.location(id) {
+                        Some(Location::Register(n)) => {
+                            let dst = phys_reg(n);
                             self.emit_load(left, dst);
-                            self.masm.add32_rr(dst, Reg64::R10);
-                        } else {
-                            self.emit_load(left, dst);
-                            match self.alloc.location(right) {
-                                Some(Location::Register(rn)) if phys_reg(rn) != dst => {
-                                    self.masm.add32_rr(dst, phys_reg(rn));
-                                }
-                                _ => {
-                                    self.emit_load(right, Reg64::R10);
-                                    self.masm.add32_rr(dst, Reg64::R10);
+                            self.masm.add32_ri(dst, imm);
+                        }
+                        _ => {
+                            self.emit_load(left, Reg64::Rax);
+                            self.masm.add32_ri(Reg64::Rax, imm);
+                            if !narrow {
+                                self.masm
+                                    .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
+                                self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+                            }
+                            self.emit_store(id, Reg64::Rax);
+                            self.rax_holds = Some(id);
+                            break 'smi_body;
+                        }
+                    }
+                } else if let Some(imm) = self.try_get_i32_constant(left) {
+                    // ADD is commutative
+                    match self.alloc.location(id) {
+                        Some(Location::Register(n)) => {
+                            let dst = phys_reg(n);
+                            self.emit_load(right, dst);
+                            self.masm.add32_ri(dst, imm);
+                        }
+                        _ => {
+                            self.emit_load(right, Reg64::Rax);
+                            self.masm.add32_ri(Reg64::Rax, imm);
+                            if !narrow {
+                                self.masm
+                                    .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
+                                self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+                            }
+                            self.emit_store(id, Reg64::Rax);
+                            self.rax_holds = Some(id);
+                            break 'smi_body;
+                        }
+                    }
+                } else {
+                    match self.alloc.location(id) {
+                        Some(Location::Register(n)) => {
+                            let dst = phys_reg(n);
+                            // Avoid clobbering right if it shares the dst register.
+                            let right_in_dst = left != right
+                                && matches!(
+                                    self.alloc.location(right),
+                                    Some(Location::Register(rn)) if phys_reg(rn) == dst
+                                );
+                            if right_in_dst {
+                                self.emit_load(right, Reg64::R10);
+                                self.emit_load(left, dst);
+                                self.masm.add32_rr(dst, Reg64::R10);
+                            } else {
+                                self.emit_load(left, dst);
+                                match self.alloc.location(right) {
+                                    Some(Location::Register(rn)) if phys_reg(rn) != dst => {
+                                        self.masm.add32_rr(dst, phys_reg(rn));
+                                    }
+                                    _ => {
+                                        self.emit_load(right, Reg64::R10);
+                                        self.masm.add32_rr(dst, Reg64::R10);
+                                    }
                                 }
                             }
                         }
-                    }
-                    _ => {
-                        self.emit_load(left, Reg64::Rax);
-                        self.emit_load(right, Reg64::R10);
-                        self.masm.add32_rr(Reg64::Rax, Reg64::R10);
-                        if !narrow {
-                            self.masm
-                                .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
-                            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+                        _ => {
+                            self.emit_load(left, Reg64::Rax);
+                            self.emit_load(right, Reg64::R10);
+                            self.masm.add32_rr(Reg64::Rax, Reg64::R10);
+                            if !narrow {
+                                self.masm
+                                    .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
+                                self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+                            }
+                            self.emit_store(id, Reg64::Rax);
+                            self.rax_holds = Some(id);
+                            break 'smi_body;
                         }
-                        self.emit_store(id, Reg64::Rax);
-                        self.rax_holds = Some(id);
-                        return;
                     }
                 }
+                // Common tail for register-allocated paths.
+                if !narrow {
+                    self.masm
+                        .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
+                }
+                let dst = match self.alloc.location(id) {
+                    Some(Location::Register(n)) => phys_reg(n),
+                    _ => unreachable!(),
+                };
+                if !narrow {
+                    self.masm.movsxd_sign_extend(dst, dst);
+                }
+                self.note_reg_holds(dst, id);
             }
-            // Common tail for register-allocated paths.
-            if !narrow {
-                self.masm
-                    .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
+
+            // ── JIT_UNDEFINED slow path: call runtime stub for NaN ──
+            if has_undef_guard {
+                self.masm.jmp(&mut undef_done);
+                self.masm.bind_label(&mut undef_slow);
+                self.clear_reg_forwarding();
+                let saved = self.emit_save_live_regs(id);
+                self.emit_load(left, Reg64::Rdi);
+                self.emit_load(right, Reg64::Rsi);
+                let addr = jit_runtime::jit_runtime_generic_add as *const () as usize;
+                self.masm.mov_ri(Reg64::R11, addr as i64);
+                self.masm.call_reg(Reg64::R11);
+                self.emit_restore_live_regs(saved);
+                self.emit_deopt_check_rax();
+                self.emit_store(id, Reg64::Rax);
+                self.rax_holds = Some(id);
+                self.masm.bind_label(&mut undef_done);
+                self.clear_reg_forwarding();
             }
-            let dst = match self.alloc.location(id) {
-                Some(Location::Register(n)) => phys_reg(n),
-                _ => unreachable!(),
-            };
-            if !narrow {
-                self.masm.movsxd_sign_extend(dst, dst);
-            }
-            self.note_reg_holds(dst, id);
             return;
         }
 
@@ -4181,7 +4227,9 @@ impl<'a> MaglevCodegen<'a> {
             let check_reg = if left_known { Reg64::R10 } else { Reg64::Rdi };
             self.masm.movsxd_rr(Reg64::Rax, check_reg);
             self.masm.cmp_rr(Reg64::Rax, check_reg);
-            self.masm.jne(&mut self.deopt_label);
+            let mut not_smi = Label::new();
+            let mut done = Label::new();
+            self.masm.jne(&mut not_smi);
 
             // 32-bit ADD; skip overflow guard when narrow (wrapping is OK).
             self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
@@ -4191,7 +4239,24 @@ impl<'a> MaglevCodegen<'a> {
                     .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                 self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
             }
+            self.masm.jmp(&mut done);
 
+            // Not-Smi: if the operand is JIT_UNDEFINED, call the runtime
+            // stub which correctly produces NaN (Number(undefined) === NaN).
+            // For any other non-Smi value, deopt as before.
+            self.masm.bind_label(&mut not_smi);
+            self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
+            self.masm.cmp_rr(check_reg, Reg64::R11);
+            self.masm.jne(&mut self.deopt_label);
+            let saved = self.emit_save_live_regs(id);
+            self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+            let addr = jit_runtime::jit_runtime_generic_add as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, addr as i64);
+            self.masm.call_reg(Reg64::R11);
+            self.emit_restore_live_regs(saved);
+            self.emit_deopt_check_rax();
+
+            self.masm.bind_label(&mut done);
             self.emit_store(id, Reg64::Rax);
             self.rax_holds = Some(id);
             return;
@@ -4281,50 +4346,93 @@ impl<'a> MaglevCodegen<'a> {
 
         if self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right) {
             let narrow = self.narrow_int32.contains(&id);
-            match self.alloc.location(id) {
-                Some(Location::Register(n)) => {
-                    let dst = phys_reg(n);
-                    // SUB is not commutative — right must not clobber dst.
-                    let right_in_dst = left != right
-                        && matches!(
-                            self.alloc.location(right),
-                            Some(Location::Register(rn)) if phys_reg(rn) == dst
-                        );
-                    if right_in_dst {
-                        self.emit_load(right, Reg64::R10);
-                        self.emit_load(left, dst);
-                        self.masm.sub32_rr(dst, Reg64::R10);
-                    } else {
-                        self.emit_load(left, dst);
-                        match self.alloc.location(right) {
-                            Some(Location::Register(rn)) if phys_reg(rn) != dst => {
-                                self.masm.sub32_rr(dst, phys_reg(rn));
-                            }
-                            _ => {
-                                self.emit_load(right, Reg64::R10);
-                                self.masm.sub32_rr(dst, Reg64::R10);
+
+            // Guard against JIT_UNDEFINED operands.
+            let left_const = self.try_get_i32_constant(left).is_some();
+            let right_const = self.try_get_i32_constant(right).is_some();
+            let has_undef_guard = !left_const || !right_const;
+            let mut undef_slow = Label::new();
+            let mut undef_done = Label::new();
+
+            if has_undef_guard {
+                self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
+                if !left_const {
+                    self.emit_load(left, Reg64::R10);
+                    self.masm.cmp_rr(Reg64::R10, Reg64::R11);
+                    self.masm.je(&mut undef_slow);
+                }
+                if !right_const {
+                    self.emit_load(right, Reg64::R10);
+                    self.masm.cmp_rr(Reg64::R10, Reg64::R11);
+                    self.masm.je(&mut undef_slow);
+                }
+            }
+
+            'smi_body: {
+                match self.alloc.location(id) {
+                    Some(Location::Register(n)) => {
+                        let dst = phys_reg(n);
+                        // SUB is not commutative — right must not clobber dst.
+                        let right_in_dst = left != right
+                            && matches!(
+                                self.alloc.location(right),
+                                Some(Location::Register(rn)) if phys_reg(rn) == dst
+                            );
+                        if right_in_dst {
+                            self.emit_load(right, Reg64::R10);
+                            self.emit_load(left, dst);
+                            self.masm.sub32_rr(dst, Reg64::R10);
+                        } else {
+                            self.emit_load(left, dst);
+                            match self.alloc.location(right) {
+                                Some(Location::Register(rn)) if phys_reg(rn) != dst => {
+                                    self.masm.sub32_rr(dst, phys_reg(rn));
+                                }
+                                _ => {
+                                    self.emit_load(right, Reg64::R10);
+                                    self.masm.sub32_rr(dst, Reg64::R10);
+                                }
                             }
                         }
+                        if !narrow {
+                            self.masm
+                                .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
+                            self.masm.movsxd_sign_extend(dst, dst);
+                        }
+                        self.note_reg_holds(dst, id);
                     }
-                    if !narrow {
-                        self.masm
-                            .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
-                        self.masm.movsxd_sign_extend(dst, dst);
+                    _ => {
+                        self.emit_load(left, Reg64::Rax);
+                        self.emit_load(right, Reg64::R10);
+                        self.masm.sub32_rr(Reg64::Rax, Reg64::R10);
+                        if !narrow {
+                            self.masm
+                                .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
+                            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
+                        }
+                        self.emit_store(id, Reg64::Rax);
+                        self.rax_holds = Some(id);
+                        break 'smi_body;
                     }
-                    self.note_reg_holds(dst, id);
                 }
-                _ => {
-                    self.emit_load(left, Reg64::Rax);
-                    self.emit_load(right, Reg64::R10);
-                    self.masm.sub32_rr(Reg64::Rax, Reg64::R10);
-                    if !narrow {
-                        self.masm
-                            .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
-                        self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
-                    }
-                    self.emit_store(id, Reg64::Rax);
-                    self.rax_holds = Some(id);
-                }
+            }
+
+            if has_undef_guard {
+                self.masm.jmp(&mut undef_done);
+                self.masm.bind_label(&mut undef_slow);
+                self.clear_reg_forwarding();
+                let saved = self.emit_save_live_regs(id);
+                self.emit_load(left, Reg64::Rdi);
+                self.emit_load(right, Reg64::Rsi);
+                let addr = jit_runtime::jit_runtime_generic_sub as *const () as usize;
+                self.masm.mov_ri(Reg64::R11, addr as i64);
+                self.masm.call_reg(Reg64::R11);
+                self.emit_restore_live_regs(saved);
+                self.emit_deopt_check_rax();
+                self.emit_store(id, Reg64::Rax);
+                self.rax_holds = Some(id);
+                self.masm.bind_label(&mut undef_done);
+                self.clear_reg_forwarding();
             }
             return;
         }
@@ -4342,7 +4450,9 @@ impl<'a> MaglevCodegen<'a> {
             let check_reg = if left_known { Reg64::R10 } else { Reg64::Rdi };
             self.masm.movsxd_rr(Reg64::Rax, check_reg);
             self.masm.cmp_rr(Reg64::Rax, check_reg);
-            self.masm.jne(&mut self.deopt_label);
+            let mut not_smi = Label::new();
+            let mut done = Label::new();
+            self.masm.jne(&mut not_smi);
 
             self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
             self.masm.sub32_rr(Reg64::Rax, Reg64::R10);
@@ -4351,7 +4461,22 @@ impl<'a> MaglevCodegen<'a> {
                     .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                 self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
             }
+            self.masm.jmp(&mut done);
 
+            // Not-Smi: if JIT_UNDEFINED, call runtime stub for NaN result.
+            self.masm.bind_label(&mut not_smi);
+            self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
+            self.masm.cmp_rr(check_reg, Reg64::R11);
+            self.masm.jne(&mut self.deopt_label);
+            let saved = self.emit_save_live_regs(id);
+            self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+            let addr = jit_runtime::jit_runtime_generic_sub as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, addr as i64);
+            self.masm.call_reg(Reg64::R11);
+            self.emit_restore_live_regs(saved);
+            self.emit_deopt_check_rax();
+
+            self.masm.bind_label(&mut done);
             self.emit_store(id, Reg64::Rax);
             self.rax_holds = Some(id);
             return;
@@ -4571,23 +4696,100 @@ impl<'a> MaglevCodegen<'a> {
         if self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right) {
             let narrow = self.narrow_int32.contains(&id);
 
-            // Strength-reduce constant multiplies: multiply is commutative,
-            // so check both operands for a known i32 constant.
-            let const_pair = self
-                .try_get_i32_constant(right)
-                .map(|imm| (left, imm))
-                .or_else(|| self.try_get_i32_constant(left).map(|imm| (right, imm)));
+            // Guard against JIT_UNDEFINED operands.
+            let left_const = self.try_get_i32_constant(left).is_some();
+            let right_const = self.try_get_i32_constant(right).is_some();
+            let has_undef_guard = !left_const || !right_const;
+            let mut undef_slow = Label::new();
+            let mut undef_done = Label::new();
 
-            if let Some((var, imm)) = const_pair {
-                // Strength-reduce *2 to ADD (1c vs IMUL's 3c).
-                // ADD correctly sets OF for the overflow deopt.
-                if imm == 2 {
+            if has_undef_guard {
+                self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
+                if !left_const {
+                    self.emit_load(left, Reg64::R10);
+                    self.masm.cmp_rr(Reg64::R10, Reg64::R11);
+                    self.masm.je(&mut undef_slow);
+                }
+                if !right_const {
+                    self.emit_load(right, Reg64::R10);
+                    self.masm.cmp_rr(Reg64::R10, Reg64::R11);
+                    self.masm.je(&mut undef_slow);
+                }
+            }
+
+            'smi_body: {
+                // Strength-reduce constant multiplies: multiply is commutative,
+                // so check both operands for a known i32 constant.
+                let const_pair = self
+                    .try_get_i32_constant(right)
+                    .map(|imm| (left, imm))
+                    .or_else(|| self.try_get_i32_constant(left).map(|imm| (right, imm)));
+
+                if let Some((var, imm)) = const_pair {
+                    // Strength-reduce *2 to ADD (1c vs IMUL's 3c).
+                    // ADD correctly sets OF for the overflow deopt.
+                    if imm == 2 {
+                        match self.alloc.location(id) {
+                            Some(Location::Register(n)) => {
+                                let dst = phys_reg(n);
+                                self.emit_load(var, dst);
+                                self.masm.add32_rr(dst, dst);
+                                if !narrow {
+                                    self.masm
+                                        .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
+                                    self.masm.movsxd_sign_extend(dst, dst);
+                                }
+                                self.note_reg_holds(dst, id);
+                            }
+                            _ => {
+                                self.emit_load(var, Reg64::R11);
+                                self.masm.add32_rr(Reg64::R11, Reg64::R11);
+                                if !narrow {
+                                    self.masm
+                                        .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
+                                    self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
+                                }
+                                self.emit_store(id, Reg64::R11);
+                            }
+                        }
+                        break 'smi_body;
+                    }
+
+                    let lea_scale: Option<u8> = match imm {
+                        3 => Some(2),
+                        5 => Some(4),
+                        9 => Some(8),
+                        _ => None,
+                    };
+
                     match self.alloc.location(id) {
                         Some(Location::Register(n)) => {
                             let dst = phys_reg(n);
-                            self.emit_load(var, dst);
-                            self.masm.add32_rr(dst, dst);
-                            if !narrow {
+                            let src_reg = match self.alloc.location(var) {
+                                Some(Location::Register(sn)) => phys_reg(sn),
+                                _ => {
+                                    self.emit_load(var, Reg64::R10);
+                                    Reg64::R10
+                                }
+                            };
+                            if narrow {
+                                // Narrow: LEA for {3,5,9} (1c vs IMUL's 3c).
+                                // No overflow check/MOVSXD — downstream only
+                                // reads lower 32 bits.
+                                if let Some(scale) = lea_scale {
+                                    if src_reg != Reg64::Rbp && src_reg != Reg64::R13 {
+                                        self.masm.lea_scaled(dst, src_reg, src_reg, scale);
+                                    } else {
+                                        self.masm.imul32_rri(dst, src_reg, imm);
+                                    }
+                                } else {
+                                    self.masm.imul32_rri(dst, src_reg, imm);
+                                }
+                            } else {
+                                // Not narrow: IMUL-immediate sets OF for the
+                                // overflow deopt; LEA does not, so always use
+                                // IMUL-immediate here.
+                                self.masm.imul32_rri(dst, src_reg, imm);
                                 self.masm
                                     .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                                 self.masm.movsxd_sign_extend(dst, dst);
@@ -4596,8 +4798,15 @@ impl<'a> MaglevCodegen<'a> {
                         }
                         _ => {
                             self.emit_load(var, Reg64::R11);
-                            self.masm.add32_rr(Reg64::R11, Reg64::R11);
-                            if !narrow {
+                            if narrow {
+                                if let Some(scale) = lea_scale {
+                                    self.masm
+                                        .lea_scaled(Reg64::R11, Reg64::R11, Reg64::R11, scale);
+                                } else {
+                                    self.masm.imul32_rri(Reg64::R11, Reg64::R11, imm);
+                                }
+                            } else {
+                                self.masm.imul32_rri(Reg64::R11, Reg64::R11, imm);
                                 self.masm
                                     .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                                 self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
@@ -4605,44 +4814,35 @@ impl<'a> MaglevCodegen<'a> {
                             self.emit_store(id, Reg64::R11);
                         }
                     }
-                    return;
+                    break 'smi_body;
                 }
 
-                let lea_scale: Option<u8> = match imm {
-                    3 => Some(2),
-                    5 => Some(4),
-                    9 => Some(8),
-                    _ => None,
-                };
-
+                // Non-constant operands — use register×register IMUL.
                 match self.alloc.location(id) {
                     Some(Location::Register(n)) => {
                         let dst = phys_reg(n);
-                        let src_reg = match self.alloc.location(var) {
-                            Some(Location::Register(sn)) => phys_reg(sn),
-                            _ => {
-                                self.emit_load(var, Reg64::R10);
-                                Reg64::R10
-                            }
-                        };
-                        if narrow {
-                            // Narrow: LEA for {3,5,9} (1c vs IMUL's 3c).
-                            // No overflow check/MOVSXD — downstream only
-                            // reads lower 32 bits.
-                            if let Some(scale) = lea_scale {
-                                if src_reg != Reg64::Rbp && src_reg != Reg64::R13 {
-                                    self.masm.lea_scaled(dst, src_reg, src_reg, scale);
-                                } else {
-                                    self.masm.imul32_rri(dst, src_reg, imm);
-                                }
-                            } else {
-                                self.masm.imul32_rri(dst, src_reg, imm);
-                            }
+                        let right_in_dst = left != right
+                            && matches!(
+                                self.alloc.location(right),
+                                Some(Location::Register(rn)) if phys_reg(rn) == dst
+                            );
+                        if right_in_dst {
+                            self.emit_load(right, Reg64::R10);
+                            self.emit_load(left, dst);
+                            self.masm.imul32_rr(dst, Reg64::R10);
                         } else {
-                            // Not narrow: IMUL-immediate sets OF for the
-                            // overflow deopt; LEA does not, so always use
-                            // IMUL-immediate here.
-                            self.masm.imul32_rri(dst, src_reg, imm);
+                            self.emit_load(left, dst);
+                            match self.alloc.location(right) {
+                                Some(Location::Register(rn)) if phys_reg(rn) != dst => {
+                                    self.masm.imul32_rr(dst, phys_reg(rn));
+                                }
+                                _ => {
+                                    self.emit_load(right, Reg64::R10);
+                                    self.masm.imul32_rr(dst, Reg64::R10);
+                                }
+                            }
+                        }
+                        if !narrow {
                             self.masm
                                 .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
                             self.masm.movsxd_sign_extend(dst, dst);
@@ -4650,70 +4850,36 @@ impl<'a> MaglevCodegen<'a> {
                         self.note_reg_holds(dst, id);
                     }
                     _ => {
-                        self.emit_load(var, Reg64::R11);
-                        if narrow {
-                            if let Some(scale) = lea_scale {
-                                self.masm
-                                    .lea_scaled(Reg64::R11, Reg64::R11, Reg64::R11, scale);
-                            } else {
-                                self.masm.imul32_rri(Reg64::R11, Reg64::R11, imm);
-                            }
-                        } else {
-                            self.masm.imul32_rri(Reg64::R11, Reg64::R11, imm);
+                        self.emit_load(left, Reg64::Rax);
+                        self.emit_load(right, Reg64::R10);
+                        self.masm.imul32_rr(Reg64::Rax, Reg64::R10);
+                        if !narrow {
                             self.masm
                                 .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
-                            self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
+                            self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
                         }
-                        self.emit_store(id, Reg64::R11);
+                        self.emit_store(id, Reg64::Rax);
+                        self.rax_holds = Some(id);
                     }
                 }
-                return;
             }
 
-            // Non-constant operands — use register×register IMUL.
-            match self.alloc.location(id) {
-                Some(Location::Register(n)) => {
-                    let dst = phys_reg(n);
-                    let right_in_dst = left != right
-                        && matches!(
-                            self.alloc.location(right),
-                            Some(Location::Register(rn)) if phys_reg(rn) == dst
-                        );
-                    if right_in_dst {
-                        self.emit_load(right, Reg64::R10);
-                        self.emit_load(left, dst);
-                        self.masm.imul32_rr(dst, Reg64::R10);
-                    } else {
-                        self.emit_load(left, dst);
-                        match self.alloc.location(right) {
-                            Some(Location::Register(rn)) if phys_reg(rn) != dst => {
-                                self.masm.imul32_rr(dst, phys_reg(rn));
-                            }
-                            _ => {
-                                self.emit_load(right, Reg64::R10);
-                                self.masm.imul32_rr(dst, Reg64::R10);
-                            }
-                        }
-                    }
-                    if !narrow {
-                        self.masm
-                            .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
-                        self.masm.movsxd_sign_extend(dst, dst);
-                    }
-                    self.note_reg_holds(dst, id);
-                }
-                _ => {
-                    self.emit_load(left, Reg64::Rax);
-                    self.emit_load(right, Reg64::R10);
-                    self.masm.imul32_rr(Reg64::Rax, Reg64::R10);
-                    if !narrow {
-                        self.masm
-                            .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
-                        self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
-                    }
-                    self.emit_store(id, Reg64::Rax);
-                    self.rax_holds = Some(id);
-                }
+            if has_undef_guard {
+                self.masm.jmp(&mut undef_done);
+                self.masm.bind_label(&mut undef_slow);
+                self.clear_reg_forwarding();
+                let saved = self.emit_save_live_regs(id);
+                self.emit_load(left, Reg64::Rdi);
+                self.emit_load(right, Reg64::Rsi);
+                let addr = jit_runtime::jit_runtime_generic_mul as *const () as usize;
+                self.masm.mov_ri(Reg64::R11, addr as i64);
+                self.masm.call_reg(Reg64::R11);
+                self.emit_restore_live_regs(saved);
+                self.emit_deopt_check_rax();
+                self.emit_store(id, Reg64::Rax);
+                self.rax_holds = Some(id);
+                self.masm.bind_label(&mut undef_done);
+                self.clear_reg_forwarding();
             }
             return;
         }
