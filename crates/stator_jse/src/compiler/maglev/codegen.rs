@@ -656,7 +656,7 @@ struct MaglevCodegen<'a> {
     #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
     array_ic_base: i32,
     /// Byte offset from RBP of the first named-property IC slot.
-    /// Each site gets 32 bytes: `[handle, map_ptr, shape_id, offset]`.
+    /// Each site gets 32 bytes: `[handle, map_ptr, shape_id, elem_addr]`.
     /// Zero when the function has no named property access sites.
     #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
     named_ic_base: i32,
@@ -5712,7 +5712,7 @@ impl<'a> MaglevCodegen<'a> {
         let ic_off_handle = ic_base; // +0
         let ic_off_map_ptr = ic_base + 8; // +8
         let ic_off_shape = ic_base + 16; // +16
-        let ic_off_offset = ic_base + 24; // +24
+        let ic_off_elem_addr = ic_base + 24; // +24  (absolute element address)
 
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
@@ -5740,31 +5740,12 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.jne(&mut slow_label);
 
         // Shape matches → property at same offset.
-        // Re-derive LIVE values data pointer from PropertyMap.
-        self.masm.mov_load_base_disp32(
-            Reg64::R11,
-            Reg64::R10,
-            pm_layout.values_data_ptr_offset as i32,
-        );
-        // R11 = values data pointer (current, not stale).
-
-        // Load cached field offset.
+        // Load the pre-computed element address from the IC slot.
+        // The IC fill stores (values_data_ptr + index * sizeof(JsValue))
+        // so we skip the values-data-pointer load and index multiply.
+        // Safety: same shape_id guarantees no Vec reallocation occurred.
         self.masm
-            .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, ic_off_offset);
-
-        // Compute element address: R11 + R10 * sizeof(JsValue).
-        // sizeof(JsValue) == 24 == 3 * 8.
-        debug_assert_eq!(
-            jv_layout.jsvalue_size, 24,
-            "LEA chain assumes JsValue is 24 bytes"
-        );
-        self.masm.lea_scaled(Reg64::R10, Reg64::R10, Reg64::R10, 2); // R10 = offset * 3
-        // SHL R10, 3 — REX.WB C1 /4 r/m=R10(enc=2), imm8=3
-        self.masm.emit_byte(0x49); // REX.W + REX.B
-        self.masm.emit_byte(0xC1); // SHL r/m64, imm8
-        self.masm.emit_byte(0xE2); // ModRM: mod=11, /4, r/m=2
-        self.masm.emit_byte(0x03); // shift count = 3
-        self.masm.add_rr(Reg64::R11, Reg64::R10);
+            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_elem_addr);
 
         // Load discriminant byte.
         self.masm

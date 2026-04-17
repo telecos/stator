@@ -7833,7 +7833,7 @@ pub(crate) mod jit_runtime {
     /// Combined named-property IC fill **and** load.
     ///
     /// Resolves the heap handle, fills the 4-slot inline cache at
-    /// `ic_slots` (`[handle, map_ptr, shape_id, offset]`), and performs
+    /// `ic_slots` (`[handle, map_ptr, shape_id, elem_addr]`), and performs
     /// the property load — all in a single call.
     ///
     /// Only fills the IC for own data-property hits on `PlainObject`
@@ -7845,7 +7845,7 @@ pub(crate) mod jit_runtime {
     /// * `RSI` (`name_idx`) – constant-pool index of the property name.
     /// * `RDX` (`rt_ptrs_cell`) – pointer to `Cell<RtPtrs>` TLS slot.
     /// * `RCX` (`ic_slots`) – pointer to 4 consecutive `i64` on the
-    ///   stack: `[handle, map_ptr, shape_id, offset]`.
+    ///   stack: `[handle, map_ptr, shape_id, elem_addr]`.
     ///
     /// Returns [`NamedIcResult`] in `RAX:RDX`.
     #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
@@ -7898,13 +7898,20 @@ pub(crate) mod jit_runtime {
                     Some(enc) => enc,
                     None => alloc_heap_handle(val.clone()),
                 };
-                // Fill IC slots: [handle, map_ptr, shape_id, offset]
+                // Fill IC slots: [handle, map_ptr, shape_id, elem_addr]
+                // Store the absolute element address (data_ptr + offset *
+                // sizeof(JsValue)) so the inline fast path can skip the
+                // values-data-pointer load and index multiplication.
                 let map_raw = map_rc.as_ptr() as i64;
+                let elem_addr = unsafe {
+                    (map.values_as_slice().as_ptr() as *const u8)
+                        .add(offset * std::mem::size_of::<JsValue>())
+                } as i64;
                 unsafe {
                     (*ic_slots)[0] = obj_i64;
                     (*ic_slots)[1] = map_raw;
                     (*ic_slots)[2] = shape as i64;
-                    (*ic_slots)[3] = offset as i64;
+                    (*ic_slots)[3] = elem_addr;
                 }
                 return NamedIcResult {
                     value: encoded,
