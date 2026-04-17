@@ -5295,7 +5295,11 @@ pub(crate) mod jit_runtime {
                     | FeedbackSlotKind::LoadProperty
             )
         });
-        if ba_free { slots | (1i64 << 63) } else { slots }
+        if ba_free {
+            slots | (1i64 << 63)
+        } else {
+            slots
+        }
     }
 
     /// Re-read the closure context pointer from a [`BytecodeArray`].
