@@ -130,6 +130,10 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // Re-run strength reduction: range analysis may have lowered
     // GenericMultiply→Int32Multiply, exposing power-of-two patterns.
     strength_reduce(graph);
+    // Re-run reassociation: range analysis lowered Generic→Int32 ops,
+    // exposing patterns like (a + x*K1) - x*K2 → a + x*(K1-K2) that
+    // the first reassociation pass could not see.
+    reassociate_arithmetic(graph);
     eliminate_trivial_phis(graph);
     let _licm_hoisted = crate::compiler::maglev::licm::hoist_loop_invariants(graph);
     // TODO: implement loop peeling — execute the first iteration outside the
@@ -147,6 +151,8 @@ pub fn optimize(graph: &mut MaglevGraph) {
     crate::compiler::maglev::range_analysis::eliminate_overflow_checks(graph);
     // Re-run strength reduction after second range analysis pass.
     strength_reduce(graph);
+    // Re-run reassociation after second range analysis pass.
+    reassociate_arithmetic(graph);
     // Re-run truncation after global promotion: promotion reduces
     // use-counts on arithmetic nodes — allowing CheckedSmi→Int32.
     let _truncations2 = propagate_int32_truncation(graph);
@@ -1330,6 +1336,38 @@ fn try_reassociate(
             {
                 return build_multiply_reassoc(pos, base, k - 1, consts, next_id);
             }
+            // (x * K1) - (x * K2)  ->  x * (K1-K2)  when same base, K1 > K2
+            if let Some(&(base_l, k_l)) = mul_info.get(left)
+                && let Some(&(base_r, k_r)) = mul_info.get(right)
+                && base_l == base_r
+                && k_l > k_r
+            {
+                return build_multiply_reassoc(pos, base_l, k_l - k_r, consts, next_id);
+            }
+            // (a + x * K1) - (x * K2)  ->  a + x * (K1-K2)  when same base
+            if let Some(&(base_r, k_r)) = mul_info.get(right)
+                && let Some(ValueNode::Int32Add {
+                    left: add_a,
+                    right: add_b,
+                }) = node_defs.get(left)
+            {
+                if let Some(&(base_l, k_l)) = mul_info.get(add_b)
+                    && base_l == base_r
+                    && k_l >= k_r
+                {
+                    return build_add_mul_reassoc(
+                        pos, *add_a, base_r, k_l - k_r, consts, next_id,
+                    );
+                }
+                if let Some(&(base_l, k_l)) = mul_info.get(add_a)
+                    && base_l == base_r
+                    && k_l >= k_r
+                {
+                    return build_add_mul_reassoc(
+                        pos, *add_b, base_r, k_l - k_r, consts, next_id,
+                    );
+                }
+            }
             None
         }
         _ => None,
@@ -2421,11 +2459,18 @@ fn compute_store_to_load_subst_with_map(
 
             // Forward named property loads.
             ValueNode::LoadNamedGeneric { object, name, .. } => {
-                // Resolve aliases: if object was a forwarded LoadGlobal,
-                // look up properties on the original object.
+                // Resolve aliases: if object was a forwarded LoadGlobal or
+                // a prior forwarded LoadNamedGeneric, look up properties
+                // on the original object.
                 let resolved_obj = alias_map.get(object).copied().unwrap_or(*object);
                 if let Some(&stored_value) = store_map.get(&(resolved_obj, *name)) {
                     subst.insert(*id, stored_value);
+                    // Record the alias so chained property accesses can
+                    // resolve through this load.  E.g. for `root.a.b`,
+                    // after forwarding `root.a` → inner_obj, the load of
+                    // `.b` needs to resolve `root.a` → inner_obj so it
+                    // can look up (inner_obj, "b") in the store_map.
+                    alias_map.insert(*id, stored_value);
                 }
             }
 
