@@ -2381,23 +2381,37 @@ impl<'a> MaglevCodegen<'a> {
 
                 // Load value arguments into registers FIRST (before
                 // clobbering any allocatable registers with immediates).
-                // Values go into RDX, RCX, R8.
-                let val_regs = [Reg64::Rdx, Reg64::Rcx, Reg64::R8];
-                for (i, &v) in values.iter().enumerate() {
+                // Values go into RDX, RCX, R8, R9 (first 4 in registers).
+                let val_regs = [Reg64::Rdx, Reg64::Rcx, Reg64::R8, Reg64::R9];
+                let reg_count = values.len().min(4);
+                for (i, &v) in values.iter().take(reg_count).enumerate() {
                     self.emit_load(v, val_regs[i]);
                 }
-                // Zero-fill unused value slots.
-                for reg in &val_regs[values.len()..3] {
+                // Zero-fill unused register value slots.
+                for reg in &val_regs[reg_count..4] {
                     self.masm.mov_ri(*reg, 0);
                 }
 
-                // Pack name indices: name0 | (name1 << 16) | (name2 << 32)
-                // | (count << 48).
+                // 7th arg (5th value) goes on the stack.  Always allocate
+                // 16 bytes to maintain 16-byte alignment after the pushes
+                // from emit_save_live_regs.
+                self.masm.sub_ri(Reg64::Rsp, 16);
+                if values.len() > 4 {
+                    self.emit_load(values[4], Reg64::R11);
+                    self.masm.mov_store_base_disp32(Reg64::Rsp, 0, Reg64::R11);
+                } else {
+                    self.masm.mov_ri(Reg64::R11, 0);
+                    self.masm.mov_store_base_disp32(Reg64::Rsp, 0, Reg64::R11);
+                }
+
+                // Pack name indices using 12-bit encoding:
+                // bits 0-11: name0, 12-23: name1, 24-35: name2,
+                // 36-47: name3, 48-59: name4, 60-63: count.
                 let mut packed: u64 = 0;
                 for (i, &n) in names.iter().enumerate() {
-                    packed |= (u64::from(n) & 0xFFFF) << (i * 16);
+                    packed |= (u64::from(n) & 0xFFF) << (i * 12);
                 }
-                packed |= (names.len() as u64) << 48;
+                packed |= (names.len() as u64) << 60;
 
                 self.masm.mov_ri(Reg64::Rdi, i64::from(*feedback_slot));
                 self.masm.mov_ri(Reg64::Rsi, packed as i64);
@@ -2406,6 +2420,7 @@ impl<'a> MaglevCodegen<'a> {
                     jit_runtime::jit_runtime_create_object_with_props as *const () as usize as i64;
                 self.masm.mov_ri(Reg64::R11, addr);
                 self.masm.call_reg(Reg64::R11);
+                self.masm.add_ri(Reg64::Rsp, 16);
                 self.emit_restore_live_regs(saved);
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
@@ -8928,6 +8943,156 @@ mod tests {
 
         let set = narrow_set(&graph);
         assert!(set.is_empty());
+    }
+
+    #[test]
+    fn test_narrow_int32_arithmetic_loop_bitor0() {
+        // Model the arithmetic_loop_10k pattern:
+        //   var n = 0;
+        //   for (var i = 0; i < 10000; i++) { n = (n + i*3 - 1) | 0; }
+        //   return n;
+        //
+        // Block 0 (pre-header): constants → Jump(1)
+        // Block 1 (header): Phi_n, Phi_i, LessThan → Branch(2, 3)
+        // Block 2 (body): Mul, Add, Sub, Or, Inc → Jump(1)
+        // Block 3 (exit): Return(Phi_n)
+        //
+        // All of Mul, Add, Sub, Or should be narrow (skip MOVSXD).
+        let mut graph = MaglevGraph::new(0);
+
+        let b0 = BasicBlock::new(0);
+        let mut b1 = BasicBlock::new(1);
+        b1.add_predecessor(0);
+        b1.add_predecessor(2);
+        let b2 = BasicBlock::new(2);
+        let mut b3 = BasicBlock::new(3);
+        b3.add_predecessor(1);
+        graph.add_block(b0);
+        graph.add_block(b1);
+        graph.add_block(b2);
+        graph.add_block(b3);
+
+        // Block 0: constants
+        let const_0 = graph
+            .add_value_node(0, ValueNode::SmiConstant { value: 0 })
+            .unwrap();
+        let const_3 = graph
+            .add_value_node(0, ValueNode::SmiConstant { value: 3 })
+            .unwrap();
+        let const_1 = graph
+            .add_value_node(0, ValueNode::Int32Constant { value: 1 })
+            .unwrap();
+        let const_zero = graph
+            .add_value_node(0, ValueNode::Int32Constant { value: 0 })
+            .unwrap();
+        let const_10k = graph
+            .add_value_node(0, ValueNode::SmiConstant { value: 10000 })
+            .unwrap();
+        graph.blocks_mut()[0].set_control(ControlNode::Jump { target: 1 });
+
+        // Pre-allocate IDs for back-edge values (or_result, inc_result)
+        let or_id = graph.alloc_node_id();
+        let inc_id = graph.alloc_node_id();
+
+        // Block 1: Phi nodes + branch
+        let phi_n = graph
+            .add_value_node(
+                1,
+                ValueNode::Phi {
+                    inputs: vec![const_0, or_id],
+                },
+            )
+            .unwrap();
+        let phi_i = graph
+            .add_value_node(
+                1,
+                ValueNode::Phi {
+                    inputs: vec![const_0, inc_id],
+                },
+            )
+            .unwrap();
+        let lt = graph
+            .add_value_node(
+                1,
+                ValueNode::Int32LessThan {
+                    left: phi_i,
+                    right: const_10k,
+                },
+            )
+            .unwrap();
+        graph.blocks_mut()[1].set_control(ControlNode::Branch {
+            condition: lt,
+            if_true: 2,
+            if_false: 3,
+        });
+
+        // Block 2: loop body
+        let mul = graph
+            .add_value_node(
+                2,
+                ValueNode::Int32Multiply {
+                    left: phi_i,
+                    right: const_3,
+                },
+            )
+            .unwrap();
+        let add = graph
+            .add_value_node(
+                2,
+                ValueNode::Int32Add {
+                    left: phi_n,
+                    right: mul,
+                },
+            )
+            .unwrap();
+        let sub = graph
+            .add_value_node(
+                2,
+                ValueNode::Int32Subtract {
+                    left: add,
+                    right: const_1,
+                },
+            )
+            .unwrap();
+        // Int32BitwiseOr(sub, 0) — identity, but ensures i32 truncation
+        graph.blocks_mut()[2].push_with_id(
+            or_id,
+            ValueNode::Int32BitwiseOr {
+                left: sub,
+                right: const_zero,
+            },
+        );
+        // i++
+        graph.blocks_mut()[2].push_with_id(inc_id, ValueNode::Int32Increment { value: phi_i });
+        graph.blocks_mut()[2].set_control(ControlNode::Jump { target: 1 });
+
+        // Block 3: exit
+        graph.blocks_mut()[3].set_control(ControlNode::Return { value: phi_n });
+
+        let set = narrow_set(&graph);
+
+        // All loop body ops should be narrow (skip MOVSXD)
+        assert!(
+            set.contains(&mul),
+            "Int32Multiply should be narrow in (n + i*3 - 1) | 0 loop"
+        );
+        assert!(
+            set.contains(&add),
+            "Int32Add should be narrow in (n + i*3 - 1) | 0 loop"
+        );
+        assert!(
+            set.contains(&sub),
+            "Int32Subtract should be narrow in (n + i*3 - 1) | 0 loop"
+        );
+        assert!(
+            set.contains(&or_id),
+            "Int32BitwiseOr should be narrow in (n + i*3 - 1) | 0 loop"
+        );
+        // Phi_n should be narrow-transparent (in the set)
+        assert!(
+            set.contains(&phi_n),
+            "Phi_n should be narrow (narrow-transparent) in arithmetic loop"
+        );
     }
 
     // ── i32-range analysis tests ─────────────────────────────────────────────

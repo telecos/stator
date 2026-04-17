@@ -2146,11 +2146,14 @@ fn mark_inlining_candidates(graph: &mut MaglevGraph) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Maximum number of property stores that can be fused into a single
-/// [`CreateObjectLiteralWithProperties`] node.  Limited by the SysV AMD64
-/// calling convention: with 6 register arguments we use 2 for
-/// `feedback_slot` and packed `names`, leaving 4 for values (but we
-/// currently only pass up to 3 values in RDX/RCX/R8).
-pub const MAX_FUSED_OBJECT_PROPS: usize = 3;
+/// [`CreateObjectLiteralWithProperties`] node.  The SysV AMD64 calling
+/// convention provides 6 register arguments; we use RDI for
+/// `feedback_slot`, RSI for packed `names` (12-bit encoding fits 5
+/// indices), RDX/RCX/R8/R9 for 4 values, and the stack for the 5th.
+///
+/// Name indices must fit in 12 bits (≤ 4095); properties with larger
+/// constant-pool indices are not fused.
+pub const MAX_FUSED_OBJECT_PROPS: usize = 5;
 
 /// Fuse `CreateObjectLiteral` + consecutive `StoreNamedGeneric` into a
 /// single [`CreateObjectLiteralWithProperties`] node.
@@ -2221,6 +2224,10 @@ fn fuse_object_literal_stores_in_block(block: &mut BasicBlock) {
                     value,
                     ..
                 } if *object == create_node_id => {
+                    // Name index must fit in the 12-bit packed encoding.
+                    if *name > 0xFFF {
+                        break;
+                    }
                     names.push(*name);
                     values.push(*value);
                     store_indices.push(j);
