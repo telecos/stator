@@ -4717,12 +4717,12 @@ pub(crate) mod jit_runtime {
                             let ba_ref: &BytecodeArray = unsafe { &*ba_raw };
                             if !ba_ref.jit_baseline_has_deopted() {
                                 if let Ok(cc) = BaselineCompiler::compile(ba_ref) {
-                                    if let Ok(cached) = (unsafe {
+                                    if let Ok(cached) = unsafe {
                                         CachedExecutableCode::from_compiled(
                                             &cc.code,
                                             cc.register_file_slots,
                                         )
-                                    }) {
+                                    } {
                                         ba_ref.store_jit_code(cached);
                                         let jit_ref = ba_ref.try_get_jit_code();
                                         if let Some(cached) = jit_ref.as_ref() {
@@ -8206,7 +8206,7 @@ pub(crate) mod jit_runtime {
 
     // ── Fused CreateObjectLiteral + StoreNamedGeneric stub ──────────────
 
-    /// Create an object literal and fill up to 3 own properties in a
+    /// Create an object literal and fill up to 5 own properties in a
     /// single call.
     ///
     /// This is the runtime half of the `CreateObjectLiteralWithProperties`
@@ -8218,12 +8218,14 @@ pub(crate) mod jit_runtime {
     /// # Calling convention (SysV AMD64)
     ///
     /// * `RDI` (`feedback_slot`) – feedback vector slot index (−1 = none).
-    /// * `RSI` (`names_packed`)  – up to 3 constant-pool name indices
-    ///   packed as `u16` values: `name0 | (name1 << 16) | (name2 << 32)`,
-    ///   with the property count in bits 48–51.
+    /// * `RSI` (`names_packed`)  – up to 5 constant-pool name indices
+    ///   packed as 12-bit values: `name0 | (name1 << 12) | … |
+    ///   (name4 << 48)`, with the property count in bits 60–63.
     /// * `RDX` (`val0`) – first property value (JIT i64).
     /// * `RCX` (`val1`) – second property value (JIT i64), or 0 if fewer.
     /// * `R8`  (`val2`) – third property value (JIT i64), or 0 if fewer.
+    /// * `R9`  (`val3`) – fourth property value (JIT i64), or 0 if fewer.
+    /// * Stack (`val4`) – fifth property value (JIT i64), or 0 if fewer.
     ///
     /// Returns a JIT i64 heap handle for the new `PlainObject`, or
     /// [`JIT_DEOPT`].
@@ -8234,8 +8236,10 @@ pub(crate) mod jit_runtime {
         val0: i64,
         val1: i64,
         val2: i64,
+        val3: i64,
+        val4: i64,
     ) -> i64 {
-        create_object_with_props_inner(feedback_slot, names_packed, val0, val1, val2)
+        create_object_with_props_inner(feedback_slot, names_packed, val0, val1, val2, val3, val4)
             .unwrap_or_else(|| {
                 track_stub_deopt(STUB_CREATE_OBJ_WITH_PROPS);
                 JIT_DEOPT
@@ -8256,10 +8260,12 @@ pub(crate) mod jit_runtime {
         val0: i64,
         val1: i64,
         val2: i64,
+        val3: i64,
+        val4: i64,
     ) -> Option<i64> {
         let names_packed_u64 = names_packed as u64;
-        let count = ((names_packed_u64 >> 48) & 0xF) as usize;
-        let vals = [val0, val1, val2];
+        let count = ((names_packed_u64 >> 60) & 0xF) as usize;
+        let vals = [val0, val1, val2, val3, val4];
 
         let ptrs = RT_PTRS.with(|p| p.get());
 
@@ -8383,24 +8389,33 @@ pub(crate) mod jit_runtime {
         }
     }
 
-    /// Decode up to 3 JIT `i64` register values into a stack-allocated
+    /// Decode up to 5 JIT `i64` register values into a stack-allocated
     /// array, avoiding a `Vec` heap allocation on the fused hot path.
     #[inline]
-    fn decode_jit_values_array(count: usize, vals: &[i64; 3]) -> [JsValue; 3] {
-        let mut out = [JsValue::Undefined, JsValue::Undefined, JsValue::Undefined];
-        for i in 0..count.min(3) {
+    fn decode_jit_values_array(count: usize, vals: &[i64; 5]) -> [JsValue; 5] {
+        let mut out = [
+            JsValue::Undefined,
+            JsValue::Undefined,
+            JsValue::Undefined,
+            JsValue::Undefined,
+            JsValue::Undefined,
+        ];
+        for i in 0..count.min(5) {
             out[i] = decode_one_jit_value(vals[i]);
         }
         out
     }
 
-    /// Unpack up to 3 constant-pool name indices from the packed `u64`.
+    /// Unpack up to 5 constant-pool name indices from the packed `u64`
+    /// (12-bit encoding).
     #[inline]
-    fn unpack_names(packed: u64) -> [u32; 3] {
+    fn unpack_names(packed: u64) -> [u32; 5] {
         [
-            (packed & 0xFFFF) as u32,
-            ((packed >> 16) & 0xFFFF) as u32,
-            ((packed >> 32) & 0xFFFF) as u32,
+            (packed & 0xFFF) as u32,
+            ((packed >> 12) & 0xFFF) as u32,
+            ((packed >> 24) & 0xFFF) as u32,
+            ((packed >> 36) & 0xFFF) as u32,
+            ((packed >> 48) & 0xFFF) as u32,
         ]
     }
 
