@@ -5248,6 +5248,12 @@ pub(crate) mod jit_runtime {
         RT_PTRS.with(|p| p as *const Cell<RtPtrs> as i64)
     }
 
+    /// Byte offset of the `global` field within `Cell<RtPtrs>`.
+    ///
+    /// Used by Maglev codegen to load the global-state pointer from R15
+    /// (`[R15 + RT_PTRS_GLOBAL_OFFSET]`) without a full TLS lookup.
+    pub const RT_PTRS_GLOBAL_OFFSET: i32 = std::mem::offset_of!(RtPtrs, global) as i32;
+
     /// Like [`jit_runtime_mono_call_prepare_check_ctx`] but accepts a
     /// pre-cached pointer to the `RT_PTRS` TLS cell in the 4th argument,
     /// eliminating one TLS lookup per call.
@@ -5677,20 +5683,15 @@ pub(crate) mod jit_runtime {
     /// Shared global-load logic used by both the cached-pointer and
     /// `.with()` paths.
     fn lda_global_from_ref(g: &RefCell<JitGlobalState>, name_idx: u32) -> Option<i64> {
-        // Clone the environment Rc and copy the IC entry by value in a
-        // scoped borrow of the global state.  This avoids holding
-        // `&JitGlobalState` across the `borrow_mut()` IC-update below.
-        let (env_rc, ic_entry) = {
-            // SAFETY: JIT execution is single-threaded.  No concurrent
-            // mutable borrows of the global state can be active during a
-            // load-global fast path.
-            let state = unsafe { &*g.as_ptr() };
-            let env_rc = Rc::clone(state.env.as_ref()?);
-            let ic_entry = state.ic[(name_idx & 63) as usize];
-            (env_rc, ic_entry)
-        };
-        // SAFETY: single-threaded JIT; `state` was dropped above.
+        // SAFETY: JIT execution is single-threaded.  No concurrent
+        // borrows of the global state can be active during a
+        // load-global stub.
+        let state = unsafe { &*g.as_ptr() };
+        let env_rc = state.env.as_ref()?;
+        // Access the GlobalEnv via raw pointer, avoiding Rc::clone/drop
+        // overhead (~10ns of atomic refcount ops on every call).
         let env = unsafe { &*env_rc.as_ptr() };
+        let ic_entry = state.ic[(name_idx & 63) as usize];
 
         // Fast path: direct-mapped IC hit.
         if ic_entry.0 == name_idx {
@@ -5708,11 +5709,11 @@ pub(crate) mod jit_runtime {
         let value = env.get(name).unwrap_or(&JsValue::Undefined);
         let result = jsvalue_ref_to_jit_i64(value);
 
-        // Populate IC — safe borrow; no aliased `&JitGlobalState` exists.
+        // Populate IC via raw pointer — single-threaded JIT, safe.
         let slot_idx = env.slot_index_for(name);
         let cur_gen = env.generation();
         if let Some(idx) = slot_idx {
-            g.borrow_mut().ic[(name_idx & 63) as usize] = (name_idx, idx, cur_gen);
+            unsafe { (*g.as_ptr()).ic[(name_idx & 63) as usize] = (name_idx, idx, cur_gen) };
         }
 
         Some(result)
@@ -5758,18 +5759,13 @@ pub(crate) mod jit_runtime {
         value_i64: i64,
         value: JsValue,
     ) -> Option<i64> {
-        // Clone env Rc and copy IC entry by value in a scoped borrow so
-        // that `&JitGlobalState` is dropped before the IC raw-pointer
-        // writes below.
-        let (env_rc, ic_entry) = {
-            // SAFETY: JIT execution is single-threaded. No concurrent borrows.
-            let state = unsafe { &*g.as_ptr() };
-            let env_rc = Rc::clone(state.env.as_ref()?);
-            let ic_entry = state.ic[(name_idx & 63) as usize];
-            (env_rc, ic_entry)
-        };
-        // SAFETY: single-threaded JIT; `state` was dropped above.
+        // SAFETY: JIT execution is single-threaded. No concurrent borrows.
+        let state = unsafe { &*g.as_ptr() };
+        let env_rc = state.env.as_ref()?;
+        // Access the GlobalEnv via raw pointer, avoiding Rc::clone/drop
+        // overhead (~10ns of atomic refcount ops on every call).
         let env = unsafe { &mut *env_rc.as_ptr() };
+        let ic_entry = state.ic[(name_idx & 63) as usize];
 
         // Fast path: direct-mapped IC hit — store by index.
         if ic_entry.0 == name_idx {
@@ -5788,8 +5784,7 @@ pub(crate) mod jit_runtime {
             env.store_by_index_sync(idx, name, value);
             // Populate / update IC with the slot index we already found.
             let cur_gen = env.generation();
-            // SAFETY: `state` was dropped; no aliased `&JitGlobalState`
-            // exists.  Single-threaded JIT.
+            // SAFETY: single-threaded JIT, no aliased borrows.
             unsafe { (*g.as_ptr()).ic[(name_idx & 63) as usize] = (name_idx, idx, cur_gen) };
         } else {
             env.insert(name.to_string(), value);
@@ -5802,6 +5797,54 @@ pub(crate) mod jit_runtime {
         }
 
         Some(value_i64)
+    }
+
+    // ── Fast R15-based global stubs ─────────────────────────────────────
+    //
+    // When Maglev codegen has R15 available (pointing to the cached
+    // `Cell<RtPtrs>`), it can pass the global-state pointer directly,
+    // skipping the TLS lookup + Cell::get copy that the normal stubs do.
+
+    /// Fast `LdaGlobal` stub that receives the global-state pointer
+    /// directly from the codegen (loaded from `[R15 + offset]`).
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`name_idx`) – constant-pool index of the variable name.
+    /// * `RSI` (`global_ptr`) – raw pointer to `RefCell<JitGlobalState>`.
+    ///
+    /// Returns the variable value as `i64` in `RAX`, or [`JIT_DEOPT`].
+    pub extern "C" fn jit_runtime_lda_global_fast(name_idx: i64, global_ptr: i64) -> i64 {
+        let g = unsafe { &*(global_ptr as *const RefCell<JitGlobalState>) };
+        let result = lda_global_from_ref(g, name_idx as u32).unwrap_or(JIT_DEOPT);
+        if result == JIT_DEOPT {
+            track_stub_deopt(STUB_LDA_GLOBAL);
+            crate::interpreter::maglev_track_global_deopt();
+        }
+        result
+    }
+
+    /// Fast `StaGlobal` stub that receives the global-state pointer
+    /// directly from the codegen (loaded from `[R15 + offset]`).
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`name_idx`) – constant-pool index of the variable name.
+    /// * `RSI` (`value_i64`) – the JIT i64 encoding of the value to store.
+    /// * `RDX` (`global_ptr`) – raw pointer to `RefCell<JitGlobalState>`.
+    ///
+    /// Returns `value_i64` in `RAX` on success, or [`JIT_DEOPT`].
+    pub extern "C" fn jit_runtime_sta_global_fast(
+        name_idx: i64,
+        value_i64: i64,
+        global_ptr: i64,
+    ) -> i64 {
+        let g = unsafe { &*(global_ptr as *const RefCell<JitGlobalState>) };
+        let value = jit_i64_to_jsvalue(value_i64);
+        sta_global_from_ref(g, name_idx as u32, value_i64, value).unwrap_or_else(|| {
+            track_stub_deopt(STUB_STA_GLOBAL);
+            JIT_DEOPT
+        })
     }
 
     // ── Specialized LdaKeyedProperty stub ───────────────────────────────
