@@ -4337,20 +4337,36 @@ impl<'a> MaglevCodegen<'a> {
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
 
-        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
-        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
-        self.masm.jne(&mut slow_label);
+        let left_known_i32 = self.i32_range.contains(&left);
+        let right_known_i32 = self.i32_range.contains(&right);
 
-        self.masm.movsxd_rr(Reg64::Rax, Reg64::R10);
-        self.masm.cmp_rr(Reg64::Rax, Reg64::R10);
-        self.masm.jne(&mut slow_label);
+        // Skip Smi check on provably-i32 inputs (e.g. SmiConstant,
+        // Int32* ops, bitwise ops).  For the remaining input, emit
+        // the standard movsxd+cmp Smi guard.
+        if !left_known_i32 {
+            self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+            self.masm.jne(&mut slow_label);
+        }
+
+        if !right_known_i32 {
+            self.masm.movsxd_rr(Reg64::Rax, Reg64::R10);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::R10);
+            self.masm.jne(&mut slow_label);
+        }
 
         self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
         self.masm.add_rr(Reg64::Rax, Reg64::R10);
 
-        self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
-        self.masm.je(&mut done_label);
+        // Overflow check: if both inputs are known i32, the 64-bit
+        // sum always fits — skip the overflow guard entirely.
+        if !left_known_i32 || !right_known_i32 {
+            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm.je(&mut done_label);
+        } else {
+            self.masm.jmp(&mut done_label);
+        }
 
         // Slow path: save live regs, call stub, restore.
         self.masm.bind_label(&mut slow_label);
@@ -4516,20 +4532,31 @@ impl<'a> MaglevCodegen<'a> {
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
 
-        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
-        self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
-        self.masm.jne(&mut slow_label);
+        let left_known_i32 = self.i32_range.contains(&left);
+        let right_known_i32 = self.i32_range.contains(&right);
 
-        self.masm.movsxd_rr(Reg64::Rax, Reg64::R10);
-        self.masm.cmp_rr(Reg64::Rax, Reg64::R10);
-        self.masm.jne(&mut slow_label);
+        if !left_known_i32 {
+            self.masm.movsxd_rr(Reg64::Rax, Reg64::Rdi);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::Rdi);
+            self.masm.jne(&mut slow_label);
+        }
+
+        if !right_known_i32 {
+            self.masm.movsxd_rr(Reg64::Rax, Reg64::R10);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::R10);
+            self.masm.jne(&mut slow_label);
+        }
 
         self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
         self.masm.sub_rr(Reg64::Rax, Reg64::R10);
 
-        self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
-        self.masm.je(&mut done_label);
+        if !left_known_i32 || !right_known_i32 {
+            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm.je(&mut done_label);
+        } else {
+            self.masm.jmp(&mut done_label);
+        }
 
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
@@ -6691,9 +6718,15 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.jcc(CondCode::GreaterEq, &mut done_label);
 
         // Callee deopt after inline dispatch: fall back to stub.
+        // Invalidate the MIC so the next call goes through the miss
+        // path (which re-checks has_deopted) instead of re-entering
+        // the stale JIT entry point on every subsequent iteration.
         self.masm.bind_label(&mut mono_hit_deopt);
         self.masm
             .mov_load_base_disp32(Reg64::Rdi, Reg64::Rbp, off_callee);
+        self.masm.xor_rr(Reg64::R10, Reg64::R10);
+        self.masm
+            .mov_store_base_disp32(Reg64::Rbp, off_callee, Reg64::R10);
         let mono_retry_addr =
             jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
         self.masm.mov_ri(Reg64::R11, mono_retry_addr as i64);
@@ -6789,11 +6822,15 @@ impl<'a> MaglevCodegen<'a> {
         }
 
         // If callee JIT returned JIT_DEOPT, fall back to runtime stub
-        // instead of deopting the CALLER.
+        // instead of deopting the CALLER.  Also invalidate the MIC to
+        // prevent re-entering the stale JIT entry on the next iteration.
         self.masm.cmp_ri(Reg64::Rax, i32::MIN);
         let mut miss_ok = Label::new();
         self.masm.jcc(CondCode::GreaterEq, &mut miss_ok);
         // Callee deopt: callee_i64 is still on the stack.
+        self.masm.xor_rr(Reg64::R10, Reg64::R10);
+        self.masm
+            .mov_store_base_disp32(Reg64::Rbp, off_callee, Reg64::R10);
         self.masm.pop(Reg64::Rdi); // callee
         self.masm.add_ri(Reg64::Rsp, 8); // discard padding
         let miss_retry_addr =

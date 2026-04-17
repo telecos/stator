@@ -1799,8 +1799,10 @@ impl BytecodeArray {
     /// like prototype-chain lookups that always trigger OVERFLOW) take over.
     /// With a constant 1-invocation cooldown, the JIT gets retried almost
     /// immediately after each deopt; persistent deopts hit the limit after
-    /// just ~10 invocations and are permanently blocked.
-    const MAX_MAGLEV_DEOPT_RETRIES: u32 = 5;
+    /// just ~30 invocations and are permanently blocked.  A higher limit
+    /// gives the JIT more chances to stabilise after initial cold-IC
+    /// misses, while still bounding worst-case deopt overhead.
+    const MAX_MAGLEV_DEOPT_RETRIES: u32 = 15;
 
     /// Returns `true` if Maglev JIT code should NOT be attempted right now.
     ///
