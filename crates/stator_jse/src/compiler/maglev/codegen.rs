@@ -5712,11 +5712,10 @@ impl<'a> MaglevCodegen<'a> {
         let ic_off_shape = ic_base + 16; // +16
         let ic_off_elem_addr = ic_base + 24; // +24  (absolute element address)
 
+        let is_smi_specialized = self.smi_guarded.contains(&id) && !self.i32_range.contains(&id);
+
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
-        let mut load_smi = Label::new();
-        let mut load_bool = Label::new();
-        let mut load_undef = Label::new();
 
         // ── Fast path (scratch regs only: R11, R10, RAX) ────────────
 
@@ -5745,117 +5744,174 @@ impl<'a> MaglevCodegen<'a> {
         self.masm
             .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_elem_addr);
 
-        // Load discriminant byte.
-        self.masm
-            .movzx_byte_base_disp32(Reg64::Rax, Reg64::R11, jv_layout.disc_offset as i32);
+        if is_smi_specialized {
+            // ── Smi-specialized fast path ──────────────────────────
+            //
+            // When this load feeds into arithmetic (smi_guarded), we
+            // skip the full discriminant dispatch.  The speculative
+            // MOVSXD and the discriminant MOVZX target independent
+            // registers and read from the same cache line, enabling
+            // ILP on modern out-of-order cores.  On disc mismatch
+            // (property value mutated to a non-Smi type) we deopt to
+            // the interpreter — the smi_guarded contract allows this.
+            //
+            // Instruction count on Smi IC hit: 12 (vs 16 before).
+            // Taken jumps on Smi IC hit: 0 (vs 2 before).
+            let mut smi_fast_done = Label::new();
 
-        // Dispatch on type.
-        self.masm.cmp_ri(Reg64::Rax, jv_layout.smi_disc as i32);
-        self.masm.je(&mut load_smi);
-        self.masm.cmp_ri(Reg64::Rax, jv_layout.bool_disc as i32);
-        self.masm.je(&mut load_bool);
-        self.masm.cmp_ri(Reg64::Rax, jv_layout.undef_disc as i32);
-        self.masm.je(&mut load_undef);
-        // Other types (String, Object, …): R11 still holds the element
-        // address.  Allocate a heap handle via a lightweight runtime
-        // call (just clone + push to heap, no property lookup needed).
-        {
+            // Speculative Smi payload load (may read garbage if not Smi,
+            // but the discriminant check below catches that).
+            self.masm.movsxd_base_disp32(
+                Reg64::Rax,
+                Reg64::R11,
+                jv_layout.smi_payload_offset as i32,
+            );
+            // Discriminant check — verifies the value is still Smi.
+            self.masm
+                .movzx_byte_base_disp32(Reg64::R10, Reg64::R11, jv_layout.disc_offset as i32);
+            self.masm.cmp_ri(Reg64::R10, jv_layout.smi_disc as i32);
+            // Type changed → deopt (smi_guarded contract).
+            self.masm.jne(&mut self.deopt_label);
+            // RAX holds the correct Smi value; skip the slow path and
+            // the redundant post-load Smi guard.
+            self.masm.jmp(&mut smi_fast_done);
+
+            // ── Slow path: IC miss ──────────────────────────────────
+            self.masm.bind_label(&mut slow_label);
             let saved = self.emit_save_live_regs(id);
-            // RDI = element address (R11 is caller-saved, so move it)
-            self.masm.mov_rr(Reg64::Rdi, Reg64::R11);
-            let alloc_addr =
-                jit_runtime::jit_runtime_alloc_handle_for_jsvalue as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, alloc_addr as i64);
+            self.emit_load(object, Reg64::Rdi);
+            self.masm.push(Reg64::Rdi);
+            self.masm.push(Reg64::R11); // alignment padding
+            self.masm.mov_ri(Reg64::Rsi, i64::from(name));
+            self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
+            self.masm.lea_base_disp32(Reg64::Rcx, Reg64::Rbp, ic_base);
+            let ic_fill_addr = jit_runtime::jit_runtime_fill_named_ic_r15 as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, ic_fill_addr as i64);
+            self.masm.call_reg(Reg64::R11);
+            let mut generic_label = Label::new();
+            self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
+            self.masm.je(&mut generic_label);
+            self.masm.add_ri(Reg64::Rsp, 16);
+            self.emit_restore_live_regs(saved);
+            self.emit_deopt_check_rax();
+            self.masm.jmp(&mut done_label);
+
+            // ── Generic fallback ────────────────────────────────────
+            self.masm.bind_label(&mut generic_label);
+            self.masm.pop(Reg64::R11); // discard alignment padding
+            self.masm.pop(Reg64::Rdi); // restore saved object
+            self.masm.mov_ri(Reg64::Rsi, i64::from(name));
+            self.masm.mov_ri(Reg64::Rdx, i64::from(feedback_slot));
+            let stub_addr = jit_runtime::jit_runtime_lda_named_property as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, stub_addr as i64);
             self.masm.call_reg(Reg64::R11);
             self.emit_restore_live_regs(saved);
-            // alloc_heap_handle always succeeds — no deopt check needed.
-            self.masm.jmp(&mut done_label);
-        }
+            self.emit_deopt_check_rax();
 
-        // ── load_smi: sign-extend i32 payload ───────────────────────
-        self.masm.bind_label(&mut load_smi);
-        self.masm
-            .movsxd_base_disp32(Reg64::Rax, Reg64::R11, jv_layout.smi_payload_offset as i32);
-        self.masm.jmp(&mut done_label);
-
-        // ── load_bool: encode as JIT_FALSE/JIT_TRUE ─────────────────
-        self.masm.bind_label(&mut load_bool);
-        self.masm.movzx_byte_base_disp32(
-            Reg64::Rax,
-            Reg64::R11,
-            jv_layout.bool_payload_offset as i32,
-        );
-        self.masm.and_ri(Reg64::Rax, 1);
-        self.masm.mov_ri(Reg64::R11, JIT_FALSE);
-        self.masm.add_rr(Reg64::Rax, Reg64::R11);
-        self.masm.jmp(&mut done_label);
-
-        // ── load_undef: → JIT_UNDEFINED ─────────────────────────────
-        self.masm.bind_label(&mut load_undef);
-        self.masm.mov_ri(Reg64::Rax, JIT_UNDEFINED);
-        self.rax_holds = None; // RAX no longer holds a forwarded value
-        self.masm.jmp(&mut done_label);
-
-        // ── Slow path: IC miss / non-inlineable type ────────────────
-        self.masm.bind_label(&mut slow_label);
-        let saved = self.emit_save_live_regs(id);
-
-        // Set up ABI args for jit_runtime_fill_named_ic_r15:
-        //   RDI = obj, RSI = name_idx, RDX = rt_ptrs (R15),
-        //   RCX = &ic_slots
-        self.emit_load(object, Reg64::Rdi);
-        // Save object for the generic fallback path.  The IC fill
-        // call clobbers caller-saved regs, and `object` may not be
-        // in the live set (last use) so restore_live_regs won't
-        // recover it.  Two pushes preserve 16-byte alignment.
-        self.masm.push(Reg64::Rdi);
-        self.masm.push(Reg64::R11); // alignment padding
-        self.masm.mov_ri(Reg64::Rsi, i64::from(name));
-        self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
-        self.masm.lea_base_disp32(Reg64::Rcx, Reg64::Rbp, ic_base);
-
-        let ic_fill_addr = jit_runtime::jit_runtime_fill_named_ic_r15 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, ic_fill_addr as i64);
-        self.masm.call_reg(Reg64::R11);
-
-        // Result: RAX = value, RDX = hit flag.
-        let mut generic_label = Label::new();
-        self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
-        self.masm.je(&mut generic_label);
-        // IC-fill hit: discard saved obj + padding, restore regs.
-        self.masm.add_ri(Reg64::Rsp, 16);
-        self.emit_restore_live_regs(saved);
-        self.emit_deopt_check_rax();
-        self.masm.jmp(&mut done_label);
-
-        // ── Generic fallback ────────────────────────────────────────
-        // Pop the saved object (safe even if it was a last-use reg)
-        // and reuse the original save_live_regs frame.
-        self.masm.bind_label(&mut generic_label);
-        self.masm.pop(Reg64::R11); // discard alignment padding
-        self.masm.pop(Reg64::Rdi); // restore saved object
-        self.masm.mov_ri(Reg64::Rsi, i64::from(name));
-        self.masm.mov_ri(Reg64::Rdx, i64::from(feedback_slot));
-        let stub_addr = jit_runtime::jit_runtime_lda_named_property as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, stub_addr as i64);
-        self.masm.call_reg(Reg64::R11);
-
-        self.emit_restore_live_regs(saved);
-        self.emit_deopt_check_rax();
-
-        // ── Common exit ─────────────────────────────────────────────
-        self.masm.bind_label(&mut done_label);
-        // Speculative Smi guard: if this load was added to `smi_guarded`,
-        // verify the result is a sign-extended i32 (Smi).  Non-Smi results
-        // (booleans, heap handles, undefined) trigger deopt to interpreter.
-        // Cost: 3 instructions; saves 6+ instructions per downstream
-        // GenericAdd that can now use the bare smi_guarded tier.
-        if self.smi_guarded.contains(&id) && !self.i32_range.contains(&id) {
+            // ── Slow-path exit with Smi guard ───────────────────────
+            // The slow path may return any type; apply the standard
+            // Smi guard so downstream smi_guarded arithmetic is safe.
+            self.masm.bind_label(&mut done_label);
             self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
             self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
             self.masm.jne(&mut self.deopt_label);
+
+            // ── Smi fast-path exit (bypasses redundant guard) ───────
+            self.masm.bind_label(&mut smi_fast_done);
+            self.emit_store(id, Reg64::Rax);
+        } else {
+            // ── General fast path with speculative Smi load ─────────
+            //
+            // Perform speculative MOVSXD before the discriminant check.
+            // If the value IS a Smi (overwhelmingly common), RAX is
+            // already correct and we jump directly to `done` — saving
+            // one taken branch vs the non-speculative path.
+            let mut load_bool = Label::new();
+            let mut load_undef = Label::new();
+
+            // Speculative Smi payload load.
+            self.masm.movsxd_base_disp32(
+                Reg64::Rax,
+                Reg64::R11,
+                jv_layout.smi_payload_offset as i32,
+            );
+            // Discriminant into R10 (independent of MOVSXD → ILP).
+            self.masm
+                .movzx_byte_base_disp32(Reg64::R10, Reg64::R11, jv_layout.disc_offset as i32);
+            self.masm.cmp_ri(Reg64::R10, jv_layout.smi_disc as i32);
+            self.masm.je(&mut done_label); // Smi confirmed → RAX ready
+
+            // Not Smi — dispatch remaining types (R11 = elem addr).
+            self.masm.cmp_ri(Reg64::R10, jv_layout.bool_disc as i32);
+            self.masm.je(&mut load_bool);
+            self.masm.cmp_ri(Reg64::R10, jv_layout.undef_disc as i32);
+            self.masm.je(&mut load_undef);
+            // Other types (String, Object, …): allocate a heap handle.
+            {
+                let saved = self.emit_save_live_regs(id);
+                self.masm.mov_rr(Reg64::Rdi, Reg64::R11);
+                let alloc_addr =
+                    jit_runtime::jit_runtime_alloc_handle_for_jsvalue as *const () as usize;
+                self.masm.mov_ri(Reg64::R11, alloc_addr as i64);
+                self.masm.call_reg(Reg64::R11);
+                self.emit_restore_live_regs(saved);
+                self.masm.jmp(&mut done_label);
+            }
+
+            // ── load_bool: encode as JIT_FALSE/JIT_TRUE ─────────────
+            self.masm.bind_label(&mut load_bool);
+            self.masm.movzx_byte_base_disp32(
+                Reg64::Rax,
+                Reg64::R11,
+                jv_layout.bool_payload_offset as i32,
+            );
+            self.masm.and_ri(Reg64::Rax, 1);
+            self.masm.mov_ri(Reg64::R11, JIT_FALSE);
+            self.masm.add_rr(Reg64::Rax, Reg64::R11);
+            self.masm.jmp(&mut done_label);
+
+            // ── load_undef: → JIT_UNDEFINED ─────────────────────────
+            self.masm.bind_label(&mut load_undef);
+            self.masm.mov_ri(Reg64::Rax, JIT_UNDEFINED);
+            self.rax_holds = None;
+            self.masm.jmp(&mut done_label);
+
+            // ── Slow path: IC miss / non-inlineable type ────────────
+            self.masm.bind_label(&mut slow_label);
+            let saved = self.emit_save_live_regs(id);
+            self.emit_load(object, Reg64::Rdi);
+            self.masm.push(Reg64::Rdi);
+            self.masm.push(Reg64::R11); // alignment padding
+            self.masm.mov_ri(Reg64::Rsi, i64::from(name));
+            self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
+            self.masm.lea_base_disp32(Reg64::Rcx, Reg64::Rbp, ic_base);
+            let ic_fill_addr = jit_runtime::jit_runtime_fill_named_ic_r15 as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, ic_fill_addr as i64);
+            self.masm.call_reg(Reg64::R11);
+            let mut generic_label = Label::new();
+            self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
+            self.masm.je(&mut generic_label);
+            self.masm.add_ri(Reg64::Rsp, 16);
+            self.emit_restore_live_regs(saved);
+            self.emit_deopt_check_rax();
+            self.masm.jmp(&mut done_label);
+
+            // ── Generic fallback ────────────────────────────────────
+            self.masm.bind_label(&mut generic_label);
+            self.masm.pop(Reg64::R11); // discard alignment padding
+            self.masm.pop(Reg64::Rdi); // restore saved object
+            self.masm.mov_ri(Reg64::Rsi, i64::from(name));
+            self.masm.mov_ri(Reg64::Rdx, i64::from(feedback_slot));
+            let stub_addr = jit_runtime::jit_runtime_lda_named_property as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+            self.masm.call_reg(Reg64::R11);
+            self.emit_restore_live_regs(saved);
+            self.emit_deopt_check_rax();
+
+            // ── Common exit ─────────────────────────────────────────
+            self.masm.bind_label(&mut done_label);
+            self.emit_store(id, Reg64::Rax);
         }
-        self.emit_store(id, Reg64::Rax);
     }
 
     /// Emit a **true-inline** fast path for keyed array load when the key

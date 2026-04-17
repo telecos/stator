@@ -81,6 +81,7 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use crate::bytecode::bytecode_array::{BytecodeArray, ConstantPoolEntry};
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
