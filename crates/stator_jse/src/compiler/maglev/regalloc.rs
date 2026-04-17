@@ -103,6 +103,30 @@ impl AllocationResult {
     pub fn live_caller_saved_at(&self, id: NodeId) -> u8 {
         self.live_caller_saved.get(&id).copied().unwrap_or(0)
     }
+
+    /// Returns a bitmask of callee-saved physical registers that are
+    /// actually used by the allocation (excluding R14 which is always
+    /// reserved for the register-file pointer).
+    ///
+    ///   - bit 0 → RBX  (phys\_reg 0)
+    ///   - bit 1 → R13  (phys\_reg 6)
+    ///   - bit 2 → R12  (phys\_reg 7)
+    ///   - bit 3 → R15  (phys\_reg 8)
+    pub fn used_callee_saved_mask(&self) -> u8 {
+        let mut mask = 0u8;
+        for loc in self.assignments.values() {
+            if let Location::Register(n) = *loc {
+                match n {
+                    0 => mask |= 1, // RBX
+                    6 => mask |= 2, // R13
+                    7 => mask |= 4, // R12
+                    8 => mask |= 8, // R15
+                    _ => {}
+                }
+            }
+        }
+        mask
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

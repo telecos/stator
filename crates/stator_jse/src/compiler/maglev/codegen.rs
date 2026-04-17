@@ -225,6 +225,10 @@ pub struct MaglevCompiledCode {
     /// Total number of `i64` slots in the register file
     /// (`parameter_count + spill_count`).
     pub register_file_slots: usize,
+    /// Whether R15 is reserved for RT_PTRS TLS caching.  When `false`,
+    /// the callee's Maglev code does not access TLS bytecode array via R15,
+    /// so callers can skip the BA set/restore on the MIC hit path.
+    pub needs_r15: bool,
     /// Safepoint table (one entry per basic block).
     pub safepoints: Vec<SafepointEntry>,
     /// Deoptimisation table (one entry per deopt site).
@@ -691,6 +695,16 @@ struct MaglevCodegen<'a> {
     /// any operation that may clobber allocatable registers.
     #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
     reg_holds: [Option<NodeId>; NUM_REG_FWD],
+    /// Ordered list of callee-saved registers pushed in the prologue
+    /// (and popped in reverse in the epilogue).  Excludes RBP which is
+    /// always pushed first.  May contain an alignment-padding entry
+    /// (`Reg64::Rax`) to keep the total push count even.
+    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
+    callee_saved_pushes: Vec<Reg64>,
+    /// Number of bytes occupied by callee-saved pushes (excluding RBP).
+    /// Equal to `callee_saved_pushes.len() * 8`.
+    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
+    callee_saved_frame_bytes: i32,
 }
 
 /// A deferred cold-path branch emitted out-of-line after all blocks.
@@ -763,6 +777,31 @@ impl<'a> MaglevCodegen<'a> {
             mono_call_cache_bytes
         };
         let needs_r15 = mono_call_sites > 0 || has_keyed_sites || named_site_count > 0;
+
+        // Determine which callee-saved registers to push/pop.
+        // R14 is always pushed (register-file pointer).
+        // Others are only pushed when the allocator actually uses them.
+        let cs_mask = alloc.used_callee_saved_mask();
+        let mut callee_saved_pushes: Vec<Reg64> = Vec::with_capacity(6);
+        if cs_mask & 1 != 0 {
+            callee_saved_pushes.push(Reg64::Rbx);
+        }
+        callee_saved_pushes.push(Reg64::R14); // always
+        if cs_mask & 2 != 0 {
+            callee_saved_pushes.push(Reg64::R13);
+        }
+        if cs_mask & 4 != 0 {
+            callee_saved_pushes.push(Reg64::R12);
+        }
+        if needs_r15 || cs_mask & 8 != 0 {
+            callee_saved_pushes.push(Reg64::R15);
+        }
+        // Total pushes = callee_saved_pushes.len() + 1 (RBP).
+        // Must be even for RSP ≡ 8 mod 16 after all pushes.
+        if !(callee_saved_pushes.len() + 1).is_multiple_of(2) {
+            callee_saved_pushes.push(Reg64::Rax); // alignment padding
+        }
+        let callee_saved_frame_bytes = (callee_saved_pushes.len() as i32) * 8;
         // Array IC: 32 bytes (4 × i64: handle, data_ptr, len, vec_ptr).
         // Place it after the mono cache area on the stack.  Rounded up
         // so the combined reservation stays a multiple of 16.
@@ -774,9 +813,10 @@ impl<'a> MaglevCodegen<'a> {
             let raw = mono_call_cache_bytes + array_ic_bytes + named_ic_bytes;
             if raw == 0 { 0 } else { (raw + 15) & !15 }
         };
-        // IC base is addressed relative to RBP.  After 5 callee-saved
-        // pushes, RSP = RBP − 40.  The cache area starts at RSP after
-        // `sub rsp, total_cache_bytes`, i.e. at RBP − 40 − total_cache_bytes.
+        // IC base is addressed relative to RBP.  After callee-saved
+        // pushes, RSP = RBP − callee_saved_frame_bytes.  The cache area
+        // starts at RSP after `sub rsp, total_cache_bytes`, i.e.
+        // at RBP − callee_saved_frame_bytes − total_cache_bytes.
         //
         // The array IC (32 bytes: handle, data_ptr, len, vec_ptr) is placed
         // at the BOTTOM of the cache area (lowest address = RSP), below any
@@ -787,9 +827,9 @@ impl<'a> MaglevCodegen<'a> {
         //   base+24 = vec_ptr
         //
         // This ensures IC fields never overlap with callee-saved registers
-        // (which occupy [RBP-40 .. RBP-8]).
+        // (which occupy [RBP-callee_saved_frame_bytes .. RBP-8]).
         let array_ic_base: i32 = if has_keyed_sites {
-            -(40 + total_cache_bytes)
+            -(callee_saved_frame_bytes + total_cache_bytes)
         } else {
             0
         };
@@ -797,7 +837,7 @@ impl<'a> MaglevCodegen<'a> {
         // Each site gets 32 bytes (4 x i64).
         let named_ic_base: i32 = if named_site_count > 0 {
             let array_overhead = if has_keyed_sites { 32 } else { 0 };
-            -(40 + total_cache_bytes) + array_overhead
+            -(callee_saved_frame_bytes + total_cache_bytes) + array_overhead
         } else {
             0
         };
@@ -833,6 +873,8 @@ impl<'a> MaglevCodegen<'a> {
             ctx_regfile_offset: None,
             rax_holds: None,
             reg_holds: [None; NUM_REG_FWD],
+            callee_saved_pushes,
+            callee_saved_frame_bytes,
         }
     }
 
@@ -943,6 +985,7 @@ impl<'a> MaglevCodegen<'a> {
             code,
             native_code_len,
             register_file_slots,
+            needs_r15: self.needs_r15,
             safepoints: self.safepoints,
             deopt_entries: self.deopt_entries,
             source_positions: self.source_positions,
@@ -966,12 +1009,10 @@ impl<'a> MaglevCodegen<'a> {
     fn emit_prologue(&mut self) {
         self.masm.push(Reg64::Rbp);
         self.masm.mov_rr(Reg64::Rbp, Reg64::Rsp);
-        self.masm.push(Reg64::Rbx);
-        self.masm.push(Reg64::R14);
-        self.masm.push(Reg64::R13);
-        self.masm.push(Reg64::R12);
-        self.masm.push(Reg64::R15);
-        // After 6 pushes (+ return-address by `call` = 7 total):
+        for &reg in &self.callee_saved_pushes {
+            self.masm.push(reg);
+        }
+        // After an even total number of pushes (RBP + callee_saved_pushes):
         // RSP ≡ 8 mod 16.  Stub calls use selective save (with
         // alignment padding when needed) to align RSP to 0 mod 16
         // before the inner `call`.
@@ -1037,11 +1078,9 @@ impl<'a> MaglevCodegen<'a> {
         if self.total_cache_bytes > 0 {
             self.masm.add_ri(Reg64::Rsp, self.total_cache_bytes);
         }
-        self.masm.pop(Reg64::R15);
-        self.masm.pop(Reg64::R12);
-        self.masm.pop(Reg64::R13);
-        self.masm.pop(Reg64::R14);
-        self.masm.pop(Reg64::Rbx);
+        for &reg in self.callee_saved_pushes.iter().rev() {
+            self.masm.pop(reg);
+        }
         self.masm.pop(Reg64::Rbp);
         self.masm.ret();
     }
@@ -1096,11 +1135,9 @@ impl<'a> MaglevCodegen<'a> {
         if self.total_cache_bytes > 0 {
             self.masm.add_ri(Reg64::Rsp, self.total_cache_bytes);
         }
-        self.masm.pop(Reg64::R15);
-        self.masm.pop(Reg64::R12);
-        self.masm.pop(Reg64::R13);
-        self.masm.pop(Reg64::R14);
-        self.masm.pop(Reg64::Rbx);
+        for &reg in self.callee_saved_pushes.iter().rev() {
+            self.masm.pop(reg);
+        }
         self.masm.pop(Reg64::Rbp);
         self.masm.ret();
     }
@@ -6611,8 +6648,9 @@ impl<'a> MaglevCodegen<'a> {
         let site = self.next_mono_cache_site;
         self.next_mono_cache_site += 1;
         // Base offset from RBP to the start of all cache slots.
-        const CACHE_BASE: i32 = -48; // first slot starts right after R15 push
-        let slot_base = CACHE_BASE - site * MONO_CACHE_SLOT_BYTES;
+        // Depends on how many callee-saved registers are pushed.
+        let cache_base: i32 = -(self.callee_saved_frame_bytes + 8);
+        let slot_base = cache_base - site * MONO_CACHE_SLOT_BYTES;
         let off_callee = slot_base - MONO_OFF_CALLEE;
         let off_entry = slot_base - MONO_OFF_ENTRY;
         let off_ctx = slot_base - MONO_OFF_CTX;
@@ -6651,15 +6689,30 @@ impl<'a> MaglevCodegen<'a> {
 
         let mut mono_hit_deopt = Label::new();
 
-        // ── Inline BA set (callee BA from mono cache) ───────────
+        // Load cached reg_slots into RCX.  Bit 63 is the "BA-free"
+        // flag set by jit_runtime_read_reg_slots when the callee's
+        // Maglev code does not use R15 (no TLS BA access needed).
+        self.masm
+            .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_reg_slots);
+
+        // ── Conditional BA set (skip when callee is BA-free) ────
         const RTPTRS_BYTECODE_OFF: i32 = 16;
+        let mut skip_ba_set = Label::new();
+        // Test bit 63: if set, callee is BA-free → skip BA swap.
+        self.masm.test_rr(Reg64::Rcx, Reg64::Rcx);
+        self.masm.jcc(CondCode::Less, &mut skip_ba_set); // JS = SF set = bit 63 set
         // R10 = &Cell<*const BytecodeArray>
         self.masm
             .mov_load_base_disp32(Reg64::R10, Reg64::R15, RTPTRS_BYTECODE_OFF);
         // Set callee BA.
         self.masm
-            .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_ba);
-        self.masm.mov_store_base_disp32(Reg64::R10, 0, Reg64::Rcx);
+            .mov_load_base_disp32(Reg64::Rdi, Reg64::Rbp, off_ba);
+        self.masm.mov_store_base_disp32(Reg64::R10, 0, Reg64::Rdi);
+        self.masm.bind_label(&mut skip_ba_set);
+
+        // Mask off the BA-free flag to get the actual slot count (1–16).
+        // Slot count is always ≤ 16, so AND with 0x1F clears bit 63.
+        self.masm.and_ri(Reg64::Rcx, 0x1F);
 
         // Allocate 128-byte register file on the JIT stack.
         // RSP ≡ 0 mod 16 (from emit_save_live_regs; sub 128
@@ -6670,8 +6723,6 @@ impl<'a> MaglevCodegen<'a> {
         // (cached in the MIC slot, clamped to 1–16).  This avoids
         // 13-14 wasted stores for small closures.
         self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
-        self.masm
-            .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_reg_slots);
         // RDI will be set to RSP after zeroing, so reuse it as the
         // store pointer during the loop.
         self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
@@ -6701,12 +6752,19 @@ impl<'a> MaglevCodegen<'a> {
         // Deallocate register file.
         self.masm.add_ri(Reg64::Rsp, 128);
 
-        // ── Inline BA restore (from cached caller BA) ───────────
+        // ── Conditional BA restore (skip when callee is BA-free) ──
+        // Re-load the reg_slots to check the BA-free flag.
+        self.masm
+            .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_reg_slots);
+        let mut skip_ba_restore = Label::new();
+        self.masm.test_rr(Reg64::Rcx, Reg64::Rcx);
+        self.masm.jcc(CondCode::Less, &mut skip_ba_restore);
         self.masm
             .mov_load_base_disp32(Reg64::R10, Reg64::R15, RTPTRS_BYTECODE_OFF);
         self.masm
             .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_caller_ba);
         self.masm.mov_store_base_disp32(Reg64::R10, 0, Reg64::Rcx);
+        self.masm.bind_label(&mut skip_ba_restore);
 
         // Deopt check.
         self.masm.cmp_ri(Reg64::Rax, i32::MIN);
