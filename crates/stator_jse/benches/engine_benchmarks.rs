@@ -545,6 +545,11 @@ fn bench_object_creation_1k(c: &mut Criterion) {
         }
         last.x + last.y + last.z;
     "#;
+    // Warmup: trigger Maglev compilation and populate ICs.
+    for _ in 0..20 {
+        let _ = eval_js(source);
+    }
+    reset_stub_deopt_counts();
     c.bench_function("object_creation_1k", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
@@ -615,17 +620,26 @@ fn bench_closure_counter_1k(c: &mut Criterion) {
         }
         result;
     "#;
+    // Warmup: trigger Maglev compilation, populate ICs, then reset deopt
+    // counters so the measurement iterations start with a clean slate.
     reset_stub_deopt_counts();
-    for _ in 0..10 {
+    for _ in 0..20 {
         let _ = eval_js(source);
     }
     let counts = stub_deopt_counts();
-    eprintln!("CLOSURE_DIAG stub_deopts_after_10_runs:");
+    eprintln!("CLOSURE_DIAG stub_deopts_after_20_runs:");
     for i in 0..STUB_DEOPT_SLOTS {
         if counts[i] > 0 {
             eprintln!("  {}: {}", STUB_NAMES[i], counts[i]);
         }
     }
+    // Reset deopt counts on all cached BytecodeArrays so that Maglev
+    // retries with warm ICs during measurement.
+    COMPILE_CACHE.with(|cache| {
+        for ba in cache.borrow().values() {
+            ba.reset_maglev_deopt_count();
+        }
+    });
     reset_stub_deopt_counts();
     c.bench_function("closure_counter_1k", |b| {
         b.iter(|| {
@@ -717,6 +731,11 @@ fn bench_deep_object_access_1k(c: &mut Criterion) {
         }
         sum;
     "#;
+    // Warmup: trigger Maglev compilation and populate ICs.
+    for _ in 0..20 {
+        let _ = eval_js(source);
+    }
+    reset_stub_deopt_counts();
     c.bench_function("deep_object_access_1k", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());

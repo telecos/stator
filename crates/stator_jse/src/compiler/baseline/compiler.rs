@@ -2342,11 +2342,12 @@ pub(crate) mod jit_runtime {
         name_idx: u32,
         _feedback_slot: u32,
     ) -> i64 {
-        let result = lda_named_property_inner(obj_i64, name_idx).unwrap_or_else(|| {
-            track_stub_deopt(STUB_LDA_NAMED);
-            JIT_DEOPT
-        });
-        result
+        lda_named_property_inner(obj_i64, name_idx)
+            .or_else(|| lda_named_fallback(obj_i64, name_idx))
+            .unwrap_or_else(|| {
+                track_stub_deopt(STUB_LDA_NAMED);
+                JIT_DEOPT
+            })
     }
 
     /// Like [`jit_runtime_lda_named_property`] but accepts a pre-cached
@@ -2371,10 +2372,12 @@ pub(crate) mod jit_runtime {
         // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
         // TLS slot lives for the thread's entire lifetime.
         let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
-        lda_named_property_inner_with_ptrs(obj_i64, name_idx, ptrs).unwrap_or_else(|| {
-            track_stub_deopt(STUB_LDA_NAMED);
-            JIT_DEOPT
-        })
+        lda_named_property_inner_with_ptrs(obj_i64, name_idx, ptrs)
+            .or_else(|| lda_named_fallback(obj_i64, name_idx))
+            .unwrap_or_else(|| {
+                track_stub_deopt(STUB_LDA_NAMED);
+                JIT_DEOPT
+            })
     }
 
     /// Inner implementation for [`jit_runtime_lda_named_property`].
@@ -2837,6 +2840,55 @@ pub(crate) mod jit_runtime {
                 }
             }
             _ => None,
+        }
+    }
+
+    /// Fallback property lookup used when [`lda_named_property_inner_with_ptrs`]
+    /// returns `None`.  Performs a simple clone-based lookup without any IC
+    /// machinery, avoiding a full JIT deopt for edge cases (unsupported
+    /// receiver types, stale heap handles, constant-pool misses on the
+    /// cached pointer path, etc.).
+    ///
+    /// Returns `Some(value)` on success, `None` only when the constant-pool
+    /// lookup fails (indicating a fundamental BA-pointer problem).
+    fn lda_named_fallback(obj_i64: i64, name_idx: u32) -> Option<i64> {
+        if !is_heap_handle(obj_i64) {
+            // Non-heap receiver (primitive, boolean, null, undefined).
+            // Property access on these returns undefined in the JIT.
+            return Some(JIT_UNDEFINED);
+        }
+
+        let prop_name = get_rt_string_constant_ref(name_idx)?;
+        let obj = jit_i64_to_jsvalue(obj_i64);
+
+        match &obj {
+            JsValue::PlainObject(map_rc) => {
+                let map = map_rc.borrow();
+                if let Some(val) = map.get(prop_name) {
+                    let encoded = jsvalue_ref_to_jit_i64(val);
+                    return Some(encoded);
+                }
+                // Not an own property — walk prototype chain.
+                let proto = map
+                    .get(INTERNAL_PROTO_PROPERTY_KEY)
+                    .or_else(|| map.get("__proto__"));
+                let (result, _) = jit_proto_chain_walk(proto, prop_name);
+                Some(result)
+            }
+            JsValue::Array(arr) => match prop_name {
+                "length" => Some(arr.borrow().len() as i64),
+                _ => Some(JIT_UNDEFINED),
+            },
+            JsValue::Function(ba) => {
+                let val = crate::interpreter::fn_props_get(ba, prop_name);
+                if !matches!(val, JsValue::Undefined) {
+                    Some(jsvalue_to_jit_i64(val))
+                } else {
+                    Some(JIT_UNDEFINED)
+                }
+            }
+            JsValue::String(s) if prop_name == "length" => Some(s.len() as i64),
+            _ => Some(JIT_UNDEFINED),
         }
     }
 
