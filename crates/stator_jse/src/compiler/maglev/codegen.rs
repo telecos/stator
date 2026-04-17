@@ -5795,6 +5795,7 @@ impl<'a> MaglevCodegen<'a> {
         // ── load_undef: → JIT_UNDEFINED ─────────────────────────────
         self.masm.bind_label(&mut load_undef);
         self.masm.mov_ri(Reg64::Rax, JIT_UNDEFINED);
+        self.rax_holds = None; // RAX no longer holds a forwarded value
         self.masm.jmp(&mut done_label);
 
         // ── Slow path: IC miss / non-inlineable type ────────────────
@@ -5956,6 +5957,7 @@ impl<'a> MaglevCodegen<'a> {
         // JIT_FALSE, etc.) cannot be arrays.  Return undefined
         // instead of falling to the slow path which may deopt.
         self.masm.mov_ri(Reg64::Rax, JIT_HEAP_TAG);
+        self.rax_holds = None; // RAX clobbered by raw constant
         self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
         self.masm.jcc(CondCode::Below, &mut load_undef);
 
@@ -6036,6 +6038,7 @@ impl<'a> MaglevCodegen<'a> {
         // undefined inline avoids the slow-path FFI call.
         self.masm.bind_label(&mut load_undef);
         self.masm.mov_ri(Reg64::Rax, JIT_UNDEFINED);
+        self.rax_holds = None; // RAX no longer holds a forwarded value
         self.masm.jmp(&mut done_label);
 
         // ── Slow path: IC miss / non-inlineable type ────────────────
@@ -6144,6 +6147,7 @@ impl<'a> MaglevCodegen<'a> {
         // Skip the store silently (JS ignores property assignment
         // on non-object primitives in sloppy mode).
         self.masm.mov_ri(Reg64::Rax, JIT_HEAP_TAG);
+        self.rax_holds = None; // RAX clobbered by raw constant
         self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
         self.masm.jcc(CondCode::Below, &mut done_label);
 

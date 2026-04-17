@@ -10775,6 +10775,22 @@ pub struct BaselineCompiler<'a> {
     /// register directly; stores write both memory and the cached register.
     #[cfg(all(target_arch = "x86_64", unix))]
     cache_map: Vec<(u32, Reg64)>,
+    /// Number of `CallUndefinedReceiver0` call sites in the bytecode.
+    /// Used to allocate monomorphic inline cache slots in the frame.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    mono_call_sites: i32,
+    /// Counter used during emission to assign sequential cache-slot
+    /// offsets to each `CallUndefinedReceiver0` site.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    next_mono_site: i32,
+    /// Total bytes reserved on the stack for monomorphic call cache
+    /// slots (aligned to preserve RSP ≡ 0 mod 16 after sub).
+    #[cfg(all(target_arch = "x86_64", unix))]
+    mono_cache_bytes: i32,
+    /// RBP offset of the first mono-cache slot's callee field.
+    /// E.g. −40 means `[RBP − 40]` holds slot 0's callee_i64.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    mono_cache_base: i32,
 }
 
 impl<'a> BaselineCompiler<'a> {
@@ -10797,6 +10813,14 @@ impl<'a> BaselineCompiler<'a> {
             promoted_extra_slots: 0,
             #[cfg(all(target_arch = "x86_64", unix))]
             cache_map: Vec::new(),
+            #[cfg(all(target_arch = "x86_64", unix))]
+            mono_call_sites: 0,
+            #[cfg(all(target_arch = "x86_64", unix))]
+            next_mono_site: 0,
+            #[cfg(all(target_arch = "x86_64", unix))]
+            mono_cache_bytes: 0,
+            #[cfg(all(target_arch = "x86_64", unix))]
+            mono_cache_base: 0,
         };
         c.compile_function()?;
         let register_file_slots = bytecode.parameter_count() as usize
@@ -10887,6 +10911,36 @@ impl<'a> BaselineCompiler<'a> {
             let off = self.reg_offset(virt_reg);
             self.masm.mov_load_base_disp32(phys_reg, Reg64::R14, off);
         }
+
+        // When there are CallUndefinedReceiver0 sites, load R15 with the
+        // RT_PTRS TLS Cell address for zero-FFI monomorphic call dispatch.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        if self.mono_call_sites > 0 {
+            // After fixed pushes (5) + cache_map pushes (N):
+            //   N even → RSP ≡ 0 mod 16 → call-ready
+            //   N odd  → RSP ≡ 8 mod 16 → need padding
+            let need_pad = self.cache_map.len() % 2 == 1;
+            if need_pad {
+                self.masm.push(Reg64::R11);
+            }
+            let addr =
+                jit_runtime::jit_runtime_get_rt_ptrs_cell_addr as *const () as i64;
+            self.masm.mov_ri(Reg64::R11, addr);
+            self.masm.call_reg(Reg64::R11);
+            self.masm.mov_rr(Reg64::R15, Reg64::Rax);
+            if need_pad {
+                self.masm.pop(Reg64::R11);
+            }
+
+            // Allocate and zero mono-cache slots.
+            self.masm.sub_ri(Reg64::Rsp, self.mono_cache_bytes);
+            self.masm.xor_rr(Reg64::R11, Reg64::R11);
+            let slots = self.mono_cache_bytes / 8;
+            for i in 0..slots {
+                self.masm
+                    .mov_store_base_disp32(Reg64::Rsp, i * 8, Reg64::R11);
+            }
+        }
     }
 
     /// Emit the normal function epilogue.
@@ -10902,6 +10956,11 @@ impl<'a> BaselineCompiler<'a> {
     /// ```
     fn emit_normal_epilogue(&mut self) {
         self.masm.mov_rr(Reg64::Rax, Reg64::R12);
+        // Deallocate mono-cache slots.
+        #[cfg(all(target_arch = "x86_64", unix))]
+        if self.mono_cache_bytes > 0 {
+            self.masm.add_ri(Reg64::Rsp, self.mono_cache_bytes);
+        }
         // Pop cache registers in reverse push order.
         #[cfg(all(target_arch = "x86_64", unix))]
         for &(_, phys_reg) in self.cache_map.iter().rev() {
@@ -11935,7 +11994,32 @@ impl<'a> BaselineCompiler<'a> {
         // before emitting the prologue (which pushes the cache registers).
         #[cfg(all(target_arch = "x86_64", unix))]
         {
-            self.cache_map = Self::analyze_register_caching(&instructions, &byte_offsets, n);
+            // Count CallUndefinedReceiver0 sites for monomorphic inline cache.
+            let call0_sites = instructions
+                .iter()
+                .filter(|i| i.opcode == Opcode::CallUndefinedReceiver0)
+                .count() as i32;
+            self.mono_call_sites = call0_sites;
+
+            let mut cache_map =
+                Self::analyze_register_caching(&instructions, &byte_offsets, n);
+            // If there are call sites, reserve R15 for RT_PTRS instead of
+            // register caching.
+            if call0_sites > 0 {
+                cache_map.retain(|&(_, reg)| reg != Reg64::R15);
+            }
+            self.cache_map = cache_map;
+
+            // Compute mono cache layout.
+            if call0_sites > 0 {
+                const SLOT_BYTES: i32 = 40;
+                let raw = call0_sites * SLOT_BYTES;
+                let total_pushes = 32 + 8 * self.cache_map.len() as i32;
+                let total = total_pushes + raw;
+                let aligned_total = (total + 15) & !15;
+                self.mono_cache_bytes = aligned_total - total_pushes;
+                self.mono_cache_base = -(total_pushes + 8);
+            }
         }
 
         self.emit_prologue();
