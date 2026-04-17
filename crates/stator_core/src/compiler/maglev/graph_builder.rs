@@ -3194,15 +3194,8 @@ mod tests {
         let mut load_named_generics = Vec::new();
         let mut generic_adds = Vec::new();
         let mut phis = Vec::new();
-        for (block_idx, block) in graph.blocks().iter().enumerate() {
-            eprintln!(
-                "Block {block_idx}: {} nodes, control={:?}",
-                block.nodes.len(),
-                block.control
-            );
+        for block in graph.blocks() {
             for (id, node) in &block.nodes {
-                let loc = alloc.location(*id);
-                eprintln!("  {id:?} → {loc:?} : {node:?}");
                 match node {
                     ValueNode::LoadGlobal { .. } => load_globals.push(*id),
                     ValueNode::LoadNamedGeneric { .. } => load_named_generics.push(*id),

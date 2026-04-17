@@ -7881,18 +7881,24 @@ impl<'a> MaglevCodegen<'a> {
         // GenericAdd/Sub/Mul can use the smi_guarded tier (~7 insns) instead
         // of the generic tier (~13 insns with dual input Smi checks).
         //
-        // LoadNamedGeneric / LoadGlobal smi_guard seeding.
+        // DISABLED: LoadNamedGeneric / LoadGlobal smi_guard seeding.
         //
-        // When a LoadNamedGeneric or LoadGlobal feeds exclusively into
-        // arithmetic-compatible consumers (GenericAdd/Sub/Mul/BitwiseOr etc.),
-        // add a speculative Smi guard.  This enables the downstream arithmetic
-        // to use the smi_guarded tier (~7 insns) instead of generic (~13 insns).
+        // History: enabled after ed049403/1c1fbf6c regalloc fix, but still
+        // causes 100% deopt on property_access and deep_object benchmarks
+        // (CI run bc404220: tried=5, deopted=5, category=generic).  The
+        // guard sequence (MOVSXD R11,EAX; CMP R11,RAX; JNE deopt) should
+        // pass for Smi values 1–5, but fails every time on Linux CI.  Root
+        // cause under investigation (SMI_GUARD_FAIL diagnostic in e9a9f0c2).
         //
-        // Previously disabled because store-to-load forwarding had a cross-block
-        // substitution bug (5b3c885a) that left LoadNamedGeneric returning
-        // JIT_UNDEFINED.  Now fixed: forwarded loads reference the SmiConstant
-        // directly, and non-forwarded loads correctly go through IC fill.
-        {
+        // With this disabled, downstream GenericAdd/Sub/Mul fall back to
+        // the generic tier (inline MOVSXD+CMP per input, ~13 insns) instead
+        // of the smi_guarded tier (~7 insns).  The trade-off is ~6 extra
+        // instructions per arithmetic op vs. permanent JIT blacklisting on
+        // deopt — a huge net win until the guard bug is found.
+        //
+        // TODO: re-enable once the smi_guard deopt root cause is fixed.
+        #[allow(clippy::overly_complex_bool_expr)]
+        if false {
             for block in graph.blocks() {
                 for (id, node) in &block.nodes {
                     if set.contains(id) || branch_conditions.contains(id) {
