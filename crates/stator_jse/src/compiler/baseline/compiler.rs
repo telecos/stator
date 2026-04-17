@@ -4724,6 +4724,12 @@ pub(crate) mod jit_runtime {
                                         )
                                     } {
                                         ba_ref.store_jit_code(cached);
+                                        // Trigger Maglev compilation in the
+                                        // background so the closure body gets
+                                        // optimised JIT code on subsequent
+                                        // invocations (the mono cache will
+                                        // pick it up on the next frame).
+                                        crate::interpreter::maybe_compile_maglev(ba_ref);
                                         let jit_ref = ba_ref.try_get_jit_code();
                                         if let Some(cached) = jit_ref.as_ref() {
                                             let exec = unsafe {
@@ -11535,15 +11541,217 @@ impl<'a> BaselineCompiler<'a> {
         self.emit_deopt(bytecode_offset);
     }
 
-    /// Emit a specialized call to
-    /// [`jit_runtime::jit_runtime_call_undefined_receiver0`] for
+    /// Emit a monomorphic-inline-cache fast path (or fallback stub call) for
     /// `CallUndefinedReceiver0` bytecodes.
     ///
-    /// Loads the callee from the register file in JIT code and calls a
-    /// dedicated function that handles native and JIT-compiled callees
-    /// without generic opcode dispatch.
+    /// When mono call sites were detected, emits a zero-FFI cache-hit path
+    /// identical to the Maglev MIC: compare callee identity → set BA inline
+    /// → allocate register file → direct call → restore BA.  On cache miss,
+    /// populates the cache via [`jit_runtime_get_jit_entry`] and falls back
+    /// to the full runtime stub when no JIT entry is available.
     #[allow(unused_variables)]
     fn emit_call_undefined_receiver0_stub(&mut self, callee_flat: i64, bytecode_offset: u32) {
+        #[cfg(all(target_arch = "x86_64", unix))]
+        if self.mono_call_sites > 0 {
+            let byte_offset = (callee_flat as i32) * 8;
+
+            // Claim a mono-cache slot.
+            let site = self.next_mono_site;
+            self.next_mono_site += 1;
+            let slot_base = self.mono_cache_base - site * 40;
+            let off_callee = slot_base;
+            let off_entry = slot_base - 8;
+            let off_ctx = slot_base - 16;
+            let off_ba = slot_base - 24;
+            let off_caller_ba = slot_base - 32;
+
+            // Load callee into R11 (scratch).
+            self.masm
+                .mov_load_base_disp32(Reg64::R11, Reg64::R14, byte_offset);
+
+            let mut cache_miss = Label::new();
+            let mut done_label = Label::new();
+
+            // ── Cache check ─────────────────────────────────────────────
+            self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, off_callee);
+            self.masm.jne(&mut cache_miss);
+
+            // ── Mono HIT: fully inline dispatch (zero FFI) ──────────────
+            const RTPTRS_BYTECODE_OFF: i32 = 16;
+
+            // Inline BA set (callee BA from mono cache).
+            self.masm
+                .mov_load_base_disp32(Reg64::R10, Reg64::R15, RTPTRS_BYTECODE_OFF);
+            self.masm
+                .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_ba);
+            self.masm
+                .mov_store_base_disp32(Reg64::R10, 0, Reg64::Rcx);
+
+            // Allocate 128-byte register file.
+            self.masm.sub_ri(Reg64::Rsp, 128);
+
+            // Zero register file with unrolled stores.
+            self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+            for i in 0..16i32 {
+                self.masm
+                    .mov_store_base_disp32(Reg64::Rsp, i * 8, Reg64::Rax);
+            }
+
+            // Load entry + ctx from mono cache.
+            self.masm
+                .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, off_entry);
+            self.masm
+                .mov_load_base_disp32(Reg64::Rsi, Reg64::Rbp, off_ctx);
+
+            // CALL entry point: RDI = register file, RSI = ctx_ptr.
+            self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
+            self.masm.call_reg(Reg64::R11);
+
+            // Deallocate register file.
+            self.masm.add_ri(Reg64::Rsp, 128);
+
+            // Inline BA restore (from cached caller BA).
+            self.masm
+                .mov_load_base_disp32(Reg64::R10, Reg64::R15, RTPTRS_BYTECODE_OFF);
+            self.masm
+                .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_caller_ba);
+            self.masm
+                .mov_store_base_disp32(Reg64::R10, 0, Reg64::Rcx);
+
+            // Deopt check: RAX >= i32::MIN means valid result.
+            self.masm.cmp_ri(Reg64::Rax, i32::MIN);
+            self.masm.jcc(CondCode::GreaterEq, &mut done_label);
+
+            // Callee deopt after inline dispatch: fall back to stub.
+            self.masm
+                .mov_load_base_disp32(Reg64::Rdi, Reg64::Rbp, off_callee);
+            let mono_retry_addr =
+                jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, mono_retry_addr as i64);
+            self.masm.call_reg(Reg64::R11);
+            self.masm.jmp(&mut done_label);
+
+            // ── Cache miss: full jit_runtime_get_jit_entry path ─────────
+            self.masm.bind_label(&mut cache_miss);
+
+            self.masm.mov_rr(Reg64::Rdi, Reg64::R11); // callee
+            // Push callee + padding (2 pushes → alignment preserved).
+            self.masm.push(Reg64::Rdi);
+            self.masm.push(Reg64::Rdi);
+
+            let get_entry_addr =
+                jit_runtime::jit_runtime_get_jit_entry as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, get_entry_addr as i64);
+            self.masm.call_reg(Reg64::R11);
+
+            // Check entry_point == 0 → stub fallback.
+            let mut stub_fallback = Label::new();
+            self.masm.test_rr(Reg64::Rax, Reg64::Rax);
+            self.masm.je(&mut stub_fallback);
+
+            // RAX = entry_point, RDX = ctx_ptr.
+            self.masm.mov_rr(Reg64::R11, Reg64::Rax); // entry
+            self.masm.mov_rr(Reg64::R10, Reg64::Rdx); // ctx
+
+            // ── Populate mono cache ─────────────────────────────────────
+            self.masm
+                .mov_load_base_disp32(Reg64::Rax, Reg64::Rsp, 0);
+            self.masm
+                .mov_store_base_disp32(Reg64::Rbp, off_callee, Reg64::Rax);
+            self.masm
+                .mov_store_base_disp32(Reg64::Rbp, off_entry, Reg64::R11);
+            self.masm
+                .mov_store_base_disp32(Reg64::Rbp, off_ctx, Reg64::R10);
+
+            // Read the current BA for caching.
+            self.masm.push(Reg64::R11);
+            self.masm.push(Reg64::R10);
+            let ba_addr =
+                jit_runtime::jit_runtime_read_current_ba as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, ba_addr as i64);
+            self.masm.call_reg(Reg64::R11);
+            self.masm
+                .mov_store_base_disp32(Reg64::Rbp, off_ba, Reg64::Rax);
+            self.masm.pop(Reg64::R10);
+            self.masm.pop(Reg64::R11);
+
+            // ── Direct-call path (cache miss only) ──────────────────────
+            self.masm.sub_ri(Reg64::Rsp, 128);
+            self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+            for i in 0..16i32 {
+                self.masm
+                    .mov_store_base_disp32(Reg64::Rsp, i * 8, Reg64::Rax);
+            }
+            self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
+            self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+            self.masm.call_reg(Reg64::R11);
+            self.masm.add_ri(Reg64::Rsp, 128);
+
+            // Finish direct call (restores BA, context, truncates heap).
+            self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
+            self.masm.mov_rr(Reg64::Rsi, Reg64::R15);
+            let finish_addr =
+                jit_runtime::jit_runtime_finish_direct_call_r15 as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, finish_addr as i64);
+            self.masm.call_reg(Reg64::R11);
+
+            // Cache caller's BA for future cache hits.
+            {
+                self.masm.mov_load_base_disp32(
+                    Reg64::R10,
+                    Reg64::R15,
+                    RTPTRS_BYTECODE_OFF,
+                );
+                self.masm
+                    .mov_load_base_disp32(Reg64::Rcx, Reg64::R10, 0);
+                self.masm
+                    .mov_store_base_disp32(Reg64::Rbp, off_caller_ba, Reg64::Rcx);
+            }
+
+            // If callee JIT returned JIT_DEOPT, fall back to runtime stub.
+            self.masm.cmp_ri(Reg64::Rax, i32::MIN);
+            let mut miss_ok = Label::new();
+            self.masm.jcc(CondCode::GreaterEq, &mut miss_ok);
+            self.masm.pop(Reg64::Rdi); // callee
+            self.masm.add_ri(Reg64::Rsp, 8); // padding
+            let miss_retry_addr =
+                jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, miss_retry_addr as i64);
+            self.masm.call_reg(Reg64::R11);
+            self.masm.jmp(&mut done_label);
+
+            self.masm.bind_label(&mut miss_ok);
+            self.masm.add_ri(Reg64::Rsp, 16); // pop callee + padding
+            self.masm.jmp(&mut done_label);
+
+            // ── Stub fallback (get_jit_entry returned 0) ────────────────
+            self.masm.bind_label(&mut stub_fallback);
+            self.masm.pop(Reg64::R11); // padding
+            self.masm.pop(Reg64::Rdi); // callee
+            let stub_addr =
+                jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+            self.masm.call_reg(Reg64::R11);
+
+            // ── Common exit ─────────────────────────────────────────────
+            self.masm.bind_label(&mut done_label);
+
+            // ── Check for deopt ─────────────────────────────────────────
+            self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
+            self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
+            let code_off = self.masm.position() as u32;
+            let liveness_map = self.all_slots_live();
+            self.deopt_entries.push(DeoptEntry {
+                code_offset: code_off,
+                bytecode_offset,
+                liveness_map,
+            });
+            self.masm.je(&mut self.deopt_label);
+
+            self.masm.mov_rr(Reg64::R12, Reg64::Rax);
+            return;
+        }
+
         #[cfg(all(target_arch = "x86_64", unix))]
         {
             // Load callee value from register file: RDI = regs[callee_flat].
