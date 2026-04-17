@@ -453,8 +453,6 @@ fn collect_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
         }
         | ValueNode::StringLength { string: object } => f(*object),
 
-        ValueNode::LoadNamedChain { root, .. } => f(*root),
-
         ValueNode::LoadEnumCacheLength { map } => f(*map),
 
         ValueNode::LoadKeyedGeneric { object, key, .. } => {
