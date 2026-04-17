@@ -775,14 +775,49 @@ pub fn allocate(graph: &MaglevGraph, num_regs: u32) -> AllocationResult {
         }
         active = still_active;
 
+        // ── Early Phi expiry ───────────────────────────────────────────
+        //
+        // When the current interval is a back-edge input with a Phi
+        // affinity, and the Phi's *real* live range (before loop
+        // extension) has ended, expire the Phi from the active set.
+        // This frees the Phi's register so the normal affinity-hint
+        // logic can immediately reuse it, avoiding an unnecessary MOV
+        // and reducing register pressure in the loop body.
+        if let Some(&pref_reg) = phi_affinity_reg.get(&iv.id)
+            && let Some(&phi_id) = phi_affinity_phi.get(&iv.id)
+            && let Some(active_idx) =
+                active.iter().position(|(r, aiv)| *r == pref_reg && aiv.id == phi_id)
+        {
+            let phi_eff_end =
+                active[active_idx].1.pre_ext_end.unwrap_or(active[active_idx].1.end);
+            if phi_eff_end <= iv.start + 1 {
+                active.remove(active_idx);
+                free_regs.push(pref_reg);
+            }
+        }
+
         if let Some(reg) = {
             // Prefer the Phi-affinity register if available.
             let preferred = phi_affinity_reg.get(&iv.id).copied();
             if let Some(pref) = preferred {
                 if let Some(pos) = free_regs.iter().position(|&r| r == pref) {
                     Some(free_regs.remove(pos))
+                } else if !free_regs.is_empty() {
+                    // The preferred register is occupied by a non-Phi
+                    // value.  If a different free register exists,
+                    // shuffle: move the occupant to the free register
+                    // and hand the preferred one to the current interval.
+                    if let Some(occ_idx) = active.iter().position(|(r, _)| *r == pref) {
+                        let alt_reg = free_regs.pop().unwrap();
+                        let occupant_id = active[occ_idx].1.id;
+                        assignments.insert(occupant_id, Location::Register(alt_reg));
+                        active[occ_idx].0 = alt_reg;
+                        Some(pref)
+                    } else {
+                        free_regs.pop()
+                    }
                 } else {
-                    free_regs.pop()
+                    None
                 }
             } else {
                 free_regs.pop()
@@ -1007,8 +1042,15 @@ fn coalesce_loop_phis(
                     _ => continue,
                 };
 
-                // Already in the same register — nothing to do.
+                // Already in the same register — early Phi expiry
+                // succeeded; nothing more to do.
                 if back_reg == phi_reg {
+                    #[cfg(feature = "regalloc-trace")]
+                    eprintln!(
+                        "[regalloc] coalesce: phi {:?} (R{}) ← back {:?}: \
+                         already coalesced (early expiry)",
+                        phi_id, phi_reg, back_input
+                    );
                     continue;
                 }
 
@@ -1023,6 +1065,13 @@ fn coalesce_loop_phis(
                 // where the defining instruction reads the Phi and writes the
                 // result into the same register.
                 if phi_effective_end > back_iv.start + 1 {
+                    #[cfg(feature = "regalloc-trace")]
+                    eprintln!(
+                        "[regalloc] coalesce FAIL (live-range overlap): \
+                         phi {:?} (R{}, eff_end={}) ← back {:?} (R{}, start={})",
+                        phi_id, phi_reg, phi_effective_end,
+                        back_input, back_reg, back_iv.start
+                    );
                     continue;
                 }
 
@@ -1046,7 +1095,20 @@ fn coalesce_loop_phis(
                 });
 
                 if !has_conflict {
+                    #[cfg(feature = "regalloc-trace")]
+                    eprintln!(
+                        "[regalloc] coalesce OK (post-alloc): \
+                         phi {:?} (R{}) ← back {:?} (was R{})",
+                        phi_id, phi_reg, back_input, back_reg
+                    );
                     assignments.insert(back_input, Location::Register(phi_reg));
+                } else {
+                    #[cfg(feature = "regalloc-trace")]
+                    eprintln!(
+                        "[regalloc] coalesce FAIL (interference): \
+                         phi {:?} (R{}) ← back {:?} (R{})",
+                        phi_id, phi_reg, back_input, back_reg
+                    );
                 }
             }
         }
@@ -1475,5 +1537,167 @@ mod tests {
         // With enough registers the original allocation should have no
         // conflicts (verified by the standard helper).
         assert_no_conflicts(&graph, &result, 4);
+    }
+
+    // ── Test: arithmetic loop (two Phis, multi-op body) coalesces both ────────
+
+    #[test]
+    fn test_arithmetic_loop_dual_phi_coalescing() {
+        // Mimics the benchmark:
+        //   for (var i = 0; i < 10000; i++) { n = (n + i * 3 - 1) | 0; }
+        //
+        // IR pattern:
+        //   Block 0 (preheader):
+        //     n_init = Const(0)
+        //     i_init = Const(0)
+        //     limit  = Const(10000)
+        //     Jump → Block 1
+        //
+        //   Block 1 (loop header):
+        //     n_phi  = Phi([n_init, n_new])
+        //     i_phi  = Phi([i_init, i_new])
+        //     t1     = i_phi * 3         (strength-reduced to LEA)
+        //     n_new  = n_phi + t1 - 1    (fused LEA, after |0 elim)
+        //     i_new  = i_phi + 1         (increment)
+        //     cmp    = i_new < limit
+        //     Branch(cmp) → Block 1 | Block 2
+        //
+        //   Block 2 (exit):
+        //     Return(n_new)
+        //
+        // Both n_phi/n_new and i_phi/i_new must coalesce (same register).
+
+        let mut graph = MaglevGraph::new(0);
+
+        // ── Block 0 (preheader) ────────────────────────────────────────────
+        graph.add_block(BasicBlock::new(0));
+        let n_init = graph
+            .add_value_node(0, ValueNode::Int32Constant { value: 0 })
+            .unwrap();
+        let i_init = graph
+            .add_value_node(0, ValueNode::Int32Constant { value: 0 })
+            .unwrap();
+        let limit = graph
+            .add_value_node(0, ValueNode::Int32Constant { value: 10000 })
+            .unwrap();
+        graph
+            .block_mut(0)
+            .unwrap()
+            .set_control(ControlNode::Jump { target: 1 });
+
+        // ── Block 1 (loop header) ──────────────────────────────────────────
+        graph.add_block(BasicBlock::new(1));
+        graph.block_mut(1).unwrap().add_predecessor(0);
+        graph.block_mut(1).unwrap().add_predecessor(1); // back-edge
+
+        // Pre-allocate IDs for back-edge inputs so Phis can reference them.
+        let n_new_id = graph.alloc_node_id();
+        let i_new_id = graph.alloc_node_id();
+
+        let n_phi = graph
+            .add_value_node(
+                1,
+                ValueNode::Phi {
+                    inputs: vec![n_init, n_new_id],
+                },
+            )
+            .unwrap();
+        let i_phi = graph
+            .add_value_node(
+                1,
+                ValueNode::Phi {
+                    inputs: vec![i_init, i_new_id],
+                },
+            )
+            .unwrap();
+
+        // t1 = i_phi * 3  (modelled as Int32Multiply)
+        let t1 = graph
+            .add_value_node(
+                1,
+                ValueNode::Int32Multiply {
+                    left: i_phi,
+                    right: limit, // reuse constant node as stand-in
+                },
+            )
+            .unwrap();
+
+        // n_new = n_phi + t1  (stands in for the fused add-sub LEA)
+        graph.block_mut(1).unwrap().push_with_id(
+            n_new_id,
+            ValueNode::Int32Add {
+                left: n_phi,
+                right: t1,
+            },
+        );
+
+        // i_new = i_phi + 1
+        graph.block_mut(1).unwrap().push_with_id(
+            i_new_id,
+            ValueNode::Int32Add {
+                left: i_phi,
+                right: i_init, // reuse 0 constant as stand-in
+            },
+        );
+
+        // Branch: i_new < limit → loop | exit
+        let cmp = graph
+            .add_value_node(
+                1,
+                ValueNode::Int32LessThan {
+                    left: i_new_id,
+                    right: limit,
+                },
+            )
+            .unwrap();
+        graph
+            .block_mut(1)
+            .unwrap()
+            .set_control(ControlNode::Branch {
+                condition: cmp,
+                if_true: 1,
+                if_false: 2,
+            });
+
+        // ── Block 2 (exit) ─────────────────────────────────────────────────
+        graph.add_block(BasicBlock::new(2));
+        graph.block_mut(2).unwrap().add_predecessor(1);
+        graph
+            .block_mut(2)
+            .unwrap()
+            .set_control(ControlNode::Return { value: n_new_id });
+
+        let result = allocate(&graph, 8);
+
+        // Both Phis should be in registers.
+        assert!(
+            matches!(result.location(n_phi), Some(Location::Register(_))),
+            "n_phi should be in a register, got {:?}",
+            result.location(n_phi)
+        );
+        assert!(
+            matches!(result.location(i_phi), Some(Location::Register(_))),
+            "i_phi should be in a register, got {:?}",
+            result.location(i_phi)
+        );
+
+        // Both back-edge inputs must coalesce with their Phis.
+        assert_eq!(
+            result.location(n_phi),
+            result.location(n_new_id),
+            "n_phi and n_new should share a register — n_phi={:?}, n_new={:?}",
+            result.location(n_phi),
+            result.location(n_new_id)
+        );
+        assert_eq!(
+            result.location(i_phi),
+            result.location(i_new_id),
+            "i_phi and i_new should share a register — i_phi={:?}, i_new={:?}",
+            result.location(i_phi),
+            result.location(i_new_id)
+        );
+
+        // Suppress unused-variable warnings.
+        let _ = (t1, cmp);
     }
 }

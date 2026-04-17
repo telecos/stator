@@ -52,3 +52,6 @@ libc.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 libc = "0.2"
+
+[features]
+regalloc-trace = []
