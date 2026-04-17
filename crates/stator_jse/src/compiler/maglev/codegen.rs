@@ -174,6 +174,7 @@ fn cached_vec_jsvalue_layout() -> &'static jit_runtime::VecJsValueLayout {
 /// Cache the [`PropertyMap`] byte layout for inline named-property IC
 /// in the Maglev codegen.
 #[cfg(all(target_arch = "x86_64", unix))]
+#[allow(dead_code)] // IC fill path still populates map_ptr/shape_id slots
 fn cached_propertymap_layout() -> &'static jit_runtime::PropertyMapLayout {
     use std::sync::OnceLock;
     static LAYOUT: OnceLock<jit_runtime::PropertyMapLayout> = OnceLock::new();
@@ -691,6 +692,16 @@ struct MaglevCodegen<'a> {
     /// any operation that may clobber allocatable registers.
     #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
     reg_holds: [Option<NodeId>; NUM_REG_FWD],
+    /// Fused add-sub pairs: maps `sub_id → (add_left, add_right, disp)`
+    /// where `disp = -K` for `Int32Subtract(Int32Add(a, b), K)`.  The fused
+    /// codegen emits a single `LEA dst, [a + b + disp]`.
+    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
+    fused_add_sub: HashMap<NodeId, (NodeId, NodeId, i32)>,
+    /// Node IDs whose codegen is subsumed by a fused operation (e.g. the
+    /// `Int32Add` in a fused add-sub pair).  These are skipped in the
+    /// main emit loop.
+    #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
+    fused_skip: HashSet<NodeId>,
 }
 
 /// A deferred cold-path branch emitted out-of-line after all blocks.
@@ -833,6 +844,8 @@ impl<'a> MaglevCodegen<'a> {
             ctx_regfile_offset: None,
             rax_holds: None,
             reg_holds: [None; NUM_REG_FWD],
+            fused_add_sub: HashMap::new(),
+            fused_skip: HashSet::new(),
         }
     }
 
@@ -884,6 +897,11 @@ impl<'a> MaglevCodegen<'a> {
         self.smi_guarded = Self::compute_smi_guarded(self.graph, &self.i32_range);
         self.narrow_int32 =
             Self::compute_narrow_int32(self.graph, self.alloc, &self.i32_range, &self.smi_guarded);
+
+        // Fused add-sub detection: find `Int32Subtract(Int32Add(a, b), K)`
+        // patterns where the add has exactly one consumer (the subtract).
+        // These are fused into a single `LEA dst, [a + b - K]`.
+        self.compute_fused_add_sub();
 
         self.emit_prologue();
         self.emit_promoted_global_loads();
@@ -1150,6 +1168,9 @@ impl<'a> MaglevCodegen<'a> {
             if Some(*id) == fused_cmp_id {
                 continue;
             }
+            if self.fused_skip.contains(id) {
+                continue;
+            }
             self.emit_value_node(*id, node);
         }
 
@@ -1316,7 +1337,9 @@ impl<'a> MaglevCodegen<'a> {
 
             // ── Int32 binary arithmetic ──────────────────────────────────────
             ValueNode::Int32Add { left, right } => {
-                if let Some(imm) = self.try_get_i32_constant(*right) {
+                if self.fused_skip.contains(&id) {
+                    // Subsumed by a fused add-sub pair — skip emission.
+                } else if let Some(imm) = self.try_get_i32_constant(*right) {
                     self.emit_wrapping_int32_binop_imm(*left, imm, id, MacroAssembler::add32_ri);
                 } else if let Some(imm) = self.try_get_i32_constant(*left) {
                     // ADD is commutative
@@ -1326,7 +1349,9 @@ impl<'a> MaglevCodegen<'a> {
                 }
             }
             ValueNode::Int32Subtract { left, right } => {
-                if let Some(imm) = self.try_get_i32_constant(*right) {
+                if let Some(&(a, b, disp)) = self.fused_add_sub.get(&id) {
+                    self.emit_fused_add_sub(a, b, disp, id);
+                } else if let Some(imm) = self.try_get_i32_constant(*right) {
                     self.emit_wrapping_int32_binop_imm(*left, imm, id, MacroAssembler::sub32_ri);
                 } else {
                     self.emit_wrapping_int32_binop(*left, *right, id, MacroAssembler::sub32_rr);
@@ -2465,9 +2490,21 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.mov_ri(Reg64::Rdi, slot_i64);
                 self.masm.mov_ri(Reg64::Rsi, packed as i64);
 
-                let addr =
-                    jit_runtime::jit_runtime_create_object_with_props as *const () as usize as i64;
-                self.masm.mov_ri(Reg64::R11, addr);
+                // When R15 caches the RT_PTRS cell address, pass it as
+                // the 8th argument (stack slot +8) so the runtime stub
+                // can skip the TLS lookup entirely.
+                if self.needs_r15 {
+                    self.masm.mov_store_base_disp32(Reg64::Rsp, 8, Reg64::R15);
+                    let addr = jit_runtime::jit_runtime_create_object_with_props_r15 as *const ()
+                        as usize as i64;
+                    self.masm.mov_ri(Reg64::R11, addr);
+                } else {
+                    self.masm.mov_ri(Reg64::R11, 0);
+                    self.masm.mov_store_base_disp32(Reg64::Rsp, 8, Reg64::R11);
+                    let addr = jit_runtime::jit_runtime_create_object_with_props as *const ()
+                        as usize as i64;
+                    self.masm.mov_ri(Reg64::R11, addr);
+                }
                 self.masm.call_reg(Reg64::R11);
                 self.masm.add_ri(Reg64::Rsp, 16);
                 self.emit_restore_live_regs(saved);
@@ -3418,6 +3455,58 @@ impl<'a> MaglevCodegen<'a> {
                     self.masm.movsxd_sign_extend(Reg64::R11, Reg64::R11);
                 }
                 self.emit_store(result, Reg64::R11);
+            }
+        }
+    }
+
+    /// Emit a fused `LEA dst, [a + b + disp]` for `Int32Add(a, b) ± K`
+    /// patterns where the intermediate add has been elided.
+    ///
+    /// This saves one instruction per loop iteration versus separate ADD + SUB.
+    /// The 64-bit LEA computes the correct lower 32 bits regardless of upper-bit
+    /// garbage (modular arithmetic).  For non-narrow results, a MOVSXD
+    /// sign-extends the 32-bit result.
+    fn emit_fused_add_sub(&mut self, a: NodeId, b: NodeId, disp: i32, result: NodeId) {
+        let narrow = self.narrow_int32.contains(&result);
+        match self.alloc.location(result) {
+            Some(Location::Register(n)) => {
+                let dst = phys_reg(n);
+                // Load `a` and `b` into registers suitable for LEA.
+                let a_reg = match self.alloc.location(a) {
+                    Some(Location::Register(rn)) => phys_reg(rn),
+                    _ => {
+                        self.emit_load(a, Reg64::R10);
+                        Reg64::R10
+                    }
+                };
+                let b_reg = match self.alloc.location(b) {
+                    Some(Location::Register(rn)) if phys_reg(rn) != a_reg => phys_reg(rn),
+                    _ => {
+                        let scratch = if a_reg == Reg64::R10 {
+                            Reg64::R11
+                        } else {
+                            Reg64::R10
+                        };
+                        self.emit_load(b, scratch);
+                        scratch
+                    }
+                };
+                // RBP/R13 as SIB base with mod=10 is fine (no ambiguity).
+                self.masm.lea_scaled_disp32(dst, a_reg, b_reg, 1, disp);
+                if !narrow {
+                    self.masm.movsxd_sign_extend(dst, dst);
+                }
+                self.note_reg_holds(dst, result);
+            }
+            _ => {
+                self.emit_load(a, Reg64::R10);
+                self.emit_load(b, Reg64::R11);
+                self.masm
+                    .lea_scaled_disp32(Reg64::R10, Reg64::R10, Reg64::R11, 1, disp);
+                if !narrow {
+                    self.masm.movsxd_sign_extend(Reg64::R10, Reg64::R10);
+                }
+                self.emit_store(result, Reg64::R10);
             }
         }
     }
@@ -5701,15 +5790,14 @@ impl<'a> MaglevCodegen<'a> {
         feedback_slot: u32,
     ) {
         let jv_layout = cached_jsvalue_layout();
-        let pm_layout = cached_propertymap_layout();
 
         // Allocate this site's IC slot.
         let site = self.next_named_ic_site;
         self.next_named_ic_site += 1;
         let ic_base = self.named_ic_base + site * 32;
         let ic_off_handle = ic_base; // +0
-        let ic_off_map_ptr = ic_base + 8; // +8
-        let ic_off_shape = ic_base + 16; // +16
+        // +8 (map_ptr) and +16 (shape_id) are populated by IC fill but
+        // no longer checked on the hit path — handle identity suffices.
         let ic_off_elem_addr = ic_base + 24; // +24  (absolute element address)
 
         let is_smi_specialized = self.smi_guarded.contains(&id) && !self.i32_range.contains(&id);
@@ -5723,24 +5811,18 @@ impl<'a> MaglevCodegen<'a> {
         self.emit_load(object, Reg64::R11);
 
         // IC handle check: same object?
+        // The handle comparison is sufficient — if the handle matches,
+        // the object identity is confirmed and the cached property
+        // offset is still valid.  Shape changes invalidate the IC via
+        // the IC invalidation logic, so a separate shape_id check is
+        // redundant on the hit path.
         self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, ic_off_handle);
         self.masm.jne(&mut slow_label);
 
-        // Load cached PropertyMap pointer.
-        self.masm
-            .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, ic_off_map_ptr);
-        // Read LIVE shape_id from PropertyMap.
-        self.masm
-            .mov_load_base_disp32(Reg64::Rax, Reg64::R10, pm_layout.shape_id_offset as i32);
-        // Compare with cached shape_id.
-        self.masm.cmp_rm(Reg64::Rax, Reg64::Rbp, ic_off_shape);
-        self.masm.jne(&mut slow_label);
-
-        // Shape matches → property at same offset.
+        // Handle matches → property at same offset.
         // Load the pre-computed element address from the IC slot.
         // The IC fill stores (values_data_ptr + index * sizeof(JsValue))
         // so we skip the values-data-pointer load and index multiply.
-        // Safety: same shape_id guarantees no Vec reallocation occurred.
         self.masm
             .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_elem_addr);
 
@@ -5755,7 +5837,7 @@ impl<'a> MaglevCodegen<'a> {
             // (property value mutated to a non-Smi type) we deopt to
             // the interpreter — the smi_guarded contract allows this.
             //
-            // Instruction count on Smi IC hit: 12 (vs 16 before).
+            // Instruction count on Smi IC hit: 8 (vs 12 before).
             // Taken jumps on Smi IC hit: 0 (vs 2 before).
             let mut smi_fast_done = Label::new();
 
@@ -6708,13 +6790,12 @@ impl<'a> MaglevCodegen<'a> {
         let mut mono_hit_deopt = Label::new();
 
         // ── Inline BA set (callee BA from mono cache) ───────────
+        // Load BA ptr first so both loads can issue in parallel.
         const RTPTRS_BYTECODE_OFF: i32 = 16;
-        // R10 = &Cell<*const BytecodeArray>
-        self.masm
-            .mov_load_base_disp32(Reg64::R10, Reg64::R15, RTPTRS_BYTECODE_OFF);
-        // Set callee BA.
         self.masm
             .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_ba);
+        self.masm
+            .mov_load_base_disp32(Reg64::R10, Reg64::R15, RTPTRS_BYTECODE_OFF);
         self.masm.mov_store_base_disp32(Reg64::R10, 0, Reg64::Rcx);
 
         // Allocate 128-byte register file on the JIT stack.
@@ -6722,26 +6803,32 @@ impl<'a> MaglevCodegen<'a> {
         // preserves alignment).
         self.masm.sub_ri(Reg64::Rsp, 128);
 
-        // Zero only the register slots the callee actually uses
-        // (cached in the MIC slot, clamped to 1–16).  This avoids
-        // 13-14 wasted stores for small closures.
+        // Unrolled zeroing: always zero slots 0–3 (32 bytes) with
+        // direct RSP-relative stores.  For closures with ≤4 slots
+        // (the common case) this replaces the counted loop entirely.
         self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+        self.masm.mov_store_base_disp32(Reg64::Rsp, 0, Reg64::Rax);
+        self.masm.mov_store_base_disp32(Reg64::Rsp, 8, Reg64::Rax);
+        self.masm.mov_store_base_disp32(Reg64::Rsp, 16, Reg64::Rax);
+        self.masm.mov_store_base_disp32(Reg64::Rsp, 24, Reg64::Rax);
+
+        // For closures with > 4 register slots, fall into a loop
+        // that zeroes the remaining slots starting at offset 32.
         self.masm
             .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_reg_slots);
-        // RDI will be set to RSP after zeroing, so reuse it as the
-        // store pointer during the loop.
+        self.masm.cmp_ri(Reg64::Rcx, 4);
+        let mut skip_extra_zero = Label::new();
+        self.masm.jcc(CondCode::LessEq, &mut skip_extra_zero);
+        self.masm.sub_ri(Reg64::Rcx, 4);
         self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
-        // Guard: skip loop if reg_slots == 0 (defensive; should be ≥ 1).
-        self.masm.test_rr(Reg64::Rcx, Reg64::Rcx);
-        let mut skip_zero = Label::new();
-        self.masm.je(&mut skip_zero);
-        let mut zero_loop = Label::new();
-        self.masm.bind_label(&mut zero_loop);
+        self.masm.add_ri(Reg64::Rdi, 32);
+        let mut extra_zero_loop = Label::new();
+        self.masm.bind_label(&mut extra_zero_loop);
         self.masm.mov_store_base_disp32(Reg64::Rdi, 0, Reg64::Rax);
         self.masm.add_ri(Reg64::Rdi, 8);
         self.masm.sub_ri(Reg64::Rcx, 1);
-        self.masm.jne(&mut zero_loop);
-        self.masm.bind_label(&mut skip_zero);
+        self.masm.jne(&mut extra_zero_loop);
+        self.masm.bind_label(&mut skip_extra_zero);
 
         // Load entry + ctx directly from mono cache.
         self.masm
@@ -6758,10 +6845,11 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.add_ri(Reg64::Rsp, 128);
 
         // ── Inline BA restore (from cached caller BA) ───────────
-        self.masm
-            .mov_load_base_disp32(Reg64::R10, Reg64::R15, RTPTRS_BYTECODE_OFF);
+        // Load BA ptr first so both loads can issue in parallel.
         self.masm
             .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_caller_ba);
+        self.masm
+            .mov_load_base_disp32(Reg64::R10, Reg64::R15, RTPTRS_BYTECODE_OFF);
         self.masm.mov_store_base_disp32(Reg64::R10, 0, Reg64::Rcx);
 
         // Deopt check.
@@ -8692,10 +8780,8 @@ impl<'a> MaglevCodegen<'a> {
         //
         // `x | 0` is identity — the result is always a valid i32 and the
         // upper 32 bits of `x` are irrelevant.  Propagate this backward:
-        // mark Phi nodes on the backward path as narrow-transparent so
-        // their MOVSXD can be elided.  Int32Add/Sub/Mul are already
-        // candidates via `is_wrapping_int32_producer`; we just ensure
-        // transitive Phis (e.g. loop-carried accumulators) are included.
+        // mark Phi nodes AND Int32 arithmetic on the backward path as
+        // narrow-transparent so their MOVSXD can be elided.
         let mut backward_worklist: Vec<NodeId> = Vec::new();
         for block in graph.blocks() {
             for (_id, node) in &block.nodes {
@@ -8740,6 +8826,7 @@ impl<'a> MaglevCodegen<'a> {
                     | ValueNode::Int32Subtract { left, right }
                     | ValueNode::Int32Multiply { left, right },
                 ) => {
+                    narrow_transparent.insert(nid);
                     backward_worklist.push(*left);
                     backward_worklist.push(*right);
                 }
@@ -8798,6 +8885,104 @@ impl<'a> MaglevCodegen<'a> {
         }
 
         candidates
+    }
+
+    /// Detect `Int32Subtract(Int32Add(a, b), K)` patterns where the add has
+    /// exactly one consumer (the subtract).  These are fused into a single
+    /// `LEA dst, [a + b - K]`, saving one instruction per iteration in hot
+    /// loops such as `n = (n + i*3 - 1) | 0`.
+    fn compute_fused_add_sub(&mut self) {
+        // Step 1: count consumers for each NodeId.
+        let mut use_counts: HashMap<NodeId, usize> = HashMap::new();
+        for block in self.graph.blocks() {
+            for (_, node) in &block.nodes {
+                let mut inputs = HashSet::new();
+                Self::collect_node_inputs(node, &mut inputs);
+                for inp in inputs {
+                    *use_counts.entry(inp).or_insert(0) += 1;
+                }
+            }
+            if let Some(ctrl) = &block.control {
+                match ctrl {
+                    ControlNode::Return { value } => {
+                        *use_counts.entry(*value).or_insert(0) += 1;
+                    }
+                    ControlNode::Branch { condition, .. } => {
+                        *use_counts.entry(*condition).or_insert(0) += 1;
+                    }
+                    ControlNode::Jump { .. } | ControlNode::Deoptimize { .. } => {}
+                }
+            }
+        }
+
+        // Step 2: build a node-lookup map.
+        let mut node_map: HashMap<NodeId, &ValueNode> = HashMap::new();
+        for block in self.graph.blocks() {
+            for (id, node) in &block.nodes {
+                node_map.insert(*id, node);
+            }
+        }
+
+        // Step 3: scan for fusible patterns.
+        for block in self.graph.blocks() {
+            for (sub_id, sub_node) in &block.nodes {
+                // Pattern: Int32Subtract(add_id, K) where K is a constant.
+                let (add_id, k) = match sub_node {
+                    ValueNode::Int32Subtract { left, right } => {
+                        if let Some(k) = Self::static_i32_constant(*right, &node_map) {
+                            (*left, k)
+                        } else {
+                            continue;
+                        }
+                    }
+                    // Also handle Int32Add(add_id, -K) as add + sub:
+                    // Int32Add(Int32Add(a,b), -K) → LEA [a + b - K]
+                    ValueNode::Int32Add { left, right } => {
+                        if let Some(k) = Self::static_i32_constant(*right, &node_map) {
+                            if k < 0 {
+                                (*left, -k)
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                    _ => continue,
+                };
+
+                // The add must be Int32Add with exactly one consumer (this sub).
+                let (a, b) = match node_map.get(&add_id) {
+                    Some(ValueNode::Int32Add { left, right }) => (*left, *right),
+                    _ => continue,
+                };
+                if use_counts.get(&add_id) != Some(&1) {
+                    continue;
+                }
+
+                // Both operands of the add must be available (in registers
+                // or rematerialisable).  Skip if both are constants — the
+                // non-fused path already handles those efficiently.
+                if Self::static_i32_constant(a, &node_map).is_some()
+                    && Self::static_i32_constant(b, &node_map).is_some()
+                {
+                    continue;
+                }
+
+                self.fused_add_sub.insert(*sub_id, (a, b, k.wrapping_neg()));
+                self.fused_skip.insert(add_id);
+            }
+        }
+    }
+
+    /// Return the compile-time i32 constant value of a node, if any.
+    fn static_i32_constant(id: NodeId, node_map: &HashMap<NodeId, &ValueNode>) -> Option<i32> {
+        match node_map.get(&id) {
+            Some(ValueNode::Int32Constant { value }) | Some(ValueNode::SmiConstant { value }) => {
+                Some(*value)
+            }
+            _ => None,
+        }
     }
 
     /// Emit a 32-bit `CMP` between `left` and `right`, using the most

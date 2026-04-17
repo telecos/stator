@@ -1124,8 +1124,8 @@ pub(crate) mod jit_runtime {
             // Pre-reserve capacity on first use so that object-heavy
             // loops (e.g. 1000 iterations) avoid repeated Vec
             // reallocations on their first execution.
-            if heap.capacity() < 256 {
-                heap.reserve(256);
+            if heap.capacity() < 1024 {
+                heap.reserve(1024);
             }
         });
         RT_HANDLE_DEDUP.with(|m| m.borrow_mut().clear());
@@ -1267,6 +1267,41 @@ pub(crate) mod jit_runtime {
             });
         }
 
+        JIT_HEAP_TAG + idx as i64
+    }
+
+    /// Allocate a heap handle for a freshly created object, skipping the
+    /// [`RT_HANDLE_DEDUP`] map entirely.
+    ///
+    /// This is safe for objects returned by `CreateObjectLiteral` /
+    /// `CreateObjectLiteralWithProperties` because:
+    ///
+    /// * The `Rc` was just popped from the pool or freshly allocated, so
+    ///   it cannot already be in the dedup map under a *valid* index.
+    /// * The caller's handle is the only reference that JIT code uses;
+    ///   no other code path will call `alloc_heap_handle` with the same
+    ///   `Rc` identity during this JIT execution.
+    ///
+    /// Eliminating the dedup map avoids two TLS lookups and two
+    /// `HashMap` operations (get + insert) per object creation — the
+    /// dominant cost on the IC-hit hot path.
+    #[inline(always)]
+    fn alloc_heap_handle_no_dedup(val: JsValue, ptrs: &RtPtrs) -> i64 {
+        let idx = if ptrs.is_cached() {
+            // SAFETY: cached pointer valid for thread lifetime; no
+            // concurrent borrows.
+            let heap = unsafe { &mut *(&*ptrs.heap).as_ptr() };
+            let idx = heap.len();
+            heap.push(val);
+            idx
+        } else {
+            RT_HEAP.with(|heap| {
+                let mut heap = heap.borrow_mut();
+                let idx = heap.len();
+                heap.push(val);
+                idx
+            })
+        };
         JIT_HEAP_TAG + idx as i64
     }
 
@@ -7697,6 +7732,7 @@ pub(crate) mod jit_runtime {
     #[derive(Debug, Clone, Copy)]
     pub struct PropertyMapLayout {
         /// Byte offset of `shape_id: u64` within `PropertyMap`.
+        #[allow(dead_code)]
         pub shape_id_offset: usize,
         /// Byte offset of the `values` Vec data-pointer field within
         /// `PropertyMap`.  The Vec layout is `[ptr, len, cap]`; this
@@ -8279,7 +8315,7 @@ pub(crate) mod jit_runtime {
                     let template = unsafe { &*ic.template };
                     let rc = acquire_object_rc_from_template_cached(template, ptrs.object_rc_pool);
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
                 }
 
                 // Fast path: template cached in BA — populate the IC.
@@ -8293,7 +8329,7 @@ pub(crate) mod jit_runtime {
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
                 }
 
                 // Second execution: promote pending → cached, then
@@ -8308,7 +8344,7 @@ pub(crate) mod jit_runtime {
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
                 }
 
                 // First execution: create fresh and register as
@@ -8317,7 +8353,7 @@ pub(crate) mod jit_runtime {
                 let rc = Rc::new(RefCell::new(map));
                 ba_ref.set_object_literal_pending(slot, Rc::clone(&rc));
                 let obj = JsValue::PlainObject(rc);
-                return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
+                return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
             }
         }
 
@@ -8419,7 +8455,7 @@ pub(crate) mod jit_runtime {
                         ptrs.object_rc_pool,
                     );
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
                 }
 
                 // ── Hot path: template cached in BA — populate IC ──
@@ -8435,7 +8471,7 @@ pub(crate) mod jit_runtime {
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
                 }
 
                 // ── Promote path (second execution) ──
@@ -8451,7 +8487,7 @@ pub(crate) mod jit_runtime {
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
                 }
 
                 // ── First execution: create fresh and fill via property stores ──
@@ -8475,7 +8511,7 @@ pub(crate) mod jit_runtime {
                     }
                 }
                 let obj = JsValue::PlainObject(rc);
-                return Some(alloc_heap_handle_with_ptrs(obj, &ptrs));
+                return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
             }
         }
 
@@ -8498,7 +8534,183 @@ pub(crate) mod jit_runtime {
             }
         }
         let obj = JsValue::PlainObject(map_rc);
-        Some(alloc_heap_handle_with_ptrs(obj, &ptrs))
+        Some(alloc_heap_handle_no_dedup(obj, &ptrs))
+    }
+
+    /// Fast-path object creation that accepts the pre-cached `RT_PTRS`
+    /// cell pointer (R15), eliminating the per-call TLS lookup for
+    /// [`RT_PTRS`].
+    ///
+    /// Called by Maglev-generated code when `needs_r15` is true.  Falls
+    /// back to [`jit_runtime_create_object_with_props`] if the cached
+    /// pointers are stale.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`feedback_slot`) – feedback vector slot index.
+    /// * `RSI` (`names_packed`)  – packed name indices + count.
+    /// * `RDX` (`val0`) – first property value.
+    /// * `RCX` (`val1`) – second property value, or 0.
+    /// * `R8`  (`val2`) – third property value, or 0.
+    /// * `R9`  (`val3`) – fourth property value, or 0.
+    /// * Stack+0 (`val4`) – fifth property value, or 0.
+    /// * Stack+8 (`rt_ptrs_cell`) – pointer to `Cell<RtPtrs>` TLS slot.
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    pub extern "C" fn jit_runtime_create_object_with_props_r15(
+        feedback_slot: i64,
+        names_packed: i64,
+        val0: i64,
+        val1: i64,
+        val2: i64,
+        val3: i64,
+        val4: i64,
+        rt_ptrs_cell: i64,
+    ) -> i64 {
+        create_object_with_props_inner_r15(
+            feedback_slot,
+            names_packed,
+            val0,
+            val1,
+            val2,
+            val3,
+            val4,
+            rt_ptrs_cell,
+        )
+        .unwrap_or_else(|| {
+            track_stub_deopt(STUB_CREATE_OBJ_WITH_PROPS);
+            JIT_DEOPT
+        })
+    }
+
+    /// Inner implementation for [`jit_runtime_create_object_with_props_r15`].
+    ///
+    /// Identical to [`create_object_with_props_inner`] except that it
+    /// resolves [`RtPtrs`] from the passed cell pointer instead of the
+    /// TLS lookup.
+    #[allow(clippy::too_many_arguments)]
+    fn create_object_with_props_inner_r15(
+        feedback_slot: i64,
+        names_packed: i64,
+        val0: i64,
+        val1: i64,
+        val2: i64,
+        val3: i64,
+        val4: i64,
+        rt_ptrs_cell: i64,
+    ) -> Option<i64> {
+        let names_packed_u64 = names_packed as u64;
+        let count = ((names_packed_u64 >> 60) & 0xF) as usize;
+        let vals = [val0, val1, val2, val3, val4];
+
+        // Resolve RtPtrs from the cached cell pointer, falling back to
+        // TLS if the pointer is null or stale.
+        let ptrs = if rt_ptrs_cell != 0 {
+            // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and
+            // the TLS slot lives for the thread's entire lifetime.
+            unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get()
+        } else {
+            RT_PTRS.with(|p| p.get())
+        };
+
+        if feedback_slot >= 0 {
+            let slot = feedback_slot as u32;
+            let ba = if ptrs.is_cached() {
+                unsafe { &*ptrs.bytecode }.get()
+            } else {
+                RT_BYTECODE.with(|b| b.get())
+            };
+            if !ba.is_null() {
+                let ba_ref = unsafe { &*ba };
+                let js_values = decode_jit_values_array(count, &vals);
+
+                // ── Ultra-fast path: IC hit ──
+                let ic = ptrs.get_object_ic();
+                if ic.slot == slot && ic.ba == ba {
+                    let template = unsafe { &*ic.template };
+                    let rc = acquire_object_rc_from_template_with_values_cached(
+                        template,
+                        &js_values[..count],
+                        ptrs.object_rc_pool,
+                    );
+                    let obj = JsValue::PlainObject(rc);
+                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                }
+
+                // ── Hot path: template cached in BA — populate IC ──
+                if let Some(rc) = ba_ref
+                    .clone_object_literal_template_with_values_pooled(slot, &js_values[..count])
+                {
+                    let tmpl_ptr = ba_ref.get_cached_template_ptr(slot);
+                    if !tmpl_ptr.is_null() {
+                        ptrs.set_object_ic(ObjectLiteralIcEntry {
+                            slot,
+                            ba,
+                            template: tmpl_ptr,
+                        });
+                    }
+                    let obj = JsValue::PlainObject(rc);
+                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                }
+
+                // ── Promote path ──
+                if let Some(rc) = ba_ref
+                    .promote_object_literal_template_with_values_pooled(slot, &js_values[..count])
+                {
+                    let tmpl_ptr = ba_ref.get_cached_template_ptr(slot);
+                    if !tmpl_ptr.is_null() {
+                        ptrs.set_object_ic(ObjectLiteralIcEntry {
+                            slot,
+                            ba,
+                            template: tmpl_ptr,
+                        });
+                    }
+                    let obj = JsValue::PlainObject(rc);
+                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                }
+
+                // ── First execution ──
+                let names = unpack_names(names_packed_u64);
+                let capacity = 4i64.max(count as i64) as usize;
+                let map = PropertyMap::with_capacity(capacity);
+                let rc = Rc::new(RefCell::new(map));
+                ba_ref.set_object_literal_pending(slot, Rc::clone(&rc));
+                {
+                    let map = unsafe { &mut *rc.as_ptr() };
+                    for i in 0..count {
+                        let prop_name = get_rt_string_constant_ref(names[i])?;
+                        let value = decode_one_jit_value(vals[i]);
+                        match map.try_template_fill(prop_name, value) {
+                            Ok(_) => {}
+                            Err(value) => {
+                                map.insert(prop_name.to_string(), value);
+                            }
+                        }
+                    }
+                }
+                let obj = JsValue::PlainObject(rc);
+                return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+            }
+        }
+
+        // Fallback.
+        let names = unpack_names(names_packed_u64);
+        let capacity = 4i64.max(count as i64) as usize;
+        let map_rc = Rc::new(RefCell::new(PropertyMap::with_capacity(capacity)));
+        {
+            let map = unsafe { &mut *map_rc.as_ptr() };
+            for i in 0..count {
+                let prop_name = get_rt_string_constant_ref(names[i])?;
+                let value = decode_one_jit_value(vals[i]);
+                match map.try_template_fill(prop_name, value) {
+                    Ok(_) => {}
+                    Err(value) => {
+                        map.insert(prop_name.to_string(), value);
+                    }
+                }
+            }
+        }
+        let obj = JsValue::PlainObject(map_rc);
+        Some(alloc_heap_handle_no_dedup(obj, &ptrs))
     }
 
     /// Decode a single JIT `i64` register value into a [`JsValue`].
