@@ -5120,23 +5120,42 @@ impl<'a> MaglevCodegen<'a> {
             let is_zero = |n: NodeId| self.try_get_i32_constant(n) == Some(0);
             if is_zero(right) {
                 if self.alloc.location(id) != self.alloc.location(left) {
-                    self.emit_load(left, Reg64::R11);
-                    self.emit_store(id, Reg64::R11);
-                    // emit_store may have moved R11 into RAX.
-                    if matches!(self.alloc.location(id), Some(Location::Register(n)) if phys_reg(n) == Reg64::Rax)
-                    {
-                        self.rax_holds = Some(id);
+                    // Load directly into destination to avoid an extra MOV
+                    // through a temporary register.
+                    match self.alloc.location(id) {
+                        Some(Location::Register(n)) => {
+                            let dst = phys_reg(n);
+                            self.emit_load(left, dst);
+                            self.note_reg_holds(dst, id);
+                        }
+                        _ => {
+                            self.emit_load(left, Reg64::R11);
+                            self.emit_store(id, Reg64::R11);
+                            if matches!(self.alloc.location(id), Some(Location::Register(n)) if phys_reg(n) == Reg64::Rax)
+                            {
+                                self.rax_holds = Some(id);
+                            }
+                        }
                     }
                 }
                 return;
             }
             if is_zero(left) {
                 if self.alloc.location(id) != self.alloc.location(right) {
-                    self.emit_load(right, Reg64::R11);
-                    self.emit_store(id, Reg64::R11);
-                    if matches!(self.alloc.location(id), Some(Location::Register(n)) if phys_reg(n) == Reg64::Rax)
-                    {
-                        self.rax_holds = Some(id);
+                    match self.alloc.location(id) {
+                        Some(Location::Register(n)) => {
+                            let dst = phys_reg(n);
+                            self.emit_load(right, dst);
+                            self.note_reg_holds(dst, id);
+                        }
+                        _ => {
+                            self.emit_load(right, Reg64::R11);
+                            self.emit_store(id, Reg64::R11);
+                            if matches!(self.alloc.location(id), Some(Location::Register(n)) if phys_reg(n) == Reg64::Rax)
+                            {
+                                self.rax_holds = Some(id);
+                            }
+                        }
                     }
                 }
                 return;
