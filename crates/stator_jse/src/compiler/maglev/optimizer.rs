@@ -2217,7 +2217,8 @@ fn fuse_object_literal_stores_in_block(block: &mut BasicBlock) {
         let mut store_indices: Vec<usize> = Vec::new();
 
         while j < len && names.len() < MAX_FUSED_OBJECT_PROPS {
-            match &nodes[j].1 {
+            let node = &nodes[j].1;
+            match node {
                 ValueNode::StoreNamedGeneric {
                     object,
                     name,
@@ -2233,23 +2234,27 @@ fn fuse_object_literal_stores_in_block(block: &mut BasicBlock) {
                     store_indices.push(j);
                     j += 1;
                 }
-                // Skip pure value nodes that may be interleaved between stores.
-                ValueNode::SmiConstant { .. }
-                | ValueNode::Float64Constant { .. }
-                | ValueNode::Int32Constant { .. }
-                | ValueNode::Uint32Constant { .. }
-                | ValueNode::BigIntConstant { .. }
-                | ValueNode::TrueConstant
-                | ValueNode::FalseConstant
-                | ValueNode::NullConstant
-                | ValueNode::UndefinedConstant
-                | ValueNode::RootConstant { .. }
-                | ValueNode::ExternalConstant { .. }
-                | ValueNode::StringConstant { .. }
-                | ValueNode::ConstantPoolEntry { .. } => {
+                // Skip any interleaved node that does NOT reference the
+                // newly created object.  The previous code only skipped
+                // constant nodes, which broke fusion when value
+                // computations (Add, Mul, …) appeared between stores —
+                // e.g. `{ x: i, y: i + 1, z: i * 2 }`.  Because the
+                // object is freshly created and only reachable via the
+                // stores being fused, any node that doesn't mention it
+                // cannot observe or mutate it, so it is safe to skip.
+                _ => {
+                    let mut refs_object = false;
+                    visit_value_node_inputs(node, &mut |id| {
+                        if id == create_node_id {
+                            refs_object = true;
+                        }
+                    });
+                    if refs_object {
+                        // Some non-store node uses the object — stop.
+                        break;
+                    }
                     j += 1;
                 }
-                _ => break,
             }
         }
 
