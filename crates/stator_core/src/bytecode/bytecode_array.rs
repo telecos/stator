@@ -544,9 +544,9 @@ pub struct BytecodeArray {
     jit_maglev_deopt_count: Rc<Cell<u32>>,
     /// Invocation count at which Maglev should next be attempted after a
     /// deopt.  When deopt happens, this is set to
-    /// `invocation_count + 2^deopt_count`, creating exponential backoff
-    /// that lets the interpreter run (with warm ICs) instead of
-    /// repeatedly entering and immediately deopting Maglev code.
+    /// `invocation_count + 1`, giving the interpreter one iteration to
+    /// warm ICs before retrying JIT.  The retry limit
+    /// [`MAX_MAGLEV_DEOPT_RETRIES`] prevents infinite deopt loops.
     maglev_next_try_at: Rc<Cell<u32>>,
     /// Captured closure context set by `CreateClosure`.
     ///
@@ -1797,13 +1797,9 @@ impl BytecodeArray {
     /// the function is permanently blocked from re-entering Maglev, letting
     /// the interpreter (which may actually be faster for pathological cases
     /// like prototype-chain lookups that always trigger OVERFLOW) take over.
-    /// Kept low: the warmup phase runs 200 iterations with Maglev to warm
-    /// JIT inline caches, so any function that *still* deopts after warmup
-    /// has a persistent issue and retrying further just wastes time.
-    /// 5 retries with linear backoff gives ~45 invocations of cooldown —
-    /// enough for transient IC cold-start deopts to resolve, but persistent
-    /// deopts are quickly and permanently blocked instead of burning
-    /// hundreds of µs per benchmark iteration.
+    /// With a constant 1-invocation cooldown, the JIT gets retried almost
+    /// immediately after each deopt; persistent deopts hit the limit after
+    /// just ~10 invocations and are permanently blocked.
     const MAX_MAGLEV_DEOPT_RETRIES: u32 = 5;
 
     /// Returns `true` if Maglev JIT code should NOT be attempted right now.
@@ -1831,20 +1827,21 @@ impl BytecodeArray {
         self.jit_maglev_deopt_count.get()
     }
 
-    /// Increment the Maglev deopt counter and set the linear cooldown
-    /// so Maglev is not re-entered until a few interpreter invocations
-    /// have elapsed.  After [`MAX_MAGLEV_DEOPT_RETRIES`] the interpreter
+    /// Increment the Maglev deopt counter and set a minimal cooldown
+    /// (1 interpreter invocation) before retrying JIT.  This gives the
+    /// interpreter exactly one iteration to warm ICs while retrying
+    /// aggressively.  After [`MAX_MAGLEV_DEOPT_RETRIES`] the interpreter
     /// will permanently skip Maglev for this function.
     pub fn mark_jit_maglev_deopted(&self) {
         let count = self.jit_maglev_deopt_count.get();
         self.jit_maglev_deopt_count.set(count.saturating_add(1));
-        // Linear backoff: wait 3 invocations per deopt before
-        // re-entering Maglev.  Exponential backoff (2^count) was too
-        // aggressive: just 7 cold-IC deopts produced a 128-invocation
-        // cooldown that exceeded Criterion's entire measurement window,
-        // forcing the benchmark to run entirely in the interpreter.
-        let backoff = 3u32.saturating_mul(count.saturating_add(1)).min(50);
-        let next_try = self.invocation_count.get().saturating_add(backoff);
+        // Constant 1-invocation cooldown: retry JIT on the very next
+        // invocation after the interpreter runs once with warm ICs.
+        // The previous linear backoff (3 * (count+1), up to 50) was too
+        // slow — after 5 deopts the cumulative 45-invocation cooldown
+        // plus the permanent block meant the JIT was never re-entered
+        // during short benchmark measurement windows.
+        let next_try = self.invocation_count.get().saturating_add(1);
         self.maglev_next_try_at.set(next_try);
     }
 
