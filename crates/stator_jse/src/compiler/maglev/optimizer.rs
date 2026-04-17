@@ -2471,16 +2471,19 @@ fn compute_store_to_load_subst_with_map(
                 }
             }
 
-            // Any other side-effecting node invalidates the map conservatively.
-            // StoreGlobal is already handled above, so exclude it from clearing.
-            other if can_invalidate_named_stores(other) => {
-                store_map.clear();
-                global_map.clear();
+            // Nodes that can mutate named properties invalidate the store map.
+            // Nodes with any side effect invalidate the global map (globals
+            // can change through deopts or calls).
+            other => {
+                if can_invalidate_named_stores(other) {
+                    store_map.clear();
+                    global_map.clear();
+                } else if has_side_effects(other) {
+                    global_map.clear();
+                }
                 // Keep alias_map — aliases are structural, not invalidated
                 // by side effects.
             }
-
-            _ => {}
         }
     }
 
