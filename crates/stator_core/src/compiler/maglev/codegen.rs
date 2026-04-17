@@ -6286,24 +6286,27 @@ impl<'a> MaglevCodegen<'a> {
     /// Emit a direct-call fast path for `CallUndefinedReceiver0` with a
     /// monomorphic inline cache and fully-inline JIT-to-JIT dispatch.
     ///
-    /// ## Mono fast path (cache hit) — inline dispatch
+    /// ## Mono fast path (cache hit) — zero-FFI inline dispatch
     ///
     /// ```text
     ///  cmp  callee, [RBP - cache_callee_off]
     ///  jne  cache_miss
-    ///  ; BA save: load [R15+16] → Cell ptr → save old BA
-    ///  ; BA set:  store callee BA into Cell
-    ///  ; allocate 128-byte register file on x86 stack (no zeroing)
+    ///  ; BA save: [R15+16] → Cell ptr, read old BA, stash on stack
+    ///  ; BA set:  write callee BA into Cell
+    ///  ; allocate + zero 128-byte register file on x86 stack
     ///  ; call cached entry_point(reg_file, cached_ctx)
     ///  ; deallocate register file
-    ///  ; BA restore: write old BA back into Cell
+    ///  ; BA restore: read stashed old BA, write back into Cell
     ///  ; deopt check → done or stub fallback
     /// ```
     ///
     /// This eliminates ALL Rust FFI calls on the monomorphic hit path.
-    /// Context is passed directly to the callee via RSI, avoiding the
-    /// expensive global context swap (Rc clone + mem::replace).  Heap
-    /// cleanup is deferred to the caller's finish path.
+    /// The TLS bytecode pointer is saved/restored inline via the
+    /// `RtPtrs.bytecode` Cell at `[R15+16]`.  Context is passed
+    /// directly to the callee via RSI, avoiding the expensive global
+    /// context swap (Rc clone + mem::replace).  The callee's baseline
+    /// JIT stores RSI → RBX in its prologue and uses RBX for all
+    /// context-slot stubs, so the TLS context is never touched.
     ///
     /// ## Cache miss / first call
     ///
@@ -6349,50 +6352,53 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, off_callee);
         self.masm.jne(&mut cache_miss);
 
-        // ── Mono HIT: inline dispatch ─────────────────────────────
+        // ── Mono HIT: fully inline dispatch (zero FFI) ────────────
         //
-        // Instead of calling jit_runtime_mono_dispatch_call_0_r15
-        // (which allocates the register file on the Rust stack and
-        // calls the entry point through FFI), we:
-        //   1. Call a lean prepare helper that saves BA, swaps ctx,
-        //      and stores DirectCallState (one FFI call).
-        //   2. Allocate + zero the register file on the JIT stack.
-        //   3. CALL the cached entry point directly.
-        //   4. Call finish_direct_call_r15 to restore BA/ctx/heap.
+        // Save/restore the TLS bytecode pointer inline via the
+        // `RtPtrs.bytecode` field at [R15+16], pass the cached
+        // context directly via RSI, and skip the Rust-side
+        // prepare/finish calls entirely.
         //
-        // This eliminates the Rust-side register-file allocation,
-        // the transmute, and one function-call frame from the hot
-        // path.
+        // The callee's baseline JIT prologue stores RSI → RBX and
+        // uses RBX for all context-slot stubs, so no TLS context
+        // swap is required.  Heap cleanup is deferred to the
+        // caller's own finish path (safe because tight-loop callees
+        // typically return Smis and allocate no heap handles).
 
-        let mut mono_hit_prepare_fail = Label::new();
         let mut mono_hit_deopt = Label::new();
 
-        // Save callee_i64 (R11) across the prepare call.
+        // Save callee_i64 (R11) for potential stub fallback.
         // Two pushes keep RSP ≡ 0 mod 16.
         self.masm.push(Reg64::R11); // [RSP+8] = callee_i64
-        self.masm.push(Reg64::R11); // [RSP+0] = padding
+        self.masm.push(Reg64::R11); // [RSP+0] = padding (will hold old_ba)
 
-        // Prepare: RDI = ba_ptr, RSI = rt_ptrs_cell, RDX = callee_i64.
+        // ── Inline BA save ──────────────────────────────────────
+        // RtPtrs is #[repr(C)]; `bytecode` (3rd field) is at byte
+        // offset 16.  Cell<T> is repr(transparent) so reading /
+        // writing through the pointer accesses the inner T directly.
+        const RTPTRS_BYTECODE_OFF: i32 = 16;
+        // R10 = &Cell<*const BytecodeArray>
         self.masm
-            .mov_load_base_disp32(Reg64::Rdi, Reg64::Rbp, off_ba);
-        self.masm.mov_rr(Reg64::Rsi, Reg64::R15);
-        self.masm.mov_rr(Reg64::Rdx, Reg64::R11); // callee_i64
-        let prepare_addr = jit_runtime::jit_runtime_mono_inline_prepare_r15 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, prepare_addr as i64);
-        self.masm.call_reg(Reg64::R11);
-        // RAX = fresh ctx_ptr, or JIT_DEOPT on failure.
+            .mov_load_base_disp32(Reg64::R10, Reg64::R15, RTPTRS_BYTECODE_OFF);
+        // RCX = old BA
+        self.masm.mov_load_base_disp32(Reg64::Rcx, Reg64::R10, 0);
+        // Stash old BA into the padding slot [RSP+0].
+        self.masm.mov_store_base_disp32(Reg64::Rsp, 0, Reg64::Rcx);
 
-        self.masm.cmp_ri(Reg64::Rax, i32::MIN);
-        self.masm.jcc(CondCode::Less, &mut mono_hit_prepare_fail);
+        // ── Inline BA set (callee BA from mono cache) ───────────
+        self.masm
+            .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_ba);
+        self.masm.mov_store_base_disp32(Reg64::R10, 0, Reg64::Rcx);
 
-        // RAX = ctx_ptr for the callee. Save it (R10 is caller-saved
-        // but we control the code between here and the CALL).
         // Push ctx + entry to preserve across rep stosq.
+        // (2 more pushes → 4 total from aligned start → aligned)
+        self.masm
+            .mov_load_base_disp32(Reg64::Rax, Reg64::Rbp, off_ctx);
         self.masm.push(Reg64::Rax); // ctx_ptr
         self.masm
             .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, off_entry);
         self.masm.push(Reg64::R11); // entry_point
-        // RSP ≡ 0 mod 16 (2 earlier pushes + 2 here = 4 pushes).
+        // RSP ≡ 0 mod 16 (4 pushes above initial alignment).
 
         // Allocate 128-byte register file on the JIT stack.
         self.masm.sub_ri(Reg64::Rsp, 128);
@@ -6415,17 +6421,16 @@ impl<'a> MaglevCodegen<'a> {
 
         // Deallocate register file + saved entry + saved ctx.
         self.masm.add_ri(Reg64::Rsp, 128 + 16);
-        // RSP now points to [padding, callee_i64] (2 items).
+        // RSP now points to [old_ba, callee_i64] (2 items).
 
-        // Finish: RDI = result, RSI = rt_ptrs_cell (R15).
-        self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
-        self.masm.mov_rr(Reg64::Rsi, Reg64::R15);
-        let finish_addr = jit_runtime::jit_runtime_finish_direct_call_r15 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, finish_addr as i64);
-        self.masm.call_reg(Reg64::R11);
-        // RAX = final result or JIT_DEOPT.
+        // ── Inline BA restore ───────────────────────────────────
+        // RCX = old_ba from the stashed padding slot.
+        self.masm.mov_load_base_disp32(Reg64::Rcx, Reg64::Rsp, 0);
+        self.masm
+            .mov_load_base_disp32(Reg64::R10, Reg64::R15, RTPTRS_BYTECODE_OFF);
+        self.masm.mov_store_base_disp32(Reg64::R10, 0, Reg64::Rcx);
 
-        // Discard saved callee + padding.
+        // Discard old_ba + callee.
         self.masm.add_ri(Reg64::Rsp, 16);
 
         // Deopt check.
@@ -6433,12 +6438,6 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.jcc(CondCode::GreaterEq, &mut done_label);
 
         // Callee deopt after inline dispatch: fall back to stub.
-        self.masm.jmp(&mut mono_hit_deopt);
-
-        // Prepare failed: pop saved callee + padding, fall back.
-        self.masm.bind_label(&mut mono_hit_prepare_fail);
-        self.masm.add_ri(Reg64::Rsp, 16); // discard padding + callee
-
         self.masm.bind_label(&mut mono_hit_deopt);
         self.masm
             .mov_load_base_disp32(Reg64::Rdi, Reg64::Rbp, off_callee);
