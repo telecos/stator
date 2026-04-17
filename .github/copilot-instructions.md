@@ -47,9 +47,9 @@ cargo test --workspace
 
 ## Project Structure
 
-- Engine internals: `crates/stator_js/src/`
-- C-ABI FFI surface: `crates/stator_js_ffi/src/`
-- Test262 harness: `crates/stator_js_test262/src/`
+- Engine internals: `crates/stator_jse/src/`
+- C-ABI FFI surface: `crates/stator_jse_ffi/src/`
+- Test262 harness: `crates/stator_jse_test262/src/`
 - CLI shell: `crates/st8/src/`
 - Demo app (C++): `examples/mini_browser/`
 - Fuzz targets: `fuzz/`

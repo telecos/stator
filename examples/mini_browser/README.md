@@ -36,8 +36,8 @@ From the **workspace root**:
 cargo build --release
 ```
 
-This produces `target/release/libstator_js_ffi.a` (Linux/macOS) or
-`target/release/stator_js_ffi.lib` (Windows).
+This produces `target/release/libstator_jse_ffi.a` (Linux/macOS) or
+`target/release/stator_jse_ffi.lib` (Windows).
 
 ### 2 — Build `mini_browser`
 
@@ -80,7 +80,7 @@ examples/mini_browser/
 ├── CMakeLists.txt        # CMake build definition
 ├── README.md             # This file
 ├── include/
-│   └── stator.h          # C header mirroring crates/stator_js_ffi exports
+│   └── stator.h          # C header mirroring crates/stator_jse_ffi exports
 └── src/
     └── main.cpp          # Minimalistic browser simulation
 ```

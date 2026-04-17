@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "crates/stator_core",
+    "crates/stator_jse",
     "crates/stator_ffi",
     "crates/stator_test262",
     "crates/st8",
@@ -12,7 +12,7 @@ unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
 
 [workspace.dependencies]
-stator_js = { path = "crates/stator_core" }
+stator_jse = { path = "crates/stator_jse" }
 bumpalo = "3.20.2"
 log = "0.4.29"
 env_logger = "0.11.9"
@@ -37,12 +37,12 @@ num-bigint = "0.4.6"
 # Prevent LLVM from creating enormous stack frames in install_globals.
 # At higher opt-levels the inliner/optimizer folds dozens of temporaries
 # into gigantic frames.  The make_* helpers in install_globals.rs carry
-# #[inline(never)] so stator_js can safely use opt-level 3.
-# stator_js_test262 still uses opt-level 1 because it has the same issue
+# #[inline(never)] so stator_jse can safely use opt-level 3.
+# stator_jse_test262 still uses opt-level 1 because it has the same issue
 # and does not need to be fast.
-[profile.release.package.stator_js_test262]
+[profile.release.package.stator_jse_test262]
 opt-level = 1
-[profile.release.package.stator_js]
+[profile.release.package.stator_jse]
 opt-level = 3
 
 # Prevent LTO from recombining the per-crate builds.

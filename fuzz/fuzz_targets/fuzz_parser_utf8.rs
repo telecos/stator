@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use stator_js::parser::preparser::preparse;
+use stator_jse::parser::preparser::preparse;
 
 fuzz_target!(|data: &[u8]| {
     // Only process valid UTF-8 inputs so the fuzzer exercises real JS text
@@ -14,5 +14,5 @@ fuzz_target!(|data: &[u8]| {
     let _ = preparse(source);
 
     // Additionally exercise the scanner on the same UTF-8 source.
-    let _ = stator_js::parser::scanner::Scanner::tokenize_all(source);
+    let _ = stator_jse::parser::scanner::Scanner::tokenize_all(source);
 });

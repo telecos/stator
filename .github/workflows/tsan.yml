@@ -3,7 +3,7 @@ name: ThreadSanitizer
 on:
   pull_request:
     paths:
-      - 'crates/stator_core/src/gc/**'
+      - 'crates/stator_jse/src/gc/**'
       - '.github/workflows/tsan.yml'
       - 'Cargo.lock'
 
@@ -35,11 +35,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-tsan-registry-
 
-      - name: Run TSAN tests – stator_js
+      - name: Run TSAN tests – stator_jse
         env:
           TSAN_OPTIONS: "suppressions=${{ github.workspace }}/scripts/tsan.supp"
         run: >
           cargo +nightly test
-          -p stator_js
+          -p stator_jse
           -Z build-std
           --target x86_64-unknown-linux-gnu

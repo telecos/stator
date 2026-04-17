@@ -129,8 +129,8 @@ jobs:
         with:
           shared-key: "mini-browser"
 
-      - name: Build stator_js_ffi (release)
-        run: cargo build --package stator_js_ffi --release
+      - name: Build stator_jse_ffi (release)
+        run: cargo build --package stator_jse_ffi --release
 
       - name: Build mini_browser
         run: |

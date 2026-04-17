@@ -1374,12 +1374,12 @@ name = "stator-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
- "stator_core",
+ "stator_jse",
  "stator_ffi",
 ]
 
 [[package]]
-name = "stator_core"
+name = "stator_jse"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.11.0",
@@ -1406,7 +1406,7 @@ version = "0.1.0"
 dependencies = [
  "cbindgen",
  "log",
- "stator_core",
+ "stator_jse",
 ]
 
 [[package]]

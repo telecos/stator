@@ -1,8 +1,8 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use stator_js::bytecode::bytecode_generator::BytecodeGenerator;
-use stator_js::parser::parse;
+use stator_jse::bytecode::bytecode_generator::BytecodeGenerator;
+use stator_jse::parser::parse;
 
 fuzz_target!(|data: &[u8]| {
     // Accept arbitrary bytes as UTF-8 source (replace invalid sequences).
@@ -23,7 +23,7 @@ fuzz_target!(|data: &[u8]| {
     // verify that the bytecode itself is well-formed.
     #[cfg(all(target_arch = "x86_64", unix))]
     {
-        use stator_js::compiler::baseline::compiler::{
+        use stator_jse::compiler::baseline::compiler::{
             BaselineCompiler, CompiledCode, FOOTER_SIZE, METADATA_MAGIC,
         };
 

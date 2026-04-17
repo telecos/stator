@@ -11,7 +11,7 @@
 ## Context
 
 Stator currently executes JavaScript through a fetch-decode-dispatch interpreter
-(`crates/stator_js/src/interpreter/mod.rs`).  The interpreter is correct and
+(`crates/stator_jse/src/interpreter/mod.rs`).  The interpreter is correct and
 complete but pays a per-instruction overhead for opcode dispatch, register-file
 indirection, and the Rust function-call frame around every bytecode handler.
 
@@ -31,15 +31,15 @@ The Stator bytecode format is well-suited to this approach:
   well-defined operand signatures (`operand_types()`).
 * [`BytecodeArray`][bca] exposes a decoded `Vec<Instruction>` through
   `instructions()`.
-* The inline-cache (`crates/stator_js/src/ic/`) and feedback-vector
+* The inline-cache (`crates/stator_jse/src/ic/`) and feedback-vector
   infrastructure is already in place to back IC stubs at JIT call sites.
 * The GC `HandleScope` and `TaggedValue` tagging scheme (ADR 001) provides the
   object-model assumptions the JIT must respect.
 
 At the time this decision was made two backend paths were evaluated.
 
-[bca]: ../../crates/stator_js/src/bytecode/bytecode_array.rs
-[op]:  ../../crates/stator_js/src/bytecode/bytecodes.rs
+[bca]: ../../crates/stator_jse/src/bytecode/bytecode_array.rs
+[op]:  ../../crates/stator_jse/src/bytecode/bytecodes.rs
 
 ---
 
@@ -57,7 +57,7 @@ mmap'd as RWX (or RX after sealing), and a function pointer is stored in a
 
 **Pros**
 
-* **Zero new dependencies.**  The entire assembler lives inside `stator_js`
+* **Zero new dependencies.**  The entire assembler lives inside `stator_jse`
   and adds no entries to `Cargo.toml`, preserving the minimal-dependency story
   that guided ADR 001.
 * **Full architecture control.**  The team chooses exactly which native calling
@@ -273,7 +273,7 @@ transfers control (via a `jmp`) to the handler's native PC (looked up in
 
 * **Positive:** Eliminates interpreter dispatch overhead for all JIT-compiled
   functions, improving throughput on arithmetic-intensive JavaScript.
-* **Positive:** The custom assembler stays inside `stator_js` with no
+* **Positive:** The custom assembler stays inside `stator_jse` with no
   additional Cargo dependencies, preserving the minimal-footprint embedding
   story.
 * **Positive:** The 1:1 bytecode→native mapping makes deoptimisation trivial:

@@ -32,7 +32,7 @@ $v8Output | Where-Object { $_ -notmatch "^V8_BENCHMARK_RESULTS_JSON=" } | ForEac
 Write-Host "`n▸ Running Stator (Criterion) benchmarks..." -ForegroundColor Yellow
 Write-Host "  This may take a few minutes..."
 
-$statorOutput = cargo bench --package stator_js --bench engine_benchmarks -- --output-format=bencher 2>&1
+$statorOutput = cargo bench --package stator_jse --bench engine_benchmarks -- --output-format=bencher 2>&1
 $statorLines = $statorOutput | Where-Object { $_ -match "^test .+ bench:" }
 
 # Parse Criterion bencher output: "test <name> ... bench:      1234 ns/iter (+/- 56)"
