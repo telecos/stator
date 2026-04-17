@@ -10929,8 +10929,7 @@ impl<'a> BaselineCompiler<'a> {
             if need_pad {
                 self.masm.push(Reg64::R11);
             }
-            let addr =
-                jit_runtime::jit_runtime_get_rt_ptrs_cell_addr as *const () as i64;
+            let addr = jit_runtime::jit_runtime_get_rt_ptrs_cell_addr as *const () as i64;
             self.masm.mov_ri(Reg64::R11, addr);
             self.masm.call_reg(Reg64::R11);
             self.masm.mov_rr(Reg64::R15, Reg64::Rax);
@@ -11584,8 +11583,7 @@ impl<'a> BaselineCompiler<'a> {
                 .mov_load_base_disp32(Reg64::R10, Reg64::R15, RTPTRS_BYTECODE_OFF);
             self.masm
                 .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_ba);
-            self.masm
-                .mov_store_base_disp32(Reg64::R10, 0, Reg64::Rcx);
+            self.masm.mov_store_base_disp32(Reg64::R10, 0, Reg64::Rcx);
 
             // Allocate 128-byte register file.
             self.masm.sub_ri(Reg64::Rsp, 128);
@@ -11615,8 +11613,7 @@ impl<'a> BaselineCompiler<'a> {
                 .mov_load_base_disp32(Reg64::R10, Reg64::R15, RTPTRS_BYTECODE_OFF);
             self.masm
                 .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_caller_ba);
-            self.masm
-                .mov_store_base_disp32(Reg64::R10, 0, Reg64::Rcx);
+            self.masm.mov_store_base_disp32(Reg64::R10, 0, Reg64::Rcx);
 
             // Deopt check: RAX >= i32::MIN means valid result.
             self.masm.cmp_ri(Reg64::Rax, i32::MIN);
@@ -11639,8 +11636,7 @@ impl<'a> BaselineCompiler<'a> {
             self.masm.push(Reg64::Rdi);
             self.masm.push(Reg64::Rdi);
 
-            let get_entry_addr =
-                jit_runtime::jit_runtime_get_jit_entry as *const () as usize;
+            let get_entry_addr = jit_runtime::jit_runtime_get_jit_entry as *const () as usize;
             self.masm.mov_ri(Reg64::R11, get_entry_addr as i64);
             self.masm.call_reg(Reg64::R11);
 
@@ -11654,8 +11650,7 @@ impl<'a> BaselineCompiler<'a> {
             self.masm.mov_rr(Reg64::R10, Reg64::Rdx); // ctx
 
             // ── Populate mono cache ─────────────────────────────────────
-            self.masm
-                .mov_load_base_disp32(Reg64::Rax, Reg64::Rsp, 0);
+            self.masm.mov_load_base_disp32(Reg64::Rax, Reg64::Rsp, 0);
             self.masm
                 .mov_store_base_disp32(Reg64::Rbp, off_callee, Reg64::Rax);
             self.masm
@@ -11666,8 +11661,7 @@ impl<'a> BaselineCompiler<'a> {
             // Read the current BA for caching.
             self.masm.push(Reg64::R11);
             self.masm.push(Reg64::R10);
-            let ba_addr =
-                jit_runtime::jit_runtime_read_current_ba as *const () as usize;
+            let ba_addr = jit_runtime::jit_runtime_read_current_ba as *const () as usize;
             self.masm.mov_ri(Reg64::R11, ba_addr as i64);
             self.masm.call_reg(Reg64::R11);
             self.masm
@@ -11690,20 +11684,15 @@ impl<'a> BaselineCompiler<'a> {
             // Finish direct call (restores BA, context, truncates heap).
             self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
             self.masm.mov_rr(Reg64::Rsi, Reg64::R15);
-            let finish_addr =
-                jit_runtime::jit_runtime_finish_direct_call_r15 as *const () as usize;
+            let finish_addr = jit_runtime::jit_runtime_finish_direct_call_r15 as *const () as usize;
             self.masm.mov_ri(Reg64::R11, finish_addr as i64);
             self.masm.call_reg(Reg64::R11);
 
             // Cache caller's BA for future cache hits.
             {
-                self.masm.mov_load_base_disp32(
-                    Reg64::R10,
-                    Reg64::R15,
-                    RTPTRS_BYTECODE_OFF,
-                );
                 self.masm
-                    .mov_load_base_disp32(Reg64::Rcx, Reg64::R10, 0);
+                    .mov_load_base_disp32(Reg64::R10, Reg64::R15, RTPTRS_BYTECODE_OFF);
+                self.masm.mov_load_base_disp32(Reg64::Rcx, Reg64::R10, 0);
                 self.masm
                     .mov_store_base_disp32(Reg64::Rbp, off_caller_ba, Reg64::Rcx);
             }
@@ -11728,8 +11717,7 @@ impl<'a> BaselineCompiler<'a> {
             self.masm.bind_label(&mut stub_fallback);
             self.masm.pop(Reg64::R11); // padding
             self.masm.pop(Reg64::Rdi); // callee
-            let stub_addr =
-                jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
+            let stub_addr = jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
             self.masm.mov_ri(Reg64::R11, stub_addr as i64);
             self.masm.call_reg(Reg64::R11);
 
@@ -12209,8 +12197,7 @@ impl<'a> BaselineCompiler<'a> {
                 .count() as i32;
             self.mono_call_sites = call0_sites;
 
-            let mut cache_map =
-                Self::analyze_register_caching(&instructions, &byte_offsets, n);
+            let mut cache_map = Self::analyze_register_caching(&instructions, &byte_offsets, n);
             // If there are call sites, reserve R15 for RT_PTRS instead of
             // register caching.
             if call0_sites > 0 {
