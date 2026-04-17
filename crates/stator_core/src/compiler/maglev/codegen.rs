@@ -7919,8 +7919,28 @@ impl<'a> MaglevCodegen<'a> {
                     }
                     let derived = match node {
                         ValueNode::GenericAdd { left, right, .. }
-                        | ValueNode::GenericSubtract { left, right, .. }
-                        | ValueNode::GenericMultiply { left, right, .. }
+                        | ValueNode::GenericSubtract { left, right, .. } => {
+                            // Both inputs smi_guarded.
+                            (set.contains(left) && set.contains(right))
+                            // Half-known: one input is provably i32, the
+                            // other is unknown.  Codegen will Smi-check the
+                            // unknown input and emit 32-bit ADD/SUB + JO
+                            // deopt.  Only apply when all consumers are
+                            // arithmetic-compatible (integer-context pattern
+                            // like `(a + b) | 0`), minimising gratuitous
+                            // deopts.
+                            || ((i32_range.contains(left)
+                                || i32_range.contains(right))
+                                && consumers_of.get(id).is_some_and(|cs| {
+                                    !cs.is_empty()
+                                        && cs.iter().all(|c| {
+                                            node_lookup.get(c).is_some_and(|n| {
+                                                Self::is_arithmetic_compatible_consumer(n)
+                                            })
+                                        })
+                                }))
+                        }
+                        ValueNode::GenericMultiply { left, right, .. }
                         | ValueNode::GenericBitwiseOr { left, right, .. }
                         | ValueNode::GenericBitwiseAnd { left, right, .. }
                         | ValueNode::GenericBitwiseXor { left, right, .. } => {
@@ -7972,8 +7992,22 @@ impl<'a> MaglevCodegen<'a> {
                     let ok = match node {
                         ValueNode::Phi { inputs } => inputs.iter().all(|inp| set.contains(inp)),
                         ValueNode::GenericAdd { left, right, .. }
-                        | ValueNode::GenericSubtract { left, right, .. }
-                        | ValueNode::GenericMultiply { left, right, .. }
+                        | ValueNode::GenericSubtract { left, right, .. } => {
+                            // Both inputs smi_guarded OR half-known
+                            // (one i32_range + arithmetic consumers).
+                            (set.contains(left) && set.contains(right))
+                                || ((i32_range.contains(left)
+                                    || i32_range.contains(right))
+                                    && consumers_of.get(id).is_some_and(|cs| {
+                                        !cs.is_empty()
+                                            && cs.iter().all(|c| {
+                                                node_lookup.get(c).is_some_and(|n| {
+                                                    Self::is_arithmetic_compatible_consumer(n)
+                                                })
+                                            })
+                                    }))
+                        }
+                        ValueNode::GenericMultiply { left, right, .. }
                         | ValueNode::GenericBitwiseOr { left, right, .. }
                         | ValueNode::GenericBitwiseAnd { left, right, .. }
                         | ValueNode::GenericBitwiseXor { left, right, .. } => {
