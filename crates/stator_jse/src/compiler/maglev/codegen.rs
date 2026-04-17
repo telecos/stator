@@ -2451,7 +2451,15 @@ impl<'a> MaglevCodegen<'a> {
                 }
                 packed |= (names.len() as u64) << 60;
 
-                self.masm.mov_ri(Reg64::Rdi, i64::from(*feedback_slot));
+                // u32::MAX is the sentinel for CreateEmptyObjectLiteral
+                // fusions that must bypass the template cache.  Emit -1 so
+                // the runtime's `if feedback_slot >= 0` guard skips caching.
+                let slot_i64 = if *feedback_slot == u32::MAX {
+                    -1i64
+                } else {
+                    i64::from(*feedback_slot)
+                };
+                self.masm.mov_ri(Reg64::Rdi, slot_i64);
                 self.masm.mov_ri(Reg64::Rsi, packed as i64);
 
                 let addr =

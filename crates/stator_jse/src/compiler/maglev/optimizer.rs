@@ -2197,9 +2197,14 @@ fn fuse_object_literal_stores_in_block(block: &mut BasicBlock) {
                 flags,
                 ..
             } => (*feedback_slot, *flags),
-            // Extend fusion to CreateEmptyObjectLiteral — uses default
-            // feedback_slot 0 and flags 0.
-            ValueNode::CreateEmptyObjectLiteral => (0, 0),
+            // Extend fusion to CreateEmptyObjectLiteral.  Use u32::MAX as
+            // a sentinel so the codegen emits feedback_slot = -1, which
+            // tells the runtime stub to skip the template cache entirely.
+            // Without this, every fused CreateEmptyObjectLiteral shares
+            // feedback_slot 0, causing template-cache collisions when
+            // multiple empty-object literals appear in the same function
+            // (e.g. nested object initializers like `{ a: { b: ... } }`).
+            ValueNode::CreateEmptyObjectLiteral => (u32::MAX, 0),
             _ => {
                 i += 1;
                 continue;

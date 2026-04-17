@@ -3436,6 +3436,129 @@ mod tests {
         );
     }
 
+    /// Verify register allocation is valid for the deep_object_access_1k
+    /// pattern — hoisted LoadNamedGeneric chains must keep their results
+    /// live across the loop body.
+    #[test]
+    fn test_deep_object_regalloc_allocations_valid() {
+        use crate::compiler::maglev::regalloc::{Location, allocate};
+
+        let source = r#"
+            var root = { a: { b: { c: { d: { e: 99 } } } } };
+            var sum = 0;
+            for (var i = 0; i < 1000; i++) {
+                sum = sum + root.a.b.c.d.e;
+            }
+            sum;
+        "#;
+        let graph = compile_and_optimize(source, "deep_regalloc");
+
+        let num_regs = 8u32;
+        let alloc = allocate(&graph, num_regs);
+
+        // Collect all LoadNamedGeneric, GenericAdd, and Phi nodes.
+        let mut load_named = Vec::new();
+        let mut generic_adds = Vec::new();
+        let mut phis = Vec::new();
+        for (blk_idx, block) in graph.blocks().iter().enumerate() {
+            for (id, node) in &block.nodes {
+                match node {
+                    ValueNode::LoadNamedGeneric { .. } => {
+                        load_named.push((*id, blk_idx));
+                    }
+                    ValueNode::GenericAdd { .. } => {
+                        generic_adds.push(*id);
+                    }
+                    ValueNode::Phi { .. } => {
+                        phis.push(*id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        eprintln!("LoadNamedGeneric: {load_named:?}");
+        eprintln!("GenericAdd: {generic_adds:?}");
+        eprintln!("Phi: {phis:?}");
+        eprintln!("Spill count: {}", alloc.spill_count());
+
+        // Every LoadNamedGeneric must have a valid allocation.
+        for (id, blk) in &load_named {
+            let loc = alloc.location(*id);
+            eprintln!("  LoadNamedGeneric {id:?} (block {blk}) → {loc:?}");
+            assert!(
+                matches!(
+                    loc,
+                    Some(Location::Register(_)) | Some(Location::StackSlot(_))
+                ),
+                "LoadNamedGeneric {id:?} in block {blk} has no allocation — \
+                 emit_load would produce JIT_UNDEFINED"
+            );
+        }
+
+        // Every GenericAdd input must have a valid allocation.
+        for block in graph.blocks() {
+            for (id, node) in &block.nodes {
+                if let ValueNode::GenericAdd { left, right, .. } = node {
+                    let ll = alloc.location(*left);
+                    let rl = alloc.location(*right);
+                    eprintln!("  GenericAdd {id:?}: left {left:?}={ll:?}, right {right:?}={rl:?}");
+                    assert!(
+                        ll.is_some(),
+                        "GenericAdd {id:?} left input {left:?} has None allocation"
+                    );
+                    assert!(
+                        rl.is_some(),
+                        "GenericAdd {id:?} right input {right:?} has None allocation"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Regression test: fused CreateEmptyObjectLiteral nodes must use the
+    /// u32::MAX sentinel as feedback_slot so the runtime skips template
+    /// caching.  Previously all fused empty-object literals shared slot 0,
+    /// causing template-cache collisions that corrupted property names of
+    /// nested object initializers and led to persistent JIT deopts.
+    #[test]
+    fn test_fused_empty_object_literal_uses_sentinel_feedback_slot() {
+        let source = r#"
+            var root = { a: { b: { c: { d: { e: 99 } } } } };
+            root;
+        "#;
+        let graph = compile_and_optimize(source, "fused_sentinel");
+
+        let mut fused_slots = Vec::new();
+        for block in graph.blocks() {
+            for (_id, node) in &block.nodes {
+                if let ValueNode::CreateObjectLiteralWithProperties {
+                    feedback_slot,
+                    ..
+                } = node
+                {
+                    fused_slots.push(*feedback_slot);
+                }
+            }
+        }
+
+        eprintln!("Fused CreateObjectLiteralWithProperties feedback_slots: {fused_slots:?}");
+        assert!(
+            !fused_slots.is_empty(),
+            "Expected at least one fused CreateObjectLiteralWithProperties node"
+        );
+
+        // Every fused node that originated from CreateEmptyObjectLiteral
+        // must use the sentinel u32::MAX, not 0.
+        for &slot in &fused_slots {
+            assert_eq!(
+                slot,
+                u32::MAX,
+                "Fused CreateEmptyObjectLiteral should use sentinel u32::MAX, got {slot}"
+            );
+        }
+    }
+
     // ── Keyed property specialization ────────────────────────────────────────
 
     /// When the feedback slot for `LdaKeyedProperty` is `Monomorphic`,
@@ -3829,6 +3952,100 @@ mod tests {
         assert!(
             !graph.is_degenerate(),
             "deep_object arrow function graph is degenerate — Maglev won't compile it"
+        );
+    }
+
+    #[test]
+    fn test_closure_counter_bytecodes_and_graph() {
+        use crate::bytecode::bytecode_array::ConstantPoolEntry;
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::compiler::maglev::optimizer::optimize;
+        use crate::parser::recursive_descent;
+
+        // Test the FULL benchmark script (top-level) — this is what actually
+        // needs to be JIT-compiled for the benchmark to be fast.
+        let source = r#"
+            function make_counter() {
+                var count = 0;
+                return function() { count = count + 1; return count; };
+            }
+            var counter = make_counter();
+            var result = 0;
+            for (var i = 0; i < 1000; i++) {
+                result = counter();
+            }
+            result;
+        "#;
+
+        let program = recursive_descent::parse(source).unwrap();
+        let script_ba = BytecodeGenerator::compile_program(&program).unwrap();
+
+        // Dump top-level bytecodes
+        eprintln!("top-level script bytecodes:");
+        let top_instrs = script_ba.instructions().unwrap();
+        for (idx, instr) in top_instrs.iter().enumerate() {
+            eprintln!("  [{idx:3}] {:?} {:?}", instr.opcode, instr.operands());
+        }
+
+        // Build graph for the top-level script
+        let feedback = FeedbackVector::new(script_ba.feedback_metadata());
+        let result = GraphBuilder::build(&script_ba, &feedback);
+        match result {
+            Ok(mut graph) => {
+                optimize(&mut graph);
+                let degen = graph.is_degenerate();
+                eprintln!("\ntop-level graph: is_degenerate={degen}");
+                for block in graph.blocks() {
+                    eprintln!(
+                        "  block {} has {} nodes, control={:?}",
+                        block.id,
+                        block.nodes.len(),
+                        block.control
+                    );
+                    for (nid, node) in &block.nodes {
+                        eprintln!("    {nid:?} = {node:?}");
+                    }
+                }
+                assert!(
+                    !degen,
+                    "closure_counter_1k top-level script graph is degenerate — Maglev won't compile the hot loop"
+                );
+            }
+            Err(e) => {
+                panic!("GraphBuilder::build failed for top-level script: {e}");
+            }
+        }
+
+        // Also check inner closure
+        let make_counter_ba = script_ba
+            .constant_pool()
+            .iter()
+            .find_map(|entry| match entry {
+                ConstantPoolEntry::Function(ba) => Some(ba.clone()),
+                _ => None,
+            })
+            .expect("should find make_counter BA");
+        let inner_ba = make_counter_ba
+            .constant_pool()
+            .iter()
+            .find_map(|entry| match entry {
+                ConstantPoolEntry::Function(ba) => Some(ba.clone()),
+                _ => None,
+            })
+            .expect("should find inner closure BA");
+
+        eprintln!("\ninner closure bytecodes:");
+        let inner_instrs = inner_ba.instructions().unwrap();
+        for (idx, instr) in inner_instrs.iter().enumerate() {
+            eprintln!("  [{idx:3}] {:?} {:?}", instr.opcode, instr.operands());
+        }
+
+        let inner_feedback = FeedbackVector::new(inner_ba.feedback_metadata());
+        let mut inner_graph = GraphBuilder::build(&inner_ba, &inner_feedback).unwrap();
+        optimize(&mut inner_graph);
+        assert!(
+            !inner_graph.is_degenerate(),
+            "inner closure graph is degenerate"
         );
     }
 }
