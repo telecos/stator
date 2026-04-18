@@ -1205,6 +1205,9 @@ impl BytecodeArray {
 
     /// Like [`promote_object_literal_template`](Self::promote_object_literal_template)
     /// but returns a pooled `Rc<RefCell<PropertyMap>>`.
+    ///
+    /// Pre-warms the pool after promotion for the same reason as
+    /// [`promote_object_literal_template_with_values_pooled`].
     pub fn promote_object_literal_template_pooled(
         &self,
         slot: u32,
@@ -1221,6 +1224,7 @@ impl BytecodeArray {
         let template = ObjectLiteralTemplate::capture(&first_borrow)?;
         let rc = acquire_object_rc_from_template(&template);
         drop(first_borrow);
+        template.pre_warm_pool();
         self.object_literal_templates
             .borrow_mut()
             .insert(slot, ObjectLiteralCacheEntry::Cached(Box::new(template)));
@@ -1245,6 +1249,10 @@ impl BytecodeArray {
 
     /// Like [`promote_object_literal_template_with_values`](Self::promote_object_literal_template_with_values)
     /// but returns a pooled `Rc<RefCell<PropertyMap>>`.
+    ///
+    /// After promoting the template, pre-warms the object pool so that
+    /// subsequent IC-hit iterations in the same invocation can skip
+    /// per-object allocation entirely.
     pub fn promote_object_literal_template_with_values_pooled(
         &self,
         slot: u32,
@@ -1262,6 +1270,10 @@ impl BytecodeArray {
         let template = ObjectLiteralTemplate::capture(&first_borrow)?;
         let rc = acquire_object_rc_from_template_with_values(&template, values);
         drop(first_borrow);
+        // Pre-warm the pool so that subsequent IC-hit iterations in the
+        // same function invocation find pool entries immediately,
+        // avoiding per-object Rc::new allocation.
+        template.pre_warm_pool();
         self.object_literal_templates
             .borrow_mut()
             .insert(slot, ObjectLiteralCacheEntry::Cached(Box::new(template)));

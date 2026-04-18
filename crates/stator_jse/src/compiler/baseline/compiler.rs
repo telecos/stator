@@ -8291,7 +8291,9 @@ pub(crate) mod jit_runtime {
         if feedback_slot >= 0 {
             let slot = feedback_slot as u32;
 
-            let ptrs = RT_PTRS.with(|p| p.get());
+            // Use as_ptr() to borrow in-place, avoiding a full struct copy.
+            // SAFETY: single-threaded JIT; Cell is not mutated during call.
+            let ptrs: &RtPtrs = unsafe { &*RT_PTRS.with(|p| p.as_ptr()) };
             let ba = if ptrs.is_cached() {
                 // SAFETY: cached pointer valid for thread lifetime.
                 unsafe { &*ptrs.bytecode }.get()
@@ -8315,7 +8317,7 @@ pub(crate) mod jit_runtime {
                     let template = unsafe { &*ic.template };
                     let rc = acquire_object_rc_from_template_cached(template, ptrs.object_rc_pool);
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, ptrs));
                 }
 
                 // Fast path: template cached in BA — populate the IC.
@@ -8329,7 +8331,7 @@ pub(crate) mod jit_runtime {
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, ptrs));
                 }
 
                 // Second execution: promote pending → cached, then
@@ -8344,7 +8346,7 @@ pub(crate) mod jit_runtime {
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, ptrs));
                 }
 
                 // First execution: create fresh and register as
@@ -8353,7 +8355,7 @@ pub(crate) mod jit_runtime {
                 let rc = Rc::new(RefCell::new(map));
                 ba_ref.set_object_literal_pending(slot, Rc::clone(&rc));
                 let obj = JsValue::PlainObject(rc);
-                return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                return Some(alloc_heap_handle_no_dedup(obj, ptrs));
             }
         }
 
@@ -8425,7 +8427,10 @@ pub(crate) mod jit_runtime {
         let count = ((names_packed_u64 >> 60) & 0xF) as usize;
         let vals = [val0, val1, val2, val3, val4];
 
-        let ptrs = RT_PTRS.with(|p| p.get());
+        // Use as_ptr() to borrow the RtPtrs in place, avoiding a 96-byte
+        // struct copy on the hot path.
+        // SAFETY: single-threaded JIT; the Cell is not mutated during this call.
+        let ptrs: &RtPtrs = unsafe { &*RT_PTRS.with(|p| p.as_ptr()) };
 
         if feedback_slot >= 0 {
             let slot = feedback_slot as u32;
@@ -8455,7 +8460,7 @@ pub(crate) mod jit_runtime {
                         ptrs.object_rc_pool,
                     );
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, ptrs));
                 }
 
                 // ── Hot path: template cached in BA — populate IC ──
@@ -8471,7 +8476,7 @@ pub(crate) mod jit_runtime {
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, ptrs));
                 }
 
                 // ── Promote path (second execution) ──
@@ -8487,7 +8492,7 @@ pub(crate) mod jit_runtime {
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, ptrs));
                 }
 
                 // ── First execution: create fresh and fill via property stores ──
@@ -8511,7 +8516,7 @@ pub(crate) mod jit_runtime {
                     }
                 }
                 let obj = JsValue::PlainObject(rc);
-                return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                return Some(alloc_heap_handle_no_dedup(obj, ptrs));
             }
         }
 
@@ -8534,7 +8539,7 @@ pub(crate) mod jit_runtime {
             }
         }
         let obj = JsValue::PlainObject(map_rc);
-        Some(alloc_heap_handle_no_dedup(obj, &ptrs))
+        Some(alloc_heap_handle_no_dedup(obj, ptrs))
     }
 
     /// Fast-path object creation that accepts the pre-cached `RT_PTRS`
@@ -8603,13 +8608,17 @@ pub(crate) mod jit_runtime {
         let vals = [val0, val1, val2, val3, val4];
 
         // Resolve RtPtrs from the cached cell pointer, falling back to
-        // TLS if the pointer is null or stale.
-        let ptrs = if rt_ptrs_cell != 0 {
+        // TLS if the pointer is null or stale.  Use as_ptr() to obtain a
+        // reference instead of Cell::get() which copies the full 96-byte
+        // struct — on the IC-hit hot path only a few fields are read.
+        let ptrs: &RtPtrs = if rt_ptrs_cell != 0 {
             // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and
             // the TLS slot lives for the thread's entire lifetime.
-            unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get()
+            // No mutation of the Cell occurs during this function call.
+            unsafe { &*(&*(rt_ptrs_cell as *const Cell<RtPtrs>)).as_ptr() }
         } else {
-            RT_PTRS.with(|p| p.get())
+            // SAFETY: single-threaded JIT; Cell is not mutated during call.
+            unsafe { &*RT_PTRS.with(|p| p.as_ptr()) }
         };
 
         if feedback_slot >= 0 {
@@ -8633,7 +8642,7 @@ pub(crate) mod jit_runtime {
                         ptrs.object_rc_pool,
                     );
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, ptrs));
                 }
 
                 // ── Hot path: template cached in BA — populate IC ──
@@ -8649,7 +8658,7 @@ pub(crate) mod jit_runtime {
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, ptrs));
                 }
 
                 // ── Promote path ──
@@ -8665,7 +8674,7 @@ pub(crate) mod jit_runtime {
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, ptrs));
                 }
 
                 // ── First execution ──
@@ -8688,7 +8697,7 @@ pub(crate) mod jit_runtime {
                     }
                 }
                 let obj = JsValue::PlainObject(rc);
-                return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                return Some(alloc_heap_handle_no_dedup(obj, ptrs));
             }
         }
 
@@ -8710,11 +8719,11 @@ pub(crate) mod jit_runtime {
             }
         }
         let obj = JsValue::PlainObject(map_rc);
-        Some(alloc_heap_handle_no_dedup(obj, &ptrs))
+        Some(alloc_heap_handle_no_dedup(obj, ptrs))
     }
 
     /// Decode a single JIT `i64` register value into a [`JsValue`].
-    #[inline]
+    #[inline(always)]
     fn decode_one_jit_value(v: i64) -> JsValue {
         if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
             JsValue::Smi(v as i32)
@@ -8725,7 +8734,7 @@ pub(crate) mod jit_runtime {
 
     /// Decode up to 5 JIT `i64` register values into a stack-allocated
     /// array, avoiding a `Vec` heap allocation on the fused hot path.
-    #[inline]
+    #[inline(always)]
     fn decode_jit_values_array(count: usize, vals: &[i64; 5]) -> [JsValue; 5] {
         let mut out = [
             JsValue::Undefined,

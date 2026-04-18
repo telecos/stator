@@ -301,13 +301,13 @@ pub(crate) fn acquire_object_rc_from_template_with_values(
                 rc
             } else {
                 Rc::new(RefCell::new(
-                    template.instantiate_with_values(values.to_vec()),
+                    template.instantiate_with_values_from_slice(values),
                 ))
             }
         })
         .unwrap_or_else(|_| {
             Rc::new(RefCell::new(
-                template.instantiate_with_values(values.to_vec()),
+                template.instantiate_with_values_from_slice(values),
             ))
         })
 }
@@ -364,7 +364,10 @@ pub(crate) fn acquire_object_rc_from_template_with_values_cached(
         }
         // Pool miss — batch-allocate entries so that subsequent loop
         // iterations hit the pool instead of allocating individually.
-        for _ in 0..POOL_BATCH_SIZE.saturating_sub(1).min(OBJECT_RC_POOL_CAP - pool.len()) {
+        for _ in 0..POOL_BATCH_SIZE
+            .saturating_sub(1)
+            .min(OBJECT_RC_POOL_CAP - pool.len())
+        {
             pool.push(Rc::new(RefCell::new(template.instantiate())));
         }
     }
@@ -394,6 +397,13 @@ pub(crate) fn acquire_object_rc_from_template_cached(
             let map = unsafe { &mut *rc.as_ptr() };
             map.reinitialize_from_template(template);
             return rc;
+        }
+        // Pool miss — batch-allocate entries for subsequent iterations.
+        for _ in 0..POOL_BATCH_SIZE
+            .saturating_sub(1)
+            .min(OBJECT_RC_POOL_CAP - pool.len())
+        {
+            pool.push(Rc::new(RefCell::new(template.instantiate())));
         }
     }
     Rc::new(RefCell::new(template.instantiate()))
@@ -776,6 +786,23 @@ impl ObjectLiteralTemplate {
             template_next_slot: filled,
             capacity_hint,
         }
+    }
+
+    /// Pre-warm the thread-local object pool with entries instantiated
+    /// from this template.  Called at template-promotion time so that
+    /// subsequent IC-hit iterations find pool entries immediately,
+    /// avoiding per-object `Rc::new` allocation.
+    pub(crate) fn pre_warm_pool(&self) {
+        const PRE_WARM_COUNT: usize = 32;
+        let _ = OBJECT_RC_POOL.try_with(|pool| {
+            // SAFETY: single-threaded JIT runtime.
+            let pool = unsafe { &mut *pool.as_ptr() };
+            let budget = PRE_WARM_COUNT.min(OBJECT_RC_POOL_CAP.saturating_sub(pool.len()));
+            pool.reserve(budget);
+            for _ in 0..budget {
+                pool.push(Rc::new(RefCell::new(self.instantiate())));
+            }
+        });
     }
 }
 
