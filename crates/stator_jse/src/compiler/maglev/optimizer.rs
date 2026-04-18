@@ -173,7 +173,14 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // LoadNamedGeneric with SmiConstants, enabling preheader GenericAdd
     // chains (from fold_invariant_addition_chains) to constant-fold.
     fold_constants(graph);
-    // Targeted late lowering: after store_to_load + fold_constants, some
+    // Re-run invariant chain folding: now that store-to-load has revealed
+    // SmiConstants for property loads, chains like `sum + obj.a + obj.b + …`
+    // become `sum + SmiConst(1) + SmiConst(2) + …` — all addends are
+    // loop-invariant.  This folds them into a single preheader sum.
+    crate::compiler::maglev::licm::fold_invariant_addition_chains(graph);
+    // Fold the new preheader additions (e.g. GenericAdd(1,2) → 3).
+    fold_constants(graph);
+    // Targeted late lowering: after store_to_load + chain folding, some
     // loops have `GenericAdd(accumulator_phi, SmiConstant(K))` where the
     // constant was only revealed by forwarding.  Convert these to Int32Add
     // when init and addend are known-safe Smi constants.
