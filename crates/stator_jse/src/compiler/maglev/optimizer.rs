@@ -176,7 +176,9 @@ pub fn optimize(graph: &mut MaglevGraph) {
     eliminate_dead_object_stores(graph);
     eliminate_dead_allocations(graph);
     replace_dead_arguments(graph);
-    strength_reduce_induction_variables(graph);
+    // NOTE: IV strength reduction disabled — caused 38% arithmetic regression
+    // (8.2µs → 11.3µs) due to extra register pressure and dependency chains.
+    // strength_reduce_induction_variables(graph);
     unroll_simple_loops(graph);
     eliminate_dead_code(graph);
 }
@@ -3997,6 +3999,7 @@ fn find_increment_step(graph: &MaglevGraph, result_id: NodeId, base_id: NodeId) 
 /// This eliminates multiplies from the loop body's critical path, replacing
 /// them with adds.  For example, `i * 3` becomes a new IV that increments
 /// by 3 each iteration.
+#[allow(dead_code)]
 fn strength_reduce_induction_variables(graph: &mut MaglevGraph) {
     let loops = licm::detect_loops(graph);
     for lp in &loops {
@@ -4004,6 +4007,7 @@ fn strength_reduce_induction_variables(graph: &mut MaglevGraph) {
     }
 }
 
+#[allow(dead_code)]
 fn strength_reduce_iv_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
     let header_idx = lp.header;
 
