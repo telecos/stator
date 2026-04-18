@@ -785,11 +785,14 @@ pub fn allocate(graph: &MaglevGraph, num_regs: u32) -> AllocationResult {
         // and reducing register pressure in the loop body.
         if let Some(&pref_reg) = phi_affinity_reg.get(&iv.id)
             && let Some(&phi_id) = phi_affinity_phi.get(&iv.id)
-            && let Some(active_idx) =
-                active.iter().position(|(r, aiv)| *r == pref_reg && aiv.id == phi_id)
+            && let Some(active_idx) = active
+                .iter()
+                .position(|(r, aiv)| *r == pref_reg && aiv.id == phi_id)
         {
-            let phi_eff_end =
-                active[active_idx].1.pre_ext_end.unwrap_or(active[active_idx].1.end);
+            let phi_eff_end = active[active_idx]
+                .1
+                .pre_ext_end
+                .unwrap_or(active[active_idx].1.end);
             if phi_eff_end <= iv.start + 1 {
                 active.remove(active_idx);
                 free_regs.push(pref_reg);
@@ -1069,8 +1072,7 @@ fn coalesce_loop_phis(
                     eprintln!(
                         "[regalloc] coalesce FAIL (live-range overlap): \
                          phi {:?} (R{}, eff_end={}) ← back {:?} (R{}, start={})",
-                        phi_id, phi_reg, phi_effective_end,
-                        back_input, back_reg, back_iv.start
+                        phi_id, phi_reg, phi_effective_end, back_input, back_reg, back_iv.start
                     );
                     continue;
                 }
