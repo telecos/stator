@@ -213,8 +213,25 @@ pub fn optimize(graph: &mut MaglevGraph) {
 /// node is replaced in-place with the folded constant; the old `NodeId` for
 /// that position is re-used so downstream references remain valid.
 fn fold_constants(graph: &mut MaglevGraph) {
+    // Pre-populate constant map from ALL blocks so cross-block constant
+    // operands can be folded (e.g. SmiConstants defined in the entry block
+    // used by chain-folded GenericAdds placed in the preheader by LICM).
+    let mut consts: HashMap<NodeId, ConstVal> = HashMap::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            match node {
+                ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } => {
+                    consts.insert(*id, ConstVal::I32(*value));
+                }
+                ValueNode::Float64Constant { value } => {
+                    consts.insert(*id, ConstVal::F64(*value));
+                }
+                _ => {}
+            }
+        }
+    }
     for block in graph.blocks_mut() {
-        fold_block_constants(block);
+        fold_block_constants(block, &mut consts);
     }
 }
 
@@ -225,13 +242,12 @@ enum ConstVal {
     F64(f64),
 }
 
-/// Fold constants within a single [`BasicBlock`].
-fn fold_block_constants(block: &mut BasicBlock) {
-    // Map from NodeId → known constant value for nodes already processed.
-    let mut consts: HashMap<NodeId, ConstVal> = HashMap::new();
-
+/// Fold constants within a single [`BasicBlock`], using a shared constant map
+/// that spans all blocks so cross-block references to literal constants (and
+/// previously folded results) are visible.
+fn fold_block_constants(block: &mut BasicBlock, consts: &mut HashMap<NodeId, ConstVal>) {
     for (id, node) in &mut block.nodes {
-        // Seed the constant map from literal constant nodes.
+        // Seed the constant map from literal constant nodes in this block.
         match node {
             ValueNode::Int32Constant { value } => {
                 consts.insert(*id, ConstVal::I32(*value));
@@ -252,15 +268,15 @@ fn fold_block_constants(block: &mut BasicBlock) {
         let folded: Option<ValueNode> = match node {
             // ── Binary Int32 / CheckedSmi ─────────────────────────────────
             ValueNode::Int32Add { left, right } | ValueNode::CheckedSmiAdd { left, right } => {
-                fold_i32_bin(left, right, &consts, |a, b| a.wrapping_add(b))
+                fold_i32_bin(left, right, consts, |a, b| a.wrapping_add(b))
             }
             ValueNode::Int32Subtract { left, right }
             | ValueNode::CheckedSmiSubtract { left, right } => {
-                fold_i32_bin(left, right, &consts, |a, b| a.wrapping_sub(b))
+                fold_i32_bin(left, right, consts, |a, b| a.wrapping_sub(b))
             }
             ValueNode::Int32Multiply { left, right }
             | ValueNode::CheckedSmiMultiply { left, right } => {
-                fold_i32_bin(left, right, &consts, |a, b| a.wrapping_mul(b))
+                fold_i32_bin(left, right, consts, |a, b| a.wrapping_mul(b))
             }
             ValueNode::Int32Divide { left, right }
             | ValueNode::CheckedSmiDivide { left, right } => {
@@ -324,19 +340,19 @@ fn fold_block_constants(block: &mut BasicBlock) {
 
             // ── Binary Float64 ────────────────────────────────────────────
             ValueNode::Float64Add { left, right } => {
-                fold_f64_bin(left, right, &consts, |a, b| a + b)
+                fold_f64_bin(left, right, consts, |a, b| a + b)
             }
             ValueNode::Float64Subtract { left, right } => {
-                fold_f64_bin(left, right, &consts, |a, b| a - b)
+                fold_f64_bin(left, right, consts, |a, b| a - b)
             }
             ValueNode::Float64Multiply { left, right } => {
-                fold_f64_bin(left, right, &consts, |a, b| a * b)
+                fold_f64_bin(left, right, consts, |a, b| a * b)
             }
             ValueNode::Float64Divide { left, right } => {
-                fold_f64_bin(left, right, &consts, |a, b| a / b)
+                fold_f64_bin(left, right, consts, |a, b| a / b)
             }
             ValueNode::Float64Modulus { left, right } => {
-                fold_f64_bin(left, right, &consts, |a, b| a % b)
+                fold_f64_bin(left, right, consts, |a, b| a % b)
             }
 
             // ── Unary Float64 ─────────────────────────────────────────────
@@ -350,24 +366,24 @@ fn fold_block_constants(block: &mut BasicBlock) {
 
             // ── Int32 bitwise ────────────────────────────────────────────
             ValueNode::Int32BitwiseOr { left, right } => {
-                fold_i32_bin(left, right, &consts, |a, b| a | b)
+                fold_i32_bin(left, right, consts, |a, b| a | b)
             }
             ValueNode::Int32BitwiseAnd { left, right } => {
-                fold_i32_bin(left, right, &consts, |a, b| a & b)
+                fold_i32_bin(left, right, consts, |a, b| a & b)
             }
             ValueNode::Int32BitwiseXor { left, right } => {
-                fold_i32_bin(left, right, &consts, |a, b| a ^ b)
+                fold_i32_bin(left, right, consts, |a, b| a ^ b)
             }
 
             // ── Generic arithmetic (same as Int32 when both inputs are i32 constants)
             ValueNode::GenericAdd { left, right, .. } => {
-                fold_smi_bin(left, right, &consts, |a, b| a.wrapping_add(b))
+                fold_smi_bin(left, right, consts, |a, b| a.wrapping_add(b))
             }
             ValueNode::GenericSubtract { left, right, .. } => {
-                fold_smi_bin(left, right, &consts, |a, b| a.wrapping_sub(b))
+                fold_smi_bin(left, right, consts, |a, b| a.wrapping_sub(b))
             }
             ValueNode::GenericMultiply { left, right, .. } => {
-                fold_smi_bin(left, right, &consts, |a, b| a.wrapping_mul(b))
+                fold_smi_bin(left, right, consts, |a, b| a.wrapping_mul(b))
             }
             ValueNode::GenericIncrement { value, .. } => {
                 if let Some(ConstVal::I32(v)) = consts.get(value) {
@@ -2820,7 +2836,15 @@ fn forward_invariant_object_properties(graph: &mut MaglevGraph) {
     for block in graph.blocks() {
         for (id, node) in &block.nodes {
             if let ValueNode::LoadNamedGeneric { object, name, .. } = node {
-                let resolved = load_global_alias.get(object).copied().unwrap_or(*object);
+                let mut resolved = load_global_alias.get(object).copied().unwrap_or(*object);
+                // Chain through prior substitutions for nested object access
+                // (e.g. root.a.b.c.d.e where each level is a
+                // CreateObjectLiteralWithProperties).
+                if !obj_props.contains_key(&resolved)
+                    && let Some(&sub) = subst.get(&resolved)
+                {
+                    resolved = sub;
+                }
                 if let Some(props) = obj_props.get(&resolved)
                     && let Some(&value) = props.get(name)
                 {
@@ -6257,6 +6281,72 @@ mod tests {
             assert_eq!(
                 *value, val_a,
                 "Expected LoadNamedGeneric to be forwarded to SmiConstant(42), got {:?}",
+                value
+            );
+        } else {
+            panic!("Expected Return control node");
+        }
+    }
+
+    #[test]
+    fn test_forward_nested_object_properties() {
+        // Simulates: var root = { a: { b: 99 } };
+        // LoadGlobal("root") → LoadNamedGeneric(_, "a") → LoadNamedGeneric(_, "b")
+        // Should resolve the entire chain to SmiConstant(99).
+        let mut graph = MaglevGraph::new(0);
+
+        // Block 0: entry
+        let mut entry = BasicBlock::new(0);
+        let val_b = entry.push_value(ValueNode::SmiConstant { value: 99 });
+        let inner = entry.push_value(ValueNode::CreateObjectLiteralWithProperties {
+            feedback_slot: u32::MAX,
+            flags: 0,
+            names: vec![7], // name index 7 = "b"
+            values: vec![val_b],
+        });
+        let outer = entry.push_value(ValueNode::CreateObjectLiteralWithProperties {
+            feedback_slot: u32::MAX,
+            flags: 0,
+            names: vec![5], // name index 5 = "a"
+            values: vec![inner],
+        });
+        entry.push_value(ValueNode::StoreGlobal {
+            name: 10,
+            value: outer,
+            feedback_slot: 1,
+        });
+        entry.set_control(ControlNode::Jump { target: 1 });
+        graph.add_block(entry);
+
+        // Block 1: chained property access
+        let mut body = BasicBlock::new(1);
+        let root_load = body.push_value(ValueNode::LoadGlobal {
+            name: 10,
+            feedback_slot: 2,
+        });
+        let load_a = body.push_value(ValueNode::LoadNamedGeneric {
+            object: root_load,
+            name: 5, // "a"
+            feedback_slot: 3,
+        });
+        let load_b = body.push_value(ValueNode::LoadNamedGeneric {
+            object: load_a,
+            name: 7, // "b"
+            feedback_slot: 4,
+        });
+        body.set_control(ControlNode::Return { value: load_b });
+        graph.add_block(body);
+
+        fuse_object_literal_stores(&mut graph);
+        forward_invariant_object_properties(&mut graph);
+
+        // load_b should resolve to val_b (SmiConstant 99)
+        let block1 = &graph.blocks()[1];
+        let ret = block1.control.as_ref().unwrap();
+        if let ControlNode::Return { value } = ret {
+            assert_eq!(
+                *value, val_b,
+                "Expected nested LoadNamedGeneric to resolve to SmiConstant(99), got {:?}",
                 value
             );
         } else {
