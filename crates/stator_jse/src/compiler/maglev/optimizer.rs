@@ -173,6 +173,13 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // LoadNamedGeneric with SmiConstants, enabling preheader GenericAdd
     // chains (from fold_invariant_addition_chains) to constant-fold.
     fold_constants(graph);
+    // Post-store-to-load range analysis: after store-to-load + constant
+    // folding, loops like `sum = sum + obj.a + obj.b + ...` have been
+    // reduced to `sum = sum + SmiConstant(K)`.  Run range analysis to
+    // convert the remaining GenericAdd → CheckedSmiAdd → Int32Add, since
+    // the constant input proves the accumulator stays in integer range.
+    crate::compiler::maglev::range_analysis::eliminate_overflow_checks(graph);
+    strength_reduce(graph);
     eliminate_dead_object_stores(graph);
     eliminate_dead_allocations(graph);
     replace_dead_arguments(graph);
@@ -3719,7 +3726,11 @@ fn apply_subst_to_control_node(ctrl: &mut ControlNode, resolve: &impl Fn(NodeId)
 fn unroll_simple_loops(graph: &mut MaglevGraph) {
     let loops = licm::detect_loops(graph);
     for lp in &loops {
-        try_unroll_counted_loop(graph, lp, 2);
+        // Try 4x first (better for large loops like arithmetic_loop_10k),
+        // fall back to 2x if trip count isn't divisible by 4.
+        if !try_unroll_counted_loop(graph, lp, 4) {
+            try_unroll_counted_loop(graph, lp, 2);
+        }
     }
 }
 
