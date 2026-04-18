@@ -1694,36 +1694,66 @@ fn strength_reduce_block(block: &mut BasicBlock, next_id: &mut u32) {
     // Identify multiply-by-power-of-two patterns.
     // Each entry: (position, non-constant operand, shift amount).
     let mut reductions: Vec<(usize, NodeId, u32)> = Vec::new();
+    // Shift-add decompositions for non-power-of-two: (2^k ± 1).
+    // Entry: (position, operand, shift_amount, is_add).
+    // is_add=true: x*(2^k+1) → (x<<k)+x, is_add=false: x*(2^k-1) → (x<<k)-x.
+    let mut shift_add_reductions: Vec<(usize, NodeId, u32, bool)> = Vec::new();
+
     for (pos, (_, node)) in block.nodes.iter().enumerate() {
-        if let ValueNode::Int32Multiply { left, right } = node
-            && let Some((operand, shift)) = find_power_of_two_operand(*left, *right, &consts)
-        {
-            reductions.push((pos, operand, shift));
+        if let ValueNode::Int32Multiply { left, right } = node {
+            if let Some((operand, shift)) = find_power_of_two_operand(*left, *right, &consts) {
+                reductions.push((pos, operand, shift));
+            } else if let Some((operand, shift, is_add)) =
+                find_shift_add_decomposition(*left, *right, &consts)
+            {
+                shift_add_reductions.push((pos, operand, shift, is_add));
+            }
         }
     }
 
-    if reductions.is_empty() {
+    if reductions.is_empty() && shift_add_reductions.is_empty() {
         return;
     }
 
-    // Apply in reverse position order so earlier insertions don't shift later
-    // indices.
-    for (pos, operand, shift_amt) in reductions.into_iter().rev() {
+    // Apply shift-add decompositions in reverse order first (they insert 2 nodes).
+    // x * (2^k+1) → shifted = x << k; result = shifted + x
+    // x * (2^k-1) → shifted = x << k; result = shifted - x
+    for (pos, operand, shift_amt, is_add) in shift_add_reductions.into_iter().rev() {
         let shift_const_id = NodeId(*next_id);
         *next_id += 1;
+        let shifted_id = NodeId(*next_id);
+        *next_id += 1;
 
-        // Replace the multiply in-place, keeping its original NodeId.
+        // Replace the multiply in-place with add/sub, keeping its original NodeId.
         let (mul_id, _) = block.nodes[pos];
         block.nodes[pos] = (
             mul_id,
-            ValueNode::Int32ShiftLeft {
-                left: operand,
-                right: shift_const_id,
+            if is_add {
+                ValueNode::Int32Add {
+                    left: shifted_id,
+                    right: operand,
+                }
+            } else {
+                ValueNode::Int32Subtract {
+                    left: shifted_id,
+                    right: operand,
+                }
             },
         );
 
-        // Insert the shift-amount constant immediately before the shift node
-        // so it is defined before its use.
+        // Insert shift node before the add/sub.
+        block.nodes.insert(
+            pos,
+            (
+                shifted_id,
+                ValueNode::Int32ShiftLeft {
+                    left: operand,
+                    right: shift_const_id,
+                },
+            ),
+        );
+
+        // Insert shift-amount constant before the shift.
         block.nodes.insert(
             pos,
             (
@@ -1733,6 +1763,58 @@ fn strength_reduce_block(block: &mut BasicBlock, next_id: &mut u32) {
                 },
             ),
         );
+    }
+
+    // Apply power-of-two reductions in reverse position order.
+    // Note: positions may have shifted if shift_add_reductions added nodes above.
+    // Since we process shift_add first in reverse, and now power-of-two in reverse,
+    // we need to account for insertions. Rebuild positions if both lists are non-empty.
+    // For simplicity, re-scan for power-of-two patterns after shift-add transforms.
+    if !reductions.is_empty() {
+        // Re-collect constants (shift-add may have added Int32Constants).
+        let mut consts2: HashMap<NodeId, i32> = HashMap::new();
+        for (id, node) in &block.nodes {
+            match node {
+                ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } => {
+                    consts2.insert(*id, *value);
+                }
+                _ => {}
+            }
+        }
+
+        let mut pow2_reductions: Vec<(usize, NodeId, u32)> = Vec::new();
+        for (pos, (_, node)) in block.nodes.iter().enumerate() {
+            if let ValueNode::Int32Multiply { left, right } = node
+                && let Some((operand, shift)) =
+                    find_power_of_two_operand(*left, *right, &consts2)
+            {
+                pow2_reductions.push((pos, operand, shift));
+            }
+        }
+
+        for (pos, operand, shift_amt) in pow2_reductions.into_iter().rev() {
+            let shift_const_id = NodeId(*next_id);
+            *next_id += 1;
+
+            let (mul_id, _) = block.nodes[pos];
+            block.nodes[pos] = (
+                mul_id,
+                ValueNode::Int32ShiftLeft {
+                    left: operand,
+                    right: shift_const_id,
+                },
+            );
+
+            block.nodes.insert(
+                pos,
+                (
+                    shift_const_id,
+                    ValueNode::Int32Constant {
+                        value: shift_amt as i32,
+                    },
+                ),
+            );
+        }
     }
 }
 
@@ -1756,6 +1838,45 @@ fn find_power_of_two_operand(
         && val.count_ones() == 1
     {
         return Some((right, val.trailing_zeros()));
+    }
+    None
+}
+
+/// Decompose `x * K` where K = 2^k ± 1 (e.g. 3, 5, 7, 9) into shift+add/sub.
+/// Returns `(other_operand, shift_amount, is_add)`:
+///   is_add=true:  x*(2^k+1) → (x<<k)+x   (K=3,5,9,17,…)
+///   is_add=false: x*(2^k-1) → (x<<k)-x   (K=7,15,31,…)
+fn find_shift_add_decomposition(
+    left: NodeId,
+    right: NodeId,
+    consts: &HashMap<NodeId, i32>,
+) -> Option<(NodeId, u32, bool)> {
+    fn try_decompose(val: i32) -> Option<(u32, bool)> {
+        if val < 3 {
+            return None;
+        }
+        // Check 2^k + 1: val-1 must be power of two ≥ 2
+        let minus_one = val - 1;
+        if minus_one >= 2 && minus_one.count_ones() == 1 {
+            return Some((minus_one.trailing_zeros(), true));
+        }
+        // Check 2^k - 1: val+1 must be power of two ≥ 4
+        let plus_one = val + 1;
+        if plus_one >= 4 && plus_one.count_ones() == 1 {
+            return Some((plus_one.trailing_zeros(), false));
+        }
+        None
+    }
+
+    if let Some(&val) = consts.get(&right)
+        && let Some((shift, is_add)) = try_decompose(val)
+    {
+        return Some((left, shift, is_add));
+    }
+    if let Some(&val) = consts.get(&left)
+        && let Some((shift, is_add)) = try_decompose(val)
+    {
+        return Some((right, shift, is_add));
     }
     None
 }
@@ -5130,18 +5251,19 @@ mod tests {
     }
 
     #[test]
-    fn test_strength_reduce_not_applied_to_non_power_of_two() {
+    fn test_strength_reduce_not_applied_to_non_decomposable() {
+        // Multiply by 6 is neither a power of two nor 2^k±1 — node should stay.
         let mut graph = MaglevGraph::new(1);
         let mut block = BasicBlock::new(0);
         let p = block.push_value(ValueNode::Parameter { index: 0 });
-        let c3 = block.push_value(ValueNode::Int32Constant { value: 3 });
-        let mul = block.push_value(ValueNode::Int32Multiply { left: p, right: c3 });
+        let c6 = block.push_value(ValueNode::Int32Constant { value: 6 });
+        let mul = block.push_value(ValueNode::Int32Multiply { left: p, right: c6 });
         block.set_control(ControlNode::Return { value: mul });
         graph.add_block(block);
 
         optimize(&mut graph);
 
-        // Multiply by 3 is not a power of two — node should stay as multiply.
+        // Multiply by 6 is not a power of two nor 2^k±1 — node should stay as multiply.
         assert!(
             graph.blocks()[0]
                 .nodes
