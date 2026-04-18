@@ -1370,9 +1370,7 @@ fn reassociate_block(
     }
 
     for (pos, (_id, node)) in block.nodes.iter().enumerate() {
-        if let Some(r) =
-            try_reassociate(node, pos, global_consts, &mul_info, &node_defs, next_id)
-        {
+        if let Some(r) = try_reassociate(node, pos, global_consts, &mul_info, &node_defs, next_id) {
             return apply_reassoc(block, r);
         }
     }
@@ -1706,15 +1704,31 @@ fn strength_reduce(graph: &mut MaglevGraph) {
         .max()
         .map_or(0, |m| m + 1);
 
+    // Pre-populate constant map from ALL blocks so cross-block constant
+    // operands are visible (e.g. SmiConstant(3) in entry block used by
+    // Int32Multiply in the loop body).
+    let mut global_consts: HashMap<NodeId, i32> = HashMap::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            if let ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } = node {
+                global_consts.insert(*id, *value);
+            }
+        }
+    }
+
     for block in graph.blocks_mut() {
-        strength_reduce_block(block, &mut next_id);
+        strength_reduce_block(block, &mut next_id, &global_consts);
     }
 }
 
 /// Perform strength reduction within a single [`BasicBlock`].
-fn strength_reduce_block(block: &mut BasicBlock, next_id: &mut u32) {
-    // Collect compile-time integer constants visible in this block.
-    let mut consts: HashMap<NodeId, i32> = HashMap::new();
+fn strength_reduce_block(
+    block: &mut BasicBlock,
+    next_id: &mut u32,
+    global_consts: &HashMap<NodeId, i32>,
+) {
+    // Start with global consts; also pick up any block-local constants.
+    let mut consts = global_consts.clone();
     for (id, node) in &block.nodes {
         match node {
             ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } => {
