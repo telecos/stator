@@ -2789,7 +2789,6 @@ fn forward_invariant_object_properties(graph: &mut MaglevGraph) {
         for (_, node) in &block.nodes {
             if let ValueNode::StoreNamedGeneric { object, .. } = node {
                 obj_props.remove(object);
-                // Also check if object is accessed through a global alias.
                 for (&_gname, &obj_id) in &global_to_obj {
                     if *object == obj_id {
                         obj_props.remove(&obj_id);
@@ -2821,9 +2820,8 @@ fn forward_invariant_object_properties(graph: &mut MaglevGraph) {
     for block in graph.blocks() {
         for (id, node) in &block.nodes {
             if let ValueNode::LoadNamedGeneric { object, name, .. } = node {
-                // Try direct match first.
-                let resolved_obj = load_global_alias.get(object).copied().unwrap_or(*object);
-                if let Some(props) = obj_props.get(&resolved_obj)
+                let resolved = load_global_alias.get(object).copied().unwrap_or(*object);
+                if let Some(props) = obj_props.get(&resolved)
                     && let Some(&value) = props.get(name)
                 {
                     subst.insert(*id, value);
@@ -6206,5 +6204,63 @@ mod tests {
         let body_before = graph.block(2).unwrap().nodes.len();
         unroll_simple_loops(&mut graph);
         assert_eq!(graph.block(2).unwrap().nodes.len(), body_before);
+    }
+
+    #[test]
+    fn test_forward_invariant_object_properties_via_global() {
+        // Simulates: var obj = { a: 1 }; ... LoadGlobal("obj") → LoadNamedGeneric(_, "a")
+        // Entry block: CreateObjectLiteralWithProperties + StoreGlobal
+        // Second block: LoadGlobal + LoadNamedGeneric (should resolve to constant)
+        let mut graph = MaglevGraph::new(0);
+
+        // Block 0: entry
+        let mut entry = BasicBlock::new(0);
+        let val_a = entry.push_value(ValueNode::SmiConstant { value: 42 });
+        let _create = entry.push_value(ValueNode::CreateObjectLiteralWithProperties {
+            feedback_slot: 0,
+            flags: 0,
+            names: vec![5], // name index 5 = "a"
+            values: vec![val_a],
+        });
+        entry.push_value(ValueNode::StoreGlobal {
+            name: 10, // global name index 10 = "obj"
+            value: _create,
+            feedback_slot: 1,
+        });
+        entry.set_control(ControlNode::Jump { target: 1 });
+        graph.add_block(entry);
+
+        // Block 1: uses LoadGlobal + LoadNamedGeneric
+        let mut body = BasicBlock::new(1);
+        let obj_load = body.push_value(ValueNode::LoadGlobal {
+            name: 10, // same global name
+            feedback_slot: 2,
+        });
+        let prop_load = body.push_value(ValueNode::LoadNamedGeneric {
+            object: obj_load,
+            name: 5, // same property name
+            feedback_slot: 3,
+        });
+        body.set_control(ControlNode::Return { value: prop_load });
+        graph.add_block(body);
+
+        // Run just the forwarding pass (not full optimize, to isolate)
+        fuse_object_literal_stores(&mut graph);
+        forward_invariant_object_properties(&mut graph);
+
+        // The LoadNamedGeneric should have been substituted.
+        // Check that prop_load's uses now point to val_a.
+        let block1 = &graph.blocks()[1];
+        let ret = block1.control.as_ref().unwrap();
+        if let ControlNode::Return { value } = ret {
+            // The return should now reference val_a (the SmiConstant 42)
+            assert_eq!(
+                *value, val_a,
+                "Expected LoadNamedGeneric to be forwarded to SmiConstant(42), got {:?}",
+                value
+            );
+        } else {
+            panic!("Expected Return control node");
+        }
     }
 }
