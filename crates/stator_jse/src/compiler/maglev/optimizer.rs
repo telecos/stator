@@ -172,6 +172,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     eliminate_dead_object_stores(graph);
     eliminate_dead_allocations(graph);
     replace_dead_arguments(graph);
+    strength_reduce_induction_variables(graph);
     unroll_simple_loops(graph);
     eliminate_dead_code(graph);
 }
@@ -1594,6 +1595,8 @@ enum CseKey {
     /// A nullary operation keyed only by kind and a u32 index (e.g. LoadGlobal
     /// keyed by its name index).
     Nullary(u16, u32),
+    /// A property load: (operation kind, object, property_name_index).
+    PropertyLoad(u16, NodeId, u32),
 }
 
 /// Extract a CSE key from a pure [`ValueNode`], or `None` if the node is not
@@ -1637,6 +1640,8 @@ fn make_cse_key(node: &ValueNode) -> Option<CseKey> {
         ValueNode::ToBoolean { value } => Some(CseKey::Unary(5, *value)),
         // Nullary: keyed only by name index.
         ValueNode::LoadGlobal { name, .. } => Some(CseKey::Nullary(1, *name)),
+        // Property loads: keyed by object and property name.
+        ValueNode::LoadNamedGeneric { object, name, .. } => Some(CseKey::PropertyLoad(1, *object, *name)),
         _ => None,
     }
 }
@@ -3920,6 +3925,218 @@ fn find_increment_step(graph: &MaglevGraph, result_id: NodeId, base_id: NodeId) 
         }
         _ => None,
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass — Induction variable strength reduction
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Replace `Int32Multiply(iv_phi, K)` inside counted loops with an additive
+/// derived induction variable: `derived_phi(init*K, derived_phi + step*K)`.
+///
+/// This eliminates multiplies from the loop body's critical path, replacing
+/// them with adds.  For example, `i * 3` becomes a new IV that increments
+/// by 3 each iteration.
+fn strength_reduce_induction_variables(graph: &mut MaglevGraph) {
+    let loops = licm::detect_loops(graph);
+    for lp in &loops {
+        strength_reduce_iv_in_loop(graph, lp);
+    }
+}
+
+fn strength_reduce_iv_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
+    let header_idx = lp.header;
+
+    // ── 1. Header must end with Branch on Int32LessThan ─────────────────
+    let (condition_id, body_block_idx) = {
+        let header = match graph.block(header_idx) {
+            Some(b) => b,
+            None => return false,
+        };
+        match &header.control {
+            Some(ControlNode::Branch {
+                condition,
+                if_true,
+                ..
+            }) => (*condition, *if_true),
+            _ => return false,
+        }
+    };
+
+    if !lp.body.contains(&body_block_idx) {
+        return false;
+    }
+
+    // Simple loop: body is a single block jumping back to header.
+    if lp.body.len() != 2 || !lp.body.contains(&header_idx) {
+        return false;
+    }
+
+    match graph.block(body_block_idx).and_then(|b| b.control.as_ref()) {
+        Some(ControlNode::Jump { target }) if *target == header_idx => {}
+        _ => return false,
+    }
+
+    // ── 2. Identify the induction variable ──────────────────────────────
+    let cmp_left = {
+        let header = graph.block(header_idx).unwrap();
+        let mut found = None;
+        for (nid, node) in &header.nodes {
+            if *nid == condition_id {
+                found = Some(node.clone());
+                break;
+            }
+        }
+        match found {
+            Some(ValueNode::Int32LessThan { left, .. }) => left,
+            _ => return false,
+        }
+    };
+
+    let back_edge_pred_pos = {
+        let h = graph.block(header_idx).unwrap();
+        match h.predecessors.iter().position(|&p| p == body_block_idx) {
+            Some(pos) => pos,
+            None => return false,
+        }
+    };
+    let preheader_pred_pos = {
+        let h = graph.block(header_idx).unwrap();
+        match h.predecessors.iter().position(|&p| p == lp.preheader) {
+            Some(pos) => pos,
+            None => return false,
+        }
+    };
+
+    let iv_phi_id = cmp_left;
+    let iv_phi_inputs = {
+        let h = graph.block(header_idx).unwrap();
+        let mut found = None;
+        for (nid, node) in &h.nodes {
+            if *nid == iv_phi_id {
+                if let ValueNode::Phi { inputs } = node {
+                    found = Some(inputs.clone());
+                }
+                break;
+            }
+        }
+        match found {
+            Some(inputs) => inputs,
+            None => return false,
+        }
+    };
+
+    let init_id = iv_phi_inputs[preheader_pred_pos];
+    let init_val = match find_i32_constant(graph, init_id) {
+        Some(v) => v,
+        None => return false,
+    };
+
+    let back_edge_input = iv_phi_inputs[back_edge_pred_pos];
+    let step_val = match find_increment_step(graph, back_edge_input, iv_phi_id) {
+        Some(s) if s > 0 => s,
+        _ => return false,
+    };
+
+    // ── 3. Find Int32Multiply(iv_phi, K) in the loop body ───────────────
+    // Deduplicate by K: multiple `i*3` uses share one derived IV.
+    let mut mul_targets: HashMap<i32, Vec<NodeId>> = HashMap::new();
+    {
+        let body = graph.block(body_block_idx).unwrap();
+        for (nid, node) in &body.nodes {
+            if let ValueNode::Int32Multiply { left, right } = node {
+                let (const_input, is_iv) = if *left == iv_phi_id {
+                    (*right, true)
+                } else if *right == iv_phi_id {
+                    (*left, true)
+                } else {
+                    (NodeId(0), false)
+                };
+                if !is_iv {
+                    continue;
+                }
+                if let Some(k) = find_i32_constant(graph, const_input)
+                    && k != 0
+                    && k != 1
+                {
+                    mul_targets.entry(k).or_default().push(*nid);
+                }
+            }
+        }
+    }
+
+    if mul_targets.is_empty() {
+        return false;
+    }
+
+    // ── 4. Create derived IVs ───────────────────────────────────────────
+    let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
+
+    for (k, mul_ids) in &mul_targets {
+        let derived_init = init_val.wrapping_mul(*k);
+        let derived_step = step_val.wrapping_mul(*k);
+
+        // Allocate node IDs.
+        let init_const_id = graph.alloc_node_id();
+        let step_const_id = graph.alloc_node_id();
+        let derived_phi_id = graph.alloc_node_id();
+        let derived_add_id = graph.alloc_node_id();
+
+        // Add constants to preheader.
+        let preheader = graph.block_mut(lp.preheader).unwrap();
+        preheader.push_with_id(
+            init_const_id,
+            ValueNode::Int32Constant {
+                value: derived_init,
+            },
+        );
+        preheader.push_with_id(
+            step_const_id,
+            ValueNode::Int32Constant {
+                value: derived_step,
+            },
+        );
+
+        // Add derived Phi to header — insert among existing Phis.
+        let mut phi_inputs = vec![NodeId(0); iv_phi_inputs.len()];
+        phi_inputs[preheader_pred_pos] = init_const_id;
+        phi_inputs[back_edge_pred_pos] = derived_add_id;
+        {
+            let header = graph.block_mut(header_idx).unwrap();
+            // Find position after last existing Phi.
+            let insert_pos = header
+                .nodes
+                .iter()
+                .position(|(_, n)| !matches!(n, ValueNode::Phi { .. }))
+                .unwrap_or(header.nodes.len());
+            header.nodes.insert(
+                insert_pos,
+                (derived_phi_id, ValueNode::Phi { inputs: phi_inputs }),
+            );
+        }
+
+        // Add Int32Add to body (before any existing back-edge increment).
+        let body = graph.block_mut(body_block_idx).unwrap();
+        body.push_with_id(
+            derived_add_id,
+            ValueNode::Int32Add {
+                left: derived_phi_id,
+                right: step_const_id,
+            },
+        );
+
+        // Map all multiply IDs to the derived Phi.
+        for mul_id in mul_ids {
+            subst.insert(*mul_id, derived_phi_id);
+        }
+    }
+
+    // ── 5. Replace all references to old multiplies ─────────────────────
+    for block in graph.blocks_mut() {
+        apply_subst_to_block(block, &subst);
+    }
+
+    true
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
