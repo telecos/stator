@@ -181,6 +181,11 @@ pub fn optimize(graph: &mut MaglevGraph) {
     crate::compiler::maglev::licm::fold_invariant_addition_chains(graph);
     // Fold the new preheader additions (e.g. GenericAdd(1,2) → 3).
     fold_constants(graph);
+    // Remove dead intermediate chain nodes left by fold_invariant_addition_chains.
+    // Without this, use-count checks in accumulator detection see stale references
+    // to Phi nodes from dead chain links, incorrectly inflating use counts and
+    // preventing scalar evolution from firing (e.g. property_access_1k).
+    eliminate_dead_code(graph);
     // Targeted late lowering: after store_to_load + chain folding, some
     // loops have `GenericAdd(accumulator_phi, SmiConstant(K))` where the
     // constant was only revealed by forwarding.  Convert these to Int32Add
@@ -4402,6 +4407,123 @@ fn find_increment_step(graph: &MaglevGraph, result_id: NodeId, base_id: NodeId) 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Affine analysis helpers for loop scalar evolution
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Try to decompose `expr_id` as `a * iv_phi + b` where a, b are constants.
+/// Returns `Some((a, b))` with i128 coefficients for overflow-safe arithmetic.
+fn extract_affine_addend(
+    graph: &MaglevGraph,
+    expr_id: NodeId,
+    iv_phi_id: NodeId,
+    consts: &HashMap<NodeId, i32>,
+    depth: u32,
+) -> Option<(i128, i128)> {
+    if depth > 8 {
+        return None;
+    }
+    if expr_id == iv_phi_id {
+        return Some((1, 0));
+    }
+    if let Some(&k) = consts.get(&expr_id) {
+        return Some((0, k as i128));
+    }
+    if let Some(k) = find_i32_constant(graph, expr_id) {
+        return Some((0, k as i128));
+    }
+    let node = graph.node(expr_id)?.clone();
+    match &node {
+        ValueNode::Int32Add { left, right } => {
+            let (a1, b1) = extract_affine_addend(graph, *left, iv_phi_id, consts, depth + 1)?;
+            let (a2, b2) = extract_affine_addend(graph, *right, iv_phi_id, consts, depth + 1)?;
+            Some((a1 + a2, b1 + b2))
+        }
+        ValueNode::Int32Subtract { left, right } => {
+            let (a1, b1) = extract_affine_addend(graph, *left, iv_phi_id, consts, depth + 1)?;
+            let (a2, b2) = extract_affine_addend(graph, *right, iv_phi_id, consts, depth + 1)?;
+            Some((a1 - a2, b1 - b2))
+        }
+        ValueNode::Int32Multiply { left, right } => {
+            let (a1, b1) = extract_affine_addend(graph, *left, iv_phi_id, consts, depth + 1)?;
+            let (a2, b2) = extract_affine_addend(graph, *right, iv_phi_id, consts, depth + 1)?;
+            if a1 == 0 {
+                Some((b1 * a2, b1 * b2))
+            } else if a2 == 0 {
+                Some((a1 * b2, b1 * b2))
+            } else {
+                None // quadratic — bail
+            }
+        }
+        ValueNode::Int32ShiftLeft { left, right } => {
+            let (a, b) = extract_affine_addend(graph, *left, iv_phi_id, consts, depth + 1)?;
+            let shift = consts
+                .get(right)
+                .copied()
+                .or_else(|| find_i32_constant(graph, *right))?;
+            if (0..32).contains(&shift) {
+                let factor = 1i128 << (shift as u32);
+                Some((a * factor, b * factor))
+            } else {
+                None
+            }
+        }
+        ValueNode::Int32Negate { value } => {
+            let (a, b) = extract_affine_addend(graph, *value, iv_phi_id, consts, depth + 1)?;
+            Some((-a, -b))
+        }
+        _ => None,
+    }
+}
+
+/// Given a back-edge node, decompose it as `phi_acc + (a * iv + b)`.
+/// Returns `Some((a, b))` for the per-iteration affine addend.
+fn peel_accumulator_addend(
+    graph: &MaglevGraph,
+    back_id: NodeId,
+    phi_acc_id: NodeId,
+    iv_phi_id: NodeId,
+    consts: &HashMap<NodeId, i32>,
+    depth: u32,
+) -> Option<(i128, i128)> {
+    if depth > 4 {
+        return None;
+    }
+    let node = graph.node(back_id)?.clone();
+    match &node {
+        ValueNode::Int32Add { left, right } => {
+            if *left == phi_acc_id {
+                return extract_affine_addend(graph, *right, iv_phi_id, consts, 0);
+            }
+            if *right == phi_acc_id {
+                return extract_affine_addend(graph, *left, iv_phi_id, consts, 0);
+            }
+            // Neither is phi directly — try recursing
+            if let Some((a, b)) =
+                peel_accumulator_addend(graph, *left, phi_acc_id, iv_phi_id, consts, depth + 1)
+                && let Some((a2, b2)) = extract_affine_addend(graph, *right, iv_phi_id, consts, 0)
+            {
+                return Some((a + a2, b + b2));
+            }
+            if let Some((a, b)) =
+                peel_accumulator_addend(graph, *right, phi_acc_id, iv_phi_id, consts, depth + 1)
+                && let Some((a2, b2)) = extract_affine_addend(graph, *left, iv_phi_id, consts, 0)
+            {
+                return Some((a + a2, b + b2));
+            }
+            None
+        }
+        ValueNode::Int32Subtract { left, right } => {
+            // phi_acc must be in the left subtree (subtracting phi would negate it)
+            let (a, b) =
+                peel_accumulator_addend(graph, *left, phi_acc_id, iv_phi_id, consts, depth + 1)?;
+            let (a2, b2) = extract_affine_addend(graph, *right, iv_phi_id, consts, 0)?;
+            Some((a - a2, b - b2))
+        }
+        _ => None,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Pass — Late constant-accumulator lowering
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -4725,8 +4847,9 @@ fn try_eliminate_constant_accumulator(
         })
         .collect();
 
-    // Collect accumulators: (phi_id, init_val, addend_val, back_node_id)
-    let mut accumulators: Vec<(NodeId, i32, i32, NodeId)> = Vec::new();
+    // Collect accumulators: (phi_id, init_val, affine_a, affine_b, back_node_id)
+    // affine_a and affine_b represent the per-iteration addend: a * iv + b
+    let mut accumulators: Vec<(NodeId, i32, i128, i128, NodeId)> = Vec::new();
 
     // Build use-count map for the loop body to verify accumulators are
     // only used by their own recurrence update.
@@ -4761,49 +4884,34 @@ fn try_eliminate_constant_accumulator(
             },
         };
 
-        // Back-edge must be Int32Add(phi, K) or Int32Add(K, phi).
-        // Only handle Int32Add — GenericAdd may have JS-level semantics
-        // (ToPrimitive, string concat) that a constant replacement would break.
-        let body = graph.block(body_block_idx).unwrap();
-        let back_node = body
-            .nodes
-            .iter()
-            .find(|(nid, _)| *nid == back_id)
-            .map(|(_, n)| n);
-
-        let addend_val = match back_node {
-            Some(ValueNode::Int32Add { left, right }) if *left == *phi_id => consts
-                .get(right)
-                .copied()
-                .or_else(|| find_i32_constant(graph, *right)),
-            Some(ValueNode::Int32Add { left, right }) if *right == *phi_id => consts
-                .get(left)
-                .copied()
-                .or_else(|| find_i32_constant(graph, *left)),
-            _ => None,
-        };
-
-        let Some(k) = addend_val else {
+        // Back-edge must decompose as phi_acc + (a * iv + b) using only
+        // Int32 operations.  This covers both constant addends (a=0) and
+        // IV-dependent addends like `i*3 - 1` (a=3, b=-1).
+        let Some((aff_a, aff_b)) =
+            peel_accumulator_addend(graph, back_id, *phi_id, iv_phi_id, consts, 0)
+        else {
             continue;
         };
 
         // Safety: the accumulator Phi must only be used inside the loop
-        // by its own recurrence update (the Int32Add back-edge).
-        // If anything else reads the accumulator within the loop, we
-        // cannot replace it with the final value.
+        // by its own recurrence update.  If anything else reads the
+        // accumulator within the loop, we cannot replace it.
         let in_loop_uses = loop_use_counts.get(phi_id).copied().unwrap_or(0);
         if in_loop_uses > 1 {
-            // More than 1 use inside the loop (the recurrence add) — bail.
             continue;
         }
 
-        // Verify closed-form result fits i32.
-        let result = (init_val as i64) + (k as i64) * trip_count;
-        if result < i32::MIN as i64 || result > i32::MAX as i64 {
+        // Compute closed-form result using i128 to avoid overflow:
+        //   result = init + N*(a*iv_init + b) + a*step*N*(N-1)/2
+        let n = trip_count as i128;
+        let iv0 = iv_init as i128;
+        let s = iv_step_val as i128;
+        let result = (init_val as i128) + n * (aff_a * iv0 + aff_b) + aff_a * s * n * (n - 1) / 2;
+        if result < i32::MIN as i128 || result > i32::MAX as i128 {
             continue;
         }
 
-        accumulators.push((*phi_id, init_val, k, back_id));
+        accumulators.push((*phi_id, init_val, aff_a, aff_b, back_id));
     }
 
     if accumulators.is_empty() {
@@ -4812,8 +4920,12 @@ fn try_eliminate_constant_accumulator(
 
     // ── 6. Apply: replace Phi init with the closed-form result ──────────
     // Create a SmiConstant for the result in the preheader.
-    for (phi_id, init_val, k, _back_id) in &accumulators {
-        let result = (*init_val as i64) + (*k as i64) * trip_count;
+    for (phi_id, init_val, aff_a, aff_b, _back_id) in &accumulators {
+        let n = trip_count as i128;
+        let iv0 = iv_init as i128;
+        let s = iv_step_val as i128;
+        let result =
+            (*init_val as i128) + n * (*aff_a * iv0 + *aff_b) + *aff_a * s * n * (n - 1) / 2;
         let result_val = result as i32;
 
         // Create a new SmiConstant node for the result.
