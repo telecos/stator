@@ -164,6 +164,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     let _truncations2 = propagate_int32_truncation(graph);
     eliminate_identity_operations_global(graph);
     eliminate_redundant_type_guards(graph);
+    specialize_closure_calls(graph);
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
     fuse_object_literal_stores(graph);
@@ -2134,6 +2135,98 @@ fn remove_redundant_check_maps_in_block(block: &mut BasicBlock) {
 
     // Apply the substitution to all node inputs and the control node.
     apply_subst_to_block(block, &subst);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass 2.4 — Monomorphic closure call specialization
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Convert `Call` nodes whose callee provably originates from a single
+/// `FastCreateClosure` or `CreateClosure` into `CallKnownFunction`, enabling
+/// the code generator to emit a direct JIT-to-JIT call instead of going
+/// through IC dispatch.
+///
+/// The pass works in two phases:
+///
+/// 1. **Collect** — scan all blocks and record every `NodeId` that is produced
+///    by `FastCreateClosure` or `CreateClosure`.  Additionally, resolve `Phi`
+///    nodes whose non-self inputs all trace back to the *same* closure origin
+///    (monomorphic phi).
+///
+/// 2. **Rewrite** — for every `Call` node whose `callee` is in the closure
+///    set, replace the node in-place with `CallKnownFunction`.
+fn specialize_closure_calls(graph: &mut MaglevGraph) {
+    // Phase 1: collect all node IDs that produce a closure value.
+    let mut closure_nodes: HashSet<NodeId> = HashSet::new();
+
+    for block in graph.blocks() {
+        for &(id, ref node) in &block.nodes {
+            if matches!(
+                node,
+                ValueNode::FastCreateClosure { .. } | ValueNode::CreateClosure { .. }
+            ) {
+                closure_nodes.insert(id);
+            }
+        }
+    }
+
+    if closure_nodes.is_empty() {
+        return;
+    }
+
+    // Resolve Phi nodes that funnel a single closure definition.  We iterate
+    // to a fixed point because Phis can reference other Phis.
+    let mut phi_map: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for block in graph.blocks() {
+        for &(id, ref node) in &block.nodes {
+            if let ValueNode::Phi { inputs } = node {
+                phi_map.insert(id, inputs.clone());
+            }
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (&phi_id, inputs) in &phi_map {
+            if closure_nodes.contains(&phi_id) {
+                continue;
+            }
+            // Check if every non-self input is either a closure node or
+            // another phi already proven to be a closure.
+            let all_closure = inputs
+                .iter()
+                .all(|&inp| inp == phi_id || closure_nodes.contains(&inp));
+            if all_closure && !inputs.is_empty() {
+                // Ensure at least one input is not self-referencing.
+                let has_non_self = inputs.iter().any(|&inp| inp != phi_id);
+                if has_non_self {
+                    closure_nodes.insert(phi_id);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    // Phase 2: rewrite Call → CallKnownFunction for monomorphic closure calls.
+    for block in graph.blocks_mut() {
+        for (_id, node) in &mut block.nodes {
+            if let ValueNode::Call {
+                callee,
+                receiver,
+                args,
+                ..
+            } = node
+                && closure_nodes.contains(callee)
+            {
+                *node = ValueNode::CallKnownFunction {
+                    callee: *callee,
+                    receiver: *receiver,
+                    args: args.clone(),
+                };
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

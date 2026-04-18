@@ -156,6 +156,27 @@ pub fn fold_invariant_addition_chains(graph: &mut MaglevGraph) -> usize {
     total
 }
 
+/// The kind of addition node in a chain.
+#[derive(Clone, Copy, PartialEq)]
+enum AddKind {
+    Int32,
+    CheckedSmi,
+    Generic,
+}
+
+/// Create an addition node of the given kind.
+fn make_add(kind: AddKind, left: NodeId, right: NodeId) -> ValueNode {
+    match kind {
+        AddKind::Int32 => ValueNode::Int32Add { left, right },
+        AddKind::CheckedSmi => ValueNode::CheckedSmiAdd { left, right },
+        AddKind::Generic => ValueNode::GenericAdd {
+            left,
+            right,
+            feedback_slot: 0,
+        },
+    }
+}
+
 /// Fold the longest invariant addition chain in a single loop.
 fn fold_chains_in_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
     // 1. Collect NodeIds defined outside the loop.
@@ -179,10 +200,8 @@ fn fold_chains_in_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
         }
     }
 
-    // 3. Collect Int32Add / CheckedSmiAdd nodes inside the loop body.
-    //    is_int32 = true  → Int32Add (wrapping)
-    //    is_int32 = false → CheckedSmiAdd (deopt on overflow)
-    let mut loop_adds: HashMap<NodeId, (NodeId, NodeId, bool)> = HashMap::new();
+    // 3. Collect Int32Add / CheckedSmiAdd / GenericAdd nodes inside the loop.
+    let mut loop_adds: HashMap<NodeId, (NodeId, NodeId, AddKind)> = HashMap::new();
     for block in graph.blocks() {
         if !lp.body.contains(&block.id) {
             continue;
@@ -190,10 +209,13 @@ fn fold_chains_in_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
         for (id, node) in &block.nodes {
             match node {
                 ValueNode::Int32Add { left, right } => {
-                    loop_adds.insert(*id, (*left, *right, true));
+                    loop_adds.insert(*id, (*left, *right, AddKind::Int32));
                 }
                 ValueNode::CheckedSmiAdd { left, right } => {
-                    loop_adds.insert(*id, (*left, *right, false));
+                    loop_adds.insert(*id, (*left, *right, AddKind::CheckedSmi));
+                }
+                ValueNode::GenericAdd { left, right, .. } => {
+                    loop_adds.insert(*id, (*left, *right, AddKind::Generic));
                 }
                 _ => {}
             }
@@ -211,20 +233,22 @@ fn fold_chains_in_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
     let mut best_endpoint: Option<NodeId> = None;
     let mut best_inv_ops: Vec<NodeId> = Vec::new();
     let mut best_root: Option<NodeId> = None;
-    let mut best_is_int32 = true;
+    let mut best_kind = AddKind::Int32;
 
     for &start_id in loop_adds.keys() {
         let mut inv_ops: Vec<NodeId> = Vec::new();
         let mut current = start_id;
         let mut root_variant = None;
-        let mut chain_kind: Option<bool> = None;
+        let mut chain_kind: Option<AddKind> = None;
 
-        while let Some(&(left, right, is_int32)) = loop_adds.get(&current) {
+        while let Some(&(left, right, kind)) = loop_adds.get(&current) {
             // Require uniform addition type across the chain.
-            if chain_kind == Some(!is_int32) {
+            if let Some(prev_kind) = chain_kind
+                && prev_kind != kind
+            {
                 break;
             }
-            chain_kind = Some(is_int32);
+            chain_kind = Some(kind);
 
             let l_out = outside_defs.contains(&left);
             let r_out = outside_defs.contains(&right);
@@ -256,7 +280,7 @@ fn fold_chains_in_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
             best_endpoint = Some(start_id);
             best_inv_ops = inv_ops;
             best_root = root_variant;
-            best_is_int32 = chain_kind.unwrap_or(true);
+            best_kind = chain_kind.unwrap_or(AddKind::Int32);
         }
     }
 
@@ -274,17 +298,7 @@ fn fold_chains_in_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
     let mut prev = best_inv_ops[0];
     for &inv in &best_inv_ops[1..] {
         let nid = graph.alloc_node_id();
-        let node = if best_is_int32 {
-            ValueNode::Int32Add {
-                left: prev,
-                right: inv,
-            }
-        } else {
-            ValueNode::CheckedSmiAdd {
-                left: prev,
-                right: inv,
-            }
-        };
+        let node = make_add(best_kind, prev, inv);
         if let Some(pre) = graph.block_mut(lp.preheader) {
             pre.push_with_id(nid, node);
         }
@@ -294,17 +308,7 @@ fn fold_chains_in_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
 
     // 6. Replace the endpoint addition with add(root_variant, inv_sum).
     //    The now-dead intermediate additions will be cleaned up by DCE.
-    let replacement = if best_is_int32 {
-        ValueNode::Int32Add {
-            left: root_variant,
-            right: inv_sum,
-        }
-    } else {
-        ValueNode::CheckedSmiAdd {
-            left: root_variant,
-            right: inv_sum,
-        }
-    };
+    let replacement = make_add(best_kind, root_variant, inv_sum);
 
     for block in graph.blocks_mut() {
         if !lp.body.contains(&block.id) {

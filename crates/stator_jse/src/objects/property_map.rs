@@ -325,6 +325,13 @@ pub(crate) fn object_rc_pool_ptr() -> *const RefCell<Vec<Rc<RefCell<PropertyMap>
     OBJECT_RC_POOL.with(|pool| pool as *const _)
 }
 
+/// Number of `Rc<RefCell<PropertyMap>>` entries to batch-allocate when
+/// the pool is empty during the IC-hit hot path.  Amortises the cost
+/// of `Rc::new` across subsequent loop iterations so they hit the
+/// pool instead of falling back to per-object allocation.
+#[cfg(all(target_arch = "x86_64", unix))]
+const POOL_BATCH_SIZE: usize = 32;
+
 /// Like [`acquire_object_rc_from_template_with_values`] but uses a
 /// pre-cached raw pointer to the `OBJECT_RC_POOL`, eliminating a TLS
 /// lookup on the hot path.
@@ -355,9 +362,14 @@ pub(crate) fn acquire_object_rc_from_template_with_values_cached(
             }
             return rc;
         }
+        // Pool miss — batch-allocate entries so that subsequent loop
+        // iterations hit the pool instead of allocating individually.
+        for _ in 0..POOL_BATCH_SIZE.saturating_sub(1).min(OBJECT_RC_POOL_CAP - pool.len()) {
+            pool.push(Rc::new(RefCell::new(template.instantiate())));
+        }
     }
     Rc::new(RefCell::new(
-        template.instantiate_with_values(values.to_vec()),
+        template.instantiate_with_values_from_slice(values),
     ))
 }
 
@@ -713,6 +725,39 @@ impl ObjectLiteralTemplate {
         PropertyMap {
             keys: Rc::clone(&self.keys),
             values,
+            attrs: Rc::clone(&self.attrs),
+            integer_key_count: self.integer_key_count,
+            index: if cap <= SMALL_PROPERTY_LINEAR_SCAN_CAP {
+                PropertyIndex::Inline
+            } else {
+                self.cached_index.clone()
+            },
+            inline_cache: None,
+            shape_id: self.cached_shape_id,
+            layout_id: self.layout_id,
+            proto_generation: Cell::new(0),
+            proto_epoch: Cell::new(0),
+            proto_global_epoch: Cell::new(0),
+            extensible: self.extensible,
+            has_accessors: self.has_accessors,
+            template_next_slot: filled,
+            capacity_hint,
+        }
+    }
+
+    /// Like [`instantiate_with_values`] but takes a slice, avoiding the
+    /// caller having to allocate a `Vec` via `to_vec()`.
+    #[inline(always)]
+    pub(crate) fn instantiate_with_values_from_slice(&self, values: &[JsValue]) -> PropertyMap {
+        let cap = self.keys.len();
+        let filled = values.len().min(cap);
+        let mut vals = Vec::with_capacity(cap);
+        vals.extend_from_slice(&values[..filled]);
+        vals.resize(cap, JsValue::Undefined);
+        let capacity_hint = self.capacity_hint.max(cap);
+        PropertyMap {
+            keys: Rc::clone(&self.keys),
+            values: vals,
             attrs: Rc::clone(&self.attrs),
             integer_key_count: self.integer_key_count,
             index: if cap <= SMALL_PROPERTY_LINEAR_SCAN_CAP {
