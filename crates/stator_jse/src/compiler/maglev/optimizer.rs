@@ -198,6 +198,8 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // constant-deferral pattern pushes all -K subtractions to the end,
     // then the combining pattern merges them (e.g. 4×(-1) → -4).
     reassociate_arithmetic(graph);
+    // Clean up identity ops (x+0, x-0) created by reassociation combining.
+    eliminate_identity_operations_global(graph);
     eliminate_dead_code(graph);
 }
 
@@ -1317,9 +1319,21 @@ fn reassociate_arithmetic_once(graph: &mut MaglevGraph) -> usize {
         .max()
         .map_or(0, |m| m + 1);
 
+    // Pre-populate constant map from ALL blocks so cross-block constant
+    // operands are visible (e.g. SmiConstant(1) in entry block used by
+    // Int32Subtract in the loop body for constant-deferral patterns).
+    let mut global_consts: HashMap<NodeId, i32> = HashMap::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            if let ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } = node {
+                global_consts.insert(*id, *value);
+            }
+        }
+    }
+
     let mut count = 0;
     for block in graph.blocks_mut() {
-        count += reassociate_block(block, &mut next_id);
+        count += reassociate_block(block, &mut next_id, &mut global_consts);
     }
     count
 }
@@ -1332,22 +1346,23 @@ struct Reassoc {
 }
 
 /// Build helper maps and apply one reassociation pattern within one block.
-fn reassociate_block(block: &mut BasicBlock, next_id: &mut u32) -> usize {
-    let mut consts: HashMap<NodeId, i32> = HashMap::new();
+fn reassociate_block(
+    block: &mut BasicBlock,
+    next_id: &mut u32,
+    global_consts: &mut HashMap<NodeId, i32>,
+) -> usize {
     let mut mul_info: HashMap<NodeId, (NodeId, i32)> = HashMap::new();
     let mut node_defs: HashMap<NodeId, ValueNode> = HashMap::new();
 
     for (id, node) in &block.nodes {
-        match node {
-            ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } => {
-                consts.insert(*id, *value);
-            }
-            _ => {}
+        // Register any new constants created by prior reassociation passes
+        if let ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } = node {
+            global_consts.insert(*id, *value);
         }
         if let ValueNode::Int32Multiply { left, right } = node {
-            if let Some(&k) = consts.get(right) {
+            if let Some(&k) = global_consts.get(right) {
                 mul_info.insert(*id, (*left, k));
-            } else if let Some(&k) = consts.get(left) {
+            } else if let Some(&k) = global_consts.get(left) {
                 mul_info.insert(*id, (*right, k));
             }
         }
@@ -1355,7 +1370,9 @@ fn reassociate_block(block: &mut BasicBlock, next_id: &mut u32) -> usize {
     }
 
     for (pos, (_id, node)) in block.nodes.iter().enumerate() {
-        if let Some(r) = try_reassociate(node, pos, &consts, &mul_info, &node_defs, next_id) {
+        if let Some(r) =
+            try_reassociate(node, pos, global_consts, &mul_info, &node_defs, next_id)
+        {
             return apply_reassoc(block, r);
         }
     }
