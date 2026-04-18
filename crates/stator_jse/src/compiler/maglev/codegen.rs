@@ -3013,22 +3013,9 @@ impl<'a> MaglevCodegen<'a> {
         // classic overwrite-before-read bug when a Phi destination
         // coincides with another Phi's source location.
         if phi_ops.len() <= 1 {
-            // Single or no Phi — no conflict possible.  Use direct
-            // register-to-register copy when both are in physical regs.
+            // Single or no Phi — no conflict possible.
             for (phi_id, src_id) in &phi_ops {
-                match (self.alloc.location(*phi_id), self.alloc.location(*src_id)) {
-                    (Some(Location::Register(dn)), Some(Location::Register(sn))) => {
-                        let dst = phys_reg(dn);
-                        let src = phys_reg(sn);
-                        if dst != src {
-                            self.masm.mov_rr(dst, src);
-                        }
-                    }
-                    _ => {
-                        self.emit_load(*src_id, Reg64::R11);
-                        self.emit_store(*phi_id, Reg64::R11);
-                    }
-                }
+                self.emit_phi_single_copy(*phi_id, *src_id);
             }
         } else {
             // Check if any destination conflicts with another source.
@@ -3042,23 +3029,61 @@ impl<'a> MaglevCodegen<'a> {
             if !has_conflict {
                 // No conflicts — safe to do direct copies.
                 for (phi_id, src_id) in &phi_ops {
-                    match (self.alloc.location(*phi_id), self.alloc.location(*src_id)) {
-                        (Some(Location::Register(dn)), Some(Location::Register(sn)))
-                            if phys_reg(dn) != phys_reg(sn) =>
-                        {
-                            self.masm.mov_rr(phys_reg(dn), phys_reg(sn));
+                    self.emit_phi_single_copy(*phi_id, *src_id);
+                }
+            } else if phi_ops.len() == 2 {
+                // Two-Phi conflict: resolve with a scratch register
+                // instead of expensive push/pop through the stack.
+                let (phi1, src1) = phi_ops[0];
+                let (phi2, src2) = phi_ops[1];
+                let loc_d1 = self.alloc.location(phi1);
+                let loc_d2 = self.alloc.location(phi2);
+                let loc_s1 = self.alloc.location(src1);
+                let loc_s2 = self.alloc.location(src2);
+
+                match (loc_d1, loc_d2, loc_s1, loc_s2) {
+                    (
+                        Some(Location::Register(d1n)),
+                        Some(Location::Register(d2n)),
+                        Some(Location::Register(s1n)),
+                        Some(Location::Register(s2n)),
+                    ) => {
+                        let d1 = phys_reg(d1n);
+                        let d2 = phys_reg(d2n);
+                        let s1 = phys_reg(s1n);
+                        let s2 = phys_reg(s2n);
+
+                        if d1 == s2 && d2 == s1 {
+                            // Cycle: d1←s1, d2←s2 where d1==s2, d2==s1.
+                            // Break cycle with scratch R10.
+                            self.masm.mov_rr(Reg64::R10, s1);
+                            self.masm.mov_rr(d1, s2);
+                            self.masm.mov_rr(d2, Reg64::R10);
+                        } else if d1 == s2 {
+                            // Chain: Phi1 would clobber s2. Do Phi2 first.
+                            self.masm.mov_rr(d2, s2);
+                            self.masm.mov_rr(d1, s1);
+                        } else {
+                            // d2 == s1: Phi2 would clobber s1. Do Phi1 first.
+                            self.masm.mov_rr(d1, s1);
+                            self.masm.mov_rr(d2, s2);
                         }
-                        (Some(Location::Register(_)), Some(Location::Register(_))) => {
-                            // Same register — skip.
-                        }
-                        _ => {
-                            self.emit_load(*src_id, Reg64::R11);
-                            self.emit_store(*phi_id, Reg64::R11);
-                        }
+                    }
+                    _ => {
+                        // Mixed register/stack/constant — fall back to
+                        // push/pop parallel move.
+                        self.emit_load(src1, Reg64::R11);
+                        self.masm.push(Reg64::R11);
+                        self.emit_load(src2, Reg64::R11);
+                        self.masm.push(Reg64::R11);
+                        self.masm.pop(Reg64::R11);
+                        self.emit_store(phi2, Reg64::R11);
+                        self.masm.pop(Reg64::R11);
+                        self.emit_store(phi1, Reg64::R11);
                     }
                 }
             } else {
-                // Parallel-move: push/pop through stack.
+                // N>2 conflicts: push/pop through stack.
                 for (_phi_id, src_id) in &phi_ops {
                     self.emit_load(*src_id, Reg64::R11);
                     self.masm.push(Reg64::R11);
@@ -3067,6 +3092,31 @@ impl<'a> MaglevCodegen<'a> {
                     self.masm.pop(Reg64::R11);
                     self.emit_store(*phi_id, Reg64::R11);
                 }
+            }
+        }
+    }
+
+    /// Emit a single Phi copy: load `src_id` directly into `phi_id`'s
+    /// allocated register when possible, avoiding the R11 intermediary.
+    fn emit_phi_single_copy(&mut self, phi_id: NodeId, src_id: NodeId) {
+        match (self.alloc.location(phi_id), self.alloc.location(src_id)) {
+            (Some(Location::Register(dn)), Some(Location::Register(sn))) => {
+                let dst = phys_reg(dn);
+                let src = phys_reg(sn);
+                if dst != src {
+                    self.masm.mov_rr(dst, src);
+                }
+            }
+            (Some(Location::Register(dn)), _) => {
+                // Source is on the stack or is a constant — load straight
+                // into the destination register (skips the R11 bounce).
+                let dst = phys_reg(dn);
+                self.emit_load(src_id, dst);
+                self.note_reg_holds(dst, phi_id);
+            }
+            _ => {
+                self.emit_load(src_id, Reg64::R11);
+                self.emit_store(phi_id, Reg64::R11);
             }
         }
     }

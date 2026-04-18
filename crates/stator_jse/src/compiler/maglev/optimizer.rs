@@ -153,6 +153,12 @@ pub fn optimize(graph: &mut MaglevGraph) {
     strength_reduce(graph);
     // Re-run reassociation after second range analysis pass.
     reassociate_arithmetic(graph);
+    // Fold invariant addition chains: after LICM has hoisted property loads
+    // and range analysis has lowered Generic→Int32, loop bodies may contain
+    // chains of Int32Add with loop-invariant operands (e.g. hoisted loads).
+    // This groups them into a single pre-computed sum in the preheader,
+    // reducing per-iteration additions from N to 1.
+    let _inv_chains = crate::compiler::maglev::licm::fold_invariant_addition_chains(graph);
     // Re-run truncation after global promotion: promotion reduces
     // use-counts on arithmetic nodes — allowing CheckedSmi→Int32.
     let _truncations2 = propagate_int32_truncation(graph);
