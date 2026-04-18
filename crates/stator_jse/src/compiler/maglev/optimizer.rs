@@ -173,13 +173,12 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // LoadNamedGeneric with SmiConstants, enabling preheader GenericAdd
     // chains (from fold_invariant_addition_chains) to constant-fold.
     fold_constants(graph);
-    // Post-store-to-load range analysis: after store-to-load + constant
-    // folding, loops like `sum = sum + obj.a + obj.b + ...` have been
-    // reduced to `sum = sum + SmiConstant(K)`.  Run range analysis to
-    // convert the remaining GenericAdd → CheckedSmiAdd → Int32Add, since
-    // the constant input proves the accumulator stays in integer range.
-    crate::compiler::maglev::range_analysis::eliminate_overflow_checks(graph);
-    strength_reduce(graph);
+    // NOTE: Post-store-to-load range analysis DISABLED — running
+    // eliminate_overflow_checks a second time causes widespread regressions:
+    // sieve: 0.9µs → missing (deopt loop), arithmetic: 7.8µs → 19.5µs,
+    // deep_object: 1.4µs → 2.5µs. Adding propagate_int32_truncation after
+    // it doesn't help — the second range analysis misidentifies accumulator
+    // patterns in the already-optimized graph. Needs a targeted approach.
     eliminate_dead_object_stores(graph);
     eliminate_dead_allocations(graph);
     replace_dead_arguments(graph);
