@@ -219,12 +219,7 @@ fn fold_chains_in_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
         let mut root_variant = None;
         let mut chain_kind: Option<bool> = None;
 
-        loop {
-            let &(left, right, is_int32) = match loop_adds.get(&current) {
-                Some(x) => x,
-                None => break,
-            };
-
+        while let Some(&(left, right, is_int32)) = loop_adds.get(&current) {
             // Require uniform addition type across the chain.
             if chain_kind == Some(!is_int32) {
                 break;
@@ -614,8 +609,7 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
 
         // Remove hoisted nodes from their source blocks (iterate in reverse
         // position order so indices remain valid).
-        let mut removals_by_block: HashMap<u32, Vec<usize>> =
-            HashMap::new();
+        let mut removals_by_block: HashMap<u32, Vec<usize>> = HashMap::new();
         for &(blk, pos, _, _) in &to_hoist {
             removals_by_block.entry(blk).or_default().push(pos);
         }
@@ -2217,6 +2211,121 @@ mod tests {
                 .nodes
                 .iter()
                 .any(|(_, n)| matches!(n, ValueNode::CallRuntime { .. })),
+        );
+    }
+
+    // ── Invariant addition chain folding ──────────────────────────────────────
+
+    #[test]
+    fn test_fold_invariant_addition_chain() {
+        // Build a graph with a loop containing:
+        //   preheader: inv_a(100), inv_b(101), inv_c(102)
+        //   body: t1 = add(phi, inv_a), t2 = add(t1, inv_b), t3 = add(t2, inv_c)
+        // After folding, the loop body should have just 1 addition: add(phi, inv_sum)
+        let mut graph = MaglevGraph::new(1);
+
+        // Block 0: preheader with three invariant constants.
+        let mut b0 = BasicBlock::new(0);
+        b0.push_with_id(NodeId(100), ValueNode::Int32Constant { value: 1 });
+        b0.push_with_id(NodeId(101), ValueNode::Int32Constant { value: 2 });
+        b0.push_with_id(NodeId(102), ValueNode::Int32Constant { value: 3 });
+        b0.set_control(ControlNode::Jump { target: 1 });
+        graph.add_block(b0);
+
+        // Block 1: header with Phi for the accumulator.
+        let mut b1 = BasicBlock::new(1);
+        b1.add_predecessor(0);
+        b1.add_predecessor(2);
+        b1.push_with_id(
+            NodeId(200),
+            ValueNode::Phi {
+                inputs: vec![NodeId(100), NodeId(203)],
+            },
+        );
+        let cond = b1.push_value(ValueNode::TrueConstant);
+        b1.set_control(ControlNode::Branch {
+            condition: cond,
+            if_true: 2,
+            if_false: 3,
+        });
+        graph.add_block(b1);
+
+        // Block 2: body — chain of 3 additions with invariant operands.
+        let mut b2 = BasicBlock::new(2);
+        b2.add_predecessor(1);
+        b2.push_with_id(
+            NodeId(201),
+            ValueNode::Int32Add {
+                left: NodeId(200),
+                right: NodeId(100),
+            },
+        );
+        b2.push_with_id(
+            NodeId(202),
+            ValueNode::Int32Add {
+                left: NodeId(201),
+                right: NodeId(101),
+            },
+        );
+        b2.push_with_id(
+            NodeId(203),
+            ValueNode::Int32Add {
+                left: NodeId(202),
+                right: NodeId(102),
+            },
+        );
+        b2.set_control(ControlNode::Jump { target: 1 });
+        graph.add_block(b2);
+
+        // Block 3: exit.
+        let mut b3 = BasicBlock::new(3);
+        b3.add_predecessor(1);
+        let undef = b3.push_value(ValueNode::UndefinedConstant);
+        b3.set_control(ControlNode::Return { value: undef });
+        graph.add_block(b3);
+
+        let body_adds_before = graph.blocks()[2]
+            .nodes
+            .iter()
+            .filter(|(_, n)| matches!(n, ValueNode::Int32Add { .. }))
+            .count();
+        assert_eq!(body_adds_before, 3, "should start with 3 additions in body");
+
+        let folded = super::fold_invariant_addition_chains(&mut graph);
+        assert_eq!(folded, 3, "should fold 3 invariant operands");
+
+        // The endpoint (NodeId 203) should now reference the invariant sum from
+        // the preheader instead of the chain.  Intermediate nodes (201, 202)
+        // are dead and will be cleaned up by DCE; they remain in the body for
+        // now.
+        let endpoint = graph.blocks()[2]
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == NodeId(203))
+            .map(|(_, n)| n);
+        match endpoint {
+            Some(ValueNode::Int32Add { left, right }) => {
+                // left should be the Phi (root_variant = 200).
+                assert_eq!(*left, NodeId(200), "endpoint left should be the Phi");
+                // right should be an invariant sum node in the preheader,
+                // NOT one of the original operands (100, 101, 102).
+                assert!(
+                    right.0 != 100 && right.0 != 101 && right.0 != 102,
+                    "endpoint right should be the new invariant sum node"
+                );
+            }
+            other => panic!("expected Int32Add for endpoint, got {other:?}"),
+        }
+
+        // The preheader should have new Int32Add nodes for the invariant sum.
+        let preheader_adds = graph.blocks()[0]
+            .nodes
+            .iter()
+            .filter(|(_, n)| matches!(n, ValueNode::Int32Add { .. }))
+            .count();
+        assert_eq!(
+            preheader_adds, 2,
+            "preheader should have 2 addition nodes for invariant sum (a+b, (a+b)+c)"
         );
     }
 }
