@@ -168,6 +168,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
     fuse_object_literal_stores(graph);
+    forward_invariant_object_properties(graph);
     eliminate_store_to_load(graph);
     // Re-run constant folding: store-to-load forwarding may replace
     // LoadNamedGeneric with SmiConstants, enabling preheader GenericAdd
@@ -2617,6 +2618,78 @@ fn fuse_object_literal_stores_in_block(block: &mut BasicBlock) {
     remove_indices.sort_unstable();
     for &idx in remove_indices.iter().rev() {
         block.nodes.remove(idx);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass 2b′ — Forward invariant object-literal properties
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Forward property loads from object literals whose properties are never
+/// modified after creation.  Unlike the general store-to-load pass, this
+/// works across block boundaries (including loop headers) because it proves
+/// that the properties are immutable throughout the function.
+///
+/// For each `CreateObjectLiteralWithProperties` that has NO `StoreNamedGeneric`
+/// targeting it anywhere in the graph, every `LoadNamedGeneric` on the same
+/// object and property name is replaced with the creation-time value.
+fn forward_invariant_object_properties(graph: &mut MaglevGraph) {
+    // Phase 1: Collect object literals and their property maps.
+    let mut obj_props: HashMap<NodeId, HashMap<u32, NodeId>> = HashMap::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            if let ValueNode::CreateObjectLiteralWithProperties { names, values, .. } = node {
+                let mut props = HashMap::new();
+                for (name, value) in names.iter().zip(values.iter()) {
+                    props.insert(*name, *value);
+                }
+                obj_props.insert(*id, props);
+            }
+        }
+    }
+
+    if obj_props.is_empty() {
+        return;
+    }
+
+    // Phase 2: Remove any object whose properties are modified (StoreNamedGeneric).
+    for block in graph.blocks() {
+        for (_, node) in &block.nodes {
+            if let ValueNode::StoreNamedGeneric { object, .. } = node {
+                obj_props.remove(object);
+            }
+        }
+    }
+
+    if obj_props.is_empty() {
+        return;
+    }
+
+    // Phase 3: Collect substitutions for LoadNamedGeneric on immutable objects.
+    let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            if let ValueNode::LoadNamedGeneric { object, name, .. } = node
+                && let Some(props) = obj_props.get(object)
+                && let Some(&value) = props.get(name)
+            {
+                subst.insert(*id, value);
+            }
+        }
+    }
+
+    if subst.is_empty() {
+        return;
+    }
+
+    // Phase 4: Apply substitutions.
+    for block in graph.blocks_mut() {
+        for (id, node) in &mut block.nodes {
+            if subst.contains_key(id) {
+                *node = ValueNode::UndefinedConstant;
+            }
+        }
+        apply_subst_to_block(block, &subst);
     }
 }
 
