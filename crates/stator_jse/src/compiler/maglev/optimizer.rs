@@ -169,6 +169,10 @@ pub fn optimize(graph: &mut MaglevGraph) {
     remove_redundant_check_maps(graph);
     fuse_object_literal_stores(graph);
     eliminate_store_to_load(graph);
+    // Re-run constant folding: store-to-load forwarding may replace
+    // LoadNamedGeneric with SmiConstants, enabling preheader GenericAdd
+    // chains (from fold_invariant_addition_chains) to constant-fold.
+    fold_constants(graph);
     eliminate_dead_object_stores(graph);
     eliminate_dead_allocations(graph);
     replace_dead_arguments(graph);
@@ -335,13 +339,51 @@ fn fold_block_constants(block: &mut BasicBlock) {
                 fold_i32_bin(left, right, &consts, |a, b| a ^ b)
             }
 
+            // ── Generic arithmetic (same as Int32 when both inputs are i32 constants)
+            ValueNode::GenericAdd { left, right, .. } => {
+                fold_smi_bin(left, right, &consts, |a, b| a.wrapping_add(b))
+            }
+            ValueNode::GenericSubtract { left, right, .. } => {
+                fold_smi_bin(left, right, &consts, |a, b| a.wrapping_sub(b))
+            }
+            ValueNode::GenericMultiply { left, right, .. } => {
+                fold_smi_bin(left, right, &consts, |a, b| a.wrapping_mul(b))
+            }
+            ValueNode::GenericIncrement { value, .. } => {
+                if let Some(ConstVal::I32(v)) = consts.get(value) {
+                    Some(ValueNode::SmiConstant {
+                        value: v.wrapping_add(1),
+                    })
+                } else {
+                    None
+                }
+            }
+            ValueNode::GenericDecrement { value, .. } => {
+                if let Some(ConstVal::I32(v)) = consts.get(value) {
+                    Some(ValueNode::SmiConstant {
+                        value: v.wrapping_sub(1),
+                    })
+                } else {
+                    None
+                }
+            }
+            ValueNode::GenericNegate { value, .. } => {
+                if let Some(ConstVal::I32(v)) = consts.get(value) {
+                    Some(ValueNode::SmiConstant {
+                        value: v.wrapping_neg(),
+                    })
+                } else {
+                    None
+                }
+            }
+
             _ => None,
         };
 
         if let Some(replacement) = folded {
             // Update the constant map so later nodes can fold through this one.
             match &replacement {
-                ValueNode::Int32Constant { value } => {
+                ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } => {
                     consts.insert(*id, ConstVal::I32(*value));
                 }
                 ValueNode::Float64Constant { value } => {
@@ -364,6 +406,22 @@ fn fold_i32_bin(
     if let (Some(ConstVal::I32(a)), Some(ConstVal::I32(b))) = (consts.get(left), consts.get(right))
     {
         Some(ValueNode::Int32Constant { value: op(*a, *b) })
+    } else {
+        None
+    }
+}
+
+/// Fold a Generic arithmetic operation on two i32-constant inputs into a
+/// `SmiConstant` (preserves the Smi representation for downstream passes).
+fn fold_smi_bin(
+    left: &NodeId,
+    right: &NodeId,
+    consts: &HashMap<NodeId, ConstVal>,
+    op: impl Fn(i32, i32) -> i32,
+) -> Option<ValueNode> {
+    if let (Some(ConstVal::I32(a)), Some(ConstVal::I32(b))) = (consts.get(left), consts.get(right))
+    {
+        Some(ValueNode::SmiConstant { value: op(*a, *b) })
     } else {
         None
     }
