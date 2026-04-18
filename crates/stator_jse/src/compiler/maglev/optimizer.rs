@@ -1699,7 +1699,9 @@ fn make_cse_key(node: &ValueNode) -> Option<CseKey> {
         // Nullary: keyed only by name index.
         ValueNode::LoadGlobal { name, .. } => Some(CseKey::Nullary(1, *name)),
         // Property loads: keyed by object and property name.
-        ValueNode::LoadNamedGeneric { object, name, .. } => Some(CseKey::PropertyLoad(1, *object, *name)),
+        ValueNode::LoadNamedGeneric { object, name, .. } => {
+            Some(CseKey::PropertyLoad(1, *object, *name))
+        }
         _ => None,
     }
 }
@@ -4013,9 +4015,7 @@ fn strength_reduce_iv_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -
         };
         match &header.control {
             Some(ControlNode::Branch {
-                condition,
-                if_true,
-                ..
+                condition, if_true, ..
             }) => (*condition, *if_true),
             _ => return false,
         }
