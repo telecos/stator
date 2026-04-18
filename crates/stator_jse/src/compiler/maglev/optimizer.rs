@@ -173,12 +173,11 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // LoadNamedGeneric with SmiConstants, enabling preheader GenericAdd
     // chains (from fold_invariant_addition_chains) to constant-fold.
     fold_constants(graph);
-    // NOTE: Post-store-to-load range analysis DISABLED — running
-    // eliminate_overflow_checks a second time causes widespread regressions:
-    // sieve: 0.9µs → missing (deopt loop), arithmetic: 7.8µs → 19.5µs,
-    // deep_object: 1.4µs → 2.5µs. Adding propagate_int32_truncation after
-    // it doesn't help — the second range analysis misidentifies accumulator
-    // patterns in the already-optimized graph. Needs a targeted approach.
+    // Targeted late lowering: after store_to_load + fold_constants, some
+    // loops have `GenericAdd(accumulator_phi, SmiConstant(K))` where the
+    // constant was only revealed by forwarding.  Convert these to Int32Add
+    // when init and addend are known-safe Smi constants.
+    lower_constant_accumulator_adds(graph);
     eliminate_dead_object_stores(graph);
     eliminate_dead_allocations(graph);
     replace_dead_arguments(graph);
@@ -3997,6 +3996,176 @@ fn find_increment_step(graph: &MaglevGraph, result_id: NodeId, base_id: NodeId) 
         }
         _ => None,
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass — Late constant-accumulator lowering
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// After store-to-load forwarding and constant folding, some loop accumulator
+/// patterns become `GenericAdd(Phi, SmiConstant(K))` where the constant was
+/// only revealed by forwarding property loads.  This targeted pass converts
+/// these to `Int32Add` when:
+///
+/// 1. The back-edge input of a Phi is `GenericAdd(phi, SmiConstant)`.
+/// 2. The Phi init (entry-edge) is `SmiConstant(init_val)`.
+/// 3. The total accumulation `init + K * max_iterations` fits in i32.
+///
+/// Unlike the full `eliminate_overflow_checks`, this pass does NOT attempt to
+/// detect induction variables or complex chained patterns.
+fn lower_constant_accumulator_adds(graph: &mut MaglevGraph) {
+    let loops = licm::detect_loops(graph);
+    if loops.is_empty() {
+        return;
+    }
+
+    // Build a node → constant map.
+    let mut consts: HashMap<NodeId, i32> = HashMap::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            match node {
+                ValueNode::SmiConstant { value } | ValueNode::Int32Constant { value } => {
+                    consts.insert(*id, *value);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // For each loop, look for GenericAdd(Phi, SmiConstant) accumulators.
+    let mut rewrites: Vec<(u32, usize, NodeId)> = Vec::new();
+
+    for lp in &loops {
+        let header = &graph.blocks()[lp.header as usize];
+        let back_pred_pos = match header
+            .predecessors
+            .iter()
+            .position(|&p| lp.body.contains(&p) && p != lp.header)
+        {
+            Some(pos) => pos,
+            None => continue,
+        };
+        let entry_pos = if back_pred_pos == 0 { 1 } else { 0 };
+
+        // Estimate max iterations from the loop structure.
+        let max_iters = estimate_max_iterations(graph, lp, &consts);
+
+        for (phi_id, node) in &header.nodes {
+            let ValueNode::Phi { inputs } = node else {
+                continue;
+            };
+            if inputs.len() != 2 {
+                continue;
+            }
+
+            let init_id = inputs[entry_pos];
+            let back_id = inputs[back_pred_pos];
+
+            // Init must be a known constant.
+            let Some(&init_val) = consts.get(&init_id) else {
+                continue;
+            };
+
+            // Find back-edge node: must be GenericAdd(phi, const) in a body block.
+            let back_node = find_node_in_blocks(graph, &back_id, &lp.body);
+            let Some((block_idx, node_idx, back_value)) = back_node else {
+                continue;
+            };
+
+            let addend_val = match &back_value {
+                ValueNode::GenericAdd { left, right, .. } if *left == *phi_id => {
+                    consts.get(right).copied()
+                }
+                ValueNode::GenericAdd { left, right, .. } if *right == *phi_id => {
+                    consts.get(left).copied()
+                }
+                _ => None,
+            };
+
+            let Some(k) = addend_val else {
+                continue;
+            };
+
+            // Check total accumulation fits i32.
+            let iters = max_iters.unwrap_or(100_000) as i64;
+            let total_min = (init_val as i64) + (k as i64) * iters;
+            let total_max = (init_val as i64) + (k as i64) * iters;
+            // Check both positive and negative constant accumulation.
+            let (lo, hi) = if k >= 0 {
+                (init_val as i64, total_max)
+            } else {
+                (total_min, init_val as i64)
+            };
+            if lo < i32::MIN as i64 || hi > i32::MAX as i64 {
+                continue;
+            }
+
+            rewrites.push((block_idx, node_idx, back_id));
+        }
+    }
+
+    // Apply rewrites.
+    for (block_idx, node_idx, _back_id) in &rewrites {
+        if let Some(block) = graph.block_mut(*block_idx)
+            && let Some((_, node)) = block.nodes.get_mut(*node_idx)
+            && let ValueNode::GenericAdd { left, right, .. } = node
+        {
+            *node = ValueNode::Int32Add {
+                left: *left,
+                right: *right,
+            };
+        }
+    }
+}
+
+/// Find a node by ID in the given set of blocks, returning (block_idx, node_idx, node).
+fn find_node_in_blocks(
+    graph: &MaglevGraph,
+    node_id: &NodeId,
+    block_indices: &HashSet<u32>,
+) -> Option<(u32, usize, ValueNode)> {
+    for &bi in block_indices {
+        if let Some(block) = graph.block(bi) {
+            for (pos, (id, node)) in block.nodes.iter().enumerate() {
+                if *id == *node_id {
+                    return Some((bi, pos, node.clone()));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Estimate the maximum number of iterations for a loop by examining
+/// the induction variable pattern (Phi with Int32LessThan comparison).
+fn estimate_max_iterations(
+    graph: &MaglevGraph,
+    lp: &licm::NaturalLoop,
+    consts: &HashMap<NodeId, i32>,
+) -> Option<u64> {
+    let header = &graph.blocks()[lp.header as usize];
+
+    // Header must end with Branch on a comparison.
+    let condition_id = match &header.control {
+        Some(ControlNode::Branch { condition, .. }) => *condition,
+        _ => return None,
+    };
+
+    // Find the comparison node.
+    let cmp_node = header
+        .nodes
+        .iter()
+        .find(|(id, _)| *id == condition_id)
+        .map(|(_, n)| n)?;
+
+    let (left, right) = match cmp_node {
+        ValueNode::Int32LessThan { left, right } => (*left, *right),
+        _ => return None,
+    };
+
+    // One side should be a Phi (IV), the other a constant (limit).
+    let limit = consts.get(&right).or_else(|| consts.get(&left))?;
+    Some(*limit as u64)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
