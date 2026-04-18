@@ -192,6 +192,11 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // (8.2µs → 11.3µs) due to extra register pressure and dependency chains.
     // strength_reduce_induction_variables(graph);
     unroll_simple_loops(graph);
+    // After unrolling, re-run reassociation to defer constant adjustments.
+    // Unrolled bodies have chains like (((n + a) - K) + b) - K) — the
+    // constant-deferral pattern pushes all -K subtractions to the end,
+    // then the combining pattern merges them (e.g. 4×(-1) → -4).
+    reassociate_arithmetic(graph);
     eliminate_dead_code(graph);
 }
 
@@ -1408,6 +1413,57 @@ fn try_reassociate(
                     return build_add_mul_reassoc(pos, *add_b, base, k + 1, consts, next_id);
                 }
             }
+            // (a - K) + b  ->  (a + b) - K  when K is constant
+            // Defers constant adjustments past independent additions.
+            // After unrolling, this pushes per-copy constant subs to
+            // the end where fold_constants combines them (e.g. 4×(-1) → -4).
+            if let Some(ValueNode::Int32Subtract {
+                left: sub_a,
+                right: sub_k,
+            }) = node_defs.get(left)
+                && consts.contains_key(sub_k)
+            {
+                let add_id = NodeId(*next_id);
+                *next_id += 1;
+                return Some(Reassoc {
+                    pos,
+                    new_node: ValueNode::Int32Subtract {
+                        left: add_id,
+                        right: *sub_k,
+                    },
+                    prefix: vec![(
+                        add_id,
+                        ValueNode::Int32Add {
+                            left: *sub_a,
+                            right: *right,
+                        },
+                    )],
+                });
+            }
+            // a + (b - K)  ->  (a + b) - K  when K is constant
+            if let Some(ValueNode::Int32Subtract {
+                left: sub_b,
+                right: sub_k,
+            }) = node_defs.get(right)
+                && consts.contains_key(sub_k)
+            {
+                let add_id = NodeId(*next_id);
+                *next_id += 1;
+                return Some(Reassoc {
+                    pos,
+                    new_node: ValueNode::Int32Subtract {
+                        left: add_id,
+                        right: *sub_k,
+                    },
+                    prefix: vec![(
+                        add_id,
+                        ValueNode::Int32Add {
+                            left: *left,
+                            right: *sub_b,
+                        },
+                    )],
+                });
+            }
             None
         }
         ValueNode::Int32Subtract { left, right } => {
@@ -1444,6 +1500,59 @@ fn try_reassociate(
                     && k_l >= k_r
                 {
                     return build_add_mul_reassoc(pos, *add_b, base_r, k_l - k_r, consts, next_id);
+                }
+            }
+            // (a - K1) - K2  ->  a - (K1+K2)  when both are constants
+            // Combines accumulated constant subtractions after deferral.
+            if let Some(&k2) = consts.get(right)
+                && let Some(ValueNode::Int32Subtract {
+                    left: sub_a,
+                    right: sub_k1,
+                }) = node_defs.get(left)
+                && let Some(&k1) = consts.get(sub_k1)
+            {
+                let combined = k1.wrapping_add(k2);
+                let (const_id, prefix) = find_or_create_const(combined, consts, next_id);
+                return Some(Reassoc {
+                    pos,
+                    new_node: ValueNode::Int32Subtract {
+                        left: *sub_a,
+                        right: const_id,
+                    },
+                    prefix,
+                });
+            }
+            // (a + K1) - K2  ->  a + (K1-K2)  when both are constants
+            if let Some(&k2) = consts.get(right)
+                && let Some(ValueNode::Int32Add {
+                    left: add_a,
+                    right: add_k1,
+                }) = node_defs.get(left)
+                && let Some(&k1) = consts.get(add_k1)
+            {
+                let diff = k1.wrapping_sub(k2);
+                if diff == 0 {
+                    // a + 0 → identity, handled by identity elimination
+                } else if diff > 0 {
+                    let (const_id, prefix) = find_or_create_const(diff, consts, next_id);
+                    return Some(Reassoc {
+                        pos,
+                        new_node: ValueNode::Int32Add {
+                            left: *add_a,
+                            right: const_id,
+                        },
+                        prefix,
+                    });
+                } else {
+                    let (const_id, prefix) = find_or_create_const(-diff, consts, next_id);
+                    return Some(Reassoc {
+                        pos,
+                        new_node: ValueNode::Int32Subtract {
+                            left: *add_a,
+                            right: const_id,
+                        },
+                        prefix,
+                    });
                 }
             }
             None
