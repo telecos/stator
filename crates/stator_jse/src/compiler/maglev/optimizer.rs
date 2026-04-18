@@ -1785,8 +1785,7 @@ fn strength_reduce_block(block: &mut BasicBlock, next_id: &mut u32) {
         let mut pow2_reductions: Vec<(usize, NodeId, u32)> = Vec::new();
         for (pos, (_, node)) in block.nodes.iter().enumerate() {
             if let ValueNode::Int32Multiply { left, right } = node
-                && let Some((operand, shift)) =
-                    find_power_of_two_operand(*left, *right, &consts2)
+                && let Some((operand, shift)) = find_power_of_two_operand(*left, *right, &consts2)
             {
                 pow2_reductions.push((pos, operand, shift));
             }
@@ -2757,14 +2756,26 @@ fn fuse_object_literal_stores_in_block(block: &mut BasicBlock) {
 fn forward_invariant_object_properties(graph: &mut MaglevGraph) {
     // Phase 1: Collect object literals and their property maps.
     let mut obj_props: HashMap<NodeId, HashMap<u32, NodeId>> = HashMap::new();
+    // Track StoreGlobal(name, value) → value for global aliasing.
+    let mut global_to_obj: HashMap<u32, NodeId> = HashMap::new();
+
     for block in graph.blocks() {
         for (id, node) in &block.nodes {
-            if let ValueNode::CreateObjectLiteralWithProperties { names, values, .. } = node {
-                let mut props = HashMap::new();
-                for (name, value) in names.iter().zip(values.iter()) {
-                    props.insert(*name, *value);
+            match node {
+                ValueNode::CreateObjectLiteralWithProperties { names, values, .. } => {
+                    let mut props = HashMap::new();
+                    for (name, value) in names.iter().zip(values.iter()) {
+                        props.insert(*name, *value);
+                    }
+                    obj_props.insert(*id, props);
                 }
-                obj_props.insert(*id, props);
+                // Track globals that point to object literals.
+                ValueNode::StoreGlobal { name, value, .. } => {
+                    if obj_props.contains_key(value) {
+                        global_to_obj.insert(*name, *value);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -2778,6 +2789,12 @@ fn forward_invariant_object_properties(graph: &mut MaglevGraph) {
         for (_, node) in &block.nodes {
             if let ValueNode::StoreNamedGeneric { object, .. } = node {
                 obj_props.remove(object);
+                // Also check if object is accessed through a global alias.
+                for (&_gname, &obj_id) in &global_to_obj {
+                    if *object == obj_id {
+                        obj_props.remove(&obj_id);
+                    }
+                }
             }
         }
     }
@@ -2786,15 +2803,31 @@ fn forward_invariant_object_properties(graph: &mut MaglevGraph) {
         return;
     }
 
+    // Build a map from LoadGlobal IDs to the object they alias.
+    let mut load_global_alias: HashMap<NodeId, NodeId> = HashMap::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            if let ValueNode::LoadGlobal { name, .. } = node
+                && let Some(&obj_id) = global_to_obj.get(name)
+                && obj_props.contains_key(&obj_id)
+            {
+                load_global_alias.insert(*id, obj_id);
+            }
+        }
+    }
+
     // Phase 3: Collect substitutions for LoadNamedGeneric on immutable objects.
     let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
     for block in graph.blocks() {
         for (id, node) in &block.nodes {
-            if let ValueNode::LoadNamedGeneric { object, name, .. } = node
-                && let Some(props) = obj_props.get(object)
-                && let Some(&value) = props.get(name)
-            {
-                subst.insert(*id, value);
+            if let ValueNode::LoadNamedGeneric { object, name, .. } = node {
+                // Try direct match first.
+                let resolved_obj = load_global_alias.get(object).copied().unwrap_or(*object);
+                if let Some(props) = obj_props.get(&resolved_obj)
+                    && let Some(&value) = props.get(name)
+                {
+                    subst.insert(*id, value);
+                }
             }
         }
     }
