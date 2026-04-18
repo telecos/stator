@@ -2402,6 +2402,29 @@ impl<'a> MaglevCodegen<'a> {
                 }
             }
 
+            // ── Speculative call-loop fusion ──────────────────────────────────
+            //
+            // Emits a stub call to `jit_runtime_speculative_call_fusion` which
+            // analyses the callee bytecodes at runtime and either computes
+            // the closed-form result or returns JIT_DEOPT.
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::SpeculativeCallFusion {
+                callee,
+                trip_count,
+            } => {
+                let saved = self.emit_save_live_regs(id);
+                self.emit_load(*callee, Reg64::Rdi);
+                self.masm.mov_ri(Reg64::Rsi, i64::from(*trip_count));
+                self.masm.mov_ri(
+                    Reg64::R11,
+                    jit_runtime::jit_runtime_speculative_call_fusion as *const () as usize as i64,
+                );
+                self.masm.call_reg(Reg64::R11);
+                self.emit_restore_live_regs(saved);
+                self.emit_deopt_check_rax();
+                self.emit_store(id, Reg64::Rax);
+            }
+
             // ── Object / array / closure creation ─────────────────────────────
             //
             // CreateObjectLiteral and CreateShallowObjectLiteral use a
@@ -3945,6 +3968,7 @@ impl<'a> MaglevCodegen<'a> {
                 | ValueNode::Construct { .. }
                 | ValueNode::ConstructWithSpread { .. }
                 | ValueNode::CallWithSpread { .. }
+                | ValueNode::SpeculativeCallFusion { .. }
         )
     }
 
@@ -8066,6 +8090,9 @@ impl<'a> MaglevCodegen<'a> {
                 for a in args {
                     out.insert(*a);
                 }
+            }
+            ValueNode::SpeculativeCallFusion { callee, .. } => {
+                out.insert(*callee);
             }
             ValueNode::CallBuiltin { args, .. } | ValueNode::CallRuntime { args, .. } => {
                 for a in args {

@@ -1354,6 +1354,19 @@ pub enum ValueNode {
         args: Vec<NodeId>,
     },
 
+    /// Speculative call-loop fusion: replaces a counted loop that calls
+    /// `callee()` N times and uses the last result.  The runtime analyses
+    /// the callee's bytecode; for simple context-slot increments it
+    /// computes the closed form in O(1).  If any check fails (wrong
+    /// bytecode shape, non-Smi slot, overflow) it returns JIT_DEOPT and
+    /// the interpreter re-runs the loop.
+    SpeculativeCallFusion {
+        /// The closure/function to call.
+        callee: NodeId,
+        /// Number of times the callee would be called.
+        trip_count: u32,
+    },
+
     /// Call to a builtin function by ID.
     CallBuiltin {
         /// Zero-based builtin function identifier.

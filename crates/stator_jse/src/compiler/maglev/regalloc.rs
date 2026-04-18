@@ -651,6 +651,10 @@ fn collect_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
             }
         }
 
+        ValueNode::SpeculativeCallFusion { callee, .. } => {
+            f(*callee);
+        }
+
         ValueNode::CallBuiltin { args, .. } | ValueNode::CallRuntime { args, .. } => {
             for &a in args {
                 f(a);

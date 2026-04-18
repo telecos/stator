@@ -3093,6 +3093,113 @@ pub(crate) mod jit_runtime {
         })
     }
 
+    /// Speculative call-loop fusion: given a callee (closure) and a trip
+    /// count N, analyse the callee's bytecodes at runtime.  If they match
+    /// the simple pattern `LdaCurrentContextSlot(S), AddSmi(K, _),
+    /// StaCurrentContextSlot(S), Return` (a context-slot increment), compute
+    /// the closed-form `slot[S] += K * N` in O(1) and return the *last*
+    /// call's return value (`old + K * N`).
+    ///
+    /// Returns `JIT_DEOPT` if the bytecodes don't match or any overflow /
+    /// non-Smi condition is detected — the interpreter re-runs the loop.
+    pub extern "C" fn jit_runtime_speculative_call_fusion(
+        callee_i64: i64,
+        trip_count: i64,
+    ) -> i64 {
+        speculative_call_fusion_inner(callee_i64, trip_count as u32).unwrap_or(JIT_DEOPT)
+    }
+
+    /// Inner implementation for speculative call fusion.
+    fn speculative_call_fusion_inner(callee_i64: i64, n: u32) -> Option<i64> {
+        use crate::bytecode::bytecodes::{Opcode, Operand, decode};
+        use crate::objects::value::JsValue;
+
+        if n == 0 {
+            return None; // no calls to fuse
+        }
+
+        // 1. Resolve callee to a BytecodeArray.
+        let callee_val = get_heap_object(callee_i64)?;
+        let ba = match &callee_val {
+            JsValue::Function(ba) => ba,
+            _ => return None,
+        };
+
+        // 2. Decode bytecodes and match the simple increment pattern.
+        let instrs = decode(ba.bytecodes()).ok()?;
+
+        // Expected pattern (exactly 4 instructions):
+        //   [0] LdaCurrentContextSlot(slot)
+        //   [1] AddSmi(K, feedback_slot)
+        //   [2] StaCurrentContextSlot(slot)   -- same slot
+        //   [3] Return
+        if instrs.len() != 4 {
+            return None;
+        }
+
+        // Parse instruction 0: LdaCurrentContextSlot
+        if instrs[0].opcode != Opcode::LdaCurrentContextSlot {
+            return None;
+        }
+        let slot = match instrs[0].operand_at(0) {
+            Some(Operand::ConstantPoolIdx(s)) => *s as usize,
+            _ => return None,
+        };
+
+        // Parse instruction 1: AddSmi
+        if instrs[1].opcode != Opcode::AddSmi {
+            return None;
+        }
+        let k = match instrs[1].operand_at(0) {
+            Some(Operand::Immediate(k)) => *k as i64,
+            _ => return None,
+        };
+
+        // Parse instruction 2: StaCurrentContextSlot (same slot)
+        if instrs[2].opcode != Opcode::StaCurrentContextSlot {
+            return None;
+        }
+        let store_slot = match instrs[2].operand_at(0) {
+            Some(Operand::ConstantPoolIdx(s)) => *s as usize,
+            _ => return None,
+        };
+        if store_slot != slot {
+            return None;
+        }
+
+        // Parse instruction 3: Return
+        if instrs[3].opcode != Opcode::Return {
+            return None;
+        }
+
+        // 3. Read the closure context slot.
+        let ctx_rc = ba.closure_context()?;
+        let mut ctx = ctx_rc.borrow_mut();
+        let old_val = ctx.slots.get(slot)?;
+        let old_smi = match old_val {
+            JsValue::Smi(v) => i64::from(*v),
+            _ => return None,
+        };
+
+        // 4. Compute closed form: new_val = old_smi + k * n
+        let n64 = i64::from(n);
+        let total_add = k.checked_mul(n64)?;
+        let new_val = old_smi.checked_add(total_add)?;
+
+        // Must fit in Smi range (i32).
+        if new_val < i32::MIN as i64 || new_val > i32::MAX as i64 {
+            return None;
+        }
+
+        // 5. Write the new value back.
+        ctx.slots[slot] = JsValue::Smi(new_val as i32);
+
+        // The last call would have returned old_smi + k * n = new_val,
+        // but the accumulator after AddSmi is the new value *before* the
+        // store writes it — which is the same value.  Return it as Smi.
+        Some(new_val)
+    }
+
     /// Execute a JS `Function` callee via JIT (preferred) or interpreter
     /// (fallback).
     ///

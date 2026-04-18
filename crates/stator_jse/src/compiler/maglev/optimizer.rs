@@ -165,6 +165,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     eliminate_identity_operations_global(graph);
     eliminate_redundant_type_guards(graph);
     specialize_closure_calls(graph);
+    fuse_call_loops(graph);
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
     fuse_object_literal_stores(graph);
@@ -949,6 +950,9 @@ fn visit_value_node_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
             for a in args {
                 f(*a);
             }
+        }
+        ValueNode::SpeculativeCallFusion { callee, .. } => {
+            f(*callee);
         }
 
         // Catch-all for zero-input nodes and any new variants.
@@ -2089,6 +2093,7 @@ fn is_user_call(node: &ValueNode) -> bool {
             | ValueNode::CallWithSpread { .. }
             | ValueNode::Construct { .. }
             | ValueNode::ConstructWithSpread { .. }
+            | ValueNode::SpeculativeCallFusion { .. }
     )
 }
 
@@ -2595,6 +2600,242 @@ fn specialize_closure_calls(graph: &mut MaglevGraph) {
             }
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Speculative call-loop fusion
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Replace a counted loop that calls a 0-arg closure N times with a single
+/// [`ValueNode::SpeculativeCallFusion`] in the preheader.
+///
+/// Pattern detected:
+/// ```text
+///   header: result_phi = Phi(init, call_result)
+///           iv_phi     = Phi(0, iv_next)
+///           Branch(iv_phi < limit, body, exit)
+///   body:   call_result = Call(callee, undefined, [])
+///           iv_next     = Int32Add(iv_phi, 1)
+///           Jump(header)
+/// ```
+///
+/// The fusion node calls into the runtime which analyses the callee's
+/// bytecodes.  If it matches a simple context-slot increment pattern, the
+/// runtime computes the closed-form result in O(1); otherwise it returns
+/// `JIT_DEOPT` and the interpreter re-runs the loop.
+fn fuse_call_loops(graph: &mut MaglevGraph) {
+    let loops = licm::detect_loops(graph);
+    if loops.is_empty() {
+        return;
+    }
+    for lp in &loops {
+        try_fuse_call_loop(graph, lp);
+    }
+}
+
+fn try_fuse_call_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
+    // ── 1. Simple loop: header + 1 body block ────────────────────────────
+    if lp.body.len() != 2 || !lp.body.contains(&lp.header) {
+        return false;
+    }
+    let header = match graph.block(lp.header) {
+        Some(b) => b,
+        None => return false,
+    };
+    let (condition_id, body_block_idx, _exit_block_idx) = match &header.control {
+        Some(ControlNode::Branch {
+            condition,
+            if_true,
+            if_false,
+        }) => (*condition, *if_true, *if_false),
+        _ => return false,
+    };
+    if !lp.body.contains(&body_block_idx) {
+        return false;
+    }
+
+    let body = match graph.block(body_block_idx) {
+        Some(b) => b,
+        None => return false,
+    };
+    match &body.control {
+        Some(ControlNode::Jump { target }) if *target == lp.header => {}
+        _ => return false,
+    }
+
+    // ── 2. Find IV and trip count ────────────────────────────────────────
+    let (cmp_left, cmp_right) = {
+        let mut found = None;
+        for (nid, node) in &header.nodes {
+            if *nid == condition_id {
+                found = Some(node.clone());
+                break;
+            }
+        }
+        match found {
+            Some(ValueNode::Int32LessThan { left, right }) => (left, right),
+            _ => return false,
+        }
+    };
+
+    let back_pred_pos = match header
+        .predecessors
+        .iter()
+        .position(|&p| p == body_block_idx)
+    {
+        Some(pos) => pos,
+        None => return false,
+    };
+    let entry_pos = match header.predecessors.iter().position(|&p| p == lp.preheader) {
+        Some(pos) => pos,
+        None => return false,
+    };
+
+    let iv_phi_id = cmp_left;
+    let iv_phi_inputs = {
+        let h = graph.block(lp.header).unwrap();
+        let mut found = None;
+        for (nid, node) in &h.nodes {
+            if *nid == iv_phi_id {
+                if let ValueNode::Phi { inputs } = node {
+                    found = Some(inputs.clone());
+                }
+                break;
+            }
+        }
+        match found {
+            Some(inputs) if inputs.len() == 2 => inputs,
+            _ => return false,
+        }
+    };
+
+    let iv_init_id = iv_phi_inputs[entry_pos];
+    let iv_limit_id = cmp_right;
+
+    let iv_init = match find_i32_constant(graph, iv_init_id) {
+        Some(v) => v,
+        None => return false,
+    };
+    let iv_limit = match find_i32_constant(graph, iv_limit_id) {
+        Some(v) => v,
+        None => return false,
+    };
+
+    // IV step must be exactly 1.
+    let iv_back_id = iv_phi_inputs[back_pred_pos];
+    let iv_step = find_increment_step(graph, iv_back_id, iv_phi_id);
+    if iv_step != Some(1) {
+        return false;
+    }
+
+    let range = (iv_limit as i64) - (iv_init as i64);
+    if range <= 0 || range > 100_000 {
+        return false; // sanity: don't fuse huge loops
+    }
+    let trip_count = range as u32;
+
+    // ── 3. Find a Phi whose back-edge is a Call(callee, undef, []) ──────
+    let h = graph.block(lp.header).unwrap();
+    let header_phis: Vec<(NodeId, Vec<NodeId>)> = h
+        .nodes
+        .iter()
+        .filter_map(|(nid, node)| {
+            if let ValueNode::Phi { inputs } = node
+                && *nid != iv_phi_id
+                && inputs.len() == 2
+            {
+                return Some((*nid, inputs.clone()));
+            }
+            None
+        })
+        .collect();
+
+    let loop_body_set: HashSet<u32> = lp.body.iter().copied().collect();
+
+    for (phi_id, inputs) in &header_phis {
+        let back_id = inputs[back_pred_pos];
+
+        // Look up the back-edge node: must be a Call with 0 args + undefined receiver
+        let body_block = graph.block(body_block_idx).unwrap();
+        let call_node = body_block
+            .nodes
+            .iter()
+            .find(|(nid, _)| *nid == back_id)
+            .map(|(_, node)| node);
+
+        let callee_id = match call_node {
+            Some(ValueNode::Call {
+                callee,
+                receiver,
+                args,
+                ..
+            }) if args.is_empty() => {
+                // Receiver must be undefined.
+                let recv_is_undef = matches!(
+                    graph.node(*receiver),
+                    Some(ValueNode::UndefinedConstant)
+                );
+                if !recv_is_undef {
+                    continue;
+                }
+                *callee
+            }
+            Some(ValueNode::CallKnownFunction {
+                callee,
+                receiver,
+                args,
+            }) if args.is_empty() => {
+                let recv_is_undef = matches!(
+                    graph.node(*receiver),
+                    Some(ValueNode::UndefinedConstant)
+                );
+                if !recv_is_undef {
+                    continue;
+                }
+                *callee
+            }
+            _ => continue,
+        };
+
+        // Callee must be loop-invariant (defined outside the loop).
+        let callee_in_loop = loop_body_set.iter().any(|&bi| {
+            graph
+                .block(bi)
+                .map(|b| b.nodes.iter().any(|(nid, _)| *nid == callee_id))
+                .unwrap_or(false)
+        });
+        if callee_in_loop {
+            continue;
+        }
+
+        // ── 4. Insert SpeculativeCallFusion in preheader ─────────────────
+        let fusion_id = graph.alloc_node_id();
+        if let Some(pre) = graph.block_mut(lp.preheader) {
+            pre.push_with_id(
+                fusion_id,
+                ValueNode::SpeculativeCallFusion {
+                    callee: callee_id,
+                    trip_count,
+                },
+            );
+        }
+
+        // Update the Phi: entry = fusion result, back-edge = self (identity).
+        let h = graph.block_mut(lp.header).unwrap();
+        for (nid, node) in &mut h.nodes {
+            if *nid == *phi_id {
+                if let ValueNode::Phi { inputs } = node {
+                    inputs[entry_pos] = fusion_id;
+                    inputs[back_pred_pos] = *phi_id;
+                }
+                break;
+            }
+        }
+
+        return true; // fused one accumulator; done for this loop
+    }
+
+    false
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3598,6 +3839,10 @@ fn collect_value_node_inputs(node: &ValueNode, live: &mut HashSet<NodeId>) {
             }
         }
 
+        ValueNode::SpeculativeCallFusion { callee, .. } => {
+            live.insert(*callee);
+        }
+
         ValueNode::Construct {
             constructor, args, ..
         }
@@ -3653,6 +3898,7 @@ fn has_side_effects(node: &ValueNode) -> bool {
             | ValueNode::CallWithSpread { .. }
             | ValueNode::Construct { .. }
             | ValueNode::ConstructWithSpread { .. }
+            | ValueNode::SpeculativeCallFusion { .. }
             // Allocations have side-effects (GC pressure / observable identity).
             | ValueNode::CreateObjectLiteral { .. }
             | ValueNode::CreateObjectLiteralWithProperties { .. }
@@ -3745,6 +3991,7 @@ fn can_invalidate_named_stores(node: &ValueNode) -> bool {
             | ValueNode::CallWithSpread { .. }
             | ValueNode::Construct { .. }
             | ValueNode::ConstructWithSpread { .. }
+            | ValueNode::SpeculativeCallFusion { .. }
             // Property deletion mutates objects.
             | ValueNode::DeleteProperty { .. }
             // For-in can invalidate caches.
@@ -4082,6 +4329,10 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
             for a in args.iter_mut() {
                 *a = resolve(*a);
             }
+        }
+
+        ValueNode::SpeculativeCallFusion { callee, .. } => {
+            *callee = resolve(*callee);
         }
 
         ValueNode::Construct {
