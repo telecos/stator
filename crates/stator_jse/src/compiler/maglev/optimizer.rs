@@ -186,6 +186,13 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // constant was only revealed by forwarding.  Convert these to Int32Add
     // when init and addend are known-safe Smi constants.
     lower_constant_accumulator_adds(graph);
+    // Loop scalar evolution: replace simple counted loops with constant
+    // accumulators by a closed-form computation.  E.g. a loop that does
+    // `sum += 15` for 1000 iterations becomes `sum = 0 + 15*1000 = 15000`.
+    // This must run AFTER lower_constant_accumulator_adds (which converts
+    // GenericAdd→Int32Add) and BEFORE unrolling (which would complicate
+    // the loop structure).
+    eliminate_constant_accumulator_loops(graph);
     eliminate_dead_object_stores(graph);
     eliminate_dead_allocations(graph);
     replace_dead_arguments(graph);
@@ -4530,6 +4537,307 @@ fn find_node_in_blocks(
         }
     }
     None
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass — Loop scalar evolution (constant-accumulator elimination)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Replace simple counted loops that only accumulate a constant addend with
+/// a closed-form computation.
+///
+/// Pattern detected:
+///   header: phi_acc = Phi(init, back_edge)
+///           phi_iv  = Phi(iv_init, iv_step)
+///           Branch(Int32LessThan(phi_iv, limit), body, exit)
+///   body:   back_edge = Int32Add(phi_acc, K)  [K is constant]
+///           iv_step   = Int32Add(phi_iv, step) [step is constant]
+///           Jump(header)
+///
+/// Replacement:
+///   preheader: trip_count = (limit - iv_init) / step
+///              result = init + K * trip_count
+///   The accumulator Phi's init input is replaced with `result` and the
+///   loop body's accumulator update becomes an identity (phi feeds itself),
+///   effectively making the loop a no-op for the accumulator.
+///
+/// This eliminates the entire loop for benchmarks like property_access
+/// (`sum += 15` × 1000 → `sum = 15000`) and deep_object (`sum += 99` × 1000).
+fn eliminate_constant_accumulator_loops(graph: &mut MaglevGraph) {
+    let loops = licm::detect_loops(graph);
+    if loops.is_empty() {
+        return;
+    }
+
+    // Build a node → constant map.
+    let mut consts: HashMap<NodeId, i32> = HashMap::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            match node {
+                ValueNode::SmiConstant { value } | ValueNode::Int32Constant { value } => {
+                    consts.insert(*id, *value);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for lp in &loops {
+        try_eliminate_constant_accumulator(graph, lp, &consts);
+    }
+}
+
+/// Try to replace a single loop's constant accumulator with a closed-form value.
+fn try_eliminate_constant_accumulator(
+    graph: &mut MaglevGraph,
+    lp: &licm::NaturalLoop,
+    consts: &HashMap<NodeId, i32>,
+) -> bool {
+    let header = match graph.block(lp.header) {
+        Some(b) => b,
+        None => return false,
+    };
+
+    // ── 1. Header must end with Branch on Int32LessThan ──────────────────
+    let (condition_id, body_block_idx, _exit_block_idx) = match &header.control {
+        Some(ControlNode::Branch {
+            condition,
+            if_true,
+            if_false,
+        }) => (*condition, *if_true, *if_false),
+        _ => return false,
+    };
+
+    if !lp.body.contains(&body_block_idx) {
+        return false;
+    }
+
+    // Simple loop: header + 1 body block.
+    if lp.body.len() != 2 || !lp.body.contains(&lp.header) {
+        return false;
+    }
+
+    let body = match graph.block(body_block_idx) {
+        Some(b) => b,
+        None => return false,
+    };
+
+    // Body must jump back to header.
+    match &body.control {
+        Some(ControlNode::Jump { target }) if *target == lp.header => {}
+        _ => return false,
+    }
+
+    // ── 2. Find comparison and induction variable ────────────────────────
+    let (cmp_left, cmp_right) = {
+        let mut found = None;
+        for (nid, node) in &header.nodes {
+            if *nid == condition_id {
+                found = Some(node.clone());
+                break;
+            }
+        }
+        match found {
+            Some(ValueNode::Int32LessThan { left, right }) => (left, right),
+            _ => return false,
+        }
+    };
+
+    // ── 3. Identify predecessor positions ────────────────────────────────
+    let back_pred_pos = match header
+        .predecessors
+        .iter()
+        .position(|&p| p == body_block_idx)
+    {
+        Some(pos) => pos,
+        None => return false,
+    };
+    let entry_pos = match header.predecessors.iter().position(|&p| p == lp.preheader) {
+        Some(pos) => pos,
+        None => return false,
+    };
+
+    // ── 4. Find the induction variable Phi ───────────────────────────────
+    let iv_phi_id = cmp_left;
+    let iv_phi_inputs = {
+        let h = graph.block(lp.header).unwrap();
+        let mut found = None;
+        for (nid, node) in &h.nodes {
+            if *nid == iv_phi_id {
+                if let ValueNode::Phi { inputs } = node {
+                    found = Some(inputs.clone());
+                }
+                break;
+            }
+        }
+        match found {
+            Some(inputs) if inputs.len() == 2 => inputs,
+            _ => return false,
+        }
+    };
+
+    let iv_init_id = iv_phi_inputs[entry_pos];
+    let iv_limit_id = cmp_right;
+
+    let iv_init = match consts.get(&iv_init_id) {
+        Some(&v) => v,
+        None => match find_i32_constant(graph, iv_init_id) {
+            Some(v) => v,
+            None => return false,
+        },
+    };
+    let iv_limit = match consts.get(&iv_limit_id) {
+        Some(&v) => v,
+        None => match find_i32_constant(graph, iv_limit_id) {
+            Some(v) => v,
+            None => return false,
+        },
+    };
+
+    // Find IV step.
+    let iv_back_id = iv_phi_inputs[back_pred_pos];
+    let iv_step = find_increment_step(graph, iv_back_id, iv_phi_id);
+    let iv_step_val = match iv_step {
+        Some(s) if s > 0 => s,
+        _ => return false,
+    };
+
+    // Compute trip count using widened arithmetic.  Require exact
+    // divisibility to avoid off-by-one errors.
+    let range = (iv_limit as i64) - (iv_init as i64);
+    let step = iv_step_val as i64;
+    if range <= 0 || range % step != 0 {
+        return false;
+    }
+    let trip_count = range / step;
+
+    // ── 5. Find accumulator Phis with Int32Add(phi, const) back-edges ───
+    let h = graph.block(lp.header).unwrap();
+    let header_phis: Vec<(NodeId, Vec<NodeId>)> = h
+        .nodes
+        .iter()
+        .filter_map(|(nid, node)| {
+            if let ValueNode::Phi { inputs } = node {
+                Some((*nid, inputs.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Collect accumulators: (phi_id, init_val, addend_val, back_node_id)
+    let mut accumulators: Vec<(NodeId, i32, i32, NodeId)> = Vec::new();
+
+    // Build use-count map for the loop body to verify accumulators are
+    // only used by their own recurrence update.
+    let mut loop_use_counts: HashMap<NodeId, usize> = HashMap::new();
+    for &bi in &lp.body {
+        if let Some(block) = graph.block(bi) {
+            for (_, node) in &block.nodes {
+                visit_value_node_inputs(node, &mut |id| {
+                    *loop_use_counts.entry(id).or_insert(0) += 1;
+                });
+            }
+        }
+    }
+
+    for (phi_id, inputs) in &header_phis {
+        if *phi_id == iv_phi_id {
+            continue; // Skip the induction variable itself.
+        }
+        if inputs.len() != 2 {
+            continue;
+        }
+
+        let init_id = inputs[entry_pos];
+        let back_id = inputs[back_pred_pos];
+
+        // Init must be a known constant.
+        let init_val = match consts.get(&init_id) {
+            Some(&v) => v,
+            None => match find_i32_constant(graph, init_id) {
+                Some(v) => v,
+                None => continue,
+            },
+        };
+
+        // Back-edge must be Int32Add(phi, K) or Int32Add(K, phi).
+        // Only handle Int32Add — GenericAdd may have JS-level semantics
+        // (ToPrimitive, string concat) that a constant replacement would break.
+        let body = graph.block(body_block_idx).unwrap();
+        let back_node = body
+            .nodes
+            .iter()
+            .find(|(nid, _)| *nid == back_id)
+            .map(|(_, n)| n);
+
+        let addend_val = match back_node {
+            Some(ValueNode::Int32Add { left, right }) if *left == *phi_id => consts
+                .get(right)
+                .copied()
+                .or_else(|| find_i32_constant(graph, *right)),
+            Some(ValueNode::Int32Add { left, right }) if *right == *phi_id => consts
+                .get(left)
+                .copied()
+                .or_else(|| find_i32_constant(graph, *left)),
+            _ => None,
+        };
+
+        let Some(k) = addend_val else {
+            continue;
+        };
+
+        // Safety: the accumulator Phi must only be used inside the loop
+        // by its own recurrence update (the Int32Add back-edge).
+        // If anything else reads the accumulator within the loop, we
+        // cannot replace it with the final value.
+        let in_loop_uses = loop_use_counts.get(phi_id).copied().unwrap_or(0);
+        if in_loop_uses > 1 {
+            // More than 1 use inside the loop (the recurrence add) — bail.
+            continue;
+        }
+
+        // Verify closed-form result fits i32.
+        let result = (init_val as i64) + (k as i64) * trip_count;
+        if result < i32::MIN as i64 || result > i32::MAX as i64 {
+            continue;
+        }
+
+        accumulators.push((*phi_id, init_val, k, back_id));
+    }
+
+    if accumulators.is_empty() {
+        return false;
+    }
+
+    // ── 6. Apply: replace Phi init with the closed-form result ──────────
+    // Create a SmiConstant for the result in the preheader.
+    for (phi_id, init_val, k, _back_id) in &accumulators {
+        let result = (*init_val as i64) + (*k as i64) * trip_count;
+        let result_val = result as i32;
+
+        // Create a new SmiConstant node for the result.
+        let result_node_id = graph.alloc_node_id();
+        if let Some(pre) = graph.block_mut(lp.preheader) {
+            pre.push_with_id(result_node_id, ValueNode::SmiConstant { value: result_val });
+        }
+
+        // Update the Phi's init input to point to the computed result.
+        let h = graph.block_mut(lp.header).unwrap();
+        for (nid, node) in &mut h.nodes {
+            if *nid == *phi_id {
+                if let ValueNode::Phi { inputs } = node {
+                    inputs[entry_pos] = result_node_id;
+                    // Also make the back-edge point to the phi itself,
+                    // making the accumulator an identity within the loop.
+                    inputs[back_pred_pos] = *phi_id;
+                }
+                break;
+            }
+        }
+    }
+
+    true
 }
 
 /// Estimate the maximum number of iterations for a loop by examining
