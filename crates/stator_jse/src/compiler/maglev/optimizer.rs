@@ -3898,10 +3898,18 @@ fn find_i32_constant(graph: &MaglevGraph, id: NodeId) -> Option<i32> {
 fn find_increment_step(graph: &MaglevGraph, result_id: NodeId, base_id: NodeId) -> Option<i32> {
     let node = graph.node(result_id)?;
     match node {
-        ValueNode::Int32Increment { value } | ValueNode::CheckedSmiIncrement { value } => {
-            if *value == base_id { Some(1) } else { None }
+        ValueNode::Int32Increment { value }
+        | ValueNode::CheckedSmiIncrement { value }
+        | ValueNode::GenericIncrement { value, .. } => {
+            if *value == base_id {
+                Some(1)
+            } else {
+                None
+            }
         }
-        ValueNode::Int32Add { left, right } | ValueNode::CheckedSmiAdd { left, right } => {
+        ValueNode::Int32Add { left, right }
+        | ValueNode::CheckedSmiAdd { left, right }
+        | ValueNode::GenericAdd { left, right, .. } => {
             if *left == base_id {
                 find_i32_constant(graph, *right)
             } else if *right == base_id {
