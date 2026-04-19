@@ -3683,7 +3683,10 @@ fn try_forward_loop_object(
         for (i, v) in final_values.iter().enumerate() {
             if v.is_none() {
                 let vn = graph.node(create_values[i]);
-                eprintln!("[OBJ_FWD] eval fail prop {i} type={:?}", vn.map(std::mem::discriminant));
+                eprintln!(
+                    "[OBJ_FWD] eval fail prop {i} type={:?}",
+                    vn.map(std::mem::discriminant)
+                );
             }
         }
         return false;
