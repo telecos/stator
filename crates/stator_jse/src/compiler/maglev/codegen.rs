@@ -2408,10 +2408,7 @@ impl<'a> MaglevCodegen<'a> {
             // analyses the callee bytecodes at runtime and either computes
             // the closed-form result or returns JIT_DEOPT.
             #[cfg(all(target_arch = "x86_64", unix))]
-            ValueNode::SpeculativeCallFusion {
-                callee,
-                trip_count,
-            } => {
+            ValueNode::SpeculativeCallFusion { callee, trip_count } => {
                 let saved = self.emit_save_live_regs(id);
                 self.emit_load(*callee, Reg64::Rdi);
                 self.masm.mov_ri(Reg64::Rsi, i64::from(*trip_count));

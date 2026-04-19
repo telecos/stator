@@ -2638,35 +2638,50 @@ fn try_fuse_call_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
     if lp.body.len() != 2 || !lp.body.contains(&lp.header) {
         return false;
     }
-    let header = match graph.block(lp.header) {
-        Some(b) => b,
-        None => return false,
-    };
-    let (condition_id, body_block_idx, _exit_block_idx) = match &header.control {
-        Some(ControlNode::Branch {
-            condition,
-            if_true,
-            if_false,
-        }) => (*condition, *if_true, *if_false),
-        _ => return false,
-    };
-    if !lp.body.contains(&body_block_idx) {
-        return false;
+
+    // Extract all structural data from blocks into owned values, then release borrows.
+    let (condition_id, body_block_idx, header_preds, header_nodes_snapshot);
+    {
+        let header = match graph.block(lp.header) {
+            Some(b) => b,
+            None => return false,
+        };
+        let (cond, body_bi, _exit) = match &header.control {
+            Some(ControlNode::Branch {
+                condition,
+                if_true,
+                if_false,
+            }) => (*condition, *if_true, *if_false),
+            _ => return false,
+        };
+        if !lp.body.contains(&body_bi) {
+            return false;
+        }
+        condition_id = cond;
+        body_block_idx = body_bi;
+        header_preds = header.predecessors.clone();
+        header_nodes_snapshot = header
+            .nodes
+            .iter()
+            .map(|(nid, node)| (*nid, node.clone()))
+            .collect::<Vec<_>>();
     }
 
-    let body = match graph.block(body_block_idx) {
-        Some(b) => b,
-        None => return false,
-    };
-    match &body.control {
-        Some(ControlNode::Jump { target }) if *target == lp.header => {}
-        _ => return false,
+    {
+        let body = match graph.block(body_block_idx) {
+            Some(b) => b,
+            None => return false,
+        };
+        match &body.control {
+            Some(ControlNode::Jump { target }) if *target == lp.header => {}
+            _ => return false,
+        }
     }
 
     // ── 2. Find IV and trip count ────────────────────────────────────────
     let (cmp_left, cmp_right) = {
         let mut found = None;
-        for (nid, node) in &header.nodes {
+        for (nid, node) in &header_nodes_snapshot {
             if *nid == condition_id {
                 found = Some(node.clone());
                 break;
@@ -2678,164 +2693,286 @@ fn try_fuse_call_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
         }
     };
 
-    let back_pred_pos = match header
-        .predecessors
-        .iter()
-        .position(|&p| p == body_block_idx)
-    {
-        Some(pos) => pos,
-        None => return false,
-    };
-    let entry_pos = match header.predecessors.iter().position(|&p| p == lp.preheader) {
-        Some(pos) => pos,
+    let iv_limit = match find_i32_constant(graph, cmp_right) {
+        Some(v) => v,
         None => return false,
     };
 
-    let iv_phi_id = cmp_left;
-    let iv_phi_inputs = {
-        let h = graph.block(lp.header).unwrap();
-        let mut found = None;
-        for (nid, node) in &h.nodes {
-            if *nid == iv_phi_id {
-                if let ValueNode::Phi { inputs } = node {
-                    found = Some(inputs.clone());
-                }
-                break;
+    // Determine trip count by examining the IV node.
+    // iv_global_name is Some(name) when the IV is a LoadGlobal (need to short-circuit).
+    let (trip_count, call_node_id, callee_id, iv_global_name) =
+        if let Some(ValueNode::Phi { inputs }) = graph.node(cmp_left) {
+            // ── Phi-based IV ──
+            let inputs = inputs.clone();
+            if inputs.len() != 2 {
+                return false;
             }
-        }
-        match found {
-            Some(inputs) if inputs.len() == 2 => inputs,
-            _ => return false,
-        }
-    };
+            let back_pred_pos = match header_preds.iter().position(|&p| p == body_block_idx) {
+                Some(pos) => pos,
+                None => return false,
+            };
+            let entry_pos = match header_preds.iter().position(|&p| p == lp.preheader) {
+                Some(pos) => pos,
+                None => return false,
+            };
 
-    let iv_init_id = iv_phi_inputs[entry_pos];
-    let iv_limit_id = cmp_right;
+            let iv_init = match find_i32_constant(graph, inputs[entry_pos]) {
+                Some(v) => v,
+                None => return false,
+            };
+            let iv_step = find_increment_step(graph, inputs[back_pred_pos], cmp_left);
+            if iv_step != Some(1) {
+                return false;
+            }
+            let range = (iv_limit as i64) - (iv_init as i64);
+            if range <= 0 || range > 100_000 {
+                return false;
+            }
 
-    let iv_init = match find_i32_constant(graph, iv_init_id) {
-        Some(v) => v,
-        None => return false,
-    };
-    let iv_limit = match find_i32_constant(graph, iv_limit_id) {
-        Some(v) => v,
-        None => return false,
-    };
+            // Find a non-IV Phi whose back-edge is a Call
+            let mut found_call = None;
+            for (nid, node) in &header_nodes_snapshot {
+                if *nid == cmp_left {
+                    continue;
+                }
+                if let ValueNode::Phi { inputs } = node
+                    && inputs.len() == 2
+                {
+                    let back_id = inputs[back_pred_pos];
+                    if let Some(cid) = find_call_callee(graph, back_id) {
+                        found_call = Some((range as u32, back_id, cid));
+                        break;
+                    }
+                }
+            }
+            match found_call {
+                Some((tc, cn, ci)) => (tc, cn, ci, None),
+                None => return false,
+            }
+        } else if let Some(ValueNode::LoadGlobal { name: iv_name, .. }) = graph.node(cmp_left) {
+            // ── LoadGlobal-based IV (globals not promoted due to Call in loop) ──
+            let iv_name = *iv_name;
 
-    // IV step must be exactly 1.
-    let iv_back_id = iv_phi_inputs[back_pred_pos];
-    let iv_step = find_increment_step(graph, iv_back_id, iv_phi_id);
-    if iv_step != Some(1) {
+            // Find the init value: look for a StoreGlobal to iv_name in the preheader.
+            let pre = graph.block(lp.preheader);
+            let iv_init = pre.and_then(|pre| {
+                pre.nodes.iter().rev().find_map(|(_, node)| {
+                    if let ValueNode::StoreGlobal { name, value, .. } = node
+                        && *name == iv_name
+                    {
+                        find_i32_constant(graph, *value)
+                    } else {
+                        None
+                    }
+                })
+            });
+            let iv_init = match iv_init {
+                Some(v) => v,
+                None => return false,
+            };
+
+            // Find IV increment in body: StoreGlobal(iv_name, Inc(LoadGlobal(iv_name)))
+            let body = graph.block(body_block_idx).unwrap();
+            let mut iv_step_ok = false;
+            for (_, node) in &body.nodes {
+                if let ValueNode::StoreGlobal { name, value, .. } = node
+                    && *name == iv_name
+                {
+                    // Check if value is an increment of a LoadGlobal(iv_name)
+                    if let Some(inc_node) = graph.node(*value) {
+                        let base = match inc_node {
+                            ValueNode::GenericIncrement { value, .. }
+                            | ValueNode::Int32Increment { value }
+                            | ValueNode::CheckedSmiIncrement { value } => Some(*value),
+                            _ => None,
+                        };
+                        if let Some(base_id) = base
+                            && let Some(ValueNode::LoadGlobal { name: bn, .. }) =
+                                graph.node(base_id)
+                            && *bn == iv_name
+                        {
+                            iv_step_ok = true;
+                        }
+                    }
+                }
+            }
+            if !iv_step_ok {
+                return false;
+            }
+
+            let range = (iv_limit as i64) - (iv_init as i64);
+            if range <= 0 || range > 100_000 {
+                return false;
+            }
+
+            // Find a Call in the body block.
+            let body = graph.block(body_block_idx).unwrap();
+            let mut found_call = None;
+            for (nid, node) in &body.nodes {
+                if let Some(cid) = find_call_callee_node(node) {
+                    found_call = Some((range as u32, *nid, cid));
+                    break;
+                }
+            }
+            match found_call {
+                Some((tc, cn, ci)) => (tc, cn, ci, Some(iv_name)),
+                None => return false,
+            }
+        } else {
+            return false;
+        };
+
+    // Callee must be loop-invariant (defined outside the loop).
+    let loop_body_set: HashSet<u32> = lp.body.iter().copied().collect();
+    let callee_in_loop = loop_body_set.iter().any(|&bi| {
+        graph
+            .block(bi)
+            .map(|b| b.nodes.iter().any(|(nid, _)| *nid == callee_id))
+            .unwrap_or(false)
+    });
+    if callee_in_loop {
         return false;
     }
 
-    let range = (iv_limit as i64) - (iv_init as i64);
-    if range <= 0 || range > 100_000 {
-        return false; // sanity: don't fuse huge loops
+    // ── 4. Insert SpeculativeCallFusion in preheader ─────────────────
+    let fusion_id = graph.alloc_node_id();
+    if let Some(pre) = graph.block_mut(lp.preheader) {
+        pre.push_with_id(
+            fusion_id,
+            ValueNode::SpeculativeCallFusion {
+                callee: callee_id,
+                trip_count,
+            },
+        );
     }
-    let trip_count = range as u32;
 
-    // ── 3. Find a Phi whose back-edge is a Call(callee, undef, []) ──────
-    let h = graph.block(lp.header).unwrap();
-    let header_phis: Vec<(NodeId, Vec<NodeId>)> = h
-        .nodes
-        .iter()
-        .filter_map(|(nid, node)| {
-            if let ValueNode::Phi { inputs } = node
-                && *nid != iv_phi_id
-                && inputs.len() == 2
-            {
-                return Some((*nid, inputs.clone()));
-            }
-            None
-        })
-        .collect();
+    // For LoadGlobal-based loops: store the fusion result to the result global
+    // and replace the Call node with a no-op (SmiConstant(0) as dummy).
+    // For Phi-based loops: update the Phi inputs.
+    // In both cases, the Call node becomes dead and will be removed by DCE.
 
-    let loop_body_set: HashSet<u32> = lp.body.iter().copied().collect();
-
-    for (phi_id, inputs) in &header_phis {
-        let back_id = inputs[back_pred_pos];
-
-        // Look up the back-edge node: must be a Call with 0 args + undefined receiver
-        let body_block = graph.block(body_block_idx).unwrap();
-        let call_node = body_block
-            .nodes
-            .iter()
-            .find(|(nid, _)| *nid == back_id)
-            .map(|(_, node)| node);
-
-        let callee_id = match call_node {
-            Some(ValueNode::Call {
-                callee,
-                receiver,
-                args,
-                ..
-            }) if args.is_empty() => {
-                // Receiver must be undefined.
-                let recv_is_undef = matches!(
-                    graph.node(*receiver),
-                    Some(ValueNode::UndefinedConstant)
-                );
-                if !recv_is_undef {
-                    continue;
-                }
-                *callee
-            }
-            Some(ValueNode::CallKnownFunction {
-                callee,
-                receiver,
-                args,
-            }) if args.is_empty() => {
-                let recv_is_undef = matches!(
-                    graph.node(*receiver),
-                    Some(ValueNode::UndefinedConstant)
-                );
-                if !recv_is_undef {
-                    continue;
-                }
-                *callee
-            }
-            _ => continue,
-        };
-
-        // Callee must be loop-invariant (defined outside the loop).
-        let callee_in_loop = loop_body_set.iter().any(|&bi| {
-            graph
-                .block(bi)
-                .map(|b| b.nodes.iter().any(|(nid, _)| *nid == callee_id))
-                .unwrap_or(false)
-        });
-        if callee_in_loop {
-            continue;
+    // Find if the call_node_id's result is stored via StoreGlobal.
+    let body = graph.block(body_block_idx).unwrap();
+    let mut result_store_name = None;
+    let mut result_store_slot = None;
+    for (_, node) in &body.nodes {
+        if let ValueNode::StoreGlobal {
+            name,
+            value,
+            feedback_slot,
+        } = node
+            && *value == call_node_id
+        {
+            result_store_name = Some(*name);
+            result_store_slot = Some(*feedback_slot);
+            break;
         }
+    }
 
-        // ── 4. Insert SpeculativeCallFusion in preheader ─────────────────
-        let fusion_id = graph.alloc_node_id();
+    if let (Some(store_name), Some(store_fb)) = (result_store_name, result_store_slot) {
+        // LoadGlobal-based: insert StoreGlobal(result, fusion_result) in preheader
+        let store_id = graph.alloc_node_id();
         if let Some(pre) = graph.block_mut(lp.preheader) {
             pre.push_with_id(
-                fusion_id,
-                ValueNode::SpeculativeCallFusion {
-                    callee: callee_id,
-                    trip_count,
+                store_id,
+                ValueNode::StoreGlobal {
+                    name: store_name,
+                    value: fusion_id,
+                    feedback_slot: store_fb,
                 },
             );
         }
+    }
 
-        // Update the Phi: entry = fusion result, back-edge = self (identity).
-        let h = graph.block_mut(lp.header).unwrap();
-        for (nid, node) in &mut h.nodes {
-            if *nid == *phi_id {
-                if let ValueNode::Phi { inputs } = node {
-                    inputs[entry_pos] = fusion_id;
-                    inputs[back_pred_pos] = *phi_id;
-                }
+    // ── 5. Short-circuit the loop ──────────────────────────────────────
+    // For LoadGlobal-based IV: store iv_limit to the IV global so the
+    // header's `LoadGlobal(iv) < iv_limit` is immediately false.
+    if let Some(iv_name) = iv_global_name {
+        // Find the StoreGlobal feedback_slot for the IV from the body block.
+        let body = graph.block(body_block_idx).unwrap();
+        let mut iv_fb = None;
+        for (_, node) in &body.nodes {
+            if let ValueNode::StoreGlobal {
+                name,
+                feedback_slot,
+                ..
+            } = node
+                && *name == iv_name
+            {
+                iv_fb = Some(*feedback_slot);
                 break;
             }
         }
-
-        return true; // fused one accumulator; done for this loop
+        if let Some(fb) = iv_fb {
+            // Store iv_limit (= cmp_right) to the IV global in preheader.
+            let iv_store_id = graph.alloc_node_id();
+            if let Some(pre) = graph.block_mut(lp.preheader) {
+                pre.push_with_id(
+                    iv_store_id,
+                    ValueNode::StoreGlobal {
+                        name: iv_name,
+                        value: cmp_right,
+                        feedback_slot: fb,
+                    },
+                );
+            }
+        }
     }
 
-    false
+    // For Phi-based IV: set the IV Phi entry to the limit constant.
+    // This makes `iv_phi < iv_limit` false on first check → loop exits immediately.
+    if iv_global_name.is_none() {
+        let back_pred_pos = header_preds.iter().position(|&p| p == body_block_idx);
+        let entry_pos = header_preds.iter().position(|&p| p == lp.preheader);
+        if let (Some(bp), Some(ep)) = (back_pred_pos, entry_pos) {
+            let h = graph.block_mut(lp.header).unwrap();
+            for (nid, node) in &mut h.nodes {
+                if *nid == cmp_left {
+                    if let ValueNode::Phi { inputs } = node
+                        && inputs.len() == 2
+                    {
+                        // Set entry input to limit → loop condition false immediately
+                        inputs[ep] = cmp_right;
+                        inputs[bp] = *nid; // identity
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // Also handle the case where there's a Phi for the result
+    let back_pred_pos = header_preds.iter().position(|&p| p == body_block_idx);
+    let entry_pos = header_preds.iter().position(|&p| p == lp.preheader);
+    if let (Some(bp), Some(ep)) = (back_pred_pos, entry_pos) {
+        let h = graph.block_mut(lp.header).unwrap();
+        for (nid, node) in &mut h.nodes {
+            if let ValueNode::Phi { inputs } = node
+                && inputs.len() == 2
+                && inputs[bp] == call_node_id
+            {
+                inputs[ep] = fusion_id;
+                inputs[bp] = *nid; // self-reference (identity)
+                break;
+            }
+        }
+    }
+
+    true
+}
+
+/// Extract callee NodeId from a Call/CallKnownFunction node (graph lookup version).
+fn find_call_callee(graph: &MaglevGraph, node_id: NodeId) -> Option<NodeId> {
+    find_call_callee_node(graph.node(node_id)?)
+}
+
+/// Extract callee NodeId from a Call/CallKnownFunction ValueNode.
+fn find_call_callee_node(node: &ValueNode) -> Option<NodeId> {
+    match node {
+        ValueNode::Call { callee, args, .. } if args.is_empty() => Some(*callee),
+        ValueNode::CallKnownFunction { callee, args, .. } if args.is_empty() => Some(*callee),
+        _ => None,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

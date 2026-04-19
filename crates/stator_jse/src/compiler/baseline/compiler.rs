@@ -3102,11 +3102,9 @@ pub(crate) mod jit_runtime {
     ///
     /// Returns `JIT_DEOPT` if the bytecodes don't match or any overflow /
     /// non-Smi condition is detected — the interpreter re-runs the loop.
-    pub extern "C" fn jit_runtime_speculative_call_fusion(
-        callee_i64: i64,
-        trip_count: i64,
-    ) -> i64 {
-        speculative_call_fusion_inner(callee_i64, trip_count as u32).unwrap_or(JIT_DEOPT)
+    pub extern "C" fn jit_runtime_speculative_call_fusion(callee_i64: i64, trip_count: i64) -> i64 {
+        let result = speculative_call_fusion_inner(callee_i64, trip_count as u32);
+        result.unwrap_or(JIT_DEOPT)
     }
 
     /// Inner implementation for speculative call fusion.
@@ -3125,50 +3123,65 @@ pub(crate) mod jit_runtime {
             _ => return None,
         };
 
-        // 2. Decode bytecodes and match the simple increment pattern.
+        // 2. Decode bytecodes and match the increment pattern.
         let instrs = decode(ba.bytecodes()).ok()?;
 
-        // Expected pattern (exactly 4 instructions):
-        //   [0] LdaCurrentContextSlot(slot)
-        //   [1] AddSmi(K, feedback_slot)
-        //   [2] StaCurrentContextSlot(slot)   -- same slot
-        //   [3] Return
-        if instrs.len() != 4 {
-            return None;
+        // Scan for the core pattern:
+        //   LdaCurrentContextSlot(S) ... Add/AddSmi(K) ... StaCurrentContextSlot(S) ... Return
+        // The closure may have prefix instructions (CreateMappedArguments, Star, LdaSmi, Star)
+        // and may reload the slot before Return.
+        let mut slot: Option<usize> = None;
+        let mut k_value: Option<i64> = None;
+        let mut store_slot: Option<usize> = None;
+        let mut has_return = false;
+
+        // Track: LdaSmi value that might be used by a subsequent Add
+        let mut pending_lda_smi: Option<i64> = None;
+
+        for instr in &instrs {
+            match instr.opcode {
+                Opcode::LdaCurrentContextSlot => {
+                    if let Some(Operand::ConstantPoolIdx(s)) = instr.operand_at(0)
+                        && slot.is_none()
+                    {
+                        slot = Some(*s as usize);
+                    }
+                }
+                Opcode::AddSmi => {
+                    if let Some(Operand::Immediate(imm)) = instr.operand_at(0) {
+                        k_value = Some(*imm as i64);
+                    }
+                }
+                Opcode::Add => {
+                    // Add uses register operand; the K comes from a prior LdaSmi
+                    if let Some(k) = pending_lda_smi {
+                        k_value = Some(k);
+                    }
+                }
+                Opcode::StaCurrentContextSlot => {
+                    if let Some(Operand::ConstantPoolIdx(s)) = instr.operand_at(0) {
+                        store_slot = Some(*s as usize);
+                    }
+                }
+                Opcode::LdaSmi => {
+                    if let Some(Operand::Immediate(imm)) = instr.operand_at(0) {
+                        pending_lda_smi = Some(*imm as i64);
+                    }
+                }
+                Opcode::Return => {
+                    has_return = true;
+                }
+                // Skip benign prefix/suffix instructions
+                Opcode::CreateMappedArguments | Opcode::Star => {}
+                // Any other opcode → not a simple increment pattern
+                _ => return None,
+            }
         }
 
-        // Parse instruction 0: LdaCurrentContextSlot
-        if instrs[0].opcode != Opcode::LdaCurrentContextSlot {
-            return None;
-        }
-        let slot = match instrs[0].operand_at(0) {
-            Some(Operand::ConstantPoolIdx(s)) => *s as usize,
-            _ => return None,
-        };
-
-        // Parse instruction 1: AddSmi
-        if instrs[1].opcode != Opcode::AddSmi {
-            return None;
-        }
-        let k = match instrs[1].operand_at(0) {
-            Some(Operand::Immediate(k)) => *k as i64,
-            _ => return None,
-        };
-
-        // Parse instruction 2: StaCurrentContextSlot (same slot)
-        if instrs[2].opcode != Opcode::StaCurrentContextSlot {
-            return None;
-        }
-        let store_slot = match instrs[2].operand_at(0) {
-            Some(Operand::ConstantPoolIdx(s)) => *s as usize,
-            _ => return None,
-        };
-        if store_slot != slot {
-            return None;
-        }
-
-        // Parse instruction 3: Return
-        if instrs[3].opcode != Opcode::Return {
+        let slot = slot?;
+        let k = k_value?;
+        let store_s = store_slot?;
+        if store_s != slot || !has_return {
             return None;
         }
 
@@ -3194,9 +3207,7 @@ pub(crate) mod jit_runtime {
         // 5. Write the new value back.
         ctx.slots[slot] = JsValue::Smi(new_val as i32);
 
-        // The last call would have returned old_smi + k * n = new_val,
-        // but the accumulator after AddSmi is the new value *before* the
-        // store writes it — which is the same value.  Return it as Smi.
+        // The last call returns the new value (after N increments).
         Some(new_val)
     }
 
