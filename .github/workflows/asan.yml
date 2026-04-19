@@ -19,12 +19,10 @@ jobs:
     env:
       RUSTFLAGS: "-Z sanitizer=address"
       RUSTDOCFLAGS: "-Z sanitizer=address"
-      # Disable LSAN leak detection: Rc<RefCell> prototype chains form
-      # reference cycles (e.g. Ctor → Ctor.prototype → constructor → Ctor)
-      # that LSAN reports as leaks.  ASAN memory-corruption checks
-      # (use-after-free, buffer overflow, etc.) remain fully enabled.
-      # Tracked: re-enable once the engine moves to a tracing GC.
-      LSAN_OPTIONS: "detect_leaks=0"
+      # Rc<RefCell> prototype chains form reference cycles that are intentional
+      # and will be resolved when the engine moves to a tracing GC.  Disable
+      # LSan so ASAN still catches buffer-overflows and use-after-free bugs.
+      ASAN_OPTIONS: "detect_leaks=0"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -35,7 +33,7 @@ jobs:
           components: rust-src
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-asan-registry-${{ hashFiles('**/Cargo.lock') }}

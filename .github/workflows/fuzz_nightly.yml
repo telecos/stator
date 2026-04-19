@@ -42,7 +42,7 @@ jobs:
 
       - name: Cache cargo-fuzz binary
         id: cache-cargo-fuzz
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/cargo-fuzz
           key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('**/Cargo.lock') }}
@@ -63,7 +63,7 @@ jobs:
           -- -max_total_time=600
 
       - name: Archive corpus for ${{ matrix.target }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           path: fuzz/corpus/${{ matrix.target }}/

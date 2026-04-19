@@ -116,6 +116,57 @@ pub fn globals_promoted_diagnostics() -> (u32, u32) {
 ///
 /// Multiple rounds are *not* performed; a single sweep of each pass is
 /// sufficient for the patterns targeted here.
+// Temporary diagnostic: dump all Phi nodes in loop headers.
+fn dump_header_phis(graph: &MaglevGraph, label: &str) {
+    let loops = crate::compiler::maglev::licm::detect_loops(graph);
+    for lp in &loops {
+        if let Some(header) = graph.block(lp.header) {
+            let bc_len = 0u32; // placeholder - bytecodes not accessible from graph
+            for (nid, node) in &header.nodes {
+                if let ValueNode::Phi { inputs } = node {
+                    let types: Vec<String> = inputs
+                        .iter()
+                        .map(|inp| match graph.node(*inp) {
+                            Some(ValueNode::CreateObjectLiteral { .. }) => {
+                                format!("CreateObjLit({inp:?})")
+                            }
+                            Some(ValueNode::CreateObjectLiteralWithProperties { .. }) => {
+                                format!("CreateObjWithProps({inp:?})")
+                            }
+                            Some(ValueNode::CreateEmptyObjectLiteral) => {
+                                format!("CreateEmptyObj({inp:?})")
+                            }
+                            Some(ValueNode::UndefinedConstant) => format!("Undefined({inp:?})"),
+                            Some(ValueNode::Phi { .. }) => format!("Phi({inp:?})"),
+                            Some(ValueNode::SmiConstant { value }) => {
+                                format!("Smi({value})({inp:?})")
+                            }
+                            Some(ValueNode::CheckedSmiIncrement { .. }) => {
+                                format!("CheckedSmiInc({inp:?})")
+                            }
+                            Some(ValueNode::GenericAdd { .. }) => format!("GenericAdd({inp:?})"),
+                            Some(ValueNode::GenericMultiply { .. }) => {
+                                format!("GenericMul({inp:?})")
+                            }
+                            Some(ValueNode::Int32Add { .. }) => format!("Int32Add({inp:?})"),
+                            Some(ValueNode::CheckedSmiAdd { .. }) => {
+                                format!("CheckedSmiAdd({inp:?})")
+                            }
+                            Some(n) => format!("disc{:?}({inp:?})", std::mem::discriminant(n)),
+                            None => format!("MISSING({inp:?})"),
+                        })
+                        .collect();
+                    eprintln!(
+                        "[{label}] bc={bc_len} phi {nid:?} inputs=[{}]",
+                        types.join(", ")
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Run the full optimization pipeline on the Maglev graph.
 pub fn optimize(graph: &mut MaglevGraph) {
     let _block_count = graph.blocks().len();
     let _node_count: usize = graph.blocks().iter().map(|b| b.nodes.len()).sum();
@@ -143,6 +194,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // current graph structure.
     eliminate_common_subexpressions(graph);
     let _globals_promoted = promote_loop_globals_counted(graph);
+    dump_header_phis(graph, "AFTER_PROMOTE");
     eliminate_trivial_phis(graph);
     let _licm_hoisted2 = crate::compiler::maglev::licm::hoist_loop_invariants(graph);
     // Re-run range analysis after global promotion: promotion replaces
@@ -153,19 +205,68 @@ pub fn optimize(graph: &mut MaglevGraph) {
     strength_reduce(graph);
     // Re-run reassociation after second range analysis pass.
     reassociate_arithmetic(graph);
+    // Fold invariant addition chains: after LICM has hoisted property loads
+    // and range analysis has lowered Generic→Int32, loop bodies may contain
+    // chains of Int32Add with loop-invariant operands (e.g. hoisted loads).
+    // This groups them into a single pre-computed sum in the preheader,
+    // reducing per-iteration additions from N to 1.
+    let _inv_chains = crate::compiler::maglev::licm::fold_invariant_addition_chains(graph);
     // Re-run truncation after global promotion: promotion reduces
     // use-counts on arithmetic nodes — allowing CheckedSmi→Int32.
     let _truncations2 = propagate_int32_truncation(graph);
     eliminate_identity_operations_global(graph);
     eliminate_redundant_type_guards(graph);
+    specialize_closure_calls(graph);
+    fuse_call_loops(graph);
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
     fuse_object_literal_stores(graph);
+    dump_header_phis(graph, "AFTER_FUSE");
+    forward_invariant_object_properties(graph);
     eliminate_store_to_load(graph);
+    // Re-run constant folding: store-to-load forwarding may replace
+    // LoadNamedGeneric with SmiConstants, enabling preheader GenericAdd
+    // chains (from fold_invariant_addition_chains) to constant-fold.
+    fold_constants(graph);
+    // Re-run invariant chain folding: now that store-to-load has revealed
+    // SmiConstants for property loads, chains like `sum + obj.a + obj.b + …`
+    // become `sum + SmiConst(1) + SmiConst(2) + …` — all addends are
+    // loop-invariant.  This folds them into a single preheader sum.
+    crate::compiler::maglev::licm::fold_invariant_addition_chains(graph);
+    // Fold the new preheader additions (e.g. GenericAdd(1,2) → 3).
+    fold_constants(graph);
+    // Remove dead intermediate chain nodes left by fold_invariant_addition_chains.
+    // Without this, use-count checks in accumulator detection see stale references
+    // to Phi nodes from dead chain links, incorrectly inflating use counts and
+    // preventing scalar evolution from firing (e.g. property_access_1k).
+    eliminate_dead_code(graph);
+    // Targeted late lowering: after store_to_load + chain folding, some
+    // loops have `GenericAdd(accumulator_phi, SmiConstant(K))` where the
+    // constant was only revealed by forwarding.  Convert these to Int32Add
+    // when init and addend are known-safe Smi constants.
+    lower_constant_accumulator_adds(graph);
+    // Loop scalar evolution: replace simple counted loops with constant
+    // accumulators by a closed-form computation.  E.g. a loop that does
+    // `sum += 15` for 1000 iterations becomes `sum = 0 + 15*1000 = 15000`.
+    // This must run AFTER lower_constant_accumulator_adds (which converts
+    // GenericAdd→Int32Add) and BEFORE unrolling (which would complicate
+    // the loop structure).
+    eliminate_constant_accumulator_loops(graph);
+    forward_loop_object_properties(graph);
     eliminate_dead_object_stores(graph);
     eliminate_dead_allocations(graph);
     replace_dead_arguments(graph);
+    // NOTE: IV strength reduction disabled — caused 38% arithmetic regression
+    // (8.2µs → 11.3µs) due to extra register pressure and dependency chains.
+    // strength_reduce_induction_variables(graph);
     unroll_simple_loops(graph);
+    // After unrolling, re-run reassociation to defer constant adjustments.
+    // Unrolled bodies have chains like (((n + a) - K) + b) - K) — the
+    // constant-deferral pattern pushes all -K subtractions to the end,
+    // then the combining pattern merges them (e.g. 4×(-1) → -4).
+    reassociate_arithmetic(graph);
+    // Clean up identity ops (x+0, x-0) created by reassociation combining.
+    eliminate_identity_operations_global(graph);
     eliminate_dead_code(graph);
 }
 
@@ -181,8 +282,25 @@ pub fn optimize(graph: &mut MaglevGraph) {
 /// node is replaced in-place with the folded constant; the old `NodeId` for
 /// that position is re-used so downstream references remain valid.
 fn fold_constants(graph: &mut MaglevGraph) {
+    // Pre-populate constant map from ALL blocks so cross-block constant
+    // operands can be folded (e.g. SmiConstants defined in the entry block
+    // used by chain-folded GenericAdds placed in the preheader by LICM).
+    let mut consts: HashMap<NodeId, ConstVal> = HashMap::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            match node {
+                ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } => {
+                    consts.insert(*id, ConstVal::I32(*value));
+                }
+                ValueNode::Float64Constant { value } => {
+                    consts.insert(*id, ConstVal::F64(*value));
+                }
+                _ => {}
+            }
+        }
+    }
     for block in graph.blocks_mut() {
-        fold_block_constants(block);
+        fold_block_constants(block, &mut consts);
     }
 }
 
@@ -193,13 +311,12 @@ enum ConstVal {
     F64(f64),
 }
 
-/// Fold constants within a single [`BasicBlock`].
-fn fold_block_constants(block: &mut BasicBlock) {
-    // Map from NodeId → known constant value for nodes already processed.
-    let mut consts: HashMap<NodeId, ConstVal> = HashMap::new();
-
+/// Fold constants within a single [`BasicBlock`], using a shared constant map
+/// that spans all blocks so cross-block references to literal constants (and
+/// previously folded results) are visible.
+fn fold_block_constants(block: &mut BasicBlock, consts: &mut HashMap<NodeId, ConstVal>) {
     for (id, node) in &mut block.nodes {
-        // Seed the constant map from literal constant nodes.
+        // Seed the constant map from literal constant nodes in this block.
         match node {
             ValueNode::Int32Constant { value } => {
                 consts.insert(*id, ConstVal::I32(*value));
@@ -220,15 +337,15 @@ fn fold_block_constants(block: &mut BasicBlock) {
         let folded: Option<ValueNode> = match node {
             // ── Binary Int32 / CheckedSmi ─────────────────────────────────
             ValueNode::Int32Add { left, right } | ValueNode::CheckedSmiAdd { left, right } => {
-                fold_i32_bin(left, right, &consts, |a, b| a.wrapping_add(b))
+                fold_i32_bin(left, right, consts, |a, b| a.wrapping_add(b))
             }
             ValueNode::Int32Subtract { left, right }
             | ValueNode::CheckedSmiSubtract { left, right } => {
-                fold_i32_bin(left, right, &consts, |a, b| a.wrapping_sub(b))
+                fold_i32_bin(left, right, consts, |a, b| a.wrapping_sub(b))
             }
             ValueNode::Int32Multiply { left, right }
             | ValueNode::CheckedSmiMultiply { left, right } => {
-                fold_i32_bin(left, right, &consts, |a, b| a.wrapping_mul(b))
+                fold_i32_bin(left, right, consts, |a, b| a.wrapping_mul(b))
             }
             ValueNode::Int32Divide { left, right }
             | ValueNode::CheckedSmiDivide { left, right } => {
@@ -292,19 +409,19 @@ fn fold_block_constants(block: &mut BasicBlock) {
 
             // ── Binary Float64 ────────────────────────────────────────────
             ValueNode::Float64Add { left, right } => {
-                fold_f64_bin(left, right, &consts, |a, b| a + b)
+                fold_f64_bin(left, right, consts, |a, b| a + b)
             }
             ValueNode::Float64Subtract { left, right } => {
-                fold_f64_bin(left, right, &consts, |a, b| a - b)
+                fold_f64_bin(left, right, consts, |a, b| a - b)
             }
             ValueNode::Float64Multiply { left, right } => {
-                fold_f64_bin(left, right, &consts, |a, b| a * b)
+                fold_f64_bin(left, right, consts, |a, b| a * b)
             }
             ValueNode::Float64Divide { left, right } => {
-                fold_f64_bin(left, right, &consts, |a, b| a / b)
+                fold_f64_bin(left, right, consts, |a, b| a / b)
             }
             ValueNode::Float64Modulus { left, right } => {
-                fold_f64_bin(left, right, &consts, |a, b| a % b)
+                fold_f64_bin(left, right, consts, |a, b| a % b)
             }
 
             // ── Unary Float64 ─────────────────────────────────────────────
@@ -318,13 +435,51 @@ fn fold_block_constants(block: &mut BasicBlock) {
 
             // ── Int32 bitwise ────────────────────────────────────────────
             ValueNode::Int32BitwiseOr { left, right } => {
-                fold_i32_bin(left, right, &consts, |a, b| a | b)
+                fold_i32_bin(left, right, consts, |a, b| a | b)
             }
             ValueNode::Int32BitwiseAnd { left, right } => {
-                fold_i32_bin(left, right, &consts, |a, b| a & b)
+                fold_i32_bin(left, right, consts, |a, b| a & b)
             }
             ValueNode::Int32BitwiseXor { left, right } => {
-                fold_i32_bin(left, right, &consts, |a, b| a ^ b)
+                fold_i32_bin(left, right, consts, |a, b| a ^ b)
+            }
+
+            // ── Generic arithmetic (same as Int32 when both inputs are i32 constants)
+            ValueNode::GenericAdd { left, right, .. } => {
+                fold_smi_bin(left, right, consts, |a, b| a.wrapping_add(b))
+            }
+            ValueNode::GenericSubtract { left, right, .. } => {
+                fold_smi_bin(left, right, consts, |a, b| a.wrapping_sub(b))
+            }
+            ValueNode::GenericMultiply { left, right, .. } => {
+                fold_smi_bin(left, right, consts, |a, b| a.wrapping_mul(b))
+            }
+            ValueNode::GenericIncrement { value, .. } => {
+                if let Some(ConstVal::I32(v)) = consts.get(value) {
+                    Some(ValueNode::SmiConstant {
+                        value: v.wrapping_add(1),
+                    })
+                } else {
+                    None
+                }
+            }
+            ValueNode::GenericDecrement { value, .. } => {
+                if let Some(ConstVal::I32(v)) = consts.get(value) {
+                    Some(ValueNode::SmiConstant {
+                        value: v.wrapping_sub(1),
+                    })
+                } else {
+                    None
+                }
+            }
+            ValueNode::GenericNegate { value, .. } => {
+                if let Some(ConstVal::I32(v)) = consts.get(value) {
+                    Some(ValueNode::SmiConstant {
+                        value: v.wrapping_neg(),
+                    })
+                } else {
+                    None
+                }
             }
 
             _ => None,
@@ -333,7 +488,7 @@ fn fold_block_constants(block: &mut BasicBlock) {
         if let Some(replacement) = folded {
             // Update the constant map so later nodes can fold through this one.
             match &replacement {
-                ValueNode::Int32Constant { value } => {
+                ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } => {
                     consts.insert(*id, ConstVal::I32(*value));
                 }
                 ValueNode::Float64Constant { value } => {
@@ -356,6 +511,22 @@ fn fold_i32_bin(
     if let (Some(ConstVal::I32(a)), Some(ConstVal::I32(b))) = (consts.get(left), consts.get(right))
     {
         Some(ValueNode::Int32Constant { value: op(*a, *b) })
+    } else {
+        None
+    }
+}
+
+/// Fold a Generic arithmetic operation on two i32-constant inputs into a
+/// `SmiConstant` (preserves the Smi representation for downstream passes).
+fn fold_smi_bin(
+    left: &NodeId,
+    right: &NodeId,
+    consts: &HashMap<NodeId, ConstVal>,
+    op: impl Fn(i32, i32) -> i32,
+) -> Option<ValueNode> {
+    if let (Some(ConstVal::I32(a)), Some(ConstVal::I32(b))) = (consts.get(left), consts.get(right))
+    {
+        Some(ValueNode::SmiConstant { value: op(*a, *b) })
     } else {
         None
     }
@@ -834,6 +1005,9 @@ fn visit_value_node_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
                 f(*a);
             }
         }
+        ValueNode::SpeculativeCallFusion { callee, .. } => {
+            f(*callee);
+        }
 
         // Catch-all for zero-input nodes and any new variants.
         _ => {}
@@ -1215,9 +1389,21 @@ fn reassociate_arithmetic_once(graph: &mut MaglevGraph) -> usize {
         .max()
         .map_or(0, |m| m + 1);
 
+    // Pre-populate constant map from ALL blocks so cross-block constant
+    // operands are visible (e.g. SmiConstant(1) in entry block used by
+    // Int32Subtract in the loop body for constant-deferral patterns).
+    let mut global_consts: HashMap<NodeId, i32> = HashMap::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            if let ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } = node {
+                global_consts.insert(*id, *value);
+            }
+        }
+    }
+
     let mut count = 0;
     for block in graph.blocks_mut() {
-        count += reassociate_block(block, &mut next_id);
+        count += reassociate_block(block, &mut next_id, &mut global_consts);
     }
     count
 }
@@ -1230,22 +1416,23 @@ struct Reassoc {
 }
 
 /// Build helper maps and apply one reassociation pattern within one block.
-fn reassociate_block(block: &mut BasicBlock, next_id: &mut u32) -> usize {
-    let mut consts: HashMap<NodeId, i32> = HashMap::new();
+fn reassociate_block(
+    block: &mut BasicBlock,
+    next_id: &mut u32,
+    global_consts: &mut HashMap<NodeId, i32>,
+) -> usize {
     let mut mul_info: HashMap<NodeId, (NodeId, i32)> = HashMap::new();
     let mut node_defs: HashMap<NodeId, ValueNode> = HashMap::new();
 
     for (id, node) in &block.nodes {
-        match node {
-            ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } => {
-                consts.insert(*id, *value);
-            }
-            _ => {}
+        // Register any new constants created by prior reassociation passes
+        if let ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } = node {
+            global_consts.insert(*id, *value);
         }
         if let ValueNode::Int32Multiply { left, right } = node {
-            if let Some(&k) = consts.get(right) {
+            if let Some(&k) = global_consts.get(right) {
                 mul_info.insert(*id, (*left, k));
-            } else if let Some(&k) = consts.get(left) {
+            } else if let Some(&k) = global_consts.get(left) {
                 mul_info.insert(*id, (*right, k));
             }
         }
@@ -1253,7 +1440,7 @@ fn reassociate_block(block: &mut BasicBlock, next_id: &mut u32) -> usize {
     }
 
     for (pos, (_id, node)) in block.nodes.iter().enumerate() {
-        if let Some(r) = try_reassociate(node, pos, &consts, &mul_info, &node_defs, next_id) {
+        if let Some(r) = try_reassociate(node, pos, global_consts, &mul_info, &node_defs, next_id) {
             return apply_reassoc(block, r);
         }
     }
@@ -1328,6 +1515,57 @@ fn try_reassociate(
                     return build_add_mul_reassoc(pos, *add_b, base, k + 1, consts, next_id);
                 }
             }
+            // (a - K) + b  ->  (a + b) - K  when K is constant
+            // Defers constant adjustments past independent additions.
+            // After unrolling, this pushes per-copy constant subs to
+            // the end where fold_constants combines them (e.g. 4×(-1) → -4).
+            if let Some(ValueNode::Int32Subtract {
+                left: sub_a,
+                right: sub_k,
+            }) = node_defs.get(left)
+                && consts.contains_key(sub_k)
+            {
+                let add_id = NodeId(*next_id);
+                *next_id += 1;
+                return Some(Reassoc {
+                    pos,
+                    new_node: ValueNode::Int32Subtract {
+                        left: add_id,
+                        right: *sub_k,
+                    },
+                    prefix: vec![(
+                        add_id,
+                        ValueNode::Int32Add {
+                            left: *sub_a,
+                            right: *right,
+                        },
+                    )],
+                });
+            }
+            // a + (b - K)  ->  (a + b) - K  when K is constant
+            if let Some(ValueNode::Int32Subtract {
+                left: sub_b,
+                right: sub_k,
+            }) = node_defs.get(right)
+                && consts.contains_key(sub_k)
+            {
+                let add_id = NodeId(*next_id);
+                *next_id += 1;
+                return Some(Reassoc {
+                    pos,
+                    new_node: ValueNode::Int32Subtract {
+                        left: add_id,
+                        right: *sub_k,
+                    },
+                    prefix: vec![(
+                        add_id,
+                        ValueNode::Int32Add {
+                            left: *left,
+                            right: *sub_b,
+                        },
+                    )],
+                });
+            }
             None
         }
         ValueNode::Int32Subtract { left, right } => {
@@ -1364,6 +1602,59 @@ fn try_reassociate(
                     && k_l >= k_r
                 {
                     return build_add_mul_reassoc(pos, *add_b, base_r, k_l - k_r, consts, next_id);
+                }
+            }
+            // (a - K1) - K2  ->  a - (K1+K2)  when both are constants
+            // Combines accumulated constant subtractions after deferral.
+            if let Some(&k2) = consts.get(right)
+                && let Some(ValueNode::Int32Subtract {
+                    left: sub_a,
+                    right: sub_k1,
+                }) = node_defs.get(left)
+                && let Some(&k1) = consts.get(sub_k1)
+            {
+                let combined = k1.wrapping_add(k2);
+                let (const_id, prefix) = find_or_create_const(combined, consts, next_id);
+                return Some(Reassoc {
+                    pos,
+                    new_node: ValueNode::Int32Subtract {
+                        left: *sub_a,
+                        right: const_id,
+                    },
+                    prefix,
+                });
+            }
+            // (a + K1) - K2  ->  a + (K1-K2)  when both are constants
+            if let Some(&k2) = consts.get(right)
+                && let Some(ValueNode::Int32Add {
+                    left: add_a,
+                    right: add_k1,
+                }) = node_defs.get(left)
+                && let Some(&k1) = consts.get(add_k1)
+            {
+                let diff = k1.wrapping_sub(k2);
+                if diff == 0 {
+                    // a + 0 → identity, handled by identity elimination
+                } else if diff > 0 {
+                    let (const_id, prefix) = find_or_create_const(diff, consts, next_id);
+                    return Some(Reassoc {
+                        pos,
+                        new_node: ValueNode::Int32Add {
+                            left: *add_a,
+                            right: const_id,
+                        },
+                        prefix,
+                    });
+                } else {
+                    let (const_id, prefix) = find_or_create_const(-diff, consts, next_id);
+                    return Some(Reassoc {
+                        pos,
+                        new_node: ValueNode::Int32Subtract {
+                            left: *add_a,
+                            right: const_id,
+                        },
+                        prefix,
+                    });
                 }
             }
             None
@@ -1483,15 +1774,31 @@ fn strength_reduce(graph: &mut MaglevGraph) {
         .max()
         .map_or(0, |m| m + 1);
 
+    // Pre-populate constant map from ALL blocks so cross-block constant
+    // operands are visible (e.g. SmiConstant(3) in entry block used by
+    // Int32Multiply in the loop body).
+    let mut global_consts: HashMap<NodeId, i32> = HashMap::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            if let ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } = node {
+                global_consts.insert(*id, *value);
+            }
+        }
+    }
+
     for block in graph.blocks_mut() {
-        strength_reduce_block(block, &mut next_id);
+        strength_reduce_block(block, &mut next_id, &global_consts);
     }
 }
 
 /// Perform strength reduction within a single [`BasicBlock`].
-fn strength_reduce_block(block: &mut BasicBlock, next_id: &mut u32) {
-    // Collect compile-time integer constants visible in this block.
-    let mut consts: HashMap<NodeId, i32> = HashMap::new();
+fn strength_reduce_block(
+    block: &mut BasicBlock,
+    next_id: &mut u32,
+    global_consts: &HashMap<NodeId, i32>,
+) {
+    // Start with global consts; also pick up any block-local constants.
+    let mut consts = global_consts.clone();
     for (id, node) in &block.nodes {
         match node {
             ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } => {
@@ -1504,36 +1811,66 @@ fn strength_reduce_block(block: &mut BasicBlock, next_id: &mut u32) {
     // Identify multiply-by-power-of-two patterns.
     // Each entry: (position, non-constant operand, shift amount).
     let mut reductions: Vec<(usize, NodeId, u32)> = Vec::new();
+    // Shift-add decompositions for non-power-of-two: (2^k ± 1).
+    // Entry: (position, operand, shift_amount, is_add).
+    // is_add=true: x*(2^k+1) → (x<<k)+x, is_add=false: x*(2^k-1) → (x<<k)-x.
+    let mut shift_add_reductions: Vec<(usize, NodeId, u32, bool)> = Vec::new();
+
     for (pos, (_, node)) in block.nodes.iter().enumerate() {
-        if let ValueNode::Int32Multiply { left, right } = node
-            && let Some((operand, shift)) = find_power_of_two_operand(*left, *right, &consts)
-        {
-            reductions.push((pos, operand, shift));
+        if let ValueNode::Int32Multiply { left, right } = node {
+            if let Some((operand, shift)) = find_power_of_two_operand(*left, *right, &consts) {
+                reductions.push((pos, operand, shift));
+            } else if let Some((operand, shift, is_add)) =
+                find_shift_add_decomposition(*left, *right, &consts)
+            {
+                shift_add_reductions.push((pos, operand, shift, is_add));
+            }
         }
     }
 
-    if reductions.is_empty() {
+    if reductions.is_empty() && shift_add_reductions.is_empty() {
         return;
     }
 
-    // Apply in reverse position order so earlier insertions don't shift later
-    // indices.
-    for (pos, operand, shift_amt) in reductions.into_iter().rev() {
+    // Apply shift-add decompositions in reverse order first (they insert 2 nodes).
+    // x * (2^k+1) → shifted = x << k; result = shifted + x
+    // x * (2^k-1) → shifted = x << k; result = shifted - x
+    for (pos, operand, shift_amt, is_add) in shift_add_reductions.into_iter().rev() {
         let shift_const_id = NodeId(*next_id);
         *next_id += 1;
+        let shifted_id = NodeId(*next_id);
+        *next_id += 1;
 
-        // Replace the multiply in-place, keeping its original NodeId.
+        // Replace the multiply in-place with add/sub, keeping its original NodeId.
         let (mul_id, _) = block.nodes[pos];
         block.nodes[pos] = (
             mul_id,
-            ValueNode::Int32ShiftLeft {
-                left: operand,
-                right: shift_const_id,
+            if is_add {
+                ValueNode::Int32Add {
+                    left: shifted_id,
+                    right: operand,
+                }
+            } else {
+                ValueNode::Int32Subtract {
+                    left: shifted_id,
+                    right: operand,
+                }
             },
         );
 
-        // Insert the shift-amount constant immediately before the shift node
-        // so it is defined before its use.
+        // Insert shift node before the add/sub.
+        block.nodes.insert(
+            pos,
+            (
+                shifted_id,
+                ValueNode::Int32ShiftLeft {
+                    left: operand,
+                    right: shift_const_id,
+                },
+            ),
+        );
+
+        // Insert shift-amount constant before the shift.
         block.nodes.insert(
             pos,
             (
@@ -1543,6 +1880,57 @@ fn strength_reduce_block(block: &mut BasicBlock, next_id: &mut u32) {
                 },
             ),
         );
+    }
+
+    // Apply power-of-two reductions in reverse position order.
+    // Note: positions may have shifted if shift_add_reductions added nodes above.
+    // Since we process shift_add first in reverse, and now power-of-two in reverse,
+    // we need to account for insertions. Rebuild positions if both lists are non-empty.
+    // For simplicity, re-scan for power-of-two patterns after shift-add transforms.
+    if !reductions.is_empty() {
+        // Re-collect constants (shift-add may have added Int32Constants).
+        let mut consts2: HashMap<NodeId, i32> = HashMap::new();
+        for (id, node) in &block.nodes {
+            match node {
+                ValueNode::Int32Constant { value } | ValueNode::SmiConstant { value } => {
+                    consts2.insert(*id, *value);
+                }
+                _ => {}
+            }
+        }
+
+        let mut pow2_reductions: Vec<(usize, NodeId, u32)> = Vec::new();
+        for (pos, (_, node)) in block.nodes.iter().enumerate() {
+            if let ValueNode::Int32Multiply { left, right } = node
+                && let Some((operand, shift)) = find_power_of_two_operand(*left, *right, &consts2)
+            {
+                pow2_reductions.push((pos, operand, shift));
+            }
+        }
+
+        for (pos, operand, shift_amt) in pow2_reductions.into_iter().rev() {
+            let shift_const_id = NodeId(*next_id);
+            *next_id += 1;
+
+            let (mul_id, _) = block.nodes[pos];
+            block.nodes[pos] = (
+                mul_id,
+                ValueNode::Int32ShiftLeft {
+                    left: operand,
+                    right: shift_const_id,
+                },
+            );
+
+            block.nodes.insert(
+                pos,
+                (
+                    shift_const_id,
+                    ValueNode::Int32Constant {
+                        value: shift_amt as i32,
+                    },
+                ),
+            );
+        }
     }
 }
 
@@ -1570,6 +1958,45 @@ fn find_power_of_two_operand(
     None
 }
 
+/// Decompose `x * K` where K = 2^k ± 1 (e.g. 3, 5, 7, 9) into shift+add/sub.
+/// Returns `(other_operand, shift_amount, is_add)`:
+///   is_add=true:  x*(2^k+1) → (x<<k)+x   (K=3,5,9,17,…)
+///   is_add=false: x*(2^k-1) → (x<<k)-x   (K=7,15,31,…)
+fn find_shift_add_decomposition(
+    left: NodeId,
+    right: NodeId,
+    consts: &HashMap<NodeId, i32>,
+) -> Option<(NodeId, u32, bool)> {
+    fn try_decompose(val: i32) -> Option<(u32, bool)> {
+        if val < 3 {
+            return None;
+        }
+        // Check 2^k + 1: val-1 must be power of two ≥ 2
+        let minus_one = val - 1;
+        if minus_one >= 2 && minus_one.count_ones() == 1 {
+            return Some((minus_one.trailing_zeros(), true));
+        }
+        // Check 2^k - 1: val+1 must be power of two ≥ 4
+        let plus_one = val + 1;
+        if plus_one >= 4 && plus_one.count_ones() == 1 {
+            return Some((plus_one.trailing_zeros(), false));
+        }
+        None
+    }
+
+    if let Some(&val) = consts.get(&right)
+        && let Some((shift, is_add)) = try_decompose(val)
+    {
+        return Some((left, shift, is_add));
+    }
+    if let Some(&val) = consts.get(&left)
+        && let Some((shift, is_add)) = try_decompose(val)
+    {
+        return Some((right, shift, is_add));
+    }
+    None
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Pass 3.5 — Common subexpression elimination (CSE)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1587,6 +2014,8 @@ enum CseKey {
     /// A nullary operation keyed only by kind and a u32 index (e.g. LoadGlobal
     /// keyed by its name index).
     Nullary(u16, u32),
+    /// A property load: (operation kind, object, property_name_index).
+    PropertyLoad(u16, NodeId, u32),
 }
 
 /// Extract a CSE key from a pure [`ValueNode`], or `None` if the node is not
@@ -1630,6 +2059,10 @@ fn make_cse_key(node: &ValueNode) -> Option<CseKey> {
         ValueNode::ToBoolean { value } => Some(CseKey::Unary(5, *value)),
         // Nullary: keyed only by name index.
         ValueNode::LoadGlobal { name, .. } => Some(CseKey::Nullary(1, *name)),
+        // Property loads: keyed by object and property name.
+        ValueNode::LoadNamedGeneric { object, name, .. } => {
+            Some(CseKey::PropertyLoad(1, *object, *name))
+        }
         _ => None,
     }
 }
@@ -1714,6 +2147,7 @@ fn is_user_call(node: &ValueNode) -> bool {
             | ValueNode::CallWithSpread { .. }
             | ValueNode::Construct { .. }
             | ValueNode::ConstructWithSpread { .. }
+            | ValueNode::SpeculativeCallFusion { .. }
     )
 }
 
@@ -1763,6 +2197,40 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
         if !lp.body.contains(&block.id) {
             continue;
         }
+        // ── diagnostic: dump all nodes in the body ──
+        for (id, node) in &block.nodes {
+            let detail = match node {
+                ValueNode::StoreGlobal { name, value, .. } => {
+                    format!("StoreGlobal(name={name}, value={value:?})")
+                }
+                ValueNode::LoadGlobal { name, .. } => format!("LoadGlobal(name={name})"),
+                ValueNode::StoreNamedGeneric {
+                    object,
+                    name,
+                    value,
+                    ..
+                } => {
+                    format!("StoreNamed(obj={object:?}, name={name}, val={value:?})")
+                }
+                ValueNode::CreateEmptyObjectLiteral => "CreateEmptyObjLit".to_string(),
+                ValueNode::GenericAdd { left, right, .. } => {
+                    format!("GenericAdd(l={left:?}, r={right:?})")
+                }
+                ValueNode::GenericMultiply { left, right, .. } => {
+                    format!("GenericMul(l={left:?}, r={right:?})")
+                }
+                ValueNode::GenericIncrement { value: v, .. } => {
+                    format!("GenericInc(val={v:?})")
+                }
+                ValueNode::Phi { inputs } => {
+                    format!("Phi(inputs={inputs:?})")
+                }
+                ValueNode::SmiConstant { value } => format!("Smi({value})"),
+                _ => format!("{:?}", std::mem::discriminant(node)),
+            };
+            eprintln!("[BODY_NODE] block={} id={id:?} {detail}", block.id);
+        }
+        // ── end diagnostic ──
         for (id, node) in &block.nodes {
             match node {
                 ValueNode::LoadGlobal {
@@ -1793,6 +2261,20 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
             }
         }
     }
+
+    // ── diagnostic: print all StoreGlobal nodes found in the body ──
+    for (&name, (val, ids, _slot)) in &store_info {
+        let val_type = match graph.node(*val) {
+            Some(n) => format!("{:?}", std::mem::discriminant(n)),
+            None => "MISSING".to_string(),
+        };
+        eprintln!(
+            "[PROMOTE_DIAG] StoreGlobal name={name} value={val:?} \
+             value_type={val_type} store_count={}",
+            ids.len()
+        );
+    }
+    // ── end diagnostic ──
 
     // Promotable globals: any global stored inside the loop (read-write OR
     // write-only).  Read-only globals are already handled by LICM, so we only
@@ -1951,9 +2433,11 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
     }
 
     // At each exit, prepend StoreGlobal nodes for each promoted global.
-    // The value to store is the StoreGlobal's original value input (the
-    // computed value from the loop body), which has been substituted through
-    // the Phi chain.
+    // The value to store is the Phi (not the body's raw value): the Phi
+    // correctly holds the preheader value when the loop doesn't execute
+    // and the last-iteration value otherwise.  Using the Phi also keeps it
+    // alive through DCE, which is essential for downstream passes like
+    // forward_loop_object_properties that pattern-match on Phi back-edges.
     for &exit_id in &exit_blocks {
         for pg in promoted.iter().rev() {
             let store_id = graph.alloc_node_id();
@@ -1964,7 +2448,7 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
                         store_id,
                         ValueNode::StoreGlobal {
                             name: pg.name,
-                            value: pg.store_value_id,
+                            value: pg.phi_id,
                             feedback_slot: pg.feedback_slot,
                         },
                     ),
@@ -2128,6 +2612,471 @@ fn remove_redundant_check_maps_in_block(block: &mut BasicBlock) {
 
     // Apply the substitution to all node inputs and the control node.
     apply_subst_to_block(block, &subst);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass 2.4 — Monomorphic closure call specialization
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Convert `Call` nodes whose callee provably originates from a single
+/// `FastCreateClosure` or `CreateClosure` into `CallKnownFunction`, enabling
+/// the code generator to emit a direct JIT-to-JIT call instead of going
+/// through IC dispatch.
+///
+/// The pass works in two phases:
+///
+/// 1. **Collect** — scan all blocks and record every `NodeId` that is produced
+///    by `FastCreateClosure` or `CreateClosure`.  Additionally, resolve `Phi`
+///    nodes whose non-self inputs all trace back to the *same* closure origin
+///    (monomorphic phi).
+///
+/// 2. **Rewrite** — for every `Call` node whose `callee` is in the closure
+///    set, replace the node in-place with `CallKnownFunction`.
+fn specialize_closure_calls(graph: &mut MaglevGraph) {
+    // Phase 1: collect all node IDs that produce a closure value.
+    let mut closure_nodes: HashSet<NodeId> = HashSet::new();
+
+    for block in graph.blocks() {
+        for &(id, ref node) in &block.nodes {
+            if matches!(
+                node,
+                ValueNode::FastCreateClosure { .. } | ValueNode::CreateClosure { .. }
+            ) {
+                closure_nodes.insert(id);
+            }
+        }
+    }
+
+    if closure_nodes.is_empty() {
+        return;
+    }
+
+    // Resolve Phi nodes that funnel a single closure definition.  We iterate
+    // to a fixed point because Phis can reference other Phis.
+    let mut phi_map: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for block in graph.blocks() {
+        for &(id, ref node) in &block.nodes {
+            if let ValueNode::Phi { inputs } = node {
+                phi_map.insert(id, inputs.clone());
+            }
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (&phi_id, inputs) in &phi_map {
+            if closure_nodes.contains(&phi_id) {
+                continue;
+            }
+            // Check if every non-self input is either a closure node or
+            // another phi already proven to be a closure.
+            let all_closure = inputs
+                .iter()
+                .all(|&inp| inp == phi_id || closure_nodes.contains(&inp));
+            if all_closure && !inputs.is_empty() {
+                // Ensure at least one input is not self-referencing.
+                let has_non_self = inputs.iter().any(|&inp| inp != phi_id);
+                if has_non_self {
+                    closure_nodes.insert(phi_id);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    // Phase 2: rewrite Call → CallKnownFunction for monomorphic closure calls.
+    for block in graph.blocks_mut() {
+        for (_id, node) in &mut block.nodes {
+            if let ValueNode::Call {
+                callee,
+                receiver,
+                args,
+                ..
+            } = node
+                && closure_nodes.contains(callee)
+            {
+                *node = ValueNode::CallKnownFunction {
+                    callee: *callee,
+                    receiver: *receiver,
+                    args: args.clone(),
+                };
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Speculative call-loop fusion
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Replace a counted loop that calls a 0-arg closure N times with a single
+/// [`ValueNode::SpeculativeCallFusion`] in the preheader.
+///
+/// Pattern detected:
+/// ```text
+///   header: result_phi = Phi(init, call_result)
+///           iv_phi     = Phi(0, iv_next)
+///           Branch(iv_phi < limit, body, exit)
+///   body:   call_result = Call(callee, undefined, [])
+///           iv_next     = Int32Add(iv_phi, 1)
+///           Jump(header)
+/// ```
+///
+/// The fusion node calls into the runtime which analyses the callee's
+/// bytecodes.  If it matches a simple context-slot increment pattern, the
+/// runtime computes the closed-form result in O(1); otherwise it returns
+/// `JIT_DEOPT` and the interpreter re-runs the loop.
+fn fuse_call_loops(graph: &mut MaglevGraph) {
+    let loops = licm::detect_loops(graph);
+    if loops.is_empty() {
+        return;
+    }
+    for lp in &loops {
+        try_fuse_call_loop(graph, lp);
+    }
+}
+
+fn try_fuse_call_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
+    // ── 1. Simple loop: header + 1 body block ────────────────────────────
+    if lp.body.len() != 2 || !lp.body.contains(&lp.header) {
+        return false;
+    }
+
+    // Extract all structural data from blocks into owned values, then release borrows.
+    let (condition_id, body_block_idx, header_preds, header_nodes_snapshot);
+    {
+        let header = match graph.block(lp.header) {
+            Some(b) => b,
+            None => return false,
+        };
+        let (cond, body_bi, _exit) = match &header.control {
+            Some(ControlNode::Branch {
+                condition,
+                if_true,
+                if_false,
+            }) => (*condition, *if_true, *if_false),
+            _ => return false,
+        };
+        if !lp.body.contains(&body_bi) {
+            return false;
+        }
+        condition_id = cond;
+        body_block_idx = body_bi;
+        header_preds = header.predecessors.clone();
+        header_nodes_snapshot = header
+            .nodes
+            .iter()
+            .map(|(nid, node)| (*nid, node.clone()))
+            .collect::<Vec<_>>();
+    }
+
+    {
+        let body = match graph.block(body_block_idx) {
+            Some(b) => b,
+            None => return false,
+        };
+        match &body.control {
+            Some(ControlNode::Jump { target }) if *target == lp.header => {}
+            _ => return false,
+        }
+    }
+
+    // ── 2. Find IV and trip count ────────────────────────────────────────
+    let (cmp_left, cmp_right) = {
+        let mut found = None;
+        for (nid, node) in &header_nodes_snapshot {
+            if *nid == condition_id {
+                found = Some(node.clone());
+                break;
+            }
+        }
+        match found {
+            Some(ValueNode::Int32LessThan { left, right }) => (left, right),
+            _ => return false,
+        }
+    };
+
+    let iv_limit = match find_i32_constant(graph, cmp_right) {
+        Some(v) => v,
+        None => return false,
+    };
+
+    // Determine trip count by examining the IV node.
+    // iv_global_name is Some(name) when the IV is a LoadGlobal (need to short-circuit).
+    let (trip_count, call_node_id, callee_id, iv_global_name) =
+        if let Some(ValueNode::Phi { inputs }) = graph.node(cmp_left) {
+            // ── Phi-based IV ──
+            let inputs = inputs.clone();
+            if inputs.len() != 2 {
+                return false;
+            }
+            let back_pred_pos = match header_preds.iter().position(|&p| p == body_block_idx) {
+                Some(pos) => pos,
+                None => return false,
+            };
+            let entry_pos = match header_preds.iter().position(|&p| p == lp.preheader) {
+                Some(pos) => pos,
+                None => return false,
+            };
+
+            let iv_init = match find_i32_constant(graph, inputs[entry_pos]) {
+                Some(v) => v,
+                None => return false,
+            };
+            let iv_step = find_increment_step(graph, inputs[back_pred_pos], cmp_left);
+            if iv_step != Some(1) {
+                return false;
+            }
+            let range = (iv_limit as i64) - (iv_init as i64);
+            if range <= 0 || range > 100_000 {
+                return false;
+            }
+
+            // Find a non-IV Phi whose back-edge is a Call
+            let mut found_call = None;
+            for (nid, node) in &header_nodes_snapshot {
+                if *nid == cmp_left {
+                    continue;
+                }
+                if let ValueNode::Phi { inputs } = node
+                    && inputs.len() == 2
+                {
+                    let back_id = inputs[back_pred_pos];
+                    if let Some(cid) = find_call_callee(graph, back_id) {
+                        found_call = Some((range as u32, back_id, cid));
+                        break;
+                    }
+                }
+            }
+            match found_call {
+                Some((tc, cn, ci)) => (tc, cn, ci, None),
+                None => return false,
+            }
+        } else if let Some(ValueNode::LoadGlobal { name: iv_name, .. }) = graph.node(cmp_left) {
+            // ── LoadGlobal-based IV (globals not promoted due to Call in loop) ──
+            let iv_name = *iv_name;
+
+            // Find the init value: look for a StoreGlobal to iv_name in the preheader.
+            let pre = graph.block(lp.preheader);
+            let iv_init = pre.and_then(|pre| {
+                pre.nodes.iter().rev().find_map(|(_, node)| {
+                    if let ValueNode::StoreGlobal { name, value, .. } = node
+                        && *name == iv_name
+                    {
+                        find_i32_constant(graph, *value)
+                    } else {
+                        None
+                    }
+                })
+            });
+            let iv_init = match iv_init {
+                Some(v) => v,
+                None => return false,
+            };
+
+            // Find IV increment in body: StoreGlobal(iv_name, Inc(LoadGlobal(iv_name)))
+            let body = graph.block(body_block_idx).unwrap();
+            let mut iv_step_ok = false;
+            for (_, node) in &body.nodes {
+                if let ValueNode::StoreGlobal { name, value, .. } = node
+                    && *name == iv_name
+                {
+                    // Check if value is an increment of a LoadGlobal(iv_name)
+                    if let Some(inc_node) = graph.node(*value) {
+                        let base = match inc_node {
+                            ValueNode::GenericIncrement { value, .. }
+                            | ValueNode::Int32Increment { value }
+                            | ValueNode::CheckedSmiIncrement { value } => Some(*value),
+                            _ => None,
+                        };
+                        if let Some(base_id) = base
+                            && let Some(ValueNode::LoadGlobal { name: bn, .. }) =
+                                graph.node(base_id)
+                            && *bn == iv_name
+                        {
+                            iv_step_ok = true;
+                        }
+                    }
+                }
+            }
+            if !iv_step_ok {
+                return false;
+            }
+
+            let range = (iv_limit as i64) - (iv_init as i64);
+            if range <= 0 || range > 100_000 {
+                return false;
+            }
+
+            // Find a Call in the body block.
+            let body = graph.block(body_block_idx).unwrap();
+            let mut found_call = None;
+            for (nid, node) in &body.nodes {
+                if let Some(cid) = find_call_callee_node(node) {
+                    found_call = Some((range as u32, *nid, cid));
+                    break;
+                }
+            }
+            match found_call {
+                Some((tc, cn, ci)) => (tc, cn, ci, Some(iv_name)),
+                None => return false,
+            }
+        } else {
+            return false;
+        };
+
+    // Callee must be loop-invariant (defined outside the loop).
+    let loop_body_set: HashSet<u32> = lp.body.iter().copied().collect();
+    let callee_in_loop = loop_body_set.iter().any(|&bi| {
+        graph
+            .block(bi)
+            .map(|b| b.nodes.iter().any(|(nid, _)| *nid == callee_id))
+            .unwrap_or(false)
+    });
+    if callee_in_loop {
+        return false;
+    }
+
+    // ── 4. Insert SpeculativeCallFusion in preheader ─────────────────
+    let fusion_id = graph.alloc_node_id();
+    if let Some(pre) = graph.block_mut(lp.preheader) {
+        pre.push_with_id(
+            fusion_id,
+            ValueNode::SpeculativeCallFusion {
+                callee: callee_id,
+                trip_count,
+            },
+        );
+    }
+
+    // For LoadGlobal-based loops: store the fusion result to the result global
+    // and replace the Call node with a no-op (SmiConstant(0) as dummy).
+    // For Phi-based loops: update the Phi inputs.
+    // In both cases, the Call node becomes dead and will be removed by DCE.
+
+    // Find if the call_node_id's result is stored via StoreGlobal.
+    let body = graph.block(body_block_idx).unwrap();
+    let mut result_store_name = None;
+    let mut result_store_slot = None;
+    for (_, node) in &body.nodes {
+        if let ValueNode::StoreGlobal {
+            name,
+            value,
+            feedback_slot,
+        } = node
+            && *value == call_node_id
+        {
+            result_store_name = Some(*name);
+            result_store_slot = Some(*feedback_slot);
+            break;
+        }
+    }
+
+    if let (Some(store_name), Some(store_fb)) = (result_store_name, result_store_slot) {
+        // LoadGlobal-based: insert StoreGlobal(result, fusion_result) in preheader
+        let store_id = graph.alloc_node_id();
+        if let Some(pre) = graph.block_mut(lp.preheader) {
+            pre.push_with_id(
+                store_id,
+                ValueNode::StoreGlobal {
+                    name: store_name,
+                    value: fusion_id,
+                    feedback_slot: store_fb,
+                },
+            );
+        }
+    }
+
+    // ── 5. Short-circuit the loop ──────────────────────────────────────
+    // For LoadGlobal-based IV: store iv_limit to the IV global so the
+    // header's `LoadGlobal(iv) < iv_limit` is immediately false.
+    if let Some(iv_name) = iv_global_name {
+        // Find the StoreGlobal feedback_slot for the IV from the body block.
+        let body = graph.block(body_block_idx).unwrap();
+        let mut iv_fb = None;
+        for (_, node) in &body.nodes {
+            if let ValueNode::StoreGlobal {
+                name,
+                feedback_slot,
+                ..
+            } = node
+                && *name == iv_name
+            {
+                iv_fb = Some(*feedback_slot);
+                break;
+            }
+        }
+        if let Some(fb) = iv_fb {
+            // Store iv_limit (= cmp_right) to the IV global in preheader.
+            let iv_store_id = graph.alloc_node_id();
+            if let Some(pre) = graph.block_mut(lp.preheader) {
+                pre.push_with_id(
+                    iv_store_id,
+                    ValueNode::StoreGlobal {
+                        name: iv_name,
+                        value: cmp_right,
+                        feedback_slot: fb,
+                    },
+                );
+            }
+        }
+    }
+
+    // For Phi-based IV: set the IV Phi entry to the limit constant.
+    // This makes `iv_phi < iv_limit` false on first check → loop exits immediately.
+    if iv_global_name.is_none() {
+        let back_pred_pos = header_preds.iter().position(|&p| p == body_block_idx);
+        let entry_pos = header_preds.iter().position(|&p| p == lp.preheader);
+        if let (Some(bp), Some(ep)) = (back_pred_pos, entry_pos) {
+            let h = graph.block_mut(lp.header).unwrap();
+            for (nid, node) in &mut h.nodes {
+                if *nid == cmp_left {
+                    if let ValueNode::Phi { inputs } = node
+                        && inputs.len() == 2
+                    {
+                        // Set entry input to limit → loop condition false immediately
+                        inputs[ep] = cmp_right;
+                        inputs[bp] = *nid; // identity
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // Also handle the case where there's a Phi for the result
+    let back_pred_pos = header_preds.iter().position(|&p| p == body_block_idx);
+    let entry_pos = header_preds.iter().position(|&p| p == lp.preheader);
+    if let (Some(bp), Some(ep)) = (back_pred_pos, entry_pos) {
+        let h = graph.block_mut(lp.header).unwrap();
+        for (nid, node) in &mut h.nodes {
+            if let ValueNode::Phi { inputs } = node
+                && inputs.len() == 2
+                && inputs[bp] == call_node_id
+            {
+                inputs[ep] = fusion_id;
+                inputs[bp] = *nid; // self-reference (identity)
+                break;
+            }
+        }
+    }
+
+    true
+}
+
+/// Extract callee NodeId from a Call/CallKnownFunction node (graph lookup version).
+fn find_call_callee(graph: &MaglevGraph, node_id: NodeId) -> Option<NodeId> {
+    find_call_callee_node(graph.node(node_id)?)
+}
+
+/// Extract callee NodeId from a Call/CallKnownFunction ValueNode.
+fn find_call_callee_node(node: &ValueNode) -> Option<NodeId> {
+    match node {
+        ValueNode::Call { callee, args, .. } if args.is_empty() => Some(*callee),
+        ValueNode::CallKnownFunction { callee, args, .. } if args.is_empty() => Some(*callee),
+        _ => None,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2334,6 +3283,118 @@ fn fuse_object_literal_stores_in_block(block: &mut BasicBlock) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Pass 2b′ — Forward invariant object-literal properties
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Forward property loads from object literals whose properties are never
+/// modified after creation.  Unlike the general store-to-load pass, this
+/// works across block boundaries (including loop headers) because it proves
+/// that the properties are immutable throughout the function.
+///
+/// For each `CreateObjectLiteralWithProperties` that has NO `StoreNamedGeneric`
+/// targeting it anywhere in the graph, every `LoadNamedGeneric` on the same
+/// object and property name is replaced with the creation-time value.
+fn forward_invariant_object_properties(graph: &mut MaglevGraph) {
+    // Phase 1: Collect object literals and their property maps.
+    let mut obj_props: HashMap<NodeId, HashMap<u32, NodeId>> = HashMap::new();
+    // Track StoreGlobal(name, value) → value for global aliasing.
+    let mut global_to_obj: HashMap<u32, NodeId> = HashMap::new();
+
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            match node {
+                ValueNode::CreateObjectLiteralWithProperties { names, values, .. } => {
+                    let mut props = HashMap::new();
+                    for (name, value) in names.iter().zip(values.iter()) {
+                        props.insert(*name, *value);
+                    }
+                    obj_props.insert(*id, props);
+                }
+                // Track globals that point to object literals.
+                ValueNode::StoreGlobal { name, value, .. } => {
+                    if obj_props.contains_key(value) {
+                        global_to_obj.insert(*name, *value);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if obj_props.is_empty() {
+        return;
+    }
+
+    // Phase 2: Remove any object whose properties are modified (StoreNamedGeneric).
+    for block in graph.blocks() {
+        for (_, node) in &block.nodes {
+            if let ValueNode::StoreNamedGeneric { object, .. } = node {
+                obj_props.remove(object);
+                for (&_gname, &obj_id) in &global_to_obj {
+                    if *object == obj_id {
+                        obj_props.remove(&obj_id);
+                    }
+                }
+            }
+        }
+    }
+
+    if obj_props.is_empty() {
+        return;
+    }
+
+    // Build a map from LoadGlobal IDs to the object they alias.
+    let mut load_global_alias: HashMap<NodeId, NodeId> = HashMap::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            if let ValueNode::LoadGlobal { name, .. } = node
+                && let Some(&obj_id) = global_to_obj.get(name)
+                && obj_props.contains_key(&obj_id)
+            {
+                load_global_alias.insert(*id, obj_id);
+            }
+        }
+    }
+
+    // Phase 3: Collect substitutions for LoadNamedGeneric on immutable objects.
+    let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            if let ValueNode::LoadNamedGeneric { object, name, .. } = node {
+                let mut resolved = load_global_alias.get(object).copied().unwrap_or(*object);
+                // Chain through prior substitutions for nested object access
+                // (e.g. root.a.b.c.d.e where each level is a
+                // CreateObjectLiteralWithProperties).
+                if !obj_props.contains_key(&resolved)
+                    && let Some(&sub) = subst.get(&resolved)
+                {
+                    resolved = sub;
+                }
+                if let Some(props) = obj_props.get(&resolved)
+                    && let Some(&value) = props.get(name)
+                {
+                    subst.insert(*id, value);
+                }
+            }
+        }
+    }
+
+    if subst.is_empty() {
+        return;
+    }
+
+    // Phase 4: Apply substitutions.
+    for block in graph.blocks_mut() {
+        for (id, node) in &mut block.nodes {
+            if subst.contains_key(id) {
+                *node = ValueNode::UndefinedConstant;
+            }
+        }
+        apply_subst_to_block(block, &subst);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Pass 2b — Store-to-load forwarding
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2489,6 +3550,577 @@ fn compute_store_to_load_subst_with_map(
     }
 
     subst
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass 2c.0 — Loop dead-object forwarding
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Forward property loads on objects created inside counted loops to their
+/// final-iteration constant values, enabling subsequent dead-allocation
+/// elimination.
+///
+/// Pattern: a counted loop creates an object literal every iteration and
+/// stores it to a global that is never read inside the loop.  After the loop,
+/// the global is loaded and only its properties are accessed.  Because only
+/// the last iteration's object matters, we can compute the final property
+/// values at compile time (for affine expressions of the IV) and replace the
+/// post-loop `LoadNamedGeneric` nodes with constants.  This makes the in-loop
+/// `CreateObjectLiteralWithProperties` + `StoreGlobal` dead, which existing
+/// passes then eliminate.
+fn forward_loop_object_properties(graph: &mut MaglevGraph) {
+    let loops = licm::detect_loops(graph);
+    if loops.is_empty() {
+        return;
+    }
+
+    // Build a node → constant map.
+    let mut consts: HashMap<NodeId, i32> = HashMap::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            match node {
+                ValueNode::SmiConstant { value } | ValueNode::Int32Constant { value } => {
+                    consts.insert(*id, *value);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for lp in &loops {
+        try_forward_loop_object(graph, lp, &consts);
+    }
+}
+
+/// Try to forward object property loads for a single counted loop.
+///
+/// After `promote_loop_globals_counted`, a write-only global like `last` in
+/// `for (...) { last = { x: i, ... }; }` becomes a header Phi whose back-edge
+/// input is a `CreateObjectLiteralWithProperties`.  Post-loop property loads
+/// appear as `LoadNamedGeneric(obj_phi, "x")`.
+///
+/// This pass detects that pattern, evaluates each property value at the final
+/// IV value (limit - step), and replaces the post-loop property loads with
+/// SmiConstants.  If the object Phi has no remaining uses after replacement,
+/// the in-loop allocation is killed.
+fn try_forward_loop_object(
+    graph: &mut MaglevGraph,
+    lp: &licm::NaturalLoop,
+    consts: &HashMap<NodeId, i32>,
+) -> bool {
+    // ── 1. Verify counted loop structure ─────────────────────────────────
+    let header = match graph.block(lp.header) {
+        Some(b) => b,
+        None => return false,
+    };
+
+    let (condition_id, body_block_idx, exit_block_idx) = match &header.control {
+        Some(ControlNode::Branch {
+            condition,
+            if_true,
+            if_false,
+        }) => (*condition, *if_true, *if_false),
+        _ => return false,
+    };
+
+    if !lp.body.contains(&body_block_idx) {
+        return false;
+    }
+    if lp.body.contains(&exit_block_idx) {
+        return false;
+    }
+    // Simple loop: header + 1 body block.
+    if lp.body.len() != 2 || !lp.body.contains(&lp.header) {
+        return false;
+    }
+
+    let body = match graph.block(body_block_idx) {
+        Some(b) => b,
+        None => return false,
+    };
+    match &body.control {
+        Some(ControlNode::Jump { target }) if *target == lp.header => {}
+        _ => return false,
+    }
+
+    // ── 2. Find IV Phi and compute trip count ────────────────────────────
+    let (cmp_left, cmp_right) = {
+        let mut found = None;
+        for (nid, node) in &header.nodes {
+            if *nid == condition_id {
+                found = Some(node.clone());
+                break;
+            }
+        }
+        match &found {
+            Some(ValueNode::Int32LessThan { left, right }) => (*left, *right),
+            _ => {
+                eprintln!(
+                    "[OBJ_FWD] bail: condition not Int32LessThan, type={:?}",
+                    found.as_ref().map(std::mem::discriminant)
+                );
+                return false;
+            }
+        }
+    };
+
+    let iv_phi_id = cmp_left;
+    let header = graph.block(lp.header).unwrap();
+    let iv_phi_inputs = {
+        let mut found = None;
+        for (nid, node) in &header.nodes {
+            if *nid == iv_phi_id {
+                if let ValueNode::Phi { inputs } = node {
+                    found = Some(inputs.clone());
+                }
+                break;
+            }
+        }
+        match found {
+            Some(inputs) if inputs.len() == 2 => inputs,
+            _ => {
+                eprintln!("[OBJ_FWD] bail: IV phi {iv_phi_id:?} not found or wrong input count");
+                return false;
+            }
+        }
+    };
+
+    let back_pred_pos = match header
+        .predecessors
+        .iter()
+        .position(|&p| p == body_block_idx)
+    {
+        Some(pos) => pos,
+        None => return false,
+    };
+    let entry_pos = match header.predecessors.iter().position(|&p| p == lp.preheader) {
+        Some(pos) => pos,
+        None => return false,
+    };
+
+    let iv_init = match consts.get(&iv_phi_inputs[entry_pos]) {
+        Some(&v) => v,
+        None => match find_i32_constant(graph, iv_phi_inputs[entry_pos]) {
+            Some(v) => v,
+            None => return false,
+        },
+    };
+    let iv_limit = match consts.get(&cmp_right) {
+        Some(&v) => v,
+        None => match find_i32_constant(graph, cmp_right) {
+            Some(v) => v,
+            None => return false,
+        },
+    };
+
+    let iv_back_id = iv_phi_inputs[back_pred_pos];
+    let iv_step = match find_increment_step(graph, iv_back_id, iv_phi_id) {
+        Some(s) if s > 0 => s,
+        _ => return false,
+    };
+
+    let range = (iv_limit as i64) - (iv_init as i64);
+    let step = iv_step as i64;
+    if range <= 0 || range % step != 0 {
+        return false;
+    }
+    if range / step == 0 {
+        return false;
+    }
+
+    let iv_final = iv_limit - iv_step;
+
+    // ── 3. Find "object Phi" in header whose back-edge is CreateObjWithProps
+    let header = graph.block(lp.header).unwrap();
+    let mut obj_phi_id: Option<NodeId> = None;
+    let mut create_obj_id: Option<NodeId> = None;
+    let mut create_names: Vec<u32> = Vec::new();
+    let mut create_values: Vec<NodeId> = Vec::new();
+
+    let mut phi_count = 0u32;
+    for (nid, node) in &header.nodes {
+        if *nid == iv_phi_id {
+            continue;
+        }
+        if let ValueNode::Phi { inputs } = node
+            && inputs.len() == 2
+        {
+            phi_count += 1;
+            let back_edge_id = inputs[back_pred_pos];
+            let back_node = graph.node(back_edge_id);
+            let type_name = match back_node {
+                Some(ValueNode::CreateObjectLiteral { .. }) => "CreateObjLit",
+                Some(ValueNode::CreateObjectLiteralWithProperties { .. }) => "CreateObjWithProps",
+                Some(ValueNode::CreateEmptyObjectLiteral) => "CreateEmptyObj",
+                Some(ValueNode::UndefinedConstant) => "Undefined",
+                Some(ValueNode::Phi { .. }) => "Phi",
+                Some(ValueNode::SmiConstant { value }) => {
+                    eprintln!("[OBJ_FWD] phi {nid:?} back={back_edge_id:?} SmiConst({value})");
+                    "SmiConstant"
+                }
+                Some(ValueNode::StoreNamedGeneric { .. }) => "StoreNamedGeneric",
+                Some(ValueNode::LoadNamedGeneric { .. }) => "LoadNamedGeneric",
+                Some(ValueNode::CheckedSmiAdd { .. }) => "CheckedSmiAdd",
+                Some(ValueNode::Int32Add { .. }) => "Int32Add",
+                Some(ValueNode::GenericAdd { .. }) => "GenericAdd",
+                Some(ValueNode::GenericMultiply { .. }) => "GenericMultiply",
+                Some(ValueNode::GenericIncrement { .. }) => "GenericIncrement",
+                Some(ValueNode::CheckedSmiIncrement { .. }) => "CheckedSmiIncrement",
+                None => "MISSING",
+                _ => {
+                    eprintln!(
+                        "[OBJ_FWD] unknown back_edge disc={:?}",
+                        back_node.map(std::mem::discriminant)
+                    );
+                    "other"
+                }
+            };
+            eprintln!("[OBJ_FWD] phi {nid:?} back={back_edge_id:?} type={type_name}");
+            if let Some(ValueNode::CreateObjectLiteralWithProperties { names, values, .. }) =
+                back_node
+            {
+                obj_phi_id = Some(*nid);
+                create_obj_id = Some(back_edge_id);
+                create_names = names.clone();
+                create_values = values.clone();
+                break;
+            }
+        }
+    }
+    eprintln!("[OBJ_FWD] phis={phi_count} found={}", obj_phi_id.is_some());
+
+    let obj_phi_id = match obj_phi_id {
+        Some(id) => id,
+        None => return false,
+    };
+    let create_obj_id = create_obj_id.unwrap();
+
+    // ── 4. Evaluate property values at IV = iv_final ─────────────────────
+    let mut final_values: Vec<Option<i32>> = Vec::new();
+    for &val_id in &create_values {
+        final_values.push(eval_at_iv(graph, val_id, iv_phi_id, iv_final, consts));
+    }
+
+    if final_values.iter().any(|v| v.is_none()) {
+        for (i, v) in final_values.iter().enumerate() {
+            if v.is_none() {
+                let vn = graph.node(create_values[i]);
+                eprintln!(
+                    "[OBJ_FWD] eval fail prop {i} type={:?}",
+                    vn.map(std::mem::discriminant)
+                );
+            }
+        }
+        return false;
+    }
+    eprintln!("[OBJ_FWD] eval ok: {final_values:?}");
+
+    // ── 5. Find post-loop LoadNamedGeneric that loads from obj_phi ────────
+    // Build property name → final constant value map.
+    let mut prop_finals: HashMap<u32, i32> = HashMap::new();
+    for (name, val) in create_names.iter().zip(final_values.iter()) {
+        prop_finals.insert(*name, val.unwrap());
+    }
+
+    let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
+    let mut new_constants: Vec<(NodeId, i32)> = Vec::new();
+
+    // Collect replacements: LoadNamedGeneric(obj_phi_id, prop_name) → const.
+    let mut pending: Vec<(NodeId, i32)> = Vec::new();
+    for block in graph.blocks() {
+        if lp.body.contains(&block.id) {
+            continue;
+        }
+        for (nid, node) in &block.nodes {
+            if let ValueNode::LoadNamedGeneric { object, name, .. } = node
+                && *object == obj_phi_id
+                && let Some(&final_val) = prop_finals.get(name)
+            {
+                pending.push((*nid, final_val));
+            }
+        }
+    }
+
+    if pending.is_empty() {
+        return false;
+    }
+
+    for (load_nid, final_val) in &pending {
+        let const_id = graph.alloc_node_id();
+        new_constants.push((const_id, *final_val));
+        subst.insert(*load_nid, const_id);
+    }
+
+    // ── 6. Safety: check that obj_phi has no uses outside the replaced loads
+    //      and exit StoreGlobal nodes.  Exit StoreGlobals that store the
+    //      obj_phi can be killed (their only purpose was materialising the
+    //      object for post-loop reads, which are now constants).
+    let replaced_set: HashSet<NodeId> = subst.keys().copied().collect();
+    let mut exit_store_globals_to_kill: Vec<NodeId> = Vec::new();
+    let mut truly_escapes = false;
+    for block in graph.blocks() {
+        for (nid, node) in &block.nodes {
+            if replaced_set.contains(nid) || *nid == obj_phi_id {
+                continue;
+            }
+            let refs = node_operands(node);
+            if refs.contains(&obj_phi_id) {
+                // Allow StoreGlobal in exit blocks — these just materialise
+                // the object for post-loop reads that are already forwarded.
+                if !lp.body.contains(&block.id) && matches!(node, ValueNode::StoreGlobal { .. }) {
+                    exit_store_globals_to_kill.push(*nid);
+                    continue;
+                }
+                truly_escapes = true;
+                break;
+            }
+        }
+        if truly_escapes {
+            break;
+        }
+        if let Some(ctrl) = &block.control {
+            let ctrl_refs = control_operands(ctrl);
+            if ctrl_refs.contains(&obj_phi_id) {
+                truly_escapes = true;
+                break;
+            }
+        }
+    }
+    if truly_escapes {
+        return apply_load_replacements_only(graph, lp, exit_block_idx, &new_constants, &subst);
+    }
+
+    // ── 7. Apply: insert constants, replace loads, kill body allocs ──────
+    // Insert SmiConstants at the start of the exit block.
+    if let Some(exit_block) = graph.block_mut(exit_block_idx) {
+        for (idx, (const_id, val)) in new_constants.iter().enumerate() {
+            exit_block
+                .nodes
+                .insert(idx, (*const_id, ValueNode::SmiConstant { value: *val }));
+        }
+    }
+
+    // Replace LoadNamedGeneric nodes with UndefinedConstant.
+    for block in graph.blocks_mut() {
+        if lp.body.contains(&block.id) {
+            continue;
+        }
+        for (nid, node) in &mut block.nodes {
+            if subst.contains_key(nid) {
+                *node = ValueNode::UndefinedConstant;
+            }
+            // Kill exit StoreGlobal nodes that stored the now-dead obj_phi.
+            if exit_store_globals_to_kill.contains(nid) {
+                *node = ValueNode::UndefinedConstant;
+            }
+        }
+        apply_subst_to_block(block, &subst);
+    }
+
+    // Kill CreateObjectLiteralWithProperties in the body (obj_phi has no
+    // remaining uses, so the allocation is dead).
+    for block in graph.blocks_mut() {
+        if !lp.body.contains(&block.id) || block.id == lp.header {
+            continue;
+        }
+        for (nid, node) in &mut block.nodes {
+            if *nid == create_obj_id {
+                *node = ValueNode::UndefinedConstant;
+            }
+        }
+    }
+
+    // Update the obj_phi's back-edge input to UndefinedConstant sentinel.
+    // The Phi itself is now dead (no uses) and will be cleaned by DCE.
+    if let Some(hdr) = graph.block_mut(lp.header) {
+        for (nid, node) in &mut hdr.nodes {
+            if *nid == obj_phi_id
+                && let ValueNode::Phi { inputs } = node
+            {
+                inputs[back_pred_pos] = inputs[entry_pos];
+            }
+        }
+    }
+
+    true
+}
+
+/// Apply only the load→constant replacements without killing the allocation.
+/// Used when the object Phi escapes (has uses beyond the forwarded loads).
+fn apply_load_replacements_only(
+    graph: &mut MaglevGraph,
+    lp: &licm::NaturalLoop,
+    exit_block_idx: u32,
+    new_constants: &[(NodeId, i32)],
+    subst: &HashMap<NodeId, NodeId>,
+) -> bool {
+    if let Some(exit_block) = graph.block_mut(exit_block_idx) {
+        for (idx, (const_id, val)) in new_constants.iter().enumerate() {
+            exit_block
+                .nodes
+                .insert(idx, (*const_id, ValueNode::SmiConstant { value: *val }));
+        }
+    }
+    for block in graph.blocks_mut() {
+        if lp.body.contains(&block.id) {
+            continue;
+        }
+        for (nid, node) in &mut block.nodes {
+            if subst.contains_key(nid) {
+                *node = ValueNode::UndefinedConstant;
+            }
+        }
+        apply_subst_to_block(block, subst);
+    }
+    true
+}
+
+/// Collect all NodeId operands of a value node.
+fn node_operands(node: &ValueNode) -> Vec<NodeId> {
+    match node {
+        ValueNode::Phi { inputs } => inputs.clone(),
+        ValueNode::Int32Add { left, right }
+        | ValueNode::Int32Subtract { left, right }
+        | ValueNode::Int32Multiply { left, right }
+        | ValueNode::Int32LessThan { left, right }
+        | ValueNode::Int32BitwiseOr { left, right }
+        | ValueNode::Int32BitwiseAnd { left, right }
+        | ValueNode::Int32ShiftLeft { left, right }
+        | ValueNode::Int32ShiftRight { left, right }
+        | ValueNode::CheckedSmiAdd { left, right }
+        | ValueNode::CheckedSmiSubtract { left, right }
+        | ValueNode::CheckedSmiMultiply { left, right }
+        | ValueNode::GenericAdd { left, right, .. }
+        | ValueNode::GenericSubtract { left, right, .. }
+        | ValueNode::GenericMultiply { left, right, .. } => vec![*left, *right],
+        ValueNode::LoadNamedGeneric { object, .. } => vec![*object],
+        ValueNode::StoreNamedGeneric { object, value, .. } => vec![*object, *value],
+        ValueNode::StoreGlobal { value, .. } => vec![*value],
+        ValueNode::Call {
+            callee,
+            receiver,
+            args,
+            ..
+        } => {
+            let mut v = vec![*callee, *receiver];
+            v.extend(args);
+            v
+        }
+        ValueNode::CallKnownFunction {
+            callee,
+            receiver,
+            args,
+            ..
+        } => {
+            let mut v = vec![*callee, *receiver];
+            v.extend(args);
+            v
+        }
+        ValueNode::CreateObjectLiteralWithProperties { values, .. } => values.clone(),
+        ValueNode::CheckMaps { receiver, .. } => vec![*receiver],
+        _ => Vec::new(),
+    }
+}
+
+/// Collect all NodeId operands of a control node.
+fn control_operands(ctrl: &ControlNode) -> Vec<NodeId> {
+    match ctrl {
+        ControlNode::Branch { condition, .. } => vec![*condition],
+        ControlNode::Return { value } => vec![*value],
+        _ => Vec::new(),
+    }
+}
+
+/// Evaluate a pure expression tree at a specific IV value.
+///
+/// Returns `Some(value)` if the expression is a constant or a pure affine
+/// function of the given IV Phi.  Returns `None` for anything else (calls,
+/// loads, side-effecting nodes, etc.).
+fn eval_at_iv(
+    graph: &MaglevGraph,
+    node_id: NodeId,
+    iv_phi: NodeId,
+    iv_value: i32,
+    consts: &HashMap<NodeId, i32>,
+) -> Option<i32> {
+    if node_id == iv_phi {
+        return Some(iv_value);
+    }
+
+    // Check constant map first.
+    if let Some(&v) = consts.get(&node_id) {
+        return Some(v);
+    }
+
+    let node = graph.node(node_id)?;
+    match node {
+        ValueNode::SmiConstant { value } | ValueNode::Int32Constant { value } => Some(*value),
+
+        // Pure binary arithmetic (Int32)
+        ValueNode::Int32Add { left, right } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            l.checked_add(r)
+        }
+        ValueNode::Int32Subtract { left, right } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            l.checked_sub(r)
+        }
+        ValueNode::Int32Multiply { left, right } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            l.checked_mul(r)
+        }
+
+        // Checked Smi variants (same semantics for constant eval)
+        ValueNode::CheckedSmiAdd { left, right } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            l.checked_add(r)
+        }
+        ValueNode::CheckedSmiSubtract { left, right } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            l.checked_sub(r)
+        }
+        ValueNode::CheckedSmiMultiply { left, right } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            l.checked_mul(r)
+        }
+
+        // Generic variants with feedback (same constant eval)
+        ValueNode::GenericAdd { left, right, .. } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            l.checked_add(r)
+        }
+        ValueNode::GenericSubtract { left, right, .. } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            l.checked_sub(r)
+        }
+        ValueNode::GenericMultiply { left, right, .. } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            l.checked_mul(r)
+        }
+
+        // Int32 bitwise OR (used in `| 0` truncation pattern)
+        ValueNode::Int32BitwiseOr { left, right } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            Some(l | r)
+        }
+        ValueNode::Int32ShiftLeft { left, right } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            Some(l.wrapping_shl(r as u32))
+        }
+
+        _ => None,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3019,6 +4651,10 @@ fn collect_value_node_inputs(node: &ValueNode, live: &mut HashSet<NodeId>) {
             }
         }
 
+        ValueNode::SpeculativeCallFusion { callee, .. } => {
+            live.insert(*callee);
+        }
+
         ValueNode::Construct {
             constructor, args, ..
         }
@@ -3074,6 +4710,7 @@ fn has_side_effects(node: &ValueNode) -> bool {
             | ValueNode::CallWithSpread { .. }
             | ValueNode::Construct { .. }
             | ValueNode::ConstructWithSpread { .. }
+            | ValueNode::SpeculativeCallFusion { .. }
             // Allocations have side-effects (GC pressure / observable identity).
             | ValueNode::CreateObjectLiteral { .. }
             | ValueNode::CreateObjectLiteralWithProperties { .. }
@@ -3166,6 +4803,7 @@ fn can_invalidate_named_stores(node: &ValueNode) -> bool {
             | ValueNode::CallWithSpread { .. }
             | ValueNode::Construct { .. }
             | ValueNode::ConstructWithSpread { .. }
+            | ValueNode::SpeculativeCallFusion { .. }
             // Property deletion mutates objects.
             | ValueNode::DeleteProperty { .. }
             // For-in can invalidate caches.
@@ -3505,6 +5143,10 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
             }
         }
 
+        ValueNode::SpeculativeCallFusion { callee, .. } => {
+            *callee = resolve(*callee);
+        }
+
         ValueNode::Construct {
             constructor, args, ..
         }
@@ -3553,7 +5195,11 @@ fn apply_subst_to_control_node(ctrl: &mut ControlNode, resolve: &impl Fn(NodeId)
 fn unroll_simple_loops(graph: &mut MaglevGraph) {
     let loops = licm::detect_loops(graph);
     for lp in &loops {
-        try_unroll_counted_loop(graph, lp, 2);
+        // Try 4x first (better for large loops like arithmetic_loop_10k),
+        // fall back to 2x if trip count isn't divisible by 4.
+        if !try_unroll_counted_loop(graph, lp, 4) {
+            try_unroll_counted_loop(graph, lp, 2);
+        }
     }
 }
 
@@ -3799,10 +5445,18 @@ fn find_i32_constant(graph: &MaglevGraph, id: NodeId) -> Option<i32> {
 fn find_increment_step(graph: &MaglevGraph, result_id: NodeId, base_id: NodeId) -> Option<i32> {
     let node = graph.node(result_id)?;
     match node {
-        ValueNode::Int32Increment { value } | ValueNode::CheckedSmiIncrement { value } => {
-            if *value == base_id { Some(1) } else { None }
+        ValueNode::Int32Increment { value }
+        | ValueNode::CheckedSmiIncrement { value }
+        | ValueNode::GenericIncrement { value, .. } => {
+            if *value == base_id {
+                Some(1)
+            } else {
+                None
+            }
         }
-        ValueNode::Int32Add { left, right } | ValueNode::CheckedSmiAdd { left, right } => {
+        ValueNode::Int32Add { left, right }
+        | ValueNode::CheckedSmiAdd { left, right }
+        | ValueNode::GenericAdd { left, right, .. } => {
             if *left == base_id {
                 find_i32_constant(graph, *right)
             } else if *right == base_id {
@@ -3813,6 +5467,796 @@ fn find_increment_step(graph: &MaglevGraph, result_id: NodeId, base_id: NodeId) 
         }
         _ => None,
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Affine analysis helpers for loop scalar evolution
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Try to decompose `expr_id` as `a * iv_phi + b` where a, b are constants.
+/// Returns `Some((a, b))` with i128 coefficients for overflow-safe arithmetic.
+fn extract_affine_addend(
+    graph: &MaglevGraph,
+    expr_id: NodeId,
+    iv_phi_id: NodeId,
+    consts: &HashMap<NodeId, i32>,
+    depth: u32,
+) -> Option<(i128, i128)> {
+    if depth > 8 {
+        return None;
+    }
+    if expr_id == iv_phi_id {
+        return Some((1, 0));
+    }
+    if let Some(&k) = consts.get(&expr_id) {
+        return Some((0, k as i128));
+    }
+    if let Some(k) = find_i32_constant(graph, expr_id) {
+        return Some((0, k as i128));
+    }
+    let node = graph.node(expr_id)?.clone();
+    match &node {
+        ValueNode::Int32Add { left, right } => {
+            let (a1, b1) = extract_affine_addend(graph, *left, iv_phi_id, consts, depth + 1)?;
+            let (a2, b2) = extract_affine_addend(graph, *right, iv_phi_id, consts, depth + 1)?;
+            Some((a1 + a2, b1 + b2))
+        }
+        ValueNode::Int32Subtract { left, right } => {
+            let (a1, b1) = extract_affine_addend(graph, *left, iv_phi_id, consts, depth + 1)?;
+            let (a2, b2) = extract_affine_addend(graph, *right, iv_phi_id, consts, depth + 1)?;
+            Some((a1 - a2, b1 - b2))
+        }
+        ValueNode::Int32Multiply { left, right } => {
+            let (a1, b1) = extract_affine_addend(graph, *left, iv_phi_id, consts, depth + 1)?;
+            let (a2, b2) = extract_affine_addend(graph, *right, iv_phi_id, consts, depth + 1)?;
+            if a1 == 0 {
+                Some((b1 * a2, b1 * b2))
+            } else if a2 == 0 {
+                Some((a1 * b2, b1 * b2))
+            } else {
+                None // quadratic — bail
+            }
+        }
+        ValueNode::Int32ShiftLeft { left, right } => {
+            let (a, b) = extract_affine_addend(graph, *left, iv_phi_id, consts, depth + 1)?;
+            let shift = consts
+                .get(right)
+                .copied()
+                .or_else(|| find_i32_constant(graph, *right))?;
+            if (0..32).contains(&shift) {
+                let factor = 1i128 << (shift as u32);
+                Some((a * factor, b * factor))
+            } else {
+                None
+            }
+        }
+        ValueNode::Int32Negate { value } => {
+            let (a, b) = extract_affine_addend(graph, *value, iv_phi_id, consts, depth + 1)?;
+            Some((-a, -b))
+        }
+        _ => None,
+    }
+}
+
+/// Given a back-edge node, decompose it as `phi_acc + (a * iv + b)`.
+/// Returns `Some((a, b))` for the per-iteration affine addend.
+fn peel_accumulator_addend(
+    graph: &MaglevGraph,
+    back_id: NodeId,
+    phi_acc_id: NodeId,
+    iv_phi_id: NodeId,
+    consts: &HashMap<NodeId, i32>,
+    depth: u32,
+) -> Option<(i128, i128)> {
+    if depth > 4 {
+        return None;
+    }
+    let node = graph.node(back_id)?.clone();
+    match &node {
+        ValueNode::Int32Add { left, right } => {
+            if *left == phi_acc_id {
+                return extract_affine_addend(graph, *right, iv_phi_id, consts, 0);
+            }
+            if *right == phi_acc_id {
+                return extract_affine_addend(graph, *left, iv_phi_id, consts, 0);
+            }
+            // Neither is phi directly — try recursing
+            if let Some((a, b)) =
+                peel_accumulator_addend(graph, *left, phi_acc_id, iv_phi_id, consts, depth + 1)
+                && let Some((a2, b2)) = extract_affine_addend(graph, *right, iv_phi_id, consts, 0)
+            {
+                return Some((a + a2, b + b2));
+            }
+            if let Some((a, b)) =
+                peel_accumulator_addend(graph, *right, phi_acc_id, iv_phi_id, consts, depth + 1)
+                && let Some((a2, b2)) = extract_affine_addend(graph, *left, iv_phi_id, consts, 0)
+            {
+                return Some((a + a2, b + b2));
+            }
+            None
+        }
+        ValueNode::Int32Subtract { left, right } => {
+            // phi_acc must be in the left subtree (subtracting phi would negate it)
+            let (a, b) =
+                peel_accumulator_addend(graph, *left, phi_acc_id, iv_phi_id, consts, depth + 1)?;
+            let (a2, b2) = extract_affine_addend(graph, *right, iv_phi_id, consts, 0)?;
+            Some((a - a2, b - b2))
+        }
+        _ => None,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass — Late constant-accumulator lowering
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// After store-to-load forwarding and constant folding, some loop accumulator
+/// patterns become `GenericAdd(Phi, SmiConstant(K))` where the constant was
+/// only revealed by forwarding property loads.  This targeted pass converts
+/// these to `Int32Add` when:
+///
+/// 1. The back-edge input of a Phi is `GenericAdd(phi, SmiConstant)`.
+/// 2. The Phi init (entry-edge) is `SmiConstant(init_val)`.
+/// 3. The total accumulation `init + K * max_iterations` fits in i32.
+///
+/// Unlike the full `eliminate_overflow_checks`, this pass does NOT attempt to
+/// detect induction variables or complex chained patterns.
+fn lower_constant_accumulator_adds(graph: &mut MaglevGraph) {
+    let loops = licm::detect_loops(graph);
+    if loops.is_empty() {
+        return;
+    }
+
+    // Build a node → constant map.
+    let mut consts: HashMap<NodeId, i32> = HashMap::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            match node {
+                ValueNode::SmiConstant { value } | ValueNode::Int32Constant { value } => {
+                    consts.insert(*id, *value);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // For each loop, look for GenericAdd(Phi, SmiConstant) accumulators.
+    let mut rewrites: Vec<(u32, usize, NodeId)> = Vec::new();
+
+    for lp in &loops {
+        let header = &graph.blocks()[lp.header as usize];
+        let back_pred_pos = match header
+            .predecessors
+            .iter()
+            .position(|&p| lp.body.contains(&p) && p != lp.header)
+        {
+            Some(pos) => pos,
+            None => continue,
+        };
+        let entry_pos = if back_pred_pos == 0 { 1 } else { 0 };
+
+        // Estimate max iterations from the loop structure.
+        let max_iters = estimate_max_iterations(graph, lp, &consts);
+
+        for (phi_id, node) in &header.nodes {
+            let ValueNode::Phi { inputs } = node else {
+                continue;
+            };
+            if inputs.len() != 2 {
+                continue;
+            }
+
+            let init_id = inputs[entry_pos];
+            let back_id = inputs[back_pred_pos];
+
+            // Init must be a known constant.
+            let Some(&init_val) = consts.get(&init_id) else {
+                continue;
+            };
+
+            // Find back-edge node: must be GenericAdd(phi, const) in a body block.
+            let back_node = find_node_in_blocks(graph, &back_id, &lp.body);
+            let Some((block_idx, node_idx, back_value)) = back_node else {
+                continue;
+            };
+
+            let addend_val = match &back_value {
+                ValueNode::GenericAdd { left, right, .. } if *left == *phi_id => {
+                    consts.get(right).copied()
+                }
+                ValueNode::GenericAdd { left, right, .. } if *right == *phi_id => {
+                    consts.get(left).copied()
+                }
+                _ => None,
+            };
+
+            let Some(k) = addend_val else {
+                continue;
+            };
+
+            // Check total accumulation fits i32.
+            let iters = max_iters.unwrap_or(100_000) as i64;
+            let total_min = (init_val as i64) + (k as i64) * iters;
+            let total_max = (init_val as i64) + (k as i64) * iters;
+            // Check both positive and negative constant accumulation.
+            let (lo, hi) = if k >= 0 {
+                (init_val as i64, total_max)
+            } else {
+                (total_min, init_val as i64)
+            };
+            if lo < i32::MIN as i64 || hi > i32::MAX as i64 {
+                continue;
+            }
+
+            rewrites.push((block_idx, node_idx, back_id));
+        }
+    }
+
+    // Apply rewrites.
+    for (block_idx, node_idx, _back_id) in &rewrites {
+        if let Some(block) = graph.block_mut(*block_idx)
+            && let Some((_, node)) = block.nodes.get_mut(*node_idx)
+            && let ValueNode::GenericAdd { left, right, .. } = node
+        {
+            *node = ValueNode::Int32Add {
+                left: *left,
+                right: *right,
+            };
+        }
+    }
+}
+
+/// Find a node by ID in the given set of blocks, returning (block_idx, node_idx, node).
+fn find_node_in_blocks(
+    graph: &MaglevGraph,
+    node_id: &NodeId,
+    block_indices: &HashSet<u32>,
+) -> Option<(u32, usize, ValueNode)> {
+    for &bi in block_indices {
+        if let Some(block) = graph.block(bi) {
+            for (pos, (id, node)) in block.nodes.iter().enumerate() {
+                if *id == *node_id {
+                    return Some((bi, pos, node.clone()));
+                }
+            }
+        }
+    }
+    None
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass — Loop scalar evolution (constant-accumulator elimination)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Replace simple counted loops that only accumulate a constant addend with
+/// a closed-form computation.
+///
+/// Pattern detected:
+///   header: phi_acc = Phi(init, back_edge)
+///           phi_iv  = Phi(iv_init, iv_step)
+///           Branch(Int32LessThan(phi_iv, limit), body, exit)
+///   body:   back_edge = Int32Add(phi_acc, K)  [K is constant]
+///           iv_step   = Int32Add(phi_iv, step) [step is constant]
+///           Jump(header)
+///
+/// Replacement:
+///   preheader: trip_count = (limit - iv_init) / step
+///              result = init + K * trip_count
+///   The accumulator Phi's init input is replaced with `result` and the
+///   loop body's accumulator update becomes an identity (phi feeds itself),
+///   effectively making the loop a no-op for the accumulator.
+///
+/// This eliminates the entire loop for benchmarks like property_access
+/// (`sum += 15` × 1000 → `sum = 15000`) and deep_object (`sum += 99` × 1000).
+fn eliminate_constant_accumulator_loops(graph: &mut MaglevGraph) {
+    let loops = licm::detect_loops(graph);
+    if loops.is_empty() {
+        return;
+    }
+
+    // Build a node → constant map.
+    let mut consts: HashMap<NodeId, i32> = HashMap::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            match node {
+                ValueNode::SmiConstant { value } | ValueNode::Int32Constant { value } => {
+                    consts.insert(*id, *value);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for lp in &loops {
+        try_eliminate_constant_accumulator(graph, lp, &consts);
+    }
+}
+
+/// Try to replace a single loop's constant accumulator with a closed-form value.
+fn try_eliminate_constant_accumulator(
+    graph: &mut MaglevGraph,
+    lp: &licm::NaturalLoop,
+    consts: &HashMap<NodeId, i32>,
+) -> bool {
+    let header = match graph.block(lp.header) {
+        Some(b) => b,
+        None => return false,
+    };
+
+    // ── 1. Header must end with Branch on Int32LessThan ──────────────────
+    let (condition_id, body_block_idx, _exit_block_idx) = match &header.control {
+        Some(ControlNode::Branch {
+            condition,
+            if_true,
+            if_false,
+        }) => (*condition, *if_true, *if_false),
+        _ => return false,
+    };
+
+    if !lp.body.contains(&body_block_idx) {
+        return false;
+    }
+
+    // Simple loop: header + 1 body block.
+    if lp.body.len() != 2 || !lp.body.contains(&lp.header) {
+        return false;
+    }
+
+    let body = match graph.block(body_block_idx) {
+        Some(b) => b,
+        None => return false,
+    };
+
+    // Body must jump back to header.
+    match &body.control {
+        Some(ControlNode::Jump { target }) if *target == lp.header => {}
+        _ => return false,
+    }
+
+    // ── 2. Find comparison and induction variable ────────────────────────
+    let (cmp_left, cmp_right) = {
+        let mut found = None;
+        for (nid, node) in &header.nodes {
+            if *nid == condition_id {
+                found = Some(node.clone());
+                break;
+            }
+        }
+        match found {
+            Some(ValueNode::Int32LessThan { left, right }) => (left, right),
+            _ => return false,
+        }
+    };
+
+    // ── 3. Identify predecessor positions ────────────────────────────────
+    let back_pred_pos = match header
+        .predecessors
+        .iter()
+        .position(|&p| p == body_block_idx)
+    {
+        Some(pos) => pos,
+        None => return false,
+    };
+    let entry_pos = match header.predecessors.iter().position(|&p| p == lp.preheader) {
+        Some(pos) => pos,
+        None => return false,
+    };
+
+    // ── 4. Find the induction variable Phi ───────────────────────────────
+    let iv_phi_id = cmp_left;
+    let iv_phi_inputs = {
+        let h = graph.block(lp.header).unwrap();
+        let mut found = None;
+        for (nid, node) in &h.nodes {
+            if *nid == iv_phi_id {
+                if let ValueNode::Phi { inputs } = node {
+                    found = Some(inputs.clone());
+                }
+                break;
+            }
+        }
+        match found {
+            Some(inputs) if inputs.len() == 2 => inputs,
+            _ => return false,
+        }
+    };
+
+    let iv_init_id = iv_phi_inputs[entry_pos];
+    let iv_limit_id = cmp_right;
+
+    let iv_init = match consts.get(&iv_init_id) {
+        Some(&v) => v,
+        None => match find_i32_constant(graph, iv_init_id) {
+            Some(v) => v,
+            None => return false,
+        },
+    };
+    let iv_limit = match consts.get(&iv_limit_id) {
+        Some(&v) => v,
+        None => match find_i32_constant(graph, iv_limit_id) {
+            Some(v) => v,
+            None => return false,
+        },
+    };
+
+    // Find IV step.
+    let iv_back_id = iv_phi_inputs[back_pred_pos];
+    let iv_step = find_increment_step(graph, iv_back_id, iv_phi_id);
+    let iv_step_val = match iv_step {
+        Some(s) if s > 0 => s,
+        _ => return false,
+    };
+
+    // Compute trip count using widened arithmetic.  Require exact
+    // divisibility to avoid off-by-one errors.
+    let range = (iv_limit as i64) - (iv_init as i64);
+    let step = iv_step_val as i64;
+    if range <= 0 || range % step != 0 {
+        return false;
+    }
+    let trip_count = range / step;
+
+    // ── 5. Find accumulator Phis with Int32Add(phi, const) back-edges ───
+    let h = graph.block(lp.header).unwrap();
+    let header_phis: Vec<(NodeId, Vec<NodeId>)> = h
+        .nodes
+        .iter()
+        .filter_map(|(nid, node)| {
+            if let ValueNode::Phi { inputs } = node {
+                Some((*nid, inputs.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Collect accumulators: (phi_id, init_val, affine_a, affine_b, back_node_id)
+    // affine_a and affine_b represent the per-iteration addend: a * iv + b
+    let mut accumulators: Vec<(NodeId, i32, i128, i128, NodeId)> = Vec::new();
+
+    // Build use-count map for the loop body to verify accumulators are
+    // only used by their own recurrence update.
+    let mut loop_use_counts: HashMap<NodeId, usize> = HashMap::new();
+    for &bi in &lp.body {
+        if let Some(block) = graph.block(bi) {
+            for (_, node) in &block.nodes {
+                visit_value_node_inputs(node, &mut |id| {
+                    *loop_use_counts.entry(id).or_insert(0) += 1;
+                });
+            }
+        }
+    }
+
+    for (phi_id, inputs) in &header_phis {
+        if *phi_id == iv_phi_id {
+            continue; // Skip the induction variable itself.
+        }
+        if inputs.len() != 2 {
+            continue;
+        }
+
+        let init_id = inputs[entry_pos];
+        let back_id = inputs[back_pred_pos];
+
+        // Init must be a known constant.
+        let init_val = match consts.get(&init_id) {
+            Some(&v) => v,
+            None => match find_i32_constant(graph, init_id) {
+                Some(v) => v,
+                None => continue,
+            },
+        };
+
+        // Back-edge must decompose as phi_acc + (a * iv + b) using only
+        // Int32 operations.  This covers both constant addends (a=0) and
+        // IV-dependent addends like `i*3 - 1` (a=3, b=-1).
+        let Some((aff_a, aff_b)) =
+            peel_accumulator_addend(graph, back_id, *phi_id, iv_phi_id, consts, 0)
+        else {
+            continue;
+        };
+
+        // Safety: the accumulator Phi must only be used inside the loop
+        // by its own recurrence update.  If anything else reads the
+        // accumulator within the loop, we cannot replace it.
+        let in_loop_uses = loop_use_counts.get(phi_id).copied().unwrap_or(0);
+        if in_loop_uses > 1 {
+            continue;
+        }
+
+        // Compute closed-form result using i128 to avoid overflow:
+        //   result = init + N*(a*iv_init + b) + a*step*N*(N-1)/2
+        let n = trip_count as i128;
+        let iv0 = iv_init as i128;
+        let s = iv_step_val as i128;
+        let result = (init_val as i128) + n * (aff_a * iv0 + aff_b) + aff_a * s * n * (n - 1) / 2;
+        if result < i32::MIN as i128 || result > i32::MAX as i128 {
+            continue;
+        }
+
+        accumulators.push((*phi_id, init_val, aff_a, aff_b, back_id));
+    }
+
+    if accumulators.is_empty() {
+        return false;
+    }
+
+    // ── 6. Apply: replace Phi init with the closed-form result ──────────
+    // Create a SmiConstant for the result in the preheader.
+    for (phi_id, init_val, aff_a, aff_b, _back_id) in &accumulators {
+        let n = trip_count as i128;
+        let iv0 = iv_init as i128;
+        let s = iv_step_val as i128;
+        let result =
+            (*init_val as i128) + n * (*aff_a * iv0 + *aff_b) + *aff_a * s * n * (n - 1) / 2;
+        let result_val = result as i32;
+
+        // Create a new SmiConstant node for the result.
+        let result_node_id = graph.alloc_node_id();
+        if let Some(pre) = graph.block_mut(lp.preheader) {
+            pre.push_with_id(result_node_id, ValueNode::SmiConstant { value: result_val });
+        }
+
+        // Update the Phi's init input to point to the computed result.
+        let h = graph.block_mut(lp.header).unwrap();
+        for (nid, node) in &mut h.nodes {
+            if *nid == *phi_id {
+                if let ValueNode::Phi { inputs } = node {
+                    inputs[entry_pos] = result_node_id;
+                    // Also make the back-edge point to the phi itself,
+                    // making the accumulator an identity within the loop.
+                    inputs[back_pred_pos] = *phi_id;
+                }
+                break;
+            }
+        }
+    }
+
+    true
+}
+
+/// Estimate the maximum number of iterations for a loop by examining
+/// the induction variable pattern (Phi with Int32LessThan comparison).
+fn estimate_max_iterations(
+    graph: &MaglevGraph,
+    lp: &licm::NaturalLoop,
+    consts: &HashMap<NodeId, i32>,
+) -> Option<u64> {
+    let header = &graph.blocks()[lp.header as usize];
+
+    // Header must end with Branch on a comparison.
+    let condition_id = match &header.control {
+        Some(ControlNode::Branch { condition, .. }) => *condition,
+        _ => return None,
+    };
+
+    // Find the comparison node.
+    let cmp_node = header
+        .nodes
+        .iter()
+        .find(|(id, _)| *id == condition_id)
+        .map(|(_, n)| n)?;
+
+    let (left, right) = match cmp_node {
+        ValueNode::Int32LessThan { left, right } => (*left, *right),
+        _ => return None,
+    };
+
+    // One side should be a Phi (IV), the other a constant (limit).
+    let limit = consts.get(&right).or_else(|| consts.get(&left))?;
+    Some(*limit as u64)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass — Induction variable strength reduction
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Replace `Int32Multiply(iv_phi, K)` inside counted loops with an additive
+/// derived induction variable: `derived_phi(init*K, derived_phi + step*K)`.
+///
+/// This eliminates multiplies from the loop body's critical path, replacing
+/// them with adds.  For example, `i * 3` becomes a new IV that increments
+/// by 3 each iteration.
+#[allow(dead_code)]
+fn strength_reduce_induction_variables(graph: &mut MaglevGraph) {
+    let loops = licm::detect_loops(graph);
+    for lp in &loops {
+        strength_reduce_iv_in_loop(graph, lp);
+    }
+}
+
+#[allow(dead_code)]
+fn strength_reduce_iv_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
+    let header_idx = lp.header;
+
+    // ── 1. Header must end with Branch on Int32LessThan ─────────────────
+    let (condition_id, body_block_idx) = {
+        let header = match graph.block(header_idx) {
+            Some(b) => b,
+            None => return false,
+        };
+        match &header.control {
+            Some(ControlNode::Branch {
+                condition, if_true, ..
+            }) => (*condition, *if_true),
+            _ => return false,
+        }
+    };
+
+    if !lp.body.contains(&body_block_idx) {
+        return false;
+    }
+
+    // Simple loop: body is a single block jumping back to header.
+    if lp.body.len() != 2 || !lp.body.contains(&header_idx) {
+        return false;
+    }
+
+    match graph.block(body_block_idx).and_then(|b| b.control.as_ref()) {
+        Some(ControlNode::Jump { target }) if *target == header_idx => {}
+        _ => return false,
+    }
+
+    // ── 2. Identify the induction variable ──────────────────────────────
+    let cmp_left = {
+        let header = graph.block(header_idx).unwrap();
+        let mut found = None;
+        for (nid, node) in &header.nodes {
+            if *nid == condition_id {
+                found = Some(node.clone());
+                break;
+            }
+        }
+        match found {
+            Some(ValueNode::Int32LessThan { left, .. }) => left,
+            _ => return false,
+        }
+    };
+
+    let back_edge_pred_pos = {
+        let h = graph.block(header_idx).unwrap();
+        match h.predecessors.iter().position(|&p| p == body_block_idx) {
+            Some(pos) => pos,
+            None => return false,
+        }
+    };
+    let preheader_pred_pos = {
+        let h = graph.block(header_idx).unwrap();
+        match h.predecessors.iter().position(|&p| p == lp.preheader) {
+            Some(pos) => pos,
+            None => return false,
+        }
+    };
+
+    let iv_phi_id = cmp_left;
+    let iv_phi_inputs = {
+        let h = graph.block(header_idx).unwrap();
+        let mut found = None;
+        for (nid, node) in &h.nodes {
+            if *nid == iv_phi_id {
+                if let ValueNode::Phi { inputs } = node {
+                    found = Some(inputs.clone());
+                }
+                break;
+            }
+        }
+        match found {
+            Some(inputs) => inputs,
+            None => return false,
+        }
+    };
+
+    let init_id = iv_phi_inputs[preheader_pred_pos];
+    let init_val = match find_i32_constant(graph, init_id) {
+        Some(v) => v,
+        None => return false,
+    };
+
+    let back_edge_input = iv_phi_inputs[back_edge_pred_pos];
+    let step_val = match find_increment_step(graph, back_edge_input, iv_phi_id) {
+        Some(s) if s > 0 => s,
+        _ => return false,
+    };
+
+    // ── 3. Find Int32Multiply(iv_phi, K) in the loop body ───────────────
+    // Deduplicate by K: multiple `i*3` uses share one derived IV.
+    let mut mul_targets: HashMap<i32, Vec<NodeId>> = HashMap::new();
+    {
+        let body = graph.block(body_block_idx).unwrap();
+        for (nid, node) in &body.nodes {
+            if let ValueNode::Int32Multiply { left, right } = node {
+                let (const_input, is_iv) = if *left == iv_phi_id {
+                    (*right, true)
+                } else if *right == iv_phi_id {
+                    (*left, true)
+                } else {
+                    (NodeId(0), false)
+                };
+                if !is_iv {
+                    continue;
+                }
+                if let Some(k) = find_i32_constant(graph, const_input)
+                    && k != 0
+                    && k != 1
+                {
+                    mul_targets.entry(k).or_default().push(*nid);
+                }
+            }
+        }
+    }
+
+    if mul_targets.is_empty() {
+        return false;
+    }
+
+    // ── 4. Create derived IVs ───────────────────────────────────────────
+    let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
+
+    for (k, mul_ids) in &mul_targets {
+        let derived_init = init_val.wrapping_mul(*k);
+        let derived_step = step_val.wrapping_mul(*k);
+
+        // Allocate node IDs.
+        let init_const_id = graph.alloc_node_id();
+        let step_const_id = graph.alloc_node_id();
+        let derived_phi_id = graph.alloc_node_id();
+        let derived_add_id = graph.alloc_node_id();
+
+        // Add constants to preheader.
+        let preheader = graph.block_mut(lp.preheader).unwrap();
+        preheader.push_with_id(
+            init_const_id,
+            ValueNode::Int32Constant {
+                value: derived_init,
+            },
+        );
+        preheader.push_with_id(
+            step_const_id,
+            ValueNode::Int32Constant {
+                value: derived_step,
+            },
+        );
+
+        // Add derived Phi to header — insert among existing Phis.
+        let mut phi_inputs = vec![NodeId(0); iv_phi_inputs.len()];
+        phi_inputs[preheader_pred_pos] = init_const_id;
+        phi_inputs[back_edge_pred_pos] = derived_add_id;
+        {
+            let header = graph.block_mut(header_idx).unwrap();
+            // Find position after last existing Phi.
+            let insert_pos = header
+                .nodes
+                .iter()
+                .position(|(_, n)| !matches!(n, ValueNode::Phi { .. }))
+                .unwrap_or(header.nodes.len());
+            header.nodes.insert(
+                insert_pos,
+                (derived_phi_id, ValueNode::Phi { inputs: phi_inputs }),
+            );
+        }
+
+        // Add Int32Add to body (before any existing back-edge increment).
+        let body = graph.block_mut(body_block_idx).unwrap();
+        body.push_with_id(
+            derived_add_id,
+            ValueNode::Int32Add {
+                left: derived_phi_id,
+                right: step_const_id,
+            },
+        );
+
+        // Map all multiply IDs to the derived Phi.
+        for mul_id in mul_ids {
+            subst.insert(*mul_id, derived_phi_id);
+        }
+    }
+
+    // ── 5. Replace all references to old multiplies ─────────────────────
+    for block in graph.blocks_mut() {
+        apply_subst_to_block(block, &subst);
+    }
+
+    true
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4376,18 +6820,19 @@ mod tests {
     }
 
     #[test]
-    fn test_strength_reduce_not_applied_to_non_power_of_two() {
+    fn test_strength_reduce_not_applied_to_non_decomposable() {
+        // Multiply by 6 is neither a power of two nor 2^k±1 — node should stay.
         let mut graph = MaglevGraph::new(1);
         let mut block = BasicBlock::new(0);
         let p = block.push_value(ValueNode::Parameter { index: 0 });
-        let c3 = block.push_value(ValueNode::Int32Constant { value: 3 });
-        let mul = block.push_value(ValueNode::Int32Multiply { left: p, right: c3 });
+        let c6 = block.push_value(ValueNode::Int32Constant { value: 6 });
+        let mul = block.push_value(ValueNode::Int32Multiply { left: p, right: c6 });
         block.set_control(ControlNode::Return { value: mul });
         graph.add_block(block);
 
         optimize(&mut graph);
 
-        // Multiply by 3 is not a power of two — node should stay as multiply.
+        // Multiply by 6 is not a power of two nor 2^k±1 — node should stay as multiply.
         assert!(
             graph.blocks()[0]
                 .nodes
@@ -5297,5 +7742,129 @@ mod tests {
         let body_before = graph.block(2).unwrap().nodes.len();
         unroll_simple_loops(&mut graph);
         assert_eq!(graph.block(2).unwrap().nodes.len(), body_before);
+    }
+
+    #[test]
+    fn test_forward_invariant_object_properties_via_global() {
+        // Simulates: var obj = { a: 1 }; ... LoadGlobal("obj") → LoadNamedGeneric(_, "a")
+        // Entry block: CreateObjectLiteralWithProperties + StoreGlobal
+        // Second block: LoadGlobal + LoadNamedGeneric (should resolve to constant)
+        let mut graph = MaglevGraph::new(0);
+
+        // Block 0: entry
+        let mut entry = BasicBlock::new(0);
+        let val_a = entry.push_value(ValueNode::SmiConstant { value: 42 });
+        let _create = entry.push_value(ValueNode::CreateObjectLiteralWithProperties {
+            feedback_slot: 0,
+            flags: 0,
+            names: vec![5], // name index 5 = "a"
+            values: vec![val_a],
+        });
+        entry.push_value(ValueNode::StoreGlobal {
+            name: 10, // global name index 10 = "obj"
+            value: _create,
+            feedback_slot: 1,
+        });
+        entry.set_control(ControlNode::Jump { target: 1 });
+        graph.add_block(entry);
+
+        // Block 1: uses LoadGlobal + LoadNamedGeneric
+        let mut body = BasicBlock::new(1);
+        let obj_load = body.push_value(ValueNode::LoadGlobal {
+            name: 10, // same global name
+            feedback_slot: 2,
+        });
+        let prop_load = body.push_value(ValueNode::LoadNamedGeneric {
+            object: obj_load,
+            name: 5, // same property name
+            feedback_slot: 3,
+        });
+        body.set_control(ControlNode::Return { value: prop_load });
+        graph.add_block(body);
+
+        // Run just the forwarding pass (not full optimize, to isolate)
+        fuse_object_literal_stores(&mut graph);
+        forward_invariant_object_properties(&mut graph);
+
+        // The LoadNamedGeneric should have been substituted.
+        // Check that prop_load's uses now point to val_a.
+        let block1 = &graph.blocks()[1];
+        let ret = block1.control.as_ref().unwrap();
+        if let ControlNode::Return { value } = ret {
+            // The return should now reference val_a (the SmiConstant 42)
+            assert_eq!(
+                *value, val_a,
+                "Expected LoadNamedGeneric to be forwarded to SmiConstant(42), got {:?}",
+                value
+            );
+        } else {
+            panic!("Expected Return control node");
+        }
+    }
+
+    #[test]
+    fn test_forward_nested_object_properties() {
+        // Simulates: var root = { a: { b: 99 } };
+        // LoadGlobal("root") → LoadNamedGeneric(_, "a") → LoadNamedGeneric(_, "b")
+        // Should resolve the entire chain to SmiConstant(99).
+        let mut graph = MaglevGraph::new(0);
+
+        // Block 0: entry
+        let mut entry = BasicBlock::new(0);
+        let val_b = entry.push_value(ValueNode::SmiConstant { value: 99 });
+        let inner = entry.push_value(ValueNode::CreateObjectLiteralWithProperties {
+            feedback_slot: u32::MAX,
+            flags: 0,
+            names: vec![7], // name index 7 = "b"
+            values: vec![val_b],
+        });
+        let outer = entry.push_value(ValueNode::CreateObjectLiteralWithProperties {
+            feedback_slot: u32::MAX,
+            flags: 0,
+            names: vec![5], // name index 5 = "a"
+            values: vec![inner],
+        });
+        entry.push_value(ValueNode::StoreGlobal {
+            name: 10,
+            value: outer,
+            feedback_slot: 1,
+        });
+        entry.set_control(ControlNode::Jump { target: 1 });
+        graph.add_block(entry);
+
+        // Block 1: chained property access
+        let mut body = BasicBlock::new(1);
+        let root_load = body.push_value(ValueNode::LoadGlobal {
+            name: 10,
+            feedback_slot: 2,
+        });
+        let load_a = body.push_value(ValueNode::LoadNamedGeneric {
+            object: root_load,
+            name: 5, // "a"
+            feedback_slot: 3,
+        });
+        let load_b = body.push_value(ValueNode::LoadNamedGeneric {
+            object: load_a,
+            name: 7, // "b"
+            feedback_slot: 4,
+        });
+        body.set_control(ControlNode::Return { value: load_b });
+        graph.add_block(body);
+
+        fuse_object_literal_stores(&mut graph);
+        forward_invariant_object_properties(&mut graph);
+
+        // load_b should resolve to val_b (SmiConstant 99)
+        let block1 = &graph.blocks()[1];
+        let ret = block1.control.as_ref().unwrap();
+        if let ControlNode::Return { value } = ret {
+            assert_eq!(
+                *value, val_b,
+                "Expected nested LoadNamedGeneric to resolve to SmiConstant(99), got {:?}",
+                value
+            );
+        } else {
+            panic!("Expected Return control node");
+        }
     }
 }
