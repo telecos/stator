@@ -184,7 +184,7 @@ fn weak_collection_key(val: &JsValue) -> Option<usize> {
                 None
             } else {
                 // Tag with high bit to avoid collision with pointer addresses.
-                Some((*id as usize) | (1usize << 63))
+                Some((*id as usize) | (1usize << (usize::BITS - 1)))
             }
         }
         _ => None,
