@@ -3625,16 +3625,37 @@ fn try_forward_loop_object(
     let mut create_names: Vec<u32> = Vec::new();
     let mut create_values: Vec<NodeId> = Vec::new();
 
+    let mut phi_count = 0u32;
     for (nid, node) in &header.nodes {
         if *nid == iv_phi_id {
-            continue; // skip the IV Phi
+            continue;
         }
         if let ValueNode::Phi { inputs } = node
             && inputs.len() == 2
         {
+            phi_count += 1;
             let back_edge_id = inputs[back_pred_pos];
+            let back_node = graph.node(back_edge_id);
+            let type_name = match back_node {
+                Some(ValueNode::CreateObjectLiteral { .. }) => "CreateObjLit",
+                Some(ValueNode::CreateObjectLiteralWithProperties { .. }) => "CreateObjWithProps",
+                Some(ValueNode::CreateEmptyObjectLiteral) => "CreateEmptyObj",
+                Some(ValueNode::UndefinedConstant) => "Undefined",
+                Some(ValueNode::Phi { .. }) => "Phi",
+                Some(ValueNode::SmiConstant { value }) => {
+                    eprintln!("[OBJ_FWD] phi {nid:?} back={back_edge_id:?} SmiConst({value})");
+                    "SmiConstant"
+                }
+                Some(ValueNode::StoreNamedGeneric { .. }) => "StoreNamedGeneric",
+                Some(ValueNode::LoadNamedGeneric { .. }) => "LoadNamedGeneric",
+                Some(ValueNode::CheckedSmiAdd { .. }) => "CheckedSmiAdd",
+                Some(ValueNode::Int32Add { .. }) => "Int32Add",
+                None => "MISSING",
+                _ => "other",
+            };
+            eprintln!("[OBJ_FWD] phi {nid:?} back={back_edge_id:?} type={type_name}");
             if let Some(ValueNode::CreateObjectLiteralWithProperties { names, values, .. }) =
-                graph.node(back_edge_id)
+                back_node
             {
                 obj_phi_id = Some(*nid);
                 create_obj_id = Some(back_edge_id);
@@ -3644,6 +3665,7 @@ fn try_forward_loop_object(
             }
         }
     }
+    eprintln!("[OBJ_FWD] phis={phi_count} found={}", obj_phi_id.is_some());
 
     let obj_phi_id = match obj_phi_id {
         Some(id) => id,
@@ -3658,8 +3680,15 @@ fn try_forward_loop_object(
     }
 
     if final_values.iter().any(|v| v.is_none()) {
+        for (i, v) in final_values.iter().enumerate() {
+            if v.is_none() {
+                let vn = graph.node(create_values[i]);
+                eprintln!("[OBJ_FWD] eval fail prop {i} type={:?}", vn.map(std::mem::discriminant));
+            }
+        }
         return false;
     }
+    eprintln!("[OBJ_FWD] eval ok: {final_values:?}");
 
     // ── 5. Find post-loop LoadNamedGeneric that loads from obj_phi ────────
     // Build property name → final constant value map.
