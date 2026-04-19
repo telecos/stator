@@ -116,6 +116,57 @@ pub fn globals_promoted_diagnostics() -> (u32, u32) {
 ///
 /// Multiple rounds are *not* performed; a single sweep of each pass is
 /// sufficient for the patterns targeted here.
+// Temporary diagnostic: dump all Phi nodes in loop headers.
+fn dump_header_phis(graph: &MaglevGraph, label: &str) {
+    let loops = crate::compiler::maglev::licm::detect_loops(graph);
+    for lp in &loops {
+        if let Some(header) = graph.block(lp.header) {
+            let bc_len = 0u32; // placeholder - bytecodes not accessible from graph
+            for (nid, node) in &header.nodes {
+                if let ValueNode::Phi { inputs } = node {
+                    let types: Vec<String> = inputs
+                        .iter()
+                        .map(|inp| match graph.node(*inp) {
+                            Some(ValueNode::CreateObjectLiteral { .. }) => {
+                                format!("CreateObjLit({inp:?})")
+                            }
+                            Some(ValueNode::CreateObjectLiteralWithProperties { .. }) => {
+                                format!("CreateObjWithProps({inp:?})")
+                            }
+                            Some(ValueNode::CreateEmptyObjectLiteral) => {
+                                format!("CreateEmptyObj({inp:?})")
+                            }
+                            Some(ValueNode::UndefinedConstant) => format!("Undefined({inp:?})"),
+                            Some(ValueNode::Phi { .. }) => format!("Phi({inp:?})"),
+                            Some(ValueNode::SmiConstant { value }) => {
+                                format!("Smi({value})({inp:?})")
+                            }
+                            Some(ValueNode::CheckedSmiIncrement { .. }) => {
+                                format!("CheckedSmiInc({inp:?})")
+                            }
+                            Some(ValueNode::GenericAdd { .. }) => format!("GenericAdd({inp:?})"),
+                            Some(ValueNode::GenericMultiply { .. }) => {
+                                format!("GenericMul({inp:?})")
+                            }
+                            Some(ValueNode::Int32Add { .. }) => format!("Int32Add({inp:?})"),
+                            Some(ValueNode::CheckedSmiAdd { .. }) => {
+                                format!("CheckedSmiAdd({inp:?})")
+                            }
+                            Some(n) => format!("disc{:?}({inp:?})", std::mem::discriminant(n)),
+                            None => format!("MISSING({inp:?})"),
+                        })
+                        .collect();
+                    eprintln!(
+                        "[{label}] bc={bc_len} phi {nid:?} inputs=[{}]",
+                        types.join(", ")
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Run the full optimization pipeline on the Maglev graph.
 pub fn optimize(graph: &mut MaglevGraph) {
     let _block_count = graph.blocks().len();
     let _node_count: usize = graph.blocks().iter().map(|b| b.nodes.len()).sum();
@@ -143,6 +194,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // current graph structure.
     eliminate_common_subexpressions(graph);
     let _globals_promoted = promote_loop_globals_counted(graph);
+    dump_header_phis(graph, "AFTER_PROMOTE");
     eliminate_trivial_phis(graph);
     let _licm_hoisted2 = crate::compiler::maglev::licm::hoist_loop_invariants(graph);
     // Re-run range analysis after global promotion: promotion replaces
@@ -169,6 +221,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
     fuse_object_literal_stores(graph);
+    dump_header_phis(graph, "AFTER_FUSE");
     forward_invariant_object_properties(graph);
     eliminate_store_to_load(graph);
     // Re-run constant folding: store-to-load forwarding may replace
@@ -3625,16 +3678,47 @@ fn try_forward_loop_object(
     let mut create_names: Vec<u32> = Vec::new();
     let mut create_values: Vec<NodeId> = Vec::new();
 
+    let mut phi_count = 0u32;
     for (nid, node) in &header.nodes {
         if *nid == iv_phi_id {
-            continue; // skip the IV Phi
+            continue;
         }
         if let ValueNode::Phi { inputs } = node
             && inputs.len() == 2
         {
+            phi_count += 1;
             let back_edge_id = inputs[back_pred_pos];
+            let back_node = graph.node(back_edge_id);
+            let type_name = match back_node {
+                Some(ValueNode::CreateObjectLiteral { .. }) => "CreateObjLit",
+                Some(ValueNode::CreateObjectLiteralWithProperties { .. }) => "CreateObjWithProps",
+                Some(ValueNode::CreateEmptyObjectLiteral) => "CreateEmptyObj",
+                Some(ValueNode::UndefinedConstant) => "Undefined",
+                Some(ValueNode::Phi { .. }) => "Phi",
+                Some(ValueNode::SmiConstant { value }) => {
+                    eprintln!("[OBJ_FWD] phi {nid:?} back={back_edge_id:?} SmiConst({value})");
+                    "SmiConstant"
+                }
+                Some(ValueNode::StoreNamedGeneric { .. }) => "StoreNamedGeneric",
+                Some(ValueNode::LoadNamedGeneric { .. }) => "LoadNamedGeneric",
+                Some(ValueNode::CheckedSmiAdd { .. }) => "CheckedSmiAdd",
+                Some(ValueNode::Int32Add { .. }) => "Int32Add",
+                Some(ValueNode::GenericAdd { .. }) => "GenericAdd",
+                Some(ValueNode::GenericMultiply { .. }) => "GenericMultiply",
+                Some(ValueNode::GenericIncrement { .. }) => "GenericIncrement",
+                Some(ValueNode::CheckedSmiIncrement { .. }) => "CheckedSmiIncrement",
+                None => "MISSING",
+                _ => {
+                    eprintln!(
+                        "[OBJ_FWD] unknown back_edge disc={:?}",
+                        back_node.map(std::mem::discriminant)
+                    );
+                    "other"
+                }
+            };
+            eprintln!("[OBJ_FWD] phi {nid:?} back={back_edge_id:?} type={type_name}");
             if let Some(ValueNode::CreateObjectLiteralWithProperties { names, values, .. }) =
-                graph.node(back_edge_id)
+                back_node
             {
                 obj_phi_id = Some(*nid);
                 create_obj_id = Some(back_edge_id);
@@ -3644,6 +3728,7 @@ fn try_forward_loop_object(
             }
         }
     }
+    eprintln!("[OBJ_FWD] phis={phi_count} found={}", obj_phi_id.is_some());
 
     let obj_phi_id = match obj_phi_id {
         Some(id) => id,
@@ -3658,8 +3743,18 @@ fn try_forward_loop_object(
     }
 
     if final_values.iter().any(|v| v.is_none()) {
+        for (i, v) in final_values.iter().enumerate() {
+            if v.is_none() {
+                let vn = graph.node(create_values[i]);
+                eprintln!(
+                    "[OBJ_FWD] eval fail prop {i} type={:?}",
+                    vn.map(std::mem::discriminant)
+                );
+            }
+        }
         return false;
     }
+    eprintln!("[OBJ_FWD] eval ok: {final_values:?}");
 
     // ── 5. Find post-loop LoadNamedGeneric that loads from obj_phi ────────
     // Build property name → final constant value map.
