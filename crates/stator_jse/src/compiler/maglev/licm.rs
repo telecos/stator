@@ -85,7 +85,7 @@
 //! assert!(graph.blocks()[2].nodes.len() < body_before);
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::compiler::maglev::ir::{BasicBlock, ControlNode, MaglevGraph, NodeId, ValueNode};
@@ -125,6 +125,204 @@ pub fn hoist_loop_invariants(graph: &mut MaglevGraph) -> usize {
         total += hoist_one_loop(graph, lp);
     }
     total
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Invariant addition chain folding
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Fold chains of loop-body additions with loop-invariant operands into a
+/// single addition per iteration.
+///
+/// After LICM hoists property loads out of a loop, the loop body often
+/// contains a left-to-right chain like:
+///
+/// ```text
+///   t1 = add(accumulator_phi, hoisted_load_a)
+///   t2 = add(t1, hoisted_load_b)
+///   t3 = add(t2, hoisted_load_c)
+///   ...
+/// ```
+///
+/// This pass pre-computes the invariant sum in the preheader and replaces
+/// the chain with `add(accumulator_phi, invariant_sum)`, reducing N
+/// additions per iteration to 1.
+pub fn fold_invariant_addition_chains(graph: &mut MaglevGraph) -> usize {
+    let loops = detect_loops(graph);
+    let mut total = 0;
+    for lp in &loops {
+        total += fold_chains_in_loop(graph, lp);
+    }
+    total
+}
+
+/// The kind of addition node in a chain.
+#[derive(Clone, Copy, PartialEq)]
+enum AddKind {
+    Int32,
+    CheckedSmi,
+    Generic,
+}
+
+/// Create an addition node of the given kind.
+fn make_add(kind: AddKind, left: NodeId, right: NodeId) -> ValueNode {
+    match kind {
+        AddKind::Int32 => ValueNode::Int32Add { left, right },
+        AddKind::CheckedSmi => ValueNode::CheckedSmiAdd { left, right },
+        AddKind::Generic => ValueNode::GenericAdd {
+            left,
+            right,
+            feedback_slot: 0,
+        },
+    }
+}
+
+/// Fold the longest invariant addition chain in a single loop.
+fn fold_chains_in_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
+    // 1. Collect NodeIds defined outside the loop.
+    let mut outside_defs: HashSet<NodeId> = HashSet::new();
+    for block in graph.blocks() {
+        if !lp.body.contains(&block.id) {
+            for (id, _) in &block.nodes {
+                outside_defs.insert(*id);
+            }
+        }
+    }
+
+    // 2. Build use-count map across the entire graph so we can verify that
+    //    intermediate chain nodes have no other consumers.
+    let mut use_counts: HashMap<NodeId, usize> = HashMap::new();
+    for block in graph.blocks() {
+        for (_, node) in &block.nodes {
+            visit_inputs(node, &mut |id| {
+                *use_counts.entry(id).or_insert(0) += 1;
+            });
+        }
+    }
+
+    // 3. Collect Int32Add / CheckedSmiAdd / GenericAdd nodes inside the loop.
+    let mut loop_adds: HashMap<NodeId, (NodeId, NodeId, AddKind)> = HashMap::new();
+    for block in graph.blocks() {
+        if !lp.body.contains(&block.id) {
+            continue;
+        }
+        for (id, node) in &block.nodes {
+            match node {
+                ValueNode::Int32Add { left, right } => {
+                    loop_adds.insert(*id, (*left, *right, AddKind::Int32));
+                }
+                ValueNode::CheckedSmiAdd { left, right } => {
+                    loop_adds.insert(*id, (*left, *right, AddKind::CheckedSmi));
+                }
+                ValueNode::GenericAdd { left, right, .. } => {
+                    loop_adds.insert(*id, (*left, *right, AddKind::Generic));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if loop_adds.is_empty() {
+        return 0;
+    }
+
+    // 4. For each addition, walk backwards through its variant input to build
+    //    the longest chain of invariant operands.  Only continue through an
+    //    intermediate addition if it has exactly one use (the next link),
+    //    ensuring that removing it is safe.
+    let mut best_endpoint: Option<NodeId> = None;
+    let mut best_inv_ops: Vec<NodeId> = Vec::new();
+    let mut best_root: Option<NodeId> = None;
+    let mut best_kind = AddKind::Int32;
+
+    for &start_id in loop_adds.keys() {
+        let mut inv_ops: Vec<NodeId> = Vec::new();
+        let mut current = start_id;
+        let mut root_variant = None;
+        let mut chain_kind: Option<AddKind> = None;
+
+        while let Some(&(left, right, kind)) = loop_adds.get(&current) {
+            // Require uniform addition type across the chain.
+            if let Some(prev_kind) = chain_kind
+                && prev_kind != kind
+            {
+                break;
+            }
+            chain_kind = Some(kind);
+
+            let l_out = outside_defs.contains(&left);
+            let r_out = outside_defs.contains(&right);
+
+            // Need exactly one invariant and one variant operand.
+            if l_out == r_out {
+                break;
+            }
+
+            let (invariant, variant) = if r_out { (right, left) } else { (left, right) };
+
+            inv_ops.push(invariant);
+
+            // Try to extend the chain backwards through the variant input.
+            if loop_adds.contains_key(&variant) {
+                let uses = use_counts.get(&variant).copied().unwrap_or(0);
+                if uses == 1 {
+                    current = variant;
+                    continue;
+                }
+            }
+
+            // Chain ends: variant is a Phi, multi-use node, or non-addition.
+            root_variant = Some(variant);
+            break;
+        }
+
+        if inv_ops.len() >= 2 && root_variant.is_some() && inv_ops.len() > best_inv_ops.len() {
+            best_endpoint = Some(start_id);
+            best_inv_ops = inv_ops;
+            best_root = root_variant;
+            best_kind = chain_kind.unwrap_or(AddKind::Int32);
+        }
+    }
+
+    let endpoint_id = match best_endpoint {
+        Some(id) => id,
+        None => return 0,
+    };
+    let root_variant = best_root.unwrap();
+
+    // Collected from endpoint backwards — reverse to natural order.
+    best_inv_ops.reverse();
+
+    // 5. Create the invariant sum in the preheader:
+    //    inv_sum = (...((inv[0] + inv[1]) + inv[2]) + ... + inv[N-1])
+    let mut prev = best_inv_ops[0];
+    for &inv in &best_inv_ops[1..] {
+        let nid = graph.alloc_node_id();
+        let node = make_add(best_kind, prev, inv);
+        if let Some(pre) = graph.block_mut(lp.preheader) {
+            pre.push_with_id(nid, node);
+        }
+        prev = nid;
+    }
+    let inv_sum = prev;
+
+    // 6. Replace the endpoint addition with add(root_variant, inv_sum).
+    //    The now-dead intermediate additions will be cleaned up by DCE.
+    let replacement = make_add(best_kind, root_variant, inv_sum);
+
+    for block in graph.blocks_mut() {
+        if !lp.body.contains(&block.id) {
+            continue;
+        }
+        for (id, node) in &mut block.nodes {
+            if *id == endpoint_id {
+                *node = replacement;
+                return best_inv_ops.len();
+            }
+        }
+    }
+
+    0
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -415,8 +613,7 @@ fn hoist_one_loop(graph: &mut MaglevGraph, lp: &NaturalLoop) -> usize {
 
         // Remove hoisted nodes from their source blocks (iterate in reverse
         // position order so indices remain valid).
-        let mut removals_by_block: std::collections::HashMap<u32, Vec<usize>> =
-            std::collections::HashMap::new();
+        let mut removals_by_block: HashMap<u32, Vec<usize>> = HashMap::new();
         for &(blk, pos, _, _) in &to_hoist {
             removals_by_block.entry(blk).or_default().push(pos);
         }
@@ -576,6 +773,7 @@ fn loop_has_property_side_effects(graph: &MaglevGraph, loop_body: &HashSet<u32>)
                     | ValueNode::CallWithSpread { .. }
                     | ValueNode::Construct { .. }
                     | ValueNode::ConstructWithSpread { .. }
+                    | ValueNode::SpeculativeCallFusion { .. }
             ) {
                 return true;
             }
@@ -947,6 +1145,10 @@ fn visit_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
             for &a in args.iter() {
                 f(a);
             }
+        }
+
+        ValueNode::SpeculativeCallFusion { callee, .. } => {
+            f(*callee);
         }
 
         ValueNode::CallBuiltin { args, .. } | ValueNode::CallRuntime { args, .. } => {
@@ -2018,6 +2220,121 @@ mod tests {
                 .nodes
                 .iter()
                 .any(|(_, n)| matches!(n, ValueNode::CallRuntime { .. })),
+        );
+    }
+
+    // ── Invariant addition chain folding ──────────────────────────────────────
+
+    #[test]
+    fn test_fold_invariant_addition_chain() {
+        // Build a graph with a loop containing:
+        //   preheader: inv_a(100), inv_b(101), inv_c(102)
+        //   body: t1 = add(phi, inv_a), t2 = add(t1, inv_b), t3 = add(t2, inv_c)
+        // After folding, the loop body should have just 1 addition: add(phi, inv_sum)
+        let mut graph = MaglevGraph::new(1);
+
+        // Block 0: preheader with three invariant constants.
+        let mut b0 = BasicBlock::new(0);
+        b0.push_with_id(NodeId(100), ValueNode::Int32Constant { value: 1 });
+        b0.push_with_id(NodeId(101), ValueNode::Int32Constant { value: 2 });
+        b0.push_with_id(NodeId(102), ValueNode::Int32Constant { value: 3 });
+        b0.set_control(ControlNode::Jump { target: 1 });
+        graph.add_block(b0);
+
+        // Block 1: header with Phi for the accumulator.
+        let mut b1 = BasicBlock::new(1);
+        b1.add_predecessor(0);
+        b1.add_predecessor(2);
+        b1.push_with_id(
+            NodeId(200),
+            ValueNode::Phi {
+                inputs: vec![NodeId(100), NodeId(203)],
+            },
+        );
+        let cond = b1.push_value(ValueNode::TrueConstant);
+        b1.set_control(ControlNode::Branch {
+            condition: cond,
+            if_true: 2,
+            if_false: 3,
+        });
+        graph.add_block(b1);
+
+        // Block 2: body — chain of 3 additions with invariant operands.
+        let mut b2 = BasicBlock::new(2);
+        b2.add_predecessor(1);
+        b2.push_with_id(
+            NodeId(201),
+            ValueNode::Int32Add {
+                left: NodeId(200),
+                right: NodeId(100),
+            },
+        );
+        b2.push_with_id(
+            NodeId(202),
+            ValueNode::Int32Add {
+                left: NodeId(201),
+                right: NodeId(101),
+            },
+        );
+        b2.push_with_id(
+            NodeId(203),
+            ValueNode::Int32Add {
+                left: NodeId(202),
+                right: NodeId(102),
+            },
+        );
+        b2.set_control(ControlNode::Jump { target: 1 });
+        graph.add_block(b2);
+
+        // Block 3: exit.
+        let mut b3 = BasicBlock::new(3);
+        b3.add_predecessor(1);
+        let undef = b3.push_value(ValueNode::UndefinedConstant);
+        b3.set_control(ControlNode::Return { value: undef });
+        graph.add_block(b3);
+
+        let body_adds_before = graph.blocks()[2]
+            .nodes
+            .iter()
+            .filter(|(_, n)| matches!(n, ValueNode::Int32Add { .. }))
+            .count();
+        assert_eq!(body_adds_before, 3, "should start with 3 additions in body");
+
+        let folded = super::fold_invariant_addition_chains(&mut graph);
+        assert_eq!(folded, 3, "should fold 3 invariant operands");
+
+        // The endpoint (NodeId 203) should now reference the invariant sum from
+        // the preheader instead of the chain.  Intermediate nodes (201, 202)
+        // are dead and will be cleaned up by DCE; they remain in the body for
+        // now.
+        let endpoint = graph.blocks()[2]
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == NodeId(203))
+            .map(|(_, n)| n);
+        match endpoint {
+            Some(ValueNode::Int32Add { left, right }) => {
+                // left should be the Phi (root_variant = 200).
+                assert_eq!(*left, NodeId(200), "endpoint left should be the Phi");
+                // right should be an invariant sum node in the preheader,
+                // NOT one of the original operands (100, 101, 102).
+                assert!(
+                    right.0 != 100 && right.0 != 101 && right.0 != 102,
+                    "endpoint right should be the new invariant sum node"
+                );
+            }
+            other => panic!("expected Int32Add for endpoint, got {other:?}"),
+        }
+
+        // The preheader should have new Int32Add nodes for the invariant sum.
+        let preheader_adds = graph.blocks()[0]
+            .nodes
+            .iter()
+            .filter(|(_, n)| matches!(n, ValueNode::Int32Add { .. }))
+            .count();
+        assert_eq!(
+            preheader_adds, 2,
+            "preheader should have 2 addition nodes for invariant sum (a+b, (a+b)+c)"
         );
     }
 }

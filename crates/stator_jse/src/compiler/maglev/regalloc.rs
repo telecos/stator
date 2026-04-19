@@ -651,6 +651,10 @@ fn collect_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
             }
         }
 
+        ValueNode::SpeculativeCallFusion { callee, .. } => {
+            f(*callee);
+        }
+
         ValueNode::CallBuiltin { args, .. } | ValueNode::CallRuntime { args, .. } => {
             for &a in args {
                 f(a);
@@ -774,6 +778,33 @@ pub fn allocate(graph: &MaglevGraph, num_regs: u32) -> AllocationResult {
             }
         }
         active = still_active;
+
+        // ── Early Phi expiry ────────────────────────────────────────
+        //
+        // When the current interval is a back-edge input with a Phi
+        // affinity, and the Phi's *real* live range (before loop
+        // extension) has ended, expire the Phi from the active set.
+        // This frees the Phi's register so the affinity-hint logic
+        // can reuse it, achieving coalescing *during* the linear scan.
+        //
+        // SAFETY: We only expire the SPECIFIC Phi that the current
+        // interval is a back-edge input of (not unrelated Phis).
+        // We do NOT shuffle other values' registers.
+        if let Some(&pref_reg) = phi_affinity_reg.get(&iv.id)
+            && let Some(&phi_id) = phi_affinity_phi.get(&iv.id)
+            && let Some(active_idx) = active
+                .iter()
+                .position(|(r, aiv)| *r == pref_reg && aiv.id == phi_id)
+        {
+            let phi_eff_end = active[active_idx]
+                .1
+                .pre_ext_end
+                .unwrap_or(active[active_idx].1.end);
+            if phi_eff_end <= iv.start + 1 {
+                active.remove(active_idx);
+                free_regs.push(pref_reg);
+            }
+        }
 
         if let Some(reg) = {
             // Prefer the Phi-affinity register if available.

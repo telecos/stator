@@ -16,12 +16,13 @@ jobs:
     name: ASAN (FFI boundary tests)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Known issue: Rc<RefCell> prototype chains form reference cycles that
-    # leak under ASAN.  Tracked for fix when the engine moves to a tracing GC.
-    continue-on-error: true
     env:
       RUSTFLAGS: "-Z sanitizer=address"
       RUSTDOCFLAGS: "-Z sanitizer=address"
+      # Rc<RefCell> prototype chains form reference cycles that are intentional
+      # and will be resolved when the engine moves to a tracing GC.  Disable
+      # LSan so ASAN still catches buffer-overflows and use-after-free bugs.
+      ASAN_OPTIONS: "detect_leaks=0"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -32,7 +33,7 @@ jobs:
           components: rust-src
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-asan-registry-${{ hashFiles('**/Cargo.lock') }}

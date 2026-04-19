@@ -415,6 +415,20 @@ fn try_rewrite(
             Some((out, repl))
         }
 
+        // ── Bitwise OR — truncates to i32 ───────────────────────────────
+        // `x | y` always calls `ToInt32` per spec; result fits i32.
+        // Propagating the range enables downstream Phi nodes (whose
+        // back-edge goes through `| 0`) to get a range, unlocking
+        // lowering of checked arithmetic on accumulators.
+        ValueNode::GenericBitwiseOr { left, right, .. }
+        | ValueNode::Int32BitwiseOr { left, right } => {
+            // Conservative: result is full i32 (bitwise OR can set any bit).
+            let _lr = ranges.get(left);
+            let _rr = ranges.get(right);
+            // We don't try to narrow the range; just declare i32.
+            Some((Range::I32_FULL, None))
+        }
+
         _ => None,
     }
 }
@@ -967,6 +981,10 @@ fn eager_range(
                 min: lr.min.checked_shl(rr.min as u32)?,
                 max: lr.max.checked_shl(rr.max as u32)?,
             })
+        }
+        // Bitwise OR truncates to i32 (ToInt32 per spec).
+        ValueNode::GenericBitwiseOr { .. } | ValueNode::Int32BitwiseOr { .. } => {
+            Some(Range::I32_FULL)
         }
         _ => None,
     }
