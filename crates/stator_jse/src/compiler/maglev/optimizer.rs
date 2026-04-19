@@ -2433,9 +2433,11 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
     }
 
     // At each exit, prepend StoreGlobal nodes for each promoted global.
-    // The value to store is the StoreGlobal's original value input (the
-    // computed value from the loop body), which has been substituted through
-    // the Phi chain.
+    // The value to store is the Phi (not the body's raw value): the Phi
+    // correctly holds the preheader value when the loop doesn't execute
+    // and the last-iteration value otherwise.  Using the Phi also keeps it
+    // alive through DCE, which is essential for downstream passes like
+    // forward_loop_object_properties that pattern-match on Phi back-edges.
     for &exit_id in &exit_blocks {
         for pg in promoted.iter().rev() {
             let store_id = graph.alloc_node_id();
@@ -2446,7 +2448,7 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
                         store_id,
                         ValueNode::StoreGlobal {
                             name: pg.name,
-                            value: pg.store_value_id,
+                            value: pg.phi_id,
                             feedback_slot: pg.feedback_slot,
                         },
                     ),
