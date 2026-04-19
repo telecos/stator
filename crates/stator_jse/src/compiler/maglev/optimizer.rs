@@ -3654,7 +3654,13 @@ fn try_forward_loop_object(
         }
         match &found {
             Some(ValueNode::Int32LessThan { left, right }) => (*left, *right),
-            _ => return false,
+            _ => {
+                eprintln!(
+                    "[OBJ_FWD] bail: condition not Int32LessThan, type={:?}",
+                    found.as_ref().map(std::mem::discriminant)
+                );
+                return false;
+            }
         }
     };
 
@@ -3672,7 +3678,10 @@ fn try_forward_loop_object(
         }
         match found {
             Some(inputs) if inputs.len() == 2 => inputs,
-            _ => return false,
+            _ => {
+                eprintln!("[OBJ_FWD] bail: IV phi {iv_phi_id:?} not found or wrong input count");
+                return false;
+            }
         }
     };
 
@@ -3858,9 +3867,7 @@ fn try_forward_loop_object(
             if refs.contains(&obj_phi_id) {
                 // Allow StoreGlobal in exit blocks — these just materialise
                 // the object for post-loop reads that are already forwarded.
-                if !lp.body.contains(&block.id)
-                    && matches!(node, ValueNode::StoreGlobal { .. })
-                {
+                if !lp.body.contains(&block.id) && matches!(node, ValueNode::StoreGlobal { .. }) {
                     exit_store_globals_to_kill.push(*nid);
                     continue;
                 }
