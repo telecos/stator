@@ -3093,6 +3093,124 @@ pub(crate) mod jit_runtime {
         })
     }
 
+    /// Speculative call-loop fusion: given a callee (closure) and a trip
+    /// count N, analyse the callee's bytecodes at runtime.  If they match
+    /// the simple pattern `LdaCurrentContextSlot(S), AddSmi(K, _),
+    /// StaCurrentContextSlot(S), Return` (a context-slot increment), compute
+    /// the closed-form `slot[S] += K * N` in O(1) and return the *last*
+    /// call's return value (`old + K * N`).
+    ///
+    /// Returns `JIT_DEOPT` if the bytecodes don't match or any overflow /
+    /// non-Smi condition is detected — the interpreter re-runs the loop.
+    pub extern "C" fn jit_runtime_speculative_call_fusion(callee_i64: i64, trip_count: i64) -> i64 {
+        let result = speculative_call_fusion_inner(callee_i64, trip_count as u32);
+        result.unwrap_or(JIT_DEOPT)
+    }
+
+    /// Inner implementation for speculative call fusion.
+    fn speculative_call_fusion_inner(callee_i64: i64, n: u32) -> Option<i64> {
+        use crate::bytecode::bytecodes::{Opcode, Operand, decode};
+        use crate::objects::value::JsValue;
+
+        if n == 0 {
+            return None; // no calls to fuse
+        }
+
+        // 1. Resolve callee to a BytecodeArray.
+        let callee_val = get_heap_object(callee_i64)?;
+        let ba = match &callee_val {
+            JsValue::Function(ba) => ba,
+            _ => return None,
+        };
+
+        // 2. Decode bytecodes and match the increment pattern.
+        let instrs = decode(ba.bytecodes()).ok()?;
+
+        // Scan for the core pattern:
+        //   LdaCurrentContextSlot(S) ... Add/AddSmi(K) ... StaCurrentContextSlot(S) ... Return
+        // The closure may have prefix instructions (CreateMappedArguments, Star, LdaSmi, Star)
+        // and may reload the slot before Return.
+        let mut slot: Option<usize> = None;
+        let mut k_value: Option<i64> = None;
+        let mut store_slot: Option<usize> = None;
+        let mut has_return = false;
+
+        // Track: LdaSmi value that might be used by a subsequent Add
+        let mut pending_lda_smi: Option<i64> = None;
+
+        for instr in &instrs {
+            match instr.opcode {
+                Opcode::LdaCurrentContextSlot => {
+                    if let Some(Operand::ConstantPoolIdx(s)) = instr.operand_at(0)
+                        && slot.is_none()
+                    {
+                        slot = Some(*s as usize);
+                    }
+                }
+                Opcode::AddSmi => {
+                    if let Some(Operand::Immediate(imm)) = instr.operand_at(0) {
+                        k_value = Some(*imm as i64);
+                    }
+                }
+                Opcode::Add => {
+                    // Add uses register operand; the K comes from a prior LdaSmi
+                    if let Some(k) = pending_lda_smi {
+                        k_value = Some(k);
+                    }
+                }
+                Opcode::StaCurrentContextSlot => {
+                    if let Some(Operand::ConstantPoolIdx(s)) = instr.operand_at(0) {
+                        store_slot = Some(*s as usize);
+                    }
+                }
+                Opcode::LdaSmi => {
+                    if let Some(Operand::Immediate(imm)) = instr.operand_at(0) {
+                        pending_lda_smi = Some(*imm as i64);
+                    }
+                }
+                Opcode::Return => {
+                    has_return = true;
+                }
+                // Skip benign prefix/suffix instructions
+                Opcode::CreateMappedArguments | Opcode::Star => {}
+                // Any other opcode → not a simple increment pattern
+                _ => return None,
+            }
+        }
+
+        let slot = slot?;
+        let k = k_value?;
+        let store_s = store_slot?;
+        if store_s != slot || !has_return {
+            return None;
+        }
+
+        // 3. Read the closure context slot.
+        let ctx_rc = ba.closure_context()?;
+        let mut ctx = ctx_rc.borrow_mut();
+        let old_val = ctx.slots.get(slot)?;
+        let old_smi = match old_val {
+            JsValue::Smi(v) => i64::from(*v),
+            _ => return None,
+        };
+
+        // 4. Compute closed form: new_val = old_smi + k * n
+        let n64 = i64::from(n);
+        let total_add = k.checked_mul(n64)?;
+        let new_val = old_smi.checked_add(total_add)?;
+
+        // Must fit in Smi range (i32).
+        if new_val < i32::MIN as i64 || new_val > i32::MAX as i64 {
+            return None;
+        }
+
+        // 5. Write the new value back.
+        ctx.slots[slot] = JsValue::Smi(new_val as i32);
+
+        // The last call returns the new value (after N increments).
+        Some(new_val)
+    }
+
     /// Execute a JS `Function` callee via JIT (preferred) or interpreter
     /// (fallback).
     ///
@@ -8291,7 +8409,9 @@ pub(crate) mod jit_runtime {
         if feedback_slot >= 0 {
             let slot = feedback_slot as u32;
 
-            let ptrs = RT_PTRS.with(|p| p.get());
+            // Use as_ptr() to borrow in-place, avoiding a full struct copy.
+            // SAFETY: single-threaded JIT; Cell is not mutated during call.
+            let ptrs: &RtPtrs = unsafe { &*RT_PTRS.with(|p| p.as_ptr()) };
             let ba = if ptrs.is_cached() {
                 // SAFETY: cached pointer valid for thread lifetime.
                 unsafe { &*ptrs.bytecode }.get()
@@ -8315,7 +8435,7 @@ pub(crate) mod jit_runtime {
                     let template = unsafe { &*ic.template };
                     let rc = acquire_object_rc_from_template_cached(template, ptrs.object_rc_pool);
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, ptrs));
                 }
 
                 // Fast path: template cached in BA — populate the IC.
@@ -8329,7 +8449,7 @@ pub(crate) mod jit_runtime {
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, ptrs));
                 }
 
                 // Second execution: promote pending → cached, then
@@ -8344,7 +8464,7 @@ pub(crate) mod jit_runtime {
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, ptrs));
                 }
 
                 // First execution: create fresh and register as
@@ -8353,7 +8473,7 @@ pub(crate) mod jit_runtime {
                 let rc = Rc::new(RefCell::new(map));
                 ba_ref.set_object_literal_pending(slot, Rc::clone(&rc));
                 let obj = JsValue::PlainObject(rc);
-                return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                return Some(alloc_heap_handle_no_dedup(obj, ptrs));
             }
         }
 
@@ -8425,7 +8545,10 @@ pub(crate) mod jit_runtime {
         let count = ((names_packed_u64 >> 60) & 0xF) as usize;
         let vals = [val0, val1, val2, val3, val4];
 
-        let ptrs = RT_PTRS.with(|p| p.get());
+        // Use as_ptr() to borrow the RtPtrs in place, avoiding a 96-byte
+        // struct copy on the hot path.
+        // SAFETY: single-threaded JIT; the Cell is not mutated during this call.
+        let ptrs: &RtPtrs = unsafe { &*RT_PTRS.with(|p| p.as_ptr()) };
 
         if feedback_slot >= 0 {
             let slot = feedback_slot as u32;
@@ -8455,7 +8578,7 @@ pub(crate) mod jit_runtime {
                         ptrs.object_rc_pool,
                     );
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, ptrs));
                 }
 
                 // ── Hot path: template cached in BA — populate IC ──
@@ -8471,7 +8594,7 @@ pub(crate) mod jit_runtime {
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, ptrs));
                 }
 
                 // ── Promote path (second execution) ──
@@ -8487,7 +8610,7 @@ pub(crate) mod jit_runtime {
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, ptrs));
                 }
 
                 // ── First execution: create fresh and fill via property stores ──
@@ -8511,7 +8634,7 @@ pub(crate) mod jit_runtime {
                     }
                 }
                 let obj = JsValue::PlainObject(rc);
-                return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                return Some(alloc_heap_handle_no_dedup(obj, ptrs));
             }
         }
 
@@ -8534,7 +8657,7 @@ pub(crate) mod jit_runtime {
             }
         }
         let obj = JsValue::PlainObject(map_rc);
-        Some(alloc_heap_handle_no_dedup(obj, &ptrs))
+        Some(alloc_heap_handle_no_dedup(obj, ptrs))
     }
 
     /// Fast-path object creation that accepts the pre-cached `RT_PTRS`
@@ -8603,13 +8726,17 @@ pub(crate) mod jit_runtime {
         let vals = [val0, val1, val2, val3, val4];
 
         // Resolve RtPtrs from the cached cell pointer, falling back to
-        // TLS if the pointer is null or stale.
-        let ptrs = if rt_ptrs_cell != 0 {
+        // TLS if the pointer is null or stale.  Use as_ptr() to obtain a
+        // reference instead of Cell::get() which copies the full 96-byte
+        // struct — on the IC-hit hot path only a few fields are read.
+        let ptrs: &RtPtrs = if rt_ptrs_cell != 0 {
             // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and
             // the TLS slot lives for the thread's entire lifetime.
-            unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get()
+            // No mutation of the Cell occurs during this function call.
+            unsafe { &*(&*(rt_ptrs_cell as *const Cell<RtPtrs>)).as_ptr() }
         } else {
-            RT_PTRS.with(|p| p.get())
+            // SAFETY: single-threaded JIT; Cell is not mutated during call.
+            unsafe { &*RT_PTRS.with(|p| p.as_ptr()) }
         };
 
         if feedback_slot >= 0 {
@@ -8633,7 +8760,7 @@ pub(crate) mod jit_runtime {
                         ptrs.object_rc_pool,
                     );
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, ptrs));
                 }
 
                 // ── Hot path: template cached in BA — populate IC ──
@@ -8649,7 +8776,7 @@ pub(crate) mod jit_runtime {
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, ptrs));
                 }
 
                 // ── Promote path ──
@@ -8665,7 +8792,7 @@ pub(crate) mod jit_runtime {
                         });
                     }
                     let obj = JsValue::PlainObject(rc);
-                    return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                    return Some(alloc_heap_handle_no_dedup(obj, ptrs));
                 }
 
                 // ── First execution ──
@@ -8688,7 +8815,7 @@ pub(crate) mod jit_runtime {
                     }
                 }
                 let obj = JsValue::PlainObject(rc);
-                return Some(alloc_heap_handle_no_dedup(obj, &ptrs));
+                return Some(alloc_heap_handle_no_dedup(obj, ptrs));
             }
         }
 
@@ -8710,11 +8837,11 @@ pub(crate) mod jit_runtime {
             }
         }
         let obj = JsValue::PlainObject(map_rc);
-        Some(alloc_heap_handle_no_dedup(obj, &ptrs))
+        Some(alloc_heap_handle_no_dedup(obj, ptrs))
     }
 
     /// Decode a single JIT `i64` register value into a [`JsValue`].
-    #[inline]
+    #[inline(always)]
     fn decode_one_jit_value(v: i64) -> JsValue {
         if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
             JsValue::Smi(v as i32)
@@ -8725,7 +8852,7 @@ pub(crate) mod jit_runtime {
 
     /// Decode up to 5 JIT `i64` register values into a stack-allocated
     /// array, avoiding a `Vec` heap allocation on the fused hot path.
-    #[inline]
+    #[inline(always)]
     fn decode_jit_values_array(count: usize, vals: &[i64; 5]) -> [JsValue; 5] {
         let mut out = [
             JsValue::Undefined,
