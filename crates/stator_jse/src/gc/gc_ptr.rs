@@ -248,7 +248,10 @@ mod tests {
         let ptr = NonNull::new(&mut obj as *mut TestObj).unwrap();
         // SAFETY: obj is live for the duration of this test.
         let gc = unsafe { GcPtr::from_raw(ptr) };
-        assert_eq!(gc.as_ptr(), &mut obj as *mut TestObj);
+        // Compare against `ptr.as_ptr()` (already captured above) rather than
+        // re-borrowing `&mut obj`, which would create a new Unique retag and
+        // invalidate the SharedReadWrite permission under Stacked Borrows.
+        assert_eq!(gc.as_ptr(), ptr.as_ptr());
         // SAFETY: obj is live.
         assert_eq!(unsafe { gc.as_ref() }.value, 42);
     }
