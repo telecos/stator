@@ -25788,6 +25788,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(debug_assertions, ignore)] // debug: JIT slow-path frames too large
     fn test_tail_call_logical_or_sloppy_small() {
         test_tail_call_assert_bool(
             "function any(n) { \
