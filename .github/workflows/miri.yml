@@ -18,8 +18,10 @@ jobs:
     name: Miri (${{ matrix.target }}, ${{ matrix.label }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Known issue: GcPtr unsafe operations cause Miri timeouts.
-    # Tracked for fix when the GC subsystem is refactored.
+    # bytecode_generator tests are skipped (they run the full interpreter under Miri
+    # and take 2+ minutes each due to 100× instrumentation overhead). If the remaining
+    # gc/objects/structural-bytecode tests still time out on a slow runner, the job is
+    # allowed to fail without blocking the PR.
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -79,4 +81,8 @@ jobs:
         env:
           MIRIFLAGS: "${{ matrix.miriflags }}"
         run: |
-          cargo +nightly miri test -p stator_jse --target ${{ matrix.target }} -- gc:: objects:: bytecode::
+          # Skip bytecode_generator tests: they run the full interpreter under Miri and
+          # take 2+ minutes each (100× overhead on integration-style tests), making the
+          # suite impossible to complete within the 30-minute timeout.
+          # gc::, objects::, and structural bytecode tests are fast enough to finish.
+          cargo +nightly miri test -p stator_jse --target ${{ matrix.target }} -- gc:: objects:: bytecode:: --skip bytecode_generator
