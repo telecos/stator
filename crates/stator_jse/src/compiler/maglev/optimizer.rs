@@ -199,6 +199,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // GenericAdd→Int32Add) and BEFORE unrolling (which would complicate
     // the loop structure).
     eliminate_constant_accumulator_loops(graph);
+    forward_loop_object_properties(graph);
     eliminate_dead_object_stores(graph);
     eliminate_dead_allocations(graph);
     replace_dead_arguments(graph);
@@ -3446,6 +3447,443 @@ fn compute_store_to_load_subst_with_map(
     }
 
     subst
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass 2c.0 — Loop dead-object forwarding
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Forward property loads on objects created inside counted loops to their
+/// final-iteration constant values, enabling subsequent dead-allocation
+/// elimination.
+///
+/// Pattern: a counted loop creates an object literal every iteration and
+/// stores it to a global that is never read inside the loop.  After the loop,
+/// the global is loaded and only its properties are accessed.  Because only
+/// the last iteration's object matters, we can compute the final property
+/// values at compile time (for affine expressions of the IV) and replace the
+/// post-loop `LoadNamedGeneric` nodes with constants.  This makes the in-loop
+/// `CreateObjectLiteralWithProperties` + `StoreGlobal` dead, which existing
+/// passes then eliminate.
+fn forward_loop_object_properties(graph: &mut MaglevGraph) {
+    let loops = licm::detect_loops(graph);
+    if loops.is_empty() {
+        return;
+    }
+
+    // Build a node → constant map.
+    let mut consts: HashMap<NodeId, i32> = HashMap::new();
+    for block in graph.blocks() {
+        for (id, node) in &block.nodes {
+            match node {
+                ValueNode::SmiConstant { value } | ValueNode::Int32Constant { value } => {
+                    consts.insert(*id, *value);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for lp in &loops {
+        try_forward_loop_object(graph, lp, &consts);
+    }
+}
+
+/// Try to forward object property loads for a single counted loop.
+fn try_forward_loop_object(
+    graph: &mut MaglevGraph,
+    lp: &licm::NaturalLoop,
+    consts: &HashMap<NodeId, i32>,
+) -> bool {
+    // ── 1. Verify counted loop structure ─────────────────────────────────
+    let header = match graph.block(lp.header) {
+        Some(b) => b,
+        None => return false,
+    };
+
+    let (condition_id, body_block_idx, exit_block_idx) = match &header.control {
+        Some(ControlNode::Branch {
+            condition,
+            if_true,
+            if_false,
+        }) => (*condition, *if_true, *if_false),
+        _ => return false,
+    };
+
+    if !lp.body.contains(&body_block_idx) {
+        return false;
+    }
+    // Exit must be outside the loop.
+    if lp.body.contains(&exit_block_idx) {
+        return false;
+    }
+
+    // Simple loop: header + 1 body block.
+    if lp.body.len() != 2 || !lp.body.contains(&lp.header) {
+        return false;
+    }
+
+    let body = match graph.block(body_block_idx) {
+        Some(b) => b,
+        None => return false,
+    };
+
+    // Body must jump back to header.
+    match &body.control {
+        Some(ControlNode::Jump { target }) if *target == lp.header => {}
+        _ => return false,
+    }
+
+    // ── 2. Find IV Phi and compute trip count ────────────────────────────
+    let (cmp_left, cmp_right) = {
+        let mut found = None;
+        for (nid, node) in &header.nodes {
+            if *nid == condition_id {
+                found = Some(node.clone());
+                break;
+            }
+        }
+        match &found {
+            Some(ValueNode::Int32LessThan { left, right }) => (*left, *right),
+            other => {
+                eprintln!(
+                    "[OBJ_FWD] bail: header condition is {:?}, not Int32LessThan",
+                    other.as_ref().map(std::mem::discriminant)
+                );
+                return false;
+            }
+        }
+    };
+
+    let iv_phi_id = cmp_left;
+    let header = graph.block(lp.header).unwrap();
+    let iv_phi_inputs = {
+        let mut found = None;
+        for (nid, node) in &header.nodes {
+            if *nid == iv_phi_id {
+                if let ValueNode::Phi { inputs } = node {
+                    found = Some(inputs.clone());
+                }
+                break;
+            }
+        }
+        match found {
+            Some(inputs) if inputs.len() == 2 => inputs,
+            _ => return false,
+        }
+    };
+
+    let back_pred_pos = match header
+        .predecessors
+        .iter()
+        .position(|&p| p == body_block_idx)
+    {
+        Some(pos) => pos,
+        None => return false,
+    };
+    let entry_pos = match header.predecessors.iter().position(|&p| p == lp.preheader) {
+        Some(pos) => pos,
+        None => return false,
+    };
+
+    let iv_init = match consts.get(&iv_phi_inputs[entry_pos]) {
+        Some(&v) => v,
+        None => match find_i32_constant(graph, iv_phi_inputs[entry_pos]) {
+            Some(v) => v,
+            None => return false,
+        },
+    };
+    let iv_limit = match consts.get(&cmp_right) {
+        Some(&v) => v,
+        None => match find_i32_constant(graph, cmp_right) {
+            Some(v) => v,
+            None => return false,
+        },
+    };
+
+    let iv_back_id = iv_phi_inputs[back_pred_pos];
+    let iv_step = match find_increment_step(graph, iv_back_id, iv_phi_id) {
+        Some(s) if s > 0 => s,
+        _ => return false,
+    };
+
+    let range = (iv_limit as i64) - (iv_init as i64);
+    let step = iv_step as i64;
+    if range <= 0 || range % step != 0 {
+        return false;
+    }
+    let trip_count = range / step;
+    if trip_count == 0 {
+        return false;
+    }
+
+    // The IV value on the LAST body execution.
+    let iv_final = iv_limit - iv_step;
+
+    // ── 3. Find CreateObjectLiteralWithProperties + StoreGlobal in body ──
+    let body = graph.block(body_block_idx).unwrap();
+    let mut obj_global_name: Option<u32> = None;
+    let mut create_obj_id: Option<NodeId> = None;
+    let mut create_names: Vec<u32> = Vec::new();
+    let mut create_values: Vec<NodeId> = Vec::new();
+    let mut store_global_idx: Option<usize> = None;
+    let mut create_obj_idx: Option<usize> = None;
+
+    for (idx, (nid, node)) in body.nodes.iter().enumerate() {
+        if let ValueNode::CreateObjectLiteralWithProperties { names, values, .. } = node {
+            create_obj_id = Some(*nid);
+            create_names = names.clone();
+            create_values = values.clone();
+            create_obj_idx = Some(idx);
+        }
+        if let ValueNode::StoreGlobal { name, value, .. } = node
+            && create_obj_id == Some(*value)
+        {
+            obj_global_name = Some(*name);
+            store_global_idx = Some(idx);
+        }
+    }
+
+    let obj_global_name = match obj_global_name {
+        Some(n) => n,
+        None => {
+            // Dump body node types for debugging.
+            let body = graph.block(body_block_idx).unwrap();
+            let types: Vec<_> = body
+                .nodes
+                .iter()
+                .map(|(_, n)| format!("{:?}", std::mem::discriminant(n)))
+                .collect();
+            eprintln!("[OBJ_FWD] bail: no CreateObjWithProps+StoreGlobal in body. nodes={types:?}");
+            return false;
+        }
+    };
+    let _create_obj_id = create_obj_id.unwrap();
+    eprintln!(
+        "[OBJ_FWD] found: global_name={obj_global_name} create_values={} iv_final={iv_final}",
+        create_values.len()
+    );
+
+    // Verify: no LoadGlobal of the same name inside the loop body.
+    for block_id in &lp.body {
+        if let Some(block) = graph.block(*block_id) {
+            for (_, node) in &block.nodes {
+                if let ValueNode::LoadGlobal { name, .. } = node
+                    && *name == obj_global_name
+                {
+                    return false;
+                }
+            }
+        }
+    }
+
+    // ── 4. Evaluate property values at IV = iv_final ─────────────────────
+    let mut final_values: Vec<Option<i32>> = Vec::new();
+    for &val_id in &create_values {
+        final_values.push(eval_at_iv(graph, val_id, iv_phi_id, iv_final, consts));
+    }
+
+    // All property values must be computable as constants.
+    if final_values.iter().any(|v| v.is_none()) {
+        for (i, v) in final_values.iter().enumerate() {
+            if v.is_none() {
+                let val_id = create_values[i];
+                let node = graph.node(val_id);
+                eprintln!(
+                    "[OBJ_FWD] bail: property {i} (val_id={val_id:?}) not evaluable: {:?}",
+                    node.map(std::mem::discriminant)
+                );
+            }
+        }
+        return false;
+    }
+    eprintln!("[OBJ_FWD] final values: {final_values:?}");
+
+    // ── 5. Find post-loop LoadGlobal → LoadNamedGeneric and replace ──────
+    // Scan ALL blocks outside the loop for LoadGlobal(obj_global_name).
+    let mut load_global_ids: Vec<NodeId> = Vec::new();
+    for block in graph.blocks() {
+        if lp.body.contains(&block.id) {
+            continue;
+        }
+        for (nid, node) in &block.nodes {
+            if let ValueNode::LoadGlobal { name, .. } = node
+                && *name == obj_global_name
+            {
+                load_global_ids.push(*nid);
+            }
+        }
+    }
+
+    if load_global_ids.is_empty() {
+        return false;
+    }
+
+    // Build property name → final constant value map.
+    let mut prop_finals: HashMap<u32, i32> = HashMap::new();
+    for (name, val) in create_names.iter().zip(final_values.iter()) {
+        prop_finals.insert(*name, val.unwrap());
+    }
+
+    // Find LoadNamedGeneric nodes that load from the post-loop LoadGlobal
+    // and replace them with SmiConstants.
+    let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
+    let mut new_constants: Vec<(NodeId, i32)> = Vec::new();
+
+    // Collect (load_nid, final_val) pairs first to avoid borrow conflict.
+    let mut pending_replacements: Vec<(NodeId, i32)> = Vec::new();
+    for block in graph.blocks() {
+        if lp.body.contains(&block.id) {
+            continue;
+        }
+        for (nid, node) in &block.nodes {
+            if let ValueNode::LoadNamedGeneric { object, name, .. } = node
+                && load_global_ids.contains(object)
+                && let Some(&final_val) = prop_finals.get(name)
+            {
+                pending_replacements.push((*nid, final_val));
+            }
+        }
+    }
+
+    for (load_nid, final_val) in pending_replacements {
+        let const_id = graph.alloc_node_id();
+        new_constants.push((const_id, final_val));
+        subst.insert(load_nid, const_id);
+    }
+
+    if subst.is_empty() {
+        return false;
+    }
+
+    // ── 6. Apply: insert constants, replace loads, kill body allocs ──────
+    // Insert new SmiConstants in the exit block.
+    if let Some(exit_block) = graph.block_mut(exit_block_idx) {
+        for (idx, (const_id, val)) in new_constants.iter().enumerate() {
+            exit_block
+                .nodes
+                .insert(idx, (*const_id, ValueNode::SmiConstant { value: *val }));
+        }
+    }
+
+    // Replace LoadNamedGeneric nodes with UndefinedConstant (their uses
+    // have been redirected via subst).
+    for block in graph.blocks_mut() {
+        if lp.body.contains(&block.id) {
+            continue;
+        }
+        for (nid, node) in &mut block.nodes {
+            if subst.contains_key(nid) {
+                *node = ValueNode::UndefinedConstant;
+            }
+        }
+        apply_subst_to_block(block, &subst);
+    }
+
+    // Kill the CreateObjectLiteralWithProperties and StoreGlobal in the
+    // body.  Replace with UndefinedConstant so DCE can clean up.
+    if let Some(body) = graph.block_mut(body_block_idx) {
+        if let Some(idx) = store_global_idx {
+            body.nodes[idx].1 = ValueNode::UndefinedConstant;
+        }
+        if let Some(idx) = create_obj_idx {
+            body.nodes[idx].1 = ValueNode::UndefinedConstant;
+        }
+    }
+
+    true
+}
+
+/// Evaluate a pure expression tree at a specific IV value.
+///
+/// Returns `Some(value)` if the expression is a constant or a pure affine
+/// function of the given IV Phi.  Returns `None` for anything else (calls,
+/// loads, side-effecting nodes, etc.).
+fn eval_at_iv(
+    graph: &MaglevGraph,
+    node_id: NodeId,
+    iv_phi: NodeId,
+    iv_value: i32,
+    consts: &HashMap<NodeId, i32>,
+) -> Option<i32> {
+    if node_id == iv_phi {
+        return Some(iv_value);
+    }
+
+    // Check constant map first.
+    if let Some(&v) = consts.get(&node_id) {
+        return Some(v);
+    }
+
+    let node = graph.node(node_id)?;
+    match node {
+        ValueNode::SmiConstant { value } | ValueNode::Int32Constant { value } => Some(*value),
+
+        // Pure binary arithmetic (Int32)
+        ValueNode::Int32Add { left, right } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            l.checked_add(r)
+        }
+        ValueNode::Int32Subtract { left, right } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            l.checked_sub(r)
+        }
+        ValueNode::Int32Multiply { left, right } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            l.checked_mul(r)
+        }
+
+        // Checked Smi variants (same semantics for constant eval)
+        ValueNode::CheckedSmiAdd { left, right } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            l.checked_add(r)
+        }
+        ValueNode::CheckedSmiSubtract { left, right } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            l.checked_sub(r)
+        }
+        ValueNode::CheckedSmiMultiply { left, right } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            l.checked_mul(r)
+        }
+
+        // Generic variants with feedback (same constant eval)
+        ValueNode::GenericAdd { left, right, .. } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            l.checked_add(r)
+        }
+        ValueNode::GenericSubtract { left, right, .. } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            l.checked_sub(r)
+        }
+        ValueNode::GenericMultiply { left, right, .. } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            l.checked_mul(r)
+        }
+
+        // Int32 bitwise OR (used in `| 0` truncation pattern)
+        ValueNode::Int32BitwiseOr { left, right } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            Some(l | r)
+        }
+        ValueNode::Int32ShiftLeft { left, right } => {
+            let l = eval_at_iv(graph, *left, iv_phi, iv_value, consts)?;
+            let r = eval_at_iv(graph, *right, iv_phi, iv_value, consts)?;
+            Some(l.wrapping_shl(r as u32))
+        }
+
+        _ => None,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
