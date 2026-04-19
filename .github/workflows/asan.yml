@@ -16,12 +16,15 @@ jobs:
     name: ASAN (FFI boundary tests)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Known issue: Rc<RefCell> prototype chains form reference cycles that
-    # leak under ASAN.  Tracked for fix when the engine moves to a tracing GC.
-    continue-on-error: true
     env:
       RUSTFLAGS: "-Z sanitizer=address"
       RUSTDOCFLAGS: "-Z sanitizer=address"
+      # Disable LSAN leak detection: Rc<RefCell> prototype chains form
+      # reference cycles (e.g. Ctor → Ctor.prototype → constructor → Ctor)
+      # that LSAN reports as leaks.  ASAN memory-corruption checks
+      # (use-after-free, buffer overflow, etc.) remain fully enabled.
+      # Tracked: re-enable once the engine moves to a tracing GC.
+      LSAN_OPTIONS: "detect_leaks=0"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
