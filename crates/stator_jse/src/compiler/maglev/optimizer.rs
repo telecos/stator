@@ -3490,6 +3490,16 @@ fn forward_loop_object_properties(graph: &mut MaglevGraph) {
 }
 
 /// Try to forward object property loads for a single counted loop.
+///
+/// After `promote_loop_globals_counted`, a write-only global like `last` in
+/// `for (...) { last = { x: i, ... }; }` becomes a header Phi whose back-edge
+/// input is a `CreateObjectLiteralWithProperties`.  Post-loop property loads
+/// appear as `LoadNamedGeneric(obj_phi, "x")`.
+///
+/// This pass detects that pattern, evaluates each property value at the final
+/// IV value (limit - step), and replaces the post-loop property loads with
+/// SmiConstants.  If the object Phi has no remaining uses after replacement,
+/// the in-loop allocation is killed.
 fn try_forward_loop_object(
     graph: &mut MaglevGraph,
     lp: &licm::NaturalLoop,
@@ -3513,11 +3523,9 @@ fn try_forward_loop_object(
     if !lp.body.contains(&body_block_idx) {
         return false;
     }
-    // Exit must be outside the loop.
     if lp.body.contains(&exit_block_idx) {
         return false;
     }
-
     // Simple loop: header + 1 body block.
     if lp.body.len() != 2 || !lp.body.contains(&lp.header) {
         return false;
@@ -3527,8 +3535,6 @@ fn try_forward_loop_object(
         Some(b) => b,
         None => return false,
     };
-
-    // Body must jump back to header.
     match &body.control {
         Some(ControlNode::Jump { target }) if *target == lp.header => {}
         _ => return false,
@@ -3545,13 +3551,7 @@ fn try_forward_loop_object(
         }
         match &found {
             Some(ValueNode::Int32LessThan { left, right }) => (*left, *right),
-            other => {
-                eprintln!(
-                    "[OBJ_FWD] bail: header condition is {:?}, not Int32LessThan",
-                    other.as_ref().map(std::mem::discriminant)
-                );
-                return false;
-            }
+            _ => return false,
         }
     };
 
@@ -3612,70 +3612,44 @@ fn try_forward_loop_object(
     if range <= 0 || range % step != 0 {
         return false;
     }
-    let trip_count = range / step;
-    if trip_count == 0 {
+    if range / step == 0 {
         return false;
     }
 
-    // The IV value on the LAST body execution.
     let iv_final = iv_limit - iv_step;
 
-    // ── 3. Find CreateObjectLiteralWithProperties + StoreGlobal in body ──
-    let body = graph.block(body_block_idx).unwrap();
-    let mut obj_global_name: Option<u32> = None;
+    // ── 3. Find "object Phi" in header whose back-edge is CreateObjWithProps
+    let header = graph.block(lp.header).unwrap();
+    let mut obj_phi_id: Option<NodeId> = None;
     let mut create_obj_id: Option<NodeId> = None;
     let mut create_names: Vec<u32> = Vec::new();
     let mut create_values: Vec<NodeId> = Vec::new();
-    let mut store_global_idx: Option<usize> = None;
-    let mut create_obj_idx: Option<usize> = None;
 
-    for (idx, (nid, node)) in body.nodes.iter().enumerate() {
-        if let ValueNode::CreateObjectLiteralWithProperties { names, values, .. } = node {
-            create_obj_id = Some(*nid);
-            create_names = names.clone();
-            create_values = values.clone();
-            create_obj_idx = Some(idx);
+    for (nid, node) in &header.nodes {
+        if *nid == iv_phi_id {
+            continue; // skip the IV Phi
         }
-        if let ValueNode::StoreGlobal { name, value, .. } = node
-            && create_obj_id == Some(*value)
+        if let ValueNode::Phi { inputs } = node
+            && inputs.len() == 2
         {
-            obj_global_name = Some(*name);
-            store_global_idx = Some(idx);
-        }
-    }
-
-    let obj_global_name = match obj_global_name {
-        Some(n) => n,
-        None => {
-            // Dump body node types for debugging.
-            let body = graph.block(body_block_idx).unwrap();
-            let types: Vec<_> = body
-                .nodes
-                .iter()
-                .map(|(_, n)| format!("{:?}", std::mem::discriminant(n)))
-                .collect();
-            eprintln!("[OBJ_FWD] bail: no CreateObjWithProps+StoreGlobal in body. nodes={types:?}");
-            return false;
-        }
-    };
-    let _create_obj_id = create_obj_id.unwrap();
-    eprintln!(
-        "[OBJ_FWD] found: global_name={obj_global_name} create_values={} iv_final={iv_final}",
-        create_values.len()
-    );
-
-    // Verify: no LoadGlobal of the same name inside the loop body.
-    for block_id in &lp.body {
-        if let Some(block) = graph.block(*block_id) {
-            for (_, node) in &block.nodes {
-                if let ValueNode::LoadGlobal { name, .. } = node
-                    && *name == obj_global_name
-                {
-                    return false;
-                }
+            let back_edge_id = inputs[back_pred_pos];
+            if let Some(ValueNode::CreateObjectLiteralWithProperties { names, values, .. }) =
+                graph.node(back_edge_id)
+            {
+                obj_phi_id = Some(*nid);
+                create_obj_id = Some(back_edge_id);
+                create_names = names.clone();
+                create_values = values.clone();
+                break;
             }
         }
     }
+
+    let obj_phi_id = match obj_phi_id {
+        Some(id) => id,
+        None => return false,
+    };
+    let create_obj_id = create_obj_id.unwrap();
 
     // ── 4. Evaluate property values at IV = iv_final ─────────────────────
     let mut final_values: Vec<Option<i32>> = Vec::new();
@@ -3683,81 +3657,88 @@ fn try_forward_loop_object(
         final_values.push(eval_at_iv(graph, val_id, iv_phi_id, iv_final, consts));
     }
 
-    // All property values must be computable as constants.
     if final_values.iter().any(|v| v.is_none()) {
-        for (i, v) in final_values.iter().enumerate() {
-            if v.is_none() {
-                let val_id = create_values[i];
-                let node = graph.node(val_id);
-                eprintln!(
-                    "[OBJ_FWD] bail: property {i} (val_id={val_id:?}) not evaluable: {:?}",
-                    node.map(std::mem::discriminant)
-                );
-            }
-        }
-        return false;
-    }
-    eprintln!("[OBJ_FWD] final values: {final_values:?}");
-
-    // ── 5. Find post-loop LoadGlobal → LoadNamedGeneric and replace ──────
-    // Scan ALL blocks outside the loop for LoadGlobal(obj_global_name).
-    let mut load_global_ids: Vec<NodeId> = Vec::new();
-    for block in graph.blocks() {
-        if lp.body.contains(&block.id) {
-            continue;
-        }
-        for (nid, node) in &block.nodes {
-            if let ValueNode::LoadGlobal { name, .. } = node
-                && *name == obj_global_name
-            {
-                load_global_ids.push(*nid);
-            }
-        }
-    }
-
-    if load_global_ids.is_empty() {
         return false;
     }
 
+    // ── 5. Find post-loop LoadNamedGeneric that loads from obj_phi ────────
     // Build property name → final constant value map.
     let mut prop_finals: HashMap<u32, i32> = HashMap::new();
     for (name, val) in create_names.iter().zip(final_values.iter()) {
         prop_finals.insert(*name, val.unwrap());
     }
 
-    // Find LoadNamedGeneric nodes that load from the post-loop LoadGlobal
-    // and replace them with SmiConstants.
     let mut subst: HashMap<NodeId, NodeId> = HashMap::new();
     let mut new_constants: Vec<(NodeId, i32)> = Vec::new();
 
-    // Collect (load_nid, final_val) pairs first to avoid borrow conflict.
-    let mut pending_replacements: Vec<(NodeId, i32)> = Vec::new();
+    // Collect replacements: LoadNamedGeneric(obj_phi_id, prop_name) → const.
+    let mut pending: Vec<(NodeId, i32)> = Vec::new();
     for block in graph.blocks() {
         if lp.body.contains(&block.id) {
             continue;
         }
         for (nid, node) in &block.nodes {
             if let ValueNode::LoadNamedGeneric { object, name, .. } = node
-                && load_global_ids.contains(object)
+                && *object == obj_phi_id
                 && let Some(&final_val) = prop_finals.get(name)
             {
-                pending_replacements.push((*nid, final_val));
+                pending.push((*nid, final_val));
             }
         }
     }
 
-    for (load_nid, final_val) in pending_replacements {
-        let const_id = graph.alloc_node_id();
-        new_constants.push((const_id, final_val));
-        subst.insert(load_nid, const_id);
-    }
-
-    if subst.is_empty() {
+    if pending.is_empty() {
         return false;
     }
 
-    // ── 6. Apply: insert constants, replace loads, kill body allocs ──────
-    // Insert new SmiConstants in the exit block.
+    for (load_nid, final_val) in &pending {
+        let const_id = graph.alloc_node_id();
+        new_constants.push((const_id, *final_val));
+        subst.insert(*load_nid, const_id);
+    }
+
+    // ── 6. Safety: check that obj_phi has no uses outside the replaced loads
+    // Collect all uses of obj_phi across the entire graph.
+    let replaced_set: HashSet<NodeId> = subst.keys().copied().collect();
+    for block in graph.blocks() {
+        for (nid, node) in &block.nodes {
+            if replaced_set.contains(nid) || *nid == obj_phi_id {
+                continue;
+            }
+            // Check if any operand references obj_phi.
+            let refs = node_operands(node);
+            if refs.contains(&obj_phi_id) {
+                // obj_phi escapes — bail out, but still replace the loads
+                // since property forwarding is still valid (the object's
+                // properties at the last iteration are correct constants).
+                // Just don't kill the allocation.
+                // Apply load replacements only.
+                return apply_load_replacements_only(
+                    graph,
+                    lp,
+                    exit_block_idx,
+                    &new_constants,
+                    &subst,
+                );
+            }
+        }
+        // Also check the block control node for uses of obj_phi.
+        if let Some(ctrl) = &block.control {
+            let ctrl_refs = control_operands(ctrl);
+            if ctrl_refs.contains(&obj_phi_id) {
+                return apply_load_replacements_only(
+                    graph,
+                    lp,
+                    exit_block_idx,
+                    &new_constants,
+                    &subst,
+                );
+            }
+        }
+    }
+
+    // ── 7. Apply: insert constants, replace loads, kill body allocs ──────
+    // Insert SmiConstants at the start of the exit block.
     if let Some(exit_block) = graph.block_mut(exit_block_idx) {
         for (idx, (const_id, val)) in new_constants.iter().enumerate() {
             exit_block
@@ -3766,8 +3747,7 @@ fn try_forward_loop_object(
         }
     }
 
-    // Replace LoadNamedGeneric nodes with UndefinedConstant (their uses
-    // have been redirected via subst).
+    // Replace LoadNamedGeneric nodes with UndefinedConstant.
     for block in graph.blocks_mut() {
         if lp.body.contains(&block.id) {
             continue;
@@ -3780,18 +3760,118 @@ fn try_forward_loop_object(
         apply_subst_to_block(block, &subst);
     }
 
-    // Kill the CreateObjectLiteralWithProperties and StoreGlobal in the
-    // body.  Replace with UndefinedConstant so DCE can clean up.
-    if let Some(body) = graph.block_mut(body_block_idx) {
-        if let Some(idx) = store_global_idx {
-            body.nodes[idx].1 = ValueNode::UndefinedConstant;
+    // Kill CreateObjectLiteralWithProperties in the body (obj_phi has no
+    // remaining uses, so the allocation is dead).
+    for block in graph.blocks_mut() {
+        if !lp.body.contains(&block.id) || block.id == lp.header {
+            continue;
         }
-        if let Some(idx) = create_obj_idx {
-            body.nodes[idx].1 = ValueNode::UndefinedConstant;
+        for (nid, node) in &mut block.nodes {
+            if *nid == create_obj_id {
+                *node = ValueNode::UndefinedConstant;
+            }
+        }
+    }
+
+    // Update the obj_phi's back-edge input to UndefinedConstant sentinel.
+    // The Phi itself is now dead (no uses) and will be cleaned by DCE.
+    if let Some(hdr) = graph.block_mut(lp.header) {
+        for (nid, node) in &mut hdr.nodes {
+            if *nid == obj_phi_id
+                && let ValueNode::Phi { inputs } = node
+            {
+                inputs[back_pred_pos] = inputs[entry_pos];
+            }
         }
     }
 
     true
+}
+
+/// Apply only the load→constant replacements without killing the allocation.
+/// Used when the object Phi escapes (has uses beyond the forwarded loads).
+fn apply_load_replacements_only(
+    graph: &mut MaglevGraph,
+    lp: &licm::NaturalLoop,
+    exit_block_idx: u32,
+    new_constants: &[(NodeId, i32)],
+    subst: &HashMap<NodeId, NodeId>,
+) -> bool {
+    if let Some(exit_block) = graph.block_mut(exit_block_idx) {
+        for (idx, (const_id, val)) in new_constants.iter().enumerate() {
+            exit_block
+                .nodes
+                .insert(idx, (*const_id, ValueNode::SmiConstant { value: *val }));
+        }
+    }
+    for block in graph.blocks_mut() {
+        if lp.body.contains(&block.id) {
+            continue;
+        }
+        for (nid, node) in &mut block.nodes {
+            if subst.contains_key(nid) {
+                *node = ValueNode::UndefinedConstant;
+            }
+        }
+        apply_subst_to_block(block, subst);
+    }
+    true
+}
+
+/// Collect all NodeId operands of a value node.
+fn node_operands(node: &ValueNode) -> Vec<NodeId> {
+    match node {
+        ValueNode::Phi { inputs } => inputs.clone(),
+        ValueNode::Int32Add { left, right }
+        | ValueNode::Int32Subtract { left, right }
+        | ValueNode::Int32Multiply { left, right }
+        | ValueNode::Int32LessThan { left, right }
+        | ValueNode::Int32BitwiseOr { left, right }
+        | ValueNode::Int32BitwiseAnd { left, right }
+        | ValueNode::Int32ShiftLeft { left, right }
+        | ValueNode::Int32ShiftRight { left, right }
+        | ValueNode::CheckedSmiAdd { left, right }
+        | ValueNode::CheckedSmiSubtract { left, right }
+        | ValueNode::CheckedSmiMultiply { left, right }
+        | ValueNode::GenericAdd { left, right, .. }
+        | ValueNode::GenericSubtract { left, right, .. }
+        | ValueNode::GenericMultiply { left, right, .. } => vec![*left, *right],
+        ValueNode::LoadNamedGeneric { object, .. } => vec![*object],
+        ValueNode::StoreNamedGeneric { object, value, .. } => vec![*object, *value],
+        ValueNode::StoreGlobal { value, .. } => vec![*value],
+        ValueNode::Call {
+            callee,
+            receiver,
+            args,
+            ..
+        } => {
+            let mut v = vec![*callee, *receiver];
+            v.extend(args);
+            v
+        }
+        ValueNode::CallKnownFunction {
+            callee,
+            receiver,
+            args,
+            ..
+        } => {
+            let mut v = vec![*callee, *receiver];
+            v.extend(args);
+            v
+        }
+        ValueNode::CreateObjectLiteralWithProperties { values, .. } => values.clone(),
+        ValueNode::CheckMaps { receiver, .. } => vec![*receiver],
+        _ => Vec::new(),
+    }
+}
+
+/// Collect all NodeId operands of a control node.
+fn control_operands(ctrl: &ControlNode) -> Vec<NodeId> {
+    match ctrl {
+        ControlNode::Branch { condition, .. } => vec![*condition],
+        ControlNode::Return { value } => vec![*value],
+        _ => Vec::new(),
+    }
 }
 
 /// Evaluate a pure expression tree at a specific IV value.
