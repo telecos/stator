@@ -3843,43 +3843,44 @@ fn try_forward_loop_object(
     }
 
     // ── 6. Safety: check that obj_phi has no uses outside the replaced loads
-    // Collect all uses of obj_phi across the entire graph.
+    //      and exit StoreGlobal nodes.  Exit StoreGlobals that store the
+    //      obj_phi can be killed (their only purpose was materialising the
+    //      object for post-loop reads, which are now constants).
     let replaced_set: HashSet<NodeId> = subst.keys().copied().collect();
+    let mut exit_store_globals_to_kill: Vec<NodeId> = Vec::new();
+    let mut truly_escapes = false;
     for block in graph.blocks() {
         for (nid, node) in &block.nodes {
             if replaced_set.contains(nid) || *nid == obj_phi_id {
                 continue;
             }
-            // Check if any operand references obj_phi.
             let refs = node_operands(node);
             if refs.contains(&obj_phi_id) {
-                // obj_phi escapes — bail out, but still replace the loads
-                // since property forwarding is still valid (the object's
-                // properties at the last iteration are correct constants).
-                // Just don't kill the allocation.
-                // Apply load replacements only.
-                return apply_load_replacements_only(
-                    graph,
-                    lp,
-                    exit_block_idx,
-                    &new_constants,
-                    &subst,
-                );
+                // Allow StoreGlobal in exit blocks — these just materialise
+                // the object for post-loop reads that are already forwarded.
+                if !lp.body.contains(&block.id)
+                    && matches!(node, ValueNode::StoreGlobal { .. })
+                {
+                    exit_store_globals_to_kill.push(*nid);
+                    continue;
+                }
+                truly_escapes = true;
+                break;
             }
         }
-        // Also check the block control node for uses of obj_phi.
+        if truly_escapes {
+            break;
+        }
         if let Some(ctrl) = &block.control {
             let ctrl_refs = control_operands(ctrl);
             if ctrl_refs.contains(&obj_phi_id) {
-                return apply_load_replacements_only(
-                    graph,
-                    lp,
-                    exit_block_idx,
-                    &new_constants,
-                    &subst,
-                );
+                truly_escapes = true;
+                break;
             }
         }
+    }
+    if truly_escapes {
+        return apply_load_replacements_only(graph, lp, exit_block_idx, &new_constants, &subst);
     }
 
     // ── 7. Apply: insert constants, replace loads, kill body allocs ──────
@@ -3899,6 +3900,10 @@ fn try_forward_loop_object(
         }
         for (nid, node) in &mut block.nodes {
             if subst.contains_key(nid) {
+                *node = ValueNode::UndefinedConstant;
+            }
+            // Kill exit StoreGlobal nodes that stored the now-dead obj_phi.
+            if exit_store_globals_to_kill.contains(nid) {
                 *node = ValueNode::UndefinedConstant;
             }
         }
