@@ -116,6 +116,57 @@ pub fn globals_promoted_diagnostics() -> (u32, u32) {
 ///
 /// Multiple rounds are *not* performed; a single sweep of each pass is
 /// sufficient for the patterns targeted here.
+// Temporary diagnostic: dump all Phi nodes in loop headers.
+fn dump_header_phis(graph: &MaglevGraph, label: &str) {
+    let loops = crate::compiler::maglev::licm::detect_loops(graph);
+    for lp in &loops {
+        if let Some(header) = graph.block(lp.header) {
+            let bc_len = 0u32; // placeholder - bytecodes not accessible from graph
+            for (nid, node) in &header.nodes {
+                if let ValueNode::Phi { inputs } = node {
+                    let types: Vec<String> = inputs
+                        .iter()
+                        .map(|inp| match graph.node(*inp) {
+                            Some(ValueNode::CreateObjectLiteral { .. }) => {
+                                format!("CreateObjLit({inp:?})")
+                            }
+                            Some(ValueNode::CreateObjectLiteralWithProperties { .. }) => {
+                                format!("CreateObjWithProps({inp:?})")
+                            }
+                            Some(ValueNode::CreateEmptyObjectLiteral) => {
+                                format!("CreateEmptyObj({inp:?})")
+                            }
+                            Some(ValueNode::UndefinedConstant) => format!("Undefined({inp:?})"),
+                            Some(ValueNode::Phi { .. }) => format!("Phi({inp:?})"),
+                            Some(ValueNode::SmiConstant { value }) => {
+                                format!("Smi({value})({inp:?})")
+                            }
+                            Some(ValueNode::CheckedSmiIncrement { .. }) => {
+                                format!("CheckedSmiInc({inp:?})")
+                            }
+                            Some(ValueNode::GenericAdd { .. }) => format!("GenericAdd({inp:?})"),
+                            Some(ValueNode::GenericMultiply { .. }) => {
+                                format!("GenericMul({inp:?})")
+                            }
+                            Some(ValueNode::Int32Add { .. }) => format!("Int32Add({inp:?})"),
+                            Some(ValueNode::CheckedSmiAdd { .. }) => {
+                                format!("CheckedSmiAdd({inp:?})")
+                            }
+                            Some(n) => format!("disc{:?}({inp:?})", std::mem::discriminant(n)),
+                            None => format!("MISSING({inp:?})"),
+                        })
+                        .collect();
+                    eprintln!(
+                        "[{label}] bc={bc_len} phi {nid:?} inputs=[{}]",
+                        types.join(", ")
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Run the full optimization pipeline on the Maglev graph.
 pub fn optimize(graph: &mut MaglevGraph) {
     let _block_count = graph.blocks().len();
     let _node_count: usize = graph.blocks().iter().map(|b| b.nodes.len()).sum();
@@ -143,6 +194,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // current graph structure.
     eliminate_common_subexpressions(graph);
     let _globals_promoted = promote_loop_globals_counted(graph);
+    dump_header_phis(graph, "AFTER_PROMOTE");
     eliminate_trivial_phis(graph);
     let _licm_hoisted2 = crate::compiler::maglev::licm::hoist_loop_invariants(graph);
     // Re-run range analysis after global promotion: promotion replaces
@@ -169,6 +221,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
     fuse_object_literal_stores(graph);
+    dump_header_phis(graph, "AFTER_FUSE");
     forward_invariant_object_properties(graph);
     eliminate_store_to_load(graph);
     // Re-run constant folding: store-to-load forwarding may replace
@@ -2144,6 +2197,40 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
         if !lp.body.contains(&block.id) {
             continue;
         }
+        // ── diagnostic: dump all nodes in the body ──
+        for (id, node) in &block.nodes {
+            let detail = match node {
+                ValueNode::StoreGlobal { name, value, .. } => {
+                    format!("StoreGlobal(name={name}, value={value:?})")
+                }
+                ValueNode::LoadGlobal { name, .. } => format!("LoadGlobal(name={name})"),
+                ValueNode::StoreNamedGeneric {
+                    object,
+                    name,
+                    value,
+                    ..
+                } => {
+                    format!("StoreNamed(obj={object:?}, name={name}, val={value:?})")
+                }
+                ValueNode::CreateEmptyObjectLiteral => "CreateEmptyObjLit".to_string(),
+                ValueNode::GenericAdd { left, right, .. } => {
+                    format!("GenericAdd(l={left:?}, r={right:?})")
+                }
+                ValueNode::GenericMultiply { left, right, .. } => {
+                    format!("GenericMul(l={left:?}, r={right:?})")
+                }
+                ValueNode::GenericIncrement { value: v, .. } => {
+                    format!("GenericInc(val={v:?})")
+                }
+                ValueNode::Phi { inputs } => {
+                    format!("Phi(inputs={inputs:?})")
+                }
+                ValueNode::SmiConstant { value } => format!("Smi({value})"),
+                _ => format!("{:?}", std::mem::discriminant(node)),
+            };
+            eprintln!("[BODY_NODE] block={} id={id:?} {detail}", block.id);
+        }
+        // ── end diagnostic ──
         for (id, node) in &block.nodes {
             match node {
                 ValueNode::LoadGlobal {
@@ -2174,6 +2261,20 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
             }
         }
     }
+
+    // ── diagnostic: print all StoreGlobal nodes found in the body ──
+    for (&name, (val, ids, _slot)) in &store_info {
+        let val_type = match graph.node(*val) {
+            Some(n) => format!("{:?}", std::mem::discriminant(n)),
+            None => "MISSING".to_string(),
+        };
+        eprintln!(
+            "[PROMOTE_DIAG] StoreGlobal name={name} value={val:?} \
+             value_type={val_type} store_count={}",
+            ids.len()
+        );
+    }
+    // ── end diagnostic ──
 
     // Promotable globals: any global stored inside the loop (read-write OR
     // write-only).  Read-only globals are already handled by LICM, so we only
@@ -2332,9 +2433,11 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
     }
 
     // At each exit, prepend StoreGlobal nodes for each promoted global.
-    // The value to store is the StoreGlobal's original value input (the
-    // computed value from the loop body), which has been substituted through
-    // the Phi chain.
+    // The value to store is the Phi (not the body's raw value): the Phi
+    // correctly holds the preheader value when the loop doesn't execute
+    // and the last-iteration value otherwise.  Using the Phi also keeps it
+    // alive through DCE, which is essential for downstream passes like
+    // forward_loop_object_properties that pattern-match on Phi back-edges.
     for &exit_id in &exit_blocks {
         for pg in promoted.iter().rev() {
             let store_id = graph.alloc_node_id();
@@ -2345,7 +2448,7 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
                         store_id,
                         ValueNode::StoreGlobal {
                             name: pg.name,
-                            value: pg.store_value_id,
+                            value: pg.phi_id,
                             feedback_slot: pg.feedback_slot,
                         },
                     ),
@@ -3551,7 +3654,13 @@ fn try_forward_loop_object(
         }
         match &found {
             Some(ValueNode::Int32LessThan { left, right }) => (*left, *right),
-            _ => return false,
+            _ => {
+                eprintln!(
+                    "[OBJ_FWD] bail: condition not Int32LessThan, type={:?}",
+                    found.as_ref().map(std::mem::discriminant)
+                );
+                return false;
+            }
         }
     };
 
@@ -3569,7 +3678,10 @@ fn try_forward_loop_object(
         }
         match found {
             Some(inputs) if inputs.len() == 2 => inputs,
-            _ => return false,
+            _ => {
+                eprintln!("[OBJ_FWD] bail: IV phi {iv_phi_id:?} not found or wrong input count");
+                return false;
+            }
         }
     };
 
@@ -3650,8 +3762,18 @@ fn try_forward_loop_object(
                 Some(ValueNode::LoadNamedGeneric { .. }) => "LoadNamedGeneric",
                 Some(ValueNode::CheckedSmiAdd { .. }) => "CheckedSmiAdd",
                 Some(ValueNode::Int32Add { .. }) => "Int32Add",
+                Some(ValueNode::GenericAdd { .. }) => "GenericAdd",
+                Some(ValueNode::GenericMultiply { .. }) => "GenericMultiply",
+                Some(ValueNode::GenericIncrement { .. }) => "GenericIncrement",
+                Some(ValueNode::CheckedSmiIncrement { .. }) => "CheckedSmiIncrement",
                 None => "MISSING",
-                _ => "other",
+                _ => {
+                    eprintln!(
+                        "[OBJ_FWD] unknown back_edge disc={:?}",
+                        back_node.map(std::mem::discriminant)
+                    );
+                    "other"
+                }
             };
             eprintln!("[OBJ_FWD] phi {nid:?} back={back_edge_id:?} type={type_name}");
             if let Some(ValueNode::CreateObjectLiteralWithProperties { names, values, .. }) =
@@ -3730,43 +3852,42 @@ fn try_forward_loop_object(
     }
 
     // ── 6. Safety: check that obj_phi has no uses outside the replaced loads
-    // Collect all uses of obj_phi across the entire graph.
+    //      and exit StoreGlobal nodes.  Exit StoreGlobals that store the
+    //      obj_phi can be killed (their only purpose was materialising the
+    //      object for post-loop reads, which are now constants).
     let replaced_set: HashSet<NodeId> = subst.keys().copied().collect();
+    let mut exit_store_globals_to_kill: Vec<NodeId> = Vec::new();
+    let mut truly_escapes = false;
     for block in graph.blocks() {
         for (nid, node) in &block.nodes {
             if replaced_set.contains(nid) || *nid == obj_phi_id {
                 continue;
             }
-            // Check if any operand references obj_phi.
             let refs = node_operands(node);
             if refs.contains(&obj_phi_id) {
-                // obj_phi escapes — bail out, but still replace the loads
-                // since property forwarding is still valid (the object's
-                // properties at the last iteration are correct constants).
-                // Just don't kill the allocation.
-                // Apply load replacements only.
-                return apply_load_replacements_only(
-                    graph,
-                    lp,
-                    exit_block_idx,
-                    &new_constants,
-                    &subst,
-                );
+                // Allow StoreGlobal in exit blocks — these just materialise
+                // the object for post-loop reads that are already forwarded.
+                if !lp.body.contains(&block.id) && matches!(node, ValueNode::StoreGlobal { .. }) {
+                    exit_store_globals_to_kill.push(*nid);
+                    continue;
+                }
+                truly_escapes = true;
+                break;
             }
         }
-        // Also check the block control node for uses of obj_phi.
+        if truly_escapes {
+            break;
+        }
         if let Some(ctrl) = &block.control {
             let ctrl_refs = control_operands(ctrl);
             if ctrl_refs.contains(&obj_phi_id) {
-                return apply_load_replacements_only(
-                    graph,
-                    lp,
-                    exit_block_idx,
-                    &new_constants,
-                    &subst,
-                );
+                truly_escapes = true;
+                break;
             }
         }
+    }
+    if truly_escapes {
+        return apply_load_replacements_only(graph, lp, exit_block_idx, &new_constants, &subst);
     }
 
     // ── 7. Apply: insert constants, replace loads, kill body allocs ──────
@@ -3786,6 +3907,10 @@ fn try_forward_loop_object(
         }
         for (nid, node) in &mut block.nodes {
             if subst.contains_key(nid) {
+                *node = ValueNode::UndefinedConstant;
+            }
+            // Kill exit StoreGlobal nodes that stored the now-dead obj_phi.
+            if exit_store_globals_to_kill.contains(nid) {
                 *node = ValueNode::UndefinedConstant;
             }
         }
