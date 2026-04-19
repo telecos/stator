@@ -2197,6 +2197,40 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
         if !lp.body.contains(&block.id) {
             continue;
         }
+        // ── diagnostic: dump all nodes in the body ──
+        for (id, node) in &block.nodes {
+            let detail = match node {
+                ValueNode::StoreGlobal { name, value, .. } => {
+                    format!("StoreGlobal(name={name}, value={value:?})")
+                }
+                ValueNode::LoadGlobal { name, .. } => format!("LoadGlobal(name={name})"),
+                ValueNode::StoreNamedGeneric {
+                    object,
+                    name,
+                    value,
+                    ..
+                } => {
+                    format!("StoreNamed(obj={object:?}, name={name}, val={value:?})")
+                }
+                ValueNode::CreateEmptyObjectLiteral => "CreateEmptyObjLit".to_string(),
+                ValueNode::GenericAdd { left, right, .. } => {
+                    format!("GenericAdd(l={left:?}, r={right:?})")
+                }
+                ValueNode::GenericMultiply { left, right, .. } => {
+                    format!("GenericMul(l={left:?}, r={right:?})")
+                }
+                ValueNode::GenericIncrement { value: v, .. } => {
+                    format!("GenericInc(val={v:?})")
+                }
+                ValueNode::Phi { inputs } => {
+                    format!("Phi(inputs={inputs:?})")
+                }
+                ValueNode::SmiConstant { value } => format!("Smi({value})"),
+                _ => format!("{:?}", std::mem::discriminant(node)),
+            };
+            eprintln!("[BODY_NODE] block={} id={id:?} {detail}", block.id);
+        }
+        // ── end diagnostic ──
         for (id, node) in &block.nodes {
             match node {
                 ValueNode::LoadGlobal {
@@ -2227,6 +2261,20 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
             }
         }
     }
+
+    // ── diagnostic: print all StoreGlobal nodes found in the body ──
+    for (&name, (val, ids, _slot)) in &store_info {
+        let val_type = match graph.node(*val) {
+            Some(n) => format!("{:?}", std::mem::discriminant(n)),
+            None => "MISSING".to_string(),
+        };
+        eprintln!(
+            "[PROMOTE_DIAG] StoreGlobal name={name} value={val:?} \
+             value_type={val_type} store_count={}",
+            ids.len()
+        );
+    }
+    // ── end diagnostic ──
 
     // Promotable globals: any global stored inside the loop (read-write OR
     // write-only).  Read-only globals are already handled by LICM, so we only
