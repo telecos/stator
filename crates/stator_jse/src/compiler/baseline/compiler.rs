@@ -3242,42 +3242,6 @@ pub(crate) mod jit_runtime {
     }
 
     /// Borrow a [`BytecodeArray`] behind a JIT heap handle without cloning the
-    /// [`Rc`].  The closure `f` receives a shared reference valid for the
-    /// duration of the call.
-    ///
-    /// Returns `None` when `handle` is not a heap-object handle or the object
-    /// is not a [`JsValue::Function`].
-    #[inline]
-    fn with_heap_function<R>(
-        handle: i64,
-        f: impl FnOnce(&crate::bytecode::bytecode_array::BytecodeArray) -> R,
-    ) -> Option<R> {
-        use crate::objects::value::JsValue;
-
-        if !is_heap_handle(handle) {
-            return None;
-        }
-        let idx = (handle - JIT_HEAP_TAG) as usize;
-        let ptrs = RT_PTRS.with(|p| p.get());
-        if ptrs.is_cached() {
-            // SAFETY: cached pointer valid for thread lifetime;
-            // single-threaded JIT, no concurrent borrows.
-            let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
-            match heap.get(idx)? {
-                JsValue::Function(ba) => Some(f(ba)),
-                _ => None,
-            }
-        } else {
-            RT_HEAP.with(|heap| {
-                let h = heap.borrow();
-                match h.get(idx)? {
-                    JsValue::Function(ba) => Some(f(ba)),
-                    _ => None,
-                }
-            })
-        }
-    }
-
     /// Analyse raw bytecodes for the context-slot increment pattern used by
     /// [`SpeculativeCallFusion`](crate::compiler::maglev::ir::ValueNode::SpeculativeCallFusion).
     ///
