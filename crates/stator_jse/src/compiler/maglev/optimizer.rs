@@ -225,17 +225,6 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // Clean up identity ops (x+0, x-0) created by reassociation combining.
     eliminate_identity_operations_global(graph);
     eliminate_dead_code(graph);
-    // Late dead-loop elimination: after scalar evolution replaces accumulator
-    // Phis with closed-form results, some loops become entirely dead.
-    // Resolve trivial Phis (e.g. Phi(result, self) → result) so DCE can
-    // remove dead loop-body nodes, then eliminate the dead loop structure.
-    //
-    // This runs AFTER forward_loop_object_properties and unroll_simple_loops
-    // to avoid removing nodes those passes depend on (the earlier attempt
-    // at lines 209–211 caused SIGSEGV in sieve_primes_1k).
-    eliminate_trivial_phis(graph);
-    eliminate_dead_code(graph);
-    eliminate_dead_counted_loops(graph);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -6114,6 +6103,7 @@ fn eliminate_dead_counted_loops(graph: &mut MaglevGraph) {
 /// Attempt to eliminate a single dead loop.
 ///
 /// Returns `true` if the loop was removed.
+#[allow(dead_code)] // Disabled in optimize() — see SIGSEGV note there.
 fn try_eliminate_dead_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
     // ── 1. Find the exit block ──────────────────────────────────────────────
     let exit_block_idx = {
