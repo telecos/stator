@@ -3131,20 +3131,6 @@ pub(crate) mod jit_runtime {
         })
     }
 
-    /// Speculative call-loop fusion: given a callee (closure) and a trip
-    /// count N, analyse the callee's bytecodes at runtime.  If they match
-    /// the simple pattern `LdaCurrentContextSlot(S), AddSmi(K, _),
-    /// StaCurrentContextSlot(S), Return` (a context-slot increment), compute
-    /// the closed-form `slot[S] += K * N` in O(1) and return the *last*
-    /// call's return value (`old + K * N`).
-    ///
-    /// Returns `JIT_DEOPT` if the bytecodes don't match or any overflow /
-    /// non-Smi condition is detected — the interpreter re-runs the loop.
-    pub extern "C" fn jit_runtime_speculative_call_fusion(callee_i64: i64, trip_count: i64) -> i64 {
-        let result = speculative_call_fusion_inner(callee_i64, trip_count as u32);
-        result.unwrap_or(JIT_DEOPT)
-    }
-
     /// Return type for [`jit_runtime_fusion_resolve`].
     ///
     /// Returned in RAX:RDX per the SysV AMD64 ABI (two-member C struct).
@@ -3235,100 +3221,6 @@ pub(crate) mod jit_runtime {
     /// Inner implementation for speculative call fusion.
     ///
     /// Inlines the heap lookup (instead of going through
-    /// [`with_heap_function`]) to eliminate closure overhead and the
-    /// double-`Option` `.flatten()`.  A [`RT_FUSION_CACHE`] thread-local
-    /// stores the resolved `(slot, k)` pattern keyed by callee handle so
-    /// that repeated invocations with the same closure (e.g. criterion
-    /// iterations that get the same deterministic heap index) skip the
-    /// [`Rc`] deref into the [`OnceCell`]-based pattern cache entirely.
-    ///
-    /// Context access uses a raw pointer (matching the pattern in
-    /// [`jit_runtime_lda_context_slot`] / [`jit_runtime_sta_context_slot`])
-    /// to skip the [`RefCell`] runtime borrow check.
-    #[inline(always)]
-    fn speculative_call_fusion_inner(callee_i64: i64, n: u32) -> Option<i64> {
-        use crate::objects::value::JsValue;
-
-        if n == 0 {
-            return None;
-        }
-
-        if !is_heap_handle(callee_i64) {
-            return None;
-        }
-        let idx = (callee_i64 - JIT_HEAP_TAG) as usize;
-
-        // ── Resolve the BytecodeArray from the JIT heap ──────────────
-        let ptrs = RT_PTRS.with(|p| p.get());
-        if !ptrs.is_cached() {
-            return None;
-        }
-        // SAFETY: cached pointer valid for thread lifetime; single-threaded
-        // JIT execution — no concurrent borrows.
-        let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
-        if idx >= heap.len() {
-            return None;
-        }
-        // SAFETY: bounds check above guarantees idx < heap.len().
-        let ba = match unsafe { heap.get_unchecked(idx) } {
-            JsValue::Function(ba) => ba,
-            _ => return None,
-        };
-
-        // ── Resolve the (slot, k) pattern ────────────────────────────
-        // Fast path: TLS cache hit — same callee handle as last time.
-        // The cache stores only value types so it is safe to keep across
-        // jit_runtime_setup/teardown cycles.
-        let cache = RT_FUSION_CACHE.with(|c| c.get());
-        let (slot, k) = if cache.callee == callee_i64 && cache.callee != 0 {
-            (cache.slot, cache.k)
-        } else {
-            let &pattern = ba
-                .fusion_pattern_cache()
-                .get_or_init(|| analyze_fusion_pattern(ba.bytecodes()));
-            let (slot, k) = pattern?;
-            RT_FUSION_CACHE.with(|c| {
-                c.set(FusionFastCache {
-                    callee: callee_i64,
-                    slot,
-                    k,
-                });
-            });
-            (slot, k)
-        };
-
-        // ── Read closure-context slot via raw pointer ────────────────
-        let ctx_rc = ba.closure_context()?;
-        // SAFETY: single-threaded JIT execution — no concurrent borrows of
-        // this closure context.  This matches the unsafe access pattern used
-        // by `jit_runtime_sta_context_slot` / `jit_runtime_lda_context_slot`.
-        let ctx = unsafe { &mut *ctx_rc.as_ptr() };
-        if slot >= ctx.slots.len() {
-            return None;
-        }
-        // SAFETY: bounds check above guarantees slot < ctx.slots.len().
-        let old_smi = match unsafe { ctx.slots.get_unchecked(slot) } {
-            JsValue::Smi(v) => i64::from(*v),
-            _ => return None,
-        };
-
-        // ── Compute closed form: new_val = old_smi + k * n ──────────
-        let n64 = i64::from(n);
-        let total_add = k.checked_mul(n64)?;
-        let new_val = old_smi.checked_add(total_add)?;
-
-        // Must fit in Smi range (i32).
-        if new_val < i32::MIN as i64 || new_val > i32::MAX as i64 {
-            return None;
-        }
-
-        // SAFETY: bounds validated by the check above (slot < ctx.slots.len()).
-        *unsafe { ctx.slots.get_unchecked_mut(slot) } = JsValue::Smi(new_val as i32);
-
-        Some(new_val)
-    }
-
-    /// Borrow a [`BytecodeArray`] behind a JIT heap handle without cloning the
     /// Analyse raw bytecodes for the context-slot increment pattern used by
     /// [`SpeculativeCallFusion`](crate::compiler::maglev::ir::ValueNode::SpeculativeCallFusion).
     ///
