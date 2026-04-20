@@ -200,30 +200,17 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // GenericAdd→Int32Add) and BEFORE unrolling (which would complicate
     // the loop structure).
     eliminate_constant_accumulator_loops(graph);
-    // NOTE: eliminate_trivial_phis + eliminate_dead_code + eliminate_dead_counted_loops
-    // were added here to resolve accumulator Phis made trivial by scalar evolution
-    // and then remove fully-dead loops.  However, the extra DCE pass interacts badly
-    // with later loop-aware passes (forward_loop_object_properties, unroll_simple_loops)
-    // by removing nodes those passes expect to still exist, causing SIGSEGV in the
-    // sieve_primes_1k benchmark.  Disabled until the interaction is understood.
-    // eliminate_trivial_phis(graph);
-    // eliminate_dead_code(graph);
-    // eliminate_dead_counted_loops(graph);
-    forward_loop_object_properties(graph);
+    // NOTE: forward_loop_object_properties and unroll_simple_loops are
+    // temporarily disabled to isolate the sieve_primes_1k and
+    // array_push_sum_1k SIGSEGV crashes.  If both benchmarks pass with
+    // these disabled, the root cause is in one of these passes.
+    // forward_loop_object_properties(graph);
     eliminate_dead_object_stores(graph);
     eliminate_dead_allocations(graph);
     replace_dead_arguments(graph);
-    // NOTE: IV strength reduction disabled — caused 38% arithmetic regression
-    // (8.2µs → 11.3µs) due to extra register pressure and dependency chains.
-    // strength_reduce_induction_variables(graph);
-    unroll_simple_loops(graph);
-    // After unrolling, re-run reassociation to defer constant adjustments.
-    // Unrolled bodies have chains like (((n + a) - K) + b) - K) — the
-    // constant-deferral pattern pushes all -K subtractions to the end,
-    // then the combining pattern merges them (e.g. 4×(-1) → -4).
-    reassociate_arithmetic(graph);
-    // Clean up identity ops (x+0, x-0) created by reassociation combining.
-    eliminate_identity_operations_global(graph);
+    // unroll_simple_loops(graph);
+    // reassociate_arithmetic(graph);
+    // eliminate_identity_operations_global(graph);
     eliminate_dead_code(graph);
 }
 
@@ -3678,6 +3665,7 @@ fn compute_store_to_load_subst_with_map(
 /// post-loop `LoadNamedGeneric` nodes with constants.  This makes the in-loop
 /// `CreateObjectLiteralWithProperties` + `StoreGlobal` dead, which existing
 /// passes then eliminate.
+#[allow(dead_code)]
 fn forward_loop_object_properties(graph: &mut MaglevGraph) {
     let loops = licm::detect_loops(graph);
     if loops.is_empty() {
@@ -5251,6 +5239,7 @@ fn apply_subst_to_control_node(ctrl: &mut ControlNode, resolve: &impl Fn(NodeId)
 /// When the trip count (`LIMIT − init`) is even, the body block is duplicated
 /// inline: the second copy uses the first copy's outputs as inputs, halving
 /// the number of back-edge comparisons.
+#[allow(dead_code)]
 fn unroll_simple_loops(graph: &mut MaglevGraph) {
     let loops = licm::detect_loops(graph);
     for lp in &loops {
@@ -5265,6 +5254,7 @@ fn unroll_simple_loops(graph: &mut MaglevGraph) {
 /// Attempt to unroll a single natural loop by the given `factor`.
 ///
 /// Returns `true` if the loop was successfully unrolled.
+#[allow(dead_code)]
 fn try_unroll_counted_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop, factor: u32) -> bool {
     if factor < 2 {
         return false;
