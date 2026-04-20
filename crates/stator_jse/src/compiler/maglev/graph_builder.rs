@@ -224,6 +224,19 @@ impl<'a> GraphBuilder<'a> {
         feedback: &'a FeedbackVector,
     ) -> StatorResult<MaglevGraph> {
         let instructions = bytecode.instructions()?;
+
+        // Bail out of Maglev compilation when the function contains both
+        // property method calls (CallProperty*) and keyed element loads
+        // (LdaKeyedProperty).  This pattern — e.g. `arr.push(v)` followed
+        // by `arr[i]` — is unsafe to JIT-compile because push can
+        // reallocate the array's backing store while subsequent keyed loads
+        // still reference the stale elements pointer cached in a register.
+        if Self::has_property_call_and_keyed_load(&instructions) {
+            return Err(StatorError::Internal(
+                "bail out: function mixes property calls with keyed loads".into(),
+            ));
+        }
+
         let frame_size = bytecode.frame_size() as usize;
         let parameter_count = bytecode.parameter_count();
 
@@ -268,6 +281,37 @@ impl<'a> GraphBuilder<'a> {
         builder.translate(&instructions)?;
 
         Ok(builder.graph)
+    }
+
+    // ── Pre-scan: unsafe pattern detection ───────────────────────────────────
+
+    /// Return `true` when `instructions` contain both a property method call
+    /// (`CallProperty0`, `CallProperty1`, or `CallProperty2`) and a keyed
+    /// element load (`LdaKeyedProperty`) or store (`StaKeyedProperty`,
+    /// `DefineKeyedOwnProperty`).
+    ///
+    /// This combination is unsafe to JIT-compile because the property call
+    /// may mutate the receiver's backing store (e.g. `Array.prototype.push`
+    /// growing the elements array), invalidating any cached elements pointer
+    /// that a subsequent keyed load would use.
+    fn has_property_call_and_keyed_load(instructions: &[Instruction]) -> bool {
+        let mut has_property_call = false;
+        let mut has_keyed_access = false;
+        for instr in instructions {
+            match instr.opcode {
+                Opcode::CallProperty0 | Opcode::CallProperty1 | Opcode::CallProperty2 => {
+                    has_property_call = true
+                }
+                Opcode::LdaKeyedProperty
+                | Opcode::StaKeyedProperty
+                | Opcode::DefineKeyedOwnProperty => has_keyed_access = true,
+                _ => {}
+            }
+            if has_property_call && has_keyed_access {
+                return true;
+            }
+        }
+        false
     }
 
     // ── Pass 1: target collection ────────────────────────────────────────────
