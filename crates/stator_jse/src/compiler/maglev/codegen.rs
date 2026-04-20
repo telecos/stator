@@ -2570,13 +2570,11 @@ impl<'a> MaglevCodegen<'a> {
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::CreateArrayLiteral { .. } | ValueNode::CreateShallowArrayLiteral { .. } => {
-                let saved = self.emit_save_live_regs(id);
-                let addr = jit_runtime::jit_runtime_create_empty_array as *const () as usize;
-                self.masm.mov_ri(Reg64::R11, addr as i64);
-                self.masm.call_reg(Reg64::R11);
-                self.emit_restore_live_regs(saved);
-                self.emit_deopt_check_rax();
-                self.emit_store(id, Reg64::Rax);
+                // Populated array literals require a runtime stub that
+                // populates the elements from the constant pool.  No such
+                // stub exists yet, so deopt back to the interpreter which
+                // handles them correctly.
+                self.masm.jmp(&mut self.deopt_label);
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::CreateClosure {

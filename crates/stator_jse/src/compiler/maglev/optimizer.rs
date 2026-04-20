@@ -784,72 +784,49 @@ fn is_provably_i32(
 #[allow(clippy::too_many_lines)]
 fn visit_value_node_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
     match node {
-        // ── Two-input arithmetic / comparisons ──────────────────────────
-        ValueNode::CheckedSmiAdd { left, right }
-        | ValueNode::CheckedSmiSubtract { left, right }
-        | ValueNode::CheckedSmiMultiply { left, right }
-        | ValueNode::CheckedSmiDivide { left, right }
-        | ValueNode::CheckedSmiModulus { left, right }
-        | ValueNode::Int32Add { left, right }
-        | ValueNode::Int32Subtract { left, right }
-        | ValueNode::Int32Multiply { left, right }
-        | ValueNode::Int32Divide { left, right }
-        | ValueNode::Int32Modulus { left, right }
-        | ValueNode::Uint32Add { left, right }
-        | ValueNode::Uint32Subtract { left, right }
-        | ValueNode::Uint32Multiply { left, right }
-        | ValueNode::Int32BitwiseOr { left, right }
-        | ValueNode::Int32BitwiseXor { left, right }
-        | ValueNode::Int32BitwiseAnd { left, right }
-        | ValueNode::Int32ShiftLeft { left, right }
-        | ValueNode::Int32ShiftRight { left, right }
-        | ValueNode::Int32ShiftRightLogical { left, right }
-        | ValueNode::Float64Add { left, right }
-        | ValueNode::Float64Subtract { left, right }
-        | ValueNode::Float64Multiply { left, right }
-        | ValueNode::Float64Divide { left, right }
-        | ValueNode::Float64Modulus { left, right }
-        | ValueNode::Float64Exponentiate { left, right }
-        | ValueNode::GenericAdd { left, right, .. }
-        | ValueNode::GenericSubtract { left, right, .. }
-        | ValueNode::GenericMultiply { left, right, .. }
-        | ValueNode::GenericDivide { left, right, .. }
-        | ValueNode::GenericModulus { left, right, .. }
-        | ValueNode::GenericExponentiate { left, right, .. }
-        | ValueNode::GenericBitwiseOr { left, right, .. }
-        | ValueNode::GenericBitwiseXor { left, right, .. }
-        | ValueNode::GenericBitwiseAnd { left, right, .. }
-        | ValueNode::GenericShiftLeft { left, right, .. }
-        | ValueNode::GenericShiftRight { left, right, .. }
-        | ValueNode::GenericShiftRightLogical { left, right, .. }
-        | ValueNode::Int32LessThan { left, right }
-        | ValueNode::Int32LessThanOrEqual { left, right }
-        | ValueNode::Int32GreaterThan { left, right }
-        | ValueNode::Int32GreaterThanOrEqual { left, right }
-        | ValueNode::Int32Equal { left, right }
-        | ValueNode::Int32StrictEqual { left, right }
-        | ValueNode::Float64Equal { left, right }
-        | ValueNode::Float64LessThan { left, right }
-        | ValueNode::Float64LessThanOrEqual { left, right }
-        | ValueNode::Float64GreaterThan { left, right }
-        | ValueNode::Float64GreaterThanOrEqual { left, right }
-        | ValueNode::TaggedEqual { left, right, .. }
-        | ValueNode::TaggedNotEqual { left, right, .. } => {
-            f(*left);
-            f(*right);
-        }
-        ValueNode::TestInstanceOf {
-            object, callable, ..
-        } => {
-            f(*object);
-            f(*callable);
-        }
-        ValueNode::TestIn { key, object, .. } => {
-            f(*key);
-            f(*object);
-        }
+        // ── Nodes with no inputs ─────────────────────────────────────────
+        ValueNode::SmiConstant { .. }
+        | ValueNode::Float64Constant { .. }
+        | ValueNode::Int32Constant { .. }
+        | ValueNode::Uint32Constant { .. }
+        | ValueNode::BigIntConstant { .. }
+        | ValueNode::TrueConstant
+        | ValueNode::FalseConstant
+        | ValueNode::NullConstant
+        | ValueNode::UndefinedConstant
+        | ValueNode::RootConstant { .. }
+        | ValueNode::ExternalConstant { .. }
+        | ValueNode::StringConstant { .. }
+        | ValueNode::ConstantPoolEntry { .. }
+        | ValueNode::Parameter { .. }
+        | ValueNode::RegisterInput { .. }
+        | ValueNode::ArgumentsLength
+        | ValueNode::RestLength
+        | ValueNode::LoadGlobal { .. }
+        | ValueNode::LoadCurrentContextSlot { .. }
+        | ValueNode::ArgumentsElements { .. }
+        | ValueNode::RestElements { .. }
+        | ValueNode::VirtualObject { .. }
+        | ValueNode::CreateFunctionContext { .. }
+        | ValueNode::CreateBlockContext { .. }
+        | ValueNode::CreateShallowObjectLiteral { .. }
+        | ValueNode::CreateShallowArrayLiteral { .. }
+        | ValueNode::CreateObjectLiteral { .. }
+        | ValueNode::CreateArrayLiteral { .. }
+        | ValueNode::CreateEmptyObjectLiteral
+        | ValueNode::CreateEmptyArrayLiteral { .. }
+        | ValueNode::CreateMappedArguments
+        | ValueNode::CreateUnmappedArguments
+        | ValueNode::CreateRestParameter
+        | ValueNode::CreateRegExpLiteral { .. }
+        | ValueNode::CreateClosure { .. }
+        | ValueNode::FastCreateClosure { .. }
+        | ValueNode::GetTemplateObject { .. }
+        | ValueNode::Debugger
+        | ValueNode::Abort { .. } => {}
 
-        // ── Single-input nodes ──────────────────────────────────────────
+        // ── Single-input value nodes ─────────────────────────────────────
+        ValueNode::GetArgument { index } => f(*index),
         ValueNode::CheckedSmiIncrement { value }
         | ValueNode::CheckedSmiDecrement { value }
         | ValueNode::Int32Negate { value }
@@ -871,57 +848,114 @@ fn visit_value_node_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
         | ValueNode::ChangeTaggedToInt32 { input: value }
         | ValueNode::ChangeTaggedToUint32 { input: value }
         | ValueNode::ChangeTaggedToFloat64 { input: value }
-        | ValueNode::CheckSmi { receiver: value }
-        | ValueNode::CheckNumber { receiver: value }
-        | ValueNode::CheckString { receiver: value }
-        | ValueNode::CheckSymbol { receiver: value }
-        | ValueNode::CheckHeapObject { receiver: value }
+        | ValueNode::CheckedTaggedToInt32 { input: value }
+        | ValueNode::CheckedTaggedToFloat64 { input: value }
         | ValueNode::ToBoolean { value }
-        | ValueNode::ToNumber { value, .. }
+        | ValueNode::TestNullOrUndefined { value }
         | ValueNode::ToString { value, .. }
         | ValueNode::ToObject { value, .. }
+        | ValueNode::ToName { value, .. }
+        | ValueNode::ToNumber { value, .. }
+        | ValueNode::ToNumberOrNumeric { value, .. }
         | ValueNode::TypeOf { value }
-        | ValueNode::TestTypeOf { value, .. }
-        | ValueNode::TestUndetectable { value } => f(*value),
+        | ValueNode::NumberToString { value, .. } => f(*value),
 
-        // ── Multi-input special nodes ───────────────────────────────────
-        ValueNode::Phi { inputs } => {
-            for id in inputs {
-                f(*id);
-            }
+        ValueNode::CheckSmi { receiver }
+        | ValueNode::CheckNumber { receiver }
+        | ValueNode::CheckHeapObject { receiver }
+        | ValueNode::CheckSymbol { receiver }
+        | ValueNode::CheckString { receiver }
+        | ValueNode::CheckStringOrStringWrapper { receiver }
+        | ValueNode::CheckSeqOneByteString { receiver }
+        | ValueNode::CheckMaps { receiver, .. }
+        | ValueNode::CheckMapsWithMigration { receiver, .. }
+        | ValueNode::CheckValue { receiver, .. } => f(*receiver),
+
+        ValueNode::CheckDynamicValue { receiver, expected } => {
+            f(*receiver);
+            f(*expected);
         }
-        ValueNode::CheckMaps { receiver, .. } => f(*receiver),
-        ValueNode::LoadField { object, .. } => f(*object),
-        ValueNode::LoadFixedArrayElement {
-            elements, index, ..
-        } => {
+
+        ValueNode::CheckInt32IsSmi { input }
+        | ValueNode::CheckUint32IsSmi { input }
+        | ValueNode::CheckHoleyFloat64IsSmi { input }
+        | ValueNode::CheckFloat64IsNan { input } => f(*input),
+
+        ValueNode::TestTypeOf { value, .. } | ValueNode::TestUndetectable { value } => f(*value),
+
+        // ── Object/field loads ───────────────────────────────────────────
+        ValueNode::LoadField { object, .. }
+        | ValueNode::LoadTaggedField { object, .. }
+        | ValueNode::LoadDoubleField { object, .. }
+        | ValueNode::LoadNamedGeneric { object, .. }
+        | ValueNode::ForInPrepare {
+            enumerator: object, ..
+        }
+        | ValueNode::StringLength { string: object } => f(*object),
+
+        ValueNode::LoadEnumCacheLength { map } => f(*map),
+
+        ValueNode::LoadKeyedGeneric { object, key, .. } => {
+            f(*object);
+            f(*key);
+        }
+
+        ValueNode::HasInPrototypeChain { object, prototype } => {
+            f(*object);
+            f(*prototype);
+        }
+
+        ValueNode::StoreField { object, value, .. } => {
+            f(*object);
+            f(*value);
+        }
+
+        ValueNode::StoreCurrentContextSlot { value, .. } | ValueNode::StoreGlobal { value, .. } => {
+            f(*value)
+        }
+
+        ValueNode::LoadContextSlot { context, .. } => f(*context),
+        ValueNode::StoreContextSlot { context, value, .. } => {
+            f(*context);
+            f(*value);
+        }
+
+        ValueNode::PushContext { context } | ValueNode::PopContext { context } => f(*context),
+
+        // ── Fixed-array loads / stores ───────────────────────────────────
+        ValueNode::LoadFixedArrayElement { elements, index }
+        | ValueNode::LoadFixedDoubleArrayElement { elements, index }
+        | ValueNode::LoadHoleyFixedDoubleArrayElement { elements, index } => {
             f(*elements);
             f(*index);
         }
+
         ValueNode::StoreFixedArrayElement {
             elements,
             index,
             value,
-            ..
+        }
+        | ValueNode::StoreFixedDoubleArrayElement {
+            elements,
+            index,
+            value,
         } => {
             f(*elements);
             f(*index);
             f(*value);
         }
-        ValueNode::LoadNamedGeneric { object, .. } => f(*object),
+
         ValueNode::StoreNamedGeneric { object, value, .. } => {
             f(*object);
             f(*value);
         }
+
         ValueNode::CreateObjectLiteralWithProperties { values, .. } => {
             for &v in values {
                 f(v);
             }
         }
-        ValueNode::LoadKeyedGeneric { object, key, .. } => {
-            f(*object);
-            f(*key);
-        }
+
         ValueNode::StoreKeyedGeneric {
             object, key, value, ..
         } => {
@@ -929,17 +963,128 @@ fn visit_value_node_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
             f(*key);
             f(*value);
         }
-        ValueNode::StoreGlobal { value, .. }
-        | ValueNode::StoreContextSlot { value, .. }
-        | ValueNode::StoreCurrentContextSlot { value, .. } => f(*value),
-        ValueNode::LoadContextSlot { context, .. } => f(*context),
-        ValueNode::PushContext { context } | ValueNode::PopContext { context } => f(*context),
-        ValueNode::GetArgument { index } => f(*index),
+
+        // ── Binary arithmetic / comparisons ──────────────────────────────
+        ValueNode::CheckedSmiAdd { left, right }
+        | ValueNode::CheckedSmiSubtract { left, right }
+        | ValueNode::CheckedSmiMultiply { left, right }
+        | ValueNode::CheckedSmiDivide { left, right }
+        | ValueNode::CheckedSmiModulus { left, right }
+        | ValueNode::Int32Add { left, right }
+        | ValueNode::Int32Subtract { left, right }
+        | ValueNode::Int32Multiply { left, right }
+        | ValueNode::Int32Divide { left, right }
+        | ValueNode::Int32Modulus { left, right }
+        | ValueNode::Int32BitwiseAnd { left, right }
+        | ValueNode::Int32BitwiseOr { left, right }
+        | ValueNode::Int32BitwiseXor { left, right }
+        | ValueNode::Int32ShiftLeft { left, right }
+        | ValueNode::Int32ShiftRight { left, right }
+        | ValueNode::Int32ShiftRightLogical { left, right }
+        | ValueNode::Uint32Add { left, right }
+        | ValueNode::Uint32Subtract { left, right }
+        | ValueNode::Uint32Multiply { left, right }
+        | ValueNode::Uint32Divide { left, right }
+        | ValueNode::Uint32Modulus { left, right }
+        | ValueNode::Float64Add { left, right }
+        | ValueNode::Float64Subtract { left, right }
+        | ValueNode::Float64Multiply { left, right }
+        | ValueNode::Float64Divide { left, right }
+        | ValueNode::Float64Modulus { left, right }
+        | ValueNode::Float64Exponentiate { left, right }
+        | ValueNode::Int32Equal { left, right }
+        | ValueNode::Int32StrictEqual { left, right }
+        | ValueNode::Int32LessThan { left, right }
+        | ValueNode::Int32LessThanOrEqual { left, right }
+        | ValueNode::Int32GreaterThan { left, right }
+        | ValueNode::Int32GreaterThanOrEqual { left, right }
+        | ValueNode::Float64Equal { left, right }
+        | ValueNode::Float64LessThan { left, right }
+        | ValueNode::Float64LessThanOrEqual { left, right }
+        | ValueNode::Float64GreaterThan { left, right }
+        | ValueNode::Float64GreaterThanOrEqual { left, right }
+        | ValueNode::StringConcat { left, right }
+        | ValueNode::StringEqual { left, right }
+        | ValueNode::GenericAdd { left, right, .. }
+        | ValueNode::GenericSubtract { left, right, .. }
+        | ValueNode::GenericMultiply { left, right, .. }
+        | ValueNode::GenericDivide { left, right, .. }
+        | ValueNode::GenericModulus { left, right, .. }
+        | ValueNode::GenericExponentiate { left, right, .. }
+        | ValueNode::GenericBitwiseAnd { left, right, .. }
+        | ValueNode::GenericBitwiseOr { left, right, .. }
+        | ValueNode::GenericBitwiseXor { left, right, .. }
+        | ValueNode::GenericShiftLeft { left, right, .. }
+        | ValueNode::GenericShiftRight { left, right, .. }
+        | ValueNode::GenericShiftRightLogical { left, right, .. }
+        | ValueNode::TaggedEqual { left, right, .. }
+        | ValueNode::TaggedNotEqual { left, right, .. } => {
+            f(*left);
+            f(*right);
+        }
+
+        ValueNode::CheckInt32Condition { left, right, .. } => {
+            f(*left);
+            f(*right);
+        }
+
+        ValueNode::CheckCacheIndicesNotCleared { receiver, indices } => {
+            f(*receiver);
+            f(*indices);
+        }
+
+        ValueNode::TestInstanceOf {
+            object, callable, ..
+        } => {
+            f(*object);
+            f(*callable);
+        }
+        ValueNode::TestIn { key, object, .. } => {
+            f(*key);
+            f(*object);
+        }
+
+        ValueNode::StringAt { string, index } => {
+            f(*string);
+            f(*index);
+        }
+
+        ValueNode::ForInNext {
+            receiver,
+            cache_index,
+            cache_array,
+            ..
+        } => {
+            f(*receiver);
+            f(*cache_index);
+            f(*cache_array);
+        }
+
+        ValueNode::DeleteProperty { object, key, .. } => {
+            f(*object);
+            f(*key);
+        }
+
+        ValueNode::CreateCatchContext { exception, .. } => f(*exception),
+        ValueNode::CreateWithContext { object, .. } => f(*object),
+
+        // ── Call / Construct nodes ────────────────────────────────────────
         ValueNode::Call {
             callee,
             receiver,
             args,
             ..
+        }
+        | ValueNode::CallWithSpread {
+            callee,
+            receiver,
+            args,
+            ..
+        }
+        | ValueNode::CallKnownFunction {
+            callee,
+            receiver,
+            args,
         } => {
             f(*callee);
             f(*receiver);
@@ -947,12 +1092,19 @@ fn visit_value_node_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
                 f(*a);
             }
         }
-        ValueNode::CallRuntime { args, .. } => {
+
+        ValueNode::CallBuiltin { args, .. } | ValueNode::CallRuntime { args, .. } => {
             for a in args {
                 f(*a);
             }
         }
+
+        ValueNode::SpeculativeCallFusion { callee, .. } => f(*callee),
+
         ValueNode::Construct {
+            constructor, args, ..
+        }
+        | ValueNode::ConstructWithSpread {
             constructor, args, ..
         } => {
             f(*constructor);
@@ -960,12 +1112,13 @@ fn visit_value_node_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
                 f(*a);
             }
         }
-        ValueNode::SpeculativeCallFusion { callee, .. } => {
-            f(*callee);
-        }
 
-        // Catch-all for zero-input nodes and any new variants.
-        _ => {}
+        // ── Phi ──────────────────────────────────────────────────────────
+        ValueNode::Phi { inputs } => {
+            for id in inputs {
+                f(*id);
+            }
+        }
     }
 }
 
