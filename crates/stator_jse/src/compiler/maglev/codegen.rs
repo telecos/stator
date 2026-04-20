@@ -4267,12 +4267,7 @@ impl<'a> MaglevCodegen<'a> {
     ///   mov   dword [r10 + pay_off], eax   ; store back
     /// ```
     #[cfg(all(target_arch = "x86_64", unix))]
-    fn emit_inline_speculative_call_fusion(
-        &mut self,
-        id: NodeId,
-        callee: NodeId,
-        trip_count: u32,
-    ) {
+    fn emit_inline_speculative_call_fusion(&mut self, id: NodeId, callee: NodeId, trip_count: u32) {
         let jv_layout = cached_jsvalue_layout();
         let disc_offset = jv_layout.disc_offset as i32;
         let payload_offset = jv_layout.smi_payload_offset as i32;
@@ -4280,8 +4275,7 @@ impl<'a> MaglevCodegen<'a> {
         // ── Phase 1: resolve via lightweight stub ─────────────────────
         let saved = self.emit_save_live_regs(id);
         self.emit_load(callee, Reg64::Rdi);
-        let resolve_addr =
-            jit_runtime::jit_runtime_fusion_resolve as *const () as usize as i64;
+        let resolve_addr = jit_runtime::jit_runtime_fusion_resolve as *const () as usize as i64;
         self.masm.mov_ri(Reg64::R11, resolve_addr);
         self.masm.call_reg(Reg64::R11);
 
@@ -4299,8 +4293,7 @@ impl<'a> MaglevCodegen<'a> {
         // Check discriminant == Smi.
         self.masm
             .movzx_byte_base_disp32(Reg64::Rax, Reg64::R10, disc_offset);
-        self.masm
-            .cmp_ri(Reg64::Rax, jv_layout.smi_disc as i32);
+        self.masm.cmp_ri(Reg64::Rax, jv_layout.smi_disc as i32);
         self.masm.jne(&mut self.deopt_stub_label);
 
         // Load Smi i32 payload, sign-extend to i64.
