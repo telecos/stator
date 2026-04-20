@@ -5270,6 +5270,27 @@ fn try_unroll_counted_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop, fact
         _ => return false,
     }
 
+    // ── 2b. Reject loops whose body contains method calls (CallProperty) ─
+    // Unrolling loops with `arr.push(i)` or similar method calls creates
+    // multiple runtime-stub invocations per iteration.  These stubs can
+    // reallocate array backing stores without updating the JIT's inline
+    // array IC, causing stale-pointer SIGSEGV when a later keyed-load
+    // loop reads from the same array.  Bail out to keep such loops at 1×
+    // where the interaction is safe.
+    let has_method_call = body.nodes.iter().any(|(_, node)| {
+        matches!(
+            node,
+            ValueNode::Call { .. }
+                | ValueNode::CallKnownFunction { .. }
+                | ValueNode::CallWithSpread { .. }
+                | ValueNode::CallBuiltin { .. }
+                | ValueNode::CallRuntime { .. }
+        )
+    });
+    if has_method_call {
+        return false;
+    }
+
     // ── 3. Find the comparison and its operands ─────────────────────────
     let (cmp_left, cmp_right) = {
         let mut found = None;
