@@ -286,9 +286,9 @@ impl<'a> GraphBuilder<'a> {
     // ── Pre-scan: unsafe pattern detection ───────────────────────────────────
 
     /// Return `true` when `instructions` contain both a property method call
-    /// (`CallProperty0`, `CallProperty1`, or `CallProperty2`) and a keyed
-    /// element load (`LdaKeyedProperty`) or store (`StaKeyedProperty`,
-    /// `DefineKeyedOwnProperty`).
+    /// (`CallProperty`, `CallProperty0`, `CallProperty1`, or `CallProperty2`)
+    /// and a keyed element load (`LdaKeyedProperty`) or store
+    /// (`StaKeyedProperty`, `DefineKeyedOwnProperty`).
     ///
     /// This combination is unsafe to JIT-compile because the property call
     /// may mutate the receiver's backing store (e.g. `Array.prototype.push`
@@ -299,9 +299,10 @@ impl<'a> GraphBuilder<'a> {
         let mut has_keyed_access = false;
         for instr in instructions {
             match instr.opcode {
-                Opcode::CallProperty0 | Opcode::CallProperty1 | Opcode::CallProperty2 => {
-                    has_property_call = true
-                }
+                Opcode::CallProperty
+                | Opcode::CallProperty0
+                | Opcode::CallProperty1
+                | Opcode::CallProperty2 => has_property_call = true,
                 Opcode::LdaKeyedProperty
                 | Opcode::StaKeyedProperty
                 | Opcode::DefineKeyedOwnProperty => has_keyed_access = true,
