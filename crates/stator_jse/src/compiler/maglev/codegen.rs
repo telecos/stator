@@ -2413,8 +2413,19 @@ impl<'a> MaglevCodegen<'a> {
             // Falls back to full deopt if the resolve fails or the slot is
             // not a Smi / the result overflows i32.
             #[cfg(all(target_arch = "x86_64", unix))]
-            ValueNode::SpeculativeCallFusion { callee, trip_count } => {
-                self.emit_inline_speculative_call_fusion(id, *callee, *trip_count);
+            ValueNode::SpeculativeCallFusion {
+                callee,
+                trip_count,
+                resolved_slot,
+                resolved_k,
+            } => {
+                self.emit_inline_speculative_call_fusion(
+                    id,
+                    *callee,
+                    *trip_count,
+                    *resolved_slot,
+                    *resolved_k,
+                );
             }
 
             // ── Object / array / closure creation ─────────────────────────────
@@ -4239,86 +4250,208 @@ impl<'a> MaglevCodegen<'a> {
 
     /// Inline fast path for [`ValueNode::SpeculativeCallFusion`].
     ///
-    /// Calls [`jit_runtime_fusion_resolve`] to obtain a raw pointer to the
-    /// target context-slot `JsValue` and the increment constant `k`.  The
-    /// closed-form arithmetic is then performed entirely in machine code:
+    /// When `resolved_slot` and `resolved_k` are `Some`, the optimizer has
+    /// pre-analysed the callee's bytecodes.  The codegen uses a **global
+    /// inline cache** (`FUSION_CTX_CALLEE` / `FUSION_CTX_SLOT_PTR`) to
+    /// bypass the runtime resolve stub entirely on cache hit:
     ///
     /// ```text
-    ///   ; ── Resolve phase (one stub call) ──────────────
+    ///   ; ── Global IC fast path (no calls) ─────────────
+    ///   mov   r11, [&FUSION_CTX_CALLEE]       ; load cached callee
+    ///   mov   r10, <callee>
+    ///   cmp   r10, r11
+    ///   jne   slow_path
+    ///   mov   r10, [&FUSION_CTX_SLOT_PTR]     ; cached slot_ptr
+    ///   jmp   arithmetic
+    ///
+    ///   slow_path:
     ///   <save live regs>
-    ///   mov   rdi, <callee>
-    ///   call  jit_runtime_fusion_resolve   ; → RAX=slot_ptr, RDX=k
-    ///   mov   r10, rax                     ; save slot_ptr
-    ///   mov   rdi, rdx                     ; save k
+    ///   mov   rdi, r10                        ; callee
+    ///   mov   rsi, slot_index                 ; compile-time constant
+    ///   call  jit_runtime_fusion_ctx_slot_ptr  ; → RAX = slot_ptr
+    ///   mov   r10, rax
     ///   <restore live regs>
-    ///   test  r10, r10                     ; slot_ptr == 0 → deopt
+    ///   test  r10, r10
     ///   jz    deopt
     ///
-    ///   ; ── Inline arithmetic (no calls) ───────────────
-    ///   movzx rax, byte [r10 + disc_off]   ; Smi discriminant check
+    ///   arithmetic:
+    ///   movzx rax, byte [r10 + disc_off]
     ///   cmp   rax, smi_disc
     ///   jne   deopt
-    ///   movsxd rax, dword [r10 + pay_off]  ; load Smi i32 payload
-    ///   imul  rdi, rdi, trip_count          ; rdi = k * trip_count
-    ///   add   rax, rdi                      ; rax = old + k * N
-    ///   movsxd r11, eax                     ; overflow check (i32)
+    ///   movsxd rax, dword [r10 + pay_off]
+    ///   imul  rdi, <k * trip_count>           ; k is compile-time imm
+    ///   add   rax, rdi
+    ///   movsxd r11, eax
     ///   cmp   r11, rax
     ///   jne   deopt_overflow
-    ///   mov   dword [r10 + pay_off], eax   ; store back
+    ///   mov   dword [r10 + pay_off], eax
     /// ```
+    ///
+    /// When `resolved_slot` / `resolved_k` are `None`, falls back to the
+    /// original [`jit_runtime_fusion_resolve`] stub path.
     #[cfg(all(target_arch = "x86_64", unix))]
-    fn emit_inline_speculative_call_fusion(&mut self, id: NodeId, callee: NodeId, trip_count: u32) {
+    fn emit_inline_speculative_call_fusion(
+        &mut self,
+        id: NodeId,
+        callee: NodeId,
+        trip_count: u32,
+        resolved_slot: Option<u32>,
+        resolved_k: Option<i64>,
+    ) {
         let jv_layout = cached_jsvalue_layout();
         let disc_offset = jv_layout.disc_offset as i32;
         let payload_offset = jv_layout.smi_payload_offset as i32;
 
-        // ── Phase 1: resolve via lightweight stub ─────────────────────
+        if let (Some(slot), Some(k)) = (resolved_slot, resolved_k) {
+            // ── Resolved path: global IC + lighter stub ───────────────
+            self.emit_resolved_fusion(
+                id,
+                callee,
+                trip_count,
+                slot,
+                k,
+                disc_offset,
+                payload_offset,
+                jv_layout.smi_disc,
+            );
+        } else {
+            // ── Legacy path: full resolve stub ────────────────────────
+            self.emit_unresolved_fusion(
+                id,
+                callee,
+                trip_count,
+                disc_offset,
+                payload_offset,
+                jv_layout.smi_disc,
+            );
+        }
+
+        // RAX = result (already the new value as i64).
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Resolved fusion fast path: global inline cache with zero-call hot
+    /// path and a lightweight stub fallback.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[allow(clippy::too_many_arguments)]
+    fn emit_resolved_fusion(
+        &mut self,
+        id: NodeId,
+        callee: NodeId,
+        trip_count: u32,
+        slot: u32,
+        k: i64,
+        disc_offset: i32,
+        payload_offset: i32,
+        smi_disc: u8,
+    ) {
+        let mut slow_label = Label::new();
+        let mut arith_label = Label::new();
+
+        // Load callee into R10 (non-allocated scratch).
+        self.emit_load(callee, Reg64::R10);
+
+        // ── Global IC check ──────────────────────────────────────────
+        let callee_addr = jit_runtime::fusion_ctx_callee_addr() as i64;
+        self.masm.mov_ri(Reg64::R11, callee_addr);
+        // Compare callee with [&FUSION_CTX_CALLEE].
+        self.masm.cmp_rm(Reg64::R10, Reg64::R11, 0);
+        self.masm.jne(&mut slow_label);
+
+        // IC hit: load cached slot_ptr.
+        let slot_ptr_addr = jit_runtime::fusion_ctx_slot_ptr_addr() as i64;
+        self.masm.mov_ri(Reg64::R11, slot_ptr_addr);
+        self.masm.mov_load_base_disp32(Reg64::R10, Reg64::R11, 0);
+        // Verify cached slot_ptr is non-zero (safety).
+        self.masm.test_rr(Reg64::R10, Reg64::R10);
+        self.masm.je(&mut slow_label);
+
+        self.masm.jmp(&mut arith_label);
+
+        // ── Slow path: call lightweight resolve stub ─────────────────
+        self.masm.bind_label(&mut slow_label);
+        let saved = self.emit_save_live_regs(id);
+        // R10 still holds the callee from emit_load above.
+        self.masm.mov_rr(Reg64::Rdi, Reg64::R10);
+        self.masm.mov_ri(Reg64::Rsi, i64::from(slot));
+        let stub_addr = jit_runtime::jit_runtime_fusion_ctx_slot_ptr as *const () as usize as i64;
+        self.masm.mov_ri(Reg64::R11, stub_addr);
+        self.masm.call_reg(Reg64::R11);
+        self.masm.mov_rr(Reg64::R10, Reg64::Rax);
+        self.emit_restore_live_regs(saved);
+
+        // Check resolve succeeded.
+        self.masm.test_rr(Reg64::R10, Reg64::R10);
+        self.masm.je(&mut self.deopt_stub_label);
+
+        // ── Inline Smi arithmetic ────────────────────────────────────
+        self.masm.bind_label(&mut arith_label);
+        self.masm
+            .movzx_byte_base_disp32(Reg64::Rax, Reg64::R10, disc_offset);
+        self.masm.cmp_ri(Reg64::Rax, smi_disc as i32);
+        self.masm.jne(&mut self.deopt_stub_label);
+
+        self.masm
+            .movsxd_base_disp32(Reg64::Rax, Reg64::R10, payload_offset);
+
+        // k * trip_count as a single compile-time constant.
+        let k_times_n = k.wrapping_mul(i64::from(trip_count));
+        self.masm.mov_ri(Reg64::Rdi, k_times_n);
+
+        self.masm.add_rr(Reg64::Rax, Reg64::Rdi);
+
+        self.masm.movsxd_sign_extend(Reg64::R11, Reg64::Rax);
+        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+        self.masm.jne(&mut self.deopt_overflow_label);
+
+        self.masm
+            .mov_store_dword_base_disp32(Reg64::R10, payload_offset, Reg64::Rax);
+    }
+
+    /// Unresolved fusion legacy path: calls [`jit_runtime_fusion_resolve`]
+    /// to obtain `(slot_ptr, k)` at runtime.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_unresolved_fusion(
+        &mut self,
+        id: NodeId,
+        callee: NodeId,
+        trip_count: u32,
+        disc_offset: i32,
+        payload_offset: i32,
+        smi_disc: u8,
+    ) {
         let saved = self.emit_save_live_regs(id);
         self.emit_load(callee, Reg64::Rdi);
         let resolve_addr = jit_runtime::jit_runtime_fusion_resolve as *const () as usize as i64;
         self.masm.mov_ri(Reg64::R11, resolve_addr);
         self.masm.call_reg(Reg64::R11);
 
-        // FusionResolved is returned in RAX (slot_ptr) and RDX (k).
-        // Move them to scratch registers before restoring live regs.
         self.masm.mov_rr(Reg64::R10, Reg64::Rax); // slot_ptr
         self.masm.mov_rr(Reg64::Rdi, Reg64::Rdx); // k
         self.emit_restore_live_regs(saved);
 
-        // Check resolve succeeded (slot_ptr != 0).
         self.masm.test_rr(Reg64::R10, Reg64::R10);
         self.masm.je(&mut self.deopt_stub_label);
 
-        // ── Phase 2: inline Smi arithmetic ────────────────────────────
-        // Check discriminant == Smi.
         self.masm
             .movzx_byte_base_disp32(Reg64::Rax, Reg64::R10, disc_offset);
-        self.masm.cmp_ri(Reg64::Rax, jv_layout.smi_disc as i32);
+        self.masm.cmp_ri(Reg64::Rax, smi_disc as i32);
         self.masm.jne(&mut self.deopt_stub_label);
 
-        // Load Smi i32 payload, sign-extend to i64.
         self.masm
             .movsxd_base_disp32(Reg64::Rax, Reg64::R10, payload_offset);
 
-        // Compute k * trip_count (64-bit IMUL with immediate).
-        // trip_count is a compile-time constant embedded as imm32.
         self.masm
             .imul_rri(Reg64::Rdi, Reg64::Rdi, trip_count as i32);
 
-        // result = old_smi + k * trip_count.
         self.masm.add_rr(Reg64::Rax, Reg64::Rdi);
 
-        // Overflow check: result must fit in i32.
         self.masm.movsxd_sign_extend(Reg64::R11, Reg64::Rax);
         self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
         self.masm.jne(&mut self.deopt_overflow_label);
 
-        // Store the new Smi i32 payload back to the slot.
         self.masm
             .mov_store_dword_base_disp32(Reg64::R10, payload_offset, Reg64::Rax);
-
-        // RAX = result (already the new value as i64).
-        self.emit_store(id, Reg64::Rax);
     }
 
     /// Emit an inline Smi+Smi fast path for `GenericAdd`.

@@ -1597,6 +1597,22 @@ impl<'a> GraphBuilder<'a> {
                 let func_idx = self.operand_constant_pool_idx(instr, 0)?;
                 let slot = self.operand_feedback_slot(instr, 1)?;
                 let flags = self.operand_flag(instr, 2)? as u32;
+
+                // Pre-analyse the callee's bytecodes for the fusion pattern
+                // so the optimizer can embed (slot, k) at compile time.
+                #[cfg(all(target_arch = "x86_64", unix))]
+                if let Some(ConstantPoolEntry::Function(callee_ba)) =
+                    self.bytecode.constant_pool().get(func_idx as usize)
+                {
+                    if let Some((s, k)) =
+                        crate::compiler::baseline::compiler::jit_runtime::analyze_fusion_pattern(
+                            callee_ba.bytecodes(),
+                        )
+                    {
+                        self.graph.set_closure_fusion_pattern(func_idx, s as u32, k);
+                    }
+                }
+
                 let id = self.emit(ValueNode::CreateClosure {
                     shared_function_info: func_idx,
                     feedback_slot: slot,

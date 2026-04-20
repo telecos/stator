@@ -1360,11 +1360,21 @@ pub enum ValueNode {
     /// computes the closed form in O(1).  If any check fails (wrong
     /// bytecode shape, non-Smi slot, overflow) it returns JIT_DEOPT and
     /// the interpreter re-runs the loop.
+    ///
+    /// When `resolved_slot` and `resolved_k` are `Some`, the optimizer
+    /// has analysed the callee's bytecodes at JIT compile time and
+    /// embedded the fusion pattern constants.  The codegen can then use
+    /// a global inline cache to bypass the runtime resolve stub entirely
+    /// on cache hit — yielding a zero-call fast path.
     SpeculativeCallFusion {
         /// The closure/function to call.
         callee: NodeId,
         /// Number of times the callee would be called.
         trip_count: u32,
+        /// Context-slot index from compile-time bytecode analysis.
+        resolved_slot: Option<u32>,
+        /// Increment constant `k` from compile-time bytecode analysis.
+        resolved_k: Option<i64>,
     },
 
     /// Call to a builtin function by ID.
@@ -1904,6 +1914,17 @@ pub struct MaglevGraph {
     /// Number of call sites identified as inlining candidates by the
     /// optimizer's inlining analysis pass.
     inline_candidates: u32,
+
+    /// Pre-analysed fusion patterns for closures created in this function.
+    ///
+    /// Maps a constant-pool index (`shared_function_info` from
+    /// [`ValueNode::CreateClosure`] / [`ValueNode::FastCreateClosure`])
+    /// to the `(slot_index, k_value)` pair extracted by
+    /// [`analyze_fusion_pattern`](crate::compiler::baseline::compiler::jit_runtime::analyze_fusion_pattern)
+    /// at graph-build time.  The optimizer consults this table when
+    /// creating [`ValueNode::SpeculativeCallFusion`] nodes to embed the
+    /// pattern constants directly in the IR.
+    closure_fusion_patterns: std::collections::HashMap<u32, (u32, i64)>,
 }
 
 impl MaglevGraph {
@@ -1915,6 +1936,7 @@ impl MaglevGraph {
             parameter_count,
             next_node_id: 0,
             inline_candidates: 0,
+            closure_fusion_patterns: std::collections::HashMap::new(),
         }
     }
 
@@ -2028,6 +2050,17 @@ impl MaglevGraph {
     /// Return the number of inlining candidate call sites.
     pub fn inline_candidates(&self) -> u32 {
         self.inline_candidates
+    }
+
+    /// Return the pre-analysed fusion patterns for closures in this function.
+    pub fn closure_fusion_patterns(&self) -> &std::collections::HashMap<u32, (u32, i64)> {
+        &self.closure_fusion_patterns
+    }
+
+    /// Record a fusion pattern `(slot_index, k_value)` for the closure
+    /// whose `shared_function_info` lives at constant-pool index `cp_idx`.
+    pub fn set_closure_fusion_pattern(&mut self, cp_idx: u32, slot: u32, k: i64) {
+        self.closure_fusion_patterns.insert(cp_idx, (slot, k));
     }
 
     /// Look up a [`ValueNode`] by its [`NodeId`].

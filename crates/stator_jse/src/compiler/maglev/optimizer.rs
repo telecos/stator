@@ -3001,6 +3001,11 @@ fn try_fuse_call_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
     }
 
     // ── 4. Insert SpeculativeCallFusion in preheader ─────────────────
+    // Try to resolve (slot, k) at compile time by tracing the callee back
+    // to a CreateClosure / FastCreateClosure node whose shared_function_info
+    // has a pre-analysed fusion pattern in the graph.
+    let (resolved_slot, resolved_k) = resolve_fusion_pattern(graph, callee_id);
+
     let fusion_id = graph.alloc_node_id();
     if let Some(pre) = graph.block_mut(lp.preheader) {
         pre.push_with_id(
@@ -3008,6 +3013,8 @@ fn try_fuse_call_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
             ValueNode::SpeculativeCallFusion {
                 callee: callee_id,
                 trip_count,
+                resolved_slot,
+                resolved_k,
             },
         );
     }
@@ -3139,6 +3146,47 @@ fn find_call_callee_node(node: &ValueNode) -> Option<NodeId> {
         ValueNode::CallKnownFunction { callee, args, .. } if args.is_empty() => Some(*callee),
         _ => None,
     }
+}
+
+/// Trace a callee [`NodeId`] back to a [`ValueNode::CreateClosure`] or
+/// [`ValueNode::FastCreateClosure`] and look up its pre-analysed fusion
+/// pattern in the graph's [`MaglevGraph::closure_fusion_patterns`] table.
+///
+/// Returns `(Some(slot), Some(k))` when the callee's bytecodes match the
+/// context-slot increment pattern, or `(None, None)` otherwise.  The
+/// resolved constants allow the code generator to emit a zero-call inline
+/// fast path for [`ValueNode::SpeculativeCallFusion`].
+fn resolve_fusion_pattern(graph: &MaglevGraph, callee_id: NodeId) -> (Option<u32>, Option<i64>) {
+    // Walk through Phi nodes to find the ultimate definition.
+    let mut target = callee_id;
+    for _ in 0..8 {
+        match graph.node(target) {
+            Some(ValueNode::CreateClosure {
+                shared_function_info,
+                ..
+            })
+            | Some(ValueNode::FastCreateClosure {
+                shared_function_info,
+                ..
+            }) => {
+                if let Some(&(slot, k)) = graph.closure_fusion_patterns().get(shared_function_info)
+                {
+                    return (Some(slot), Some(k));
+                }
+                return (None, None);
+            }
+            Some(ValueNode::Phi { inputs }) => {
+                // Follow the first non-self input.
+                if let Some(&inp) = inputs.iter().find(|&&i| i != target) {
+                    target = inp;
+                    continue;
+                }
+                return (None, None);
+            }
+            _ => return (None, None),
+        }
+    }
+    (None, None)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
