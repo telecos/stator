@@ -2402,24 +2402,19 @@ impl<'a> MaglevCodegen<'a> {
                 }
             }
 
-            // ── Speculative call-loop fusion ──────────────────────────────────
+            // ── Speculative call-loop fusion (inline fast path) ────────────
             //
-            // Emits a stub call to `jit_runtime_speculative_call_fusion` which
-            // analyses the callee bytecodes at runtime and either computes
-            // the closed-form result or returns JIT_DEOPT.
+            // Calls a lightweight resolve helper to obtain a raw pointer to
+            // the target context slot and the increment constant `k`.  The
+            // actual closed-form arithmetic (load Smi, add k*trip_count,
+            // overflow check, store back) is emitted inline — no further
+            // function call on the hot path.
+            //
+            // Falls back to full deopt if the resolve fails or the slot is
+            // not a Smi / the result overflows i32.
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::SpeculativeCallFusion { callee, trip_count } => {
-                let saved = self.emit_save_live_regs(id);
-                self.emit_load(*callee, Reg64::Rdi);
-                self.masm.mov_ri(Reg64::Rsi, i64::from(*trip_count));
-                self.masm.mov_ri(
-                    Reg64::R11,
-                    jit_runtime::jit_runtime_speculative_call_fusion as *const () as usize as i64,
-                );
-                self.masm.call_reg(Reg64::R11);
-                self.emit_restore_live_regs(saved);
-                self.emit_deopt_check_rax();
-                self.emit_store(id, Reg64::Rax);
+                self.emit_inline_speculative_call_fusion(id, *callee, *trip_count);
             }
 
             // ── Object / array / closure creation ─────────────────────────────
@@ -4239,6 +4234,97 @@ impl<'a> MaglevCodegen<'a> {
         self.emit_deopt_check_rax();
 
         self.masm.bind_label(&mut done_label);
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Inline fast path for [`ValueNode::SpeculativeCallFusion`].
+    ///
+    /// Calls [`jit_runtime_fusion_resolve`] to obtain a raw pointer to the
+    /// target context-slot `JsValue` and the increment constant `k`.  The
+    /// closed-form arithmetic is then performed entirely in machine code:
+    ///
+    /// ```text
+    ///   ; ── Resolve phase (one stub call) ──────────────
+    ///   <save live regs>
+    ///   mov   rdi, <callee>
+    ///   call  jit_runtime_fusion_resolve   ; → RAX=slot_ptr, RDX=k
+    ///   mov   r10, rax                     ; save slot_ptr
+    ///   mov   rdi, rdx                     ; save k
+    ///   <restore live regs>
+    ///   test  r10, r10                     ; slot_ptr == 0 → deopt
+    ///   jz    deopt
+    ///
+    ///   ; ── Inline arithmetic (no calls) ───────────────
+    ///   movzx rax, byte [r10 + disc_off]   ; Smi discriminant check
+    ///   cmp   rax, smi_disc
+    ///   jne   deopt
+    ///   movsxd rax, dword [r10 + pay_off]  ; load Smi i32 payload
+    ///   imul  rdi, rdi, trip_count          ; rdi = k * trip_count
+    ///   add   rax, rdi                      ; rax = old + k * N
+    ///   movsxd r11, eax                     ; overflow check (i32)
+    ///   cmp   r11, rax
+    ///   jne   deopt_overflow
+    ///   mov   dword [r10 + pay_off], eax   ; store back
+    /// ```
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_inline_speculative_call_fusion(
+        &mut self,
+        id: NodeId,
+        callee: NodeId,
+        trip_count: u32,
+    ) {
+        let jv_layout = cached_jsvalue_layout();
+        let disc_offset = jv_layout.disc_offset as i32;
+        let payload_offset = jv_layout.smi_payload_offset as i32;
+
+        // ── Phase 1: resolve via lightweight stub ─────────────────────
+        let saved = self.emit_save_live_regs(id);
+        self.emit_load(callee, Reg64::Rdi);
+        let resolve_addr =
+            jit_runtime::jit_runtime_fusion_resolve as *const () as usize as i64;
+        self.masm.mov_ri(Reg64::R11, resolve_addr);
+        self.masm.call_reg(Reg64::R11);
+
+        // FusionResolved is returned in RAX (slot_ptr) and RDX (k).
+        // Move them to scratch registers before restoring live regs.
+        self.masm.mov_rr(Reg64::R10, Reg64::Rax); // slot_ptr
+        self.masm.mov_rr(Reg64::Rdi, Reg64::Rdx); // k
+        self.emit_restore_live_regs(saved);
+
+        // Check resolve succeeded (slot_ptr != 0).
+        self.masm.test_rr(Reg64::R10, Reg64::R10);
+        self.masm.je(&mut self.deopt_stub_label);
+
+        // ── Phase 2: inline Smi arithmetic ────────────────────────────
+        // Check discriminant == Smi.
+        self.masm
+            .movzx_byte_base_disp32(Reg64::Rax, Reg64::R10, disc_offset);
+        self.masm
+            .cmp_ri(Reg64::Rax, jv_layout.smi_disc as i32);
+        self.masm.jne(&mut self.deopt_stub_label);
+
+        // Load Smi i32 payload, sign-extend to i64.
+        self.masm
+            .movsxd_base_disp32(Reg64::Rax, Reg64::R10, payload_offset);
+
+        // Compute k * trip_count (64-bit IMUL with immediate).
+        // trip_count is a compile-time constant embedded as imm32.
+        self.masm
+            .imul_rri(Reg64::Rdi, Reg64::Rdi, trip_count as i32);
+
+        // result = old_smi + k * trip_count.
+        self.masm.add_rr(Reg64::Rax, Reg64::Rdi);
+
+        // Overflow check: result must fit in i32.
+        self.masm.movsxd_sign_extend(Reg64::R11, Reg64::Rax);
+        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+        self.masm.jne(&mut self.deopt_overflow_label);
+
+        // Store the new Smi i32 payload back to the slot.
+        self.masm
+            .mov_store_dword_base_disp32(Reg64::R10, payload_offset, Reg64::Rax);
+
+        // RAX = result (already the new value as i64).
         self.emit_store(id, Reg64::Rax);
     }
 

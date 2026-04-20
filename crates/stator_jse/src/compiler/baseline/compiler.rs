@@ -3145,6 +3145,93 @@ pub(crate) mod jit_runtime {
         result.unwrap_or(JIT_DEOPT)
     }
 
+    /// Return type for [`jit_runtime_fusion_resolve`].
+    ///
+    /// Returned in RAX:RDX per the SysV AMD64 ABI (two-member C struct).
+    /// The Maglev codegen uses the resolved pointers to inline the
+    /// closed-form arithmetic, avoiding a full stub call for the hot path.
+    #[repr(C)]
+    pub struct FusionResolved {
+        /// Raw pointer to the start of `slots[slot]` in the closure
+        /// context's `Vec<JsValue>` data buffer, or 0 on failure.
+        pub slot_ptr: i64,
+        /// The increment constant `k` from the fusion pattern.
+        pub k: i64,
+    }
+
+    /// Lightweight resolve helper for inline speculative call fusion.
+    ///
+    /// Resolves `callee_i64` → `BytecodeArray` → closure context → slot
+    /// data pointer and pattern `(slot, k)`.  Returns the raw pointer to
+    /// the target `JsValue` slot entry and the increment constant `k`.
+    ///
+    /// The Maglev inline fast path then performs the actual load, add,
+    /// overflow check, and store in machine code — no further function
+    /// call needed.
+    ///
+    /// Returns `slot_ptr == 0` on any failure (non-heap-handle, missing
+    /// context, non-Smi slot, etc.).
+    #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
+    pub extern "C" fn jit_runtime_fusion_resolve(callee_i64: i64) -> FusionResolved {
+        let fail = FusionResolved { slot_ptr: 0, k: 0 };
+
+        if !is_heap_handle(callee_i64) {
+            return fail;
+        }
+        let idx = (callee_i64 - JIT_HEAP_TAG) as usize;
+
+        // ── Resolve BytecodeArray from heap ──────────────────────────
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if !ptrs.is_cached() {
+            return fail;
+        }
+        // SAFETY: cached pointer valid for thread lifetime; single-threaded.
+        let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+        if idx >= heap.len() {
+            return fail;
+        }
+        use crate::objects::value::JsValue;
+        // SAFETY: bounds check above.
+        let ba = match unsafe { heap.get_unchecked(idx) } {
+            JsValue::Function(ba) => ba,
+            _ => return fail,
+        };
+
+        // ── Resolve (slot, k) pattern (with TLS fast cache) ─────────
+        let cache = RT_FUSION_CACHE.with(|c| c.get());
+        let (slot, k) = if cache.callee == callee_i64 && cache.callee != 0 {
+            (cache.slot, cache.k)
+        } else {
+            let &pattern = ba
+                .fusion_pattern_cache()
+                .get_or_init(|| analyze_fusion_pattern(ba.bytecodes()));
+            let Some((slot, k)) = pattern else {
+                return fail;
+            };
+            RT_FUSION_CACHE.with(|c| {
+                c.set(FusionFastCache {
+                    callee: callee_i64,
+                    slot,
+                    k,
+                });
+            });
+            (slot, k)
+        };
+
+        // ── Get closure-context slot pointer ─────────────────────────
+        let Some(ctx_rc) = ba.closure_context() else {
+            return fail;
+        };
+        // SAFETY: single-threaded JIT execution — no concurrent borrows.
+        let ctx = unsafe { &*ctx_rc.as_ptr() };
+        if slot >= ctx.slots.len() {
+            return fail;
+        }
+        let slot_ptr = unsafe { ctx.slots.as_ptr().add(slot) } as i64;
+
+        FusionResolved { slot_ptr, k }
+    }
+
     /// Inner implementation for speculative call fusion.
     ///
     /// Inlines the heap lookup (instead of going through
