@@ -318,6 +318,15 @@ type DecodedBytecodeRef<'a> = (&'a [Instruction], &'a [usize], &'a [Option<usize
 type DecodedBytecodeCache = Rc<OnceCell<Rc<DecodedBytecode>>>;
 type SharedFeedbackVector = Rc<RefCell<FeedbackVector>>;
 
+/// Cached result of fusion-pattern analysis used by
+/// [`SpeculativeCallFusion`](crate::compiler::maglev::ir::ValueNode::SpeculativeCallFusion).
+///
+/// When the inner [`Option`] is `Some((slot, k))`, the bytecodes match the
+/// context-slot increment pattern and the runtime can compute the closed-form
+/// result in O(1).  `None` means the bytecodes were analysed and do **not**
+/// match.  The outer [`OnceCell`] is empty until the first analysis.
+type FusionPatternCache = Rc<OnceCell<Option<(usize, i64)>>>;
+
 /// Shared Maglev JIT code cache stored in a [`BytecodeArray`].
 ///
 /// On x86-64 Unix this stores a [`CachedExecutableCode`] that owns a
@@ -441,6 +450,11 @@ pub struct BytecodeArray {
     handler_table_remapped: Rc<OnceCell<Rc<Vec<HandlerTableEntry>>>>,
     /// Lazily-populated decoded instruction cache shared across clones.
     cached_decode: DecodedBytecodeCache,
+    /// Lazily-populated fusion-pattern analysis cache shared across clones.
+    ///
+    /// Used by the [`SpeculativeCallFusion`] runtime stub to avoid
+    /// re-decoding the bytecodes on every invocation.
+    fusion_pattern_cache: FusionPatternCache,
     /// Cached template objects keyed by bytecode offset.
     ///
     /// Tagged template sites must reuse the same frozen template object across
@@ -721,6 +735,7 @@ impl BytecodeArray {
             handler_table: Rc::new(handler_table),
             handler_table_remapped: Rc::new(OnceCell::new()),
             cached_decode: Rc::new(OnceCell::new()),
+            fusion_pattern_cache: Rc::new(OnceCell::new()),
             template_cache: Rc::new(RefCell::new(HashMap::new())),
             is_generator: false,
             is_async: false,
@@ -901,6 +916,15 @@ impl BytecodeArray {
     /// Returns the captured closure context, if any.
     pub fn closure_context(&self) -> Option<&Rc<RefCell<JsContext>>> {
         self.closure_context.as_ref()
+    }
+
+    /// Returns the lazily-populated fusion-pattern analysis cache.
+    ///
+    /// The [`SpeculativeCallFusion`] runtime stub calls
+    /// [`OnceCell::get_or_init`] on the returned cell so that the expensive
+    /// bytecode decode + pattern match runs at most once per template.
+    pub fn fusion_pattern_cache(&self) -> &OnceCell<Option<(usize, i64)>> {
+        &self.fusion_pattern_cache
     }
 
     /// Attach a captured closure context to this [`BytecodeArray`].

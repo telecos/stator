@@ -3108,28 +3108,104 @@ pub(crate) mod jit_runtime {
     }
 
     /// Inner implementation for speculative call fusion.
+    ///
+    /// Uses the [`BytecodeArray::fusion_pattern_cache`] so that the expensive
+    /// bytecode decode + pattern match runs at most once per closure template.
+    /// Context access uses a raw pointer (matching the pattern in
+    /// [`jit_runtime_lda_context_slot`] / [`jit_runtime_sta_context_slot`]) to
+    /// skip the [`RefCell`] runtime borrow check.  The heap lookup uses
+    /// [`with_heap_function`] to avoid cloning the [`JsValue`] / [`Rc`].
     fn speculative_call_fusion_inner(callee_i64: i64, n: u32) -> Option<i64> {
-        use crate::bytecode::bytecodes::{Opcode, Operand, decode};
-        use crate::objects::value::JsValue;
-
         if n == 0 {
-            return None; // no calls to fuse
+            return None;
         }
 
-        // 1. Resolve callee to a BytecodeArray.
-        let callee_val = get_heap_object(callee_i64)?;
-        let ba = match &callee_val {
-            JsValue::Function(ba) => ba,
-            _ => return None,
-        };
+        with_heap_function(callee_i64, |ba| {
+            // 1. Check (or populate) the fusion-pattern cache.
+            let &pattern = ba
+                .fusion_pattern_cache()
+                .get_or_init(|| analyze_fusion_pattern(ba.bytecodes()));
+            let (slot, k) = pattern?;
 
-        // 2. Decode bytecodes and match the increment pattern.
-        let instrs = decode(ba.bytecodes()).ok()?;
+            // 2. Read the closure context slot via raw pointer.
+            let ctx_rc = ba.closure_context()?;
+            // SAFETY: single-threaded JIT execution — no concurrent borrows of
+            // this closure context.  This matches the unsafe access pattern used
+            // by `jit_runtime_sta_context_slot` / `jit_runtime_lda_context_slot`.
+            let ctx = unsafe { &mut *ctx_rc.as_ptr() };
+            let old_smi = match ctx.slots.get(slot)? {
+                crate::objects::value::JsValue::Smi(v) => i64::from(*v),
+                _ => return None,
+            };
 
-        // Scan for the core pattern:
-        //   LdaCurrentContextSlot(S) ... Add/AddSmi(K) ... StaCurrentContextSlot(S) ... Return
-        // The closure may have prefix instructions (CreateMappedArguments, Star, LdaSmi, Star)
-        // and may reload the slot before Return.
+            // 3. Compute closed form: new_val = old_smi + k * n
+            let n64 = i64::from(n);
+            let total_add = k.checked_mul(n64)?;
+            let new_val = old_smi.checked_add(total_add)?;
+
+            // Must fit in Smi range (i32).
+            if new_val < i32::MIN as i64 || new_val > i32::MAX as i64 {
+                return None;
+            }
+
+            // 4. Write the new value back.
+            ctx.slots[slot] = crate::objects::value::JsValue::Smi(new_val as i32);
+
+            Some(new_val)
+        })
+        .flatten()
+    }
+
+    /// Borrow a [`BytecodeArray`] behind a JIT heap handle without cloning the
+    /// [`Rc`].  The closure `f` receives a shared reference valid for the
+    /// duration of the call.
+    ///
+    /// Returns `None` when `handle` is not a heap-object handle or the object
+    /// is not a [`JsValue::Function`].
+    #[inline]
+    fn with_heap_function<R>(
+        handle: i64,
+        f: impl FnOnce(&crate::bytecode::bytecode_array::BytecodeArray) -> R,
+    ) -> Option<R> {
+        use crate::objects::value::JsValue;
+
+        if !is_heap_handle(handle) {
+            return None;
+        }
+        let idx = (handle - JIT_HEAP_TAG) as usize;
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if ptrs.is_cached() {
+            // SAFETY: cached pointer valid for thread lifetime;
+            // single-threaded JIT, no concurrent borrows.
+            let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+            match heap.get(idx)? {
+                JsValue::Function(ba) => Some(f(ba)),
+                _ => None,
+            }
+        } else {
+            RT_HEAP.with(|heap| {
+                let h = heap.borrow();
+                match h.get(idx)? {
+                    JsValue::Function(ba) => Some(f(ba)),
+                    _ => None,
+                }
+            })
+        }
+    }
+
+    /// Analyse raw bytecodes for the context-slot increment pattern used by
+    /// [`SpeculativeCallFusion`](crate::compiler::maglev::ir::ValueNode::SpeculativeCallFusion).
+    ///
+    /// Returns `Some((slot_index, k_value))` when the bytecodes match:
+    /// ```text
+    /// LdaCurrentContextSlot(S) … Add/AddSmi(K) … StaCurrentContextSlot(S) … Return
+    /// ```
+    /// and `None` otherwise.
+    fn analyze_fusion_pattern(bytecodes: &[u8]) -> Option<(usize, i64)> {
+        use crate::bytecode::bytecodes::{Opcode, Operand, decode};
+
+        let instrs = decode(bytecodes).ok()?;
+
         let mut slot: Option<usize> = None;
         let mut k_value: Option<i64> = None;
         let mut store_slot: Option<usize> = None;
@@ -3184,31 +3260,7 @@ pub(crate) mod jit_runtime {
         if store_s != slot || !has_return {
             return None;
         }
-
-        // 3. Read the closure context slot.
-        let ctx_rc = ba.closure_context()?;
-        let mut ctx = ctx_rc.borrow_mut();
-        let old_val = ctx.slots.get(slot)?;
-        let old_smi = match old_val {
-            JsValue::Smi(v) => i64::from(*v),
-            _ => return None,
-        };
-
-        // 4. Compute closed form: new_val = old_smi + k * n
-        let n64 = i64::from(n);
-        let total_add = k.checked_mul(n64)?;
-        let new_val = old_smi.checked_add(total_add)?;
-
-        // Must fit in Smi range (i32).
-        if new_val < i32::MIN as i64 || new_val > i32::MAX as i64 {
-            return None;
-        }
-
-        // 5. Write the new value back.
-        ctx.slots[slot] = JsValue::Smi(new_val as i32);
-
-        // The last call returns the new value (after N increments).
-        Some(new_val)
+        Some((slot, k))
     }
 
     /// Execute a JS `Function` callee via JIT (preferred) or interpreter
