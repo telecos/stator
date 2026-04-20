@@ -375,6 +375,20 @@ pub(crate) mod jit_runtime {
         static RT_OBJECT_IC: Cell<ObjectLiteralIcEntry> = const {
             Cell::new(ObjectLiteralIcEntry::EMPTY)
         };
+
+        /// Cached resolved pattern for [`SpeculativeCallFusion`] runtime
+        /// stub.  Stores only value-type data (no pointers) so it is
+        /// safe to keep across JIT invocations without invalidation.
+        ///
+        /// On a cache hit (same `callee` heap handle, which is
+        /// deterministic when the heap is cleared between iterations),
+        /// the fusion function skips the [`Rc`] deref into the
+        /// [`OnceCell`]-based pattern cache and the pattern-match
+        /// destructure — going straight to the heap lookup for the
+        /// closure context.
+        static RT_FUSION_CACHE: Cell<FusionFastCache> = const {
+            Cell::new(FusionFastCache::EMPTY)
+        };
     }
 
     // ── Direct JIT-to-JIT call state ────────────────────────────────
@@ -521,6 +535,29 @@ pub(crate) mod jit_runtime {
     /// Reset all per-stub first-deopt counts to zero.
     pub fn reset_first_deopt_counts() {
         RT_FIRST_DEOPT_COUNTS.with(|c| c.set([0; STUB_DEOPT_SLOTS]));
+    }
+
+    /// Cached fusion-pattern data for [`SpeculativeCallFusion`] runtime stub.
+    ///
+    /// Stores only value-type data (heap-handle identity, slot index,
+    /// increment constant) — no raw pointers — so the cache is safe to
+    /// keep across `jit_runtime_setup` / `jit_runtime_teardown` cycles.
+    #[derive(Clone, Copy)]
+    struct FusionFastCache {
+        /// Callee heap handle used as the cache key.
+        callee: i64,
+        /// Context-slot index from the fusion pattern.
+        slot: usize,
+        /// Increment constant from the fusion pattern.
+        k: i64,
+    }
+
+    impl FusionFastCache {
+        const EMPTY: Self = Self {
+            callee: 0,
+            slot: 0,
+            k: 0,
+        };
     }
 
     /// Extended single-entry callee cache entry.
@@ -1092,6 +1129,7 @@ pub(crate) mod jit_runtime {
         });
         DIRECT_CALL_OLD_CTX.with(|c| *c.borrow_mut() = None);
         RT_LAST_BA.with(|b| b.set((std::ptr::null(), 0)));
+        RT_FUSION_CACHE.with(|c| c.set(FusionFastCache::EMPTY));
 
         // ── Clear heap so recycled PlainObjects don't linger ───────
         RT_HEAP.with(|h| h.borrow_mut().clear());
@@ -3109,51 +3147,98 @@ pub(crate) mod jit_runtime {
 
     /// Inner implementation for speculative call fusion.
     ///
-    /// Uses the [`BytecodeArray::fusion_pattern_cache`] so that the expensive
-    /// bytecode decode + pattern match runs at most once per closure template.
+    /// Inlines the heap lookup (instead of going through
+    /// [`with_heap_function`]) to eliminate closure overhead and the
+    /// double-`Option` `.flatten()`.  A [`RT_FUSION_CACHE`] thread-local
+    /// stores the resolved `(slot, k)` pattern keyed by callee handle so
+    /// that repeated invocations with the same closure (e.g. criterion
+    /// iterations that get the same deterministic heap index) skip the
+    /// [`Rc`] deref into the [`OnceCell`]-based pattern cache entirely.
+    ///
     /// Context access uses a raw pointer (matching the pattern in
-    /// [`jit_runtime_lda_context_slot`] / [`jit_runtime_sta_context_slot`]) to
-    /// skip the [`RefCell`] runtime borrow check.  The heap lookup uses
-    /// [`with_heap_function`] to avoid cloning the [`JsValue`] / [`Rc`].
+    /// [`jit_runtime_lda_context_slot`] / [`jit_runtime_sta_context_slot`])
+    /// to skip the [`RefCell`] runtime borrow check.
+    #[inline(always)]
     fn speculative_call_fusion_inner(callee_i64: i64, n: u32) -> Option<i64> {
+        use crate::objects::value::JsValue;
+
         if n == 0 {
             return None;
         }
 
-        with_heap_function(callee_i64, |ba| {
-            // 1. Check (or populate) the fusion-pattern cache.
+        if !is_heap_handle(callee_i64) {
+            return None;
+        }
+        let idx = (callee_i64 - JIT_HEAP_TAG) as usize;
+
+        // ── Resolve the BytecodeArray from the JIT heap ──────────────
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if !ptrs.is_cached() {
+            return None;
+        }
+        // SAFETY: cached pointer valid for thread lifetime; single-threaded
+        // JIT execution — no concurrent borrows.
+        let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+        if idx >= heap.len() {
+            return None;
+        }
+        // SAFETY: bounds check above guarantees idx < heap.len().
+        let ba = match unsafe { heap.get_unchecked(idx) } {
+            JsValue::Function(ba) => ba,
+            _ => return None,
+        };
+
+        // ── Resolve the (slot, k) pattern ────────────────────────────
+        // Fast path: TLS cache hit — same callee handle as last time.
+        // The cache stores only value types so it is safe to keep across
+        // jit_runtime_setup/teardown cycles.
+        let cache = RT_FUSION_CACHE.with(|c| c.get());
+        let (slot, k) = if cache.callee == callee_i64 && cache.callee != 0 {
+            (cache.slot, cache.k)
+        } else {
             let &pattern = ba
                 .fusion_pattern_cache()
                 .get_or_init(|| analyze_fusion_pattern(ba.bytecodes()));
             let (slot, k) = pattern?;
+            RT_FUSION_CACHE.with(|c| {
+                c.set(FusionFastCache {
+                    callee: callee_i64,
+                    slot,
+                    k,
+                });
+            });
+            (slot, k)
+        };
 
-            // 2. Read the closure context slot via raw pointer.
-            let ctx_rc = ba.closure_context()?;
-            // SAFETY: single-threaded JIT execution — no concurrent borrows of
-            // this closure context.  This matches the unsafe access pattern used
-            // by `jit_runtime_sta_context_slot` / `jit_runtime_lda_context_slot`.
-            let ctx = unsafe { &mut *ctx_rc.as_ptr() };
-            let old_smi = match ctx.slots.get(slot)? {
-                crate::objects::value::JsValue::Smi(v) => i64::from(*v),
-                _ => return None,
-            };
+        // ── Read closure-context slot via raw pointer ────────────────
+        let ctx_rc = ba.closure_context()?;
+        // SAFETY: single-threaded JIT execution — no concurrent borrows of
+        // this closure context.  This matches the unsafe access pattern used
+        // by `jit_runtime_sta_context_slot` / `jit_runtime_lda_context_slot`.
+        let ctx = unsafe { &mut *ctx_rc.as_ptr() };
+        if slot >= ctx.slots.len() {
+            return None;
+        }
+        // SAFETY: bounds check above guarantees slot < ctx.slots.len().
+        let old_smi = match unsafe { ctx.slots.get_unchecked(slot) } {
+            JsValue::Smi(v) => i64::from(*v),
+            _ => return None,
+        };
 
-            // 3. Compute closed form: new_val = old_smi + k * n
-            let n64 = i64::from(n);
-            let total_add = k.checked_mul(n64)?;
-            let new_val = old_smi.checked_add(total_add)?;
+        // ── Compute closed form: new_val = old_smi + k * n ──────────
+        let n64 = i64::from(n);
+        let total_add = k.checked_mul(n64)?;
+        let new_val = old_smi.checked_add(total_add)?;
 
-            // Must fit in Smi range (i32).
-            if new_val < i32::MIN as i64 || new_val > i32::MAX as i64 {
-                return None;
-            }
+        // Must fit in Smi range (i32).
+        if new_val < i32::MIN as i64 || new_val > i32::MAX as i64 {
+            return None;
+        }
 
-            // 4. Write the new value back.
-            ctx.slots[slot] = crate::objects::value::JsValue::Smi(new_val as i32);
+        // SAFETY: bounds validated by the check above (slot < ctx.slots.len()).
+        *unsafe { ctx.slots.get_unchecked_mut(slot) } = JsValue::Smi(new_val as i32);
 
-            Some(new_val)
-        })
-        .flatten()
+        Some(new_val)
     }
 
     /// Borrow a [`BytecodeArray`] behind a JIT heap handle without cloning the
