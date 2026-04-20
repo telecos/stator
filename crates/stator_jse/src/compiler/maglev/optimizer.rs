@@ -200,13 +200,15 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // GenericAdd→Int32Add) and BEFORE unrolling (which would complicate
     // the loop structure).
     eliminate_constant_accumulator_loops(graph);
-    // Scalar evolution turns accumulator Phis into Phi(const, self) — trivial.
-    // Resolve them so the loop body's only live state is the IV.
-    eliminate_trivial_phis(graph);
-    eliminate_dead_code(graph);
-    // If all loop-carried values have been resolved to constants and the loop
-    // body has no side effects, the entire loop is dead — skip it.
-    eliminate_dead_counted_loops(graph);
+    // NOTE: eliminate_trivial_phis + eliminate_dead_code + eliminate_dead_counted_loops
+    // were added here to resolve accumulator Phis made trivial by scalar evolution
+    // and then remove fully-dead loops.  However, the extra DCE pass interacts badly
+    // with later loop-aware passes (forward_loop_object_properties, unroll_simple_loops)
+    // by removing nodes those passes expect to still exist, causing SIGSEGV in the
+    // sieve_primes_1k benchmark.  Disabled until the interaction is understood.
+    // eliminate_trivial_phis(graph);
+    // eliminate_dead_code(graph);
+    // eliminate_dead_counted_loops(graph);
     forward_loop_object_properties(graph);
     eliminate_dead_object_stores(graph);
     eliminate_dead_allocations(graph);
@@ -6069,6 +6071,7 @@ fn estimate_max_iterations(
 /// induction variable, which nothing outside reads.  This pass detects such
 /// loops and short-circuits the preheader to jump directly to the exit block,
 /// eliminating all loop overhead.
+#[allow(dead_code)] // Disabled in optimize() — see SIGSEGV note there.
 fn eliminate_dead_counted_loops(graph: &mut MaglevGraph) {
     let loops = licm::detect_loops(graph);
     for lp in &loops {
@@ -6079,6 +6082,7 @@ fn eliminate_dead_counted_loops(graph: &mut MaglevGraph) {
 /// Attempt to eliminate a single dead loop.
 ///
 /// Returns `true` if the loop was removed.
+#[allow(dead_code)] // Disabled in optimize() — see SIGSEGV note there.
 fn try_eliminate_dead_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
     // ── 1. Find the exit block ──────────────────────────────────────────────
     let exit_block_idx = {
