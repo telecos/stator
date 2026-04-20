@@ -1603,14 +1603,12 @@ impl<'a> GraphBuilder<'a> {
                 #[cfg(all(target_arch = "x86_64", unix))]
                 if let Some(ConstantPoolEntry::Function(callee_ba)) =
                     self.bytecode.constant_pool().get(func_idx as usize)
-                {
-                    if let Some((s, k)) =
+                    && let Some((s, k)) =
                         crate::compiler::baseline::compiler::jit_runtime::analyze_fusion_pattern(
                             callee_ba.bytecodes(),
                         )
-                    {
-                        self.graph.set_closure_fusion_pattern(func_idx, s as u32, k);
-                    }
+                {
+                    self.graph.set_closure_fusion_pattern(func_idx, s as u32, k);
                 }
 
                 let id = self.emit(ValueNode::CreateClosure {

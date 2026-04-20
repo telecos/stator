@@ -64,7 +64,7 @@ use std::collections::HashMap;
 #[cfg(all(target_arch = "x86_64", unix))]
 use std::rc::Rc;
 #[cfg(all(target_arch = "x86_64", unix))]
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Table serialization constants
