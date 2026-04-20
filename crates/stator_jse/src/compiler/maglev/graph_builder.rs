@@ -225,17 +225,13 @@ impl<'a> GraphBuilder<'a> {
     ) -> StatorResult<MaglevGraph> {
         let instructions = bytecode.instructions()?;
 
-        // Bail out of Maglev compilation when the function contains both
-        // property method calls (CallProperty*) and keyed element loads
-        // (LdaKeyedProperty).  This pattern — e.g. `arr.push(v)` followed
-        // by `arr[i]` — is unsafe to JIT-compile because push can
-        // reallocate the array's backing store while subsequent keyed loads
-        // still reference the stale elements pointer cached in a register.
-        if Self::has_property_call_and_keyed_load(&instructions) {
-            return Err(StatorError::Internal(
-                "bail out: function mixes property calls with keyed loads".into(),
-            ));
-        }
+        // NOTE: The bail-out for CallProperty + keyed access (commit 49cfa6b0)
+        // has been replaced by post-call IC invalidation in codegen.  After
+        // every Call/CallKnownFunction/Construct node, the codegen zeroes the
+        // array IC handle so the next keyed access re-fills with current
+        // metadata.  This is both safer (covers array shrinks, not just
+        // growth) and less restrictive (no false-positive bail-outs for
+        // unrelated call + keyed access pairs like sieve_primes).
 
         let frame_size = bytecode.frame_size() as usize;
         let parameter_count = bytecode.parameter_count();
@@ -290,10 +286,10 @@ impl<'a> GraphBuilder<'a> {
     /// and a keyed element load (`LdaKeyedProperty`) or store
     /// (`StaKeyedProperty`, `DefineKeyedOwnProperty`).
     ///
-    /// This combination is unsafe to JIT-compile because the property call
-    /// may mutate the receiver's backing store (e.g. `Array.prototype.push`
-    /// growing the elements array), invalidating any cached elements pointer
-    /// that a subsequent keyed load would use.
+    /// This combination was previously used to bail out of JIT compilation,
+    /// but has been superseded by post-call IC invalidation in codegen.
+    /// Retained for potential future use in diagnostics or heuristics.
+    #[allow(dead_code)]
     fn has_property_call_and_keyed_load(instructions: &[Instruction]) -> bool {
         let mut has_property_call = false;
         let mut has_keyed_access = false;

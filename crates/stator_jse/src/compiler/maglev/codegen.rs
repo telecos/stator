@@ -2355,6 +2355,9 @@ impl<'a> MaglevCodegen<'a> {
                         self.emit_store(id, Reg64::R11);
                     }
                 }
+                // Invalidate array IC — the callee may have mutated or
+                // reallocated any array's backing store.
+                self.emit_invalidate_array_ic();
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::CallKnownFunction {
@@ -2400,6 +2403,7 @@ impl<'a> MaglevCodegen<'a> {
                         self.emit_store(id, Reg64::R11);
                     }
                 }
+                self.emit_invalidate_array_ic();
             }
 
             // ── Speculative call-loop fusion (inline fast path) ────────────
@@ -2718,6 +2722,7 @@ impl<'a> MaglevCodegen<'a> {
                     self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
                     self.emit_store(id, Reg64::R11);
                 }
+                self.emit_invalidate_array_ic();
             }
 
             // ── Generic arithmetic via dedicated stubs ────────────────────────
@@ -6328,6 +6333,24 @@ impl<'a> MaglevCodegen<'a> {
     /// done:
     ///   store result
     /// ```
+    /// Zero the array IC handle so the next keyed access is a guaranteed
+    /// miss → refill.  Call this after any JS-visible call (`Call`,
+    /// `CallKnownFunction`, `Construct`) because the callee may mutate,
+    /// shrink, or reallocate array backing stores, making the cached
+    /// handle/length/vec_ptr stale.
+    ///
+    /// When `array_ic_base == 0` there are no keyed sites in this
+    /// function — nothing to invalidate.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_invalidate_array_ic(&mut self) {
+        if self.array_ic_base != 0 {
+            // XOR R11,R11 is 3 bytes; MOV [RBP+disp32],R11 is 7 bytes.
+            self.masm.xor_rr(Reg64::R11, Reg64::R11);
+            self.masm
+                .mov_store_base_disp32(Reg64::Rbp, self.array_ic_base, Reg64::R11);
+        }
+    }
+
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_inline_load_keyed_smi(&mut self, id: NodeId, object: NodeId, key: NodeId) {
         let layout = cached_jsvalue_layout();
