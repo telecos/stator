@@ -200,6 +200,13 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // GenericAdd→Int32Add) and BEFORE unrolling (which would complicate
     // the loop structure).
     eliminate_constant_accumulator_loops(graph);
+    // Scalar evolution turns accumulator Phis into Phi(const, self) — trivial.
+    // Resolve them so the loop body's only live state is the IV.
+    eliminate_trivial_phis(graph);
+    eliminate_dead_code(graph);
+    // If all loop-carried values have been resolved to constants and the loop
+    // body has no side effects, the entire loop is dead — skip it.
+    eliminate_dead_counted_loops(graph);
     forward_loop_object_properties(graph);
     eliminate_dead_object_stores(graph);
     eliminate_dead_allocations(graph);
@@ -5894,6 +5901,136 @@ fn estimate_max_iterations(
     // One side should be a Phi (IV), the other a constant (limit).
     let limit = consts.get(&right).or_else(|| consts.get(&left))?;
     Some(*limit as u64)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pass — Dead counted loop elimination
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Remove loops whose body has no side effects and whose values are not
+/// referenced by any node outside the loop.
+///
+/// After scalar evolution resolves accumulator Phis to constants and trivial
+/// phi elimination propagates those constants to external consumers, a counted
+/// loop may become entirely dead — its only remaining work is incrementing the
+/// induction variable, which nothing outside reads.  This pass detects such
+/// loops and short-circuits the preheader to jump directly to the exit block,
+/// eliminating all loop overhead.
+fn eliminate_dead_counted_loops(graph: &mut MaglevGraph) {
+    let loops = licm::detect_loops(graph);
+    for lp in &loops {
+        try_eliminate_dead_loop(graph, lp);
+    }
+}
+
+/// Attempt to eliminate a single dead loop.
+///
+/// Returns `true` if the loop was removed.
+fn try_eliminate_dead_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
+    // ── 1. Find the exit block ──────────────────────────────────────────────
+    let exit_block_idx = {
+        let header = match graph.block(lp.header) {
+            Some(b) => b,
+            None => return false,
+        };
+        match &header.control {
+            Some(ControlNode::Branch {
+                if_true, if_false, ..
+            }) => {
+                if lp.body.contains(if_true) && !lp.body.contains(if_false) {
+                    *if_false
+                } else if lp.body.contains(if_false) && !lp.body.contains(if_true) {
+                    *if_true
+                } else {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    };
+
+    // ── 2. Collect all NodeIds defined inside the loop ──────────────────────
+    let mut loop_node_ids: HashSet<NodeId> = HashSet::new();
+    for &block_idx in &lp.body {
+        if let Some(block) = graph.block(block_idx) {
+            for (id, _) in &block.nodes {
+                loop_node_ids.insert(*id);
+            }
+        }
+    }
+
+    // ── 3. No side effects allowed ──────────────────────────────────────────
+    for &block_idx in &lp.body {
+        if let Some(block) = graph.block(block_idx) {
+            for (_, node) in &block.nodes {
+                if has_side_effects(node) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    // ── 4. No loop-internal value may be referenced from outside ────────────
+    for block in graph.blocks() {
+        if lp.body.contains(&block.id) {
+            continue;
+        }
+        for (_, node) in &block.nodes {
+            let mut refs_loop = false;
+            visit_value_node_inputs(node, &mut |id| {
+                if loop_node_ids.contains(&id) {
+                    refs_loop = true;
+                }
+            });
+            if refs_loop {
+                return false;
+            }
+        }
+        if let Some(ctrl) = &block.control {
+            let mut live = HashSet::new();
+            collect_control_node_inputs(ctrl, &mut live);
+            if live.iter().any(|id| loop_node_ids.contains(id)) {
+                return false;
+            }
+        }
+    }
+
+    // ── 5. Bail out if the exit block has Phis (predecessor rewrite is unsafe) ─
+    if let Some(exit_block) = graph.block(exit_block_idx) {
+        for (_, node) in &exit_block.nodes {
+            if matches!(node, ValueNode::Phi { .. }) {
+                return false;
+            }
+        }
+    }
+
+    // ── 6. Redirect preheader → exit ────────────────────────────────────────
+    if let Some(preheader) = graph.block_mut(lp.preheader) {
+        preheader.control = Some(ControlNode::Jump {
+            target: exit_block_idx,
+        });
+    }
+
+    // Update exit block predecessors.
+    if let Some(exit_block) = graph.block_mut(exit_block_idx) {
+        exit_block.predecessors.retain(|p| !lp.body.contains(p));
+        if !exit_block.predecessors.contains(&lp.preheader) {
+            exit_block.predecessors.push(lp.preheader);
+        }
+    }
+
+    // Clear dead loop blocks.
+    for &block_idx in &lp.body {
+        if let Some(block) = graph.block_mut(block_idx) {
+            block.nodes.clear();
+            block.is_loop_header = false;
+            block.control = Some(ControlNode::Jump {
+                target: exit_block_idx,
+            });
+        }
+    }
+
+    true
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
