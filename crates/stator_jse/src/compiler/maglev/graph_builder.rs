@@ -225,13 +225,17 @@ impl<'a> GraphBuilder<'a> {
     ) -> StatorResult<MaglevGraph> {
         let instructions = bytecode.instructions()?;
 
-        // NOTE: The bail-out for CallProperty + keyed access (commit 49cfa6b0)
-        // has been replaced by post-call IC invalidation in codegen.  After
-        // every Call/CallKnownFunction/Construct node, the codegen zeroes the
-        // array IC handle so the next keyed access re-fills with current
-        // metadata.  This is both safer (covers array shrinks, not just
-        // growth) and less restrictive (no false-positive bail-outs for
-        // unrelated call + keyed access pairs like sieve_primes).
+        // Bail out of Maglev when the function contains both a property
+        // method call (arr.push, obj.method, …) and a keyed element
+        // access (arr[i]).  The codegen's post-call IC invalidation is
+        // not yet sufficient to prevent stale-pointer crashes in all
+        // cases (e.g. array_push_sum_1k SIGSEGV).  Baseline JIT still
+        // handles these functions correctly.
+        if Self::has_property_call_and_keyed_load(&instructions) {
+            return Err(StatorError::Internal(
+                "Maglev bail-out: mixed CallProperty + keyed access".into(),
+            ));
+        }
 
         let frame_size = bytecode.frame_size() as usize;
         let parameter_count = bytecode.parameter_count();
@@ -286,10 +290,9 @@ impl<'a> GraphBuilder<'a> {
     /// and a keyed element load (`LdaKeyedProperty`) or store
     /// (`StaKeyedProperty`, `DefineKeyedOwnProperty`).
     ///
-    /// This combination was previously used to bail out of JIT compilation,
-    /// but has been superseded by post-call IC invalidation in codegen.
-    /// Retained for potential future use in diagnostics or heuristics.
-    #[allow(dead_code)]
+    /// This combination triggers a Maglev bail-out because the codegen's
+    /// post-call IC invalidation is not yet sufficient to prevent
+    /// stale-pointer SIGSEGV in all cases.
     fn has_property_call_and_keyed_load(instructions: &[Instruction]) -> bool {
         let mut has_property_call = false;
         let mut has_keyed_access = false;
