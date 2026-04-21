@@ -579,9 +579,6 @@ pub(crate) mod jit_runtime {
     /// context inline cache.
     static FUSION_CTX_SLOT_PTR: AtomicI64 = AtomicI64::new(0);
 
-    /// Cached increment constant `k` for the fusion context inline cache.
-    static FUSION_CTX_K: AtomicI64 = AtomicI64::new(0);
-
     /// Return the address of [`FUSION_CTX_CALLEE`] for embedding as
     /// an absolute address immediate in JIT machine code.
     pub fn fusion_ctx_callee_addr() -> usize {
@@ -592,12 +589,6 @@ pub(crate) mod jit_runtime {
     /// an absolute address immediate in JIT machine code.
     pub fn fusion_ctx_slot_ptr_addr() -> usize {
         &FUSION_CTX_SLOT_PTR as *const AtomicI64 as usize
-    }
-
-    /// Return the address of [`FUSION_CTX_K`] for embedding as
-    /// an absolute address immediate in JIT machine code.
-    pub fn fusion_ctx_k_addr() -> usize {
-        &FUSION_CTX_K as *const AtomicI64 as usize
     }
 
     /// Lightweight fusion resolve stub: given a callee heap handle and
@@ -648,7 +639,6 @@ pub(crate) mod jit_runtime {
         // Update the global inline cache.
         FUSION_CTX_CALLEE.store(callee_i64, Ordering::Relaxed);
         FUSION_CTX_SLOT_PTR.store(slot_ptr, Ordering::Relaxed);
-        FUSION_CTX_K.store(0, Ordering::Relaxed); // resolved uses compile-time k
 
         slot_ptr
     }
@@ -1225,7 +1215,6 @@ pub(crate) mod jit_runtime {
         RT_FUSION_CACHE.with(|c| c.set(FusionFastCache::EMPTY));
         FUSION_CTX_CALLEE.store(0, Ordering::Relaxed);
         FUSION_CTX_SLOT_PTR.store(0, Ordering::Relaxed);
-        FUSION_CTX_K.store(0, Ordering::Relaxed);
 
         // ── Clear heap so recycled PlainObjects don't linger ───────
         RT_HEAP.with(|h| h.borrow_mut().clear());
@@ -3310,12 +3299,6 @@ pub(crate) mod jit_runtime {
             return fail;
         }
         let slot_ptr = unsafe { ctx.slots.as_ptr().add(slot) } as i64;
-
-        // Update the global inline cache so subsequent unresolved
-        // fusion calls from Maglev can skip the runtime resolve.
-        FUSION_CTX_CALLEE.store(callee_i64, Ordering::Relaxed);
-        FUSION_CTX_SLOT_PTR.store(slot_ptr, Ordering::Relaxed);
-        FUSION_CTX_K.store(k, Ordering::Relaxed);
 
         FusionResolved { slot_ptr, k }
     }
@@ -7734,23 +7717,27 @@ pub(crate) mod jit_runtime {
                     // SAFETY: bounds verified above.
                     unsafe { *v.get_unchecked_mut(key) = value };
                 } else {
-                    // Out-of-bounds — grow to key+1 only.
-                    // We fill gaps with TheHole (sparse array holes) so
-                    // that Array.length stays correct (v.len() == logical
-                    // length).  Reserve extra capacity so subsequent
-                    // sequential appends are amortised.
+                    // Out-of-bounds — grow allocation if needed.
                     if key >= v.capacity() {
                         let new_cap = (key + 1).next_power_of_two();
                         v.reserve(new_cap.saturating_sub(v.len()));
                     }
-                    v.resize(key + 1, JsValue::TheHole);
-                    // SAFETY: key < v.len() after resize.
+                    // Pre-extend to full capacity with TheHole so that
+                    // the Maglev inline IC can service all subsequent
+                    // stores up to this capacity without another FFI
+                    // call.  The cost is O(cap) TheHole writes, but it
+                    // happens only O(log n) times (at each power-of-2
+                    // boundary).
+                    let cap = v.capacity();
+                    v.resize(cap, JsValue::TheHole);
+                    // SAFETY: key < cap after resize.
                     unsafe { *v.get_unchecked_mut(key) = value };
                 }
 
                 // Update caller's IC slots so subsequent x86 inline
                 // checks can succeed with the new data pointer and
-                // length (len == key+1 after grow).
+                // length.  After pre-extend, len == capacity, so the
+                // inline IC will accept every key < capacity.
                 if ic_ptr != 0 {
                     // SAFETY: ic_ptr points to 4 writable i64s on the
                     // caller's stack frame (Maglev-generated code).
