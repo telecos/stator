@@ -225,17 +225,6 @@ impl<'a> GraphBuilder<'a> {
     ) -> StatorResult<MaglevGraph> {
         let instructions = bytecode.instructions()?;
 
-        // Bail out of Maglev when the function contains keyed element
-        // access (arr[i], arr[i] = v).  The Maglev codegen for keyed
-        // IC paths has unresolved bugs: array_push_sum_1k crashes with
-        // SIGSEGV and sieve_primes_1k hangs in an infinite loop.
-        // Baseline JIT handles keyed access correctly.
-        if Self::has_keyed_access(&instructions) {
-            return Err(StatorError::Internal(
-                "Maglev bail-out: keyed element access".into(),
-            ));
-        }
-
         let frame_size = bytecode.frame_size() as usize;
         let parameter_count = bytecode.parameter_count();
 
@@ -280,30 +269,6 @@ impl<'a> GraphBuilder<'a> {
         builder.translate(&instructions)?;
 
         Ok(builder.graph)
-    }
-
-    // ── Pre-scan: unsafe pattern detection ───────────────────────────────────
-
-    /// Return `true` when `instructions` contain both a property method call
-    /// (`CallProperty`, `CallProperty0`, `CallProperty1`, or `CallProperty2`)
-    /// and a keyed element load (`LdaKeyedProperty`) or store
-    /// (`StaKeyedProperty`, `DefineKeyedOwnProperty`).
-    ///
-    /// This combination triggers a Maglev bail-out because the codegen's
-    /// post-call IC invalidation is not yet sufficient to prevent
-    /// stale-pointer SIGSEGV in all cases.
-    /// Returns `true` if any instruction performs keyed element access
-    /// (load, store, or define keyed property).
-    fn has_keyed_access(instructions: &[Instruction]) -> bool {
-        for instr in instructions {
-            match instr.opcode {
-                Opcode::LdaKeyedProperty
-                | Opcode::StaKeyedProperty
-                | Opcode::DefineKeyedOwnProperty => return true,
-                _ => {}
-            }
-        }
-        false
     }
 
     // ── Pass 1: target collection ────────────────────────────────────────────
@@ -3611,8 +3576,7 @@ mod tests {
     /// the builder should emit `CheckSmi` + `LoadFixedArrayElement` instead
     /// of the generic `LoadKeyedGeneric`.
     #[test]
-    fn test_keyed_load_monomorphic_bails_out() {
-        // With the keyed-access bail-out, Maglev should reject this bytecode.
+    fn test_keyed_load_monomorphic_builds_graph() {
         let instrs = vec![
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(0)]),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
@@ -3627,16 +3591,16 @@ mod tests {
         let (arr, mut fv) = build(instrs, vec![], 2, 1, metadata);
         fv.set_state(0, InlineCacheState::Monomorphic);
 
-        let err = GraphBuilder::build(&arr, &fv).unwrap_err();
+        let graph = GraphBuilder::build(&arr, &fv).unwrap();
         assert!(
-            err.to_string().contains("keyed element access"),
-            "expected keyed bail-out, got: {err}"
+            !graph.is_degenerate(),
+            "keyed load graph should not be degenerate"
         );
     }
 
-    /// Keyed load with uninitialized feedback should bail out.
+    /// Keyed load with uninitialized feedback should build a graph.
     #[test]
-    fn test_keyed_load_uninitialized_bails_out() {
+    fn test_keyed_load_uninitialized_builds_graph() {
         let instrs = vec![
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(0)]),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
@@ -3650,16 +3614,16 @@ mod tests {
         let metadata = FeedbackMetadata::new(vec![FeedbackSlotKind::KeyedLoadProperty]);
         let (arr, fv) = build(instrs, vec![], 2, 1, metadata);
 
-        let err = GraphBuilder::build(&arr, &fv).unwrap_err();
+        let graph = GraphBuilder::build(&arr, &fv).unwrap();
         assert!(
-            err.to_string().contains("keyed element access"),
-            "expected keyed bail-out, got: {err}"
+            !graph.is_degenerate(),
+            "keyed load graph should not be degenerate"
         );
     }
 
-    /// Keyed store with monomorphic feedback should bail out.
+    /// Keyed store with monomorphic feedback should build a graph.
     #[test]
-    fn test_keyed_store_monomorphic_bails_out() {
+    fn test_keyed_store_monomorphic_builds_graph() {
         let instrs = vec![
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
             Instruction::new_unchecked(
@@ -3676,16 +3640,16 @@ mod tests {
         let (arr, mut fv) = build(instrs, vec![], 2, 2, metadata);
         fv.set_state(0, InlineCacheState::Monomorphic);
 
-        let err = GraphBuilder::build(&arr, &fv).unwrap_err();
+        let graph = GraphBuilder::build(&arr, &fv).unwrap();
         assert!(
-            err.to_string().contains("keyed element access"),
-            "expected keyed bail-out, got: {err}"
+            !graph.is_degenerate(),
+            "keyed store graph should not be degenerate"
         );
     }
 
-    /// Keyed load with megamorphic feedback should bail out.
+    /// Keyed load with megamorphic feedback should build a graph.
     #[test]
-    fn test_keyed_load_megamorphic_bails_out() {
+    fn test_keyed_load_megamorphic_builds_graph() {
         let instrs = vec![
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(0)]),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
@@ -3700,16 +3664,16 @@ mod tests {
         let (arr, mut fv) = build(instrs, vec![], 2, 1, metadata);
         fv.set_state(0, InlineCacheState::Megamorphic);
 
-        let err = GraphBuilder::build(&arr, &fv).unwrap_err();
+        let graph = GraphBuilder::build(&arr, &fv).unwrap();
         assert!(
-            err.to_string().contains("keyed element access"),
-            "expected keyed bail-out, got: {err}"
+            !graph.is_degenerate(),
+            "keyed load graph should not be degenerate"
         );
     }
 
-    /// Regression test: sieve_primes benchmark bails out due to keyed access.
+    /// Regression test: sieve_primes benchmark now compiles with Maglev JIT.
     #[test]
-    fn test_sieve_benchmark_bails_out() {
+    fn test_sieve_benchmark_builds_graph() {
         use crate::bytecode::bytecode_generator::BytecodeGenerator;
         use crate::parser::recursive_descent;
 
@@ -3736,10 +3700,10 @@ mod tests {
         let program = recursive_descent::parse(source).unwrap();
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
         let feedback = FeedbackVector::new(ba.feedback_metadata());
-        let err = GraphBuilder::build(&ba, &feedback).unwrap_err();
+        let graph = GraphBuilder::build(&ba, &feedback).unwrap();
         assert!(
-            err.to_string().contains("keyed element access"),
-            "expected keyed bail-out, got: {err}"
+            !graph.is_degenerate(),
+            "sieve graph should not be degenerate"
         );
     }
 
@@ -3781,9 +3745,9 @@ mod tests {
         );
     }
 
-    /// Array literals with keyed access (a[i]) should bail out.
+    /// Array literals with keyed access (a[i]) should build a graph.
     #[test]
-    fn test_array_literal_with_keyed_access_bails_out() {
+    fn test_array_literal_with_keyed_access_builds_graph() {
         use crate::bytecode::bytecode_generator::BytecodeGenerator;
         use crate::parser::recursive_descent;
 
@@ -3810,10 +3774,10 @@ mod tests {
         );
 
         let feedback = FeedbackVector::new(ba.feedback_metadata());
-        let err = GraphBuilder::build(&ba, &feedback).unwrap_err();
+        let graph = GraphBuilder::build(&ba, &feedback).unwrap();
         assert!(
-            err.to_string().contains("keyed element access"),
-            "expected keyed bail-out, got: {err}"
+            !graph.is_degenerate(),
+            "array literal graph should not be degenerate"
         );
     }
 
