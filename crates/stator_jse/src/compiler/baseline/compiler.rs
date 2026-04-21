@@ -3315,7 +3315,7 @@ pub(crate) mod jit_runtime {
         // fusion calls from Maglev can skip the runtime resolve.
         FUSION_CTX_CALLEE.store(callee_i64, Ordering::Relaxed);
         FUSION_CTX_SLOT_PTR.store(slot_ptr, Ordering::Relaxed);
-        FUSION_CTX_K.store(k as i64, Ordering::Relaxed);
+        FUSION_CTX_K.store(k, Ordering::Relaxed);
 
         FusionResolved { slot_ptr, k }
     }

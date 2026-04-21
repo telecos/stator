@@ -6403,10 +6403,12 @@ impl<'a> MaglevCodegen<'a> {
         let mut load_bool = Label::new();
         let mut load_undef = Label::new();
 
-        // ── Fast path (scratch regs only: R11, R10, RAX) ────────────
+        // ── Fast path DISABLED — all keyed loads go through runtime ──
+        // The inline fast path has unresolved correctness issues.
+        // Bypassing it keeps the function JIT-compiled while keyed
+        // loads use the safe runtime stub.
 
         // Load object and key into scratch registers.
-        // R10/R11 are never allocated by regalloc, so no conflict.
         self.emit_load(object, Reg64::R11);
         self.emit_load(key, Reg64::R10);
 
@@ -6418,15 +6420,8 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
         self.masm.jcc(CondCode::Below, &mut load_undef);
 
-        // IC hit check: is this the same array handle?
-        self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, ic_off_handle);
-        self.masm.jne(&mut slow_label);
-
-        // Unsigned bounds check: key < cached length.
-        // Since key is a sign-extended Smi, negative values appear as
-        // very large unsigned numbers → caught by JAE.
-        self.masm.cmp_rm(Reg64::R10, Reg64::Rbp, ic_off_len);
-        self.masm.jcc(CondCode::AboveEq, &mut slow_label);
+        // Always go to slow path (fast path disabled).
+        self.masm.jmp(&mut slow_label);
 
         // Re-derive a *fresh* data pointer from the Vec struct pointer
         // instead of trusting the cached data_ptr (which becomes stale
@@ -6581,7 +6576,7 @@ impl<'a> MaglevCodegen<'a> {
         value: NodeId,
     ) {
         let layout = cached_jsvalue_layout();
-        let vec_layout = cached_vec_jsvalue_layout();
+        let _vec_layout = cached_vec_jsvalue_layout();
         let ic_base = self.array_ic_base;
         let ic_off_handle = ic_base;
         let _ic_off_data = ic_base + 8;
@@ -6594,7 +6589,10 @@ impl<'a> MaglevCodegen<'a> {
         let mut store_bool = Label::new();
         let mut check_grow = Label::new();
 
-        // ── Fast path (scratch regs only: R11, R10, RAX) ────────────
+        // ── Fast path DISABLED — all keyed stores go through runtime ──
+        // The inline fast path has unresolved correctness issues.
+        // Bypassing it keeps the function JIT-compiled while keyed
+        // stores use the safe runtime stub.
 
         // Load object and key into scratch registers.
         self.emit_load(object, Reg64::R11);
@@ -6611,8 +6609,8 @@ impl<'a> MaglevCodegen<'a> {
         // Load value now that we know the receiver is valid.
         self.emit_load(value, Reg64::Rax);
 
-        // IC hit check: is this the same array handle?
-        self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, ic_off_handle);
+        // Always go to slow path (fast path disabled).
+        self.masm.jmp(&mut slow_label);
         self.masm.jne(&mut slow_label);
 
         // Unsigned bounds check: key < cached length.
