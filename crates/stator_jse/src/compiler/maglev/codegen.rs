@@ -6385,17 +6385,10 @@ impl<'a> MaglevCodegen<'a> {
     fn emit_inline_load_keyed_smi(&mut self, id: NodeId, object: NodeId, key: NodeId) {
         let layout = cached_jsvalue_layout();
         let ic_base = self.array_ic_base;
-        let ic_off_handle = ic_base;
-        // ic_off_data at +8 is still WRITTEN by the IC-fill stub but we
-        // deliberately ignore it on the fast path — see below.
+        let _ic_off_handle = ic_base;
         let _ic_off_data = ic_base + 8;
-        let ic_off_len = ic_base + 16;
-        // The store IC (and the load-IC fill stub) writes the Vec struct
-        // pointer at +24.  Unlike data_ptr, the Vec struct itself never
-        // moves (it lives inside a RefCell), so this pointer is always
-        // valid.  We dereference it at offset 0 to obtain the *current*
-        // buffer pointer, which may have changed after a reallocation.
-        let ic_off_vec_ptr = ic_base + 24;
+        let _ic_off_len = ic_base + 16;
+        let _ic_off_vec_ptr = ic_base + 24;
 
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
@@ -6578,10 +6571,10 @@ impl<'a> MaglevCodegen<'a> {
         let layout = cached_jsvalue_layout();
         let _vec_layout = cached_vec_jsvalue_layout();
         let ic_base = self.array_ic_base;
-        let ic_off_handle = ic_base;
+        let _ic_off_handle = ic_base;
         let _ic_off_data = ic_base + 8;
-        let ic_off_len = ic_base + 16;
-        let ic_off_vec_ptr = ic_base + 24;
+        let _ic_off_len = ic_base + 16;
+        let _ic_off_vec_ptr = ic_base + 24;
 
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
