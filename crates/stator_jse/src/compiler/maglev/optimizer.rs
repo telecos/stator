@@ -201,14 +201,10 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // the loop structure).
     eliminate_constant_accumulator_loops(graph);
     // NOTE: eliminate_trivial_phis + eliminate_dead_code + eliminate_dead_counted_loops
-    // were added here to resolve accumulator Phis made trivial by scalar evolution
-    // and then remove fully-dead loops.  However, the extra DCE pass interacts badly
-    // with later loop-aware passes (forward_loop_object_properties, unroll_simple_loops)
-    // by removing nodes those passes expect to still exist, causing SIGSEGV in the
-    // sieve_primes_1k benchmark.  Disabled until the interaction is understood.
-    // eliminate_trivial_phis(graph);
-    // eliminate_dead_code(graph);
-    // eliminate_dead_counted_loops(graph);
+    // were previously here but interacted badly with loop-aware passes
+    // (forward_loop_object_properties, unroll_simple_loops) that
+    // pattern-match on loop structure.  Moved to AFTER all loop-aware
+    // passes so the loop structure is consumed before removal.
     forward_loop_object_properties(graph);
     eliminate_dead_object_stores(graph);
     eliminate_dead_allocations(graph);
@@ -224,6 +220,13 @@ pub fn optimize(graph: &mut MaglevGraph) {
     reassociate_arithmetic(graph);
     // Clean up identity ops (x+0, x-0) created by reassociation combining.
     eliminate_identity_operations_global(graph);
+    eliminate_dead_code(graph);
+    // Now that all loop-aware passes have completed, it's safe to
+    // eliminate dead counted loops created by scalar evolution.  The
+    // trivial-phi pass resolves accumulator Phis that became identities
+    // (init == back) after scalar evolution replaced them.
+    eliminate_trivial_phis(graph);
+    eliminate_dead_counted_loops(graph);
     eliminate_dead_code(graph);
 }
 
@@ -2988,7 +2991,8 @@ fn try_fuse_call_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
             return false;
         };
 
-    // Callee must be loop-invariant (defined outside the loop).
+    // Callee must be loop-invariant (defined outside the loop, or a
+    // LoadGlobal whose name is never stored inside the loop body).
     let loop_body_set: HashSet<u32> = lp.body.iter().copied().collect();
     let callee_in_loop = loop_body_set.iter().any(|&bi| {
         graph
@@ -2997,7 +3001,30 @@ fn try_fuse_call_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
             .unwrap_or(false)
     });
     if callee_in_loop {
-        return false;
+        // A LoadGlobal is semantically invariant when no StoreGlobal
+        // with the same name exists inside the loop.  LICM doesn't
+        // hoist it because other StoreGlobals make it conservatively
+        // non-pure, but we can check the specific name.
+        let is_invariant_load_global = if let Some(ValueNode::LoadGlobal { name, .. }) =
+            graph.node(callee_id)
+        {
+            let callee_name = *name;
+            !loop_body_set.iter().any(|&bi| {
+                graph
+                    .block(bi)
+                    .map(|b| {
+                        b.nodes.iter().any(|(_, node)| {
+                            matches!(node, ValueNode::StoreGlobal { name, .. } if *name == callee_name)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        } else {
+            false
+        };
+        if !is_invariant_load_global {
+            return false;
+        }
     }
 
     // ── 4. Insert SpeculativeCallFusion in preheader ─────────────────
