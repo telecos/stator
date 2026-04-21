@@ -225,15 +225,14 @@ impl<'a> GraphBuilder<'a> {
     ) -> StatorResult<MaglevGraph> {
         let instructions = bytecode.instructions()?;
 
-        // Bail out of Maglev when the function contains both a property
-        // method call (arr.push, obj.method, …) and a keyed element
-        // access (arr[i]).  The codegen's post-call IC invalidation is
-        // not yet sufficient to prevent stale-pointer crashes in all
-        // cases (e.g. array_push_sum_1k SIGSEGV).  Baseline JIT still
-        // handles these functions correctly.
-        if Self::has_property_call_and_keyed_load(&instructions) {
+        // Bail out of Maglev when the function contains keyed element
+        // access (arr[i], arr[i] = v).  The Maglev codegen for keyed
+        // IC paths has unresolved bugs: array_push_sum_1k crashes with
+        // SIGSEGV and sieve_primes_1k hangs in an infinite loop.
+        // Baseline JIT handles keyed access correctly.
+        if Self::has_keyed_access(&instructions) {
             return Err(StatorError::Internal(
-                "Maglev bail-out: mixed CallProperty + keyed access".into(),
+                "Maglev bail-out: keyed element access".into(),
             ));
         }
 
@@ -293,22 +292,15 @@ impl<'a> GraphBuilder<'a> {
     /// This combination triggers a Maglev bail-out because the codegen's
     /// post-call IC invalidation is not yet sufficient to prevent
     /// stale-pointer SIGSEGV in all cases.
-    fn has_property_call_and_keyed_load(instructions: &[Instruction]) -> bool {
-        let mut has_property_call = false;
-        let mut has_keyed_access = false;
+    /// Returns `true` if any instruction performs keyed element access
+    /// (load, store, or define keyed property).
+    fn has_keyed_access(instructions: &[Instruction]) -> bool {
         for instr in instructions {
             match instr.opcode {
-                Opcode::CallProperty
-                | Opcode::CallProperty0
-                | Opcode::CallProperty1
-                | Opcode::CallProperty2 => has_property_call = true,
                 Opcode::LdaKeyedProperty
                 | Opcode::StaKeyedProperty
-                | Opcode::DefineKeyedOwnProperty => has_keyed_access = true,
+                | Opcode::DefineKeyedOwnProperty => return true,
                 _ => {}
-            }
-            if has_property_call && has_keyed_access {
-                return true;
             }
         }
         false
@@ -3619,16 +3611,12 @@ mod tests {
     /// the builder should emit `CheckSmi` + `LoadFixedArrayElement` instead
     /// of the generic `LoadKeyedGeneric`.
     #[test]
-    fn test_keyed_load_monomorphic_specializes_to_fixed_array() {
-        // Bytecode: LdaSmi(0), Star(r1), Ldar(r0), LdaKeyedProperty(r0, slot:0), Return
-        //   r0 = param 0 (the array)
-        //   r1 = the key (0)
-        //   acc = arr[0]
+    fn test_keyed_load_monomorphic_bails_out() {
+        // With the keyed-access bail-out, Maglev should reject this bytecode.
         let instrs = vec![
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(0)]),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(0)]),
-            // LdaKeyedProperty r0, [slot 0]
             Instruction::new_unchecked(
                 Opcode::LdaKeyedProperty,
                 vec![Operand::Register(0), Operand::FeedbackSlot(0)],
@@ -3637,40 +3625,18 @@ mod tests {
         ];
         let metadata = FeedbackMetadata::new(vec![FeedbackSlotKind::KeyedLoadProperty]);
         let (arr, mut fv) = build(instrs, vec![], 2, 1, metadata);
-        // Simulate warm feedback.
         fv.set_state(0, InlineCacheState::Monomorphic);
 
-        let graph = GraphBuilder::build(&arr, &fv).unwrap();
-        let block = graph.entry_block().unwrap();
-
-        // Should contain a CheckSmi guard on the key.
-        let has_check_smi = block
-            .nodes
-            .iter()
-            .any(|(_, n)| matches!(n, ValueNode::CheckSmi { .. }));
-        assert!(has_check_smi, "expected CheckSmi guard for key");
-
-        // Should contain a LoadFixedArrayElement (not LoadKeyedGeneric).
-        let has_fast_load = block
-            .nodes
-            .iter()
-            .any(|(_, n)| matches!(n, ValueNode::LoadFixedArrayElement { .. }));
-        assert!(has_fast_load, "expected LoadFixedArrayElement (fast path)");
-
-        let has_generic = block
-            .nodes
-            .iter()
-            .any(|(_, n)| matches!(n, ValueNode::LoadKeyedGeneric { .. }));
+        let err = GraphBuilder::build(&arr, &fv).unwrap_err();
         assert!(
-            !has_generic,
-            "LoadKeyedGeneric should NOT appear when feedback is monomorphic"
+            err.to_string().contains("keyed element access"),
+            "expected keyed bail-out, got: {err}"
         );
     }
 
-    /// When the feedback slot for `LdaKeyedProperty` is `Uninitialized`,
-    /// the builder should fall back to `LoadKeyedGeneric`.
+    /// Keyed load with uninitialized feedback should bail out.
     #[test]
-    fn test_keyed_load_uninitialized_falls_back_to_generic() {
+    fn test_keyed_load_uninitialized_bails_out() {
         let instrs = vec![
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(0)]),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
@@ -3683,39 +3649,19 @@ mod tests {
         ];
         let metadata = FeedbackMetadata::new(vec![FeedbackSlotKind::KeyedLoadProperty]);
         let (arr, fv) = build(instrs, vec![], 2, 1, metadata);
-        // fv slot 0 stays Uninitialized (default).
 
-        let graph = GraphBuilder::build(&arr, &fv).unwrap();
-        let block = graph.entry_block().unwrap();
-
-        let has_generic = block
-            .nodes
-            .iter()
-            .any(|(_, n)| matches!(n, ValueNode::LoadKeyedGeneric { .. }));
+        let err = GraphBuilder::build(&arr, &fv).unwrap_err();
         assert!(
-            has_generic,
-            "expected LoadKeyedGeneric when feedback is uninitialized"
-        );
-
-        let has_fast_load = block
-            .nodes
-            .iter()
-            .any(|(_, n)| matches!(n, ValueNode::LoadFixedArrayElement { .. }));
-        assert!(
-            !has_fast_load,
-            "LoadFixedArrayElement should NOT appear without warm feedback"
+            err.to_string().contains("keyed element access"),
+            "expected keyed bail-out, got: {err}"
         );
     }
 
-    /// When the feedback slot for `StaKeyedProperty` is `Monomorphic`,
-    /// the builder should emit `CheckSmi` + `StoreFixedArrayElement`.
+    /// Keyed store with monomorphic feedback should bail out.
     #[test]
-    fn test_keyed_store_monomorphic_specializes_to_fixed_array() {
-        // Bytecode: LdaSmi(42), StaKeyedProperty(r0, r1, slot:0), Return
-        //   r0 = param 0 (the array), r1 = param 1 (the key)
+    fn test_keyed_store_monomorphic_bails_out() {
         let instrs = vec![
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(42)]),
-            // StaKeyedProperty r0, r1, [slot 0]
             Instruction::new_unchecked(
                 Opcode::StaKeyedProperty,
                 vec![
@@ -3730,37 +3676,16 @@ mod tests {
         let (arr, mut fv) = build(instrs, vec![], 2, 2, metadata);
         fv.set_state(0, InlineCacheState::Monomorphic);
 
-        let graph = GraphBuilder::build(&arr, &fv).unwrap();
-        let block = graph.entry_block().unwrap();
-
-        let has_check_smi = block
-            .nodes
-            .iter()
-            .any(|(_, n)| matches!(n, ValueNode::CheckSmi { .. }));
-        assert!(has_check_smi, "expected CheckSmi guard for key");
-
-        let has_fast_store = block
-            .nodes
-            .iter()
-            .any(|(_, n)| matches!(n, ValueNode::StoreFixedArrayElement { .. }));
+        let err = GraphBuilder::build(&arr, &fv).unwrap_err();
         assert!(
-            has_fast_store,
-            "expected StoreFixedArrayElement (fast path)"
-        );
-
-        let has_generic = block
-            .nodes
-            .iter()
-            .any(|(_, n)| matches!(n, ValueNode::StoreKeyedGeneric { .. }));
-        assert!(
-            !has_generic,
-            "StoreKeyedGeneric should NOT appear when feedback is monomorphic"
+            err.to_string().contains("keyed element access"),
+            "expected keyed bail-out, got: {err}"
         );
     }
 
-    /// Megamorphic feedback should fall back to the generic path.
+    /// Keyed load with megamorphic feedback should bail out.
     #[test]
-    fn test_keyed_load_megamorphic_falls_back_to_generic() {
+    fn test_keyed_load_megamorphic_bails_out() {
         let instrs = vec![
             Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(0)]),
             Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
@@ -3775,23 +3700,16 @@ mod tests {
         let (arr, mut fv) = build(instrs, vec![], 2, 1, metadata);
         fv.set_state(0, InlineCacheState::Megamorphic);
 
-        let graph = GraphBuilder::build(&arr, &fv).unwrap();
-        let block = graph.entry_block().unwrap();
-
-        let has_generic = block
-            .nodes
-            .iter()
-            .any(|(_, n)| matches!(n, ValueNode::LoadKeyedGeneric { .. }));
+        let err = GraphBuilder::build(&arr, &fv).unwrap_err();
         assert!(
-            has_generic,
-            "expected LoadKeyedGeneric when feedback is megamorphic"
+            err.to_string().contains("keyed element access"),
+            "expected keyed bail-out, got: {err}"
         );
     }
 
-    /// Regression test: the sieve_primes benchmark must compile to a
-    /// non-degenerate graph with zero spurious deoptimisation blocks.
+    /// Regression test: sieve_primes benchmark bails out due to keyed access.
     #[test]
-    fn test_sieve_benchmark_no_deopt() {
+    fn test_sieve_benchmark_bails_out() {
         use crate::bytecode::bytecode_generator::BytecodeGenerator;
         use crate::parser::recursive_descent;
 
@@ -3818,24 +3736,10 @@ mod tests {
         let program = recursive_descent::parse(source).unwrap();
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
         let feedback = FeedbackVector::new(ba.feedback_metadata());
-        let graph = GraphBuilder::build(&ba, &feedback).unwrap();
-
-        let deopt_blocks: Vec<_> = graph
-            .blocks()
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| matches!(b.control, Some(ControlNode::Deoptimize { .. })))
-            .map(|(i, _)| i)
-            .collect();
-
+        let err = GraphBuilder::build(&ba, &feedback).unwrap_err();
         assert!(
-            deopt_blocks.is_empty(),
-            "sieve graph has Deoptimize control in blocks {deopt_blocks:?} — \
-             indicates unhandled bytecodes"
-        );
-        assert!(
-            !graph.is_degenerate(),
-            "sieve graph should not be degenerate"
+            err.to_string().contains("keyed element access"),
+            "expected keyed bail-out, got: {err}"
         );
     }
 
@@ -3877,10 +3781,9 @@ mod tests {
         );
     }
 
-    /// Verify that array literals with multiple elements (which emit
-    /// `StaInArrayLiteral`) compile without spurious deopts.
+    /// Array literals with keyed access (a[i]) should bail out.
     #[test]
-    fn test_array_literal_sta_in_array_literal_no_deopt() {
+    fn test_array_literal_with_keyed_access_bails_out() {
         use crate::bytecode::bytecode_generator::BytecodeGenerator;
         use crate::parser::recursive_descent;
 
@@ -3907,24 +3810,10 @@ mod tests {
         );
 
         let feedback = FeedbackVector::new(ba.feedback_metadata());
-        let graph = GraphBuilder::build(&ba, &feedback).unwrap();
-
-        let deopt_blocks: Vec<_> = graph
-            .blocks()
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| matches!(b.control, Some(ControlNode::Deoptimize { .. })))
-            .map(|(i, _)| i)
-            .collect();
-
+        let err = GraphBuilder::build(&ba, &feedback).unwrap_err();
         assert!(
-            deopt_blocks.is_empty(),
-            "array literal graph has Deoptimize in blocks {deopt_blocks:?} — \
-             StaInArrayLiteral handler may be missing"
-        );
-        assert!(
-            !graph.is_degenerate(),
-            "array literal graph should not be degenerate"
+            err.to_string().contains("keyed element access"),
+            "expected keyed bail-out, got: {err}"
         );
     }
 
