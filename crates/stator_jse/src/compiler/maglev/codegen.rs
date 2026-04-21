@@ -6373,13 +6373,6 @@ impl<'a> MaglevCodegen<'a> {
         let mut load_bool = Label::new();
         let mut load_undef = Label::new();
 
-        // DIAGNOSTIC: bypass the inline x86 fast path entirely.
-        // All keyed loads go through the slow path (runtime stubs).
-        // This isolates whether the crash is in the inline fast path
-        // or in the runtime stubs / optimizer.
-        // TODO: remove this bypass once the inline fast path bug is found.
-        self.masm.jmp(&mut slow_label);
-
         // ── Fast path (scratch regs only: R11, R10, RAX) ────────────
 
         // Load object and key into scratch registers.
@@ -6572,11 +6565,6 @@ impl<'a> MaglevCodegen<'a> {
         let mut store_smi = Label::new();
         let mut store_bool = Label::new();
         let mut check_grow = Label::new();
-
-        // DIAGNOSTIC: bypass the inline x86 fast path entirely.
-        // All keyed stores go through the slow path (runtime stubs).
-        // TODO: remove this bypass once the inline fast path bug is found.
-        self.masm.jmp(&mut slow_label);
 
         // ── Fast path (scratch regs only: R11, R10, RAX) ────────────
 
