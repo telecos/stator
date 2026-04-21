@@ -6382,13 +6382,14 @@ impl<'a> MaglevCodegen<'a> {
     }
 
     #[cfg(all(target_arch = "x86_64", unix))]
+    #[allow(unused_variables)] // IC vars used by disabled fast-path code below
     fn emit_inline_load_keyed_smi(&mut self, id: NodeId, object: NodeId, key: NodeId) {
         let layout = cached_jsvalue_layout();
         let ic_base = self.array_ic_base;
-        let _ic_off_handle = ic_base;
-        let _ic_off_data = ic_base + 8;
-        let _ic_off_len = ic_base + 16;
-        let _ic_off_vec_ptr = ic_base + 24;
+        let ic_off_handle = ic_base;
+        let ic_off_data = ic_base + 8;
+        let ic_off_len = ic_base + 16;
+        let ic_off_vec_ptr = ic_base + 24;
 
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
@@ -6561,6 +6562,7 @@ impl<'a> MaglevCodegen<'a> {
     /// stub is called as a fallback.  Only the slow path invalidates the
     /// array IC (out-of-bounds stores may cause Vec reallocation).
     #[cfg(all(target_arch = "x86_64", unix))]
+    #[allow(unused_variables)] // IC vars used by disabled fast-path code below
     fn emit_inline_store_keyed_smi(
         &mut self,
         id: NodeId,
@@ -6571,10 +6573,10 @@ impl<'a> MaglevCodegen<'a> {
         let layout = cached_jsvalue_layout();
         let _vec_layout = cached_vec_jsvalue_layout();
         let ic_base = self.array_ic_base;
-        let _ic_off_handle = ic_base;
-        let _ic_off_data = ic_base + 8;
-        let _ic_off_len = ic_base + 16;
-        let _ic_off_vec_ptr = ic_base + 24;
+        let ic_off_handle = ic_base;
+        let ic_off_data = ic_base + 8;
+        let ic_off_len = ic_base + 16;
+        let ic_off_vec_ptr = ic_base + 24;
 
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
