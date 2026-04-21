@@ -6414,8 +6414,10 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.test_rr(Reg64::R11, Reg64::R11);
         self.masm.je(&mut slow_label);
         // Dereference vec_ptr to get the current buffer pointer.
-        // Vec layout: [ptr, len, cap] — data pointer is at offset 0.
-        self.masm.mov_load_base_disp32(Reg64::R11, Reg64::R11, 0);
+        // Use probed ptr_offset (not hardcoded 0) for robustness.
+        let vec_layout = cached_vec_jsvalue_layout();
+        self.masm
+            .mov_load_base_disp32(Reg64::R11, Reg64::R11, vec_layout.ptr_offset as i32);
 
         // Compute element address: R11 + R10 * sizeof(JsValue).
         // jsvalue_size is always 24 = 3 * 8; replace IMUL (3c latency)
@@ -6616,7 +6618,8 @@ impl<'a> MaglevCodegen<'a> {
             .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_vec_ptr);
         self.masm.test_rr(Reg64::R11, Reg64::R11);
         self.masm.je(&mut slow_label);
-        self.masm.mov_load_base_disp32(Reg64::R11, Reg64::R11, 0);
+        self.masm
+            .mov_load_base_disp32(Reg64::R11, Reg64::R11, vec_layout.ptr_offset as i32);
         self.masm.lea_scaled(Reg64::R10, Reg64::R10, Reg64::R10, 2); // R10 = index * 3
         // SHL R10, 3 — REX.WB C1 /4 r/m=R10(enc=2), imm8=3
         self.masm.emit_byte(0x49); // REX.W + REX.B
@@ -6708,7 +6711,8 @@ impl<'a> MaglevCodegen<'a> {
             // Re-derive fresh data pointer from Vec struct.
             self.masm
                 .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, ic_off_vec_ptr);
-            self.masm.mov_load_base_disp32(Reg64::R10, Reg64::R10, 0);
+            self.masm
+                .mov_load_base_disp32(Reg64::R10, Reg64::R10, vec_layout.ptr_offset as i32);
             // R11 = key * 24; LEA+SHL (2c) replaces IMUL (3c).
             debug_assert_eq!(
                 layout.jsvalue_size, 24,

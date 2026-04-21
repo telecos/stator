@@ -7938,6 +7938,8 @@ pub(crate) mod jit_runtime {
     /// bypassing any FFI call.
     #[derive(Debug, Clone, Copy)]
     pub struct VecJsValueLayout {
+        /// Byte offset of the data-pointer field within `Vec<JsValue>`.
+        pub ptr_offset: usize,
         /// Byte offset of the `len` field within `Vec<JsValue>`.
         pub len_offset: usize,
         /// Byte offset of the `capacity` field within `Vec<JsValue>`.
@@ -7945,7 +7947,7 @@ pub(crate) mod jit_runtime {
     }
 
     /// Probe the in-memory byte layout of `Vec<JsValue>` to find
-    /// the offsets of `len` and `capacity` fields.
+    /// the offsets of the data-pointer, `len`, and `capacity` fields.
     ///
     /// Uses distinctive element counts to locate each field by scanning
     /// the raw bytes of a stack-allocated Vec.
@@ -7963,15 +7965,22 @@ pub(crate) mod jit_runtime {
 
         let len_bytes = 37usize.to_ne_bytes();
         let cap_bytes = 97usize.to_ne_bytes();
+        let data_ptr_val = v.as_ptr() as usize;
+        let ptr_bytes = data_ptr_val.to_ne_bytes();
 
+        let mut ptr_offset = None;
         let mut len_offset = None;
         let mut cap_offset = None;
 
         for i in 0..=(vec_size.saturating_sub(8)) {
             // SAFETY: reading bytes of a stack-allocated Vec.
+            let matches_ptr = (0..8).all(|j| unsafe { *vec_ptr.add(i + j) } == ptr_bytes[j]);
             let matches_len = (0..8).all(|j| unsafe { *vec_ptr.add(i + j) } == len_bytes[j]);
             let matches_cap = (0..8).all(|j| unsafe { *vec_ptr.add(i + j) } == cap_bytes[j]);
 
+            if matches_ptr && ptr_offset.is_none() {
+                ptr_offset = Some(i);
+            }
             if matches_len && len_offset.is_none() {
                 len_offset = Some(i);
             }
@@ -7980,6 +7989,8 @@ pub(crate) mod jit_runtime {
             }
         }
 
+        let ptr_offset =
+            ptr_offset.expect("Vec<JsValue>: cannot find ptr field in byte representation");
         let len_offset =
             len_offset.expect("Vec<JsValue>: cannot find len field in byte representation");
         let cap_offset =
@@ -7997,8 +8008,16 @@ pub(crate) mod jit_runtime {
             probed_cap, 97,
             "Vec<JsValue>: capacity field not at expected offset"
         );
+        // Cross-check the data pointer — may have moved after push.
+        let probed_ptr = unsafe { *(vec_ptr.add(ptr_offset) as *const usize) };
+        assert_eq!(
+            probed_ptr,
+            v.as_ptr() as usize,
+            "Vec<JsValue>: ptr field not at expected offset"
+        );
 
         VecJsValueLayout {
+            ptr_offset,
             len_offset,
             cap_offset,
         }
