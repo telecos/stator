@@ -6679,112 +6679,12 @@ impl<'a> MaglevCodegen<'a> {
         // ── Inline grow: key == len && len < capacity ───────────────
         // For sequential array growth (e.g. `sieve[i] = true` in a
         // loop), this avoids the FFI slow path entirely.  We write the
-        // value directly into the Vec buffer and increment Vec::len
-        // using the probed layout offsets.  Only capacity overflows
-        // (≈10 per 1000 appends) fall through to the FFI slow path.
+        // Route all out-of-bounds stores through the slow path.
+        // The inline grow path that directly mutated Vec::len was UB-prone
+        // (partial JsValue initialization before len increment), so we
+        // delegate all growth to the safe Rust runtime stubs.
         self.masm.bind_label(&mut check_grow);
-        {
-            // At this point: R10 = key, RAX = value (JIT encoding).
-            // Bounds check already determined key >= IC.len.
-            // Check key == IC.len (sequential append).
-            self.masm.jne(&mut slow_label); // key != len → sparse, slow
-
-            // Load vec_ptr from IC.  If 0, the IC hasn't been filled
-            // with a vec_ptr yet → fall through to slow path.
-            self.masm
-                .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_vec_ptr);
-            self.masm.test_rr(Reg64::R11, Reg64::R11);
-            self.masm.je(&mut slow_label);
-
-            // Load capacity from Vec struct: [vec_ptr + cap_offset].
-            self.masm
-                .mov_load_base_disp32(Reg64::R11, Reg64::R11, vec_layout.cap_offset as i32);
-            // Check key < capacity (unsigned: negative keys already
-            // handled by the IC handle check).
-            self.masm.cmp_rr(Reg64::R10, Reg64::R11);
-            self.masm.jcc(CondCode::AboveEq, &mut slow_label); // need realloc
-
-            // ── Capacity available: inline append ────────────────
-            // Compute element address: data_ptr + key * sizeof(JsValue).
-            // Save key in R11 (we need it for len increment).
-            self.masm.mov_rr(Reg64::R11, Reg64::R10);
-            // Re-derive fresh data pointer from Vec struct.
-            self.masm
-                .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, ic_off_vec_ptr);
-            self.masm
-                .mov_load_base_disp32(Reg64::R10, Reg64::R10, vec_layout.ptr_offset as i32);
-            // R11 = key * 24; LEA+SHL (2c) replaces IMUL (3c).
-            debug_assert_eq!(
-                layout.jsvalue_size, 24,
-                "LEA chain assumes JsValue is 24 bytes"
-            );
-            self.masm.lea_scaled(Reg64::R11, Reg64::R11, Reg64::R11, 2); // R11 = key * 3
-            // SHL R11, 3 — REX.WB C1 /4 r/m=R11(enc=3), imm8=3
-            self.masm.emit_byte(0x49); // REX.W + REX.B
-            self.masm.emit_byte(0xC1); // SHL r/m64, imm8
-            self.masm.emit_byte(0xE3); // ModRM: mod=11, /4, r/m=3
-            self.masm.emit_byte(0x03); // shift count = 3
-            self.masm.add_rr(Reg64::R10, Reg64::R11);
-
-            // Decode value type and write.
-            let mut grow_store_smi = Label::new();
-            let mut grow_store_bool = Label::new();
-            let mut grow_update_len = Label::new();
-
-            // Check Bool first (hot for boolean arrays like sieve).
-            // XOR with JIT_FALSE: JIT_FALSE→0, JIT_TRUE→1, all else→>1.
-            self.masm.mov_ri(Reg64::R11, JIT_FALSE);
-            self.masm.xor_rr(Reg64::R11, Reg64::Rax);
-            self.masm.cmp_ri(Reg64::R11, 2);
-            self.masm.jcc(CondCode::Below, &mut grow_store_bool);
-
-            // Check if Smi (sign-extends to same value).
-            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
-            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
-            self.masm.je(&mut grow_store_smi);
-
-            // Not Smi or Bool → fall through to slow path.
-            self.masm.jmp(&mut slow_label);
-
-            // Write Smi.
-            self.masm.bind_label(&mut grow_store_smi);
-            self.masm.mov_store_byte_imm_base_disp32(
-                Reg64::R10,
-                layout.disc_offset as i32,
-                layout.smi_disc,
-            );
-            self.masm.mov_store_dword_base_disp32(
-                Reg64::R10,
-                layout.smi_payload_offset as i32,
-                Reg64::Rax,
-            );
-            self.masm.jmp(&mut grow_update_len);
-
-            // Write Bool — R11 already holds the payload (0 or 1)
-            // from the XOR check.  RAX is untouched.
-            self.masm.bind_label(&mut grow_store_bool);
-            self.masm.mov_store_byte_imm_base_disp32(
-                Reg64::R10,
-                layout.disc_offset as i32,
-                layout.bool_disc,
-            );
-            self.masm.mov_store_byte_base_disp32(
-                Reg64::R10,
-                layout.bool_payload_offset as i32,
-                Reg64::R11,
-            );
-
-            // Increment Vec::len and IC cached len.
-            self.masm.bind_label(&mut grow_update_len);
-            // Increment the real Vec::len via probed offset.
-            self.masm
-                .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_vec_ptr);
-            self.masm
-                .inc_mem_base_disp32(Reg64::R11, vec_layout.len_offset as i32);
-            // Increment the IC cached len.
-            self.masm.inc_mem_base_disp32(Reg64::Rbp, ic_off_len);
-            self.masm.jmp(&mut done_label);
-        }
+        self.masm.jmp(&mut slow_label);
 
         // ── Slow path: IC miss / non-inlineable type ────────────────
         self.masm.bind_label(&mut slow_label);
