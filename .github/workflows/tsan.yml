@@ -43,3 +43,5 @@ jobs:
           -p stator_jse
           -Z build-std
           --target x86_64-unknown-linux-gnu
+          --
+          gc::

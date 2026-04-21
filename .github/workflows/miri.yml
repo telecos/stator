@@ -18,33 +18,55 @@ jobs:
     name: Miri (${{ matrix.target }}, ${{ matrix.label }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # bytecode_generator tests are skipped (they run the full interpreter under Miri
-    # and take 2+ minutes each due to 100× instrumentation overhead). If the remaining
-    # gc/objects/structural-bytecode tests still time out on a slow runner, the job is
-    # allowed to fail without blocking the PR.
     continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
         include:
           # Primary target – x86-64 Linux (Stacked Borrows)
+          # Skips bytecode_generator (100× overhead per test) and objects::regexp
+          # (0 unsafe, 123 tests, 1.5 min) to stay within the 30-minute limit.
           - target: x86_64-unknown-linux-gnu
             miriflags: "-Zmiri-preemption-rate=0.1"
             label: "Stacked Borrows"
+            test_filter: >-
+              gc:: objects:: bytecode::
+              --skip bytecode_generator
+              --skip objects::regexp
           # Primary target – x86-64 Linux (Tree Borrows)
           - target: x86_64-unknown-linux-gnu
             miriflags: "-Zmiri-tree-borrows -Zmiri-preemption-rate=0.1"
             label: "Tree Borrows"
-          # 32-bit target – catch pointer-size-dependent bugs in GC / objects
+            test_filter: >-
+              gc:: objects:: bytecode::
+              --skip bytecode_generator
+              --skip objects::regexp
+          # 32-bit target – only pointer-size-critical modules.
+          # Miri on i686 runs GC algorithm tests at ~15 s/test (vs ~6 s on x86_64),
+          # so the full gc:: suite would exceed 30 minutes. We keep only the tests
+          # that directly exercise 32-bit pointer representation: gc_ptr, handle,
+          # tlab, and the NaN-boxing / tagged-pointer objects modules.
           - target: i686-unknown-linux-gnu
             miriflags: "-Zmiri-preemption-rate=0.1"
             label: "Stacked Borrows"
             packages: "gcc-multilib"
-          # AArch64 target – exercise interpreter + GC on a second architecture
+            test_filter: >-
+              gc::gc_ptr::
+              gc::handle::
+              gc::tlab::
+              objects::nanbox::
+              objects::nan_boxing::
+              objects::tagged::
+          # AArch64 target – exercise GC + objects on a second architecture.
+          # Skips regexp and bytecode_generator for the same timing reasons as x86_64.
           - target: aarch64-unknown-linux-gnu
             miriflags: "-Zmiri-preemption-rate=0.1"
             label: "Stacked Borrows"
             packages: "gcc-aarch64-linux-gnu libc6-dev-arm64-cross"
+            test_filter: >-
+              gc:: objects:: bytecode::
+              --skip bytecode_generator
+              --skip objects::regexp
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -81,8 +103,4 @@ jobs:
         env:
           MIRIFLAGS: "${{ matrix.miriflags }}"
         run: |
-          # Skip bytecode_generator tests: they run the full interpreter under Miri and
-          # take 2+ minutes each (100× overhead on integration-style tests), making the
-          # suite impossible to complete within the 30-minute timeout.
-          # gc::, objects::, and structural bytecode tests are fast enough to finish.
-          cargo +nightly miri test -p stator_jse --target ${{ matrix.target }} -- gc:: objects:: bytecode:: --skip bytecode_generator
+          cargo +nightly miri test -p stator_jse --target ${{ matrix.target }} -- ${{ matrix.test_filter }}
