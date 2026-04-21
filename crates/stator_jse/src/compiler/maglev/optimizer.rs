@@ -121,14 +121,6 @@ pub fn optimize(graph: &mut MaglevGraph) {
     let _block_count = graph.blocks().len();
     let _node_count: usize = graph.blocks().iter().map(|b| b.nodes.len()).sum();
 
-    // Detect if the graph contains keyed array access nodes.  When
-    // present, skip late loop transforms (unrolling, scalar evolution,
-    // forward_loop_object_properties) that can interact badly with
-    // keyed load/store IC semantics — the single-slot IC cache is not
-    // designed for unrolled bodies where multiple keyed accesses per
-    // iteration share the same IC.
-    let has_keyed = graph_has_keyed_access(graph);
-
     fold_constants(graph);
 
     let _truncations = propagate_int32_truncation(graph);
@@ -207,70 +199,35 @@ pub fn optimize(graph: &mut MaglevGraph) {
     // This must run AFTER lower_constant_accumulator_adds (which converts
     // GenericAdd→Int32Add) and BEFORE unrolling (which would complicate
     // the loop structure).
-    // Skipped when keyed access is present — scalar evolution cannot
-    // reason about array-element accumulation patterns.
-    if !has_keyed {
-        eliminate_constant_accumulator_loops(graph);
-    }
+    eliminate_constant_accumulator_loops(graph);
     // NOTE: eliminate_trivial_phis + eliminate_dead_code + eliminate_dead_counted_loops
     // were previously here but interacted badly with loop-aware passes
     // (forward_loop_object_properties, unroll_simple_loops) that
     // pattern-match on loop structure.  Moved to AFTER all loop-aware
     // passes so the loop structure is consumed before removal.
-    if !has_keyed {
-        forward_loop_object_properties(graph);
-    }
+    forward_loop_object_properties(graph);
     eliminate_dead_object_stores(graph);
     eliminate_dead_allocations(graph);
     replace_dead_arguments(graph);
     // NOTE: IV strength reduction disabled — caused 38% arithmetic regression
     // (8.2µs → 11.3µs) due to extra register pressure and dependency chains.
     // strength_reduce_induction_variables(graph);
-    if !has_keyed {
-        unroll_simple_loops(graph);
-        // After unrolling, re-run reassociation to defer constant adjustments.
-        // Unrolled bodies have chains like (((n + a) - K) + b) - K) — the
-        // constant-deferral pattern pushes all -K subtractions to the end,
-        // then the combining pattern merges them (e.g. 4×(-1) → -4).
-        reassociate_arithmetic(graph);
-        // Clean up identity ops (x+0, x-0) created by reassociation combining.
-        eliminate_identity_operations_global(graph);
-    }
+    unroll_simple_loops(graph);
+    // After unrolling, re-run reassociation to defer constant adjustments.
+    // Unrolled bodies have chains like (((n + a) - K) + b) - K) — the
+    // constant-deferral pattern pushes all -K subtractions to the end,
+    // then the combining pattern merges them (e.g. 4×(-1) → -4).
+    reassociate_arithmetic(graph);
+    // Clean up identity ops (x+0, x-0) created by reassociation combining.
+    eliminate_identity_operations_global(graph);
     eliminate_dead_code(graph);
     // Now that all loop-aware passes have completed, it's safe to
     // eliminate dead counted loops created by scalar evolution.  The
     // trivial-phi pass resolves accumulator Phis that became identities
     // (init == back) after scalar evolution replaced them.
     eliminate_trivial_phis(graph);
-    if !has_keyed {
-        eliminate_dead_counted_loops(graph);
-    }
+    eliminate_dead_counted_loops(graph);
     eliminate_dead_code(graph);
-}
-
-/// Check whether any block in the graph contains keyed array access nodes.
-///
-/// Used by [`optimize`] to gate late loop transforms (unrolling, scalar
-/// evolution, forward_loop_object_properties) that can interact badly
-/// with the single-slot keyed IC cache.
-fn graph_has_keyed_access(graph: &MaglevGraph) -> bool {
-    for block in graph.blocks() {
-        for (_nid, node) in &block.nodes {
-            if matches!(
-                node,
-                ValueNode::LoadKeyedGeneric { .. }
-                    | ValueNode::StoreKeyedGeneric { .. }
-                    | ValueNode::LoadFixedArrayElement { .. }
-                    | ValueNode::LoadFixedDoubleArrayElement { .. }
-                    | ValueNode::LoadHoleyFixedDoubleArrayElement { .. }
-                    | ValueNode::StoreFixedArrayElement { .. }
-                    | ValueNode::StoreFixedDoubleArrayElement { .. }
-            ) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -5384,11 +5341,7 @@ fn try_unroll_counted_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop, fact
     // array IC, causing stale-pointer SIGSEGV when a later keyed-load
     // loop reads from the same array.  Bail out to keep such loops at 1×
     // where the interaction is safe.
-    //
-    // Also reject loops with keyed array access — these become runtime
-    // stub calls in codegen and share a single-slot IC cache that is
-    // not designed for multiple accesses per unrolled iteration.
-    let has_unsafe_node = body.nodes.iter().any(|(_, node)| {
+    let has_method_call = body.nodes.iter().any(|(_, node)| {
         matches!(
             node,
             ValueNode::Call { .. }
@@ -5396,16 +5349,9 @@ fn try_unroll_counted_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop, fact
                 | ValueNode::CallWithSpread { .. }
                 | ValueNode::CallBuiltin { .. }
                 | ValueNode::CallRuntime { .. }
-                | ValueNode::LoadKeyedGeneric { .. }
-                | ValueNode::StoreKeyedGeneric { .. }
-                | ValueNode::LoadFixedArrayElement { .. }
-                | ValueNode::LoadFixedDoubleArrayElement { .. }
-                | ValueNode::LoadHoleyFixedDoubleArrayElement { .. }
-                | ValueNode::StoreFixedArrayElement { .. }
-                | ValueNode::StoreFixedDoubleArrayElement { .. }
         )
     });
-    if has_unsafe_node {
+    if has_method_call {
         return false;
     }
 
