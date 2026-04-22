@@ -401,6 +401,14 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
         &jit_before,
         &dispatch_before,
     );
+    let (loops, hoisted, named_hoisted, blocked) = licm_diagnostics();
+    eprintln!(
+        "LICM_DIAG[array_push_sum_1k]: loops={loops} hoisted={hoisted} named_generic_hoisted={named_hoisted} blocked_by_side_effects={blocked}"
+    );
+    let (opt_promoted, opt_skipped, cg_promoted) = globals_promotion_diagnostics();
+    eprintln!(
+        "GLOBALS_DIAG[array_push_sum_1k]: opt_promoted={opt_promoted} opt_skipped={opt_skipped} codegen_promoted={cg_promoted}"
+    );
 }
 
 fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
