@@ -4651,58 +4651,6 @@ impl<'a> MaglevCodegen<'a> {
             return;
         }
 
-        // Half-known smi_guarded: this GenericAdd was marked smi_guarded
-        // because one input is provably i32 and all consumers are
-        // arithmetic-compatible (e.g. `(sum + loaded_e) | 0`).  Skip the
-        // Smi check on the known input; Smi-check only the unknown input.
-        // On Smi-check failure or overflow, deopt to the interpreter.
-        if self.smi_guarded.contains(&id) {
-            let narrow = self.narrow_int32.contains(&id);
-            let left_known = self.i32_range.contains(&left) || self.smi_guarded.contains(&left);
-
-            self.clear_reg_forwarding();
-            self.emit_load(left, Reg64::Rdi);
-            self.emit_load(right, Reg64::R10);
-
-            // Smi check only the unknown input.
-            let check_reg = if left_known { Reg64::R10 } else { Reg64::Rdi };
-            self.masm.movsxd_rr(Reg64::Rax, check_reg);
-            self.masm.cmp_rr(Reg64::Rax, check_reg);
-            let mut not_smi = Label::new();
-            let mut done = Label::new();
-            self.masm.jne(&mut not_smi);
-
-            // 32-bit ADD; skip overflow guard when narrow (wrapping is OK).
-            self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
-            self.masm.add32_rr(Reg64::Rax, Reg64::R10);
-            if !narrow {
-                self.masm
-                    .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
-                self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
-            }
-            self.masm.jmp(&mut done);
-
-            // Not-Smi: if the operand is JIT_UNDEFINED, call the runtime
-            // stub which correctly produces NaN (Number(undefined) === NaN).
-            // For any other non-Smi value, deopt as before.
-            self.masm.bind_label(&mut not_smi);
-            self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
-            self.masm.cmp_rr(check_reg, Reg64::R11);
-            self.masm.jne(&mut self.deopt_label);
-            let saved = self.emit_save_live_regs(id);
-            self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
-            let addr = jit_runtime::jit_runtime_generic_add as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, addr as i64);
-            self.masm.call_reg(Reg64::R11);
-            self.emit_restore_live_regs(saved);
-            self.emit_deopt_check_rax();
-
-            self.masm.bind_label(&mut done);
-            self.emit_store(id, Reg64::Rax);
-            self.rax_holds = Some(id);
-            return;
-        }
-
         // Load into non-allocated registers — no save needed on fast path.
         // Generic path clobbers RAX in both fast + slow branches, so
         // invalidate the forwarding cache.
@@ -4853,51 +4801,6 @@ impl<'a> MaglevCodegen<'a> {
                 }
             }
 
-            return;
-        }
-
-        // Half-known smi_guarded: same as GenericAdd tier 2.5 but with SUB.
-        // Note: SUB is not commutative, so operand order is preserved.
-        if self.smi_guarded.contains(&id) {
-            let narrow = self.narrow_int32.contains(&id);
-            let left_known = self.i32_range.contains(&left) || self.smi_guarded.contains(&left);
-
-            self.clear_reg_forwarding();
-            self.emit_load(left, Reg64::Rdi);
-            self.emit_load(right, Reg64::R10);
-
-            let check_reg = if left_known { Reg64::R10 } else { Reg64::Rdi };
-            self.masm.movsxd_rr(Reg64::Rax, check_reg);
-            self.masm.cmp_rr(Reg64::Rax, check_reg);
-            let mut not_smi = Label::new();
-            let mut done = Label::new();
-            self.masm.jne(&mut not_smi);
-
-            self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
-            self.masm.sub32_rr(Reg64::Rax, Reg64::R10);
-            if !narrow {
-                self.masm
-                    .jcc(CondCode::Overflow, &mut self.deopt_overflow_label);
-                self.masm.movsxd_sign_extend(Reg64::Rax, Reg64::Rax);
-            }
-            self.masm.jmp(&mut done);
-
-            // Not-Smi: if JIT_UNDEFINED, call runtime stub for NaN result.
-            self.masm.bind_label(&mut not_smi);
-            self.masm.mov_ri(Reg64::R11, JIT_UNDEFINED);
-            self.masm.cmp_rr(check_reg, Reg64::R11);
-            self.masm.jne(&mut self.deopt_label);
-            let saved = self.emit_save_live_regs(id);
-            self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
-            let addr = jit_runtime::jit_runtime_generic_sub as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, addr as i64);
-            self.masm.call_reg(Reg64::R11);
-            self.emit_restore_live_regs(saved);
-            self.emit_deopt_check_rax();
-
-            self.masm.bind_label(&mut done);
-            self.emit_store(id, Reg64::Rax);
-            self.rax_holds = Some(id);
             return;
         }
 
@@ -8488,199 +8391,155 @@ impl<'a> MaglevCodegen<'a> {
     /// inputs can skip both input Smi checks (6 instructions) and emit a
     /// bare ADD + single result guard (7 instructions total, down from 13).
     fn compute_smi_guarded(graph: &MaglevGraph, i32_range: &HashSet<NodeId>) -> HashSet<NodeId> {
-        // DISABLED: speculative smi_guarded derivation beyond i32_range.
-        //
-        // The analysis below adds Phi nodes, GenericAdd/Sub/Mul with
-        // half-known inputs, and propagates through arithmetic chains.
-        // On Linux x86_64 CI this causes the sieve benchmark to hang:
-        // the speculative Smi guard (MOVSXD+CMP+JNE deopt) fires
-        // spuriously when a value that is statically i32-range at
-        // compile time turns out to hold a non-Smi encoding at runtime
-        // (e.g. JIT_TRUE=0x1_0000_0001 routed through a Phi whose
-        // other arm is Smi).  The resulting deopt cascade permanently
-        // blacklists the JIT code, forcing every subsequent call into
-        // the interpreter — slow enough to exceed the benchmark timeout.
-        //
-        // With this disabled, GenericAdd/Sub/Mul fall back to the
-        // generic inline tier (~13 insns with per-input Smi checks)
-        // instead of the smi_guarded tier (~7 insns).  The ~6 extra
-        // instructions per arithmetic op are a small price compared to
-        // permanent JIT blacklisting on deopt.
-        //
-        // Everything provably i32 (SmiConstant, Int32* ops, bitwise
-        // ops) remains in the set — those never need a runtime guard.
-        //
-        // TODO: re-enable once the underlying runtime value mismatch
-        //       is root-caused on Linux x86_64 (use jit_smi_guard_fail_log).
-        #[allow(clippy::overly_complex_bool_expr)]
-        if false {
-            let _ = {
-                // Start as a clone of i32_range (everything provably i32 is
-                // trivially smi-guarded).
-                let mut set: HashSet<NodeId> = i32_range.clone();
+        // Start as a clone of i32_range (everything provably i32 is
+        // trivially smi-guarded).
+        let mut set: HashSet<NodeId> = i32_range.clone();
 
-                // Build a consumer map: for each NodeId, which other NodeIds use it?
-                let mut consumers_of: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
-                let mut node_lookup: HashMap<NodeId, &ValueNode> = HashMap::new();
-                // Track nodes used as Branch conditions — these are booleans
-                // (JIT_TRUE/JIT_FALSE) and must NOT be smi_guarded because the
-                // movsxd Smi guard would fail.  Return values are fine.
-                let mut branch_conditions: HashSet<NodeId> = HashSet::new();
+        // Build a consumer map: for each NodeId, which other NodeIds use it?
+        let mut consumers_of: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        let mut node_lookup: HashMap<NodeId, &ValueNode> = HashMap::new();
+        // Track nodes used as Branch conditions — these are booleans
+        // (JIT_TRUE/JIT_FALSE) and must NOT be smi_guarded because the
+        // movsxd Smi guard would fail.  Return values are fine.
+        let mut branch_conditions: HashSet<NodeId> = HashSet::new();
 
-                for block in graph.blocks() {
-                    for (id, node) in &block.nodes {
-                        node_lookup.insert(*id, node);
-                        let mut inputs = HashSet::new();
-                        Self::collect_node_inputs(node, &mut inputs);
-                        for inp in inputs {
-                            consumers_of.entry(inp).or_default().push(*id);
-                        }
+        for block in graph.blocks() {
+            for (id, node) in &block.nodes {
+                node_lookup.insert(*id, node);
+                let mut inputs = HashSet::new();
+                Self::collect_node_inputs(node, &mut inputs);
+                for inp in inputs {
+                    consumers_of.entry(inp).or_default().push(*id);
+                }
+            }
+            if let Some(ctrl) = &block.control {
+                match ctrl {
+                    ControlNode::Branch { condition, .. } => {
+                        branch_conditions.insert(*condition);
                     }
-                    if let Some(ctrl) = &block.control {
-                        match ctrl {
-                            ControlNode::Branch { condition, .. } => {
-                                branch_conditions.insert(*condition);
-                            }
-                            ControlNode::Return { .. }
-                            | ControlNode::Jump { .. }
-                            | ControlNode::Deoptimize { .. } => {}
-                        }
+                    ControlNode::Return { .. }
+                    | ControlNode::Jump { .. }
+                    | ControlNode::Deoptimize { .. } => {}
+                }
+            }
+        }
+
+        // Seed LoadNamedGeneric and LoadGlobal into smi_guarded when they
+        // feed exclusively into arithmetic-compatible consumers.  At codegen
+        // time, each seeded node gets a Smi deopt guard (MOVSXD + CMP + JNE
+        // deopt) that safely bails to the interpreter if the runtime value
+        // is not a Smi.  Downstream GenericAdd/Sub/Mul can then use the
+        // smi_guarded tier (~7 insns) instead of the generic tier (~13 insns
+        // with dual input Smi checks).
+        //
+        // Previously disabled because store-to-load forwarding did not
+        // propagate global_map across blocks, leaving LoadNamedGeneric IC
+        // nodes live.  The IC produced JIT_UNDEFINED for the object handle,
+        // causing 100% deopt.  Now that global_map and alias_map are
+        // propagated across single-predecessor blocks, the forwarding chain
+        // (CreateObjectLiteralWithProperties → StoreGlobal → LoadGlobal →
+        // LoadNamedGeneric) resolves correctly, eliminating the IC calls.
+        // For any remaining un-forwarded loads, the has_undef_guard in
+        // GenericAdd smi_guarded tier provides a runtime safety net.
+        {
+            for block in graph.blocks() {
+                for (id, node) in &block.nodes {
+                    if set.contains(id) || branch_conditions.contains(id) {
+                        continue;
+                    }
+                    let is_load = matches!(
+                        node,
+                        ValueNode::LoadNamedGeneric { .. } | ValueNode::LoadGlobal { .. }
+                    );
+                    if !is_load {
+                        continue;
+                    }
+                    let all_arith = consumers_of.get(id).is_some_and(|cs| {
+                        !cs.is_empty()
+                            && cs.iter().all(|c| {
+                                node_lookup
+                                    .get(c)
+                                    .is_some_and(|n| Self::is_arithmetic_input_of(n, *id))
+                            })
+                    });
+                    if all_arith {
+                        set.insert(*id);
                     }
                 }
+            }
+        }
 
-                // Seed LoadNamedGeneric and LoadGlobal into smi_guarded when they
-                // feed exclusively into arithmetic-compatible consumers.  At codegen
-                // time, each seeded node gets a Smi deopt guard (MOVSXD + CMP + JNE
-                // deopt) that safely bails to the interpreter if the runtime value
-                // is not a Smi.  Downstream GenericAdd/Sub/Mul can then use the
-                // smi_guarded tier (~7 insns) instead of the generic tier (~13 insns
-                // with dual input Smi checks).
-                //
-                // Previously disabled because store-to-load forwarding did not
-                // propagate global_map across blocks, leaving LoadNamedGeneric IC
-                // nodes live.  The IC produced JIT_UNDEFINED for the object handle,
-                // causing 100% deopt.  Now that global_map and alias_map are
-                // propagated across single-predecessor blocks, the forwarding chain
-                // (CreateObjectLiteralWithProperties → StoreGlobal → LoadGlobal →
-                // LoadNamedGeneric) resolves correctly, eliminating the IC calls.
-                // For any remaining un-forwarded loads, the has_undef_guard in
-                // GenericAdd smi_guarded tier provides a runtime safety net.
+        // Optimistic Phi seeding for loop-carried Smi values.
+        //
+        // In loops like `sum = sum + obj.a`, the Phi for `sum` has a
+        // SmiConstant preheader input and a GenericAdd loop-body input.
+        // Without seeding, neither GenericAdd nor Phi can enter the set
+        // first (circular dependency).  We break the tie by optimistically
+        // adding Phis with at least one smi_guarded input whose consumers
+        // are all arithmetic-compatible.  The fixed-point then derives the
+        // GenericAdd results, confirming the Phi.  A verification pass
+        // afterwards removes any Phis that weren't fully confirmed.
+        for block in graph.blocks() {
+            for (id, node) in &block.nodes {
+                if let ValueNode::Phi { inputs } = node
+                    && !set.contains(id)
+                    && !branch_conditions.contains(id)
                 {
-                    for block in graph.blocks() {
-                        for (id, node) in &block.nodes {
-                            if set.contains(id) || branch_conditions.contains(id) {
-                                continue;
-                            }
-                            let is_load = matches!(
-                                node,
-                                ValueNode::LoadNamedGeneric { .. } | ValueNode::LoadGlobal { .. }
-                            );
-                            if !is_load {
-                                continue;
-                            }
-                            let all_arith = consumers_of.get(id).is_some_and(|cs| {
-                                !cs.is_empty()
-                                    && cs.iter().all(|c| {
-                                        node_lookup.get(c).is_some_and(|n| {
-                                            Self::is_arithmetic_compatible_consumer(n)
-                                        })
-                                    })
-                            });
-                            if all_arith {
-                                set.insert(*id);
-                            }
-                        }
+                    let any_in_set = inputs.iter().any(|inp| set.contains(inp));
+                    let all_arith = consumers_of.get(id).is_some_and(|cs| {
+                        !cs.is_empty()
+                            && cs.iter().all(|c| {
+                                node_lookup
+                                    .get(c)
+                                    .is_some_and(|n| Self::is_arithmetic_input_of(n, *id))
+                            })
+                    });
+                    if any_in_set && all_arith {
+                        set.insert(*id);
                     }
                 }
+            }
+        }
 
-                // Optimistic Phi seeding for loop-carried Smi values.
-                //
-                // In loops like `sum = sum + obj.a`, the Phi for `sum` has a
-                // SmiConstant preheader input and a GenericAdd loop-body input.
-                // Without seeding, neither GenericAdd nor Phi can enter the set
-                // first (circular dependency).  We break the tie by optimistically
-                // adding Phis with at least one smi_guarded input whose consumers
-                // are all arithmetic-compatible.  The fixed-point then derives the
-                // GenericAdd results, confirming the Phi.  A verification pass
-                // afterwards removes any Phis that weren't fully confirmed.
-                for block in graph.blocks() {
-                    for (id, node) in &block.nodes {
-                        if let ValueNode::Phi { inputs } = node
-                            && !set.contains(id)
-                            && !branch_conditions.contains(id)
-                        {
-                            let any_in_set = inputs.iter().any(|inp| set.contains(inp));
-                            let all_arith = consumers_of.get(id).is_some_and(|cs| {
-                                !cs.is_empty()
-                                    && cs.iter().all(|c| {
-                                        node_lookup.get(c).is_some_and(|n| {
-                                            Self::is_arithmetic_compatible_consumer(n)
-                                        })
-                                    })
-                            });
-                            if any_in_set && all_arith {
-                                set.insert(*id);
-                            }
-                        }
+        // Fixed-point propagation through GenericAdd/Sub/Mul/Inc/Dec/Negate
+        // and Phi.
+        //
+        // For Phi nodes, the derivation includes two conditions:
+        //   1. Standard convergence: all inputs are in the set.
+        //   2. Optimistic seeding: at least one input is in the set AND
+        //      all consumers are arithmetic-compatible.  This breaks
+        //      circular dependencies (e.g. Phi ↔ GenericAdd) on the first
+        //      iteration where a Phi's preheader input becomes available
+        //      (which may happen AFTER other nodes enter the set during
+        //      an earlier fixed-point iteration).  A subsequent
+        //      verification pass removes any Phis that were not fully
+        //      confirmed.
+        loop {
+            let mut changed = false;
+            for block in graph.blocks() {
+                for (id, node) in &block.nodes {
+                    if set.contains(id) {
+                        continue;
                     }
-                }
-
-                // Fixed-point propagation through GenericAdd/Sub/Mul/Inc/Dec/Negate
-                // and Phi.
-                //
-                // For Phi nodes, the derivation includes two conditions:
-                //   1. Standard convergence: all inputs are in the set.
-                //   2. Optimistic seeding: at least one input is in the set AND
-                //      all consumers are arithmetic-compatible.  This breaks
-                //      circular dependencies (e.g. Phi ↔ GenericAdd) on the first
-                //      iteration where a Phi's preheader input becomes available
-                //      (which may happen AFTER other nodes enter the set during
-                //      an earlier fixed-point iteration).  A subsequent
-                //      verification pass removes any Phis that were not fully
-                //      confirmed.
-                loop {
-                    let mut changed = false;
-                    for block in graph.blocks() {
-                        for (id, node) in &block.nodes {
-                            if set.contains(id) {
-                                continue;
-                            }
-                            let derived = match node {
-                                ValueNode::GenericAdd { left, right, .. }
-                                | ValueNode::GenericSubtract { left, right, .. } => {
-                                    // Both inputs smi_guarded.
-                                    (set.contains(left) && set.contains(right))
-                            // Half-known: one input is provably i32, the
-                            // other is unknown.  Codegen will Smi-check the
-                            // unknown input and emit 32-bit ADD/SUB + JO
-                            // deopt.  Only apply when all consumers are
-                            // arithmetic-compatible (integer-context pattern
-                            // like `(a + b) | 0`), minimising gratuitous
-                            // deopts.
-                            || ((i32_range.contains(left)
-                                || i32_range.contains(right))
-                                && consumers_of.get(id).is_some_and(|cs| {
-                                    !cs.is_empty()
-                                        && cs.iter().all(|c| {
-                                            node_lookup.get(c).is_some_and(|n| {
-                                                Self::is_arithmetic_compatible_consumer(n)
-                                            })
-                                        })
-                                }))
-                                }
-                                ValueNode::GenericMultiply { left, right, .. }
-                                | ValueNode::GenericBitwiseOr { left, right, .. }
-                                | ValueNode::GenericBitwiseAnd { left, right, .. }
-                                | ValueNode::GenericBitwiseXor { left, right, .. } => {
-                                    set.contains(left) && set.contains(right)
-                                }
-                                ValueNode::GenericIncrement { value, .. }
-                                | ValueNode::GenericDecrement { value, .. }
-                                | ValueNode::GenericNegate { value, .. }
-                                | ValueNode::GenericBitwiseNot { value, .. } => set.contains(value),
-                                ValueNode::Phi { inputs } => {
-                                    // Standard: all inputs confirmed.
-                                    inputs.iter().all(|inp| set.contains(inp))
+                    let derived = match node {
+                        ValueNode::GenericAdd { left, right, .. }
+                        | ValueNode::GenericSubtract { left, right, .. } => {
+                            // Both inputs smi_guarded.
+                            set.contains(left) && set.contains(right)
+                        }
+                        ValueNode::GenericMultiply { left, right, .. }
+                        | ValueNode::GenericBitwiseOr { left, right, .. }
+                        | ValueNode::GenericBitwiseAnd { left, right, .. }
+                        | ValueNode::GenericBitwiseXor { left, right, .. } => {
+                            set.contains(left) && set.contains(right)
+                        }
+                        ValueNode::GenericIncrement { value, .. }
+                        | ValueNode::GenericDecrement { value, .. }
+                        | ValueNode::GenericNegate { value, .. }
+                        | ValueNode::GenericBitwiseNot { value, .. } => set.contains(value),
+                        ValueNode::Phi { inputs } => {
+                            // Standard: all inputs confirmed.
+                            inputs.iter().all(|inp| set.contains(inp))
                             // OR optimistic seeding (integrated into
                             // the fixed-point so it fires as soon as a
                             // Phi input enters the set via derivation).
@@ -8690,82 +8549,63 @@ impl<'a> MaglevCodegen<'a> {
                                     !cs.is_empty()
                                         && cs.iter().all(|c| {
                                             node_lookup.get(c).is_some_and(|n| {
-                                                Self::is_arithmetic_compatible_consumer(n)
+                                                Self::is_arithmetic_input_of(n, *id)
                                             })
                                         })
                                 }))
-                                }
-                                _ => false,
-                            };
-                            if derived && !branch_conditions.contains(id) {
-                                set.insert(*id);
-                                changed = true;
-                            }
                         }
-                    }
-                    if !changed {
-                        break;
+                        _ => false,
+                    };
+                    if derived && !branch_conditions.contains(id) {
+                        set.insert(*id);
+                        changed = true;
                     }
                 }
-
-                // Verify optimistic Phis: remove any whose inputs are not all
-                // confirmed in the final set, then cascade to derived nodes.
-                loop {
-                    let mut changed = false;
-                    for block in graph.blocks() {
-                        for (id, node) in &block.nodes {
-                            if !set.contains(id) || i32_range.contains(id) {
-                                continue;
-                            }
-                            let ok = match node {
-                                ValueNode::Phi { inputs } => {
-                                    inputs.iter().all(|inp| set.contains(inp))
-                                }
-                                ValueNode::GenericAdd { left, right, .. }
-                                | ValueNode::GenericSubtract { left, right, .. } => {
-                                    // Both inputs smi_guarded OR half-known
-                                    // (one i32_range + arithmetic consumers).
-                                    (set.contains(left) && set.contains(right))
-                                        || ((i32_range.contains(left) || i32_range.contains(right))
-                                            && consumers_of.get(id).is_some_and(|cs| {
-                                                !cs.is_empty()
-                                                    && cs.iter().all(|c| {
-                                                        node_lookup.get(c).is_some_and(|n| {
-                                                            Self::is_arithmetic_compatible_consumer(
-                                                                n,
-                                                            )
-                                                        })
-                                                    })
-                                            }))
-                                }
-                                ValueNode::GenericMultiply { left, right, .. }
-                                | ValueNode::GenericBitwiseOr { left, right, .. }
-                                | ValueNode::GenericBitwiseAnd { left, right, .. }
-                                | ValueNode::GenericBitwiseXor { left, right, .. } => {
-                                    set.contains(left) && set.contains(right)
-                                }
-                                ValueNode::GenericIncrement { value, .. }
-                                | ValueNode::GenericDecrement { value, .. }
-                                | ValueNode::GenericNegate { value, .. }
-                                | ValueNode::GenericBitwiseNot { value, .. } => set.contains(value),
-                                _ => true,
-                            };
-                            if !ok {
-                                set.remove(id);
-                                changed = true;
-                            }
-                        }
-                    }
-                    if !changed {
-                        break;
-                    }
-                }
-
-                set
-            }; // end disabled smi_guarded analysis
+            }
+            if !changed {
+                break;
+            }
         }
 
-        i32_range.clone()
+        // Verify optimistic Phis: remove any whose inputs are not all
+        // confirmed in the final set, then cascade to derived nodes.
+        loop {
+            let mut changed = false;
+            for block in graph.blocks() {
+                for (id, node) in &block.nodes {
+                    if !set.contains(id) || i32_range.contains(id) {
+                        continue;
+                    }
+                    let ok = match node {
+                        ValueNode::Phi { inputs } => inputs.iter().all(|inp| set.contains(inp)),
+                        ValueNode::GenericAdd { left, right, .. }
+                        | ValueNode::GenericSubtract { left, right, .. } => {
+                            set.contains(left) && set.contains(right)
+                        }
+                        ValueNode::GenericMultiply { left, right, .. }
+                        | ValueNode::GenericBitwiseOr { left, right, .. }
+                        | ValueNode::GenericBitwiseAnd { left, right, .. }
+                        | ValueNode::GenericBitwiseXor { left, right, .. } => {
+                            set.contains(left) && set.contains(right)
+                        }
+                        ValueNode::GenericIncrement { value, .. }
+                        | ValueNode::GenericDecrement { value, .. }
+                        | ValueNode::GenericNegate { value, .. }
+                        | ValueNode::GenericBitwiseNot { value, .. } => set.contains(value),
+                        _ => true,
+                    };
+                    if !ok {
+                        set.remove(id);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        set
     }
 
     /// Returns `true` if a consumer node is arithmetic-compatible for the
@@ -8800,14 +8640,32 @@ impl<'a> MaglevCodegen<'a> {
                 | ValueNode::TaggedNotEqual { .. }
                 | ValueNode::StoreGlobal { .. }
                 | ValueNode::Phi { .. }
-                // Keyed array accesses consume their index as a Smi, so
-                // a Phi used as an array index is arithmetic-compatible.
                 | ValueNode::LoadFixedArrayElement { .. }
                 | ValueNode::StoreFixedArrayElement { .. }
                 | ValueNode::LoadFixedDoubleArrayElement { .. }
                 | ValueNode::StoreFixedDoubleArrayElement { .. }
                 | ValueNode::LoadHoleyFixedDoubleArrayElement { .. }
         )
+    }
+
+    /// Input-aware version of [`is_arithmetic_compatible_consumer`].
+    ///
+    /// For array access nodes, only the **index** input is arithmetic (a Smi);
+    /// the **elements** (object) input is a heap reference and must NOT cause
+    /// its producer to be smi_guarded.  This prevents e.g. a LoadGlobal that
+    /// loads an array from being incorrectly marked as smi_guarded.
+    fn is_arithmetic_input_of(consumer: &ValueNode, input_id: NodeId) -> bool {
+        match consumer {
+            ValueNode::LoadFixedArrayElement { elements, .. }
+            | ValueNode::LoadFixedDoubleArrayElement { elements, .. }
+            | ValueNode::LoadHoleyFixedDoubleArrayElement { elements, .. } => {
+                // Only the index input (everything except `elements`) is arithmetic.
+                *elements != input_id
+            }
+            ValueNode::StoreFixedArrayElement { elements, .. }
+            | ValueNode::StoreFixedDoubleArrayElement { elements, .. } => *elements != input_id,
+            _ => Self::is_arithmetic_compatible_consumer(consumer),
+        }
     }
 
     /// Precompute the set of wrapping Int32 nodes whose consumers all operate
