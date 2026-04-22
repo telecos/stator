@@ -633,6 +633,12 @@ fn collect_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
             args,
             ..
         }
+        | ValueNode::CallArrayPush {
+            callee,
+            receiver,
+            args,
+            ..
+        }
         | ValueNode::CallWithSpread {
             callee,
             receiver,

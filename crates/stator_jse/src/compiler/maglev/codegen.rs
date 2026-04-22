@@ -2359,6 +2359,27 @@ impl<'a> MaglevCodegen<'a> {
                 // reallocated any array's backing store.
                 self.emit_invalidate_array_ic();
             }
+            // Specialized push call — same emission as CallProperty1 but
+            // the optimizer does NOT treat this as a user call, so global
+            // promotion can proceed in push loops.
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::CallArrayPush {
+                callee,
+                receiver,
+                args,
+                ..
+            } => {
+                debug_assert_eq!(args.len(), 1);
+                self.emit_stub_call_3node(
+                    id,
+                    *callee,
+                    *receiver,
+                    args[0],
+                    jit_runtime::jit_runtime_call_property1 as *const () as usize,
+                );
+                // Invalidate array IC — push may reallocate the backing store.
+                self.emit_invalidate_array_ic();
+            }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::CallKnownFunction {
                 callee,
@@ -8100,6 +8121,12 @@ impl<'a> MaglevCodegen<'a> {
 
             // ── Variable-input nodes ────────────────────────────────────
             ValueNode::Call {
+                callee,
+                receiver,
+                args,
+                ..
+            }
+            | ValueNode::CallArrayPush {
                 callee,
                 receiver,
                 args,

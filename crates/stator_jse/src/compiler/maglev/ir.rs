@@ -1344,6 +1344,23 @@ pub enum ValueNode {
         feedback_slot: u32,
     },
 
+    /// Specialized `Array.prototype.push` call with a single argument.
+    ///
+    /// Lowered from `CallProperty1` when the property name is `"push"`.
+    /// Unlike generic [`Call`](Self::Call), this is **not** treated as a
+    /// user-visible call for global-promotion purposes because native
+    /// `push` does not read or write script globals.
+    CallArrayPush {
+        /// The loaded push method (kept for correctness guard).
+        callee: NodeId,
+        /// The array receiver (`this`).
+        receiver: NodeId,
+        /// Single-element argument list (the value to push).
+        args: Vec<NodeId>,
+        /// Feedback vector slot index.
+        feedback_slot: u32,
+    },
+
     /// Call to a statically-known function.
     CallKnownFunction {
         /// The function to call.

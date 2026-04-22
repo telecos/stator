@@ -1080,6 +1080,12 @@ fn visit_value_node_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
             args,
             ..
         }
+        | ValueNode::CallArrayPush {
+            callee,
+            receiver,
+            args,
+            ..
+        }
         | ValueNode::CallWithSpread {
             callee,
             receiver,
@@ -4768,6 +4774,12 @@ fn collect_value_node_inputs(node: &ValueNode, live: &mut HashSet<NodeId>) {
             args,
             ..
         }
+        | ValueNode::CallArrayPush {
+            callee,
+            receiver,
+            args,
+            ..
+        }
         | ValueNode::CallWithSpread {
             callee,
             receiver,
@@ -4845,6 +4857,7 @@ fn has_side_effects(node: &ValueNode) -> bool {
             | ValueNode::StoreCurrentContextSlot { .. }
             // Calls may have side-effects.
             | ValueNode::Call { .. }
+            | ValueNode::CallArrayPush { .. }
             | ValueNode::CallKnownFunction { .. }
             | ValueNode::CallBuiltin { .. }
             | ValueNode::CallRuntime { .. }
@@ -4938,6 +4951,7 @@ fn can_invalidate_named_stores(node: &ValueNode) -> bool {
             | ValueNode::StoreCurrentContextSlot { .. }
             // Calls may execute arbitrary JS that mutates properties.
             | ValueNode::Call { .. }
+            | ValueNode::CallArrayPush { .. }
             | ValueNode::CallKnownFunction { .. }
             | ValueNode::CallBuiltin { .. }
             | ValueNode::CallRuntime { .. }
@@ -5255,6 +5269,12 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
         ValueNode::CreateWithContext { object, .. } => *object = resolve(*object),
 
         ValueNode::Call {
+            callee,
+            receiver,
+            args,
+            ..
+        }
+        | ValueNode::CallArrayPush {
             callee,
             receiver,
             args,

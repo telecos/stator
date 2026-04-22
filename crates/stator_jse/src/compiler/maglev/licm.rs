@@ -769,6 +769,7 @@ fn loop_has_property_side_effects(graph: &MaglevGraph, loop_body: &HashSet<u32>)
                     | ValueNode::StoreKeyedGeneric { .. }
                     | ValueNode::DeleteProperty { .. }
                     | ValueNode::Call { .. }
+                    | ValueNode::CallArrayPush { .. }
                     | ValueNode::CallKnownFunction { .. }
                     | ValueNode::CallWithSpread { .. }
                     | ValueNode::Construct { .. }
@@ -800,6 +801,7 @@ fn is_pure(node: &ValueNode) -> bool {
             | ValueNode::StoreContextSlot { .. }
             | ValueNode::StoreCurrentContextSlot { .. }
             | ValueNode::Call { .. }
+            | ValueNode::CallArrayPush { .. }
             | ValueNode::CallKnownFunction { .. }
             | ValueNode::CallBuiltin { .. }
             | ValueNode::CallRuntime { .. }
@@ -1124,6 +1126,12 @@ fn visit_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
         ValueNode::CreateWithContext { object, .. } => f(*object),
 
         ValueNode::Call {
+            callee,
+            receiver,
+            args,
+            ..
+        }
+        | ValueNode::CallArrayPush {
             callee,
             receiver,
             args,

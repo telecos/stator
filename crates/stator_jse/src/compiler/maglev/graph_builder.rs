@@ -1312,12 +1312,39 @@ impl<'a> GraphBuilder<'a> {
                 let callee = self.env_get_register(callable_reg)?;
                 let receiver = self.env_get_register(receiver_reg)?;
                 let arg1 = self.env_get_register(arg1_reg)?;
-                let id = self.emit(ValueNode::Call {
-                    callee,
-                    receiver,
-                    args: vec![arg1],
-                    feedback_slot: slot,
-                })?;
+
+                // Detect Array.prototype.push: callee from LoadNamedGeneric
+                // with name == "push".  Emit CallArrayPush so global promotion
+                // can proceed (push doesn't read/write script globals).
+                let is_push = if let Some(ValueNode::LoadNamedGeneric { name, .. }) =
+                    self.graph.node(callee)
+                {
+                    self.bytecode
+                        .constant_pool()
+                        .get(*name as usize)
+                        .is_some_and(
+                            |entry| matches!(entry, ConstantPoolEntry::String(s) if s == "push"),
+                        )
+                } else {
+                    false
+                };
+
+                let node = if is_push {
+                    ValueNode::CallArrayPush {
+                        callee,
+                        receiver,
+                        args: vec![arg1],
+                        feedback_slot: slot,
+                    }
+                } else {
+                    ValueNode::Call {
+                        callee,
+                        receiver,
+                        args: vec![arg1],
+                        feedback_slot: slot,
+                    }
+                };
+                let id = self.emit(node)?;
                 self.env.set_accumulator(id);
                 self.known_globals.clear();
                 self.known_props.clear();
