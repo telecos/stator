@@ -6857,14 +6857,6 @@ pub(crate) mod jit_runtime {
             }
         }
         result.unwrap_or_else(|| {
-            static STA_IC_DEOPT_COUNT: AtomicU32 = AtomicU32::new(0);
-            let n = STA_IC_DEOPT_COUNT.fetch_add(1, Ordering::Relaxed);
-            if n < 5 {
-                eprintln!(
-                    "[diag:sta_keyed_ic] #{n} obj=0x{obj_i64:016x} key=0x{key_i64:016x} \
-                     val=0x{value_i64:016x}"
-                );
-            }
             track_stub_deopt(STUB_STA_KEYED);
             value_i64
         })
@@ -6914,14 +6906,6 @@ pub(crate) mod jit_runtime {
             }
         }
         result.unwrap_or_else(|| {
-            static STA_IC_R15_DEOPT_COUNT: AtomicU32 = AtomicU32::new(0);
-            let n = STA_IC_R15_DEOPT_COUNT.fetch_add(1, Ordering::Relaxed);
-            if n < 5 {
-                eprintln!(
-                    "[diag:sta_keyed_ic_r15] #{n} obj=0x{obj_i64:016x} key=0x{key_i64:016x} \
-                     val=0x{value_i64:016x}"
-                );
-            }
             track_stub_deopt(STUB_STA_KEYED);
             value_i64
         })

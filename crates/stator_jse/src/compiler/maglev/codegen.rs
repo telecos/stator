@@ -3769,17 +3769,6 @@ impl<'a> MaglevCodegen<'a> {
                 .any(|(_, node)| Self::is_user_call_node(node))
         });
         if has_user_call {
-            for block in self.graph.blocks() {
-                for (_, node) in &block.nodes {
-                    if Self::is_user_call_node(node) {
-                        eprintln!(
-                            "CODEGEN_PROMO_SKIP: block={} node={:?}",
-                            block.id,
-                            std::mem::discriminant(node),
-                        );
-                    }
-                }
-            }
             return;
         }
 
@@ -8284,12 +8273,6 @@ impl<'a> MaglevCodegen<'a> {
                 args,
                 ..
             }
-            | ValueNode::CallArrayPush {
-                callee,
-                receiver,
-                args,
-                ..
-            }
             | ValueNode::CallWithSpread {
                 callee,
                 receiver,
@@ -8297,6 +8280,14 @@ impl<'a> MaglevCodegen<'a> {
                 ..
             } => {
                 out.insert(*callee);
+                out.insert(*receiver);
+                for a in args {
+                    out.insert(*a);
+                }
+            }
+            // CallArrayPush codegen ignores callee — exclude from inputs
+            // so smi_guarded analysis doesn't track the dead reference.
+            ValueNode::CallArrayPush { receiver, args, .. } => {
                 out.insert(*receiver);
                 for a in args {
                     out.insert(*a);

@@ -2350,11 +2350,6 @@ fn promote_globals_in_loop(
         }
         for (_, node) in &block.nodes {
             if is_user_call(node) {
-                eprintln!(
-                    "OPT_PROMO_SKIP: loop header={} blocked by user_call node={:?}",
-                    lp.header,
-                    std::mem::discriminant(node),
-                );
                 OPT_GLOBALS_SKIPPED.fetch_add(1, Ordering::Relaxed);
                 return 0;
             }
