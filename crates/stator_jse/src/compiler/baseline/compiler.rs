@@ -464,6 +464,12 @@ pub(crate) mod jit_runtime {
         static RT_FIRST_DEOPT_COUNTS: Cell<[u64; STUB_DEOPT_SLOTS]> =
             const { Cell::new([0; STUB_DEOPT_SLOTS]) };
 
+        /// Per-stub total call counts.  Incremented on every FFI stub
+        /// entry (both fast and slow paths) to diagnose whether inline
+        /// IC fast paths are firing or all calls fall to the FFI.
+        static RT_STUB_CALL_COUNTS: Cell<[u64; STUB_DEOPT_SLOTS]> =
+            const { Cell::new([0; STUB_DEOPT_SLOTS]) };
+
         /// Repeat-callee cache for [`exec_maglev_callee`].
         ///
         /// When a tight loop calls the same closure repeatedly, this cache
@@ -542,6 +548,26 @@ pub(crate) mod jit_runtime {
     /// Reset all per-stub first-deopt counts to zero.
     pub fn reset_first_deopt_counts() {
         RT_FIRST_DEOPT_COUNTS.with(|c| c.set([0; STUB_DEOPT_SLOTS]));
+    }
+
+    /// Record a call to the FFI stub at the given index.
+    #[inline]
+    fn track_stub_call(idx: usize) {
+        RT_STUB_CALL_COUNTS.with(|c| {
+            let mut arr = c.get();
+            arr[idx] = arr[idx].saturating_add(1);
+            c.set(arr);
+        });
+    }
+
+    /// Return the current per-stub call counts.
+    pub fn stub_call_counts() -> [u64; STUB_DEOPT_SLOTS] {
+        RT_STUB_CALL_COUNTS.with(|c| c.get())
+    }
+
+    /// Reset all per-stub call counts to zero.
+    pub fn reset_stub_call_counts() {
+        RT_STUB_CALL_COUNTS.with(|c| c.set([0; STUB_DEOPT_SLOTS]));
     }
 
     /// Cached fusion-pattern data for [`SpeculativeCallFusion`] runtime stub.
@@ -2542,6 +2568,7 @@ pub(crate) mod jit_runtime {
         name_idx: u32,
         _feedback_slot: u32,
     ) -> i64 {
+        track_stub_call(STUB_LDA_NAMED);
         lda_named_property_inner(obj_i64, name_idx)
             .or_else(|| lda_named_fallback(obj_i64, name_idx))
             .unwrap_or_else(|| {
@@ -2569,6 +2596,7 @@ pub(crate) mod jit_runtime {
         _feedback_slot: u32,
         rt_ptrs_cell: i64,
     ) -> i64 {
+        track_stub_call(STUB_LDA_NAMED);
         // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
         // TLS slot lives for the thread's entire lifetime.
         let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
@@ -6082,6 +6110,7 @@ pub(crate) mod jit_runtime {
     ///
     /// Returns the variable value as `i64` in `RAX`, or [`JIT_DEOPT`].
     pub extern "C" fn jit_runtime_lda_global(name_idx: i64) -> i64 {
+        track_stub_call(STUB_LDA_GLOBAL);
         let result = lda_global_inner(name_idx as u32).unwrap_or(JIT_DEOPT);
         if result == JIT_DEOPT {
             track_stub_deopt(STUB_LDA_GLOBAL);
@@ -6240,6 +6269,7 @@ pub(crate) mod jit_runtime {
     ///
     /// Returns the variable value as `i64` in `RAX`, or [`JIT_DEOPT`].
     pub extern "C" fn jit_runtime_lda_global_fast(name_idx: i64, global_ptr: i64) -> i64 {
+        track_stub_call(STUB_LDA_GLOBAL);
         let g = unsafe { &*(global_ptr as *const RefCell<JitGlobalState>) };
         let result = lda_global_from_ref(g, name_idx as u32).unwrap_or(JIT_DEOPT);
         if result == JIT_DEOPT {
@@ -6264,6 +6294,7 @@ pub(crate) mod jit_runtime {
         value_i64: i64,
         global_ptr: i64,
     ) -> i64 {
+        track_stub_call(STUB_STA_GLOBAL);
         let g = unsafe { &*(global_ptr as *const RefCell<JitGlobalState>) };
         let value = jit_i64_to_jsvalue(value_i64);
         sta_global_from_ref(g, name_idx as u32, value_i64, value).unwrap_or_else(|| {
@@ -6286,6 +6317,7 @@ pub(crate) mod jit_runtime {
     ///
     /// Returns the element value as `i64` in `RAX`, or [`JIT_DEOPT`].
     pub extern "C" fn jit_runtime_lda_keyed_property(obj_i64: i64, key_i64: i64) -> i64 {
+        track_stub_call(STUB_LDA_KEYED);
         lda_keyed_property_inner(obj_i64, key_i64).unwrap_or_else(|| {
             track_stub_deopt(STUB_LDA_KEYED);
             JIT_DEOPT
@@ -6310,6 +6342,7 @@ pub(crate) mod jit_runtime {
         key_i64: i64,
         rt_ptrs_cell: i64,
     ) -> i64 {
+        track_stub_call(STUB_LDA_KEYED);
         // SAFETY: rt_ptrs_cell was obtained from RT_PTRS.with() and the
         // TLS slot lives for the thread's entire lifetime.
         let ptrs = unsafe { &*(rt_ptrs_cell as *const Cell<RtPtrs>) }.get();
@@ -9459,6 +9492,7 @@ pub(crate) mod jit_runtime {
         arg0_i64: i64,
         ic_ptr: i64,
     ) -> i64 {
+        track_stub_call(STUB_FAST_ARRAY_PUSH);
         match call_array_push_inner(receiver_i64, arg0_i64) {
             Some(new_len) => {
                 // Fill the array IC so subsequent inline pushes hit.

@@ -23,7 +23,8 @@ use std::rc::Rc;
 
 use criterion::{Criterion, criterion_group};
 use stator_jse::compiler::baseline::compiler::{
-    STUB_DEOPT_SLOTS, STUB_NAMES, reset_stub_deopt_counts, stub_deopt_counts,
+    STUB_DEOPT_SLOTS, STUB_NAMES, reset_stub_call_counts, reset_stub_deopt_counts,
+    stub_call_counts, stub_deopt_counts,
 };
 
 /// CI-friendly Criterion configuration with reduced samples to avoid timeouts.

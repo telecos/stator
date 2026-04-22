@@ -17,7 +17,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use stator_jse::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_jse::compiler::baseline::compiler::{
     STUB_DEOPT_SLOTS, STUB_NAMES, first_deopt_counts, reset_first_deopt_counts,
-    reset_stub_deopt_counts, stub_deopt_counts,
+    reset_stub_call_counts, reset_stub_deopt_counts, stub_call_counts, stub_deopt_counts,
 };
 use stator_jse::interpreter::{
     GlobalEnv, Interpreter, InterpreterFrame, dispatch_entry_diagnostics,
@@ -385,6 +385,7 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
     let first_deopts_before = first_deopt_counts();
     let jit_before = jit_entry_diagnostics();
     let dispatch_before = dispatch_entry_diagnostics();
+    reset_stub_call_counts();
     c.bench_function("array_push_sum_1k_precompiled", |b| {
         b.iter(|| {
             let mut frame =
@@ -409,6 +410,15 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
     eprintln!(
         "GLOBALS_DIAG[array_push_sum_1k]: opt_promoted={opt_promoted} opt_skipped={opt_skipped} codegen_promoted={cg_promoted}"
     );
+    // Print per-stub FFI call counts to diagnose inline fast path usage.
+    let calls = stub_call_counts();
+    eprint!("STUB_CALLS[array_push_sum_1k]:");
+    for i in 0..STUB_DEOPT_SLOTS {
+        if calls[i] > 0 {
+            eprint!(" {}={}", STUB_NAMES[i], calls[i]);
+        }
+    }
+    eprintln!();
 }
 
 fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
