@@ -11178,6 +11178,30 @@ pub fn reset_first_deopt_counts() {
     }
 }
 
+/// Return the current per-stub FFI call counts.
+///
+/// On platforms without the JIT (non-x86-64/non-Unix), returns all zeros.
+pub fn stub_call_counts() -> [u64; STUB_DEOPT_SLOTS] {
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        jit_runtime::stub_call_counts()
+    }
+    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    {
+        [0; STUB_DEOPT_SLOTS]
+    }
+}
+
+/// Reset all per-stub call counts to zero.
+///
+/// On platforms without the JIT this is a no-op.
+pub fn reset_stub_call_counts() {
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        jit_runtime::reset_stub_call_counts();
+    }
+}
+
 /// A single entry in the safepoint table.
 ///
 /// A safepoint is any code location at which the garbage collector is allowed

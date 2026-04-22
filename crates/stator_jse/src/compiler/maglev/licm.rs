@@ -1149,9 +1149,7 @@ fn visit_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
             }
         }
         // CallArrayPush codegen ignores callee — don't track it.
-        ValueNode::CallArrayPush {
-            receiver, args, ..
-        } => {
+        ValueNode::CallArrayPush { receiver, args, .. } => {
             f(*receiver);
             for &a in args.iter() {
                 f(a);
