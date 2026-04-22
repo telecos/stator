@@ -755,6 +755,7 @@ impl<'a> MaglevCodegen<'a> {
                             | ValueNode::LoadHoleyFixedDoubleArrayElement { .. }
                             | ValueNode::StoreFixedArrayElement { .. }
                             | ValueNode::StoreFixedDoubleArrayElement { .. }
+                            | ValueNode::CallArrayPush { .. }
                     );
                 }
                 if matches!(node, ValueNode::LoadNamedGeneric { .. }) {
@@ -2366,14 +2367,16 @@ impl<'a> MaglevCodegen<'a> {
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::CallArrayPush { receiver, args, .. } => {
                 debug_assert_eq!(args.len(), 1);
-                self.emit_stub_call_2node(
-                    id,
-                    *receiver,
-                    args[0],
-                    jit_runtime::jit_runtime_array_push as *const () as usize,
-                );
-                // Invalidate array IC — push may reallocate the backing store.
-                self.emit_invalidate_array_ic();
+                if self.array_ic_base != 0 {
+                    self.emit_inline_array_push(id, *receiver, args[0]);
+                } else {
+                    self.emit_stub_call_2node(
+                        id,
+                        *receiver,
+                        args[0],
+                        jit_runtime::jit_runtime_array_push as *const () as usize,
+                    );
+                }
             }
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::CallKnownFunction {
@@ -6720,6 +6723,155 @@ impl<'a> MaglevCodegen<'a> {
         // ── Common exit ─────────────────────────────────────────────
         self.masm.bind_label(&mut done_label);
         self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Emit an inline fast-path for `Array.prototype.push(smi)` using
+    /// the array IC.
+    ///
+    /// ## Fast path (≈25 x86 instructions, ZERO function calls)
+    ///
+    /// On IC hit, receiver is the same array, value is Smi, and the
+    /// backing Vec has spare capacity: writes the JsValue::Smi element
+    /// directly into Vec memory, increments Vec::len, updates the IC,
+    /// and returns the new length — all without any FFI call.
+    ///
+    /// ## Slow path
+    ///
+    /// Calls `jit_runtime_array_push_fill_ic` which performs the push
+    /// via Rust's `Vec::push` and fills the IC on success, so the next
+    /// iteration hits the fast path.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn emit_inline_array_push(&mut self, id: NodeId, receiver: NodeId, value: NodeId) {
+        let layout = cached_jsvalue_layout();
+        let vec_layout = cached_vec_jsvalue_layout();
+        let ic_base = self.array_ic_base;
+        debug_assert_ne!(ic_base, 0);
+        let ic_off_handle = ic_base;
+        let ic_off_len = ic_base + 16;
+        let ic_off_vec_ptr = ic_base + 24;
+
+        let mut slow_label = Label::new();
+        let mut done_label = Label::new();
+
+        // ── Fast path (scratch regs only: R11, R10, RAX) ────────────
+
+        // Load receiver → R11, value → RAX.
+        self.emit_load(receiver, Reg64::R11);
+        self.emit_load(value, Reg64::Rax);
+        self.rax_holds = None;
+
+        // Smi check on value: sign-extend the lower 32 bits and compare.
+        self.masm.movsxd_rr(Reg64::R10, Reg64::Rax);
+        self.masm.cmp_rr(Reg64::R10, Reg64::Rax);
+        self.masm.jne(&mut slow_label);
+
+        // Heap handle check on receiver.
+        self.masm.mov_ri(Reg64::R10, JIT_HEAP_TAG);
+        self.masm.cmp_rr(Reg64::R11, Reg64::R10);
+        self.masm.jcc(CondCode::Below, &mut slow_label);
+
+        // IC hit: same array handle?
+        self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, ic_off_handle);
+        self.masm.jne(&mut slow_label);
+
+        // Load vec_ptr from IC.
+        self.masm
+            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_vec_ptr);
+        self.masm.test_rr(Reg64::R11, Reg64::R11);
+        self.masm.je(&mut slow_label);
+
+        // R11 = vec_ptr, RAX = Smi value.
+        // Capacity check: len < cap?
+        self.masm
+            .mov_load_base_disp32(Reg64::R10, Reg64::R11, vec_layout.len_offset as i32);
+        self.masm
+            .cmp_rm(Reg64::R10, Reg64::R11, vec_layout.cap_offset as i32);
+        // Unsigned comparison: len >= cap means need realloc.
+        self.masm.jcc(CondCode::AboveEq, &mut slow_label);
+
+        // ── Write element at data_ptr + len * 24 ────────────────────
+        // R10 = len (index to write at), R11 = vec_ptr, RAX = Smi value.
+        // Save value on stack — we need all 3 scratch regs for address
+        // computation.
+        self.masm.push(Reg64::Rax);
+
+        // RAX = data_ptr (fresh from Vec struct).
+        self.masm
+            .mov_load_base_disp32(Reg64::Rax, Reg64::R11, vec_layout.ptr_offset as i32);
+
+        // R10 = len * 24 (= len * 3 * 8).
+        debug_assert_eq!(
+            layout.jsvalue_size, 24,
+            "inline push assumes JsValue is 24 bytes"
+        );
+        self.masm.lea_scaled(Reg64::R10, Reg64::R10, Reg64::R10, 2); // R10 = len * 3
+        // SHL R10, 3  →  REX.WB C1 /4 r/m=R10(enc=2), imm8=3
+        self.masm.emit_byte(0x49);
+        self.masm.emit_byte(0xC1);
+        self.masm.emit_byte(0xE2);
+        self.masm.emit_byte(0x03);
+
+        // R10 = element address = data_ptr + len*24.
+        self.masm.add_rr(Reg64::R10, Reg64::Rax);
+
+        // Restore Smi value.
+        self.masm.pop(Reg64::Rax);
+
+        // Write JsValue::Smi(value) at the element address.
+        // R10 = element addr, RAX = Smi value, R11 = vec_ptr.
+        self.masm.mov_store_byte_imm_base_disp32(
+            Reg64::R10,
+            layout.disc_offset as i32,
+            layout.smi_disc,
+        );
+        self.masm.mov_store_dword_base_disp32(
+            Reg64::R10,
+            layout.smi_payload_offset as i32,
+            Reg64::Rax,
+        );
+
+        // ── Increment Vec::len ──────────────────────────────────────
+        // R11 still holds vec_ptr (only RAX and R10 were repurposed).
+        self.masm
+            .mov_load_base_disp32(Reg64::R10, Reg64::R11, vec_layout.len_offset as i32);
+        self.masm.add_ri(Reg64::R10, 1);
+        self.masm
+            .mov_store_base_disp32(Reg64::R11, vec_layout.len_offset as i32, Reg64::R10);
+
+        // Update IC cached length.
+        self.masm
+            .mov_store_base_disp32(Reg64::Rbp, ic_off_len, Reg64::R10);
+
+        // Return new length as JIT Smi (fits in i32 for any
+        // practical array size).
+        self.masm.mov_rr(Reg64::Rax, Reg64::R10);
+        self.emit_store(id, Reg64::Rax);
+        self.masm.jmp(&mut done_label);
+
+        // ── Slow path: IC miss, non-Smi, or capacity exceeded ───────
+        self.masm.bind_label(&mut slow_label);
+        let saved = self.emit_save_live_regs(id);
+
+        // Load receiver and value into scratch regs first to avoid
+        // clobbering when the allocator placed them in ABI registers.
+        self.emit_load(receiver, Reg64::R11);
+        self.emit_load(value, Reg64::R10);
+        self.masm.mov_rr(Reg64::Rdi, Reg64::R11);
+        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+
+        // Pass IC pointer in RDX (3rd arg).
+        self.masm.lea_base_disp32(Reg64::Rdx, Reg64::Rbp, ic_base);
+
+        let stub_addr = jit_runtime::jit_runtime_array_push_fill_ic as *const () as usize;
+        self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        self.masm.call_reg(Reg64::R11);
+
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+        self.emit_store(id, Reg64::Rax);
+
+        // ── Common exit ─────────────────────────────────────────────
+        self.masm.bind_label(&mut done_label);
     }
 
     /// Call a 3-node-arg stub: `stub(node0, node1, node2)`.

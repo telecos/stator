@@ -9446,6 +9446,48 @@ pub(crate) mod jit_runtime {
         })
     }
 
+    /// Array push that also fills the Maglev array IC on success.
+    ///
+    /// `ic_ptr` points to `[handle, data_ptr, len, vec_ptr]` (4 × i64)
+    /// on the JIT stack frame.  After a successful push, populates all
+    /// four IC fields so that the next inline push fast-path hits.
+    ///
+    /// Returns the new array length as `i64`, or [`JIT_DEOPT`].
+    #[no_mangle]
+    pub extern "C" fn jit_runtime_array_push_fill_ic(
+        receiver_i64: i64,
+        arg0_i64: i64,
+        ic_ptr: i64,
+    ) -> i64 {
+        match call_array_push_inner(receiver_i64, arg0_i64) {
+            Some(new_len) => {
+                // Fill the array IC so subsequent inline pushes hit.
+                if ic_ptr != 0 {
+                    let cache = RT_PUSH_CACHE.with(|c| c.get());
+                    if cache.receiver == receiver_i64 && !cache.vec_ptr.is_null() {
+                        // SAFETY: ic_ptr is a valid stack-frame address
+                        // from `[RBP + array_ic_base]`.  vec_ptr is valid
+                        // for the duration of JIT execution.
+                        unsafe {
+                            let ic = ic_ptr as *mut i64;
+                            let vec = &*cache.vec_ptr;
+                            // IC layout: [handle(+0), data_ptr(+8), len(+16), vec_ptr(+24)]
+                            *ic = receiver_i64;
+                            *ic.add(1) = vec.as_ptr() as i64;
+                            *ic.add(2) = vec.len() as i64;
+                            *ic.add(3) = cache.vec_ptr as i64;
+                        }
+                    }
+                }
+                new_len
+            }
+            None => {
+                track_stub_deopt(STUB_CALL_PROP1);
+                JIT_DEOPT
+            }
+        }
+    }
+
     /// IC-hit fast path for `Array.prototype.push` in `CallProperty1`.
     ///
     /// Called when [`RT_CALL_PROP1_IC`] identifies the callee as a
