@@ -389,6 +389,13 @@ pub(crate) mod jit_runtime {
         static RT_FUSION_CACHE: Cell<FusionFastCache> = const {
             Cell::new(FusionFastCache::EMPTY)
         };
+
+        /// Cached Vec pointer for `jit_runtime_array_push`.  Avoids
+        /// repeated heap → JsValue::Array → Rc<RefCell<Vec>> dereferences
+        /// when the receiver is the same array across iterations.
+        static RT_PUSH_CACHE: Cell<PushVecCache> = const {
+            Cell::new(PushVecCache::EMPTY)
+        };
     }
 
     // ── Direct JIT-to-JIT call state ────────────────────────────────
@@ -940,6 +947,37 @@ pub(crate) mod jit_runtime {
         const TAG_ARRAY_PUSH: u8 = 1;
     }
 
+    /// Single-entry cache for `jit_runtime_array_push`.
+    ///
+    /// Caches the `*mut Vec<JsValue>` raw pointer obtained from the last
+    /// receiver array so that repeated `arr.push(v)` calls in a tight
+    /// loop skip the heap dereference, `JsValue::Array` match, and
+    /// `Rc<RefCell<_>>::as_ptr()` chain.
+    ///
+    /// # Safety
+    ///
+    /// The `vec_ptr` is derived from `Rc<RefCell<Vec<JsValue>>>::as_ptr()`.
+    /// The owning `Rc` lives in the heap, which is alive during JIT
+    /// execution.  The cache is cleared in [`jit_runtime_setup`] when the
+    /// heap is recycled.
+    #[derive(Clone, Copy)]
+    struct PushVecCache {
+        /// Receiver heap handle of the last push call.
+        receiver: i64,
+        /// Raw pointer to the inner `Vec<JsValue>`.
+        vec_ptr: *mut Vec<JsValue>,
+    }
+
+    impl PushVecCache {
+        const EMPTY: Self = Self {
+            receiver: 0,
+            vec_ptr: std::ptr::null_mut(),
+        };
+    }
+
+    // SAFETY: PushVecCache is only accessed from the JIT thread.
+    unsafe impl Send for PushVecCache {}
+
     /// Single-entry inline cache for object-literal template lookups.
     ///
     /// Caches a raw pointer to the [`ObjectLiteralTemplate`] stored inside
@@ -1058,6 +1096,9 @@ pub(crate) mod jit_runtime {
         // The call-property1 IC caches heap handles that are invalidated
         // by recycle_and_clear_heap, so clear it unconditionally.
         RT_CALL_PROP1_IC.with(|c| c.set(CallProp1IcEntry::EMPTY));
+        // Push cache holds a raw Vec pointer into the heap — must be
+        // invalidated when the heap is recycled.
+        RT_PUSH_CACHE.with(|c| c.set(PushVecCache::EMPTY));
         // The cached callee entry holds raw pointers (`ba_ptr`, `ctx_ptr`)
         // derived from Rc values that lived in the now-cleared heap.
         // A matching `callee_i64` (deterministic allocation from an empty
@@ -1213,6 +1254,7 @@ pub(crate) mod jit_runtime {
         DIRECT_CALL_OLD_CTX.with(|c| *c.borrow_mut() = None);
         RT_LAST_BA.with(|b| b.set((std::ptr::null(), 0)));
         RT_FUSION_CACHE.with(|c| c.set(FusionFastCache::EMPTY));
+        RT_PUSH_CACHE.with(|c| c.set(PushVecCache::EMPTY));
         FUSION_CTX_CALLEE.store(0, Ordering::Relaxed);
         FUSION_CTX_SLOT_PTR.store(0, Ordering::Relaxed);
 
@@ -9450,6 +9492,34 @@ pub(crate) mod jit_runtime {
     /// already proven the callee is `Array.prototype.push`.
     #[inline(always)]
     fn call_array_push_inner(receiver_i64: i64, arg0_i64: i64) -> Option<i64> {
+        // Decode the argument (Smi fast path first — common in push loops).
+        let arg0 = if arg0_i64 >= i32::MIN as i64 && arg0_i64 <= i32::MAX as i64 {
+            JsValue::Smi(arg0_i64 as i32)
+        } else if is_heap_handle(arg0_i64) {
+            let ptrs = RT_PTRS.with(|p| p.get());
+            if !ptrs.is_cached() {
+                return None;
+            }
+            let heap_ref = unsafe { &*ptrs.heap };
+            let heap = unsafe { &*heap_ref.as_ptr() };
+            let a_idx = (arg0_i64 - JIT_HEAP_TAG) as usize;
+            heap.get(a_idx).cloned().unwrap_or(JsValue::Undefined)
+        } else {
+            super::jit_to_jsvalue(arg0_i64).unwrap_or(JsValue::Undefined)
+        };
+
+        // ── Cache fast path: reuse the Vec pointer from previous push ──
+        let cache = RT_PUSH_CACHE.with(|c| c.get());
+        if cache.receiver == receiver_i64 && !cache.vec_ptr.is_null() {
+            // SAFETY: vec_ptr was set from Rc<RefCell<Vec<JsValue>>>::as_ptr()
+            // in the slow path below.  The Rc lives in the heap which is
+            // alive during JIT execution (single-threaded, no GC).
+            let items = unsafe { &mut *cache.vec_ptr };
+            items.push(arg0);
+            return Some(items.len() as i64);
+        }
+
+        // ── Slow path: resolve receiver and populate cache ─────────────
         if !is_heap_handle(receiver_i64) {
             return None;
         }
@@ -9464,17 +9534,17 @@ pub(crate) mod jit_runtime {
         let heap = unsafe { &*heap_ref.as_ptr() };
         match heap.get(recv_idx)? {
             JsValue::Array(arr) => {
-                let arg0 = if arg0_i64 >= i32::MIN as i64 && arg0_i64 <= i32::MAX as i64 {
-                    JsValue::Smi(arg0_i64 as i32)
-                } else if is_heap_handle(arg0_i64) {
-                    let a_idx = (arg0_i64 - JIT_HEAP_TAG) as usize;
-                    heap.get(a_idx).cloned().unwrap_or(JsValue::Undefined)
-                } else {
-                    super::jit_to_jsvalue(arg0_i64).unwrap_or(JsValue::Undefined)
-                };
+                let vec_ptr = arr.as_ptr();
+                // Populate cache for subsequent iterations.
+                RT_PUSH_CACHE.with(|c| {
+                    c.set(PushVecCache {
+                        receiver: receiver_i64,
+                        vec_ptr,
+                    })
+                });
                 // SAFETY: single-threaded JIT; no concurrent borrows of
                 // this array during push.
-                let items = unsafe { &mut *arr.as_ptr() };
+                let items = unsafe { &mut *vec_ptr };
                 items.push(arg0);
                 Some(items.len() as i64)
             }
