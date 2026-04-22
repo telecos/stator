@@ -9385,6 +9385,25 @@ pub(crate) mod jit_runtime {
         })
     }
 
+    /// Specialized `Array.prototype.push` runtime for `CallArrayPush`.
+    ///
+    /// Skips callee resolution entirely — the graph builder already
+    /// verified the callee is `push` at compile time.  Only needs
+    /// the receiver (array) and the argument.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`receiver_i64`) – JIT i64 encoding of the receiver array.
+    /// * `RSI` (`arg0_i64`) – JIT i64 encoding of the value to push.
+    ///
+    /// Returns the new array length as `i64` in `RAX`, or [`JIT_DEOPT`].
+    pub extern "C" fn jit_runtime_array_push(receiver_i64: i64, arg0_i64: i64) -> i64 {
+        call_array_push_inner(receiver_i64, arg0_i64).unwrap_or_else(|| {
+            track_stub_deopt(STUB_CALL_PROP1);
+            JIT_DEOPT
+        })
+    }
+
     /// IC-hit fast path for `Array.prototype.push` in `CallProperty1`.
     ///
     /// Called when [`RT_CALL_PROP1_IC`] identifies the callee as a
@@ -9412,6 +9431,44 @@ pub(crate) mod jit_runtime {
                     heap.get(a_idx).cloned().unwrap_or(JsValue::Undefined)
                 } else if arg0_i64 >= i32::MIN as i64 && arg0_i64 <= i32::MAX as i64 {
                     JsValue::Smi(arg0_i64 as i32)
+                } else {
+                    super::jit_to_jsvalue(arg0_i64).unwrap_or(JsValue::Undefined)
+                };
+                // SAFETY: single-threaded JIT; no concurrent borrows of
+                // this array during push.
+                let items = unsafe { &mut *arr.as_ptr() };
+                items.push(arg0);
+                Some(items.len() as i64)
+            }
+            _ => None,
+        }
+    }
+
+    /// Direct array push — no callee resolution, no IC.
+    ///
+    /// Used by `jit_runtime_array_push` when the graph builder has
+    /// already proven the callee is `Array.prototype.push`.
+    #[inline(always)]
+    fn call_array_push_inner(receiver_i64: i64, arg0_i64: i64) -> Option<i64> {
+        if !is_heap_handle(receiver_i64) {
+            return None;
+        }
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if !ptrs.is_cached() {
+            return None;
+        }
+        let recv_idx = (receiver_i64 - JIT_HEAP_TAG) as usize;
+        // SAFETY: cached pointers set by cache_rt_ptrs; valid for thread lifetime.
+        let heap_ref = unsafe { &*ptrs.heap };
+        // SAFETY: single-threaded JIT; no concurrent mutable borrows.
+        let heap = unsafe { &*heap_ref.as_ptr() };
+        match heap.get(recv_idx)? {
+            JsValue::Array(arr) => {
+                let arg0 = if arg0_i64 >= i32::MIN as i64 && arg0_i64 <= i32::MAX as i64 {
+                    JsValue::Smi(arg0_i64 as i32)
+                } else if is_heap_handle(arg0_i64) {
+                    let a_idx = (arg0_i64 - JIT_HEAP_TAG) as usize;
+                    heap.get(a_idx).cloned().unwrap_or(JsValue::Undefined)
                 } else {
                     super::jit_to_jsvalue(arg0_i64).unwrap_or(JsValue::Undefined)
                 };
