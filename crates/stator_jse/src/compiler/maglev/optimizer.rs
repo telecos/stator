@@ -2239,9 +2239,25 @@ fn promote_loop_globals_counted(graph: &mut MaglevGraph) -> usize {
     if loops.is_empty() {
         return 0;
     }
-    let mut count = 0;
 
+    // Collect all loop headers so we can detect nesting.
+    let all_headers: HashSet<u32> = loops.iter().map(|l| l.header).collect();
+
+    let mut count = 0;
     for lp in &loops {
+        // Skip loops that contain a nested sub-loop.  Promoting globals
+        // in an outer loop whose body includes an inner loop header
+        // produces incorrect Phi wiring: a global written at multiple
+        // nesting levels (e.g. `j = i*i` in outer, `j = j+i` in inner)
+        // gets a single Phi at the outer header with the wrong back-edge
+        // value.  This caused SIGSEGV in sieve-like patterns.
+        let has_nested = lp
+            .body
+            .iter()
+            .any(|&b| b != lp.header && all_headers.contains(&b));
+        if has_nested {
+            continue;
+        }
         count += promote_globals_in_loop(graph, lp);
     }
     count
