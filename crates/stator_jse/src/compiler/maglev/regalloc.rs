@@ -633,12 +633,6 @@ fn collect_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
             args,
             ..
         }
-        | ValueNode::CallArrayPush {
-            callee,
-            receiver,
-            args,
-            ..
-        }
         | ValueNode::CallWithSpread {
             callee,
             receiver,
@@ -651,6 +645,17 @@ fn collect_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
             args,
         } => {
             f(*callee);
+            f(*receiver);
+            for &a in args {
+                f(a);
+            }
+        }
+        // CallArrayPush codegen ignores the callee — don't register
+        // it as a live input so DCE can remove the dead
+        // LoadNamedGeneric and regalloc doesn't waste a register.
+        ValueNode::CallArrayPush {
+            receiver, args, ..
+        } => {
             f(*receiver);
             for &a in args {
                 f(a);

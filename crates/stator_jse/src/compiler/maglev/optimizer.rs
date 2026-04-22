@@ -1080,12 +1080,6 @@ fn visit_value_node_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
             args,
             ..
         }
-        | ValueNode::CallArrayPush {
-            callee,
-            receiver,
-            args,
-            ..
-        }
         | ValueNode::CallWithSpread {
             callee,
             receiver,
@@ -1098,6 +1092,15 @@ fn visit_value_node_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
             args,
         } => {
             f(*callee);
+            f(*receiver);
+            for a in args {
+                f(*a);
+            }
+        }
+        // CallArrayPush codegen ignores callee — not an input.
+        ValueNode::CallArrayPush {
+            receiver, args, ..
+        } => {
             f(*receiver);
             for a in args {
                 f(*a);
@@ -4774,12 +4777,6 @@ fn collect_value_node_inputs(node: &ValueNode, live: &mut HashSet<NodeId>) {
             args,
             ..
         }
-        | ValueNode::CallArrayPush {
-            callee,
-            receiver,
-            args,
-            ..
-        }
         | ValueNode::CallWithSpread {
             callee,
             receiver,
@@ -4792,6 +4789,18 @@ fn collect_value_node_inputs(node: &ValueNode, live: &mut HashSet<NodeId>) {
             args,
         } => {
             live.insert(*callee);
+            live.insert(*receiver);
+            for &a in args {
+                live.insert(a);
+            }
+        }
+        // CallArrayPush codegen ignores the callee (uses inline push
+        // or direct stub call without method resolution).  Marking
+        // callee dead lets DCE remove the LoadNamedGeneric(arr,"push")
+        // that would otherwise be emitted as an FFI call per iteration.
+        ValueNode::CallArrayPush {
+            receiver, args, ..
+        } => {
             live.insert(*receiver);
             for &a in args {
                 live.insert(a);
