@@ -1282,7 +1282,9 @@ impl<'a> GraphBuilder<'a> {
                 // Detect Array.prototype.push: callee from LoadNamedGeneric
                 // with name == "push".  Emit CallArrayPush so global
                 // promotion can proceed (push doesn't read/write globals).
-                let is_push = instr.opcode == Opcode::CallProperty && self.is_push_callee(callee);
+                let is_push = instr.opcode == Opcode::CallProperty
+                    && args.len() == 1
+                    && self.is_push_callee(callee);
 
                 let node = if is_push {
                     ValueNode::CallArrayPush {
