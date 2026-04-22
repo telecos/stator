@@ -1278,12 +1278,28 @@ impl<'a> GraphBuilder<'a> {
                 // Args follow receiver in the register file.
                 let args_start = receiver_reg + 1;
                 let args = self.collect_args(args_start, args_count)?;
-                let id = self.emit(ValueNode::Call {
-                    callee,
-                    receiver,
-                    args,
-                    feedback_slot: slot,
-                })?;
+
+                // Detect Array.prototype.push: callee from LoadNamedGeneric
+                // with name == "push".  Emit CallArrayPush so global
+                // promotion can proceed (push doesn't read/write globals).
+                let is_push = instr.opcode == Opcode::CallProperty && self.is_push_callee(callee);
+
+                let node = if is_push {
+                    ValueNode::CallArrayPush {
+                        callee,
+                        receiver,
+                        args,
+                        feedback_slot: slot,
+                    }
+                } else {
+                    ValueNode::Call {
+                        callee,
+                        receiver,
+                        args,
+                        feedback_slot: slot,
+                    }
+                };
+                let id = self.emit(node)?;
                 self.env.set_accumulator(id);
                 self.known_globals.clear();
                 self.known_props.clear();
@@ -1316,18 +1332,7 @@ impl<'a> GraphBuilder<'a> {
                 // Detect Array.prototype.push: callee from LoadNamedGeneric
                 // with name == "push".  Emit CallArrayPush so global promotion
                 // can proceed (push doesn't read/write script globals).
-                let is_push = if let Some(ValueNode::LoadNamedGeneric { name, .. }) =
-                    self.graph.node(callee)
-                {
-                    self.bytecode
-                        .constant_pool()
-                        .get(*name as usize)
-                        .is_some_and(
-                            |entry| matches!(entry, ConstantPoolEntry::String(s) if s == "push"),
-                        )
-                } else {
-                    false
-                };
+                let is_push = self.is_push_callee(callee);
 
                 let node = if is_push {
                     ValueNode::CallArrayPush {
@@ -2173,6 +2178,21 @@ impl<'a> GraphBuilder<'a> {
             let id = self.emit(ValueNode::UndefinedConstant)?;
             self.env.set(reg, id);
             Ok(id)
+        }
+    }
+
+    /// Check whether `callee` is a `LoadNamedGeneric` whose constant-pool
+    /// name is `"push"`.  Used to emit [`ValueNode::CallArrayPush`] instead
+    /// of a generic [`ValueNode::Call`] so that global promotion is not
+    /// blocked by method calls on arrays.
+    fn is_push_callee(&self, callee: NodeId) -> bool {
+        if let Some(ValueNode::LoadNamedGeneric { name, .. }) = self.graph.node(callee) {
+            self.bytecode
+                .constant_pool()
+                .get(*name as usize)
+                .is_some_and(|entry| matches!(entry, ConstantPoolEntry::String(s) if s == "push"))
+        } else {
+            false
         }
     }
 
