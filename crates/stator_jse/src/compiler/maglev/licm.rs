@@ -776,6 +776,7 @@ fn loop_has_property_side_effects(graph: &MaglevGraph, loop_body: &HashSet<u32>)
                     | ValueNode::ConstructWithSpread { .. }
                     | ValueNode::SpeculativeCallFusion { .. }
             ) {
+                eprintln!("LICM_SIDE_EFFECT: node={:?}", std::mem::discriminant(node),);
                 return true;
             }
         }

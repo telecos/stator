@@ -3769,6 +3769,17 @@ impl<'a> MaglevCodegen<'a> {
                 .any(|(_, node)| Self::is_user_call_node(node))
         });
         if has_user_call {
+            for block in self.graph.blocks() {
+                for (_, node) in &block.nodes {
+                    if Self::is_user_call_node(node) {
+                        eprintln!(
+                            "CODEGEN_PROMO_SKIP: block={} node={:?}",
+                            block.id,
+                            std::mem::discriminant(node),
+                        );
+                    }
+                }
+            }
             return;
         }
 
