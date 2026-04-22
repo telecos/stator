@@ -1639,7 +1639,7 @@ mod tests {
 
         // block 0: init (preheader) with a parameter
         let mut b0 = BasicBlock::new(0);
-        let param = b0.push_value(ValueNode::Parameter { index: 0 });
+        let _param = b0.push_value(ValueNode::Parameter { index: 0 });
         b0.set_control(ControlNode::Jump { target: 3 });
         graph.add_block(b0);
 

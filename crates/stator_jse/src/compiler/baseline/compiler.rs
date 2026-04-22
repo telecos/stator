@@ -9453,7 +9453,7 @@ pub(crate) mod jit_runtime {
     /// four IC fields so that the next inline push fast-path hits.
     ///
     /// Returns the new array length as `i64`, or [`JIT_DEOPT`].
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     pub extern "C" fn jit_runtime_array_push_fill_ic(
         receiver_i64: i64,
         arg0_i64: i64,
