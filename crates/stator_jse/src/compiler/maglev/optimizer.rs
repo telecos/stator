@@ -2235,30 +2235,60 @@ fn cse_in_block(block: &mut BasicBlock) {
 ///
 /// This eliminates per-iteration memory traffic for loop-carried globals.
 fn promote_loop_globals_counted(graph: &mut MaglevGraph) -> usize {
-    let loops = licm::detect_loops(graph);
+    let mut loops = licm::detect_loops(graph);
     if loops.is_empty() {
         return 0;
     }
 
-    // Collect all loop headers so we can detect nesting.
-    let all_headers: HashSet<u32> = loops.iter().map(|l| l.header).collect();
+    // Sort loops by body size (smallest/innermost first).  Inner loops are
+    // promoted first so their Phis are established before outer loops.
+    loops.sort_by_key(|lp| lp.body.len());
+
+    // For each loop, collect the set of globals (by name index) that are
+    // stored inside *nested* sub-loops.  These must be excluded from outer-
+    // loop promotion to avoid broken Phi wiring (a global written at
+    // multiple nesting levels would get a single Phi at the outer header
+    // with the wrong back-edge value — the root cause of the sieve SIGSEGV).
+    //
+    // Step 1: collect which global names each loop stores.
+    let loop_stored_globals: Vec<HashSet<u32>> = loops
+        .iter()
+        .map(|lp| {
+            let mut stored = HashSet::new();
+            for block in graph.blocks() {
+                if !lp.body.contains(&block.id) {
+                    continue;
+                }
+                for (_, node) in &block.nodes {
+                    if let ValueNode::StoreGlobal { name, .. } = node {
+                        stored.insert(*name);
+                    }
+                }
+            }
+            stored
+        })
+        .collect();
+
+    // Step 2: for each loop, union the stored-globals of all strictly
+    // nested sub-loops (inner.body ⊂ outer.body).
+    let mut nested_stored: Vec<HashSet<u32>> = vec![HashSet::new(); loops.len()];
+    for (i, outer) in loops.iter().enumerate() {
+        for (j, inner) in loops.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            // Strict nesting: inner body is a proper subset of outer body.
+            if inner.body.len() < outer.body.len() && inner.body.is_subset(&outer.body) {
+                for name in &loop_stored_globals[j] {
+                    nested_stored[i].insert(*name);
+                }
+            }
+        }
+    }
 
     let mut count = 0;
-    for lp in &loops {
-        // Skip loops that contain a nested sub-loop.  Promoting globals
-        // in an outer loop whose body includes an inner loop header
-        // produces incorrect Phi wiring: a global written at multiple
-        // nesting levels (e.g. `j = i*i` in outer, `j = j+i` in inner)
-        // gets a single Phi at the outer header with the wrong back-edge
-        // value.  This caused SIGSEGV in sieve-like patterns.
-        let has_nested = lp
-            .body
-            .iter()
-            .any(|&b| b != lp.header && all_headers.contains(&b));
-        if has_nested {
-            continue;
-        }
-        count += promote_globals_in_loop(graph, lp);
+    for (i, lp) in loops.iter().enumerate() {
+        count += promote_globals_in_loop(graph, lp, &nested_stored[i]);
     }
     count
 }
@@ -2299,8 +2329,13 @@ struct PromotedGlobal {
 }
 
 /// Promote loop-carried globals to Phi nodes.  Returns the number of globals
-/// promoted (0 if none).
-fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> usize {
+/// promoted (0 if none).  `exclude_names` contains global name indices that
+/// must not be promoted in this loop (written by nested sub-loops).
+fn promote_globals_in_loop(
+    graph: &mut MaglevGraph,
+    lp: &licm::NaturalLoop,
+    exclude_names: &HashSet<u32>,
+) -> usize {
     // Safety check: skip loops containing user function calls.
     for block in graph.blocks() {
         if !lp.body.contains(&block.id) {
@@ -2358,9 +2393,14 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
     }
 
     // Promotable globals: any global stored inside the loop (read-write OR
-    // write-only).  Read-only globals are already handled by LICM, so we only
-    // need to promote those that have at least one StoreGlobal in the body.
-    let promotable: Vec<u32> = store_names.iter().copied().collect();
+    // write-only) that is NOT also written by a nested sub-loop.  Read-only
+    // globals are already handled by LICM, so we only need to promote those
+    // that have at least one StoreGlobal in the body.
+    let promotable: Vec<u32> = store_names
+        .iter()
+        .copied()
+        .filter(|name| !exclude_names.contains(name))
+        .collect();
     if promotable.is_empty() {
         return 0;
     }
@@ -2486,13 +2526,12 @@ fn promote_globals_in_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> u
 
     if let Some(header_block) = graph.block_mut(lp.header) {
         for pg in &promoted {
-            for (_, node) in &mut header_block.nodes {
-                if let ValueNode::Phi { inputs } = node {
-                    // Find the Phi we inserted by checking the first input.
-                    if inputs.len() == 1 && inputs[0] == pg.preheader_load_id {
+            for (id, node) in &mut header_block.nodes {
+                if *id == pg.phi_id {
+                    if let ValueNode::Phi { inputs } = node {
                         inputs.push(pg.store_value_id);
-                        break;
                     }
+                    break;
                 }
             }
         }
