@@ -555,10 +555,6 @@ fn bench_property_access_1k(c: &mut Criterion) {
         }
         sum;
     "#;
-    // Warmup: trigger Maglev compilation and populate ICs.
-    for _ in 0..20 {
-        let _ = eval_js(source);
-    }
     c.bench_function("property_access_1k", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
@@ -598,10 +594,6 @@ fn bench_array_push_sum_1k(c: &mut Criterion) {
         }
         sum;
     "#;
-    // Warmup: trigger Maglev compilation and populate ICs.
-    for _ in 0..20 {
-        let _ = eval_js(source);
-    }
     c.bench_function("array_push_sum_1k", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
