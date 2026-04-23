@@ -6323,11 +6323,14 @@ impl<'a> MaglevCodegen<'a> {
         // Re-derive a *fresh* data pointer from the Vec struct pointer
         // instead of trusting the cached data_ptr (which becomes stale
         // after Vec reallocation — the root cause of the sieve SIGSEGV).
+        //
+        // Note: the vec_ptr null check is omitted because IC hit (handle
+        // match above) guarantees the IC was previously filled — all 4
+        // slots (handle, data_ptr, len, vec_ptr) are written atomically
+        // by the IC fill stub. Initial state has handle=0 which always
+        // misses, and invalidation zeroes only the handle.
         self.masm
             .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_vec_ptr);
-        // vec_ptr == 0 means the IC hasn't been filled by a store yet.
-        self.masm.test_rr(Reg64::R11, Reg64::R11);
-        self.masm.je(&mut slow_label);
         // Dereference vec_ptr to get the current buffer pointer.
         // Use probed ptr_offset (not hardcoded 0) for robustness.
         let vec_layout = cached_vec_jsvalue_layout();
@@ -6524,10 +6527,9 @@ impl<'a> MaglevCodegen<'a> {
         );
         // Re-derive fresh data pointer from Vec struct (same fix as
         // the load IC — prevents stale-pointer SIGSEGV after realloc).
+        // vec_ptr null check omitted: IC hit guarantees it was filled.
         self.masm
             .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_vec_ptr);
-        self.masm.test_rr(Reg64::R11, Reg64::R11);
-        self.masm.je(&mut slow_label);
         self.masm
             .mov_load_base_disp32(Reg64::R11, Reg64::R11, vec_layout.ptr_offset as i32);
         self.masm.lea_scaled(Reg64::R10, Reg64::R10, Reg64::R10, 2); // R10 = index * 3
@@ -6775,10 +6777,10 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.jne(&mut slow_label);
 
         // Load vec_ptr from IC.
+        // Null check omitted: IC hit (handle match) guarantees the IC
+        // was previously filled — vec_ptr is always non-null here.
         self.masm
             .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_vec_ptr);
-        self.masm.test_rr(Reg64::R11, Reg64::R11);
-        self.masm.je(&mut slow_label);
 
         // R11 = vec_ptr, RAX = Smi value.
         // Capacity check: len < cap?

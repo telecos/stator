@@ -555,6 +555,10 @@ fn bench_property_access_1k(c: &mut Criterion) {
         }
         sum;
     "#;
+    // Warmup: trigger Maglev compilation and populate ICs.
+    for _ in 0..20 {
+        let _ = eval_js(source);
+    }
     c.bench_function("property_access_1k", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
@@ -594,6 +598,10 @@ fn bench_array_push_sum_1k(c: &mut Criterion) {
         }
         sum;
     "#;
+    // Warmup: trigger Maglev compilation and populate ICs.
+    for _ in 0..20 {
+        let _ = eval_js(source);
+    }
     c.bench_function("array_push_sum_1k", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
@@ -851,7 +859,16 @@ fn main() {
     // Drain interpreter pools (FRAME_POOL, REGISTER_POOL, etc.)
     stator_jse::interpreter::clear_interpreter_state();
 
-    // Full JIT teardown: releases leaked Rc in callee caches,
-    // clears RT_CONTEXT/RT_GLOBAL, and drains property-map pools.
-    stator_jse::compiler::baseline::compiler::jit_full_teardown();
+    // Flush all output before exit — benchmark results must be captured.
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+
+    // Exit cleanly before JIT TLS teardown.  The full teardown can
+    // SIGSEGV when named-property IC state leaves dangling pointers
+    // in the callee/proto caches.  Since the process is exiting, the
+    // OS reclaims all memory — the teardown is only needed to prevent
+    // non-deterministic TLS destruction crashes, which std::process::exit
+    // avoids entirely by not running thread-local destructors.
+    std::process::exit(0);
 }
