@@ -1275,8 +1275,10 @@ impl<'a> GraphBuilder<'a> {
                 let slot = self.operand_feedback_slot(instr, 3)?;
                 let callee = self.env_get_register(callable_reg)?;
                 let receiver = self.env_get_register(receiver_reg)?;
-                // Args follow receiver in the register file.
-                let args_start = receiver_reg + 1;
+                // Args follow the callee in the register file.
+                // Register layout: [receiver, callee, arg0, arg1, ...]
+                // so args begin at callable_reg + 1, NOT receiver_reg + 1.
+                let args_start = callable_reg + 1;
                 let args = self.collect_args(args_start, args_count)?;
 
                 // Detect Array.prototype.push: callee from LoadNamedGeneric
@@ -4059,5 +4061,36 @@ mod tests {
             !inner_graph.is_degenerate(),
             "inner closure graph is degenerate"
         );
+    }
+
+    /// Regression test: verify `CallProperty` (variadic) passes the correct
+    /// argument to `CallArrayPush`, not the callee method.
+    ///
+    /// Before the fix, `args_start = receiver_reg + 1` picked up the callee
+    /// register (which sits between receiver and args), so every `arr.push(i)`
+    /// was actually pushing the `.push` method itself instead of `i`.
+    #[test]
+    fn test_array_push_sum_args_correct() {
+        use crate::compiler::maglev::ir::ValueNode;
+        let source = r#"
+            var arr = [];
+            for (var i = 0; i < 1000; i++) arr.push(i);
+            var sum = 0;
+            for (var i = 0; i < 1000; i++) sum += arr[i];
+            sum;
+        "#;
+        let graph = compile_and_optimize(source, "array_push_sum");
+
+        // Find CallArrayPush nodes and verify their args are NOT the callee.
+        for block in graph.blocks() {
+            for (_, node) in &block.nodes {
+                if let ValueNode::CallArrayPush { callee, args, .. } = node {
+                    assert!(
+                        !args.contains(callee),
+                        "CallArrayPush arg must not be the callee (was pushing the .push method instead of the value)"
+                    );
+                }
+            }
+        }
     }
 }
