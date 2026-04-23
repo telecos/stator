@@ -548,6 +548,12 @@ fn bench_fib_40_iterative(c: &mut Criterion) {
         }
         b;
     "#;
+    if bench_selected("fib_40_iterative") {
+        for _ in 0..20 {
+            let _ = eval_js(source);
+        }
+        reset_stub_deopt_counts();
+    }
     c.bench_function("fib_40_iterative", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
@@ -563,6 +569,12 @@ fn bench_arithmetic_loop_10k(c: &mut Criterion) {
         }
         n;
     "#;
+    if bench_selected("arithmetic_loop_10k") {
+        for _ in 0..20 {
+            let _ = eval_js(source);
+        }
+        reset_stub_deopt_counts();
+    }
     c.bench_function("arithmetic_loop_10k", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
@@ -579,6 +591,14 @@ fn bench_property_access_1k(c: &mut Criterion) {
         }
         sum;
     "#;
+    // Warmup: trigger Maglev compilation and populate ICs.
+    // Guarded to avoid polluting TLS state when another benchmark is targeted.
+    if bench_selected("property_access_1k") {
+        for _ in 0..20 {
+            let _ = eval_js(source);
+        }
+        reset_stub_deopt_counts();
+    }
     c.bench_function("property_access_1k", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
@@ -621,6 +641,14 @@ fn bench_array_push_sum_1k(c: &mut Criterion) {
         }
         sum;
     "#;
+    // Warmup: trigger Maglev compilation and populate ICs.
+    // Guarded to avoid polluting TLS state when another benchmark is targeted.
+    if bench_selected("array_push_sum_1k") {
+        for _ in 0..20 {
+            let _ = eval_js(source);
+        }
+        reset_stub_deopt_counts();
+    }
     c.bench_function("array_push_sum_1k", |b| {
         b.iter(|| {
             black_box(eval_js(black_box(source)).unwrap());
