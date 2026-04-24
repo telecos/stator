@@ -6272,6 +6272,210 @@ impl Interpreter {
                                                         smi_acc_spilled = false;
                                                         smi_acc_bool = false;
                                                         hot_acc = None;
+                                                        // Instruction fusion: speculatively
+                                                        // execute subsequent Star/Ldar/AddSmi
+                                                        // instructions inline to avoid per-
+                                                        // instruction dispatch overhead.
+                                                        'fuse: {
+                                                            if pc >= frame.loop_end_pc {
+                                                                break 'fuse;
+                                                            }
+                                                            // Star rX — store call result
+                                                            let i1 = unsafe {
+                                                                instructions.get_unchecked(pc)
+                                                            };
+                                                            if i1.opcode != Opcode::Star {
+                                                                break 'fuse;
+                                                            }
+                                                            let dst1 = unsafe {
+                                                                operand_reg_unchecked(i1, 0)
+                                                            };
+                                                            unsafe {
+                                                                frame.write_reg_unchecked(
+                                                                    dst1,
+                                                                    JsValue::Smi(r),
+                                                                );
+                                                            }
+                                                            pc += 1;
+
+                                                            if pc >= frame.loop_end_pc {
+                                                                break 'fuse;
+                                                            }
+                                                            // Ldar rY — load loop counter
+                                                            let i2 = unsafe {
+                                                                instructions.get_unchecked(pc)
+                                                            };
+                                                            if i2.opcode != Opcode::Ldar {
+                                                                break 'fuse;
+                                                            }
+                                                            let src = unsafe {
+                                                                operand_reg_unchecked(i2, 0)
+                                                            };
+                                                            let rv = unsafe {
+                                                                frame.read_reg_unchecked(src)
+                                                            };
+                                                            if let JsValue::Smi(sv) = rv {
+                                                                sa = *sv;
+                                                                pc += 1;
+                                                            } else {
+                                                                break 'fuse;
+                                                            }
+
+                                                            if pc >= frame.loop_end_pc {
+                                                                break 'fuse;
+                                                            }
+                                                            // AddSmi N — increment counter
+                                                            let i3 = unsafe {
+                                                                instructions.get_unchecked(pc)
+                                                            };
+                                                            if i3.opcode != Opcode::AddSmi {
+                                                                break 'fuse;
+                                                            }
+                                                            let add_imm = unsafe {
+                                                                match *i3.operand_unchecked(0) {
+                                                                    Operand::Immediate(v) => v,
+                                                                    _ => break 'fuse,
+                                                                }
+                                                            };
+                                                            if let Some(added) =
+                                                                sa.checked_add(add_imm)
+                                                            {
+                                                                sa = added;
+                                                                pc += 1;
+                                                            } else {
+                                                                break 'fuse;
+                                                            }
+
+                                                            if pc >= frame.loop_end_pc {
+                                                                break 'fuse;
+                                                            }
+                                                            // Star rZ — store updated counter
+                                                            let i4 = unsafe {
+                                                                instructions.get_unchecked(pc)
+                                                            };
+                                                            if i4.opcode != Opcode::Star {
+                                                                break 'fuse;
+                                                            }
+                                                            let dst2 = unsafe {
+                                                                operand_reg_unchecked(i4, 0)
+                                                            };
+                                                            unsafe {
+                                                                frame.write_reg_unchecked(
+                                                                    dst2,
+                                                                    JsValue::Smi(sa),
+                                                                );
+                                                            }
+                                                            pc += 1;
+
+                                                            // Check for TestLessThan + JumpIfTrue
+                                                            // to form a zero-dispatch tight loop.
+                                                            if pc + 1 < frame.loop_end_pc {
+                                                                let i5 = unsafe {
+                                                                    instructions.get_unchecked(pc)
+                                                                };
+                                                                if i5.opcode == Opcode::TestLessThan
+                                                                    || i5.opcode
+                                                                        == Opcode::TestLessThanOrEqual
+                                                                {
+                                                                    let limit_reg = unsafe {
+                                                                        operand_reg_unchecked(i5, 0)
+                                                                    };
+                                                                    let limit_val = unsafe {
+                                                                        frame
+                                                                            .read_reg_num_hot_unchecked(
+                                                                                limit_reg,
+                                                                            )
+                                                                    };
+                                                                    let is_leq = i5.opcode
+                                                                        == Opcode::TestLessThanOrEqual;
+                                                                    let i6 = unsafe {
+                                                                        instructions
+                                                                            .get_unchecked(pc + 1)
+                                                                    };
+                                                                    if i6.opcode
+                                                                        == Opcode::JumpIfTrue
+                                                                        || i6.opcode
+                                                                            == Opcode::JumpIfToBooleanTrue
+                                                                    {
+                                                                        let cond = if is_leq {
+                                                                            sa <= limit_val
+                                                                        } else {
+                                                                            sa < limit_val
+                                                                        };
+                                                                        if cond {
+                                                                            // Enter tight loop: repeat
+                                                                            // call+Star+Ldar+AddSmi+Star+
+                                                                            // test+jump with zero dispatch.
+                                                                            let mut counter = sa;
+                                                                            loop {
+                                                                                // Inline closure call
+                                                                                let slot_ref = unsafe {
+                                                                                    &mut *cached_call_slot_ptr
+                                                                                };
+                                                                                if let JsValue::Smi(
+                                                                                    val,
+                                                                                ) = *slot_ref
+                                                                                {
+                                                                                    let next =
+                                                                                        match cached_call_op
+                                                                                        {
+                                                                                            0 => val.checked_add(cached_call_imm),
+                                                                                            1 => val.checked_sub(cached_call_imm),
+                                                                                            2 => val.checked_add(1),
+                                                                                            3 => val.checked_sub(1),
+                                                                                            _ => None,
+                                                                                        };
+                                                                                    if let Some(
+                                                                                        call_r,
+                                                                                    ) = next
+                                                                                    {
+                                                                                        *slot_ref = JsValue::Smi(call_r);
+                                                                                        // Star dst1
+                                                                                        unsafe {
+                                                                                            frame.write_reg_unchecked(dst1, JsValue::Smi(call_r));
+                                                                                        }
+                                                                                        // Ldar+AddSmi+Star
+                                                                                        if let Some(
+                                                                                            nc,
+                                                                                        ) = counter
+                                                                                            .checked_add(
+                                                                                                add_imm,
+                                                                                            )
+                                                                                        {
+                                                                                            counter =
+                                                                                                nc;
+                                                                                            unsafe {
+                                                                                                frame.write_reg_unchecked(dst2, JsValue::Smi(nc));
+                                                                                            }
+                                                                                            // Test+Jump
+                                                                                            let c =
+                                                                                                if is_leq {
+                                                                                                    nc <= limit_val
+                                                                                                } else {
+                                                                                                    nc < limit_val
+                                                                                                };
+                                                                                            if c {
+                                                                                                continue;
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                                // Overflow, type change, or
+                                                                                // loop done — break out.
+                                                                                break;
+                                                                            }
+                                                                            sa = counter;
+                                                                        }
+                                                                        // Advance past TestLessThan +
+                                                                        // JumpIfTrue.
+                                                                        pc += 2;
+                                                                        smi_acc_spilled = false;
+                                                                        smi_acc_bool = false;
+                                                                        hot_acc = None;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
                                                         continue 'smi;
                                                     }
                                                 }
