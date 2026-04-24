@@ -97,6 +97,36 @@ fn bench_selected(name: &str) -> bool {
     }
 }
 
+/// Run enough eval_js iterations for JIT compilation to trigger, then
+/// wait for background Maglev/Turbofan compilation to finish.
+///
+/// The precompiled benchmarks use `warmup_with_maglev` which runs 100+
+/// iterations and explicitly waits.  The V8-comparison benchmarks need
+/// equivalent warmup so that Criterion measures JIT-compiled code, not
+/// interpreter-only execution (which can be 10 000× slower for array-heavy
+/// workloads like the sieve).
+fn warmup_eval_js(source: &str) {
+    // Phase 1: 100 iterations to warm ICs and trigger Maglev tiering.
+    for _ in 0..100 {
+        let _ = eval_js(source);
+    }
+    // Phase 2: wait up to 5 s for background JIT compilation.
+    let ba = EVAL_FAST.with(|f| f.borrow().2.clone());
+    if let Some(ref ba) = ba {
+        let start = std::time::Instant::now();
+        while !ba.has_all_maglev_jit_code()
+            && !ba.has_turbofan_jit_code()
+            && start.elapsed() < std::time::Duration::from_secs(5)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    // Phase 3: 100 more iterations with JIT code active to warm JIT ICs.
+    for _ in 0..100 {
+        let _ = eval_js(source);
+    }
+}
+
 /// Drop cached `Rc<BytecodeArray>` and `Rc<RefCell<GlobalEnv>>` so that
 /// all reference-counted JS objects are released while thread-local
 /// storage is still alive — preventing SIGSEGV during TLS destruction.
@@ -549,9 +579,7 @@ fn bench_fib_40_iterative(c: &mut Criterion) {
         b;
     "#;
     if bench_selected("fib_40_iterative") {
-        for _ in 0..20 {
-            let _ = eval_js(source);
-        }
+        warmup_eval_js(source);
         reset_stub_deopt_counts();
     }
     c.bench_function("fib_40_iterative", |b| {
@@ -570,9 +598,7 @@ fn bench_arithmetic_loop_10k(c: &mut Criterion) {
         n;
     "#;
     if bench_selected("arithmetic_loop_10k") {
-        for _ in 0..20 {
-            let _ = eval_js(source);
-        }
+        warmup_eval_js(source);
         reset_stub_deopt_counts();
     }
     c.bench_function("arithmetic_loop_10k", |b| {
@@ -594,9 +620,7 @@ fn bench_property_access_1k(c: &mut Criterion) {
     // Warmup: trigger Maglev compilation and populate ICs.
     // Guarded to avoid polluting TLS state when another benchmark is targeted.
     if bench_selected("property_access_1k") {
-        for _ in 0..20 {
-            let _ = eval_js(source);
-        }
+        warmup_eval_js(source);
         reset_stub_deopt_counts();
     }
     c.bench_function("property_access_1k", |b| {
@@ -617,9 +641,7 @@ fn bench_object_creation_1k(c: &mut Criterion) {
     // Warmup: trigger Maglev compilation and populate ICs.
     // Guarded to avoid polluting TLS state when another benchmark is targeted.
     if bench_selected("object_creation_1k") {
-        for _ in 0..20 {
-            let _ = eval_js(source);
-        }
+        warmup_eval_js(source);
         reset_stub_deopt_counts();
     }
     c.bench_function("object_creation_1k", |b| {
@@ -644,9 +666,7 @@ fn bench_array_push_sum_1k(c: &mut Criterion) {
     // Warmup: trigger Maglev compilation and populate ICs.
     // Guarded to avoid polluting TLS state when another benchmark is targeted.
     if bench_selected("array_push_sum_1k") {
-        for _ in 0..20 {
-            let _ = eval_js(source);
-        }
+        warmup_eval_js(source);
         reset_stub_deopt_counts();
     }
     c.bench_function("array_push_sum_1k", |b| {
@@ -705,18 +725,14 @@ fn bench_closure_counter_1k(c: &mut Criterion) {
     // Guarded to avoid polluting TLS state when another benchmark is targeted.
     if bench_selected("closure_counter_1k") {
         reset_stub_deopt_counts();
-        for _ in 0..20 {
-            let _ = eval_js(source);
-        }
+        warmup_eval_js(source);
         let counts = stub_deopt_counts();
-        eprintln!("CLOSURE_DIAG stub_deopts_after_20_runs:");
+        eprintln!("CLOSURE_DIAG stub_deopts_after_warmup:");
         for i in 0..STUB_DEOPT_SLOTS {
             if counts[i] > 0 {
                 eprintln!("  {}: {}", STUB_NAMES[i], counts[i]);
             }
         }
-        // Reset deopt counts on all cached BytecodeArrays so that Maglev
-        // retries with warm ICs during measurement.
         COMPILE_CACHE.with(|cache| {
             for ba in cache.borrow().values() {
                 ba.reset_maglev_deopt_count();
@@ -749,11 +765,9 @@ fn bench_prototype_chain_1k(c: &mut Criterion) {
     // Guarded to avoid polluting TLS state when another benchmark is targeted.
     if bench_selected("prototype_chain_1k") {
         reset_stub_deopt_counts();
-        for _ in 0..10 {
-            let _ = eval_js(source);
-        }
+        warmup_eval_js(source);
         let counts = stub_deopt_counts();
-        eprintln!("PROTO_DIAG stub_deopts_after_10_runs:");
+        eprintln!("PROTO_DIAG stub_deopts_after_warmup:");
         for i in 0..STUB_DEOPT_SLOTS {
             if counts[i] > 0 {
                 eprintln!("  {}: {}", STUB_NAMES[i], counts[i]);
@@ -792,11 +806,9 @@ fn bench_sieve_primes_1k(c: &mut Criterion) {
     // Guarded to avoid polluting TLS state when another benchmark is targeted.
     if bench_selected("sieve_primes_1k") {
         reset_stub_deopt_counts();
-        for _ in 0..10 {
-            let _ = eval_js(source);
-        }
+        warmup_eval_js(source);
         let counts = stub_deopt_counts();
-        eprintln!("SIEVE_DIAG stub_deopts_after_10_runs:");
+        eprintln!("SIEVE_DIAG stub_deopts_after_warmup:");
         for i in 0..STUB_DEOPT_SLOTS {
             if counts[i] > 0 {
                 eprintln!("  {}: {}", STUB_NAMES[i], counts[i]);
@@ -823,9 +835,7 @@ fn bench_deep_object_access_1k(c: &mut Criterion) {
     // Warmup: trigger Maglev compilation and populate ICs.
     // Guarded to avoid polluting TLS state when another benchmark is targeted.
     if bench_selected("deep_object_access_1k") {
-        for _ in 0..20 {
-            let _ = eval_js(source);
-        }
+        warmup_eval_js(source);
         reset_stub_deopt_counts();
     }
     c.bench_function("deep_object_access_1k", |b| {
