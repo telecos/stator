@@ -3641,6 +3641,9 @@ impl Interpreter {
                     let mut cached_call_imm: i32 = 0;
                     // 0=AddSmi, 1=SubSmi, 2=Inc, 3=Dec
                     let mut cached_call_op: u8 = u8::MAX;
+                    // Raw pointer to the closure context slot — bypasses
+                    // Rc clone + RefCell borrow on the hot cached-call path.
+                    let mut cached_call_slot_ptr: *mut JsValue = std::ptr::null_mut();
                     'smi: loop {
                         if pc >= frame.loop_end_pc {
                             frame.loop_end_pc = 0;
@@ -6242,35 +6245,91 @@ impl Interpreter {
                                         // as last call — skip try_inline_small_function
                                         // and do the context-slot update directly.
                                         if ba_ptr == cached_call_ba && cached_call_op != u8::MAX {
-                                            if let Some(js_ctx) = func_ba.closure_context() {
-                                                let mut guard = js_ctx.borrow_mut();
-                                                if cached_call_slot < guard.slots.len() {
-                                                    if let JsValue::Smi(val) =
-                                                        guard.slots[cached_call_slot]
-                                                    {
-                                                        let next = match cached_call_op {
-                                                            0 => val.checked_add(cached_call_imm),
-                                                            1 => val.checked_sub(cached_call_imm),
-                                                            2 => val.checked_add(1),
-                                                            3 => val.checked_sub(1),
-                                                            _ => None,
-                                                        };
-                                                        if let Some(r) = next {
-                                                            guard.slots[cached_call_slot] =
-                                                                JsValue::Smi(r);
-                                                            sa = r;
-                                                            smi_acc_spilled = false;
-                                                            smi_acc_bool = false;
-                                                            hot_acc = None;
-                                                            continue 'smi;
+                                            // Raw-pointer path: bypass Rc clone +
+                                            // RefCell borrow on every iteration.
+                                            if !cached_call_slot_ptr.is_null() {
+                                                // SAFETY: The pointer targets a slot
+                                                // in the closure context's Vec<JsValue>.
+                                                // The Vec is not reallocated (we only
+                                                // modify an existing element), the
+                                                // Rc<RefCell<JsContext>> stays alive
+                                                // through the function register, and
+                                                // no other code borrows the RefCell
+                                                // during the smi loop.
+                                                let slot_ref =
+                                                    unsafe { &mut *cached_call_slot_ptr };
+                                                if let JsValue::Smi(val) = *slot_ref {
+                                                    let next = match cached_call_op {
+                                                        0 => val.checked_add(cached_call_imm),
+                                                        1 => val.checked_sub(cached_call_imm),
+                                                        2 => val.checked_add(1),
+                                                        3 => val.checked_sub(1),
+                                                        _ => None,
+                                                    };
+                                                    if let Some(r) = next {
+                                                        *slot_ref = JsValue::Smi(r);
+                                                        sa = r;
+                                                        smi_acc_spilled = false;
+                                                        smi_acc_bool = false;
+                                                        hot_acc = None;
+                                                        continue 'smi;
+                                                    }
+                                                }
+                                                // Type changed or overflow — invalidate.
+                                                cached_call_slot_ptr = std::ptr::null_mut();
+                                                cached_call_op = u8::MAX;
+                                            } else {
+                                                // First hit: use RefCell borrow and
+                                                // cache the raw slot pointer.
+                                                if let Some(js_ctx) = func_ba.closure_context() {
+                                                    let guard = js_ctx.borrow_mut();
+                                                    if cached_call_slot < guard.slots.len() {
+                                                        if let JsValue::Smi(val) =
+                                                            guard.slots[cached_call_slot]
+                                                        {
+                                                            let next = match cached_call_op {
+                                                                0 => {
+                                                                    val.checked_add(cached_call_imm)
+                                                                }
+                                                                1 => {
+                                                                    val.checked_sub(cached_call_imm)
+                                                                }
+                                                                2 => val.checked_add(1),
+                                                                3 => val.checked_sub(1),
+                                                                _ => None,
+                                                            };
+                                                            if let Some(r) = next {
+                                                                // SAFETY: Pointer into
+                                                                // the Vec's buffer; Vec
+                                                                // is never resized from
+                                                                // here (only slot value
+                                                                // changes).
+                                                                cached_call_slot_ptr = unsafe {
+                                                                    (*js_ctx.as_ptr())
+                                                                        .slots
+                                                                        .as_mut_ptr()
+                                                                        .add(cached_call_slot)
+                                                                };
+                                                                // Write through the raw
+                                                                // pointer immediately.
+                                                                unsafe {
+                                                                    *cached_call_slot_ptr =
+                                                                        JsValue::Smi(r);
+                                                                }
+                                                                sa = r;
+                                                                smi_acc_spilled = false;
+                                                                smi_acc_bool = false;
+                                                                hot_acc = None;
+                                                                // Drop the guard before
+                                                                // continuing — we now
+                                                                // use the raw pointer.
+                                                                drop(guard);
+                                                                continue 'smi;
+                                                            }
                                                         }
                                                     }
                                                 }
                                             }
-                                            // Cached path failed (overflow or
-                                            // type changed) — invalidate and
-                                            // fall through to slow path.
-                                            cached_call_op = u8::MAX;
                                         }
 
                                         // Slow path: full pattern match.
