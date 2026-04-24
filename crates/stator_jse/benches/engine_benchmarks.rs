@@ -110,13 +110,15 @@ fn warmup_eval_js(source: &str) {
     for _ in 0..100 {
         let _ = eval_js(source);
     }
-    // Phase 2: wait up to 5 s for background JIT compilation.
+    // Phase 2: wait up to 15 s for background JIT compilation.
+    // Slow CI runners may need extra time for Maglev compilation of
+    // complex scripts (e.g. sieve with 325 bytecodes).
     let ba = EVAL_FAST.with(|f| f.borrow().2.clone());
     if let Some(ref ba) = ba {
         let start = std::time::Instant::now();
         while !ba.has_all_maglev_jit_code()
             && !ba.has_turbofan_jit_code()
-            && start.elapsed() < std::time::Duration::from_secs(5)
+            && start.elapsed() < std::time::Duration::from_secs(15)
         {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
