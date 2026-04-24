@@ -3516,6 +3516,12 @@ impl Interpreter {
             // instructions in the same function each get their own cache.
             let mut empty_obj_template: Option<(usize, ObjectLiteralTemplate)> = None;
 
+            // Cached pointer for the array-push callee object.  When the
+            // same bound-method PlainObject appears on consecutive
+            // CallProperty1 opcodes we skip the PropertyMap lookup and
+            // string comparison, going straight to Vec::push.
+            let mut cached_push_callee: *const RefCell<PropertyMap> = std::ptr::null();
+
             'dispatch: loop {
                 // ΓöÇΓöÇ Debug hook (pre-fetch) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
                 if debug_active {
@@ -9025,85 +9031,97 @@ impl Interpreter {
                         let arg_reg = unsafe { operand_reg_unchecked(instr, 2) };
                         let callee = unsafe { frame.read_reg_unchecked(callee_reg) };
                         if let JsValue::PlainObject(callee_map) = callee {
-                            // SAFETY: single-threaded interpreter; no
-                            // concurrent borrows possible.
-                            let callee_pm = unsafe { &*callee_map.as_ptr() };
-                            let method_name = callee_pm.get(FAST_ARRAY_METHOD_KEY).and_then(|v| {
-                                if let JsValue::String(s) = v {
-                                    Some(Rc::clone(s))
-                                } else {
-                                    None
-                                }
-                            });
-                            if let Some(name) = method_name {
+                            let callee_ptr = Rc::as_ptr(callee_map);
+
+                            // Ultra-fast push path: if the callee pointer
+                            // matches the cached push method, skip the
+                            // PropertyMap lookup entirely.
+                            if callee_ptr == cached_push_callee {
                                 let recv = unsafe { frame.read_reg_unchecked(recv_reg) };
                                 if let JsValue::Array(arr) = recv {
                                     let arg =
                                         unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
-                                    acc = match &*name {
-                                        "push" => {
-                                            // SAFETY: single-threaded; no
-                                            // concurrent borrows.
-                                            let items = unsafe { &mut *arr.as_ptr() };
-                                            items.push(arg);
-                                            JsValue::Smi(items.len() as i32)
-                                        }
-                                        _ => {
-                                            let recv_clone = recv.cheap_clone();
-                                            if let Some(result) = dispatch_fast_array_method(
-                                                &recv_clone,
-                                                &name,
-                                                &[arg],
-                                            )? {
-                                                result
-                                            } else {
-                                                // Unknown method ΓÇö fall through to dispatch table.
-                                                frame.pc = pc;
-                                                frame.accumulator = acc;
-                                                match dispatch_via_table(
-                                                    frame,
-                                                    instructions,
-                                                    byte_offsets,
-                                                    jump_targets,
-                                                    handler_table.as_slice(),
-                                                    instr,
-                                                ) {
-                                                    Ok(dispatch::DispatchAction::Continue) => {
-                                                        pc = frame.pc;
-                                                        acc = std::mem::replace(
-                                                            &mut frame.accumulator,
-                                                            JsValue::Undefined,
-                                                        );
-                                                        continue 'dispatch;
-                                                    }
-                                                    Ok(dispatch::DispatchAction::Return(v)) => {
-                                                        return Ok(v);
-                                                    }
-                                                    Ok(dispatch::DispatchAction::TailCall) => {
-                                                        continue 'tail_call;
-                                                    }
-                                                    Err(e) => {
-                                                        if let Some(resume_pc) =
-                                                            handle_dispatch_error(
-                                                                &e,
-                                                                frame,
-                                                                handler_table.as_slice(),
-                                                            )
-                                                        {
-                                                            pc = resume_pc;
-                                                            acc = std::mem::replace(
-                                                                &mut frame.accumulator,
-                                                                JsValue::Undefined,
-                                                            );
-                                                            continue 'dispatch;
-                                                        }
-                                                        return Err(e);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    };
+                                    // SAFETY: single-threaded; no concurrent borrows.
+                                    let items = unsafe { &mut *arr.as_ptr() };
+                                    items.push(arg);
+                                    acc = JsValue::Smi(items.len() as i32);
                                     continue 'dispatch;
+                                }
+                            }
+
+                            // SAFETY: single-threaded interpreter; no
+                            // concurrent borrows possible.
+                            let callee_pm = unsafe { &*callee_map.as_ptr() };
+                            if let Some(JsValue::String(name)) =
+                                callee_pm.get(FAST_ARRAY_METHOD_KEY)
+                            {
+                                let recv = unsafe { frame.read_reg_unchecked(recv_reg) };
+                                if let JsValue::Array(arr) = recv {
+                                    // Check push first without Rc::clone.
+                                    if &**name == "push" {
+                                        cached_push_callee = callee_ptr;
+                                        let arg = unsafe { frame.read_reg_unchecked(arg_reg) }
+                                            .cheap_clone();
+                                        // SAFETY: single-threaded; no
+                                        // concurrent borrows.
+                                        let items = unsafe { &mut *arr.as_ptr() };
+                                        items.push(arg);
+                                        acc = JsValue::Smi(items.len() as i32);
+                                        continue 'dispatch;
+                                    }
+                                    // Other array methods — clone Rc only
+                                    // when needed for the general dispatch.
+                                    let name = Rc::clone(name);
+                                    let arg =
+                                        unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
+                                    let recv_clone = recv.cheap_clone();
+                                    if let Some(result) =
+                                        dispatch_fast_array_method(&recv_clone, &name, &[arg])?
+                                    {
+                                        acc = result;
+                                        continue 'dispatch;
+                                    }
+                                    // Unknown method — fall through to dispatch table.
+                                    frame.pc = pc;
+                                    frame.accumulator = acc;
+                                    match dispatch_via_table(
+                                        frame,
+                                        instructions,
+                                        byte_offsets,
+                                        jump_targets,
+                                        handler_table.as_slice(),
+                                        instr,
+                                    ) {
+                                        Ok(dispatch::DispatchAction::Continue) => {
+                                            pc = frame.pc;
+                                            acc = std::mem::replace(
+                                                &mut frame.accumulator,
+                                                JsValue::Undefined,
+                                            );
+                                            continue 'dispatch;
+                                        }
+                                        Ok(dispatch::DispatchAction::Return(v)) => {
+                                            return Ok(v);
+                                        }
+                                        Ok(dispatch::DispatchAction::TailCall) => {
+                                            continue 'tail_call;
+                                        }
+                                        Err(e) => {
+                                            if let Some(resume_pc) = handle_dispatch_error(
+                                                &e,
+                                                frame,
+                                                handler_table.as_slice(),
+                                            ) {
+                                                pc = resume_pc;
+                                                acc = std::mem::replace(
+                                                    &mut frame.accumulator,
+                                                    JsValue::Undefined,
+                                                );
+                                                continue 'dispatch;
+                                            }
+                                            return Err(e);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -10829,7 +10847,7 @@ pub(super) fn dispatch_call_property(
     Ok(())
 }
 
-const FAST_ARRAY_METHOD_KEY: &str = "\0stator.fast_array_method";
+pub(super) const FAST_ARRAY_METHOD_KEY: &str = "\0stator.fast_array_method";
 const FAST_ARRAY_METHOD_TARGET_KEY: &str = "\0stator.fast_array_target";
 
 fn array_like_length_from_property_map(map: &PropertyMap) -> usize {
