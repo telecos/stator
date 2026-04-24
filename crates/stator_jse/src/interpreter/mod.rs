@@ -3675,7 +3675,6 @@ impl Interpreter {
                                     | Opcode::Nop
                                     | Opcode::CallAnyReceiver
                                     | Opcode::LdaGlobalStar
-                                    | Opcode::CallProperty1
                             )
                         {
                             acc = materialize_acc!();
@@ -5153,41 +5152,6 @@ impl Interpreter {
                                             continue 'smi;
                                         }
                                     }
-                                    // Poly-load cache for array methods
-                                    // (arr.push, arr.pop, etc.) — avoids exiting
-                                    // the SMI loop for repeated method lookups.
-                                    let arr_ptr = Rc::as_ptr(items) as usize;
-                                    if let Some(entries) = frame
-                                        .poly_load_cache
-                                        .as_ref()
-                                        .and_then(|cache| cache.get(&slot))
-                                    {
-                                        for &(cached_ptr, ref cached_val) in entries {
-                                            if cached_ptr == arr_ptr {
-                                                // Cache the push callee pointer
-                                                // if this is a push method.
-                                                if let JsValue::PlainObject(m) = cached_val {
-                                                    let p = Rc::as_ptr(m);
-                                                    if cached_push_callee.is_null() {
-                                                        // SAFETY: single-threaded.
-                                                        let cpm = unsafe { &*m.as_ptr() };
-                                                        if let Some(JsValue::String(n)) =
-                                                            cpm.get(FAST_ARRAY_METHOD_KEY)
-                                                        {
-                                                            if &**n == "push" {
-                                                                cached_push_callee = p;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                acc = cached_val.cheap_clone();
-                                                smi_acc_spilled = true;
-                                                smi_acc_bool = false;
-                                                hot_acc = None;
-                                                continue 'smi;
-                                            }
-                                        }
-                                    }
                                 }
 
                                 if let JsValue::PlainObject(map) = obj {
@@ -6103,75 +6067,6 @@ impl Interpreter {
                                     }
                                     continue 'smi;
                                 }
-                                acc = materialize_acc!();
-                                frame.smi_mode = false;
-                                frame.loop_end_pc = 0;
-                                pc -= 1;
-                                break 'smi;
-                            }
-                            Opcode::CallProperty1 => {
-                                // Inline push fast path inside the SMI loop.
-                                // Keeps the entire push loop in SMI mode,
-                                // avoiding per-iteration dispatch transitions.
-                                let callee_reg = unsafe { operand_reg_unchecked(instr, 0) };
-                                let recv_reg = unsafe { operand_reg_unchecked(instr, 1) };
-                                let arg_reg = unsafe { operand_reg_unchecked(instr, 2) };
-                                let callee = unsafe { frame.read_reg_unchecked(callee_reg) };
-                                if let JsValue::PlainObject(callee_map) = callee {
-                                    let callee_ptr = Rc::as_ptr(callee_map);
-                                    // Ultra-fast path: cached push callee pointer.
-                                    if callee_ptr == cached_push_callee {
-                                        let recv = unsafe { frame.read_reg_unchecked(recv_reg) };
-                                        if let JsValue::Array(arr) = recv {
-                                            let arg = unsafe { frame.read_reg_unchecked(arg_reg) }
-                                                .cheap_clone();
-                                            // SAFETY: single-threaded; no concurrent borrows.
-                                            let items = unsafe { &mut *arr.as_ptr() };
-                                            if items.capacity() == 0 {
-                                                items.reserve(256);
-                                            }
-                                            items.push(arg);
-                                            // Invalidate cached array pointer since push
-                                            // may have reallocated the backing Vec.
-                                            cached_arr_reg = u32::MAX;
-                                            sa = items.len() as i32;
-                                            smi_acc_bool = false;
-                                            smi_acc_spilled = false;
-                                            hot_acc = Some(NanBoxedValue::from_smi(sa));
-                                            continue 'smi;
-                                        }
-                                    }
-                                    // First-time detection: check if this is a
-                                    // push method and populate the cache.
-                                    // SAFETY: single-threaded; no concurrent borrows.
-                                    let callee_pm = unsafe { &*callee_map.as_ptr() };
-                                    if let Some(JsValue::String(name)) =
-                                        callee_pm.get(FAST_ARRAY_METHOD_KEY)
-                                    {
-                                        if &**name == "push" {
-                                            cached_push_callee = callee_ptr;
-                                            let recv =
-                                                unsafe { frame.read_reg_unchecked(recv_reg) };
-                                            if let JsValue::Array(arr) = recv {
-                                                let arg =
-                                                    unsafe { frame.read_reg_unchecked(arg_reg) }
-                                                        .cheap_clone();
-                                                let items = unsafe { &mut *arr.as_ptr() };
-                                                if items.capacity() == 0 {
-                                                    items.reserve(256);
-                                                }
-                                                items.push(arg);
-                                                cached_arr_reg = u32::MAX;
-                                                sa = items.len() as i32;
-                                                smi_acc_bool = false;
-                                                smi_acc_spilled = false;
-                                                hot_acc = Some(NanBoxedValue::from_smi(sa));
-                                                continue 'smi;
-                                            }
-                                        }
-                                    }
-                                }
-                                // Non-push CallProperty1: exit SMI loop.
                                 acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
