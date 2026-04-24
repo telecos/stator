@@ -4663,6 +4663,90 @@ impl Interpreter {
                                     }
                                 }
                             }
+                            Opcode::LdaGlobalStar => {
+                                // Fused LdaGlobal + Star — load a global and
+                                // store it into a register in one step.
+                                let name_idx =
+                                    unsafe { operand_constant_pool_idx_unchecked(instr, 0) };
+                                let dst = unsafe { operand_reg_unchecked(instr, 2) };
+                                let dst_idx = frame.reg_flat_index_unchecked(dst);
+                                // IC fast path: read directly from slots via raw pointer.
+                                if let Some(&(slot_idx, _cached_gen)) =
+                                    frame.global_ic.as_ref().and_then(|ic| ic.get(&name_idx))
+                                {
+                                    // SAFETY: env_ptr valid, slot_idx from prior IC population.
+                                    let val = unsafe { &(&(*env_ptr).slots)[slot_idx] };
+                                    if let JsValue::Smi(v) = val {
+                                        sa = *v;
+                                        smi_acc_bool = false;
+                                        smi_acc_spilled = false;
+                                        hot_acc = Some(NanBoxedValue::from_smi(*v));
+                                        unsafe { frame.write_reg_unchecked(dst, JsValue::Smi(*v)) };
+                                        if let Some(ref mut hr) = frame.hot_registers {
+                                            hr.write_smi(dst_idx, *v);
+                                        }
+                                    } else {
+                                        acc = val.cheap_clone();
+                                        smi_acc_spilled = true;
+                                        smi_acc_bool = false;
+                                        hot_acc = None;
+                                        unsafe {
+                                            frame.write_reg_unchecked(dst, acc.cheap_clone())
+                                        };
+                                        if let Some(ref mut hr) = frame.hot_registers {
+                                            hr.invalidate(dst_idx);
+                                        }
+                                    }
+                                    // Invalidate array cache when overwriting the
+                                    // register that held the cached array pointer.
+                                    if dst == cached_arr_reg {
+                                        cached_arr_reg = u32::MAX;
+                                    }
+                                    continue 'smi;
+                                }
+                                // IC miss: sync vars before slow path.
+                                if smi_vars_dirty {
+                                    frame.global_env.borrow_mut().sync_slots_to_vars();
+                                    smi_vars_dirty = false;
+                                }
+                                acc = materialize_acc!();
+                                frame.pc = pc;
+                                frame.accumulator = acc.cheap_clone();
+                                let name = frame.get_string_constant(name_idx)?;
+                                let value = frame.load_global(name.as_ref())?;
+                                if let JsValue::Smi(v) = &value {
+                                    sa = *v;
+                                    smi_acc_bool = false;
+                                    smi_acc_spilled = false;
+                                    hot_acc = Some(NanBoxedValue::from_smi(*v));
+                                    if let Some(ref mut hr) = frame.hot_registers {
+                                        hr.write_smi(dst_idx, *v);
+                                    }
+                                } else {
+                                    acc = value.cheap_clone();
+                                    smi_acc_spilled = true;
+                                    smi_acc_bool = false;
+                                    hot_acc = None;
+                                    if let Some(ref mut hr) = frame.hot_registers {
+                                        hr.invalidate(dst_idx);
+                                    }
+                                }
+                                unsafe { frame.write_reg_unchecked(dst, value) };
+                                if dst == cached_arr_reg {
+                                    cached_arr_reg = u32::MAX;
+                                }
+                                // Populate IC for next iteration.
+                                {
+                                    let env_borrow = frame.global_env.borrow();
+                                    let ic_info = env_borrow
+                                        .slot_index_for(&name)
+                                        .map(|si| (si, env_borrow.generation));
+                                    drop(env_borrow);
+                                    if let Some((slot_idx, cur_gen)) = ic_info {
+                                        frame.global_ic_put(name_idx, slot_idx, cur_gen);
+                                    }
+                                }
+                            }
                             Opcode::StaGlobal => {
                                 let name_idx =
                                     unsafe { operand_constant_pool_idx_unchecked(instr, 0) };
@@ -9148,7 +9232,7 @@ impl Interpreter {
                                     // Speculatively reserve on first push to avoid
                                     // repeated small reallocations in loops.
                                     if items.capacity() == 0 {
-                                        items.reserve(256);
+                                        items.reserve(1024);
                                     }
                                     items.push(arg);
                                     acc = JsValue::Smi(items.len() as i32);
@@ -9173,7 +9257,7 @@ impl Interpreter {
                                         // concurrent borrows.
                                         let items = unsafe { &mut *arr.as_ptr() };
                                         if items.capacity() == 0 {
-                                            items.reserve(256);
+                                            items.reserve(1024);
                                         }
                                         items.push(arg);
                                         acc = JsValue::Smi(items.len() as i32);
@@ -11043,7 +11127,7 @@ fn dispatch_fast_array_method(
                 "push" => {
                     let mut items = arr.borrow_mut();
                     if items.capacity() == 0 {
-                        items.reserve(256);
+                        items.reserve(1024);
                     }
                     items.extend(args.iter().cloned());
                     JsValue::Smi(items.len() as i32)
@@ -28270,6 +28354,35 @@ mod tests {
         );
         // Null
         assert_eq!(HotRegisters::decode(NanBoxedValue::null()), JsValue::Null);
+    }
+
+    #[test]
+    fn dump_array_push_sum_bytecode() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::parser::recursive_descent;
+
+        let source = r#"
+            var arr = [];
+            for (var i = 0; i < 1000; i++) {
+                arr.push(i);
+            }
+            var sum = 0;
+            for (var i = 0; i < arr.length; i++) {
+                sum = sum + arr[i];
+            }
+            sum;
+        "#;
+        let program = recursive_descent::parse(source).unwrap();
+        let ba = BytecodeGenerator::compile_program(&program).unwrap();
+
+        eprintln!(
+            "=== ARRAY_PUSH_SUM bytecodes (count={}) ===",
+            ba.bytecode_count()
+        );
+        let decoded = ba.shared_decoded_instructions().unwrap();
+        for (i, instr) in decoded.0.iter().enumerate() {
+            eprintln!("  [{}] {:?} {:?}", i, instr.opcode, instr.operands());
+        }
     }
 
     #[test]
