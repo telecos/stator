@@ -9581,13 +9581,103 @@ impl Interpreter {
                         }
                     }
 
-                    // ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
-                    // Tier 3 ΓÇö ~10% of executed instructions (rare).
+                    // ── Inline CallProperty (variadic array push fast path) ──
+                    //
+                    // The bytecode generator sometimes emits CallProperty
+                    // (variadic) instead of CallProperty1 for arr.push(val).
+                    // Handle the 1-arg push case inline to avoid building
+                    // a CallArgs SmallVec.
+                    Opcode::CallProperty => {
+                        if let Some(Operand::RegisterCount(1)) = instr.operand_at(2) {
+                            let callee_reg = unsafe { operand_reg_unchecked(instr, 0) };
+                            let recv_reg = unsafe { operand_reg_unchecked(instr, 1) };
+                            let callee = unsafe { frame.read_reg_unchecked(callee_reg) };
+                            if let JsValue::PlainObject(callee_map) = callee {
+                                let callee_ptr = Rc::as_ptr(callee_map);
+
+                                if callee_ptr == cached_push_callee {
+                                    let recv = unsafe { frame.read_reg_unchecked(recv_reg) };
+                                    if let JsValue::Array(arr) = recv {
+                                        // Argument is in the register after the callee.
+                                        let arg =
+                                            unsafe { frame.read_reg_unchecked(callee_reg + 1) }
+                                                .cheap_clone();
+                                        // SAFETY: single-threaded; no concurrent borrows.
+                                        let items = unsafe { &mut *arr.as_ptr() };
+                                        if items.capacity() == 0 {
+                                            items.reserve(1024);
+                                        }
+                                        items.push(arg);
+                                        acc = JsValue::Smi(items.len() as i32);
+                                        continue 'dispatch;
+                                    }
+                                }
+
+                                // SAFETY: single-threaded interpreter.
+                                let callee_pm = unsafe { &*callee_map.as_ptr() };
+                                if let Some(JsValue::String(name)) =
+                                    callee_pm.get(FAST_ARRAY_METHOD_KEY)
+                                {
+                                    let recv = unsafe { frame.read_reg_unchecked(recv_reg) };
+                                    if let JsValue::Array(arr) = recv {
+                                        if &**name == "push" {
+                                            cached_push_callee = callee_ptr;
+                                            let arg =
+                                                unsafe { frame.read_reg_unchecked(callee_reg + 1) }
+                                                    .cheap_clone();
+                                            let items = unsafe { &mut *arr.as_ptr() };
+                                            if items.capacity() == 0 {
+                                                items.reserve(1024);
+                                            }
+                                            items.push(arg);
+                                            acc = JsValue::Smi(items.len() as i32);
+                                            continue 'dispatch;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Fall through to table dispatch.
+                        frame.pc = pc;
+                        frame.accumulator = acc;
+                        match dispatch_via_table(
+                            frame,
+                            instructions,
+                            byte_offsets,
+                            jump_targets,
+                            handler_table.as_slice(),
+                            instr,
+                        ) {
+                            Ok(dispatch::DispatchAction::Continue) => {
+                                pc = frame.pc;
+                                acc = std::mem::replace(&mut frame.accumulator, JsValue::Undefined);
+                                continue 'dispatch;
+                            }
+                            Ok(dispatch::DispatchAction::Return(v)) => return Ok(v),
+                            Ok(dispatch::DispatchAction::TailCall) => continue 'tail_call,
+                            Err(e) => {
+                                if let Some(resume_pc) =
+                                    handle_dispatch_error(&e, frame, handler_table.as_slice())
+                                {
+                                    pc = resume_pc;
+                                    acc = std::mem::replace(
+                                        &mut frame.accumulator,
+                                        JsValue::Undefined,
+                                    );
+                                    continue 'dispatch;
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+
+                    // ══════════════════════════════════════════════════════════
+                    // Tier 3 — ~10% of executed instructions (rare).
                     // Full dispatch via function-pointer table.  Cold
                     // code kept out of the I-cache hot region above.
-                    // ΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉ
+                    // ══════════════════════════════════════════════════════════
 
-                    // ΓöÇΓöÇ All other opcodes: dispatch table ΓöÇΓöÇΓöÇΓöÇ
+                    // ── All other opcodes: dispatch table ────
                     _ => {
                         // Write back locals before cold-path dispatch.
                         frame.pc = pc;
