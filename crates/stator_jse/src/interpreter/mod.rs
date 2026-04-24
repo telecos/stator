@@ -3631,6 +3631,16 @@ impl Interpreter {
                     // Cached array register for keyed-property elision.
                     let mut cached_arr_reg: u32 = u32::MAX;
                     let mut cached_arr_ptr: *mut Vec<JsValue> = std::ptr::null_mut();
+                    // Cached inline-call site for repeated closure calls
+                    // (e.g. closure_counter pattern).  When the same
+                    // BytecodeArray is seen again, skip the full pattern
+                    // match in try_inline_small_function and go straight
+                    // to the context-slot update.
+                    let mut cached_call_ba: *const BytecodeArray = std::ptr::null();
+                    let mut cached_call_slot: usize = 0;
+                    let mut cached_call_imm: i32 = 0;
+                    // 0=AddSmi, 1=SubSmi, 2=Inc, 3=Dec
+                    let mut cached_call_op: u8 = u8::MAX;
                     'smi: loop {
                         if pc >= frame.loop_end_pc {
                             frame.loop_end_pc = 0;
@@ -6084,6 +6094,44 @@ impl Interpreter {
                                     let callee = unsafe { frame.read_reg_unchecked(callee_reg) };
                                     if let JsValue::Function(func_rc) = callee {
                                         let func_ba = func_rc.as_ref();
+                                        let ba_ptr = func_ba as *const BytecodeArray;
+
+                                        // Ultra-fast cached path: same closure
+                                        // as last call — skip try_inline_small_function
+                                        // and do the context-slot update directly.
+                                        if ba_ptr == cached_call_ba && cached_call_op != u8::MAX {
+                                            if let Some(js_ctx) = func_ba.closure_context() {
+                                                let mut guard = js_ctx.borrow_mut();
+                                                if cached_call_slot < guard.slots.len() {
+                                                    if let JsValue::Smi(val) =
+                                                        guard.slots[cached_call_slot]
+                                                    {
+                                                        let next = match cached_call_op {
+                                                            0 => val.checked_add(cached_call_imm),
+                                                            1 => val.checked_sub(cached_call_imm),
+                                                            2 => val.checked_add(1),
+                                                            3 => val.checked_sub(1),
+                                                            _ => None,
+                                                        };
+                                                        if let Some(r) = next {
+                                                            guard.slots[cached_call_slot] =
+                                                                JsValue::Smi(r);
+                                                            sa = r;
+                                                            smi_acc_spilled = false;
+                                                            smi_acc_bool = false;
+                                                            hot_acc = None;
+                                                            continue 'smi;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // Cached path failed (overflow or
+                                            // type changed) — invalidate and
+                                            // fall through to slow path.
+                                            cached_call_op = u8::MAX;
+                                        }
+
+                                        // Slow path: full pattern match.
                                         if func_ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
                                             && !func_ba.has_exception_handler()
                                         {
@@ -6092,6 +6140,15 @@ impl Interpreter {
                                                 &[],
                                                 &frame.global_env,
                                             ) {
+                                                // Populate the cache for next call.
+                                                if let Some(info) =
+                                                    extract_inline_call_cache(func_ba)
+                                                {
+                                                    cached_call_ba = ba_ptr;
+                                                    cached_call_slot = info.0;
+                                                    cached_call_imm = info.1;
+                                                    cached_call_op = info.2;
+                                                }
                                                 match result {
                                                     JsValue::Smi(v) => {
                                                         sa = v;
@@ -11401,6 +11458,34 @@ fn inline_context_slot_update(
     Some(next)
 }
 
+/// Inline a context-slot update where the addend comes from a `LdaSmiStar`
+/// instruction (pattern: `LdaSmiStar(imm) + LdaCurrentContextSlot(slot) +
+/// Add + StaCurrentContextSlot(slot) + [LdaCurrentContextSlot(slot) +]
+/// Return`).  This is the closure_counter pattern.
+#[inline(always)]
+fn inline_context_slot_smi_add(ba: &BytecodeArray, slot_idx: u32, imm: i32) -> Option<JsValue> {
+    let js_ctx = ba.closure_context()?;
+    let mut borrowed = js_ctx.borrow_mut();
+    let slot = slot_idx as usize;
+    if slot >= borrowed.slots.len() {
+        borrowed.slots.resize(slot + 1, JsValue::Undefined);
+    }
+    let current = borrowed.slots[slot].cheap_clone();
+    let next = match current {
+        JsValue::Smi(value) => match value.checked_add(imm) {
+            Some(result) => JsValue::Smi(result),
+            None => JsValue::HeapNumber(value as f64 + imm as f64),
+        },
+        JsValue::BigInt(_) => return None,
+        _ if is_inline_primitive(&current) => {
+            number_to_jsvalue(current.to_number().ok()? + f64::from(imm))
+        }
+        _ => return None,
+    };
+    borrowed.slots[slot] = next.cheap_clone();
+    Some(next)
+}
+
 /// Returns `true` for `LdaContextSlot` and `LdaImmutableContextSlot` (chain-walking variants).
 #[inline(always)]
 fn is_inline_chained_context_load(opcode: Opcode) -> bool {
@@ -11543,6 +11628,74 @@ fn inline_chained_context_slot_binary_op(
 
 /// Maximum bytecode instruction count eligible for interpreter-level inlining.
 pub(super) const INLINE_BYTECODE_THRESHOLD: usize = 40;
+
+/// Extract cacheable metadata from a small closure's bytecodes.
+///
+/// Returns `(slot, imm, op_tag)` where op_tag: 0=AddSmi, 1=SubSmi, 2=Inc, 3=Dec.
+/// Handles both "current-context slot update" patterns (4-5 instrs) and
+/// the "LdaSmiStar + Add" pattern (5-6 instrs, closure_counter).
+#[inline(always)]
+fn extract_inline_call_cache(ba: &BytecodeArray) -> Option<(usize, i32, u8)> {
+    let decoded = ba.shared_decoded_instructions().ok()?;
+    let all_instrs = decoded.0.as_slice();
+    let instrs = if all_instrs.len() >= 2
+        && matches!(
+            all_instrs[0].opcode,
+            Opcode::CreateMappedArguments | Opcode::CreateUnmappedArguments
+        )
+        && all_instrs[1].opcode == Opcode::Star
+    {
+        &all_instrs[2..]
+    } else {
+        all_instrs
+    };
+
+    // Match LdaSmiStar + LdaCurrentContextSlot + Add + StaCurrentContextSlot + [Reload +] Return
+    // (closure_counter pattern).  Returns same tag as AddSmi (0).
+    if instrs.len() >= 5
+        && instrs[0].opcode == Opcode::LdaSmiStar
+        && is_inline_current_context_load(instrs[1].opcode)
+        && instrs[2].opcode == Opcode::Add
+        && instrs[3].opcode == Opcode::StaCurrentContextSlot
+    {
+        let ok_tail = (instrs.len() == 5 && instrs[4].opcode == Opcode::Return)
+            || (instrs.len() == 6
+                && is_inline_current_context_load(instrs[4].opcode)
+                && instrs[5].opcode == Opcode::Return);
+        if ok_tail {
+            let slot = checked_operand_constant_pool_idx(&instrs[1], 0)? as usize;
+            let imm = checked_operand_imm(&instrs[0], 0)?;
+            return Some((slot, imm, 0u8));
+        }
+    }
+
+    // Match 4-instr or 5-instr current-context slot update patterns.
+    let (load, update) = match instrs {
+        [load, update, store, _ret]
+            if is_inline_current_context_load(load.opcode)
+                && store.opcode == Opcode::StaCurrentContextSlot =>
+        {
+            (load, update)
+        }
+        [load, update, _store, _reload, _ret]
+            if is_inline_current_context_load(load.opcode)
+                && _store.opcode == Opcode::StaCurrentContextSlot
+                && is_inline_current_context_load(_reload.opcode) =>
+        {
+            (load, update)
+        }
+        _ => return None,
+    };
+    let slot = checked_operand_constant_pool_idx(load, 0)? as usize;
+    let (imm, op_tag) = match update.opcode {
+        Opcode::AddSmi => (checked_operand_imm(update, 0)?, 0u8),
+        Opcode::SubSmi => (checked_operand_imm(update, 0)?, 1u8),
+        Opcode::Inc => (0, 2u8),
+        Opcode::Dec => (0, 3u8),
+        _ => return None,
+    };
+    Some((slot, imm, op_tag))
+}
 
 pub(super) fn try_inline_small_function(
     ba: &BytecodeArray,
@@ -11772,6 +11925,40 @@ pub(super) fn try_inline_small_function(
             let lhs = inline_arg_from_reg(args, checked_operand_reg(lhs, 0)?)?;
             let rhs = inline_arg_from_reg(args, checked_operand_reg(rhs, 0)?)?;
             inline_binary_op(op.opcode, &lhs, &rhs)
+        }
+        // Context-slot add with Smi constant (closure_counter pattern, 5 or 6 instrs).
+        // LdaSmiStar(imm,r) + LdaCurrentContextSlot(slot) + Add(r) + StaCurrentContextSlot(slot) + Return
+        [lda_smi_star, load, add_instr, store, ret]
+            if lda_smi_star.opcode == Opcode::LdaSmiStar
+                && is_inline_current_context_load(load.opcode)
+                && add_instr.opcode == Opcode::Add
+                && store.opcode == Opcode::StaCurrentContextSlot
+                && ret.opcode == Opcode::Return =>
+        {
+            let imm = checked_operand_imm(lda_smi_star, 0)?;
+            let load_slot = checked_operand_constant_pool_idx(load, 0)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 0)?;
+            if load_slot != store_slot {
+                return None;
+            }
+            inline_context_slot_smi_add(ba, load_slot, imm)
+        }
+        // LdaSmiStar(imm,r) + LdaCurrentContextSlot(slot) + Add(r) + StaCurrentContextSlot(slot) + LdaCurrentContextSlot(slot) + Return
+        [lda_smi_star, load, add_instr, store, reload, ret]
+            if lda_smi_star.opcode == Opcode::LdaSmiStar
+                && is_inline_current_context_load(load.opcode)
+                && add_instr.opcode == Opcode::Add
+                && store.opcode == Opcode::StaCurrentContextSlot
+                && is_inline_current_context_load(reload.opcode)
+                && ret.opcode == Opcode::Return =>
+        {
+            let imm = checked_operand_imm(lda_smi_star, 0)?;
+            let load_slot = checked_operand_constant_pool_idx(load, 0)?;
+            let store_slot = checked_operand_constant_pool_idx(store, 0)?;
+            if load_slot != store_slot {
+                return None;
+            }
+            inline_context_slot_smi_add(ba, load_slot, imm)
         }
         // Global-variable add+store+return (6 instrs).
         // Pattern: LdaSmiStar(imm,r) + LdaGlobal(cp) + Add(r) + StaGlobal(cp) + LdaGlobal(cp) + Return
