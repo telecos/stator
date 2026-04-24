@@ -3684,6 +3684,7 @@ impl Interpreter {
                                     | Opcode::Return
                                     | Opcode::Nop
                                     | Opcode::CallAnyReceiver
+                                    | Opcode::CallProperty
                                     | Opcode::LdaGlobalStar
                             )
                         {
@@ -5246,6 +5247,25 @@ impl Interpreter {
                                             continue 'smi;
                                         }
                                     }
+                                    // Non-length Array property: check poly_load_cache
+                                    // (covers arr.push, arr.pop, etc. resolved via
+                                    // prototype and cached by Rc pointer identity).
+                                    let arr_ptr = Rc::as_ptr(items) as usize;
+                                    if let Some(entries) = frame
+                                        .poly_load_cache
+                                        .as_ref()
+                                        .and_then(|cache| cache.get(&slot))
+                                    {
+                                        for &(cached_ptr, ref cached_val) in entries {
+                                            if cached_ptr == arr_ptr {
+                                                acc = cached_val.cheap_clone();
+                                                smi_acc_spilled = true;
+                                                smi_acc_bool = false;
+                                                hot_acc = None;
+                                                continue 'smi;
+                                            }
+                                        }
+                                    }
                                 }
 
                                 if let JsValue::PlainObject(map) = obj {
@@ -6161,6 +6181,44 @@ impl Interpreter {
                                     }
                                     continue 'smi;
                                 }
+                                acc = materialize_acc!();
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                pc -= 1;
+                                break 'smi;
+                            }
+                            Opcode::CallProperty => {
+                                // Inline arr.push(val) inside the smi loop to
+                                // avoid dispatch overhead per push in tight loops.
+                                if let Some(Operand::RegisterCount(1)) = instr.operand_at(2) {
+                                    let callee_reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                    let recv_reg = unsafe { operand_reg_unchecked(instr, 1) };
+                                    let callee = unsafe { frame.read_reg_unchecked(callee_reg) };
+                                    if let JsValue::PlainObject(callee_map) = callee {
+                                        let callee_ptr = Rc::as_ptr(callee_map);
+                                        if callee_ptr == cached_push_callee {
+                                            let recv =
+                                                unsafe { frame.read_reg_unchecked(recv_reg) };
+                                            if let JsValue::Array(arr) = recv {
+                                                let arg = unsafe {
+                                                    frame.read_reg_unchecked(callee_reg + 1)
+                                                }
+                                                .cheap_clone();
+                                                let items = unsafe { &mut *arr.as_ptr() };
+                                                if items.capacity() == 0 {
+                                                    items.reserve(1024);
+                                                }
+                                                items.push(arg);
+                                                sa = items.len() as i32;
+                                                smi_acc_spilled = false;
+                                                smi_acc_bool = false;
+                                                hot_acc = Some(NanBoxedValue::from_smi(sa));
+                                                continue 'smi;
+                                            }
+                                        }
+                                    }
+                                }
+                                // Non-push or cache miss — exit smi loop.
                                 acc = materialize_acc!();
                                 frame.smi_mode = false;
                                 frame.loop_end_pc = 0;
