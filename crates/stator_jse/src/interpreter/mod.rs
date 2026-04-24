@@ -6464,14 +6464,20 @@ impl Interpreter {
                                                                                 // loop done — break out.
                                                                                 break;
                                                                             }
-                                                                            sa = counter;
                                                                         }
                                                                         // Advance past TestLessThan +
-                                                                        // JumpIfTrue.
+                                                                        // JumpIfTrue.  Accumulator is
+                                                                        // Boolean(false) from the test
+                                                                        // that ended the loop.
                                                                         pc += 2;
+                                                                        sa = 0;
                                                                         smi_acc_spilled = false;
-                                                                        smi_acc_bool = false;
-                                                                        hot_acc = None;
+                                                                        smi_acc_bool = true;
+                                                                        hot_acc = Some(
+                                                                            NanBoxedValue::from_boolean(
+                                                                                false,
+                                                                            ),
+                                                                        );
                                                                     }
                                                                 }
                                                             }
