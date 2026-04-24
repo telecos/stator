@@ -4830,20 +4830,324 @@ impl Interpreter {
                                         }
                                     }
                                 }
-                                if let JsValue::Function(ba) = callee
-                                    && !ba.is_generator()
-                                    && !ba.is_async()
+                                if let JsValue::Function(func_rc) = callee
+                                    && !func_rc.is_generator()
+                                    && !func_rc.is_async()
                                 {
+                                    let func_ba = func_rc.as_ref();
+                                    let ba_ptr = func_ba as *const BytecodeArray;
+
+                                    // Ultra-fast cached path: same closure
+                                    // as last call — skip pattern matching.
+                                    if ba_ptr == cached_call_ba && cached_call_op != u8::MAX {
+                                        if !cached_call_slot_ptr.is_null() {
+                                            // SAFETY: see CallAnyReceiver.
+                                            let slot_ref = unsafe { &mut *cached_call_slot_ptr };
+                                            if let JsValue::Smi(val) = *slot_ref {
+                                                let next = match cached_call_op {
+                                                    0 => val.checked_add(cached_call_imm),
+                                                    1 => val.checked_sub(cached_call_imm),
+                                                    2 => val.checked_add(1),
+                                                    3 => val.checked_sub(1),
+                                                    _ => None,
+                                                };
+                                                if let Some(r) = next {
+                                                    *slot_ref = JsValue::Smi(r);
+                                                    sa = r;
+                                                    smi_acc_spilled = false;
+                                                    smi_acc_bool = false;
+                                                    hot_acc = None;
+                                                    // Instruction fusion
+                                                    'fuse0: {
+                                                        if pc >= frame.loop_end_pc {
+                                                            break 'fuse0;
+                                                        }
+                                                        let i1 = unsafe {
+                                                            instructions.get_unchecked(pc)
+                                                        };
+                                                        if i1.opcode != Opcode::Star {
+                                                            break 'fuse0;
+                                                        }
+                                                        let dst1 =
+                                                            unsafe { operand_reg_unchecked(i1, 0) };
+                                                        unsafe {
+                                                            frame.write_reg_unchecked(
+                                                                dst1,
+                                                                JsValue::Smi(r),
+                                                            );
+                                                        }
+                                                        pc += 1;
+                                                        if pc >= frame.loop_end_pc {
+                                                            break 'fuse0;
+                                                        }
+                                                        let i2 = unsafe {
+                                                            instructions.get_unchecked(pc)
+                                                        };
+                                                        if i2.opcode != Opcode::Ldar {
+                                                            break 'fuse0;
+                                                        }
+                                                        let src =
+                                                            unsafe { operand_reg_unchecked(i2, 0) };
+                                                        let rv = unsafe {
+                                                            frame.read_reg_unchecked(src)
+                                                        };
+                                                        if let JsValue::Smi(sv) = rv {
+                                                            sa = *sv;
+                                                            pc += 1;
+                                                        } else {
+                                                            break 'fuse0;
+                                                        }
+                                                        if pc >= frame.loop_end_pc {
+                                                            break 'fuse0;
+                                                        }
+                                                        let i3 = unsafe {
+                                                            instructions.get_unchecked(pc)
+                                                        };
+                                                        #[allow(unused_assignments)]
+                                                        let mut dst2 = 0u32;
+                                                        #[allow(unused_assignments)]
+                                                        let mut add_imm = 0i32;
+                                                        if i3.opcode == Opcode::IncStar {
+                                                            add_imm = 1;
+                                                            if let Some(added) = sa.checked_add(1) {
+                                                                sa = added;
+                                                            } else {
+                                                                break 'fuse0;
+                                                            }
+                                                            dst2 = unsafe {
+                                                                operand_reg_unchecked(i3, 1)
+                                                            };
+                                                            unsafe {
+                                                                frame.write_reg_unchecked(
+                                                                    dst2,
+                                                                    JsValue::Smi(sa),
+                                                                );
+                                                            }
+                                                            pc += 1;
+                                                        } else if i3.opcode == Opcode::AddSmi {
+                                                            add_imm = unsafe {
+                                                                match *i3.operand_unchecked(0) {
+                                                                    Operand::Immediate(v) => v,
+                                                                    _ => break 'fuse0,
+                                                                }
+                                                            };
+                                                            if let Some(added) =
+                                                                sa.checked_add(add_imm)
+                                                            {
+                                                                sa = added;
+                                                                pc += 1;
+                                                            } else {
+                                                                break 'fuse0;
+                                                            }
+                                                            if pc >= frame.loop_end_pc {
+                                                                break 'fuse0;
+                                                            }
+                                                            let i4 = unsafe {
+                                                                instructions.get_unchecked(pc)
+                                                            };
+                                                            if i4.opcode != Opcode::Star {
+                                                                break 'fuse0;
+                                                            }
+                                                            dst2 = unsafe {
+                                                                operand_reg_unchecked(i4, 0)
+                                                            };
+                                                            unsafe {
+                                                                frame.write_reg_unchecked(
+                                                                    dst2,
+                                                                    JsValue::Smi(sa),
+                                                                );
+                                                            }
+                                                            pc += 1;
+                                                        } else {
+                                                            break 'fuse0;
+                                                        }
+                                                        // Tight loop
+                                                        if pc < frame.loop_end_pc {
+                                                            let i5 = unsafe {
+                                                                instructions.get_unchecked(pc)
+                                                            };
+                                                            let fused_test = match i5.opcode {
+                                                                Opcode::TestLessThanJump => {
+                                                                    let flag = unsafe {
+                                                                        match *i5
+                                                                            .operand_unchecked(3)
+                                                                        {
+                                                                            Operand::Flag(f) => f,
+                                                                            _ => u8::MAX,
+                                                                        }
+                                                                    };
+                                                                    if flag == 1 {
+                                                                        Some((false, 1usize))
+                                                                    } else {
+                                                                        None
+                                                                    }
+                                                                }
+                                                                Opcode::TestLessThanOrEqualJump => {
+                                                                    let flag = unsafe {
+                                                                        match *i5
+                                                                            .operand_unchecked(3)
+                                                                        {
+                                                                            Operand::Flag(f) => f,
+                                                                            _ => u8::MAX,
+                                                                        }
+                                                                    };
+                                                                    if flag == 1 {
+                                                                        Some((true, 1usize))
+                                                                    } else {
+                                                                        None
+                                                                    }
+                                                                }
+                                                                Opcode::TestLessThan
+                                                                | Opcode::TestLessThanOrEqual
+                                                                    if pc + 1
+                                                                        < frame.loop_end_pc =>
+                                                                {
+                                                                    let i6 = unsafe {
+                                                                        instructions
+                                                                            .get_unchecked(pc + 1)
+                                                                    };
+                                                                    if i6.opcode == Opcode::JumpIfTrue || i6.opcode == Opcode::JumpIfToBooleanTrue {
+                                                                            Some((i5.opcode == Opcode::TestLessThanOrEqual, 2usize))
+                                                                        } else { None }
+                                                                }
+                                                                _ => None,
+                                                            };
+                                                            if let Some((is_leq, pc_advance)) =
+                                                                fused_test
+                                                            {
+                                                                let limit_reg = unsafe {
+                                                                    operand_reg_unchecked(i5, 0)
+                                                                };
+                                                                let limit_val = unsafe {
+                                                                    frame
+                                                                        .read_reg_num_hot_unchecked(
+                                                                            limit_reg,
+                                                                        )
+                                                                };
+                                                                let cond = if is_leq {
+                                                                    sa <= limit_val
+                                                                } else {
+                                                                    sa < limit_val
+                                                                };
+                                                                if cond {
+                                                                    let mut counter = sa;
+                                                                    loop {
+                                                                        let slot_ref = unsafe {
+                                                                            &mut *cached_call_slot_ptr
+                                                                        };
+                                                                        if let JsValue::Smi(val) =
+                                                                            *slot_ref
+                                                                        {
+                                                                            let next = match cached_call_op {
+                                                                                0 => val.checked_add(cached_call_imm),
+                                                                                1 => val.checked_sub(cached_call_imm),
+                                                                                2 => val.checked_add(1),
+                                                                                3 => val.checked_sub(1),
+                                                                                _ => None,
+                                                                            };
+                                                                            if let Some(call_r) =
+                                                                                next
+                                                                            {
+                                                                                *slot_ref =
+                                                                                    JsValue::Smi(
+                                                                                        call_r,
+                                                                                    );
+                                                                                unsafe {
+                                                                                    frame.write_reg_unchecked(dst1, JsValue::Smi(call_r));
+                                                                                }
+                                                                                if let Some(nc) = counter.checked_add(add_imm) {
+                                                                                    counter = nc;
+                                                                                    unsafe { frame.write_reg_unchecked(dst2, JsValue::Smi(nc)); }
+                                                                                    let c = if is_leq { nc <= limit_val } else { nc < limit_val };
+                                                                                    if c { continue; }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        break;
+                                                                    }
+                                                                    pc += pc_advance;
+                                                                    sa = 0;
+                                                                    smi_acc_spilled = false;
+                                                                    smi_acc_bool = true;
+                                                                    hot_acc = Some(
+                                                                        NanBoxedValue::from_boolean(
+                                                                            false,
+                                                                        ),
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    continue 'smi;
+                                                }
+                                            }
+                                            // Type changed or overflow.
+                                            cached_call_slot_ptr = std::ptr::null_mut();
+                                            cached_call_op = u8::MAX;
+                                        } else {
+                                            // First cached hit — use
+                                            // RefCell borrow and cache ptr.
+                                            if let Some(js_ctx) = func_ba.closure_context() {
+                                                let guard = js_ctx.borrow_mut();
+                                                if cached_call_slot < guard.slots.len() {
+                                                    if let JsValue::Smi(val) =
+                                                        guard.slots[cached_call_slot]
+                                                    {
+                                                        let next = match cached_call_op {
+                                                            0 => val.checked_add(cached_call_imm),
+                                                            1 => val.checked_sub(cached_call_imm),
+                                                            2 => val.checked_add(1),
+                                                            3 => val.checked_sub(1),
+                                                            _ => None,
+                                                        };
+                                                        if let Some(r) = next {
+                                                            cached_call_slot_ptr = unsafe {
+                                                                (*js_ctx.as_ptr())
+                                                                    .slots
+                                                                    .as_mut_ptr()
+                                                                    .add(cached_call_slot)
+                                                            };
+                                                            unsafe {
+                                                                *cached_call_slot_ptr =
+                                                                    JsValue::Smi(r);
+                                                            }
+                                                            sa = r;
+                                                            smi_acc_spilled = false;
+                                                            smi_acc_bool = false;
+                                                            hot_acc = None;
+                                                            drop(guard);
+                                                            continue 'smi;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     // Try inline BEFORE any Rc clones.
-                                    if ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
-                                        && !ba.has_exception_handler()
-                                        && let Some(result) =
-                                            try_inline_small_function(ba, &[], &frame.global_env)
+                                    if func_ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+                                        && !func_ba.has_exception_handler()
+                                        && let Some(result) = try_inline_small_function(
+                                            func_ba,
+                                            &[],
+                                            &frame.global_env,
+                                        )
                                     {
                                         match result {
-                                            JsValue::Smi(v) => {
-                                                sa = v;
-                                                hot_acc = Some(NanBoxedValue::from_smi(v));
+                                            JsValue::Smi(r) => {
+                                                // Cache for next iteration.
+                                                if cached_call_ba.is_null() {
+                                                    cached_call_ba = ba_ptr;
+                                                    if let Some((slot, imm, op)) =
+                                                        extract_inline_call_cache(func_ba)
+                                                    {
+                                                        cached_call_slot = slot;
+                                                        cached_call_imm = imm;
+                                                        cached_call_op = op;
+                                                    }
+                                                }
+                                                sa = r;
+                                                hot_acc = Some(NanBoxedValue::from_smi(r));
                                                 continue 'smi;
                                             }
                                             v => {
@@ -4854,17 +5158,17 @@ impl Interpreter {
                                             }
                                         }
                                     }
-                                    // Only sync the PC for error traces ΓÇö the
+                                    // Only sync the PC for error traces — the
                                     // accumulator is dead here (overwritten by
                                     // the call result or rebuilt on Err).
-                                    // Extract all data from ba and clone it before
+                                    // Extract all data from func_ba and clone it before
                                     // mutating frame (releases the register borrow).
-                                    let is_arrow = ba.is_arrow();
-                                    let is_strict = ba.is_strict();
-                                    let has_self_name = ba.self_name_register().is_some();
-                                    let has_fn_props = is_arrow && ba.has_fn_props();
-                                    let closure_ctx = ba.closure_context().map(Rc::clone);
-                                    let ba = Rc::clone(ba);
+                                    let is_arrow = func_ba.is_arrow();
+                                    let is_strict = func_ba.is_strict();
+                                    let has_self_name = func_ba.self_name_register().is_some();
+                                    let has_fn_props = is_arrow && func_ba.has_fn_props();
+                                    let closure_ctx = func_ba.closure_context().map(Rc::clone);
+                                    let ba = Rc::clone(func_rc);
                                     frame.pc = pc;
 
                                     let saved_this = if !is_arrow && is_strict {
