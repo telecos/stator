@@ -1115,7 +1115,25 @@ pub(crate) mod jit_runtime {
         RT_SETUP_GEN.with(|g| g.set(g.get().wrapping_add(1)));
         // Reset the first-deopt flag so the next deopt is recorded.
         RT_FIRST_DEOPT_REPORTED.with(|r| r.set(false));
-        cache_rt_ptrs();
+        // Skip the expensive 13-TLS-call cache_rt_ptrs() when pointers
+        // are already cached — TLS cell addresses are stable for the
+        // thread's lifetime.  Only update the generation field.
+        let already_cached = RT_PTRS.with(|p| {
+            let ptrs = p.get();
+            if ptrs.is_cached() {
+                let new_gen = RT_SETUP_GEN.with(|g| g.get());
+                p.set(RtPtrs {
+                    generation: new_gen,
+                    ..ptrs
+                });
+                true
+            } else {
+                false
+            }
+        });
+        if !already_cached {
+            cache_rt_ptrs();
+        }
         let ba_ptr = ba as *const BytecodeArray;
         RT_BYTECODE.with(|b| b.set(ba_ptr));
         recycle_and_clear_heap();
