@@ -6301,7 +6301,9 @@ impl Interpreter {
                                                             if pc >= frame.loop_end_pc {
                                                                 break 'fuse;
                                                             }
-                                                            // Ldar rY — load loop counter
+                                                            // Two patterns for loop counter update:
+                                                            // A) Ldar rY → AddSmi N → Star rZ
+                                                            // B) Ldar rY → IncStar rZ
                                                             let i2 = unsafe {
                                                                 instructions.get_unchecked(pc)
                                                             };
@@ -6324,48 +6326,72 @@ impl Interpreter {
                                                             if pc >= frame.loop_end_pc {
                                                                 break 'fuse;
                                                             }
-                                                            // AddSmi N — increment counter
                                                             let i3 = unsafe {
                                                                 instructions.get_unchecked(pc)
                                                             };
-                                                            if i3.opcode != Opcode::AddSmi {
-                                                                break 'fuse;
-                                                            }
-                                                            let add_imm = unsafe {
-                                                                match *i3.operand_unchecked(0) {
-                                                                    Operand::Immediate(v) => v,
-                                                                    _ => break 'fuse,
+                                                            #[allow(unused_assignments)]
+                                                            let mut dst2 = 0u32;
+                                                            #[allow(unused_assignments)]
+                                                            let mut add_imm = 0i32;
+                                                            if i3.opcode == Opcode::IncStar {
+                                                                // Pattern B: IncStar rZ (fused
+                                                                // Inc+Star — acc+1 → register)
+                                                                add_imm = 1;
+                                                                if let Some(added) =
+                                                                    sa.checked_add(1)
+                                                                {
+                                                                    sa = added;
+                                                                } else {
+                                                                    break 'fuse;
                                                                 }
-                                                            };
-                                                            if let Some(added) =
-                                                                sa.checked_add(add_imm)
-                                                            {
-                                                                sa = added;
+                                                                dst2 = unsafe {
+                                                                    operand_reg_unchecked(i3, 1)
+                                                                };
+                                                                unsafe {
+                                                                    frame.write_reg_unchecked(
+                                                                        dst2,
+                                                                        JsValue::Smi(sa),
+                                                                    );
+                                                                }
+                                                                pc += 1;
+                                                            } else if i3.opcode == Opcode::AddSmi {
+                                                                // Pattern A: AddSmi N → Star rZ
+                                                                add_imm = unsafe {
+                                                                    match *i3.operand_unchecked(0) {
+                                                                        Operand::Immediate(v) => v,
+                                                                        _ => break 'fuse,
+                                                                    }
+                                                                };
+                                                                if let Some(added) =
+                                                                    sa.checked_add(add_imm)
+                                                                {
+                                                                    sa = added;
+                                                                    pc += 1;
+                                                                } else {
+                                                                    break 'fuse;
+                                                                }
+                                                                if pc >= frame.loop_end_pc {
+                                                                    break 'fuse;
+                                                                }
+                                                                let i4 = unsafe {
+                                                                    instructions.get_unchecked(pc)
+                                                                };
+                                                                if i4.opcode != Opcode::Star {
+                                                                    break 'fuse;
+                                                                }
+                                                                dst2 = unsafe {
+                                                                    operand_reg_unchecked(i4, 0)
+                                                                };
+                                                                unsafe {
+                                                                    frame.write_reg_unchecked(
+                                                                        dst2,
+                                                                        JsValue::Smi(sa),
+                                                                    );
+                                                                }
                                                                 pc += 1;
                                                             } else {
                                                                 break 'fuse;
                                                             }
-
-                                                            if pc >= frame.loop_end_pc {
-                                                                break 'fuse;
-                                                            }
-                                                            // Star rZ — store updated counter
-                                                            let i4 = unsafe {
-                                                                instructions.get_unchecked(pc)
-                                                            };
-                                                            if i4.opcode != Opcode::Star {
-                                                                break 'fuse;
-                                                            }
-                                                            let dst2 = unsafe {
-                                                                operand_reg_unchecked(i4, 0)
-                                                            };
-                                                            unsafe {
-                                                                frame.write_reg_unchecked(
-                                                                    dst2,
-                                                                    JsValue::Smi(sa),
-                                                                );
-                                                            }
-                                                            pc += 1;
 
                                                             // Check for TestLessThan + JumpIfTrue
                                                             // to form a zero-dispatch tight loop.
