@@ -6658,6 +6658,9 @@ fn handle_call_property1(
             if let JsValue::Array(arr) = recv {
                 let arg0 = ctx.frame.read_reg(arg0_v)?.cheap_clone();
                 let mut items = arr.borrow_mut();
+                if items.capacity() == 0 {
+                    items.reserve(256);
+                }
                 items.push(arg0);
                 let new_len = items.len() as i32;
                 drop(items);

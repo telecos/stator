@@ -9043,6 +9043,11 @@ impl Interpreter {
                                         unsafe { frame.read_reg_unchecked(arg_reg) }.cheap_clone();
                                     // SAFETY: single-threaded; no concurrent borrows.
                                     let items = unsafe { &mut *arr.as_ptr() };
+                                    // Speculatively reserve on first push to avoid
+                                    // repeated small reallocations in loops.
+                                    if items.capacity() == 0 {
+                                        items.reserve(256);
+                                    }
                                     items.push(arg);
                                     acc = JsValue::Smi(items.len() as i32);
                                     continue 'dispatch;
@@ -9065,6 +9070,9 @@ impl Interpreter {
                                         // SAFETY: single-threaded; no
                                         // concurrent borrows.
                                         let items = unsafe { &mut *arr.as_ptr() };
+                                        if items.capacity() == 0 {
+                                            items.reserve(256);
+                                        }
                                         items.push(arg);
                                         acc = JsValue::Smi(items.len() as i32);
                                         continue 'dispatch;
@@ -10932,6 +10940,9 @@ fn dispatch_fast_array_method(
             let result = match method_name {
                 "push" => {
                     let mut items = arr.borrow_mut();
+                    if items.capacity() == 0 {
+                        items.reserve(256);
+                    }
                     items.extend(args.iter().cloned());
                     JsValue::Smi(items.len() as i32)
                 }
