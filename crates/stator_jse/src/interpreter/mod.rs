@@ -6073,6 +6073,51 @@ impl Interpreter {
                                 pc -= 1;
                                 break 'smi;
                             }
+                            Opcode::CallAnyReceiver => {
+                                // Inline zero-arg closure calls inside the
+                                // smi loop to avoid per-call dispatch
+                                // transitions (e.g. closure_counter pattern).
+                                let is_zero_arg =
+                                    matches!(instr.operand_at(2), Some(Operand::RegisterCount(0)));
+                                if is_zero_arg {
+                                    let callee_reg = unsafe { operand_reg_unchecked(instr, 0) };
+                                    let callee = unsafe { frame.read_reg_unchecked(callee_reg) };
+                                    if let JsValue::Function(func_rc) = callee {
+                                        let func_ba = func_rc.as_ref();
+                                        if func_ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
+                                            && !func_ba.has_exception_handler()
+                                        {
+                                            if let Some(result) = try_inline_small_function(
+                                                func_ba,
+                                                &[],
+                                                &frame.global_env,
+                                            ) {
+                                                match result {
+                                                    JsValue::Smi(v) => {
+                                                        sa = v;
+                                                        smi_acc_spilled = false;
+                                                        smi_acc_bool = false;
+                                                        hot_acc = None;
+                                                    }
+                                                    _ => {
+                                                        acc = result;
+                                                        smi_acc_spilled = true;
+                                                        smi_acc_bool = false;
+                                                        hot_acc = None;
+                                                    }
+                                                }
+                                                continue 'smi;
+                                            }
+                                        }
+                                    }
+                                }
+                                // Non-inlineable — exit smi loop.
+                                acc = materialize_acc!();
+                                frame.smi_mode = false;
+                                frame.loop_end_pc = 0;
+                                pc -= 1;
+                                break 'smi;
+                            }
                             _ => {
                                 // Unsupported opcode — exit SMI loop and let
                                 // the regular dispatch handle it.
@@ -11323,20 +11368,32 @@ fn inline_context_slot_update(
             _ => return None,
         },
         Opcode::AddSmi => {
-            if matches!(current, JsValue::BigInt(_)) {
-                return None;
+            let imm = checked_operand_imm(update, 0)?;
+            match current {
+                JsValue::Smi(value) => match value.checked_add(imm) {
+                    Some(result) => JsValue::Smi(result),
+                    None => JsValue::HeapNumber(value as f64 + imm as f64),
+                },
+                JsValue::BigInt(_) => return None,
+                _ if is_inline_primitive(&current) => {
+                    number_to_jsvalue(current.to_number().ok()? + f64::from(imm))
+                }
+                _ => return None,
             }
-            number_to_jsvalue(
-                current.to_number().ok()? + f64::from(checked_operand_imm(update, 0)?),
-            )
         }
         Opcode::SubSmi => {
-            if matches!(current, JsValue::BigInt(_)) {
-                return None;
+            let imm = checked_operand_imm(update, 0)?;
+            match current {
+                JsValue::Smi(value) => match value.checked_sub(imm) {
+                    Some(result) => JsValue::Smi(result),
+                    None => JsValue::HeapNumber(value as f64 - imm as f64),
+                },
+                JsValue::BigInt(_) => return None,
+                _ if is_inline_primitive(&current) => {
+                    number_to_jsvalue(current.to_number().ok()? - f64::from(imm))
+                }
+                _ => return None,
             }
-            number_to_jsvalue(
-                current.to_number().ok()? - f64::from(checked_operand_imm(update, 0)?),
-            )
         }
         _ => return None,
     };
