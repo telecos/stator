@@ -6393,15 +6393,66 @@ impl Interpreter {
                                                                 break 'fuse;
                                                             }
 
-                                                            // Check for TestLessThan + JumpIfTrue
-                                                            // to form a zero-dispatch tight loop.
-                                                            if pc + 1 < frame.loop_end_pc {
+                                                            // Check for test+jump pattern to form
+                                                            // a zero-dispatch tight loop. Handles
+                                                            // both separate (TestLessThan+JumpIfTrue)
+                                                            // and fused (TestLessThanJump) opcodes.
+                                                            if pc < frame.loop_end_pc {
                                                                 let i5 = unsafe {
                                                                     instructions.get_unchecked(pc)
                                                                 };
-                                                                if i5.opcode == Opcode::TestLessThan
-                                                                    || i5.opcode
-                                                                        == Opcode::TestLessThanOrEqual
+                                                                // Determine limit register, is_leq,
+                                                                // is_true_jump, and how many PCs to
+                                                                // skip after the loop exits.
+                                                                let fused_test = match i5.opcode {
+                                                                    Opcode::TestLessThanJump => {
+                                                                        let flag = unsafe {
+                                                                            match *i5.operand_unchecked(3) {
+                                                                                Operand::Flag(f) => f,
+                                                                                _ => u8::MAX,
+                                                                            }
+                                                                        };
+                                                                        if flag == 1 {
+                                                                            Some((false, 1usize))
+                                                                        } else {
+                                                                            None
+                                                                        }
+                                                                    }
+                                                                    Opcode::TestLessThanOrEqualJump => {
+                                                                        let flag = unsafe {
+                                                                            match *i5.operand_unchecked(3) {
+                                                                                Operand::Flag(f) => f,
+                                                                                _ => u8::MAX,
+                                                                            }
+                                                                        };
+                                                                        if flag == 1 {
+                                                                            Some((true, 1usize))
+                                                                        } else {
+                                                                            None
+                                                                        }
+                                                                    }
+                                                                    Opcode::TestLessThan
+                                                                    | Opcode::TestLessThanOrEqual
+                                                                        if pc + 1 < frame.loop_end_pc =>
+                                                                    {
+                                                                        let i6 = unsafe {
+                                                                            instructions.get_unchecked(pc + 1)
+                                                                        };
+                                                                        if i6.opcode == Opcode::JumpIfTrue
+                                                                            || i6.opcode == Opcode::JumpIfToBooleanTrue
+                                                                        {
+                                                                            Some((
+                                                                                i5.opcode == Opcode::TestLessThanOrEqual,
+                                                                                2usize,
+                                                                            ))
+                                                                        } else {
+                                                                            None
+                                                                        }
+                                                                    }
+                                                                    _ => None,
+                                                                };
+                                                                if let Some((is_leq, pc_advance)) =
+                                                                    fused_test
                                                                 {
                                                                     let limit_reg = unsafe {
                                                                         operand_reg_unchecked(i5, 0)
@@ -6412,37 +6463,26 @@ impl Interpreter {
                                                                                 limit_reg,
                                                                             )
                                                                     };
-                                                                    let is_leq = i5.opcode
-                                                                        == Opcode::TestLessThanOrEqual;
-                                                                    let i6 = unsafe {
-                                                                        instructions
-                                                                            .get_unchecked(pc + 1)
+                                                                    let cond = if is_leq {
+                                                                        sa <= limit_val
+                                                                    } else {
+                                                                        sa < limit_val
                                                                     };
-                                                                    if i6.opcode
-                                                                        == Opcode::JumpIfTrue
-                                                                        || i6.opcode
-                                                                            == Opcode::JumpIfToBooleanTrue
-                                                                    {
-                                                                        let cond = if is_leq {
-                                                                            sa <= limit_val
-                                                                        } else {
-                                                                            sa < limit_val
-                                                                        };
-                                                                        if cond {
-                                                                            // Enter tight loop: repeat
-                                                                            // call+Star+Ldar+AddSmi+Star+
-                                                                            // test+jump with zero dispatch.
-                                                                            let mut counter = sa;
-                                                                            loop {
-                                                                                // Inline closure call
-                                                                                let slot_ref = unsafe {
-                                                                                    &mut *cached_call_slot_ptr
-                                                                                };
-                                                                                if let JsValue::Smi(
-                                                                                    val,
-                                                                                ) = *slot_ref
-                                                                                {
-                                                                                    let next =
+                                                                    if cond {
+                                                                        // Enter tight loop: repeat
+                                                                        // call+store+inc+test with
+                                                                        // zero dispatch.
+                                                                        let mut counter = sa;
+                                                                        loop {
+                                                                            // Inline closure call
+                                                                            let slot_ref = unsafe {
+                                                                                &mut *cached_call_slot_ptr
+                                                                            };
+                                                                            if let JsValue::Smi(
+                                                                                val,
+                                                                            ) = *slot_ref
+                                                                            {
+                                                                                let next =
                                                                                         match cached_call_op
                                                                                         {
                                                                                             0 => val.checked_add(cached_call_imm),
@@ -6451,17 +6491,17 @@ impl Interpreter {
                                                                                             3 => val.checked_sub(1),
                                                                                             _ => None,
                                                                                         };
+                                                                                if let Some(
+                                                                                    call_r,
+                                                                                ) = next
+                                                                                {
+                                                                                    *slot_ref = JsValue::Smi(call_r);
+                                                                                    // Star dst1
+                                                                                    unsafe {
+                                                                                        frame.write_reg_unchecked(dst1, JsValue::Smi(call_r));
+                                                                                    }
+                                                                                    // Ldar+AddSmi+Star
                                                                                     if let Some(
-                                                                                        call_r,
-                                                                                    ) = next
-                                                                                    {
-                                                                                        *slot_ref = JsValue::Smi(call_r);
-                                                                                        // Star dst1
-                                                                                        unsafe {
-                                                                                            frame.write_reg_unchecked(dst1, JsValue::Smi(call_r));
-                                                                                        }
-                                                                                        // Ldar+AddSmi+Star
-                                                                                        if let Some(
                                                                                             nc,
                                                                                         ) = counter
                                                                                             .checked_add(
@@ -6484,27 +6524,26 @@ impl Interpreter {
                                                                                                 continue;
                                                                                             }
                                                                                         }
-                                                                                    }
                                                                                 }
-                                                                                // Overflow, type change, or
-                                                                                // loop done — break out.
-                                                                                break;
                                                                             }
+                                                                            // Overflow, type change, or
+                                                                            // loop done — break out.
+                                                                            break;
                                                                         }
-                                                                        // Advance past TestLessThan +
-                                                                        // JumpIfTrue.  Accumulator is
-                                                                        // Boolean(false) from the test
-                                                                        // that ended the loop.
-                                                                        pc += 2;
-                                                                        sa = 0;
-                                                                        smi_acc_spilled = false;
-                                                                        smi_acc_bool = true;
-                                                                        hot_acc = Some(
-                                                                            NanBoxedValue::from_boolean(
-                                                                                false,
-                                                                            ),
-                                                                        );
                                                                     }
+                                                                    // Advance past test+jump.
+                                                                    // Accumulator is
+                                                                    // Boolean(false) from the test
+                                                                    // that ended the loop.
+                                                                    pc += pc_advance;
+                                                                    sa = 0;
+                                                                    smi_acc_spilled = false;
+                                                                    smi_acc_bool = true;
+                                                                    hot_acc = Some(
+                                                                        NanBoxedValue::from_boolean(
+                                                                            false,
+                                                                        ),
+                                                                    );
                                                                 }
                                                             }
                                                         }
