@@ -3675,6 +3675,7 @@ impl Interpreter {
                     // Closure-counter plan fields:
                     let mut batch_cc_limit: i32 = 0;
                     let mut batch_cc_counter_slot: usize = usize::MAX;
+                    let mut batch_cc_result_slot: usize = usize::MAX;
                     'smi: loop {
                         if pc >= frame.loop_end_pc {
                             frame.loop_end_pc = 0;
@@ -4833,6 +4834,7 @@ impl Interpreter {
                                                     // Scan body for a Call* opcode (the
                                                     // closure call).
                                                     let mut has_call = false;
+                                                    let mut result_idx = u32::MAX;
                                                     for bi in (pc + 3)..loop_end {
                                                         let binstr = unsafe {
                                                             instructions.get_unchecked(bi)
@@ -4842,6 +4844,18 @@ impl Interpreter {
                                                             | Opcode::CallUndefinedReceiver0 => {
                                                                 has_call = true;
                                                             }
+                                                            // First StaGlobal after the Call
+                                                            // stores the call result.
+                                                            Opcode::StaGlobal
+                                                                if has_call
+                                                                    && result_idx == u32::MAX =>
+                                                            {
+                                                                result_idx = unsafe {
+                                                                    operand_constant_pool_idx_unchecked(
+                                                                        binstr, 0,
+                                                                    )
+                                                                };
+                                                            }
                                                             _ => {}
                                                         }
                                                     }
@@ -4849,9 +4863,17 @@ impl Interpreter {
                                                         if let Some(c_slot) =
                                                             frame.global_ic_get(counter_idx)
                                                         {
+                                                            let r_slot = if result_idx != u32::MAX {
+                                                                frame.global_ic_get(result_idx)
+                                                            } else {
+                                                                None
+                                                            };
                                                             batch_plan = 3;
                                                             batch_cc_limit = limit;
                                                             batch_cc_counter_slot = c_slot.0;
+                                                            batch_cc_result_slot = r_slot
+                                                                .map(|s| s.0)
+                                                                .unwrap_or(usize::MAX);
                                                         }
                                                     }
                                                 }
@@ -5012,6 +5034,14 @@ impl Interpreter {
                                                             (&mut (*env_ptr).slots)
                                                                 [batch_cc_counter_slot] =
                                                                 JsValue::Smi(batch_cc_limit);
+                                                            // Update result global (stores
+                                                            // the return value of the last
+                                                            // closure call).
+                                                            if batch_cc_result_slot != usize::MAX {
+                                                                (&mut (*env_ptr).slots)
+                                                                    [batch_cc_result_slot] =
+                                                                    JsValue::Smi(new_slot as i32);
+                                                            }
                                                             (*env_ptr).generation = (*env_ptr)
                                                                 .generation
                                                                 .wrapping_add(1);
