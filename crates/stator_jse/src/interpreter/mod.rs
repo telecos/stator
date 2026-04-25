@@ -5129,40 +5129,41 @@ impl Interpreter {
                                                                     sa < limit_val
                                                                 };
                                                                 if cond {
-                                                                    let mut counter = sa;
-                                                                    loop {
-                                                                        let slot_ref = unsafe {
-                                                                            &mut *cached_call_slot_ptr
-                                                                        };
-                                                                        if let JsValue::Smi(val) =
-                                                                            *slot_ref
-                                                                        {
+                                                                    // Optimized tight loop: raw i32
+                                                                    // math, write JsValue only at
+                                                                    // exit.
+                                                                    let slot_ref = unsafe {
+                                                                        &mut *cached_call_slot_ptr
+                                                                    };
+                                                                    if let JsValue::Smi(
+                                                                        mut call_val,
+                                                                    ) = *slot_ref
+                                                                    {
+                                                                        let mut counter = sa;
+                                                                        loop {
                                                                             let next = match cached_call_op {
-                                                                                0 => val.checked_add(cached_call_imm),
-                                                                                1 => val.checked_sub(cached_call_imm),
-                                                                                2 => val.checked_add(1),
-                                                                                3 => val.checked_sub(1),
+                                                                                0 => call_val.checked_add(cached_call_imm),
+                                                                                1 => call_val.checked_sub(cached_call_imm),
+                                                                                2 => call_val.checked_add(1),
+                                                                                3 => call_val.checked_sub(1),
                                                                                 _ => None,
                                                                             };
-                                                                            if let Some(call_r) =
-                                                                                next
-                                                                            {
-                                                                                *slot_ref =
-                                                                                    JsValue::Smi(
-                                                                                        call_r,
-                                                                                    );
-                                                                                unsafe {
-                                                                                    frame.write_reg_unchecked(dst1, JsValue::Smi(call_r));
-                                                                                }
+                                                                            if let Some(cv) = next {
+                                                                                call_val = cv;
                                                                                 if let Some(nc) = counter.checked_add(add_imm) {
                                                                                     counter = nc;
-                                                                                    unsafe { frame.write_reg_unchecked(dst2, JsValue::Smi(nc)); }
                                                                                     let c = if is_leq { nc <= limit_val } else { nc < limit_val };
                                                                                     if c { continue; }
                                                                                 }
                                                                             }
+                                                                            break;
                                                                         }
-                                                                        break;
+                                                                        *slot_ref =
+                                                                            JsValue::Smi(call_val);
+                                                                        unsafe {
+                                                                            frame.write_reg_unchecked(dst1, JsValue::Smi(call_val));
+                                                                            frame.write_reg_unchecked(dst2, JsValue::Smi(counter));
+                                                                        }
                                                                     }
                                                                     pc = exit_pc;
                                                                     sa = 0;
@@ -6886,66 +6887,45 @@ impl Interpreter {
                                                                         sa < limit_val
                                                                     };
                                                                     if cond {
-                                                                        // Enter tight loop: repeat
-                                                                        // call+store+inc+test with
-                                                                        // zero dispatch.
-                                                                        let mut counter = sa;
-                                                                        loop {
-                                                                            // Inline closure call
-                                                                            let slot_ref = unsafe {
-                                                                                &mut *cached_call_slot_ptr
-                                                                            };
-                                                                            if let JsValue::Smi(
-                                                                                val,
-                                                                            ) = *slot_ref
-                                                                            {
-                                                                                let next =
-                                                                                        match cached_call_op
-                                                                                        {
-                                                                                            0 => val.checked_add(cached_call_imm),
-                                                                                            1 => val.checked_sub(cached_call_imm),
-                                                                                            2 => val.checked_add(1),
-                                                                                            3 => val.checked_sub(1),
-                                                                                            _ => None,
-                                                                                        };
-                                                                                if let Some(
-                                                                                    call_r,
-                                                                                ) = next
+                                                                        // Optimized tight loop: raw
+                                                                        // i32 math, write JsValue
+                                                                        // only at exit.
+                                                                        let slot_ref = unsafe {
+                                                                            &mut *cached_call_slot_ptr
+                                                                        };
+                                                                        if let JsValue::Smi(
+                                                                            mut call_val,
+                                                                        ) = *slot_ref
+                                                                        {
+                                                                            let mut counter = sa;
+                                                                            loop {
+                                                                                let next = match cached_call_op {
+                                                                                    0 => call_val.checked_add(cached_call_imm),
+                                                                                    1 => call_val.checked_sub(cached_call_imm),
+                                                                                    2 => call_val.checked_add(1),
+                                                                                    3 => call_val.checked_sub(1),
+                                                                                    _ => None,
+                                                                                };
+                                                                                if let Some(cv) =
+                                                                                    next
                                                                                 {
-                                                                                    *slot_ref = JsValue::Smi(call_r);
-                                                                                    // Star dst1
-                                                                                    unsafe {
-                                                                                        frame.write_reg_unchecked(dst1, JsValue::Smi(call_r));
+                                                                                    call_val = cv;
+                                                                                    if let Some(nc) = counter.checked_add(add_imm) {
+                                                                                        counter = nc;
+                                                                                        let c = if is_leq { nc <= limit_val } else { nc < limit_val };
+                                                                                        if c { continue; }
                                                                                     }
-                                                                                    // Ldar+AddSmi+Star
-                                                                                    if let Some(
-                                                                                            nc,
-                                                                                        ) = counter
-                                                                                            .checked_add(
-                                                                                                add_imm,
-                                                                                            )
-                                                                                        {
-                                                                                            counter =
-                                                                                                nc;
-                                                                                            unsafe {
-                                                                                                frame.write_reg_unchecked(dst2, JsValue::Smi(nc));
-                                                                                            }
-                                                                                            // Test+Jump
-                                                                                            let c =
-                                                                                                if is_leq {
-                                                                                                    nc <= limit_val
-                                                                                                } else {
-                                                                                                    nc < limit_val
-                                                                                                };
-                                                                                            if c {
-                                                                                                continue;
-                                                                                            }
-                                                                                        }
                                                                                 }
+                                                                                break;
                                                                             }
-                                                                            // Overflow, type change, or
-                                                                            // loop done — break out.
-                                                                            break;
+                                                                            *slot_ref =
+                                                                                JsValue::Smi(
+                                                                                    call_val,
+                                                                                );
+                                                                            unsafe {
+                                                                                frame.write_reg_unchecked(dst1, JsValue::Smi(call_val));
+                                                                                frame.write_reg_unchecked(dst2, JsValue::Smi(counter));
+                                                                            }
                                                                         }
                                                                     }
                                                                     // Advance past test+jump.
