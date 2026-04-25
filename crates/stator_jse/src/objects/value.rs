@@ -356,10 +356,13 @@ pub enum JsValue {
     DataView(Rc<RefCell<crate::builtins::typed_array::JsDataView>>),
 }
 
-// Compile-time assertion: JsValue is 24 bytes (discriminant + 16-byte max payload).
-// Boxing BigInt removes i128 from the enum layout, but String(Rc<str>) and
-// NativeFunction(Rc<dyn Fn(…)>) are still 16-byte fat pointers.
+// Compile-time assertion: on 64-bit targets JsValue is 24 bytes
+// (discriminant + 16-byte max payload from fat-pointer variants such as
+// String(Rc<str>) and NativeFunction(Rc<dyn Fn(…)>)).
+// On 32-bit targets fat pointers are only 8 bytes so the enum is smaller;
+// the assertion is skipped there.
 // TODO: Use thin-pointer wrappers for Rc<str>/Rc<dyn Fn> to reach 16 bytes.
+#[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<JsValue>() == 24);
 
 /// A scope context representing the environment for captured variables.
