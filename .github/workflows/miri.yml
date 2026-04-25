@@ -15,15 +15,65 @@ permissions:
 
 jobs:
   miri:
-    name: Miri (unsafe code validation)
+    name: Miri (${{ matrix.target }}, ${{ matrix.label }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Known issue: GcPtr unsafe operations cause Miri timeouts.
-    # Tracked for fix when the GC subsystem is refactored.
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Primary target – x86-64 Linux (Stacked Borrows)
+          # Skips bytecode_generator (100× overhead per test) and objects::regexp
+          # (0 unsafe, 123 tests, 1.5 min) to stay within the 30-minute limit.
+          - target: x86_64-unknown-linux-gnu
+            miriflags: "-Zmiri-preemption-rate=0.1"
+            label: "Stacked Borrows"
+            test_filter: >-
+              gc:: objects:: bytecode::
+              --skip bytecode_generator
+              --skip objects::regexp
+          # Primary target – x86-64 Linux (Tree Borrows)
+          - target: x86_64-unknown-linux-gnu
+            miriflags: "-Zmiri-tree-borrows -Zmiri-preemption-rate=0.1"
+            label: "Tree Borrows"
+            test_filter: >-
+              gc:: objects:: bytecode::
+              --skip bytecode_generator
+              --skip objects::regexp
+          # 32-bit target – only pointer-size-critical modules.
+          # Miri on i686 runs GC algorithm tests at ~15 s/test (vs ~6 s on x86_64),
+          # so the full gc:: suite would exceed 30 minutes. We keep only the tests
+          # that directly exercise 32-bit pointer representation: gc_ptr, handle,
+          # tlab, and the NaN-boxing / tagged-pointer objects modules.
+          - target: i686-unknown-linux-gnu
+            miriflags: "-Zmiri-preemption-rate=0.1"
+            label: "Stacked Borrows"
+            packages: "gcc-multilib"
+            test_filter: >-
+              gc::gc_ptr::
+              gc::handle::
+              gc::tlab::
+              objects::nanbox::
+              objects::nan_boxing::
+              objects::tagged::
+          # AArch64 target – exercise GC + objects on a second architecture.
+          # Skips regexp and bytecode_generator for the same timing reasons as x86_64.
+          - target: aarch64-unknown-linux-gnu
+            miriflags: "-Zmiri-preemption-rate=0.1"
+            label: "Stacked Borrows"
+            packages: "gcc-aarch64-linux-gnu libc6-dev-arm64-cross"
+            test_filter: >-
+              gc:: objects:: bytecode::
+              --skip bytecode_generator
+              --skip objects::regexp
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+
+      - name: Install cross-compilation toolchain
+        if: ${{ matrix.packages != '' && matrix.packages != null }}
+        run: sudo apt-get update -q && sudo apt-get install -y ${{ matrix.packages }}
 
       - name: Install Rust nightly with Miri
         uses: dtolnay/rust-toolchain@nightly
@@ -34,29 +84,23 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-miri-registry-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-miri-${{ matrix.target }}-registry-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-miri-registry-
+            ${{ runner.os }}-cargo-miri-${{ matrix.target }}-registry-
 
       - name: Cache cargo index
         uses: actions/cache@v5
         with:
           path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-miri-git-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-miri-${{ matrix.target }}-git-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-miri-git-
+            ${{ runner.os }}-cargo-miri-${{ matrix.target }}-git-
 
       - name: Set up Miri sysroot
-        run: cargo +nightly miri setup
+        run: cargo +nightly miri setup --target ${{ matrix.target }}
 
-      - name: Run Miri tests – Stacked Borrows (default)
+      - name: Run Miri tests
         env:
-          MIRIFLAGS: "-Zmiri-preemption-rate=0.1"
+          MIRIFLAGS: "${{ matrix.miriflags }}"
         run: |
-          cargo +nightly miri test -p stator_jse -- gc:: objects:: bytecode::
-
-      - name: Run Miri tests – Tree Borrows
-        env:
-          MIRIFLAGS: "-Zmiri-tree-borrows -Zmiri-preemption-rate=0.1"
-        run: |
-          cargo +nightly miri test -p stator_jse -- gc:: objects:: bytecode::
+          cargo +nightly miri test -p stator_jse --target ${{ matrix.target }} -- ${{ matrix.test_filter }}
