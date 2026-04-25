@@ -460,14 +460,23 @@ fn fuse_superinstructions_with_origins(
             let second = &instructions[index + 1];
 
             match (first.opcode, second.opcode) {
-                (Opcode::TestLessThan, Opcode::JumpIfTrue | Opcode::JumpIfFalse) => {
+                (
+                    Opcode::TestLessThan,
+                    Opcode::JumpIfTrue
+                    | Opcode::JumpIfFalse
+                    | Opcode::JumpIfToBooleanTrue
+                    | Opcode::JumpIfToBooleanFalse,
+                ) => {
                     if let (
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
                     ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
-                        let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
+                        let is_true = u8::from(matches!(
+                            second.opcode,
+                            Opcode::JumpIfTrue | Opcode::JumpIfToBooleanTrue
+                        ));
                         fused_origins.push(origins[index]);
                         consumed.push(2);
                         fused_instructions.push(Instruction::new_unchecked(
@@ -483,14 +492,23 @@ fn fuse_superinstructions_with_origins(
                         continue;
                     }
                 }
-                (Opcode::TestGreaterThan, Opcode::JumpIfTrue | Opcode::JumpIfFalse) => {
+                (
+                    Opcode::TestGreaterThan,
+                    Opcode::JumpIfTrue
+                    | Opcode::JumpIfFalse
+                    | Opcode::JumpIfToBooleanTrue
+                    | Opcode::JumpIfToBooleanFalse,
+                ) => {
                     if let (
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
                     ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
-                        let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
+                        let is_true = u8::from(matches!(
+                            second.opcode,
+                            Opcode::JumpIfTrue | Opcode::JumpIfToBooleanTrue
+                        ));
                         fused_origins.push(origins[index]);
                         consumed.push(2);
                         fused_instructions.push(Instruction::new_unchecked(
@@ -506,14 +524,23 @@ fn fuse_superinstructions_with_origins(
                         continue;
                     }
                 }
-                (Opcode::TestEqual, Opcode::JumpIfTrue | Opcode::JumpIfFalse) => {
+                (
+                    Opcode::TestEqual,
+                    Opcode::JumpIfTrue
+                    | Opcode::JumpIfFalse
+                    | Opcode::JumpIfToBooleanTrue
+                    | Opcode::JumpIfToBooleanFalse,
+                ) => {
                     if let (
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
                     ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
-                        let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
+                        let is_true = u8::from(matches!(
+                            second.opcode,
+                            Opcode::JumpIfTrue | Opcode::JumpIfToBooleanTrue
+                        ));
                         fused_origins.push(origins[index]);
                         consumed.push(2);
                         fused_instructions.push(Instruction::new_unchecked(
@@ -529,14 +556,23 @@ fn fuse_superinstructions_with_origins(
                         continue;
                     }
                 }
-                (Opcode::TestNotEqual, Opcode::JumpIfTrue | Opcode::JumpIfFalse) => {
+                (
+                    Opcode::TestNotEqual,
+                    Opcode::JumpIfTrue
+                    | Opcode::JumpIfFalse
+                    | Opcode::JumpIfToBooleanTrue
+                    | Opcode::JumpIfToBooleanFalse,
+                ) => {
                     if let (
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
                     ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
-                        let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
+                        let is_true = u8::from(matches!(
+                            second.opcode,
+                            Opcode::JumpIfTrue | Opcode::JumpIfToBooleanTrue
+                        ));
                         fused_origins.push(origins[index]);
                         consumed.push(2);
                         fused_instructions.push(Instruction::new_unchecked(
@@ -552,14 +588,23 @@ fn fuse_superinstructions_with_origins(
                         continue;
                     }
                 }
-                (Opcode::TestEqualStrict, Opcode::JumpIfTrue | Opcode::JumpIfFalse) => {
+                (
+                    Opcode::TestEqualStrict,
+                    Opcode::JumpIfTrue
+                    | Opcode::JumpIfFalse
+                    | Opcode::JumpIfToBooleanTrue
+                    | Opcode::JumpIfToBooleanFalse,
+                ) => {
                     if let (
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
                     ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
-                        let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
+                        let is_true = u8::from(matches!(
+                            second.opcode,
+                            Opcode::JumpIfTrue | Opcode::JumpIfToBooleanTrue
+                        ));
                         fused_origins.push(origins[index]);
                         consumed.push(2);
                         fused_instructions.push(Instruction::new_unchecked(
@@ -575,14 +620,23 @@ fn fuse_superinstructions_with_origins(
                         continue;
                     }
                 }
-                (Opcode::TestLessThanOrEqual, Opcode::JumpIfTrue | Opcode::JumpIfFalse) => {
+                (
+                    Opcode::TestLessThanOrEqual,
+                    Opcode::JumpIfTrue
+                    | Opcode::JumpIfFalse
+                    | Opcode::JumpIfToBooleanTrue
+                    | Opcode::JumpIfToBooleanFalse,
+                ) => {
                     if let (
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
                     ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
-                        let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
+                        let is_true = u8::from(matches!(
+                            second.opcode,
+                            Opcode::JumpIfTrue | Opcode::JumpIfToBooleanTrue
+                        ));
                         fused_origins.push(origins[index]);
                         consumed.push(2);
                         fused_instructions.push(Instruction::new_unchecked(
@@ -598,14 +652,23 @@ fn fuse_superinstructions_with_origins(
                         continue;
                     }
                 }
-                (Opcode::TestGreaterThanOrEqual, Opcode::JumpIfTrue | Opcode::JumpIfFalse) => {
+                (
+                    Opcode::TestGreaterThanOrEqual,
+                    Opcode::JumpIfTrue
+                    | Opcode::JumpIfFalse
+                    | Opcode::JumpIfToBooleanTrue
+                    | Opcode::JumpIfToBooleanFalse,
+                ) => {
                     if let (
                         Operand::Register(reg),
                         Operand::FeedbackSlot(slot),
                         Operand::JumpOffset(offset),
                     ) = (*first.operand(0), *first.operand(1), *second.operand(0))
                     {
-                        let is_true = u8::from(matches!(second.opcode, Opcode::JumpIfTrue));
+                        let is_true = u8::from(matches!(
+                            second.opcode,
+                            Opcode::JumpIfTrue | Opcode::JumpIfToBooleanTrue
+                        ));
                         fused_origins.push(origins[index]);
                         consumed.push(2);
                         fused_instructions.push(Instruction::new_unchecked(

@@ -395,8 +395,12 @@ type SharedMegamorphicIc = Rc<RefCell<Option<Box<crate::interpreter::Megamorphic
 /// Shared, lazily-allocated prototype-chain IC state.
 type SharedProtoLoadIc = Rc<RefCell<Option<Box<crate::interpreter::ProtoIcCache>>>>;
 
+/// Global IC entry: `(slot_index, generation)`.
+type GlobalIcEntry = Option<(usize, u64)>;
+
 /// Shared, lazily-allocated global-variable IC state.
-type SharedGlobalIc = Rc<RefCell<Option<Box<HashMap<u32, (usize, u64)>>>>>;
+/// Flat `Vec` indexed by constant-pool index for O(1) lookups.
+type SharedGlobalIc = Rc<RefCell<Option<Box<Vec<GlobalIcEntry>>>>>;
 
 /// An immutable, compact representation of the bytecode for a single
 /// JavaScript function.
@@ -1341,12 +1345,12 @@ impl BytecodeArray {
     }
 
     /// Returns a clone of the shared global variable IC, if populated.
-    pub fn shared_global_ic(&self) -> Option<Box<HashMap<u32, (usize, u64)>>> {
+    pub fn shared_global_ic(&self) -> Option<Box<Vec<GlobalIcEntry>>> {
         self.shared_global_ic.borrow().clone()
     }
 
     /// Writes back a global variable IC to the shared cache.
-    pub fn set_shared_global_ic(&self, ic: Box<HashMap<u32, (usize, u64)>>) {
+    pub fn set_shared_global_ic(&self, ic: Box<Vec<GlobalIcEntry>>) {
         *self.shared_global_ic.borrow_mut() = Some(ic);
     }
 

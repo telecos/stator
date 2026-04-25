@@ -222,7 +222,10 @@ type MonoLoadCache = HashMap<u32, (usize, JsValue)>;
 type PolyLoadCache = HashMap<u32, Vec<(usize, JsValue)>>;
 type ProtoLoadIcCache = ProtoIcCache;
 type StringCache = HashMap<u32, Rc<str>>;
-type GlobalIcCache = HashMap<u32, (usize, u64)>;
+/// Flat-array global IC cache. Indexed by constant-pool index; `None`
+/// entries indicate uncached names. Much faster than `HashMap` for the
+/// small, dense key ranges typical of global-variable accesses.
+type GlobalIcCache = Vec<Option<(usize, u64)>>;
 
 thread_local! {
     /// The currently-attached debugger for this thread, if any.
@@ -3109,14 +3112,22 @@ impl InterpreterFrame {
     /// Fast-path lookup: returns `(slot_index, generation)` if cached.
     #[inline]
     fn global_ic_get(&self, name_idx: u32) -> Option<(usize, u64)> {
-        self.global_ic.as_ref()?.get(&name_idx).copied()
+        self.global_ic
+            .as_ref()?
+            .get(name_idx as usize)
+            .copied()
+            .flatten()
     }
 
     /// Cache a global variable's slot index and generation.
     #[inline]
     fn global_ic_put(&mut self, name_idx: u32, slot_idx: usize, generation: u64) {
-        self.global_ic_mut()
-            .insert(name_idx, (slot_idx, generation));
+        let ic = self.global_ic_mut();
+        let idx = name_idx as usize;
+        if idx >= ic.len() {
+            ic.resize(idx + 1, None);
+        }
+        ic[idx] = Some((slot_idx, generation));
     }
 
     /// Clear the global IC cache (e.g. on tail-call invalidation).
@@ -3201,7 +3212,7 @@ impl InterpreterFrame {
         // IC fast path: known slot, generation matches.
         // Use a single borrow_mut to avoid double borrow overhead.
         if let Some(ref ic) = self.global_ic
-            && let Some(&(slot_idx, cached_gen)) = ic.get(&name_idx)
+            && let Some(&Some((slot_idx, cached_gen))) = ic.get(name_idx as usize)
         {
             let mut env = self.global_env.borrow_mut();
             if env.generation() == cached_gen {
@@ -3224,8 +3235,7 @@ impl InterpreterFrame {
         drop(env);
         self.cache_generation = new_gen;
         if let Some((slot_idx, cached_gen)) = slot_gen {
-            self.global_ic_mut()
-                .insert(name_idx, (slot_idx, cached_gen));
+            self.global_ic_put(name_idx, slot_idx, cached_gen);
         }
         self.global_cache_put_no_gen(name, value);
     }
@@ -4614,8 +4624,10 @@ impl Interpreter {
                                 let name_idx =
                                     unsafe { operand_constant_pool_idx_unchecked(instr, 0) };
                                 // IC fast path: read directly from slots via raw pointer.
-                                if let Some(&(slot_idx, _cached_gen)) =
-                                    frame.global_ic.as_ref().and_then(|ic| ic.get(&name_idx))
+                                if let Some(&Some((slot_idx, _cached_gen))) = frame
+                                    .global_ic
+                                    .as_ref()
+                                    .and_then(|ic| ic.get(name_idx as usize))
                                 {
                                     // SAFETY: env_ptr valid, slot_idx from prior IC population.
                                     let val = unsafe { &(&(*env_ptr).slots)[slot_idx] };
@@ -4675,8 +4687,10 @@ impl Interpreter {
                                 let dst = unsafe { operand_reg_unchecked(instr, 2) };
                                 let dst_idx = frame.reg_flat_index_unchecked(dst);
                                 // IC fast path: read directly from slots via raw pointer.
-                                if let Some(&(slot_idx, _cached_gen)) =
-                                    frame.global_ic.as_ref().and_then(|ic| ic.get(&name_idx))
+                                if let Some(&Some((slot_idx, _cached_gen))) = frame
+                                    .global_ic
+                                    .as_ref()
+                                    .and_then(|ic| ic.get(name_idx as usize))
                                 {
                                     // SAFETY: env_ptr valid, slot_idx from prior IC population.
                                     let val = unsafe { &(&(*env_ptr).slots)[slot_idx] };
@@ -4757,8 +4771,10 @@ impl Interpreter {
                                 // IC fast path: write directly to slot via raw pointer.
                                 {
                                     let val = materialize_acc!();
-                                    if let Some(&(slot_idx, _cached_gen)) =
-                                        frame.global_ic.as_ref().and_then(|ic| ic.get(&name_idx))
+                                    if let Some(&Some((slot_idx, _cached_gen))) = frame
+                                        .global_ic
+                                        .as_ref()
+                                        .and_then(|ic| ic.get(name_idx as usize))
                                     {
                                         // SAFETY: env_ptr valid, slot_idx from prior IC population.
                                         unsafe {
@@ -6396,10 +6412,10 @@ impl Interpreter {
                                                             maybe_sta, 0,
                                                         )
                                                     };
-                                                    if let Some(&(gsi, _)) = frame
+                                                    if let Some(&Some((gsi, _))) = frame
                                                         .global_ic
                                                         .as_ref()
-                                                        .and_then(|ic| ic.get(&gname_idx))
+                                                        .and_then(|ic| ic.get(gname_idx as usize))
                                                     {
                                                         fused_sta_global = Some((gsi, gname_idx));
                                                         // Pre-clear the spilled accumulator
@@ -7258,8 +7274,8 @@ impl Interpreter {
                                     Opcode::LdaGlobal => {
                                         if let Operand::ConstantPoolIdx(name_idx) = *si.operand(0) {
                                             if let Some(ref ic) = frame.global_ic
-                                                && let Some(&(slot_idx, cached_gen)) =
-                                                    ic.get(&name_idx)
+                                                && let Some(&Some((slot_idx, cached_gen))) =
+                                                    ic.get(name_idx as usize)
                                             {
                                                 let env = frame.global_env.borrow();
                                                 if env.generation() == cached_gen {
@@ -8590,7 +8606,8 @@ impl Interpreter {
                         if let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) {
                             // IC fast path: known slot, generation matches.
                             if let Some(ref ic) = frame.global_ic
-                                && let Some(&(slot_idx, cached_gen)) = ic.get(&name_idx)
+                                && let Some(&Some((slot_idx, cached_gen))) =
+                                    ic.get(name_idx as usize)
                             {
                                 let env = frame.global_env.borrow();
                                 if env.generation() == cached_gen {
