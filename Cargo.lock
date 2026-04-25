@@ -540,18 +540,6 @@ dependencies = [
 
 [[package]]
 name = "cranelift-frontend"
-version = "0.129.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c31db0085c3dfa131e739c3b26f9f9c84d69a9459627aac1ac4ef8355e3411b"
-dependencies = [
- "cranelift-codegen 0.129.1",
- "log",
- "smallvec",
- "target-lexicon",
-]
-
-[[package]]
-name = "cranelift-frontend"
 version = "0.131.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4dca3df1d107d98d88f159ad1d5eaa2d5cdb678b3d5bcfadc6fc83d8ebb448ea"
@@ -1859,7 +1847,7 @@ dependencies = [
  "bitflags 2.11.0",
  "bumpalo",
  "cranelift-codegen 0.129.1",
- "cranelift-frontend 0.129.1",
+ "cranelift-frontend",
  "cranelift-jit",
  "cranelift-module",
  "criterion",
@@ -2507,7 +2495,7 @@ dependencies = [
  "cranelift-codegen 0.131.0",
  "cranelift-control 0.131.0",
  "cranelift-entity 0.131.0",
- "cranelift-frontend 0.131.0",
+ "cranelift-frontend",
  "cranelift-native 0.131.0",
  "gimli",
  "itertools 0.14.0",
