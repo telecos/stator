@@ -17,7 +17,7 @@ jobs:
   miri:
     name: Miri (${{ matrix.target }}, ${{ matrix.label }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -25,7 +25,7 @@ jobs:
         include:
           # Primary target – x86-64 Linux (Stacked Borrows)
           # Skips bytecode_generator (100× overhead per test) and objects::regexp
-          # (0 unsafe, 123 tests, 1.5 min) to stay within the 30-minute limit.
+          # (0 unsafe, 123 tests, 1.5 min) to keep within the 60-minute limit.
           - target: x86_64-unknown-linux-gnu
             miriflags: "-Zmiri-preemption-rate=0.1"
             label: "Stacked Borrows"
@@ -34,16 +34,16 @@ jobs:
               --skip bytecode_generator
               --skip objects::regexp
           # Primary target – x86-64 Linux (Tree Borrows)
+          # Only runs gc:: because Tree Borrows validates pointer aliasing rules
+          # which are only exercised by the unsafe GC code.  objects:: and
+          # bytecode:: are pure-safe Rust so SB already covers them.
           - target: x86_64-unknown-linux-gnu
             miriflags: "-Zmiri-tree-borrows -Zmiri-preemption-rate=0.1"
             label: "Tree Borrows"
-            test_filter: >-
-              gc:: objects:: bytecode::
-              --skip bytecode_generator
-              --skip objects::regexp
+            test_filter: "gc::"
           # 32-bit target – only pointer-size-critical modules.
           # Miri on i686 runs GC algorithm tests at ~15 s/test (vs ~6 s on x86_64),
-          # so the full gc:: suite would exceed 30 minutes. We keep only the tests
+          # so the full gc:: suite would exceed the timeout. We keep only the tests
           # that directly exercise 32-bit pointer representation: gc_ptr, handle,
           # tlab, and the NaN-boxing / tagged-pointer objects modules.
           - target: i686-unknown-linux-gnu
@@ -58,14 +58,15 @@ jobs:
               objects::nan_boxing::
               objects::tagged::
           # AArch64 target – exercise GC + objects on a second architecture.
-          # Skips regexp and bytecode_generator for the same timing reasons as x86_64.
+          # Skips bytecode:: (safe Rust, already covered by x86_64 SB) and
+          # objects::regexp (no unsafe code, 123 tests, adds ~4 min under QEMU)
+          # to keep the cross-compiled job well within the 60-minute limit.
           - target: aarch64-unknown-linux-gnu
             miriflags: "-Zmiri-preemption-rate=0.1"
             label: "Stacked Borrows"
             packages: "gcc-aarch64-linux-gnu libc6-dev-arm64-cross"
             test_filter: >-
-              gc:: objects:: bytecode::
-              --skip bytecode_generator
+              gc:: objects::
               --skip objects::regexp
     steps:
       - name: Checkout repository
@@ -76,6 +77,7 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -y ${{ matrix.packages }}
 
       - name: Install Rust nightly with Miri
+        id: toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri, rust-src
@@ -95,6 +97,15 @@ jobs:
           key: ${{ runner.os }}-cargo-miri-${{ matrix.target }}-git-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-miri-${{ matrix.target }}-git-
+
+      - name: Cache Miri build artifacts
+        uses: actions/cache@v5
+        with:
+          path: target/miri
+          key: ${{ runner.os }}-miri-target-${{ matrix.target }}-${{ steps.toolchain.outputs.rustc-version }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-miri-target-${{ matrix.target }}-${{ steps.toolchain.outputs.rustc-version }}-
+            ${{ runner.os }}-miri-target-${{ matrix.target }}-
 
       - name: Set up Miri sysroot
         run: cargo +nightly miri setup --target ${{ matrix.target }}
