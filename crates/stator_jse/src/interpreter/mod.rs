@@ -3661,7 +3661,8 @@ impl Interpreter {
                     let mut batch_loop_trips: u32 = 0;
                     // Cached batch plan for the current loop.
                     // 0 = not analyzed, 1 = push-sequential-smis,
-                    // 2 = sum-array-smis, 0xFF = not batchable.
+                    // 2 = sum-array-smis, 3 = closure-counter,
+                    // 0xFF = not batchable.
                     let mut batch_plan: u8 = 0;
                     // Push plan fields:
                     let mut batch_push_limit: i32 = 0;
@@ -3671,6 +3672,9 @@ impl Interpreter {
                     let mut batch_sum_counter_slot: usize = usize::MAX;
                     let mut batch_sum_arr_slot: usize = usize::MAX;
                     let mut batch_sum_sum_slot: usize = usize::MAX;
+                    // Closure-counter plan fields:
+                    let mut batch_cc_limit: i32 = 0;
+                    let mut batch_cc_counter_slot: usize = usize::MAX;
                     'smi: loop {
                         if pc >= frame.loop_end_pc {
                             frame.loop_end_pc = 0;
@@ -4800,6 +4804,59 @@ impl Interpreter {
                                                 }
                                             }
                                         }
+
+                                        // Plan 3: closure-counter pattern.
+                                        // Requires cached_call_op to be set (closure
+                                        // pattern already identified) and the same
+                                        // LdaSmiStar + LdaGlobal + TestLessThanJump
+                                        // header. Body calls a 0-arg closure that does
+                                        // context_slot += imm, then increments counter.
+                                        if batch_plan == 0xFF
+                                            && cached_call_op != u8::MAX
+                                            && !cached_call_slot_ptr.is_null()
+                                        {
+                                            if loop_end > pc + 3 {
+                                                let h0 = unsafe { instructions.get_unchecked(pc) };
+                                                let h1 =
+                                                    unsafe { instructions.get_unchecked(pc + 1) };
+                                                let h2 =
+                                                    unsafe { instructions.get_unchecked(pc + 2) };
+                                                if h0.opcode == Opcode::LdaSmiStar
+                                                    && h1.opcode == Opcode::LdaGlobal
+                                                    && h2.opcode == Opcode::TestLessThanJump
+                                                {
+                                                    let limit =
+                                                        unsafe { operand_imm_unchecked(h0, 0) };
+                                                    let counter_idx = unsafe {
+                                                        operand_constant_pool_idx_unchecked(h1, 0)
+                                                    };
+                                                    // Scan body for a Call* opcode (the
+                                                    // closure call).
+                                                    let mut has_call = false;
+                                                    for bi in (pc + 3)..loop_end {
+                                                        let binstr = unsafe {
+                                                            instructions.get_unchecked(bi)
+                                                        };
+                                                        match binstr.opcode {
+                                                            Opcode::CallAnyReceiver
+                                                            | Opcode::CallUndefinedReceiver0 => {
+                                                                has_call = true;
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                    if has_call {
+                                                        if let Some(c_slot) =
+                                                            frame.global_ic_get(counter_idx)
+                                                        {
+                                                            batch_plan = 3;
+                                                            batch_cc_limit = limit;
+                                                            batch_cc_counter_slot = c_slot.0;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
 
                                     // Execute batch if plan is active.
@@ -4908,6 +4965,68 @@ impl Interpreter {
                                                                 Some(NanBoxedValue::from_smi(sa));
                                                             continue 'smi;
                                                         }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Guard failed — disable plan.
+                                        batch_plan = 0xFF;
+                                    } else if batch_plan == 3 {
+                                        // Closure-counter batch.
+                                        // Read the loop counter from the global slot.
+                                        let current_i_val =
+                                            unsafe { &(&(*env_ptr).slots)[batch_cc_counter_slot] };
+                                        if let JsValue::Smi(current_i) = current_i_val {
+                                            let current_i = *current_i;
+                                            if current_i < batch_cc_limit
+                                                && !cached_call_slot_ptr.is_null()
+                                            {
+                                                // SAFETY: cached_call_slot_ptr was validated
+                                                // earlier; the closure context is alive.
+                                                let slot_ref =
+                                                    unsafe { &mut *cached_call_slot_ptr };
+                                                if let JsValue::Smi(slot_val) = *slot_ref {
+                                                    let remaining =
+                                                        (batch_cc_limit - current_i) as i64;
+                                                    let delta = match cached_call_op {
+                                                        // 0=AddSmi
+                                                        0 => remaining * (cached_call_imm as i64),
+                                                        // 1=SubSmi
+                                                        1 => {
+                                                            remaining * (-(cached_call_imm as i64))
+                                                        }
+                                                        // 2=Inc
+                                                        2 => remaining,
+                                                        // 3=Dec
+                                                        3 => -remaining,
+                                                        _ => 0,
+                                                    };
+                                                    let new_slot = (slot_val as i64) + delta;
+                                                    // Check i32 range.
+                                                    if new_slot >= i32::MIN as i64
+                                                        && new_slot <= i32::MAX as i64
+                                                    {
+                                                        *slot_ref = JsValue::Smi(new_slot as i32);
+                                                        // Update counter global to limit.
+                                                        unsafe {
+                                                            (&mut (*env_ptr).slots)
+                                                                [batch_cc_counter_slot] =
+                                                                JsValue::Smi(batch_cc_limit);
+                                                            (*env_ptr).generation = (*env_ptr)
+                                                                .generation
+                                                                .wrapping_add(1);
+                                                        }
+                                                        smi_vars_dirty = true;
+                                                        let skipped = remaining as u64;
+                                                        let body_len = (loop_end - pc) as u64;
+                                                        frame.instructions_executed +=
+                                                            skipped * body_len;
+                                                        // Accumulator = last call result.
+                                                        sa = new_slot as i32;
+                                                        smi_acc_spilled = false;
+                                                        smi_acc_bool = false;
+                                                        hot_acc = Some(NanBoxedValue::from_smi(sa));
+                                                        continue 'smi;
                                                     }
                                                 }
                                             }
