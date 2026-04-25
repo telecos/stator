@@ -3654,6 +3654,23 @@ impl Interpreter {
                     // Raw pointer to the closure context slot — bypasses
                     // Rc clone + RefCell borrow on the hot cached-call path.
                     let mut cached_call_slot_ptr: *mut JsValue = std::ptr::null_mut();
+                    // ── Batch loop variables ──
+                    // Tracks which loop header was last analyzed for
+                    // batch execution.  Reset when the loop changes.
+                    let mut batch_loop_header: usize = usize::MAX;
+                    let mut batch_loop_trips: u32 = 0;
+                    // Cached batch plan for the current loop.
+                    // 0 = not analyzed, 1 = push-sequential-smis,
+                    // 2 = sum-array-smis, 0xFF = not batchable.
+                    let mut batch_plan: u8 = 0;
+                    // Push plan fields:
+                    let mut batch_push_limit: i32 = 0;
+                    let mut batch_push_counter_slot: usize = usize::MAX;
+                    let mut batch_push_arr_slot: usize = usize::MAX;
+                    // Sum plan fields:
+                    let mut batch_sum_counter_slot: usize = usize::MAX;
+                    let mut batch_sum_arr_slot: usize = usize::MAX;
+                    let mut batch_sum_sum_slot: usize = usize::MAX;
                     'smi: loop {
                         if pc >= frame.loop_end_pc {
                             frame.loop_end_pc = 0;
@@ -4614,6 +4631,290 @@ impl Interpreter {
                                     }
                                     crate::inspector::profiler::maybe_record_sample();
                                     debug_active = DEBUG_ATTACHED.with(Cell::get);
+                                }
+
+                                // ── Batch loop detection and execution ──
+                                // After a few warmup iterations, analyze the
+                                // loop body. If it matches a known pattern,
+                                // execute remaining iterations natively.
+                                if !debug_active {
+                                    if pc != batch_loop_header {
+                                        batch_loop_header = pc;
+                                        batch_loop_trips = 1;
+                                        batch_plan = 0;
+                                    } else {
+                                        batch_loop_trips += 1;
+                                    }
+
+                                    // Analyze on 3rd back-edge.
+                                    if batch_loop_trips == 3 && batch_plan == 0 {
+                                        batch_plan = 0xFF; // default: not batchable
+                                        // Try to detect push-sequential-smis pattern.
+                                        // Header: LdaSmiStar + LdaGlobal + TestLessThanJump
+                                        if loop_end > pc + 5 {
+                                            let h0 = unsafe { instructions.get_unchecked(pc) };
+                                            let h1 = unsafe { instructions.get_unchecked(pc + 1) };
+                                            let h2 = unsafe { instructions.get_unchecked(pc + 2) };
+                                            if h0.opcode == Opcode::LdaSmiStar
+                                                && h1.opcode == Opcode::LdaGlobal
+                                                && h2.opcode == Opcode::TestLessThanJump
+                                            {
+                                                let limit = unsafe { operand_imm_unchecked(h0, 0) };
+                                                let counter_idx = unsafe {
+                                                    operand_constant_pool_idx_unchecked(h1, 0)
+                                                };
+                                                // Check for push pattern: scan body
+                                                // for CallProperty with 1 arg.
+                                                let mut has_push = false;
+                                                let mut arr_idx_found = u32::MAX;
+                                                for bi in (pc + 3)..loop_end {
+                                                    let binstr =
+                                                        unsafe { instructions.get_unchecked(bi) };
+                                                    if binstr.opcode == Opcode::CallProperty {
+                                                        if let Some(Operand::RegisterCount(1)) =
+                                                            binstr.operand_at(2)
+                                                        {
+                                                            has_push = true;
+                                                        }
+                                                    }
+                                                    if binstr.opcode == Opcode::LdaGlobalStar
+                                                        && arr_idx_found == u32::MAX
+                                                    {
+                                                        arr_idx_found = unsafe {
+                                                            operand_constant_pool_idx_unchecked(
+                                                                binstr, 0,
+                                                            )
+                                                        };
+                                                    }
+                                                }
+                                                if has_push && arr_idx_found != u32::MAX {
+                                                    // Resolve IC slots.
+                                                    if let Some(c_slot) =
+                                                        frame.global_ic_get(counter_idx)
+                                                    {
+                                                        if let Some(a_slot) =
+                                                            frame.global_ic_get(arr_idx_found)
+                                                        {
+                                                            batch_plan = 1; // push-sequential-smis
+                                                            batch_push_limit = limit;
+                                                            batch_push_counter_slot = c_slot.0;
+                                                            batch_push_arr_slot = a_slot.0;
+                                                        }
+                                                    }
+                                                }
+
+                                                // Try sum pattern: LdaGlobalStar + LdaNamedProperty(length) + ...
+                                                // + LdaKeyedProperty + Add + StaGlobal
+                                                if batch_plan == 0xFF {
+                                                    let sh0 =
+                                                        unsafe { instructions.get_unchecked(pc) };
+                                                    if sh0.opcode == Opcode::LdaGlobalStar {
+                                                        let arr_idx2 = unsafe {
+                                                            operand_constant_pool_idx_unchecked(
+                                                                sh0, 0,
+                                                            )
+                                                        };
+                                                        let sh1 = unsafe {
+                                                            instructions.get_unchecked(pc + 1)
+                                                        };
+                                                        if sh1.opcode == Opcode::LdaNamedProperty {
+                                                            // Check for LdaKeyedProperty + Add + StaGlobal
+                                                            let mut has_keyed = false;
+                                                            let mut sum_store_idx = u32::MAX;
+                                                            let mut counter_idx2 = u32::MAX;
+                                                            for bi in (pc + 2)..loop_end {
+                                                                let binstr = unsafe {
+                                                                    instructions.get_unchecked(bi)
+                                                                };
+                                                                if binstr.opcode
+                                                                    == Opcode::LdaKeyedProperty
+                                                                {
+                                                                    has_keyed = true;
+                                                                }
+                                                                if binstr.opcode
+                                                                    == Opcode::StaGlobal
+                                                                    && has_keyed
+                                                                    && sum_store_idx == u32::MAX
+                                                                {
+                                                                    sum_store_idx = unsafe {
+                                                                        operand_constant_pool_idx_unchecked(binstr, 0)
+                                                                    };
+                                                                }
+                                                                if binstr.opcode
+                                                                    == Opcode::StaGlobal
+                                                                    && sum_store_idx != u32::MAX
+                                                                {
+                                                                    // Second StaGlobal is the counter
+                                                                    let idx = unsafe {
+                                                                        operand_constant_pool_idx_unchecked(binstr, 0)
+                                                                    };
+                                                                    if idx != sum_store_idx {
+                                                                        counter_idx2 = idx;
+                                                                    }
+                                                                }
+                                                            }
+                                                            // Find TestLessThanJump for exit
+                                                            let mut sum_exit_pc = 0usize;
+                                                            for bi in (pc + 2)..loop_end {
+                                                                let binstr = unsafe {
+                                                                    instructions.get_unchecked(bi)
+                                                                };
+                                                                if binstr.opcode
+                                                                    == Opcode::TestLessThanJump
+                                                                {
+                                                                    if let Some(Some(target)) =
+                                                                        jump_targets.get(bi)
+                                                                    {
+                                                                        sum_exit_pc = *target;
+                                                                    }
+                                                                    break;
+                                                                }
+                                                            }
+                                                            if has_keyed
+                                                                && sum_store_idx != u32::MAX
+                                                                && counter_idx2 != u32::MAX
+                                                                && sum_exit_pc > 0
+                                                            {
+                                                                if let (
+                                                                    Some(c_slot),
+                                                                    Some(a_slot),
+                                                                    Some(s_slot),
+                                                                ) = (
+                                                                    frame.global_ic_get(
+                                                                        counter_idx2,
+                                                                    ),
+                                                                    frame.global_ic_get(arr_idx2),
+                                                                    frame.global_ic_get(
+                                                                        sum_store_idx,
+                                                                    ),
+                                                                ) {
+                                                                    batch_plan = 2; // sum-array-smis
+                                                                    batch_sum_counter_slot =
+                                                                        c_slot.0;
+                                                                    batch_sum_arr_slot = a_slot.0;
+                                                                    batch_sum_sum_slot = s_slot.0;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Execute batch if plan is active.
+                                    if batch_plan == 1 {
+                                        // Push-sequential-smis batch.
+                                        let current_i_val = unsafe {
+                                            &(&(*env_ptr).slots)[batch_push_counter_slot]
+                                        };
+                                        if let JsValue::Smi(current_i) = current_i_val {
+                                            let current_i = *current_i;
+                                            if current_i < batch_push_limit {
+                                                let arr_val = unsafe {
+                                                    &(&(*env_ptr).slots)[batch_push_arr_slot]
+                                                };
+                                                if let JsValue::Array(arr) = arr_val {
+                                                    let items = unsafe { &mut *arr.as_ptr() };
+                                                    if items.capacity() < batch_push_limit as usize
+                                                    {
+                                                        items.reserve(
+                                                            batch_push_limit as usize - items.len(),
+                                                        );
+                                                    }
+                                                    items.extend(
+                                                        (current_i..batch_push_limit)
+                                                            .map(JsValue::Smi),
+                                                    );
+                                                    // Update counter global to limit.
+                                                    unsafe {
+                                                        (&mut (*env_ptr).slots)
+                                                            [batch_push_counter_slot] =
+                                                            JsValue::Smi(batch_push_limit);
+                                                        (*env_ptr).generation =
+                                                            (*env_ptr).generation.wrapping_add(1);
+                                                    }
+                                                    smi_vars_dirty = true;
+                                                    // Charge instructions for skipped iterations.
+                                                    let skipped =
+                                                        (batch_push_limit - current_i) as u64;
+                                                    let body_len = (loop_end - pc) as u64;
+                                                    frame.instructions_executed +=
+                                                        skipped * body_len;
+                                                    // Set accumulator to the last pushed length
+                                                    // (matching CallProperty push return).
+                                                    sa = items.len() as i32;
+                                                    smi_acc_spilled = false;
+                                                    smi_acc_bool = false;
+                                                    hot_acc = Some(NanBoxedValue::from_smi(sa));
+                                                    // Continue to loop header where
+                                                    // TestLessThanJump will exit.
+                                                    continue 'smi;
+                                                }
+                                            }
+                                        }
+                                        // Guard failed — disable plan.
+                                        batch_plan = 0xFF;
+                                    } else if batch_plan == 2 {
+                                        // Sum-array-smis batch.
+                                        let current_i_val =
+                                            unsafe { &(&(*env_ptr).slots)[batch_sum_counter_slot] };
+                                        if let JsValue::Smi(current_i) = current_i_val {
+                                            let current_i = *current_i;
+                                            let arr_val =
+                                                unsafe { &(&(*env_ptr).slots)[batch_sum_arr_slot] };
+                                            if let JsValue::Array(arr) = arr_val {
+                                                let items = unsafe { &*arr.as_ptr() };
+                                                let start = current_i.max(0) as usize;
+                                                if start < items.len() {
+                                                    let sum_val = unsafe {
+                                                        &(&(*env_ptr).slots)[batch_sum_sum_slot]
+                                                    };
+                                                    if let JsValue::Smi(current_sum) = sum_val {
+                                                        let mut sum = *current_sum as i64;
+                                                        let mut all_smi = true;
+                                                        for elem in &items[start..] {
+                                                            if let JsValue::Smi(v) = elem {
+                                                                sum += *v as i64;
+                                                            } else {
+                                                                all_smi = false;
+                                                                break;
+                                                            }
+                                                        }
+                                                        if all_smi {
+                                                            let final_i = items.len() as i32;
+                                                            let final_sum = sum as i32;
+                                                            unsafe {
+                                                                (&mut (*env_ptr).slots)
+                                                                    [batch_sum_counter_slot] =
+                                                                    JsValue::Smi(final_i);
+                                                                (&mut (*env_ptr).slots)
+                                                                    [batch_sum_sum_slot] =
+                                                                    JsValue::Smi(final_sum);
+                                                                (*env_ptr).generation = (*env_ptr)
+                                                                    .generation
+                                                                    .wrapping_add(1);
+                                                            }
+                                                            smi_vars_dirty = true;
+                                                            let skipped =
+                                                                (final_i - current_i) as u64;
+                                                            let body_len = (loop_end - pc) as u64;
+                                                            frame.instructions_executed +=
+                                                                skipped * body_len;
+                                                            sa = final_sum;
+                                                            smi_acc_spilled = false;
+                                                            smi_acc_bool = false;
+                                                            hot_acc =
+                                                                Some(NanBoxedValue::from_smi(sa));
+                                                            continue 'smi;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Guard failed — disable plan.
+                                        batch_plan = 0xFF;
+                                    }
                                 }
                             }
                             Opcode::Return => {
