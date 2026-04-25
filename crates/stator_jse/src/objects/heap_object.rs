@@ -33,7 +33,19 @@ const FORWARDING_TAG: usize = 0b10;
 /// object's new address OR-ed with [`FORWARDING_TAG`] (bit 1).  All map
 /// accesses must go through [`HeapObject::map`] rather than reading
 /// `map_word` directly.
-#[repr(C)]
+///
+/// # Alignment
+///
+/// `HeapObject` is forced to 8-byte alignment so that the low three bits of
+/// every `*mut HeapObject` are zero.  The NaN-boxing scheme in
+/// [`crate::objects::nan_boxing`] reuses bits 0 and 60–63 of the pointer for
+/// type tags, and the GC forwarding scheme reuses bit 1 of `map_word`
+/// (see [`FORWARDING_TAG`]).  Without an explicit `align(8)`, on 32-bit
+/// targets this struct would only be 4-byte aligned (since `usize`/`u32`
+/// have alignment 4), which would corrupt those tag bits and trip the
+/// `pointer must be 8-byte aligned` assertion in
+/// [`crate::objects::nan_boxing::NanBoxedValue::from_heap_ptr`].
+#[repr(C, align(8))]
 pub struct HeapObject {
     /// Tagged pointer to this object's [`Map`] (hidden class), or a
     /// forwarding pointer during a GC scavenge cycle.
@@ -178,6 +190,19 @@ impl HeapObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `HeapObject` must be at least 8-byte aligned on every target so that
+    /// the low three bits of every `*mut HeapObject` are free for use by the
+    /// NaN-boxing scheme (bit 0) and the GC forwarding marker (bit 1).
+    /// Without `#[repr(C, align(8))]`, this would silently regress to
+    /// alignment 4 on 32-bit targets.
+    #[test]
+    fn test_heap_object_is_8_byte_aligned() {
+        assert!(
+            std::mem::align_of::<HeapObject>() >= 8,
+            "HeapObject must be at least 8-byte aligned on all targets"
+        );
+    }
 
     #[test]
     fn test_map_ptr_round_trip() {
