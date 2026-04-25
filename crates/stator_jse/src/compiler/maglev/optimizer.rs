@@ -3093,7 +3093,7 @@ fn try_fuse_call_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
     // Try to resolve (slot, k) at compile time by tracing the callee back
     // to a CreateClosure / FastCreateClosure node whose shared_function_info
     // has a pre-analysed fusion pattern in the graph.
-    let (resolved_slot, resolved_k) = resolve_fusion_pattern(graph, callee_id);
+    let (resolved_slot, resolved_k) = resolve_fusion_pattern(graph, callee_id, lp.preheader);
 
     let fusion_id = graph.alloc_node_id();
     if let Some(pre) = graph.block_mut(lp.preheader) {
@@ -3245,7 +3245,11 @@ fn find_call_callee_node(node: &ValueNode) -> Option<NodeId> {
 /// context-slot increment pattern, or `(None, None)` otherwise.  The
 /// resolved constants allow the code generator to emit a zero-call inline
 /// fast path for [`ValueNode::SpeculativeCallFusion`].
-fn resolve_fusion_pattern(graph: &MaglevGraph, callee_id: NodeId) -> (Option<u32>, Option<i64>) {
+fn resolve_fusion_pattern(
+    graph: &MaglevGraph,
+    callee_id: NodeId,
+    preheader: u32,
+) -> (Option<u32>, Option<i64>) {
     // Walk through Phi nodes to find the ultimate definition.
     let mut target = callee_id;
     for _ in 0..8 {
@@ -3266,6 +3270,79 @@ fn resolve_fusion_pattern(graph: &MaglevGraph, callee_id: NodeId) -> (Option<u32
             }
             Some(ValueNode::Phi { inputs }) => {
                 // Follow the first non-self input.
+                if let Some(&inp) = inputs.iter().find(|&&i| i != target) {
+                    target = inp;
+                    continue;
+                }
+                return (None, None);
+            }
+            Some(ValueNode::LoadGlobal { name, .. }) => {
+                // Trace through LoadGlobal → StoreGlobal in preheader →
+                // Call(CreateClosure(factory)) to resolve factory patterns.
+                let callee_name = *name;
+                return resolve_factory_fusion(graph, callee_name, preheader);
+            }
+            _ => return (None, None),
+        }
+    }
+    (None, None)
+}
+
+/// Resolve a factory fusion pattern: trace a global back through the
+/// preheader to find `StoreGlobal(name, Call(CreateClosure(factory)))`.
+/// If the factory has a known factory fusion pattern, return it.
+fn resolve_factory_fusion(
+    graph: &MaglevGraph,
+    global_name: u32,
+    preheader: u32,
+) -> (Option<u32>, Option<i64>) {
+    let pre = match graph.block(preheader) {
+        Some(b) => b,
+        None => return (None, None),
+    };
+
+    // Find StoreGlobal(global_name, value) in the preheader.
+    let mut stored_value = None;
+    for (_, node) in pre.nodes.iter().rev() {
+        if let ValueNode::StoreGlobal { name, value, .. } = node
+            && *name == global_name
+        {
+            stored_value = Some(*value);
+            break;
+        }
+    }
+    let stored_value = match stored_value {
+        Some(v) => v,
+        None => return (None, None),
+    };
+
+    // Check if stored_value is a Call result.
+    let call_callee = match graph.node(stored_value) {
+        Some(ValueNode::Call { callee, args, .. }) if args.is_empty() => *callee,
+        Some(ValueNode::CallKnownFunction { callee, args, .. }) if args.is_empty() => *callee,
+        _ => return (None, None),
+    };
+
+    // Trace the Call's callee to a CreateClosure.
+    let mut target = call_callee;
+    for _ in 0..4 {
+        match graph.node(target) {
+            Some(ValueNode::CreateClosure {
+                shared_function_info,
+                ..
+            })
+            | Some(ValueNode::FastCreateClosure {
+                shared_function_info,
+                ..
+            }) => {
+                // Check factory fusion patterns (inner closures).
+                if let Some(&(slot, k)) = graph.factory_fusion_patterns().get(shared_function_info)
+                {
+                    return (Some(slot), Some(k));
+                }
+                return (None, None);
+            }
+            Some(ValueNode::Phi { inputs }) => {
                 if let Some(&inp) = inputs.iter().find(|&&i| i != target) {
                     target = inp;
                     continue;
