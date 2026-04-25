@@ -1633,17 +1633,16 @@ impl<'a> GraphBuilder<'a> {
                         //   }
                         //   for (...) counter();  // counter = make_counter()
                         for entry in callee_ba.constant_pool() {
-                            if let ConstantPoolEntry::Function(inner_ba) = entry {
-                                if let Some((s, k)) =
+                            if let ConstantPoolEntry::Function(inner_ba) = entry
+                                && let Some((s, k)) =
                                     crate::compiler::baseline::compiler::jit_runtime::analyze_fusion_pattern(
                                         inner_ba.bytecodes(),
                                     )
-                                {
-                                    self.graph.set_factory_fusion_pattern(
-                                        func_idx, s as u32, k,
-                                    );
-                                    break;
-                                }
+                            {
+                                self.graph.set_factory_fusion_pattern(
+                                    func_idx, s as u32, k,
+                                );
+                                break;
                             }
                         }
                     }
