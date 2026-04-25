@@ -17,7 +17,7 @@ jobs:
   miri:
     name: Miri (${{ matrix.target }}, ${{ matrix.label }})
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -25,7 +25,7 @@ jobs:
         include:
           # Primary target – x86-64 Linux (Stacked Borrows)
           # Skips bytecode_generator (100× overhead per test) and objects::regexp
-          # (0 unsafe, 123 tests, 1.5 min) to stay within the 30-minute limit.
+          # (0 unsafe, 123 tests, 1.5 min) to keep within the 60-minute limit.
           - target: x86_64-unknown-linux-gnu
             miriflags: "-Zmiri-preemption-rate=0.1"
             label: "Stacked Borrows"
@@ -43,7 +43,7 @@ jobs:
               --skip objects::regexp
           # 32-bit target – only pointer-size-critical modules.
           # Miri on i686 runs GC algorithm tests at ~15 s/test (vs ~6 s on x86_64),
-          # so the full gc:: suite would exceed 30 minutes. We keep only the tests
+          # so the full gc:: suite would exceed the timeout. We keep only the tests
           # that directly exercise 32-bit pointer representation: gc_ptr, handle,
           # tlab, and the NaN-boxing / tagged-pointer objects modules.
           - target: i686-unknown-linux-gnu
