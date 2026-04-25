@@ -4961,12 +4961,20 @@ impl Interpreter {
                                                         } else {
                                                             break 'fuse0;
                                                         }
-                                                        // Tight loop
+                                                        // Tight loop detection.
+                                                        // Layout A: ...IncStar -> Test+Jump (test at bottom)
+                                                        // Layout B: ...IncStar -> JumpLoop -> header (test at top)
                                                         if pc < frame.loop_end_pc {
                                                             let i5 = unsafe {
                                                                 instructions.get_unchecked(pc)
                                                             };
-                                                            let fused_test = match i5.opcode {
+
+                                                            // Try to extract (is_leq, limit_val, exit_pc)
+                                                            let fused_test: Option<(
+                                                                bool,
+                                                                i32,
+                                                                usize,
+                                                            )> = match i5.opcode {
                                                                 Opcode::TestLessThanJump => {
                                                                     let flag = unsafe {
                                                                         match *i5
@@ -4977,7 +4985,15 @@ impl Interpreter {
                                                                         }
                                                                     };
                                                                     if flag == 1 {
-                                                                        Some((false, 1usize))
+                                                                        let lr = unsafe {
+                                                                            operand_reg_unchecked(
+                                                                                i5, 0,
+                                                                            )
+                                                                        };
+                                                                        let lv = unsafe {
+                                                                            frame.read_reg_num_hot_unchecked(lr)
+                                                                        };
+                                                                        Some((false, lv, pc + 1))
                                                                     } else {
                                                                         None
                                                                     }
@@ -4992,7 +5008,15 @@ impl Interpreter {
                                                                         }
                                                                     };
                                                                     if flag == 1 {
-                                                                        Some((true, 1usize))
+                                                                        let lr = unsafe {
+                                                                            operand_reg_unchecked(
+                                                                                i5, 0,
+                                                                            )
+                                                                        };
+                                                                        let lv = unsafe {
+                                                                            frame.read_reg_num_hot_unchecked(lr)
+                                                                        };
+                                                                        Some((true, lv, pc + 1))
                                                                     } else {
                                                                         None
                                                                     }
@@ -5007,23 +5031,98 @@ impl Interpreter {
                                                                             .get_unchecked(pc + 1)
                                                                     };
                                                                     if i6.opcode == Opcode::JumpIfTrue || i6.opcode == Opcode::JumpIfToBooleanTrue {
-                                                                            Some((i5.opcode == Opcode::TestLessThanOrEqual, 2usize))
-                                                                        } else { None }
+                                                                        let lr = unsafe { operand_reg_unchecked(i5, 0) };
+                                                                        let lv = unsafe { frame.read_reg_num_hot_unchecked(lr) };
+                                                                        Some((i5.opcode == Opcode::TestLessThanOrEqual, lv, pc + 2))
+                                                                    } else { None }
+                                                                }
+                                                                // Layout B: JumpLoop -> test at loop header
+                                                                Opcode::JumpLoop => 'jl: {
+                                                                    let header = unsafe {
+                                                                        resolve_jump_unchecked(
+                                                                            pc + 1,
+                                                                            jump_targets,
+                                                                        )
+                                                                    };
+                                                                    if header + 3
+                                                                        > instructions.len()
+                                                                    {
+                                                                        break 'jl None;
+                                                                    }
+                                                                    let h0 = unsafe {
+                                                                        instructions
+                                                                            .get_unchecked(header)
+                                                                    };
+                                                                    let (limit_imm, test_idx) =
+                                                                        if h0.opcode
+                                                                            == Opcode::LdaSmiStar
+                                                                        {
+                                                                            (
+                                                                                unsafe {
+                                                                                    operand_imm_unchecked(h0, 0)
+                                                                                },
+                                                                                header + 2,
+                                                                            )
+                                                                        } else if h0.opcode
+                                                                            == Opcode::LdaSmi
+                                                                        {
+                                                                            if header + 4
+                                                                                > instructions.len()
+                                                                            {
+                                                                                break 'jl None;
+                                                                            }
+                                                                            (
+                                                                                unsafe {
+                                                                                    operand_imm_unchecked(h0, 0)
+                                                                                },
+                                                                                header + 3,
+                                                                            )
+                                                                        } else {
+                                                                            break 'jl None;
+                                                                        };
+                                                                    if test_idx
+                                                                        >= instructions.len()
+                                                                    {
+                                                                        break 'jl None;
+                                                                    }
+                                                                    let ht = unsafe {
+                                                                        instructions
+                                                                            .get_unchecked(test_idx)
+                                                                    };
+                                                                    match ht.opcode {
+                                                                        Opcode::TestLessThanJump => {
+                                                                            let flag = unsafe { match *ht.operand_unchecked(3) { Operand::Flag(f) => f, _ => u8::MAX } };
+                                                                            // flag=0: jump-if-false -> exit loop when condition false
+                                                                            if flag == 0 { Some((false, limit_imm, pc + 1)) } else { None }
+                                                                        }
+                                                                        Opcode::TestLessThanOrEqualJump => {
+                                                                            let flag = unsafe { match *ht.operand_unchecked(3) { Operand::Flag(f) => f, _ => u8::MAX } };
+                                                                            if flag == 0 { Some((true, limit_imm, pc + 1)) } else { None }
+                                                                        }
+                                                                        Opcode::TestLessThan if test_idx + 1 < instructions.len() => {
+                                                                            let hn = unsafe { instructions.get_unchecked(test_idx + 1) };
+                                                                            if hn.opcode == Opcode::JumpIfFalse || hn.opcode == Opcode::JumpIfToBooleanFalse {
+                                                                                Some((false, limit_imm, pc + 1))
+                                                                            } else { None }
+                                                                        }
+                                                                        Opcode::TestLessThanOrEqual if test_idx + 1 < instructions.len() => {
+                                                                            let hn = unsafe { instructions.get_unchecked(test_idx + 1) };
+                                                                            if hn.opcode == Opcode::JumpIfFalse || hn.opcode == Opcode::JumpIfToBooleanFalse {
+                                                                                Some((true, limit_imm, pc + 1))
+                                                                            } else { None }
+                                                                        }
+                                                                        _ => None,
+                                                                    }
                                                                 }
                                                                 _ => None,
                                                             };
-                                                            if let Some((is_leq, pc_advance)) =
-                                                                fused_test
+
+                                                            if let Some((
+                                                                is_leq,
+                                                                limit_val,
+                                                                exit_pc,
+                                                            )) = fused_test
                                                             {
-                                                                let limit_reg = unsafe {
-                                                                    operand_reg_unchecked(i5, 0)
-                                                                };
-                                                                let limit_val = unsafe {
-                                                                    frame
-                                                                        .read_reg_num_hot_unchecked(
-                                                                            limit_reg,
-                                                                        )
-                                                                };
                                                                 let cond = if is_leq {
                                                                     sa <= limit_val
                                                                 } else {
@@ -5065,7 +5164,7 @@ impl Interpreter {
                                                                         }
                                                                         break;
                                                                     }
-                                                                    pc += pc_advance;
+                                                                    pc = exit_pc;
                                                                     sa = 0;
                                                                     smi_acc_spilled = false;
                                                                     smi_acc_bool = true;
@@ -6697,76 +6796,90 @@ impl Interpreter {
                                                                 break 'fuse;
                                                             }
 
-                                                            // Check for test+jump pattern to form
-                                                            // a zero-dispatch tight loop. Handles
-                                                            // both separate (TestLessThan+JumpIfTrue)
-                                                            // and fused (TestLessThanJump) opcodes.
+                                                            // Tight loop detection.
+                                                            // Layout A: ...IncStar -> Test+Jump (test at bottom)
+                                                            // Layout B: ...IncStar -> JumpLoop -> header (test at top)
                                                             if pc < frame.loop_end_pc {
                                                                 let i5 = unsafe {
                                                                     instructions.get_unchecked(pc)
                                                                 };
-                                                                // Determine limit register, is_leq,
-                                                                // is_true_jump, and how many PCs to
-                                                                // skip after the loop exits.
-                                                                let fused_test = match i5.opcode {
+
+                                                                let fused_test: Option<(bool, i32, usize)> =
+                                                                match i5.opcode {
                                                                     Opcode::TestLessThanJump => {
-                                                                        let flag = unsafe {
-                                                                            match *i5.operand_unchecked(3) {
-                                                                                Operand::Flag(f) => f,
-                                                                                _ => u8::MAX,
-                                                                            }
-                                                                        };
+                                                                        let flag = unsafe { match *i5.operand_unchecked(3) { Operand::Flag(f) => f, _ => u8::MAX } };
                                                                         if flag == 1 {
-                                                                            Some((false, 1usize))
-                                                                        } else {
-                                                                            None
-                                                                        }
+                                                                            let lr = unsafe { operand_reg_unchecked(i5, 0) };
+                                                                            let lv = unsafe { frame.read_reg_num_hot_unchecked(lr) };
+                                                                            Some((false, lv, pc + 1))
+                                                                        } else { None }
                                                                     }
                                                                     Opcode::TestLessThanOrEqualJump => {
-                                                                        let flag = unsafe {
-                                                                            match *i5.operand_unchecked(3) {
-                                                                                Operand::Flag(f) => f,
-                                                                                _ => u8::MAX,
-                                                                            }
-                                                                        };
+                                                                        let flag = unsafe { match *i5.operand_unchecked(3) { Operand::Flag(f) => f, _ => u8::MAX } };
                                                                         if flag == 1 {
-                                                                            Some((true, 1usize))
-                                                                        } else {
-                                                                            None
-                                                                        }
+                                                                            let lr = unsafe { operand_reg_unchecked(i5, 0) };
+                                                                            let lv = unsafe { frame.read_reg_num_hot_unchecked(lr) };
+                                                                            Some((true, lv, pc + 1))
+                                                                        } else { None }
                                                                     }
-                                                                    Opcode::TestLessThan
-                                                                    | Opcode::TestLessThanOrEqual
+                                                                    Opcode::TestLessThan | Opcode::TestLessThanOrEqual
                                                                         if pc + 1 < frame.loop_end_pc =>
                                                                     {
-                                                                        let i6 = unsafe {
-                                                                            instructions.get_unchecked(pc + 1)
-                                                                        };
-                                                                        if i6.opcode == Opcode::JumpIfTrue
-                                                                            || i6.opcode == Opcode::JumpIfToBooleanTrue
-                                                                        {
-                                                                            Some((
-                                                                                i5.opcode == Opcode::TestLessThanOrEqual,
-                                                                                2usize,
-                                                                            ))
+                                                                        let i6 = unsafe { instructions.get_unchecked(pc + 1) };
+                                                                        if i6.opcode == Opcode::JumpIfTrue || i6.opcode == Opcode::JumpIfToBooleanTrue {
+                                                                            let lr = unsafe { operand_reg_unchecked(i5, 0) };
+                                                                            let lv = unsafe { frame.read_reg_num_hot_unchecked(lr) };
+                                                                            Some((i5.opcode == Opcode::TestLessThanOrEqual, lv, pc + 2))
+                                                                        } else { None }
+                                                                    }
+                                                                    // Layout B: JumpLoop -> test at loop header
+                                                                    Opcode::JumpLoop => 'jl: {
+                                                                        let header = unsafe { resolve_jump_unchecked(pc + 1, jump_targets) };
+                                                                        if header + 3 > instructions.len() { break 'jl None; }
+                                                                        let h0 = unsafe { instructions.get_unchecked(header) };
+                                                                        let (limit_imm, test_idx) = if h0.opcode == Opcode::LdaSmiStar {
+                                                                            (unsafe { operand_imm_unchecked(h0, 0) }, header + 2)
+                                                                        } else if h0.opcode == Opcode::LdaSmi {
+                                                                            if header + 4 > instructions.len() { break 'jl None; }
+                                                                            (unsafe { operand_imm_unchecked(h0, 0) }, header + 3)
                                                                         } else {
-                                                                            None
+                                                                            break 'jl None;
+                                                                        };
+                                                                        if test_idx >= instructions.len() { break 'jl None; }
+                                                                        let ht = unsafe { instructions.get_unchecked(test_idx) };
+                                                                        match ht.opcode {
+                                                                            Opcode::TestLessThanJump => {
+                                                                                let flag = unsafe { match *ht.operand_unchecked(3) { Operand::Flag(f) => f, _ => u8::MAX } };
+                                                                                if flag == 0 { Some((false, limit_imm, pc + 1)) } else { None }
+                                                                            }
+                                                                            Opcode::TestLessThanOrEqualJump => {
+                                                                                let flag = unsafe { match *ht.operand_unchecked(3) { Operand::Flag(f) => f, _ => u8::MAX } };
+                                                                                if flag == 0 { Some((true, limit_imm, pc + 1)) } else { None }
+                                                                            }
+                                                                            Opcode::TestLessThan if test_idx + 1 < instructions.len() => {
+                                                                                let hn = unsafe { instructions.get_unchecked(test_idx + 1) };
+                                                                                if hn.opcode == Opcode::JumpIfFalse || hn.opcode == Opcode::JumpIfToBooleanFalse {
+                                                                                    Some((false, limit_imm, pc + 1))
+                                                                                } else { None }
+                                                                            }
+                                                                            Opcode::TestLessThanOrEqual if test_idx + 1 < instructions.len() => {
+                                                                                let hn = unsafe { instructions.get_unchecked(test_idx + 1) };
+                                                                                if hn.opcode == Opcode::JumpIfFalse || hn.opcode == Opcode::JumpIfToBooleanFalse {
+                                                                                    Some((true, limit_imm, pc + 1))
+                                                                                } else { None }
+                                                                            }
+                                                                            _ => None,
                                                                         }
                                                                     }
                                                                     _ => None,
                                                                 };
-                                                                if let Some((is_leq, pc_advance)) =
-                                                                    fused_test
+
+                                                                if let Some((
+                                                                    is_leq,
+                                                                    limit_val,
+                                                                    exit_pc,
+                                                                )) = fused_test
                                                                 {
-                                                                    let limit_reg = unsafe {
-                                                                        operand_reg_unchecked(i5, 0)
-                                                                    };
-                                                                    let limit_val = unsafe {
-                                                                        frame
-                                                                            .read_reg_num_hot_unchecked(
-                                                                                limit_reg,
-                                                                            )
-                                                                    };
                                                                     let cond = if is_leq {
                                                                         sa <= limit_val
                                                                     } else {
@@ -6839,7 +6952,7 @@ impl Interpreter {
                                                                     // Accumulator is
                                                                     // Boolean(false) from the test
                                                                     // that ended the loop.
-                                                                    pc += pc_advance;
+                                                                    pc = exit_pc;
                                                                     sa = 0;
                                                                     smi_acc_spilled = false;
                                                                     smi_acc_bool = true;
