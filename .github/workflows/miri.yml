@@ -34,13 +34,18 @@ jobs:
               --skip bytecode_generator
               --skip objects::regexp
           # Primary target – x86-64 Linux (Tree Borrows)
-          # Only runs gc:: because Tree Borrows validates pointer aliasing rules
-          # which are only exercised by the unsafe GC code.  objects:: and
-          # bytecode:: are pure-safe Rust so SB already covers them.
+          # Only runs the raw-pointer GC submodules because Tree Borrows validates
+          # pointer aliasing rules which only matter for the unsafe GC code.
+          # The full gc:: suite (~108 tests) times out at ~55 min under Tree
+          # Borrows (~12× SB overhead); restricting to gc_ptr/handle/tlab keeps
+          # it under 15 minutes while still covering all unsafe raw-pointer code.
           - target: x86_64-unknown-linux-gnu
             miriflags: "-Zmiri-tree-borrows -Zmiri-preemption-rate=0.1"
             label: "Tree Borrows"
-            test_filter: "gc::"
+            test_filter: >-
+              gc::gc_ptr::
+              gc::handle::
+              gc::tlab::
           # 32-bit target – only pointer-size-critical modules.
           # Miri on i686 runs GC algorithm tests at ~15 s/test (vs ~6 s on x86_64),
           # so the full gc:: suite would exceed the timeout. We keep only the tests
