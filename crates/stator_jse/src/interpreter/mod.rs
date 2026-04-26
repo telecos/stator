@@ -5606,23 +5606,59 @@ impl Interpreter {
                                                                     ) = *slot_ref
                                                                     {
                                                                         let mut counter = sa;
-                                                                        loop {
-                                                                            let next = match cached_call_op {
-                                                                                0 => call_val.checked_add(cached_call_imm),
-                                                                                1 => call_val.checked_sub(cached_call_imm),
-                                                                                2 => call_val.checked_add(1),
-                                                                                3 => call_val.checked_sub(1),
-                                                                                _ => None,
-                                                                            };
-                                                                            if let Some(cv) = next {
-                                                                                call_val = cv;
-                                                                                if let Some(nc) = counter.checked_add(add_imm) {
-                                                                                    counter = nc;
-                                                                                    let c = if is_leq { nc <= limit_val } else { nc < limit_val };
-                                                                                    if c { continue; }
+                                                                        // Specialized tight loops for
+                                                                        // common op+cmp combos — eliminates
+                                                                        // match dispatch per iteration.
+                                                                        if cached_call_op == 0
+                                                                            && !is_leq
+                                                                        {
+                                                                            let imm =
+                                                                                cached_call_imm;
+                                                                            loop {
+                                                                                if let Some(cv) = call_val.checked_add(imm) {
+                                                                                    call_val = cv;
+                                                                                    if let Some(nc) = counter.checked_add(add_imm) {
+                                                                                        counter = nc;
+                                                                                        if nc < limit_val { continue; }
+                                                                                    }
                                                                                 }
+                                                                                break;
                                                                             }
-                                                                            break;
+                                                                        } else if cached_call_op
+                                                                            == 2
+                                                                            && !is_leq
+                                                                        {
+                                                                            loop {
+                                                                                if let Some(cv) = call_val.checked_add(1) {
+                                                                                    call_val = cv;
+                                                                                    if let Some(nc) = counter.checked_add(add_imm) {
+                                                                                        counter = nc;
+                                                                                        if nc < limit_val { continue; }
+                                                                                    }
+                                                                                }
+                                                                                break;
+                                                                            }
+                                                                        } else {
+                                                                            loop {
+                                                                                let next = match cached_call_op {
+                                                                                    0 => call_val.checked_add(cached_call_imm),
+                                                                                    1 => call_val.checked_sub(cached_call_imm),
+                                                                                    2 => call_val.checked_add(1),
+                                                                                    3 => call_val.checked_sub(1),
+                                                                                    _ => None,
+                                                                                };
+                                                                                if let Some(cv) =
+                                                                                    next
+                                                                                {
+                                                                                    call_val = cv;
+                                                                                    if let Some(nc) = counter.checked_add(add_imm) {
+                                                                                        counter = nc;
+                                                                                        let c = if is_leq { nc <= limit_val } else { nc < limit_val };
+                                                                                        if c { continue; }
+                                                                                    }
+                                                                                }
+                                                                                break;
+                                                                            }
                                                                         }
                                                                         *slot_ref =
                                                                             JsValue::Smi(call_val);
@@ -7364,25 +7400,61 @@ impl Interpreter {
                                                                         ) = *slot_ref
                                                                         {
                                                                             let mut counter = sa;
-                                                                            loop {
-                                                                                let next = match cached_call_op {
-                                                                                    0 => call_val.checked_add(cached_call_imm),
-                                                                                    1 => call_val.checked_sub(cached_call_imm),
-                                                                                    2 => call_val.checked_add(1),
-                                                                                    3 => call_val.checked_sub(1),
-                                                                                    _ => None,
-                                                                                };
-                                                                                if let Some(cv) =
-                                                                                    next
-                                                                                {
-                                                                                    call_val = cv;
-                                                                                    if let Some(nc) = counter.checked_add(add_imm) {
-                                                                                        counter = nc;
-                                                                                        let c = if is_leq { nc <= limit_val } else { nc < limit_val };
-                                                                                        if c { continue; }
+                                                                            // Specialized tight loops for
+                                                                            // common op+cmp combos — eliminates
+                                                                            // match dispatch per iteration.
+                                                                            if cached_call_op == 0
+                                                                                && !is_leq
+                                                                            {
+                                                                                let imm =
+                                                                                    cached_call_imm;
+                                                                                loop {
+                                                                                    if let Some(cv) = call_val.checked_add(imm) {
+                                                                                        call_val = cv;
+                                                                                        if let Some(nc) = counter.checked_add(add_imm) {
+                                                                                            counter = nc;
+                                                                                            if nc < limit_val { continue; }
+                                                                                        }
                                                                                     }
+                                                                                    break;
                                                                                 }
-                                                                                break;
+                                                                            } else if cached_call_op
+                                                                                == 2
+                                                                                && !is_leq
+                                                                            {
+                                                                                loop {
+                                                                                    if let Some(cv) = call_val.checked_add(1) {
+                                                                                        call_val = cv;
+                                                                                        if let Some(nc) = counter.checked_add(add_imm) {
+                                                                                            counter = nc;
+                                                                                            if nc < limit_val { continue; }
+                                                                                        }
+                                                                                    }
+                                                                                    break;
+                                                                                }
+                                                                            } else {
+                                                                                loop {
+                                                                                    let next = match cached_call_op {
+                                                                                        0 => call_val.checked_add(cached_call_imm),
+                                                                                        1 => call_val.checked_sub(cached_call_imm),
+                                                                                        2 => call_val.checked_add(1),
+                                                                                        3 => call_val.checked_sub(1),
+                                                                                        _ => None,
+                                                                                    };
+                                                                                    if let Some(
+                                                                                        cv,
+                                                                                    ) = next
+                                                                                    {
+                                                                                        call_val =
+                                                                                            cv;
+                                                                                        if let Some(nc) = counter.checked_add(add_imm) {
+                                                                                            counter = nc;
+                                                                                            let c = if is_leq { nc <= limit_val } else { nc < limit_val };
+                                                                                            if c { continue; }
+                                                                                        }
+                                                                                    }
+                                                                                    break;
+                                                                                }
                                                                             }
                                                                             *slot_ref =
                                                                                 JsValue::Smi(
