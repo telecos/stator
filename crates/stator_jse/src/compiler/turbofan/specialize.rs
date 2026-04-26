@@ -1264,6 +1264,17 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
             *callee = resolve(*callee);
         }
 
+        BatchArrayPushRange {
+            receiver,
+            start,
+            end,
+            ..
+        } => {
+            *receiver = resolve(*receiver);
+            *start = resolve(*start);
+            *end = resolve(*end);
+        }
+
         Construct {
             constructor, args, ..
         }

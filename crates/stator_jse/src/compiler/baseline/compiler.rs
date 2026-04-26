@@ -9481,6 +9481,30 @@ pub(crate) mod jit_runtime {
         })
     }
 
+    /// Batch push Smi values `start..end` into an array in a single call.
+    ///
+    /// Replaces a counted `for (i=start; i<end; i++) arr.push(i)` loop
+    /// with a tight Rust loop that LLVM can optimise (vectorise, etc.).
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`receiver_i64`) – JIT i64 encoding of the receiver array.
+    /// * `RSI` (`start_i64`)    – First Smi value (inclusive).
+    /// * `RDX` (`end_i64`)      – Last Smi value (exclusive).
+    ///
+    /// Returns the new array length as `i64` in `RAX`, or [`JIT_DEOPT`].
+    #[unsafe(no_mangle)]
+    pub extern "C" fn jit_runtime_batch_push_smi_range(
+        receiver_i64: i64,
+        start_i64: i64,
+        end_i64: i64,
+    ) -> i64 {
+        batch_push_smi_range_inner(receiver_i64, start_i64, end_i64).unwrap_or_else(|| {
+            track_stub_deopt(STUB_CALL_PROP1);
+            JIT_DEOPT
+        })
+    }
+
     /// Array push that also fills the Maglev array IC on success.
     ///
     /// `ic_ptr` points to `[handle, data_ptr, len, vec_ptr]` (4 × i64)
@@ -9631,6 +9655,54 @@ pub(crate) mod jit_runtime {
                     items.reserve(1024);
                 }
                 items.push(arg0);
+                Some(items.len() as i64)
+            }
+            _ => None,
+        }
+    }
+
+    /// Batch push Smi range `start..end` into an array.
+    ///
+    /// Resolves the receiver, reserves capacity, and pushes
+    /// `JsValue::Smi(i)` for each `i` in `start..end`.
+    #[inline(always)]
+    fn batch_push_smi_range_inner(receiver_i64: i64, start_i64: i64, end_i64: i64) -> Option<i64> {
+        let start = start_i64 as i32;
+        let end = end_i64 as i32;
+        if end <= start {
+            // Nothing to push — return 0 (deopt to be safe).
+            return None;
+        }
+        let count = (end - start) as usize;
+
+        if !is_heap_handle(receiver_i64) {
+            return None;
+        }
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if !ptrs.is_cached() {
+            return None;
+        }
+        let recv_idx = (receiver_i64 - JIT_HEAP_TAG) as usize;
+        // SAFETY: cached pointers set by cache_rt_ptrs; valid for thread lifetime.
+        let heap_ref = unsafe { &*ptrs.heap };
+        // SAFETY: single-threaded JIT; no concurrent mutable borrows.
+        let heap = unsafe { &*heap_ref.as_ptr() };
+        match heap.get(recv_idx)? {
+            JsValue::Array(arr) => {
+                let vec_ptr = arr.as_ptr();
+                // Populate push cache for any subsequent per-element pushes.
+                RT_PUSH_CACHE.with(|c| {
+                    c.set(PushVecCache {
+                        receiver: receiver_i64,
+                        vec_ptr,
+                    })
+                });
+                // SAFETY: single-threaded JIT; no concurrent borrows.
+                let items = unsafe { &mut *vec_ptr };
+                items.reserve(count);
+                for i in start..end {
+                    items.push(JsValue::Smi(i));
+                }
                 Some(items.len() as i64)
             }
             _ => None,

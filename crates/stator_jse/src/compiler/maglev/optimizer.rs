@@ -1113,6 +1113,17 @@ fn visit_value_node_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
 
         ValueNode::SpeculativeCallFusion { callee, .. } => f(*callee),
 
+        ValueNode::BatchArrayPushRange {
+            receiver,
+            start,
+            end,
+            ..
+        } => {
+            f(*receiver);
+            f(*start);
+            f(*end);
+        }
+
         ValueNode::Construct {
             constructor, args, ..
         }
@@ -2860,8 +2871,215 @@ fn fuse_call_loops(graph: &mut MaglevGraph) {
         return;
     }
     for lp in &loops {
+        // Try push-loop fusion first (more specific pattern).
+        if try_fuse_push_loop(graph, lp) {
+            continue;
+        }
         try_fuse_call_loop(graph, lp);
     }
+}
+
+/// Detect a counted `for (i = start; i < end; i++) arr.push(i)` loop
+/// and replace it with a single [`ValueNode::BatchArrayPushRange`] in
+/// the preheader, then short-circuit the loop so it exits immediately.
+///
+/// Pattern recognised (Phi-based IV only):
+///
+/// ```text
+///   preheader: …
+///   header: iv_phi   = Phi(iv_init, iv_next)
+///           Branch(iv_phi < limit, body, exit)
+///   body:   CallArrayPush { receiver: R, args: [iv_phi] }
+///           iv_next  = Int32Add(iv_phi, 1)  (or similar +1 step)
+///           Jump(header)
+/// ```
+fn try_fuse_push_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
+    // ── 1. Simple loop: header + 1 body block ────────────────────────────
+    if lp.body.len() != 2 || !lp.body.contains(&lp.header) {
+        return false;
+    }
+
+    let (condition_id, body_block_idx, header_preds, header_nodes_snapshot);
+    {
+        let header = match graph.block(lp.header) {
+            Some(b) => b,
+            None => return false,
+        };
+        let (cond, body_bi, _exit) = match &header.control {
+            Some(ControlNode::Branch {
+                condition,
+                if_true,
+                if_false,
+            }) => (*condition, *if_true, *if_false),
+            _ => return false,
+        };
+        if !lp.body.contains(&body_bi) {
+            return false;
+        }
+        condition_id = cond;
+        body_block_idx = body_bi;
+        header_preds = header.predecessors.clone();
+        header_nodes_snapshot = header
+            .nodes
+            .iter()
+            .map(|(nid, node)| (*nid, node.clone()))
+            .collect::<Vec<_>>();
+    }
+
+    // Body must jump back to header.
+    {
+        let body = match graph.block(body_block_idx) {
+            Some(b) => b,
+            None => return false,
+        };
+        match &body.control {
+            Some(ControlNode::Jump { target }) if *target == lp.header => {}
+            _ => return false,
+        }
+    }
+
+    // ── 2. Find IV Phi and limit ─────────────────────────────────────────
+    let (cmp_left, cmp_right) = {
+        let mut found = None;
+        for (nid, node) in &header_nodes_snapshot {
+            if *nid == condition_id {
+                found = Some(node.clone());
+                break;
+            }
+        }
+        match found {
+            Some(ValueNode::Int32LessThan { left, right }) => (left, right),
+            _ => return false,
+        }
+    };
+
+    // cmp_left must be a Phi (IV), cmp_right must be a constant (limit).
+    let _iv_limit = match find_i32_constant(graph, cmp_right) {
+        Some(v) => v,
+        None => return false,
+    };
+
+    let iv_phi_inputs = match graph.node(cmp_left) {
+        Some(ValueNode::Phi { inputs }) if inputs.len() == 2 => inputs.clone(),
+        _ => return false,
+    };
+
+    let back_pred_pos = match header_preds.iter().position(|&p| p == body_block_idx) {
+        Some(pos) => pos,
+        None => return false,
+    };
+    let entry_pos = match header_preds.iter().position(|&p| p == lp.preheader) {
+        Some(pos) => pos,
+        None => return false,
+    };
+
+    let iv_init_id = iv_phi_inputs[entry_pos];
+    let _iv_init_val = match find_i32_constant(graph, iv_init_id) {
+        Some(v) => v,
+        None => return false,
+    };
+
+    // Check step == 1.
+    let iv_step = find_increment_step(graph, iv_phi_inputs[back_pred_pos], cmp_left);
+    if iv_step != Some(1) {
+        return false;
+    }
+
+    // ── 3. Find CallArrayPush in body whose arg is the IV ────────────────
+    let (push_node_id, receiver_id, feedback_slot);
+    {
+        let body = match graph.block(body_block_idx) {
+            Some(b) => b,
+            None => return false,
+        };
+        let mut found = None;
+        for (nid, node) in &body.nodes {
+            if let ValueNode::CallArrayPush {
+                receiver,
+                args,
+                feedback_slot: fb,
+                ..
+            } = node
+            {
+                // The single argument must be the IV phi.
+                if args.len() == 1 && args[0] == cmp_left {
+                    found = Some((*nid, *receiver, *fb));
+                    break;
+                }
+            }
+        }
+        match found {
+            Some((pn, recv, fb)) => {
+                push_node_id = pn;
+                receiver_id = recv;
+                feedback_slot = fb;
+            }
+            None => return false,
+        }
+    }
+
+    // Receiver must be loop-invariant (defined outside the loop).
+    let loop_body_set: HashSet<u32> = lp.body.iter().copied().collect();
+    let receiver_in_loop = loop_body_set.iter().any(|&bi| {
+        graph
+            .block(bi)
+            .map(|b| b.nodes.iter().any(|(nid, _)| *nid == receiver_id))
+            .unwrap_or(false)
+    });
+    if receiver_in_loop {
+        return false;
+    }
+
+    // ── 4. Insert BatchArrayPushRange in preheader ───────────────────────
+    let fusion_id = graph.alloc_node_id();
+    if let Some(pre) = graph.block_mut(lp.preheader) {
+        pre.push_with_id(
+            fusion_id,
+            ValueNode::BatchArrayPushRange {
+                receiver: receiver_id,
+                start: iv_init_id,
+                end: cmp_right,
+                feedback_slot,
+            },
+        );
+    }
+
+    // ── 5. Short-circuit the loop ────────────────────────────────────────
+    // Set the IV Phi's entry input to the limit constant so the header's
+    // `iv < limit` check is immediately false → loop body never executes.
+    {
+        let h = graph.block_mut(lp.header).unwrap();
+        for (nid, node) in &mut h.nodes {
+            if *nid == cmp_left {
+                if let ValueNode::Phi { inputs } = node
+                    && inputs.len() == 2
+                {
+                    inputs[entry_pos] = cmp_right;
+                    inputs[back_pred_pos] = *nid; // self-reference (identity)
+                }
+                break;
+            }
+        }
+    }
+
+    // If any Phi in the header has its back-edge input == push_node_id
+    // (i.e. the push result feeds into a header Phi), update it to
+    // reference the fusion result from the preheader.
+    {
+        let h = graph.block_mut(lp.header).unwrap();
+        for (nid, node) in &mut h.nodes {
+            if let ValueNode::Phi { inputs } = node
+                && inputs.len() == 2
+                && inputs[back_pred_pos] == push_node_id
+            {
+                inputs[entry_pos] = fusion_id;
+                inputs[back_pred_pos] = *nid; // identity
+                break;
+            }
+        }
+    }
+
+    true
 }
 
 fn try_fuse_call_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
@@ -4890,6 +5108,17 @@ fn collect_value_node_inputs(node: &ValueNode, live: &mut HashSet<NodeId>) {
             live.insert(*callee);
         }
 
+        ValueNode::BatchArrayPushRange {
+            receiver,
+            start,
+            end,
+            ..
+        } => {
+            live.insert(*receiver);
+            live.insert(*start);
+            live.insert(*end);
+        }
+
         ValueNode::Construct {
             constructor, args, ..
         }
@@ -4947,6 +5176,7 @@ fn has_side_effects(node: &ValueNode) -> bool {
             | ValueNode::Construct { .. }
             | ValueNode::ConstructWithSpread { .. }
             | ValueNode::SpeculativeCallFusion { .. }
+            | ValueNode::BatchArrayPushRange { .. }
             // Allocations have side-effects (GC pressure / observable identity).
             | ValueNode::CreateObjectLiteral { .. }
             | ValueNode::CreateObjectLiteralWithProperties { .. }
@@ -5041,6 +5271,7 @@ fn can_invalidate_named_stores(node: &ValueNode) -> bool {
             | ValueNode::Construct { .. }
             | ValueNode::ConstructWithSpread { .. }
             | ValueNode::SpeculativeCallFusion { .. }
+            | ValueNode::BatchArrayPushRange { .. }
             // Property deletion mutates objects.
             | ValueNode::DeleteProperty { .. }
             // For-in can invalidate caches.
@@ -5388,6 +5619,17 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
 
         ValueNode::SpeculativeCallFusion { callee, .. } => {
             *callee = resolve(*callee);
+        }
+
+        ValueNode::BatchArrayPushRange {
+            receiver,
+            start,
+            end,
+            ..
+        } => {
+            *receiver = resolve(*receiver);
+            *start = resolve(*start);
+            *end = resolve(*end);
         }
 
         ValueNode::Construct {

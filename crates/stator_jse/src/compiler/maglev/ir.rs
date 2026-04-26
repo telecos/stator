@@ -1394,6 +1394,22 @@ pub enum ValueNode {
         resolved_k: Option<i64>,
     },
 
+    /// Batch push of a Smi range `start..end` into an array.
+    ///
+    /// Replaces a counted `for (i=start; i<end; i++) arr.push(i)` loop
+    /// with a single runtime call that pushes all elements at once,
+    /// letting LLVM optimise the inner `Vec::push` loop.
+    BatchArrayPushRange {
+        /// The array receiver (heap handle).
+        receiver: NodeId,
+        /// Start of the Smi range (inclusive).
+        start: NodeId,
+        /// End of the Smi range (exclusive).
+        end: NodeId,
+        /// Feedback vector slot index for IC invalidation.
+        feedback_slot: u32,
+    },
+
     /// Call to a builtin function by ID.
     CallBuiltin {
         /// Zero-based builtin function identifier.
