@@ -756,7 +756,6 @@ impl<'a> MaglevCodegen<'a> {
                             | ValueNode::StoreFixedArrayElement { .. }
                             | ValueNode::StoreFixedDoubleArrayElement { .. }
                             | ValueNode::CallArrayPush { .. }
-                            | ValueNode::BatchArrayPushRange { .. }
                     );
                 }
                 if matches!(node, ValueNode::LoadNamedGeneric { .. }) {
@@ -2452,26 +2451,6 @@ impl<'a> MaglevCodegen<'a> {
                 );
             }
 
-            // ── Batch array push fusion ───────────────────────────────────────
-            //
-            // Replaces a counted push loop with a single runtime call:
-            //   jit_runtime_batch_push_smi_range(receiver, start, end) -> len
-            #[cfg(all(target_arch = "x86_64", unix))]
-            ValueNode::BatchArrayPushRange {
-                receiver,
-                start,
-                end,
-                ..
-            } => {
-                self.emit_stub_call_3node(
-                    id,
-                    *receiver,
-                    *start,
-                    *end,
-                    jit_runtime::jit_runtime_batch_push_smi_range as *const () as usize,
-                );
-            }
-
             // ── Object / array / closure creation ─────────────────────────────
             //
             // CreateObjectLiteral and CreateShallowObjectLiteral use a
@@ -4015,7 +3994,6 @@ impl<'a> MaglevCodegen<'a> {
                 | ValueNode::ConstructWithSpread { .. }
                 | ValueNode::CallWithSpread { .. }
                 | ValueNode::SpeculativeCallFusion { .. }
-                | ValueNode::BatchArrayPushRange { .. }
         )
     }
 
@@ -8437,16 +8415,6 @@ impl<'a> MaglevCodegen<'a> {
             }
             ValueNode::SpeculativeCallFusion { callee, .. } => {
                 out.insert(*callee);
-            }
-            ValueNode::BatchArrayPushRange {
-                receiver,
-                start,
-                end,
-                ..
-            } => {
-                out.insert(*receiver);
-                out.insert(*start);
-                out.insert(*end);
             }
             ValueNode::CallBuiltin { args, .. } | ValueNode::CallRuntime { args, .. } => {
                 for a in args {

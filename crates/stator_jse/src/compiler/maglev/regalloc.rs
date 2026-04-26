@@ -664,17 +664,6 @@ fn collect_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
             f(*callee);
         }
 
-        ValueNode::BatchArrayPushRange {
-            receiver,
-            start,
-            end,
-            ..
-        } => {
-            f(*receiver);
-            f(*start);
-            f(*end);
-        }
-
         ValueNode::CallBuiltin { args, .. } | ValueNode::CallRuntime { args, .. } => {
             for &a in args {
                 f(a);
