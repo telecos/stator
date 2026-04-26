@@ -6902,44 +6902,70 @@ impl<'a> MaglevCodegen<'a> {
 
         // ── Write element at data_ptr + len * 24 ────────────────────
         // R10 = len (index to write at), R11 = vec_ptr, RAX = Smi value.
-        // Save value on stack — we need all 3 scratch regs for address
-        // computation.
-        self.masm.push(Reg64::Rax);
-
-        // RAX = data_ptr (fresh from Vec struct).
-        self.masm
-            .mov_load_base_disp32(Reg64::Rax, Reg64::R11, vec_layout.ptr_offset as i32);
-
-        // R10 = len * 24 (= len * 3 * 8).
         debug_assert_eq!(
             layout.jsvalue_size, 24,
             "inline push assumes JsValue is 24 bytes"
         );
-        self.masm.lea_scaled(Reg64::R10, Reg64::R10, Reg64::R10, 2); // R10 = len * 3
-        // SHL R10, 3  →  REX.WB C1 /4 r/m=R10(enc=2), imm8=3
-        self.masm.emit_byte(0x49);
-        self.masm.emit_byte(0xC1);
-        self.masm.emit_byte(0xE2);
-        self.masm.emit_byte(0x03);
 
-        // R10 = element address = data_ptr + len*24.
-        self.masm.add_rr(Reg64::R10, Reg64::Rax);
+        if layout.disc_offset == 0 && layout.smi_payload_offset == 4 {
+            // ── Packed qword store: combine discriminant + payload ────
+            // R11 = vec_ptr → clobber with data_ptr, reload from IC later.
+            self.masm
+                .mov_load_base_disp32(Reg64::R11, Reg64::R11, vec_layout.ptr_offset as i32);
 
-        // Restore Smi value.
-        self.masm.pop(Reg64::Rax);
+            // R10 = len * 24 (= len * 3 * 8).
+            self.masm.lea_scaled(Reg64::R10, Reg64::R10, Reg64::R10, 2);
+            // SHL R10, 3
+            self.masm.emit_byte(0x49);
+            self.masm.emit_byte(0xC1);
+            self.masm.emit_byte(0xE2);
+            self.masm.emit_byte(0x03);
 
-        // Write JsValue::Smi(value) at the element address.
-        // R10 = element addr, RAX = Smi value, R11 = vec_ptr.
-        self.masm.mov_store_byte_imm_base_disp32(
-            Reg64::R10,
-            layout.disc_offset as i32,
-            layout.smi_disc,
-        );
-        self.masm.mov_store_dword_base_disp32(
-            Reg64::R10,
-            layout.smi_payload_offset as i32,
-            Reg64::Rax,
-        );
+            // R10 = element address = data_ptr + len*24.
+            self.masm.add_rr(Reg64::R10, Reg64::R11);
+
+            // Pack disc + payload: RAX = (value << 32) | smi_disc.
+            // Byte layout: [disc, 0, 0, 0, payload_b0..b3].
+            // SHL RAX, 32  →  REX.W C1 /4 RAX(0), imm8=32
+            self.masm.emit_byte(0x48);
+            self.masm.emit_byte(0xC1);
+            self.masm.emit_byte(0xE0);
+            self.masm.emit_byte(0x20);
+            // OR RAX, smi_disc  →  REX.W 83 /1 RAX(0), imm8
+            self.masm.emit_byte(0x48);
+            self.masm.emit_byte(0x83);
+            self.masm.emit_byte(0xC8);
+            self.masm.emit_byte(layout.smi_disc);
+            // Single 8-byte store writes disc + padding + payload.
+            self.masm.mov_store_base_disp32(Reg64::R10, 0, Reg64::Rax);
+
+            // Reload vec_ptr from IC (L1 hit — always on stack frame).
+            self.masm
+                .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_vec_ptr);
+        } else {
+            // ── Fallback: separate byte + dword stores ───────────────
+            self.masm.push(Reg64::Rax);
+            self.masm
+                .mov_load_base_disp32(Reg64::Rax, Reg64::R11, vec_layout.ptr_offset as i32);
+            self.masm.lea_scaled(Reg64::R10, Reg64::R10, Reg64::R10, 2);
+            // SHL R10, 3
+            self.masm.emit_byte(0x49);
+            self.masm.emit_byte(0xC1);
+            self.masm.emit_byte(0xE2);
+            self.masm.emit_byte(0x03);
+            self.masm.add_rr(Reg64::R10, Reg64::Rax);
+            self.masm.pop(Reg64::Rax);
+            self.masm.mov_store_byte_imm_base_disp32(
+                Reg64::R10,
+                layout.disc_offset as i32,
+                layout.smi_disc,
+            );
+            self.masm.mov_store_dword_base_disp32(
+                Reg64::R10,
+                layout.smi_payload_offset as i32,
+                Reg64::Rax,
+            );
+        }
 
         // ── Increment Vec::len ──────────────────────────────────────
         // R11 still holds vec_ptr (only RAX and R10 were repurposed).
