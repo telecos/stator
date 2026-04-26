@@ -1275,6 +1275,18 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
             *end = resolve(*end);
         }
 
+        BatchSumSmiArray {
+            object,
+            start,
+            end,
+            acc_init,
+        } => {
+            *object = resolve(*object);
+            *start = resolve(*start);
+            *end = resolve(*end);
+            *acc_init = resolve(*acc_init);
+        }
+
         Construct {
             constructor, args, ..
         }

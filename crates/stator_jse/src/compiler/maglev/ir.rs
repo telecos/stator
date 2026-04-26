@@ -1410,6 +1410,22 @@ pub enum ValueNode {
         feedback_slot: u32,
     },
 
+    /// Batch sum of Smi elements in an array slice `[start..end)`.
+    ///
+    /// Replaces a counted `for (i=start; i<end; i++) sum += arr[i]`
+    /// loop with a single runtime call that sums all elements at once.
+    /// Deoptimises if any element is not a Smi or if the sum overflows i32.
+    BatchSumSmiArray {
+        /// The array receiver (heap handle).
+        object: NodeId,
+        /// Start index (inclusive).
+        start: NodeId,
+        /// End index (exclusive, typically arr.length).
+        end: NodeId,
+        /// Initial accumulator value.
+        acc_init: NodeId,
+    },
+
     /// Call to a builtin function by ID.
     CallBuiltin {
         /// Zero-based builtin function identifier.
