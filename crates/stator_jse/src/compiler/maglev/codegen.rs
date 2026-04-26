@@ -8737,6 +8737,9 @@ impl<'a> MaglevCodegen<'a> {
                         ValueNode::LoadNamedGeneric { .. }
                             | ValueNode::LoadGlobal { .. }
                             | ValueNode::LoadKeyedGeneric { .. }
+                            | ValueNode::LoadFixedArrayElement { .. }
+                            | ValueNode::LoadFixedDoubleArrayElement { .. }
+                            | ValueNode::LoadHoleyFixedDoubleArrayElement { .. }
                     );
                     if !is_load {
                         continue;
