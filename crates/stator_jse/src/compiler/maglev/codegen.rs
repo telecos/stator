@@ -2485,19 +2485,17 @@ impl<'a> MaglevCodegen<'a> {
                 acc_init,
             } => {
                 let saved = self.emit_save_live_regs(id);
-                // Load all node args into scratch regs first to avoid
-                // ABI-register clobbering.
+                // Load all 4 node args into scratch/non-arg registers first
+                // to avoid clobbering when a value lives in an arg register.
+                // R11, R10, RAX are scratch; RDI is arg0 but loaded last.
                 self.emit_load(*object, Reg64::R11);
                 self.emit_load(*start, Reg64::R10);
                 self.emit_load(*end, Reg64::Rax);
-                // acc_init goes to RCX (4th SysV arg).
-                // Save RAX (end) to stack temporarily since we need RCX.
-                self.masm.push_r(Reg64::Rax);
-                self.emit_load(*acc_init, Reg64::Rcx);
-                self.masm.pop_r(Reg64::Rdx); // end
-                self.masm.mov_rr(Reg64::Rdi, Reg64::R11); // object
-                self.masm.mov_rr(Reg64::Rsi, Reg64::R10); // start
-                // RDX = end (from pop), RCX = acc_init (from emit_load)
+                self.emit_load(*acc_init, Reg64::Rcx); // RCX = arg3 (SysV)
+                self.masm.mov_rr(Reg64::Rdi, Reg64::R11); // arg0 = object
+                self.masm.mov_rr(Reg64::Rsi, Reg64::R10); // arg1 = start
+                self.masm.mov_rr(Reg64::Rdx, Reg64::Rax); // arg2 = end
+                // RCX already holds acc_init (arg3)
                 let addr =
                     jit_runtime::jit_runtime_batch_sum_smi_array as *const () as usize as i64;
                 self.masm.mov_ri(Reg64::R11, addr);
