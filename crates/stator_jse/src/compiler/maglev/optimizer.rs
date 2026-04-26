@@ -2997,6 +2997,61 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
         return false;
     }
 
+    // The limit (cmp_right) must be available in the preheader.
+    // If it's defined outside the loop, use it directly.  If it's a
+    // LoadNamedGeneric("length") inside the loop on an invariant object,
+    // hoist a copy into the preheader (safe because the loop body only
+    // reads the array, never modifies it).
+    let loop_body_set: HashSet<u32> = lp.body.iter().copied().collect();
+    let limit_in_loop = loop_body_set.iter().any(|&bi| {
+        graph
+            .block(bi)
+            .map(|b| b.nodes.iter().any(|(nid, _)| *nid == cmp_right))
+            .unwrap_or(false)
+    });
+    let effective_limit = if limit_in_loop {
+        // Try to hoist: must be LoadNamedGeneric on an invariant object.
+        // This is safe because the loop body only performs keyed reads
+        // and arithmetic — no stores that could alter the property.
+        match graph.node(cmp_right) {
+            Some(ValueNode::LoadNamedGeneric {
+                object,
+                name,
+                feedback_slot,
+            }) => {
+                let obj = *object;
+                let fb = *feedback_slot;
+                let nm = *name;
+                // Object must be defined outside the loop.
+                let obj_in_loop = loop_body_set.iter().any(|&bi| {
+                    graph
+                        .block(bi)
+                        .map(|b| b.nodes.iter().any(|(nid, _)| *nid == obj))
+                        .unwrap_or(false)
+                });
+                if obj_in_loop {
+                    return false;
+                }
+                // Clone the length load into the preheader.
+                let hoisted_id = graph.alloc_node_id();
+                if let Some(pre) = graph.block_mut(lp.preheader) {
+                    pre.push_with_id(
+                        hoisted_id,
+                        ValueNode::LoadNamedGeneric {
+                            object: obj,
+                            name: nm,
+                            feedback_slot: fb,
+                        },
+                    );
+                }
+                hoisted_id
+            }
+            _ => return false,
+        }
+    } else {
+        cmp_right
+    };
+
     // ── 3. Find accumulator Phi whose back-edge is Add(acc, LoadKeyed) ───
     let (acc_phi_id, acc_init_id, load_object_id);
     {
@@ -3047,7 +3102,6 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
     }
 
     // The load object must be loop-invariant.
-    let loop_body_set: HashSet<u32> = lp.body.iter().copied().collect();
     let object_in_loop = loop_body_set.iter().any(|&bi| {
         graph
             .block(bi)
@@ -3066,7 +3120,7 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
             ValueNode::BatchSumSmiArray {
                 object: load_object_id,
                 start: iv_init_id,
-                end: cmp_right,
+                end: effective_limit,
                 acc_init: acc_init_id,
             },
         );
@@ -3081,7 +3135,7 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
                 if let ValueNode::Phi { inputs } = node
                     && inputs.len() == 2
                 {
-                    inputs[entry_pos] = cmp_right;
+                    inputs[entry_pos] = effective_limit;
                     inputs[back_pred_pos] = *nid;
                 }
                 break;
