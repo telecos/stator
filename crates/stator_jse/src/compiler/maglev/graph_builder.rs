@@ -1615,12 +1615,37 @@ impl<'a> GraphBuilder<'a> {
                 #[cfg(all(target_arch = "x86_64", unix))]
                 if let Some(ConstantPoolEntry::Function(callee_ba)) =
                     self.bytecode.constant_pool().get(func_idx as usize)
-                    && let Some((s, k)) =
+                {
+                    if let Some((s, k)) =
                         crate::compiler::baseline::compiler::jit_runtime::analyze_fusion_pattern(
                             callee_ba.bytecodes(),
                         )
-                {
-                    self.graph.set_closure_fusion_pattern(func_idx, s as u32, k);
+                    {
+                        self.graph.set_closure_fusion_pattern(func_idx, s as u32, k);
+                    } else {
+                        // Transitive: if the function itself doesn't match
+                        // but it's a factory that returns an inner closure
+                        // matching the pattern, record the inner pattern
+                        // as a "factory fusion pattern".  This handles:
+                        //   function make_counter() {
+                        //       var count = 0;
+                        //       return function() { count += 1; return count; };
+                        //   }
+                        //   for (...) counter();  // counter = make_counter()
+                        for entry in callee_ba.constant_pool() {
+                            if let ConstantPoolEntry::Function(inner_ba) = entry
+                                && let Some((s, k)) =
+                                    crate::compiler::baseline::compiler::jit_runtime::analyze_fusion_pattern(
+                                        inner_ba.bytecodes(),
+                                    )
+                            {
+                                self.graph.set_factory_fusion_pattern(
+                                    func_idx, s as u32, k,
+                                );
+                                break;
+                            }
+                        }
+                    }
                 }
 
                 let id = self.emit(ValueNode::CreateClosure {

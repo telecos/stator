@@ -1942,6 +1942,19 @@ pub struct MaglevGraph {
     /// creating [`ValueNode::SpeculativeCallFusion`] nodes to embed the
     /// pattern constants directly in the IR.
     closure_fusion_patterns: std::collections::HashMap<u32, (u32, i64)>,
+
+    /// Pre-analysed fusion patterns for *factory* functions — functions that
+    /// return a closure matching the fusion pattern.
+    ///
+    /// When the optimizer detects a loop like:
+    /// ```text
+    /// var counter = make_counter();
+    /// for (...) counter();
+    /// ```
+    /// and `make_counter` (at CP index K) doesn't match the fusion pattern
+    /// itself but returns an inner closure that does, this map stores the
+    /// inner closure's `(slot_index, k_value)` keyed by K.
+    factory_fusion_patterns: std::collections::HashMap<u32, (u32, i64)>,
 }
 
 impl MaglevGraph {
@@ -1954,6 +1967,7 @@ impl MaglevGraph {
             next_node_id: 0,
             inline_candidates: 0,
             closure_fusion_patterns: std::collections::HashMap::new(),
+            factory_fusion_patterns: std::collections::HashMap::new(),
         }
     }
 
@@ -2078,6 +2092,17 @@ impl MaglevGraph {
     /// whose `shared_function_info` lives at constant-pool index `cp_idx`.
     pub fn set_closure_fusion_pattern(&mut self, cp_idx: u32, slot: u32, k: i64) {
         self.closure_fusion_patterns.insert(cp_idx, (slot, k));
+    }
+
+    /// Return the pre-analysed factory fusion patterns.
+    pub fn factory_fusion_patterns(&self) -> &std::collections::HashMap<u32, (u32, i64)> {
+        &self.factory_fusion_patterns
+    }
+
+    /// Record a factory fusion pattern: calling the function at `cp_idx`
+    /// returns a closure whose body matches `(slot, k)`.
+    pub fn set_factory_fusion_pattern(&mut self, cp_idx: u32, slot: u32, k: i64) {
+        self.factory_fusion_patterns.insert(cp_idx, (slot, k));
     }
 
     /// Look up a [`ValueNode`] by its [`NodeId`].

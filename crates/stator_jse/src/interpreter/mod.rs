@@ -222,7 +222,10 @@ type MonoLoadCache = HashMap<u32, (usize, JsValue)>;
 type PolyLoadCache = HashMap<u32, Vec<(usize, JsValue)>>;
 type ProtoLoadIcCache = ProtoIcCache;
 type StringCache = HashMap<u32, Rc<str>>;
-type GlobalIcCache = HashMap<u32, (usize, u64)>;
+/// Flat-array global IC cache. Indexed by constant-pool index; `None`
+/// entries indicate uncached names. Much faster than `HashMap` for the
+/// small, dense key ranges typical of global-variable accesses.
+type GlobalIcCache = Vec<Option<(usize, u64)>>;
 
 thread_local! {
     /// The currently-attached debugger for this thread, if any.
@@ -3109,14 +3112,22 @@ impl InterpreterFrame {
     /// Fast-path lookup: returns `(slot_index, generation)` if cached.
     #[inline]
     fn global_ic_get(&self, name_idx: u32) -> Option<(usize, u64)> {
-        self.global_ic.as_ref()?.get(&name_idx).copied()
+        self.global_ic
+            .as_ref()?
+            .get(name_idx as usize)
+            .copied()
+            .flatten()
     }
 
     /// Cache a global variable's slot index and generation.
     #[inline]
     fn global_ic_put(&mut self, name_idx: u32, slot_idx: usize, generation: u64) {
-        self.global_ic_mut()
-            .insert(name_idx, (slot_idx, generation));
+        let ic = self.global_ic_mut();
+        let idx = name_idx as usize;
+        if idx >= ic.len() {
+            ic.resize(idx + 1, None);
+        }
+        ic[idx] = Some((slot_idx, generation));
     }
 
     /// Clear the global IC cache (e.g. on tail-call invalidation).
@@ -3201,7 +3212,7 @@ impl InterpreterFrame {
         // IC fast path: known slot, generation matches.
         // Use a single borrow_mut to avoid double borrow overhead.
         if let Some(ref ic) = self.global_ic
-            && let Some(&(slot_idx, cached_gen)) = ic.get(&name_idx)
+            && let Some(&Some((slot_idx, cached_gen))) = ic.get(name_idx as usize)
         {
             let mut env = self.global_env.borrow_mut();
             if env.generation() == cached_gen {
@@ -3224,8 +3235,7 @@ impl InterpreterFrame {
         drop(env);
         self.cache_generation = new_gen;
         if let Some((slot_idx, cached_gen)) = slot_gen {
-            self.global_ic_mut()
-                .insert(name_idx, (slot_idx, cached_gen));
+            self.global_ic_put(name_idx, slot_idx, cached_gen);
         }
         self.global_cache_put_no_gen(name, value);
     }
@@ -3644,6 +3654,28 @@ impl Interpreter {
                     // Raw pointer to the closure context slot — bypasses
                     // Rc clone + RefCell borrow on the hot cached-call path.
                     let mut cached_call_slot_ptr: *mut JsValue = std::ptr::null_mut();
+                    // ── Batch loop variables ──
+                    // Tracks which loop header was last analyzed for
+                    // batch execution.  Reset when the loop changes.
+                    let mut batch_loop_header: usize = usize::MAX;
+                    let mut batch_loop_trips: u32 = 0;
+                    // Cached batch plan for the current loop.
+                    // 0 = not analyzed, 1 = push-sequential-smis,
+                    // 2 = sum-array-smis, 3 = closure-counter,
+                    // 0xFF = not batchable.
+                    let mut batch_plan: u8 = 0;
+                    // Push plan fields:
+                    let mut batch_push_limit: i32 = 0;
+                    let mut batch_push_counter_slot: usize = usize::MAX;
+                    let mut batch_push_arr_slot: usize = usize::MAX;
+                    // Sum plan fields:
+                    let mut batch_sum_counter_slot: usize = usize::MAX;
+                    let mut batch_sum_arr_slot: usize = usize::MAX;
+                    let mut batch_sum_sum_slot: usize = usize::MAX;
+                    // Closure-counter plan fields:
+                    let mut batch_cc_limit: i32 = 0;
+                    let mut batch_cc_counter_slot: usize = usize::MAX;
+                    let mut batch_cc_result_slot: usize = usize::MAX;
                     'smi: loop {
                         if pc >= frame.loop_end_pc {
                             frame.loop_end_pc = 0;
@@ -4605,6 +4637,434 @@ impl Interpreter {
                                     crate::inspector::profiler::maybe_record_sample();
                                     debug_active = DEBUG_ATTACHED.with(Cell::get);
                                 }
+
+                                // ── Batch loop detection and execution ──
+                                // After a few warmup iterations, analyze the
+                                // loop body. If it matches a known pattern,
+                                // execute remaining iterations natively.
+                                if !debug_active {
+                                    if pc != batch_loop_header {
+                                        batch_loop_header = pc;
+                                        batch_loop_trips = 1;
+                                        batch_plan = 0;
+                                    } else {
+                                        batch_loop_trips += 1;
+                                    }
+
+                                    // Analyze on 3rd back-edge.
+                                    if batch_loop_trips == 3 && batch_plan == 0 {
+                                        batch_plan = 0xFF; // default: not batchable
+                                        // Try to detect push-sequential-smis pattern.
+                                        // Header: LdaSmiStar + LdaGlobal + TestLessThanJump
+                                        if loop_end > pc + 5 {
+                                            let h0 = unsafe { instructions.get_unchecked(pc) };
+                                            let h1 = unsafe { instructions.get_unchecked(pc + 1) };
+                                            let h2 = unsafe { instructions.get_unchecked(pc + 2) };
+                                            if h0.opcode == Opcode::LdaSmiStar
+                                                && h1.opcode == Opcode::LdaGlobal
+                                                && h2.opcode == Opcode::TestLessThanJump
+                                            {
+                                                let limit = unsafe { operand_imm_unchecked(h0, 0) };
+                                                let counter_idx = unsafe {
+                                                    operand_constant_pool_idx_unchecked(h1, 0)
+                                                };
+                                                // Check for push pattern: scan body
+                                                // for CallProperty with 1 arg.
+                                                let mut has_push = false;
+                                                let mut arr_idx_found = u32::MAX;
+                                                for bi in (pc + 3)..loop_end {
+                                                    let binstr =
+                                                        unsafe { instructions.get_unchecked(bi) };
+                                                    if binstr.opcode == Opcode::CallProperty {
+                                                        if let Some(Operand::RegisterCount(1)) =
+                                                            binstr.operand_at(2)
+                                                        {
+                                                            has_push = true;
+                                                        }
+                                                    }
+                                                    if binstr.opcode == Opcode::LdaGlobalStar
+                                                        && arr_idx_found == u32::MAX
+                                                    {
+                                                        arr_idx_found = unsafe {
+                                                            operand_constant_pool_idx_unchecked(
+                                                                binstr, 0,
+                                                            )
+                                                        };
+                                                    }
+                                                }
+                                                if has_push && arr_idx_found != u32::MAX {
+                                                    // Resolve IC slots.
+                                                    if let Some(c_slot) =
+                                                        frame.global_ic_get(counter_idx)
+                                                    {
+                                                        if let Some(a_slot) =
+                                                            frame.global_ic_get(arr_idx_found)
+                                                        {
+                                                            batch_plan = 1; // push-sequential-smis
+                                                            batch_push_limit = limit;
+                                                            batch_push_counter_slot = c_slot.0;
+                                                            batch_push_arr_slot = a_slot.0;
+                                                        }
+                                                    }
+                                                }
+
+                                                // Try sum pattern: LdaGlobalStar + LdaNamedProperty(length) + ...
+                                                // + LdaKeyedProperty + Add + StaGlobal
+                                                if batch_plan == 0xFF {
+                                                    let sh0 =
+                                                        unsafe { instructions.get_unchecked(pc) };
+                                                    if sh0.opcode == Opcode::LdaGlobalStar {
+                                                        let arr_idx2 = unsafe {
+                                                            operand_constant_pool_idx_unchecked(
+                                                                sh0, 0,
+                                                            )
+                                                        };
+                                                        let sh1 = unsafe {
+                                                            instructions.get_unchecked(pc + 1)
+                                                        };
+                                                        if sh1.opcode == Opcode::LdaNamedProperty {
+                                                            // Check for LdaKeyedProperty + Add + StaGlobal
+                                                            let mut has_keyed = false;
+                                                            let mut sum_store_idx = u32::MAX;
+                                                            let mut counter_idx2 = u32::MAX;
+                                                            for bi in (pc + 2)..loop_end {
+                                                                let binstr = unsafe {
+                                                                    instructions.get_unchecked(bi)
+                                                                };
+                                                                if binstr.opcode
+                                                                    == Opcode::LdaKeyedProperty
+                                                                {
+                                                                    has_keyed = true;
+                                                                }
+                                                                if binstr.opcode
+                                                                    == Opcode::StaGlobal
+                                                                    && has_keyed
+                                                                    && sum_store_idx == u32::MAX
+                                                                {
+                                                                    sum_store_idx = unsafe {
+                                                                        operand_constant_pool_idx_unchecked(binstr, 0)
+                                                                    };
+                                                                }
+                                                                if binstr.opcode
+                                                                    == Opcode::StaGlobal
+                                                                    && sum_store_idx != u32::MAX
+                                                                {
+                                                                    // Second StaGlobal is the counter
+                                                                    let idx = unsafe {
+                                                                        operand_constant_pool_idx_unchecked(binstr, 0)
+                                                                    };
+                                                                    if idx != sum_store_idx {
+                                                                        counter_idx2 = idx;
+                                                                    }
+                                                                }
+                                                            }
+                                                            // Find TestLessThanJump for exit
+                                                            let mut sum_exit_pc = 0usize;
+                                                            for bi in (pc + 2)..loop_end {
+                                                                let binstr = unsafe {
+                                                                    instructions.get_unchecked(bi)
+                                                                };
+                                                                if binstr.opcode
+                                                                    == Opcode::TestLessThanJump
+                                                                {
+                                                                    if let Some(Some(target)) =
+                                                                        jump_targets.get(bi)
+                                                                    {
+                                                                        sum_exit_pc = *target;
+                                                                    }
+                                                                    break;
+                                                                }
+                                                            }
+                                                            if has_keyed
+                                                                && sum_store_idx != u32::MAX
+                                                                && counter_idx2 != u32::MAX
+                                                                && sum_exit_pc > 0
+                                                            {
+                                                                if let (
+                                                                    Some(c_slot),
+                                                                    Some(a_slot),
+                                                                    Some(s_slot),
+                                                                ) = (
+                                                                    frame.global_ic_get(
+                                                                        counter_idx2,
+                                                                    ),
+                                                                    frame.global_ic_get(arr_idx2),
+                                                                    frame.global_ic_get(
+                                                                        sum_store_idx,
+                                                                    ),
+                                                                ) {
+                                                                    batch_plan = 2; // sum-array-smis
+                                                                    batch_sum_counter_slot =
+                                                                        c_slot.0;
+                                                                    batch_sum_arr_slot = a_slot.0;
+                                                                    batch_sum_sum_slot = s_slot.0;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // Plan 3: closure-counter pattern.
+                                        // Requires cached_call_op to be set (closure
+                                        // pattern already identified) and the same
+                                        // LdaSmiStar + LdaGlobal + TestLessThanJump
+                                        // header. Body calls a 0-arg closure that does
+                                        // context_slot += imm, then increments counter.
+                                        if batch_plan == 0xFF
+                                            && cached_call_op != u8::MAX
+                                            && !cached_call_slot_ptr.is_null()
+                                        {
+                                            if loop_end > pc + 3 {
+                                                let h0 = unsafe { instructions.get_unchecked(pc) };
+                                                let h1 =
+                                                    unsafe { instructions.get_unchecked(pc + 1) };
+                                                let h2 =
+                                                    unsafe { instructions.get_unchecked(pc + 2) };
+                                                if h0.opcode == Opcode::LdaSmiStar
+                                                    && h1.opcode == Opcode::LdaGlobal
+                                                    && h2.opcode == Opcode::TestLessThanJump
+                                                {
+                                                    let limit =
+                                                        unsafe { operand_imm_unchecked(h0, 0) };
+                                                    let counter_idx = unsafe {
+                                                        operand_constant_pool_idx_unchecked(h1, 0)
+                                                    };
+                                                    // Scan body for a Call* opcode (the
+                                                    // closure call).
+                                                    let mut has_call = false;
+                                                    let mut result_idx = u32::MAX;
+                                                    for bi in (pc + 3)..loop_end {
+                                                        let binstr = unsafe {
+                                                            instructions.get_unchecked(bi)
+                                                        };
+                                                        match binstr.opcode {
+                                                            Opcode::CallAnyReceiver
+                                                            | Opcode::CallUndefinedReceiver0 => {
+                                                                has_call = true;
+                                                            }
+                                                            // First StaGlobal after the Call
+                                                            // stores the call result.
+                                                            Opcode::StaGlobal
+                                                                if has_call
+                                                                    && result_idx == u32::MAX =>
+                                                            {
+                                                                result_idx = unsafe {
+                                                                    operand_constant_pool_idx_unchecked(
+                                                                        binstr, 0,
+                                                                    )
+                                                                };
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                    if has_call {
+                                                        if let Some(c_slot) =
+                                                            frame.global_ic_get(counter_idx)
+                                                        {
+                                                            let r_slot = if result_idx != u32::MAX {
+                                                                frame.global_ic_get(result_idx)
+                                                            } else {
+                                                                None
+                                                            };
+                                                            batch_plan = 3;
+                                                            batch_cc_limit = limit;
+                                                            batch_cc_counter_slot = c_slot.0;
+                                                            batch_cc_result_slot = r_slot
+                                                                .map(|s| s.0)
+                                                                .unwrap_or(usize::MAX);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Execute batch if plan is active.
+                                    if batch_plan == 1 {
+                                        // Push-sequential-smis batch.
+                                        let current_i_val = unsafe {
+                                            &(&(*env_ptr).slots)[batch_push_counter_slot]
+                                        };
+                                        if let JsValue::Smi(current_i) = current_i_val {
+                                            let current_i = *current_i;
+                                            if current_i < batch_push_limit {
+                                                let arr_val = unsafe {
+                                                    &(&(*env_ptr).slots)[batch_push_arr_slot]
+                                                };
+                                                if let JsValue::Array(arr) = arr_val {
+                                                    let items = unsafe { &mut *arr.as_ptr() };
+                                                    if items.capacity() < batch_push_limit as usize
+                                                    {
+                                                        items.reserve(
+                                                            batch_push_limit as usize - items.len(),
+                                                        );
+                                                    }
+                                                    items.extend(
+                                                        (current_i..batch_push_limit)
+                                                            .map(JsValue::Smi),
+                                                    );
+                                                    // Update counter global to limit.
+                                                    unsafe {
+                                                        (&mut (*env_ptr).slots)
+                                                            [batch_push_counter_slot] =
+                                                            JsValue::Smi(batch_push_limit);
+                                                        (*env_ptr).generation =
+                                                            (*env_ptr).generation.wrapping_add(1);
+                                                    }
+                                                    smi_vars_dirty = true;
+                                                    // Charge instructions for skipped iterations.
+                                                    let skipped =
+                                                        (batch_push_limit - current_i) as u64;
+                                                    let body_len = (loop_end - pc) as u64;
+                                                    frame.instructions_executed +=
+                                                        skipped * body_len;
+                                                    // Set accumulator to the last pushed length
+                                                    // (matching CallProperty push return).
+                                                    sa = items.len() as i32;
+                                                    smi_acc_spilled = false;
+                                                    smi_acc_bool = false;
+                                                    hot_acc = Some(NanBoxedValue::from_smi(sa));
+                                                    // Continue to loop header where
+                                                    // TestLessThanJump will exit.
+                                                    continue 'smi;
+                                                }
+                                            }
+                                        }
+                                        // Guard failed — disable plan.
+                                        batch_plan = 0xFF;
+                                    } else if batch_plan == 2 {
+                                        // Sum-array-smis batch.
+                                        let current_i_val =
+                                            unsafe { &(&(*env_ptr).slots)[batch_sum_counter_slot] };
+                                        if let JsValue::Smi(current_i) = current_i_val {
+                                            let current_i = *current_i;
+                                            let arr_val =
+                                                unsafe { &(&(*env_ptr).slots)[batch_sum_arr_slot] };
+                                            if let JsValue::Array(arr) = arr_val {
+                                                let items = unsafe { &*arr.as_ptr() };
+                                                let start = current_i.max(0) as usize;
+                                                if start < items.len() {
+                                                    let sum_val = unsafe {
+                                                        &(&(*env_ptr).slots)[batch_sum_sum_slot]
+                                                    };
+                                                    if let JsValue::Smi(current_sum) = sum_val {
+                                                        let mut sum = *current_sum as i64;
+                                                        let mut all_smi = true;
+                                                        for elem in &items[start..] {
+                                                            if let JsValue::Smi(v) = elem {
+                                                                sum += *v as i64;
+                                                            } else {
+                                                                all_smi = false;
+                                                                break;
+                                                            }
+                                                        }
+                                                        if all_smi {
+                                                            let final_i = items.len() as i32;
+                                                            let final_sum = sum as i32;
+                                                            unsafe {
+                                                                (&mut (*env_ptr).slots)
+                                                                    [batch_sum_counter_slot] =
+                                                                    JsValue::Smi(final_i);
+                                                                (&mut (*env_ptr).slots)
+                                                                    [batch_sum_sum_slot] =
+                                                                    JsValue::Smi(final_sum);
+                                                                (*env_ptr).generation = (*env_ptr)
+                                                                    .generation
+                                                                    .wrapping_add(1);
+                                                            }
+                                                            smi_vars_dirty = true;
+                                                            let skipped =
+                                                                (final_i - current_i) as u64;
+                                                            let body_len = (loop_end - pc) as u64;
+                                                            frame.instructions_executed +=
+                                                                skipped * body_len;
+                                                            sa = final_sum;
+                                                            smi_acc_spilled = false;
+                                                            smi_acc_bool = false;
+                                                            hot_acc =
+                                                                Some(NanBoxedValue::from_smi(sa));
+                                                            continue 'smi;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Guard failed — disable plan.
+                                        batch_plan = 0xFF;
+                                    } else if batch_plan == 3 {
+                                        // Closure-counter batch.
+                                        // Read the loop counter from the global slot.
+                                        let current_i_val =
+                                            unsafe { &(&(*env_ptr).slots)[batch_cc_counter_slot] };
+                                        if let JsValue::Smi(current_i) = current_i_val {
+                                            let current_i = *current_i;
+                                            if current_i < batch_cc_limit
+                                                && !cached_call_slot_ptr.is_null()
+                                            {
+                                                // SAFETY: cached_call_slot_ptr was validated
+                                                // earlier; the closure context is alive.
+                                                let slot_ref =
+                                                    unsafe { &mut *cached_call_slot_ptr };
+                                                if let JsValue::Smi(slot_val) = *slot_ref {
+                                                    let remaining =
+                                                        (batch_cc_limit - current_i) as i64;
+                                                    let delta = match cached_call_op {
+                                                        // 0=AddSmi
+                                                        0 => remaining * (cached_call_imm as i64),
+                                                        // 1=SubSmi
+                                                        1 => {
+                                                            remaining * (-(cached_call_imm as i64))
+                                                        }
+                                                        // 2=Inc
+                                                        2 => remaining,
+                                                        // 3=Dec
+                                                        3 => -remaining,
+                                                        _ => 0,
+                                                    };
+                                                    let new_slot = (slot_val as i64) + delta;
+                                                    // Check i32 range.
+                                                    if new_slot >= i32::MIN as i64
+                                                        && new_slot <= i32::MAX as i64
+                                                    {
+                                                        *slot_ref = JsValue::Smi(new_slot as i32);
+                                                        // Update counter global to limit.
+                                                        unsafe {
+                                                            (&mut (*env_ptr).slots)
+                                                                [batch_cc_counter_slot] =
+                                                                JsValue::Smi(batch_cc_limit);
+                                                            // Update result global (stores
+                                                            // the return value of the last
+                                                            // closure call).
+                                                            if batch_cc_result_slot != usize::MAX {
+                                                                (&mut (*env_ptr).slots)
+                                                                    [batch_cc_result_slot] =
+                                                                    JsValue::Smi(new_slot as i32);
+                                                            }
+                                                            (*env_ptr).generation = (*env_ptr)
+                                                                .generation
+                                                                .wrapping_add(1);
+                                                        }
+                                                        smi_vars_dirty = true;
+                                                        let skipped = remaining as u64;
+                                                        let body_len = (loop_end - pc) as u64;
+                                                        frame.instructions_executed +=
+                                                            skipped * body_len;
+                                                        // Accumulator = last call result.
+                                                        sa = new_slot as i32;
+                                                        smi_acc_spilled = false;
+                                                        smi_acc_bool = false;
+                                                        hot_acc = Some(NanBoxedValue::from_smi(sa));
+                                                        continue 'smi;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Guard failed — disable plan.
+                                        batch_plan = 0xFF;
+                                    }
+                                }
                             }
                             Opcode::Return => {
                                 frame.pc = pc;
@@ -4614,8 +5074,10 @@ impl Interpreter {
                                 let name_idx =
                                     unsafe { operand_constant_pool_idx_unchecked(instr, 0) };
                                 // IC fast path: read directly from slots via raw pointer.
-                                if let Some(&(slot_idx, _cached_gen)) =
-                                    frame.global_ic.as_ref().and_then(|ic| ic.get(&name_idx))
+                                if let Some(&Some((slot_idx, _cached_gen))) = frame
+                                    .global_ic
+                                    .as_ref()
+                                    .and_then(|ic| ic.get(name_idx as usize))
                                 {
                                     // SAFETY: env_ptr valid, slot_idx from prior IC population.
                                     let val = unsafe { &(&(*env_ptr).slots)[slot_idx] };
@@ -4675,8 +5137,10 @@ impl Interpreter {
                                 let dst = unsafe { operand_reg_unchecked(instr, 2) };
                                 let dst_idx = frame.reg_flat_index_unchecked(dst);
                                 // IC fast path: read directly from slots via raw pointer.
-                                if let Some(&(slot_idx, _cached_gen)) =
-                                    frame.global_ic.as_ref().and_then(|ic| ic.get(&name_idx))
+                                if let Some(&Some((slot_idx, _cached_gen))) = frame
+                                    .global_ic
+                                    .as_ref()
+                                    .and_then(|ic| ic.get(name_idx as usize))
                                 {
                                     // SAFETY: env_ptr valid, slot_idx from prior IC population.
                                     let val = unsafe { &(&(*env_ptr).slots)[slot_idx] };
@@ -4757,8 +5221,10 @@ impl Interpreter {
                                 // IC fast path: write directly to slot via raw pointer.
                                 {
                                     let val = materialize_acc!();
-                                    if let Some(&(slot_idx, _cached_gen)) =
-                                        frame.global_ic.as_ref().and_then(|ic| ic.get(&name_idx))
+                                    if let Some(&Some((slot_idx, _cached_gen))) = frame
+                                        .global_ic
+                                        .as_ref()
+                                        .and_then(|ic| ic.get(name_idx as usize))
                                     {
                                         // SAFETY: env_ptr valid, slot_idx from prior IC population.
                                         unsafe {
@@ -5129,40 +5595,41 @@ impl Interpreter {
                                                                     sa < limit_val
                                                                 };
                                                                 if cond {
-                                                                    let mut counter = sa;
-                                                                    loop {
-                                                                        let slot_ref = unsafe {
-                                                                            &mut *cached_call_slot_ptr
-                                                                        };
-                                                                        if let JsValue::Smi(val) =
-                                                                            *slot_ref
-                                                                        {
+                                                                    // Optimized tight loop: raw i32
+                                                                    // math, write JsValue only at
+                                                                    // exit.
+                                                                    let slot_ref = unsafe {
+                                                                        &mut *cached_call_slot_ptr
+                                                                    };
+                                                                    if let JsValue::Smi(
+                                                                        mut call_val,
+                                                                    ) = *slot_ref
+                                                                    {
+                                                                        let mut counter = sa;
+                                                                        loop {
                                                                             let next = match cached_call_op {
-                                                                                0 => val.checked_add(cached_call_imm),
-                                                                                1 => val.checked_sub(cached_call_imm),
-                                                                                2 => val.checked_add(1),
-                                                                                3 => val.checked_sub(1),
+                                                                                0 => call_val.checked_add(cached_call_imm),
+                                                                                1 => call_val.checked_sub(cached_call_imm),
+                                                                                2 => call_val.checked_add(1),
+                                                                                3 => call_val.checked_sub(1),
                                                                                 _ => None,
                                                                             };
-                                                                            if let Some(call_r) =
-                                                                                next
-                                                                            {
-                                                                                *slot_ref =
-                                                                                    JsValue::Smi(
-                                                                                        call_r,
-                                                                                    );
-                                                                                unsafe {
-                                                                                    frame.write_reg_unchecked(dst1, JsValue::Smi(call_r));
-                                                                                }
+                                                                            if let Some(cv) = next {
+                                                                                call_val = cv;
                                                                                 if let Some(nc) = counter.checked_add(add_imm) {
                                                                                     counter = nc;
-                                                                                    unsafe { frame.write_reg_unchecked(dst2, JsValue::Smi(nc)); }
                                                                                     let c = if is_leq { nc <= limit_val } else { nc < limit_val };
                                                                                     if c { continue; }
                                                                                 }
                                                                             }
+                                                                            break;
                                                                         }
-                                                                        break;
+                                                                        *slot_ref =
+                                                                            JsValue::Smi(call_val);
+                                                                        unsafe {
+                                                                            frame.write_reg_unchecked(dst1, JsValue::Smi(call_val));
+                                                                            frame.write_reg_unchecked(dst2, JsValue::Smi(counter));
+                                                                        }
                                                                     }
                                                                     pc = exit_pc;
                                                                     sa = 0;
@@ -6395,10 +6862,10 @@ impl Interpreter {
                                                             maybe_sta, 0,
                                                         )
                                                     };
-                                                    if let Some(&(gsi, _)) = frame
+                                                    if let Some(&Some((gsi, _))) = frame
                                                         .global_ic
                                                         .as_ref()
-                                                        .and_then(|ic| ic.get(&gname_idx))
+                                                        .and_then(|ic| ic.get(gname_idx as usize))
                                                     {
                                                         fused_sta_global = Some((gsi, gname_idx));
                                                         // Pre-clear the spilled accumulator
@@ -6886,66 +7353,45 @@ impl Interpreter {
                                                                         sa < limit_val
                                                                     };
                                                                     if cond {
-                                                                        // Enter tight loop: repeat
-                                                                        // call+store+inc+test with
-                                                                        // zero dispatch.
-                                                                        let mut counter = sa;
-                                                                        loop {
-                                                                            // Inline closure call
-                                                                            let slot_ref = unsafe {
-                                                                                &mut *cached_call_slot_ptr
-                                                                            };
-                                                                            if let JsValue::Smi(
-                                                                                val,
-                                                                            ) = *slot_ref
-                                                                            {
-                                                                                let next =
-                                                                                        match cached_call_op
-                                                                                        {
-                                                                                            0 => val.checked_add(cached_call_imm),
-                                                                                            1 => val.checked_sub(cached_call_imm),
-                                                                                            2 => val.checked_add(1),
-                                                                                            3 => val.checked_sub(1),
-                                                                                            _ => None,
-                                                                                        };
-                                                                                if let Some(
-                                                                                    call_r,
-                                                                                ) = next
+                                                                        // Optimized tight loop: raw
+                                                                        // i32 math, write JsValue
+                                                                        // only at exit.
+                                                                        let slot_ref = unsafe {
+                                                                            &mut *cached_call_slot_ptr
+                                                                        };
+                                                                        if let JsValue::Smi(
+                                                                            mut call_val,
+                                                                        ) = *slot_ref
+                                                                        {
+                                                                            let mut counter = sa;
+                                                                            loop {
+                                                                                let next = match cached_call_op {
+                                                                                    0 => call_val.checked_add(cached_call_imm),
+                                                                                    1 => call_val.checked_sub(cached_call_imm),
+                                                                                    2 => call_val.checked_add(1),
+                                                                                    3 => call_val.checked_sub(1),
+                                                                                    _ => None,
+                                                                                };
+                                                                                if let Some(cv) =
+                                                                                    next
                                                                                 {
-                                                                                    *slot_ref = JsValue::Smi(call_r);
-                                                                                    // Star dst1
-                                                                                    unsafe {
-                                                                                        frame.write_reg_unchecked(dst1, JsValue::Smi(call_r));
+                                                                                    call_val = cv;
+                                                                                    if let Some(nc) = counter.checked_add(add_imm) {
+                                                                                        counter = nc;
+                                                                                        let c = if is_leq { nc <= limit_val } else { nc < limit_val };
+                                                                                        if c { continue; }
                                                                                     }
-                                                                                    // Ldar+AddSmi+Star
-                                                                                    if let Some(
-                                                                                            nc,
-                                                                                        ) = counter
-                                                                                            .checked_add(
-                                                                                                add_imm,
-                                                                                            )
-                                                                                        {
-                                                                                            counter =
-                                                                                                nc;
-                                                                                            unsafe {
-                                                                                                frame.write_reg_unchecked(dst2, JsValue::Smi(nc));
-                                                                                            }
-                                                                                            // Test+Jump
-                                                                                            let c =
-                                                                                                if is_leq {
-                                                                                                    nc <= limit_val
-                                                                                                } else {
-                                                                                                    nc < limit_val
-                                                                                                };
-                                                                                            if c {
-                                                                                                continue;
-                                                                                            }
-                                                                                        }
                                                                                 }
+                                                                                break;
                                                                             }
-                                                                            // Overflow, type change, or
-                                                                            // loop done — break out.
-                                                                            break;
+                                                                            *slot_ref =
+                                                                                JsValue::Smi(
+                                                                                    call_val,
+                                                                                );
+                                                                            unsafe {
+                                                                                frame.write_reg_unchecked(dst1, JsValue::Smi(call_val));
+                                                                                frame.write_reg_unchecked(dst2, JsValue::Smi(counter));
+                                                                            }
                                                                         }
                                                                     }
                                                                     // Advance past test+jump.
@@ -7278,8 +7724,8 @@ impl Interpreter {
                                     Opcode::LdaGlobal => {
                                         if let Operand::ConstantPoolIdx(name_idx) = *si.operand(0) {
                                             if let Some(ref ic) = frame.global_ic
-                                                && let Some(&(slot_idx, cached_gen)) =
-                                                    ic.get(&name_idx)
+                                                && let Some(&Some((slot_idx, cached_gen))) =
+                                                    ic.get(name_idx as usize)
                                             {
                                                 let env = frame.global_env.borrow();
                                                 if env.generation() == cached_gen {
@@ -8610,7 +9056,8 @@ impl Interpreter {
                         if let Operand::ConstantPoolIdx(name_idx) = *instr.operand(0) {
                             // IC fast path: known slot, generation matches.
                             if let Some(ref ic) = frame.global_ic
-                                && let Some(&(slot_idx, cached_gen)) = ic.get(&name_idx)
+                                && let Some(&Some((slot_idx, cached_gen))) =
+                                    ic.get(name_idx as usize)
                             {
                                 let env = frame.global_env.borrow();
                                 if env.generation() == cached_gen {

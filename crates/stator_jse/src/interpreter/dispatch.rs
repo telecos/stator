@@ -3689,7 +3689,7 @@ fn handle_lda_global_star(
         .frame
         .global_ic
         .as_ref()
-        .and_then(|ic| ic.get(&name_idx).copied());
+        .and_then(|ic| ic.get(name_idx as usize).copied().flatten());
     if let Some((slot_idx, cached_gen)) = ic_hit {
         let env = ctx.frame.global_env.borrow();
         if env.generation() == cached_gen {
@@ -3713,9 +3713,7 @@ fn handle_lda_global_star(
             .map(|idx| (idx, env.generation()));
         drop(env);
         if let Some((slot_idx, cached_gen)) = slot_gen {
-            ctx.frame
-                .global_ic_mut()
-                .insert(name_idx, (slot_idx, cached_gen));
+            ctx.frame.global_ic_put(name_idx, slot_idx, cached_gen);
         }
     }
 

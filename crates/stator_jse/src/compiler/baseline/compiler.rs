@@ -9623,6 +9623,13 @@ pub(crate) mod jit_runtime {
                 // SAFETY: single-threaded JIT; no concurrent borrows of
                 // this array during push.
                 let items = unsafe { &mut *vec_ptr };
+                // Pre-allocate when pushing into an empty array.  Code that
+                // enters a push loop will typically push many elements;
+                // reserving up front avoids ~10 reallocations + memcpys for
+                // a 1000-element loop (saves ~24 KB of redundant copying).
+                if items.is_empty() {
+                    items.reserve(1024);
+                }
                 items.push(arg0);
                 Some(items.len() as i64)
             }
