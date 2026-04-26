@@ -3282,6 +3282,17 @@ fn resolve_fusion_pattern(
                 let callee_name = *name;
                 return resolve_factory_fusion(graph, callee_name, preheader);
             }
+            Some(ValueNode::Call { callee, args, .. }) if args.is_empty() => {
+                // The callee is the result of a zero-arg call (e.g.,
+                // `var counter = make_counter()`).  Trace through to
+                // the factory's callee to find factory fusion patterns.
+                target = *callee;
+                continue;
+            }
+            Some(ValueNode::CallKnownFunction { callee, args, .. }) if args.is_empty() => {
+                target = *callee;
+                continue;
+            }
             _ => return (None, None),
         }
     }
@@ -3296,19 +3307,23 @@ fn resolve_factory_fusion(
     global_name: u32,
     preheader: u32,
 ) -> (Option<u32>, Option<i64>) {
-    let pre = match graph.block(preheader) {
-        Some(b) => b,
-        None => return (None, None),
-    };
-
-    // Find StoreGlobal(global_name, value) in the preheader.
+    // Find StoreGlobal(global_name, value) in the preheader or any
+    // preceding block (common in top-level scripts where several
+    // statements precede the loop).
     let mut stored_value = None;
-    for (_, node) in pre.nodes.iter().rev() {
-        if let ValueNode::StoreGlobal { name, value, .. } = node
-            && *name == global_name
-        {
-            stored_value = Some(*value);
-            break;
+    for bi in (0..=preheader).rev() {
+        if let Some(blk) = graph.block(bi) {
+            for (_, node) in blk.nodes.iter().rev() {
+                if let ValueNode::StoreGlobal { name, value, .. } = node
+                    && *name == global_name
+                {
+                    stored_value = Some(*value);
+                    break;
+                }
+            }
+            if stored_value.is_some() {
+                break;
+            }
         }
     }
     let stored_value = match stored_value {
@@ -3348,6 +3363,36 @@ fn resolve_factory_fusion(
                     continue;
                 }
                 return (None, None);
+            }
+            Some(ValueNode::LoadGlobal { name, .. }) => {
+                // In top-level scripts, `function make_counter() {}`
+                // compiles to CreateClosure + StaGlobal.  The Call's
+                // callee is LoadGlobal("make_counter").  Search all
+                // blocks up to the preheader for the matching store.
+                let gn = *name;
+                let mut found = None;
+                for bi in 0..=preheader {
+                    if let Some(blk) = graph.block(bi) {
+                        for (_, node) in blk.nodes.iter().rev() {
+                            if let ValueNode::StoreGlobal { name, value, .. } = node
+                                && *name == gn
+                            {
+                                found = Some(*value);
+                                break;
+                            }
+                        }
+                        if found.is_some() {
+                            break;
+                        }
+                    }
+                }
+                match found {
+                    Some(v) => {
+                        target = v;
+                        continue;
+                    }
+                    None => return (None, None),
+                }
             }
             _ => return (None, None),
         }
