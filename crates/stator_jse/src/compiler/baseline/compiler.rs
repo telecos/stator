@@ -9505,34 +9505,6 @@ pub(crate) mod jit_runtime {
         })
     }
 
-    /// Batch sum of Smi elements in an array slice `[start..end)`.
-    ///
-    /// Replaces a counted `for (i=start; i<end; i++) sum += arr[i]`
-    /// loop with a single tight Rust loop that LLVM can optimise.
-    ///
-    /// # Calling convention (SysV AMD64)
-    ///
-    /// * `RDI` (`object_i64`)   – JIT i64 encoding of the array.
-    /// * `RSI` (`start_i64`)    – First index (inclusive).
-    /// * `RDX` (`end_i64`)      – Last index (exclusive).
-    /// * `RCX` (`acc_init_i64`) – Initial accumulator value.
-    ///
-    /// Returns the sum as `i64` in `RAX`, or [`JIT_DEOPT`].
-    #[unsafe(no_mangle)]
-    pub extern "C" fn jit_runtime_batch_sum_smi_array(
-        object_i64: i64,
-        start_i64: i64,
-        end_i64: i64,
-        acc_init_i64: i64,
-    ) -> i64 {
-        batch_sum_smi_array_inner(object_i64, start_i64, end_i64, acc_init_i64).unwrap_or_else(
-            || {
-                track_stub_deopt(STUB_CALL_PROP1);
-                JIT_DEOPT
-            },
-        )
-    }
-
     /// Array push that also fills the Maglev array IC on success.
     ///
     /// `ic_ptr` points to `[handle, data_ptr, len, vec_ptr]` (4 × i64)
@@ -9732,62 +9704,6 @@ pub(crate) mod jit_runtime {
                     items.push(JsValue::Smi(i));
                 }
                 Some(items.len() as i64)
-            }
-            _ => None,
-        }
-    }
-
-    /// Batch sum of Smi elements in `[start..end)` of an array.
-    ///
-    /// Returns the sum as `i64` or `None` (deopt) if any element is
-    /// not a Smi or if the sum overflows `i32`.
-    #[inline(always)]
-    fn batch_sum_smi_array_inner(
-        object_i64: i64,
-        start_i64: i64,
-        end_i64: i64,
-        acc_init_i64: i64,
-    ) -> Option<i64> {
-        let start = start_i64 as usize;
-        let end = end_i64 as usize;
-        if end < start {
-            return None;
-        }
-
-        if !is_heap_handle(object_i64) {
-            return None;
-        }
-        let ptrs = RT_PTRS.with(|p| p.get());
-        if !ptrs.is_cached() {
-            return None;
-        }
-        let recv_idx = (object_i64 - JIT_HEAP_TAG) as usize;
-        // SAFETY: cached pointers set by cache_rt_ptrs; valid for thread lifetime.
-        let heap_ref = unsafe { &*ptrs.heap };
-        // SAFETY: single-threaded JIT; no concurrent mutable borrows.
-        let heap = unsafe { &*heap_ref.as_ptr() };
-        match heap.get(recv_idx)? {
-            JsValue::Array(arr) => {
-                // SAFETY: single-threaded JIT; no concurrent borrows.
-                let items = unsafe { &*arr.as_ptr() };
-                // Bounds check.
-                if end > items.len() {
-                    return None;
-                }
-                let mut sum = acc_init_i64 as i64;
-                for item in &items[start..end] {
-                    match item {
-                        JsValue::Smi(v) => {
-                            sum = sum.checked_add(*v as i64)?;
-                        }
-                        _ => return None, // non-Smi element → deopt
-                    }
-                }
-                // Check the result fits in i32 for Smi encoding.
-                if sum < i32::MIN as i64 || sum > i32::MAX as i64 {
-                    return None;
-                }
-                Some(sum)
             }
             _ => None,
         }

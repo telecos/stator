@@ -1124,18 +1124,6 @@ fn visit_value_node_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
             f(*end);
         }
 
-        ValueNode::BatchSumSmiArray {
-            object,
-            start,
-            end,
-            acc_init,
-        } => {
-            f(*object);
-            f(*start);
-            f(*end);
-            f(*acc_init);
-        }
-
         ValueNode::Construct {
             constructor, args, ..
         }
@@ -2882,289 +2870,13 @@ fn fuse_call_loops(graph: &mut MaglevGraph) {
     if loops.is_empty() {
         return;
     }
-    eprintln!("FUSE_LOOPS: found {} loops", loops.len());
-    for (i, lp) in loops.iter().enumerate() {
-        eprintln!(
-            "FUSE_LOOPS[{i}]: header={} preheader={} body={:?}",
-            lp.header, lp.preheader, lp.body
-        );
-        // Try push-loop fusion first (most specific pattern).
+    for lp in &loops {
+        // Try push-loop fusion first (more specific pattern).
         if try_fuse_push_loop(graph, lp) {
-            continue;
-        }
-        // Try sum-loop fusion.
-        if try_fuse_sum_loop(graph, lp) {
             continue;
         }
         try_fuse_call_loop(graph, lp);
     }
-}
-
-/// Detect a counted `for (i = start; i < end; i++) sum += arr[i]` loop
-/// and replace it with a single [`ValueNode::BatchSumSmiArray`] in the
-/// preheader, then short-circuit the loop.
-///
-/// Pattern recognised (Phi-based IV only):
-///
-/// ```text
-///   header: iv_phi  = Phi(iv_init, iv_next)
-///           acc_phi = Phi(acc_init, acc_next)
-///           Branch(iv_phi < limit, body, exit)
-///   body:   loaded   = LoadKeyedGeneric(object, iv_phi)
-///           acc_next = Int32Add(acc_phi, loaded)  [or GenericAdd]
-///           iv_next  = Int32Add(iv_phi, 1)
-///           Jump(header)
-/// ```
-fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
-    // ── 1. Simple loop: header + 1 body block ────────────────────────────
-    if lp.body.len() != 2 || !lp.body.contains(&lp.header) {
-        return false;
-    }
-
-    let (condition_id, body_block_idx, header_preds, header_nodes_snapshot);
-    {
-        let header = match graph.block(lp.header) {
-            Some(b) => b,
-            None => return false,
-        };
-        let (cond, body_bi, _exit) = match &header.control {
-            Some(ControlNode::Branch {
-                condition,
-                if_true,
-                if_false,
-            }) => (*condition, *if_true, *if_false),
-            _ => return false,
-        };
-        if !lp.body.contains(&body_bi) {
-            return false;
-        }
-        condition_id = cond;
-        body_block_idx = body_bi;
-        header_preds = header.predecessors.clone();
-        header_nodes_snapshot = header
-            .nodes
-            .iter()
-            .map(|(nid, node)| (*nid, node.clone()))
-            .collect::<Vec<_>>();
-    }
-
-    // Body must jump back to header.
-    {
-        let body = match graph.block(body_block_idx) {
-            Some(b) => b,
-            None => return false,
-        };
-        match &body.control {
-            Some(ControlNode::Jump { target }) if *target == lp.header => {}
-            _ => return false,
-        }
-    }
-
-    // ── 2. Find IV Phi and limit ─────────────────────────────────────────
-    let (cmp_left, cmp_right) = {
-        let mut found = None;
-        for (nid, node) in &header_nodes_snapshot {
-            if *nid == condition_id {
-                found = Some(node.clone());
-                break;
-            }
-        }
-        match found {
-            Some(ValueNode::Int32LessThan { left, right }) => (left, right),
-            _ => return false,
-        }
-    };
-
-    // cmp_left must be a Phi (IV).
-    let iv_phi_inputs = match graph.node(cmp_left) {
-        Some(ValueNode::Phi { inputs }) if inputs.len() == 2 => inputs.clone(),
-        _ => return false,
-    };
-
-    let back_pred_pos = match header_preds.iter().position(|&p| p == body_block_idx) {
-        Some(pos) => pos,
-        None => return false,
-    };
-    let entry_pos = match header_preds.iter().position(|&p| p == lp.preheader) {
-        Some(pos) => pos,
-        None => return false,
-    };
-
-    let iv_init_id = iv_phi_inputs[entry_pos];
-    // IV init must be a constant.
-    if find_i32_constant(graph, iv_init_id).is_none() {
-        return false;
-    }
-
-    // Check step == 1.
-    let iv_step = find_increment_step(graph, iv_phi_inputs[back_pred_pos], cmp_left);
-    if iv_step != Some(1) {
-        return false;
-    }
-
-    // The limit (cmp_right) must be available in the preheader.
-    // If it's defined outside the loop, use it directly.  If it's a
-    // LoadNamedGeneric("length") inside the loop on an invariant object,
-    // hoist a copy into the preheader (safe because the loop body only
-    // reads the array, never modifies it).
-    let loop_body_set: HashSet<u32> = lp.body.iter().copied().collect();
-    let limit_in_loop = loop_body_set.iter().any(|&bi| {
-        graph
-            .block(bi)
-            .map(|b| b.nodes.iter().any(|(nid, _)| *nid == cmp_right))
-            .unwrap_or(false)
-    });
-    let effective_limit = if limit_in_loop {
-        // Try to hoist: must be LoadNamedGeneric on an invariant object.
-        // This is safe because the loop body only performs keyed reads
-        // and arithmetic — no stores that could alter the property.
-        match graph.node(cmp_right) {
-            Some(ValueNode::LoadNamedGeneric {
-                object,
-                name,
-                feedback_slot,
-            }) => {
-                let obj = *object;
-                let fb = *feedback_slot;
-                let nm = *name;
-                // Object must be defined outside the loop.
-                let obj_in_loop = loop_body_set.iter().any(|&bi| {
-                    graph
-                        .block(bi)
-                        .map(|b| b.nodes.iter().any(|(nid, _)| *nid == obj))
-                        .unwrap_or(false)
-                });
-                if obj_in_loop {
-                    return false;
-                }
-                // Clone the length load into the preheader.
-                let hoisted_id = graph.alloc_node_id();
-                if let Some(pre) = graph.block_mut(lp.preheader) {
-                    pre.push_with_id(
-                        hoisted_id,
-                        ValueNode::LoadNamedGeneric {
-                            object: obj,
-                            name: nm,
-                            feedback_slot: fb,
-                        },
-                    );
-                }
-                hoisted_id
-            }
-            _ => return false,
-        }
-    } else {
-        cmp_right
-    };
-
-    // ── 3. Find accumulator Phi whose back-edge is Add(acc, LoadKeyed) ───
-    let (acc_phi_id, acc_init_id, load_object_id);
-    {
-        let mut found = None;
-        for (nid, node) in &header_nodes_snapshot {
-            if *nid == cmp_left || *nid == condition_id {
-                continue;
-            }
-            if let ValueNode::Phi { inputs } = node
-                && inputs.len() == 2
-            {
-                let back_id = inputs[back_pred_pos];
-                let entry_id = inputs[entry_pos];
-                // Check if back_id is an Add whose operands are the acc phi and a LoadKeyed.
-                if let Some(add_node) = graph.node(back_id) {
-                    let (add_left, add_right) = match add_node {
-                        ValueNode::Int32Add { left, right }
-                        | ValueNode::GenericAdd { left, right, .. } => (*left, *right),
-                        _ => continue,
-                    };
-                    // One operand must be the acc phi, the other a LoadKeyedGeneric.
-                    let load_id = if add_left == *nid {
-                        add_right
-                    } else if add_right == *nid {
-                        add_left
-                    } else {
-                        continue;
-                    };
-                    // Check load_id is a LoadKeyedGeneric whose key is the IV phi.
-                    if let Some(ValueNode::LoadKeyedGeneric { object, key, .. }) =
-                        graph.node(load_id)
-                        && *key == cmp_left
-                    {
-                        found = Some((*nid, entry_id, *object));
-                        break;
-                    }
-                }
-            }
-        }
-        match found {
-            Some((ap, ai, lo)) => {
-                acc_phi_id = ap;
-                acc_init_id = ai;
-                load_object_id = lo;
-            }
-            None => return false,
-        }
-    }
-
-    // The load object must be loop-invariant.
-    let object_in_loop = loop_body_set.iter().any(|&bi| {
-        graph
-            .block(bi)
-            .map(|b| b.nodes.iter().any(|(nid, _)| *nid == load_object_id))
-            .unwrap_or(false)
-    });
-    if object_in_loop {
-        return false;
-    }
-
-    // ── 4. Insert BatchSumSmiArray in preheader ──────────────────────────
-    let fusion_id = graph.alloc_node_id();
-    if let Some(pre) = graph.block_mut(lp.preheader) {
-        pre.push_with_id(
-            fusion_id,
-            ValueNode::BatchSumSmiArray {
-                object: load_object_id,
-                start: iv_init_id,
-                end: effective_limit,
-                acc_init: acc_init_id,
-            },
-        );
-    }
-
-    // ── 5. Short-circuit the loop ────────────────────────────────────────
-    // Set IV entry to limit → condition immediately false.
-    {
-        let h = graph.block_mut(lp.header).unwrap();
-        for (nid, node) in &mut h.nodes {
-            if *nid == cmp_left {
-                if let ValueNode::Phi { inputs } = node
-                    && inputs.len() == 2
-                {
-                    inputs[entry_pos] = effective_limit;
-                    inputs[back_pred_pos] = *nid;
-                }
-                break;
-            }
-        }
-    }
-
-    // Set accumulator entry to fusion result → exit sees the batch sum.
-    {
-        let h = graph.block_mut(lp.header).unwrap();
-        for (nid, node) in &mut h.nodes {
-            if *nid == acc_phi_id {
-                if let ValueNode::Phi { inputs } = node
-                    && inputs.len() == 2
-                {
-                    inputs[entry_pos] = fusion_id;
-                    inputs[back_pred_pos] = *nid;
-                }
-                break;
-            }
-        }
-    }
-
-    true
 }
 
 /// Detect a counted `for (i = start; i < end; i++) arr.push(i)` loop
@@ -3184,11 +2896,6 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
 fn try_fuse_push_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
     // ── 1. Simple loop: header + 1 body block ────────────────────────────
     if lp.body.len() != 2 || !lp.body.contains(&lp.header) {
-        eprintln!(
-            "PUSH_FUSION[1]: bail body_len={} header_in_body={}",
-            lp.body.len(),
-            lp.body.contains(&lp.header)
-        );
         return false;
     }
 
@@ -3204,13 +2911,9 @@ fn try_fuse_push_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
                 if_true,
                 if_false,
             }) => (*condition, *if_true, *if_false),
-            _ => {
-                eprintln!("PUSH_FUSION[2]: bail no Branch control");
-                return false;
-            }
+            _ => return false,
         };
         if !lp.body.contains(&body_bi) {
-            eprintln!("PUSH_FUSION[3]: bail body_bi not in loop body");
             return false;
         }
         condition_id = cond;
@@ -3231,10 +2934,7 @@ fn try_fuse_push_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
         };
         match &body.control {
             Some(ControlNode::Jump { target }) if *target == lp.header => {}
-            _ => {
-                eprintln!("PUSH_FUSION[4]: bail body doesn't jump to header");
-                return false;
-            }
+            _ => return false,
         }
     }
 
@@ -3249,73 +2949,39 @@ fn try_fuse_push_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
         }
         match found {
             Some(ValueNode::Int32LessThan { left, right }) => (left, right),
-            _ => {
-                eprintln!(
-                    "PUSH_FUSION[5]: bail condition is not Int32LessThan, cond_id={condition_id:?}, node={found:?}"
-                );
-                return false;
-            }
+            _ => return false,
         }
     };
 
     // cmp_left must be a Phi (IV), cmp_right must be a constant (limit).
     let _iv_limit = match find_i32_constant(graph, cmp_right) {
         Some(v) => v,
-        None => {
-            eprintln!(
-                "PUSH_FUSION[6]: bail limit not constant, right_id={cmp_right:?}, node={:?}",
-                graph.node(cmp_right)
-            );
-            return false;
-        }
+        None => return false,
     };
 
     let iv_phi_inputs = match graph.node(cmp_left) {
         Some(ValueNode::Phi { inputs }) if inputs.len() == 2 => inputs.clone(),
-        _ => {
-            eprintln!(
-                "PUSH_FUSION[7]: bail left not Phi(2), left_id={cmp_left:?}, node={:?}",
-                graph.node(cmp_left)
-            );
-            return false;
-        }
+        _ => return false,
     };
 
     let back_pred_pos = match header_preds.iter().position(|&p| p == body_block_idx) {
         Some(pos) => pos,
-        None => {
-            eprintln!("PUSH_FUSION[8]: bail body_block not in header preds");
-            return false;
-        }
+        None => return false,
     };
     let entry_pos = match header_preds.iter().position(|&p| p == lp.preheader) {
         Some(pos) => pos,
-        None => {
-            eprintln!("PUSH_FUSION[9]: bail preheader not in header preds");
-            return false;
-        }
+        None => return false,
     };
 
     let iv_init_id = iv_phi_inputs[entry_pos];
     let _iv_init_val = match find_i32_constant(graph, iv_init_id) {
         Some(v) => v,
-        None => {
-            eprintln!(
-                "PUSH_FUSION[10]: bail iv_init not constant, id={iv_init_id:?}, node={:?}",
-                graph.node(iv_init_id)
-            );
-            return false;
-        }
+        None => return false,
     };
 
     // Check step == 1.
     let iv_step = find_increment_step(graph, iv_phi_inputs[back_pred_pos], cmp_left);
     if iv_step != Some(1) {
-        eprintln!(
-            "PUSH_FUSION[11]: bail step={iv_step:?}, back_edge_id={:?}, node={:?}",
-            iv_phi_inputs[back_pred_pos],
-            graph.node(iv_phi_inputs[back_pred_pos])
-        );
         return false;
     }
 
@@ -3348,19 +3014,7 @@ fn try_fuse_push_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
                 receiver_id = recv;
                 feedback_slot = fb;
             }
-            None => {
-                let body = graph.block(body_block_idx).unwrap();
-                let body_nodes: Vec<_> = body
-                    .nodes
-                    .iter()
-                    .map(|(nid, n)| format!("  n{nid:?}: {n:?}"))
-                    .collect();
-                eprintln!(
-                    "PUSH_FUSION[12]: bail no CallArrayPush with iv arg, iv_phi={cmp_left:?}\n{}",
-                    body_nodes.join("\n")
-                );
-                return false;
-            }
+            None => return false,
         }
     }
 
@@ -3425,7 +3079,6 @@ fn try_fuse_push_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
         }
     }
 
-    eprintln!("PUSH_FUSION[OK]: fused push loop, fusion_id={fusion_id:?}");
     true
 }
 
@@ -5466,18 +5119,6 @@ fn collect_value_node_inputs(node: &ValueNode, live: &mut HashSet<NodeId>) {
             live.insert(*end);
         }
 
-        ValueNode::BatchSumSmiArray {
-            object,
-            start,
-            end,
-            acc_init,
-        } => {
-            live.insert(*object);
-            live.insert(*start);
-            live.insert(*end);
-            live.insert(*acc_init);
-        }
-
         ValueNode::Construct {
             constructor, args, ..
         }
@@ -5989,18 +5630,6 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
             *receiver = resolve(*receiver);
             *start = resolve(*start);
             *end = resolve(*end);
-        }
-
-        ValueNode::BatchSumSmiArray {
-            object,
-            start,
-            end,
-            acc_init,
-        } => {
-            *object = resolve(*object);
-            *start = resolve(*start);
-            *end = resolve(*end);
-            *acc_init = resolve(*acc_init);
         }
 
         ValueNode::Construct {

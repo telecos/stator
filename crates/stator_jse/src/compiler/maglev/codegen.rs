@@ -757,7 +757,6 @@ impl<'a> MaglevCodegen<'a> {
                             | ValueNode::StoreFixedDoubleArrayElement { .. }
                             | ValueNode::CallArrayPush { .. }
                             | ValueNode::BatchArrayPushRange { .. }
-                            | ValueNode::BatchSumSmiArray { .. }
                     );
                 }
                 if matches!(node, ValueNode::LoadNamedGeneric { .. }) {
@@ -2473,38 +2472,6 @@ impl<'a> MaglevCodegen<'a> {
                 );
             }
 
-            // ── Batch sum fusion ──────────────────────────────────────────────
-            //
-            // Replaces a counted sum loop with a single runtime call:
-            //   jit_runtime_batch_sum_smi_array(object, start, end, acc_init) -> sum
-            #[cfg(all(target_arch = "x86_64", unix))]
-            ValueNode::BatchSumSmiArray {
-                object,
-                start,
-                end,
-                acc_init,
-            } => {
-                let saved = self.emit_save_live_regs(id);
-                // Load all 4 node args into scratch/non-arg registers first
-                // to avoid clobbering when a value lives in an arg register.
-                // R11, R10, RAX are scratch; RDI is arg0 but loaded last.
-                self.emit_load(*object, Reg64::R11);
-                self.emit_load(*start, Reg64::R10);
-                self.emit_load(*end, Reg64::Rax);
-                self.emit_load(*acc_init, Reg64::Rcx); // RCX = arg3 (SysV)
-                self.masm.mov_rr(Reg64::Rdi, Reg64::R11); // arg0 = object
-                self.masm.mov_rr(Reg64::Rsi, Reg64::R10); // arg1 = start
-                self.masm.mov_rr(Reg64::Rdx, Reg64::Rax); // arg2 = end
-                // RCX already holds acc_init (arg3)
-                let addr =
-                    jit_runtime::jit_runtime_batch_sum_smi_array as *const () as usize as i64;
-                self.masm.mov_ri(Reg64::R11, addr);
-                self.masm.call_reg(Reg64::R11);
-                self.emit_restore_live_regs(saved);
-                self.emit_deopt_check_rax();
-                self.emit_store(id, Reg64::Rax);
-            }
-
             // ── Object / array / closure creation ─────────────────────────────
             //
             // CreateObjectLiteral and CreateShallowObjectLiteral use a
@@ -4049,7 +4016,6 @@ impl<'a> MaglevCodegen<'a> {
                 | ValueNode::CallWithSpread { .. }
                 | ValueNode::SpeculativeCallFusion { .. }
                 | ValueNode::BatchArrayPushRange { .. }
-                | ValueNode::BatchSumSmiArray { .. }
         )
     }
 
@@ -8374,17 +8340,6 @@ impl<'a> MaglevCodegen<'a> {
                 out.insert(*receiver);
                 out.insert(*start);
                 out.insert(*end);
-            }
-            ValueNode::BatchSumSmiArray {
-                object,
-                start,
-                end,
-                acc_init,
-            } => {
-                out.insert(*object);
-                out.insert(*start);
-                out.insert(*end);
-                out.insert(*acc_init);
             }
             ValueNode::CallBuiltin { args, .. } | ValueNode::CallRuntime { args, .. } => {
                 for a in args {

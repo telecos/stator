@@ -675,18 +675,6 @@ fn collect_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
             f(*end);
         }
 
-        ValueNode::BatchSumSmiArray {
-            object,
-            start,
-            end,
-            acc_init,
-        } => {
-            f(*object);
-            f(*start);
-            f(*end);
-            f(*acc_init);
-        }
-
         ValueNode::CallBuiltin { args, .. } | ValueNode::CallRuntime { args, .. } => {
             for &a in args {
                 f(a);
