@@ -6859,6 +6859,13 @@ impl<'a> MaglevCodegen<'a> {
         let ic_off_len = ic_base + 16;
         let ic_off_vec_ptr = ic_base + 24;
 
+        // If the value is known to be i32-range (e.g. a loop counter
+        // with `for (i = 0; i < 1000; i++)`), skip the Smi check —
+        // i32 representation is always a valid JIT Smi.
+        let value_known_smi = self.i32_range.contains(&value)
+            || self.smi_guarded.contains(&value)
+            || self.narrow_int32.contains(&value);
+
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
 
@@ -6869,17 +6876,16 @@ impl<'a> MaglevCodegen<'a> {
         self.emit_load(value, Reg64::Rax);
         self.rax_holds = None;
 
-        // Smi check on value: sign-extend the lower 32 bits and compare.
-        self.masm.movsxd_rr(Reg64::R10, Reg64::Rax);
-        self.masm.cmp_rr(Reg64::R10, Reg64::Rax);
-        self.masm.jne(&mut slow_label);
+        if !value_known_smi {
+            // Smi check on value: sign-extend the lower 32 bits and compare.
+            self.masm.movsxd_rr(Reg64::R10, Reg64::Rax);
+            self.masm.cmp_rr(Reg64::R10, Reg64::Rax);
+            self.masm.jne(&mut slow_label);
+        }
 
-        // Heap handle check on receiver.
-        self.masm.mov_ri(Reg64::R10, JIT_HEAP_TAG);
-        self.masm.cmp_rr(Reg64::R11, Reg64::R10);
-        self.masm.jcc(CondCode::Below, &mut slow_label);
-
-        // IC hit: same array handle?
+        // IC hit check first: if the handle matches, the receiver is
+        // guaranteed to be a valid heap handle (the IC was filled with
+        // one), so we skip the separate heap-handle guard entirely.
         self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, ic_off_handle);
         self.masm.jne(&mut slow_label);
 
