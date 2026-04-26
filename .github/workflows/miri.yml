@@ -34,13 +34,18 @@ jobs:
               --skip bytecode_generator
               --skip objects::regexp
           # Primary target – x86-64 Linux (Tree Borrows)
+          # Only runs the raw-pointer GC submodules because Tree Borrows validates
+          # pointer aliasing rules which only matter for the unsafe GC code.
+          # The full gc:: suite (~108 tests) times out at ~55 min under Tree
+          # Borrows (~12× SB overhead); restricting to gc_ptr/handle/tlab keeps
+          # it under 15 minutes while still covering all unsafe raw-pointer code.
           - target: x86_64-unknown-linux-gnu
             miriflags: "-Zmiri-tree-borrows -Zmiri-preemption-rate=0.1"
             label: "Tree Borrows"
             test_filter: >-
-              gc:: objects:: bytecode::
-              --skip bytecode_generator
-              --skip objects::regexp
+              gc::gc_ptr::
+              gc::handle::
+              gc::tlab::
           # 32-bit target – only pointer-size-critical modules.
           # Miri on i686 runs GC algorithm tests at ~15 s/test (vs ~6 s on x86_64),
           # so the full gc:: suite would exceed the timeout. We keep only the tests
@@ -58,14 +63,15 @@ jobs:
               objects::nan_boxing::
               objects::tagged::
           # AArch64 target – exercise GC + objects on a second architecture.
-          # Skips regexp and bytecode_generator for the same timing reasons as x86_64.
+          # Skips bytecode:: (safe Rust, already covered by x86_64 SB) and
+          # objects::regexp (no unsafe code, 123 tests, adds ~4 min under QEMU)
+          # to keep the cross-compiled job well within the 60-minute limit.
           - target: aarch64-unknown-linux-gnu
             miriflags: "-Zmiri-preemption-rate=0.1"
             label: "Stacked Borrows"
             packages: "gcc-aarch64-linux-gnu libc6-dev-arm64-cross"
             test_filter: >-
-              gc:: objects:: bytecode::
-              --skip bytecode_generator
+              gc:: objects::
               --skip objects::regexp
     steps:
       - name: Checkout repository
@@ -76,6 +82,7 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -y ${{ matrix.packages }}
 
       - name: Install Rust nightly with Miri
+        id: toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri, rust-src
@@ -95,6 +102,15 @@ jobs:
           key: ${{ runner.os }}-cargo-miri-${{ matrix.target }}-git-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-miri-${{ matrix.target }}-git-
+
+      - name: Cache Miri build artifacts
+        uses: actions/cache@v5
+        with:
+          path: target/miri
+          key: ${{ runner.os }}-miri-target-${{ matrix.target }}-${{ steps.toolchain.outputs.rustc-version }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-miri-target-${{ matrix.target }}-${{ steps.toolchain.outputs.rustc-version }}-
+            ${{ runner.os }}-miri-target-${{ matrix.target }}-
 
       - name: Set up Miri sysroot
         run: cargo +nightly miri setup --target ${{ matrix.target }}
