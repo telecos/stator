@@ -6311,11 +6311,10 @@ impl<'a> MaglevCodegen<'a> {
         // buffer pointer, which may have changed after a reallocation.
         let ic_off_vec_ptr = ic_base + 24;
 
+        let is_smi_specialized = self.smi_guarded.contains(&id) && !self.i32_range.contains(&id);
+
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
-        let mut load_smi = Label::new();
-        let mut load_bool = Label::new();
-        let mut load_undef = Label::new();
 
         // ── Fast path (scratch regs only: R11, R10, RAX) ────────────
 
@@ -6324,155 +6323,263 @@ impl<'a> MaglevCodegen<'a> {
         self.emit_load(object, Reg64::R11);
         self.emit_load(key, Reg64::R10);
 
-        // Heap-handle guard: non-heap values (Smi, JIT_UNDEFINED,
-        // JIT_FALSE, etc.) cannot be arrays.  Return undefined
-        // instead of falling to the slow path which may deopt.
-        self.masm.mov_ri(Reg64::Rax, JIT_HEAP_TAG);
-        self.rax_holds = None; // RAX clobbered by raw constant
-        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
-        self.masm.jcc(CondCode::Below, &mut load_undef);
+        if is_smi_specialized {
+            // ── Smi-specialized fast path ──────────────────────────
+            //
+            // When this keyed load feeds exclusively into arithmetic
+            // (smi_guarded), skip the full discriminant dispatch.
+            // On IC hit + in-bounds, speculatively load the Smi
+            // payload and verify the discriminant.  Non-Smi elements
+            // deopt to the interpreter.
+            let mut smi_fast_done = Label::new();
 
-        // IC hit check: is this the same array handle?
-        self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, ic_off_handle);
-        self.masm.jne(&mut slow_label);
+            // Heap-handle guard.
+            self.masm.mov_ri(Reg64::Rax, JIT_HEAP_TAG);
+            self.rax_holds = None;
+            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm.jcc(CondCode::Below, &mut slow_label);
 
-        // Unsigned bounds check: key < cached length.
-        // Since key is a sign-extended Smi, negative values appear as
-        // very large unsigned numbers → caught by JAE.
-        self.masm.cmp_rm(Reg64::R10, Reg64::Rbp, ic_off_len);
-        self.masm.jcc(CondCode::AboveEq, &mut slow_label);
+            // IC hit check.
+            self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, ic_off_handle);
+            self.masm.jne(&mut slow_label);
 
-        // Re-derive a *fresh* data pointer from the Vec struct pointer
-        // instead of trusting the cached data_ptr (which becomes stale
-        // after Vec reallocation — the root cause of the sieve SIGSEGV).
-        //
-        // Note: the vec_ptr null check is omitted because IC hit (handle
-        // match above) guarantees the IC was previously filled — all 4
-        // slots (handle, data_ptr, len, vec_ptr) are written atomically
-        // by the IC fill stub. Initial state has handle=0 which always
-        // misses, and invalidation zeroes only the handle.
-        self.masm
-            .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_vec_ptr);
-        // Dereference vec_ptr to get the current buffer pointer.
-        // Use probed ptr_offset (not hardcoded 0) for robustness.
-        let vec_layout = cached_vec_jsvalue_layout();
-        self.masm
-            .mov_load_base_disp32(Reg64::R11, Reg64::R11, vec_layout.ptr_offset as i32);
+            // Unsigned bounds check.
+            self.masm.cmp_rm(Reg64::R10, Reg64::Rbp, ic_off_len);
+            self.masm.jcc(CondCode::AboveEq, &mut slow_label);
 
-        // Compute element address: R11 + R10 * sizeof(JsValue).
-        // jsvalue_size is always 24 = 3 * 8; replace IMUL (3c latency)
-        // with LEA+SHL (1c + 1c).
-        debug_assert_eq!(
-            layout.jsvalue_size, 24,
-            "LEA chain assumes JsValue is 24 bytes"
-        );
-        self.masm.lea_scaled(Reg64::R10, Reg64::R10, Reg64::R10, 2); // R10 = index * 3
-        // SHL R10, 3 — REX.WB C1 /4 r/m=R10(enc=2), imm8=3
-        self.masm.emit_byte(0x49); // REX.W + REX.B
-        self.masm.emit_byte(0xC1); // SHL r/m64, imm8
-        self.masm.emit_byte(0xE2); // ModRM: mod=11, /4, r/m=2
-        self.masm.emit_byte(0x03); // shift count = 3
-        self.masm.add_rr(Reg64::R11, Reg64::R10);
+            // Re-derive fresh data pointer.
+            self.masm
+                .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_vec_ptr);
+            let vec_layout = cached_vec_jsvalue_layout();
+            self.masm
+                .mov_load_base_disp32(Reg64::R11, Reg64::R11, vec_layout.ptr_offset as i32);
 
-        // Load discriminant byte.
-        self.masm
-            .movzx_byte_base_disp32(Reg64::Rax, Reg64::R11, layout.disc_offset as i32);
+            // Compute element address.
+            debug_assert_eq!(
+                layout.jsvalue_size, 24,
+                "LEA chain assumes JsValue is 24 bytes"
+            );
+            self.masm.lea_scaled(Reg64::R10, Reg64::R10, Reg64::R10, 2);
+            self.masm.emit_byte(0x49); // SHL R10, 3
+            self.masm.emit_byte(0xC1);
+            self.masm.emit_byte(0xE2);
+            self.masm.emit_byte(0x03);
+            self.masm.add_rr(Reg64::R11, Reg64::R10);
 
-        // Dispatch on discriminant — Bool first (hot for boolean arrays
-        // like the sieve benchmark), then Smi.  Undefined and TheHole are
-        // handled inline (return JIT_UNDEFINED) to avoid the slow path
-        // for holey arrays.  Other types fall through to the slow path.
-        self.masm.cmp_ri(Reg64::Rax, layout.bool_disc as i32);
-        self.masm.je(&mut load_bool);
-        self.masm.cmp_ri(Reg64::Rax, layout.smi_disc as i32);
-        self.masm.je(&mut load_smi);
-        self.masm.cmp_ri(Reg64::Rax, layout.undef_disc as i32);
-        self.masm.je(&mut load_undef);
-        self.masm.cmp_ri(Reg64::Rax, layout.hole_disc as i32);
-        self.masm.je(&mut load_undef);
-        // Null, String, Object, … → slow path.
-        self.masm.jmp(&mut slow_label);
+            // Speculative Smi payload load (may read garbage for non-Smi
+            // elements, but the discriminant check catches that).
+            self.masm
+                .movsxd_base_disp32(Reg64::Rax, Reg64::R11, layout.smi_payload_offset as i32);
+            // Discriminant check — independent of MOVSXD for ILP.
+            self.masm
+                .movzx_byte_base_disp32(Reg64::R10, Reg64::R11, layout.disc_offset as i32);
+            self.masm.cmp_ri(Reg64::R10, layout.smi_disc as i32);
+            // Non-Smi element → deopt (smi_guarded contract).
+            self.masm.jne(&mut self.deopt_label);
+            self.masm.jmp(&mut smi_fast_done);
 
-        // ── load_smi: sign-extend i32 payload ───────────────────────
-        self.masm.bind_label(&mut load_smi);
-        self.masm
-            .movsxd_base_disp32(Reg64::Rax, Reg64::R11, layout.smi_payload_offset as i32);
-        self.masm.jmp(&mut done_label);
-
-        // ── load_bool: zero-extend bool, encode as JIT_FALSE/JIT_TRUE ─
-        self.masm.bind_label(&mut load_bool);
-        self.masm
-            .movzx_byte_base_disp32(Reg64::Rax, Reg64::R11, layout.bool_payload_offset as i32);
-        self.masm.and_ri(Reg64::Rax, 1);
-        // JIT_FALSE is a 33-bit value (0x1_0000_0000); can't use add_ri.
-        self.masm.mov_ri(Reg64::R11, JIT_FALSE);
-        self.masm.add_rr(Reg64::Rax, Reg64::R11);
-        self.masm.jmp(&mut done_label);
-
-        // ── load_undef: Undefined or TheHole → return JIT_UNDEFINED ──
-        // Holey arrays store TheHole for uninitialized slots; returning
-        // undefined inline avoids the slow-path FFI call.
-        self.masm.bind_label(&mut load_undef);
-        self.masm.mov_ri(Reg64::Rax, JIT_UNDEFINED);
-        self.rax_holds = None; // RAX no longer holds a forwarded value
-        self.masm.jmp(&mut done_label);
-
-        // ── Slow path: IC miss / non-inlineable type ────────────────
-        // Null, String, Object, etc. are all handled here.
-        self.masm.bind_label(&mut slow_label);
-        let saved = self.emit_save_live_regs(id);
-
-        // Set up ABI args for jit_runtime_inline_load_keyed_smi_ic_r15:
-        //   RDI = obj, RSI = key, RDX = rt_ptrs (R15), RCX = &ic_slots
-        self.emit_load(object, Reg64::Rdi);
-        self.emit_load(key, Reg64::Rsi);
-        // Save object and key for the generic fallback path.  The IC
-        // fill call clobbers caller-saved regs, and these inputs may
-        // not be in the live set (last use) so restore_live_regs
-        // won't recover them.  Two pushes preserve 16-byte alignment.
-        self.masm.push(Reg64::Rsi); // save key
-        self.masm.push(Reg64::Rdi); // save object
-        self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
-        self.masm.lea_base_disp32(Reg64::Rcx, Reg64::Rbp, ic_base);
-
-        let ic_fill_addr =
-            jit_runtime::jit_runtime_inline_load_keyed_smi_ic_r15 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, ic_fill_addr as i64);
-        self.masm.call_reg(Reg64::R11);
-
-        // Result: RAX = value, RDX = hit flag.
-        let mut generic_label = Label::new();
-        self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
-        self.masm.je(&mut generic_label);
-        // IC-fill hit: discard saved obj + key, restore regs.
-        self.masm.add_ri(Reg64::Rsp, 16);
-        self.emit_restore_live_regs(saved);
-        self.emit_deopt_check_rax();
-        self.masm.jmp(&mut done_label);
-
-        // ── Generic fallback ────────────────────────────────────────
-        // Pop saved object+key (safe even if they were last-use regs)
-        // and reuse the original save_live_regs frame.
-        self.masm.bind_label(&mut generic_label);
-        self.masm.pop(Reg64::Rdi); // restore saved object
-        self.masm.pop(Reg64::Rsi); // restore saved key
-        if self.needs_r15 {
-            // Pass R15 (cached RT_PTRS cell) in RDX (3rd arg).
+            // ── Slow path: IC miss / OOB / non-heap ─────────────────
+            self.masm.bind_label(&mut slow_label);
+            let saved = self.emit_save_live_regs(id);
+            self.emit_load(object, Reg64::Rdi);
+            self.emit_load(key, Reg64::Rsi);
+            self.masm.push(Reg64::Rsi);
+            self.masm.push(Reg64::Rdi);
             self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
-            let stub_addr = jit_runtime::jit_runtime_lda_keyed_property_r15 as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+            self.masm.lea_base_disp32(Reg64::Rcx, Reg64::Rbp, ic_base);
+
+            let ic_fill_addr =
+                jit_runtime::jit_runtime_inline_load_keyed_smi_ic_r15 as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, ic_fill_addr as i64);
+            self.masm.call_reg(Reg64::R11);
+
+            let mut generic_label = Label::new();
+            self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
+            self.masm.je(&mut generic_label);
+            self.masm.add_ri(Reg64::Rsp, 16);
+            self.emit_restore_live_regs(saved);
+            self.emit_deopt_check_rax();
+            self.masm.jmp(&mut done_label);
+
+            // ── Generic fallback ────────────────────────────────────
+            self.masm.bind_label(&mut generic_label);
+            self.masm.pop(Reg64::Rdi);
+            self.masm.pop(Reg64::Rsi);
+            if self.needs_r15 {
+                self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
+                let stub_addr =
+                    jit_runtime::jit_runtime_lda_keyed_property_r15 as *const () as usize;
+                self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+            } else {
+                let stub_addr = jit_runtime::jit_runtime_lda_keyed_property as *const () as usize;
+                self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+            }
+            self.masm.call_reg(Reg64::R11);
+            self.emit_restore_live_regs(saved);
+            self.emit_deopt_check_rax();
+
+            // ── Slow-path exit with Smi guard ───────────────────────
+            // Slow path may return any type; verify Smi so downstream
+            // smi_guarded arithmetic is safe.
+            self.masm.bind_label(&mut done_label);
+            self.masm.movsxd_rr(Reg64::R11, Reg64::Rax);
+            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm.jne(&mut self.deopt_label);
+
+            // ── Smi fast-path exit (bypasses redundant guard) ───────
+            self.masm.bind_label(&mut smi_fast_done);
+            self.emit_store(id, Reg64::Rax);
         } else {
-            let stub_addr = jit_runtime::jit_runtime_lda_keyed_property as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+            // ── General path with full discriminant dispatch ─────────
+            let mut load_smi = Label::new();
+            let mut load_bool = Label::new();
+            let mut load_undef = Label::new();
+
+            // Heap-handle guard: non-heap values (Smi, JIT_UNDEFINED,
+            // JIT_FALSE, etc.) cannot be arrays.  Return undefined
+            // instead of falling to the slow path which may deopt.
+            self.masm.mov_ri(Reg64::Rax, JIT_HEAP_TAG);
+            self.rax_holds = None; // RAX clobbered by raw constant
+            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm.jcc(CondCode::Below, &mut load_undef);
+
+            // IC hit check: is this the same array handle?
+            self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, ic_off_handle);
+            self.masm.jne(&mut slow_label);
+
+            // Unsigned bounds check: key < cached length.
+            // Since key is a sign-extended Smi, negative values appear as
+            // very large unsigned numbers → caught by JAE.
+            self.masm.cmp_rm(Reg64::R10, Reg64::Rbp, ic_off_len);
+            self.masm.jcc(CondCode::AboveEq, &mut slow_label);
+
+            // Re-derive a *fresh* data pointer from the Vec struct pointer
+            // instead of trusting the cached data_ptr (which becomes stale
+            // after Vec reallocation — the root cause of the sieve SIGSEGV).
+            self.masm
+                .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_vec_ptr);
+            let vec_layout = cached_vec_jsvalue_layout();
+            self.masm
+                .mov_load_base_disp32(Reg64::R11, Reg64::R11, vec_layout.ptr_offset as i32);
+
+            // Compute element address: R11 + R10 * sizeof(JsValue).
+            // jsvalue_size is always 24 = 3 * 8; replace IMUL (3c latency)
+            // with LEA+SHL (1c + 1c).
+            debug_assert_eq!(
+                layout.jsvalue_size, 24,
+                "LEA chain assumes JsValue is 24 bytes"
+            );
+            self.masm.lea_scaled(Reg64::R10, Reg64::R10, Reg64::R10, 2);
+            self.masm.emit_byte(0x49); // SHL R10, 3
+            self.masm.emit_byte(0xC1);
+            self.masm.emit_byte(0xE2);
+            self.masm.emit_byte(0x03);
+            self.masm.add_rr(Reg64::R11, Reg64::R10);
+
+            // Load discriminant byte.
+            self.masm
+                .movzx_byte_base_disp32(Reg64::Rax, Reg64::R11, layout.disc_offset as i32);
+
+            // Dispatch on discriminant — Bool first (hot for boolean arrays
+            // like the sieve benchmark), then Smi.  Undefined and TheHole are
+            // handled inline (return JIT_UNDEFINED) to avoid the slow path
+            // for holey arrays.  Other types fall through to the slow path.
+            self.masm.cmp_ri(Reg64::Rax, layout.bool_disc as i32);
+            self.masm.je(&mut load_bool);
+            self.masm.cmp_ri(Reg64::Rax, layout.smi_disc as i32);
+            self.masm.je(&mut load_smi);
+            self.masm.cmp_ri(Reg64::Rax, layout.undef_disc as i32);
+            self.masm.je(&mut load_undef);
+            self.masm.cmp_ri(Reg64::Rax, layout.hole_disc as i32);
+            self.masm.je(&mut load_undef);
+            // Null, String, Object, … → slow path.
+            self.masm.jmp(&mut slow_label);
+
+            // ── load_smi: sign-extend i32 payload ───────────────────────
+            self.masm.bind_label(&mut load_smi);
+            self.masm
+                .movsxd_base_disp32(Reg64::Rax, Reg64::R11, layout.smi_payload_offset as i32);
+            self.masm.jmp(&mut done_label);
+
+            // ── load_bool: zero-extend bool, encode as JIT_FALSE/JIT_TRUE ─
+            self.masm.bind_label(&mut load_bool);
+            self.masm.movzx_byte_base_disp32(
+                Reg64::Rax,
+                Reg64::R11,
+                layout.bool_payload_offset as i32,
+            );
+            self.masm.and_ri(Reg64::Rax, 1);
+            // JIT_FALSE is a 33-bit value (0x1_0000_0000); can't use add_ri.
+            self.masm.mov_ri(Reg64::R11, JIT_FALSE);
+            self.masm.add_rr(Reg64::Rax, Reg64::R11);
+            self.masm.jmp(&mut done_label);
+
+            // ── load_undef: Undefined or TheHole → return JIT_UNDEFINED ──
+            // Holey arrays store TheHole for uninitialized slots; returning
+            // undefined inline avoids the slow-path FFI call.
+            self.masm.bind_label(&mut load_undef);
+            self.masm.mov_ri(Reg64::Rax, JIT_UNDEFINED);
+            self.rax_holds = None; // RAX no longer holds a forwarded value
+            self.masm.jmp(&mut done_label);
+
+            // ── Slow path: IC miss / non-inlineable type ────────────────
+            // Null, String, Object, etc. are all handled here.
+            self.masm.bind_label(&mut slow_label);
+            let saved = self.emit_save_live_regs(id);
+
+            // Set up ABI args for jit_runtime_inline_load_keyed_smi_ic_r15:
+            //   RDI = obj, RSI = key, RDX = rt_ptrs (R15), RCX = &ic_slots
+            self.emit_load(object, Reg64::Rdi);
+            self.emit_load(key, Reg64::Rsi);
+            // Save object and key for the generic fallback path.  The IC
+            // fill call clobbers caller-saved regs, and these inputs may
+            // not be in the live set (last use) so restore_live_regs
+            // won't recover them.  Two pushes preserve 16-byte alignment.
+            self.masm.push(Reg64::Rsi); // save key
+            self.masm.push(Reg64::Rdi); // save object
+            self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
+            self.masm.lea_base_disp32(Reg64::Rcx, Reg64::Rbp, ic_base);
+
+            let ic_fill_addr =
+                jit_runtime::jit_runtime_inline_load_keyed_smi_ic_r15 as *const () as usize;
+            self.masm.mov_ri(Reg64::R11, ic_fill_addr as i64);
+            self.masm.call_reg(Reg64::R11);
+
+            // Result: RAX = value, RDX = hit flag.
+            let mut generic_label = Label::new();
+            self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
+            self.masm.je(&mut generic_label);
+            // IC-fill hit: discard saved obj + key, restore regs.
+            self.masm.add_ri(Reg64::Rsp, 16);
+            self.emit_restore_live_regs(saved);
+            self.emit_deopt_check_rax();
+            self.masm.jmp(&mut done_label);
+
+            // ── Generic fallback ────────────────────────────────────────
+            // Pop saved object+key (safe even if they were last-use regs)
+            // and reuse the original save_live_regs frame.
+            self.masm.bind_label(&mut generic_label);
+            self.masm.pop(Reg64::Rdi); // restore saved object
+            self.masm.pop(Reg64::Rsi); // restore saved key
+            if self.needs_r15 {
+                // Pass R15 (cached RT_PTRS cell) in RDX (3rd arg).
+                self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
+                let stub_addr =
+                    jit_runtime::jit_runtime_lda_keyed_property_r15 as *const () as usize;
+                self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+            } else {
+                let stub_addr = jit_runtime::jit_runtime_lda_keyed_property as *const () as usize;
+                self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+            }
+            self.masm.call_reg(Reg64::R11);
+
+            self.emit_restore_live_regs(saved);
+            self.emit_deopt_check_rax();
+
+            // ── Common exit ─────────────────────────────────────────────
+            self.masm.bind_label(&mut done_label);
+            self.emit_store(id, Reg64::Rax);
         }
-        self.masm.call_reg(Reg64::R11);
-
-        self.emit_restore_live_regs(saved);
-        self.emit_deopt_check_rax();
-
-        // ── Common exit ─────────────────────────────────────────────
-        self.masm.bind_label(&mut done_label);
-        self.emit_store(id, Reg64::Rax);
     }
 
     /// Emit an inline fast-path for keyed **store** when the key is a
@@ -8659,7 +8766,9 @@ impl<'a> MaglevCodegen<'a> {
                     }
                     let is_load = matches!(
                         node,
-                        ValueNode::LoadNamedGeneric { .. } | ValueNode::LoadGlobal { .. }
+                        ValueNode::LoadNamedGeneric { .. }
+                            | ValueNode::LoadGlobal { .. }
+                            | ValueNode::LoadKeyedGeneric { .. }
                     );
                     if !is_load {
                         continue;
