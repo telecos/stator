@@ -6311,13 +6311,9 @@ impl<'a> MaglevCodegen<'a> {
             // deopt to the interpreter.
             let mut smi_fast_done = Label::new();
 
-            // Heap-handle guard.
-            self.masm.mov_ri(Reg64::Rax, JIT_HEAP_TAG);
-            self.rax_holds = None;
-            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
-            self.masm.jcc(CondCode::Below, &mut slow_label);
-
-            // IC hit check.
+            // IC hit check first: if the handle matches, the receiver
+            // is guaranteed to be a heap handle (the IC was filled
+            // with one), so we skip a separate heap-handle guard.
             self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, ic_off_handle);
             self.masm.jne(&mut slow_label);
 
