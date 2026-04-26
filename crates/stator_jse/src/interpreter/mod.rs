@@ -7542,24 +7542,64 @@ impl Interpreter {
                                             }
                                         }
 
-                                        // Slow path: full pattern match.
+                                        // Fast cold-start: try extract_inline_call_cache
+                                        // first (cheaper than try_inline_small_function).
+                                        // If it matches, do the context-slot update AND
+                                        // cache the raw pointer in one shot, saving a
+                                        // full iteration of slow-path overhead.
                                         if func_ba.bytecode_count() <= INLINE_BYTECODE_THRESHOLD
                                             && !func_ba.has_exception_handler()
                                         {
+                                            if let Some(info) = extract_inline_call_cache(func_ba) {
+                                                cached_call_ba = ba_ptr;
+                                                cached_call_slot = info.0;
+                                                cached_call_imm = info.1;
+                                                cached_call_op = info.2;
+                                                // Directly do the update + cache
+                                                // raw pointer (merges old iter 0+1).
+                                                if let Some(js_ctx) = func_ba.closure_context() {
+                                                    let guard = js_ctx.borrow_mut();
+                                                    if info.0 < guard.slots.len() {
+                                                        if let JsValue::Smi(val) =
+                                                            guard.slots[info.0]
+                                                        {
+                                                            let next = match info.2 {
+                                                                0 => val.checked_add(info.1),
+                                                                1 => val.checked_sub(info.1),
+                                                                2 => val.checked_add(1),
+                                                                3 => val.checked_sub(1),
+                                                                _ => None,
+                                                            };
+                                                            if let Some(r) = next {
+                                                                // SAFETY: same invariants
+                                                                // as first-hit path above.
+                                                                cached_call_slot_ptr = unsafe {
+                                                                    (*js_ctx.as_ptr())
+                                                                        .slots
+                                                                        .as_mut_ptr()
+                                                                        .add(info.0)
+                                                                };
+                                                                unsafe {
+                                                                    *cached_call_slot_ptr =
+                                                                        JsValue::Smi(r);
+                                                                }
+                                                                sa = r;
+                                                                smi_acc_spilled = false;
+                                                                smi_acc_bool = false;
+                                                                hot_acc = None;
+                                                                drop(guard);
+                                                                continue 'smi;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // Fall back to full pattern match.
                                             if let Some(result) = try_inline_small_function(
                                                 func_ba,
                                                 &[],
                                                 &frame.global_env,
                                             ) {
-                                                // Populate the cache for next call.
-                                                if let Some(info) =
-                                                    extract_inline_call_cache(func_ba)
-                                                {
-                                                    cached_call_ba = ba_ptr;
-                                                    cached_call_slot = info.0;
-                                                    cached_call_imm = info.1;
-                                                    cached_call_op = info.2;
-                                                }
                                                 match result {
                                                     JsValue::Smi(v) => {
                                                         sa = v;
