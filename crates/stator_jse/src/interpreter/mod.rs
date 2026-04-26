@@ -4708,98 +4708,84 @@ impl Interpreter {
                                                     }
                                                 }
 
-                                                // Try sum pattern: LdaGlobalStar + LdaNamedProperty(length) + ...
-                                                // + LdaKeyedProperty + Add + StaGlobal
+                                                // Try sum pattern: scan body for
+                                                // LdaKeyedProperty + Add/AddSmi + StaGlobal.
+                                                // Uses counter_idx from the header's LdaGlobal.
                                                 if batch_plan == 0xFF {
-                                                    let sh0 =
-                                                        unsafe { instructions.get_unchecked(pc) };
-                                                    if sh0.opcode == Opcode::LdaGlobalStar {
-                                                        let arr_idx2 = unsafe {
-                                                            operand_constant_pool_idx_unchecked(
-                                                                sh0, 0,
-                                                            )
+                                                    let mut has_keyed = false;
+                                                    let mut arr_idx2 = u32::MAX;
+                                                    let mut sum_store_idx = u32::MAX;
+                                                    for bi in (pc + 3)..loop_end {
+                                                        let binstr = unsafe {
+                                                            instructions.get_unchecked(bi)
                                                         };
-                                                        let sh1 = unsafe {
-                                                            instructions.get_unchecked(pc + 1)
-                                                        };
-                                                        if sh1.opcode == Opcode::LdaNamedProperty {
-                                                            // Check for LdaKeyedProperty + Add + StaGlobal
-                                                            let mut has_keyed = false;
-                                                            let mut sum_store_idx = u32::MAX;
-                                                            let mut counter_idx2 = u32::MAX;
-                                                            for bi in (pc + 2)..loop_end {
-                                                                let binstr = unsafe {
-                                                                    instructions.get_unchecked(bi)
+                                                        if binstr.opcode == Opcode::LdaGlobalStar
+                                                            && arr_idx2 == u32::MAX
+                                                        {
+                                                            arr_idx2 = unsafe {
+                                                                operand_constant_pool_idx_unchecked(
+                                                                    binstr, 0,
+                                                                )
+                                                            };
+                                                        }
+                                                        if binstr.opcode == Opcode::LdaKeyedProperty
+                                                        {
+                                                            has_keyed = true;
+                                                        }
+                                                        if binstr.opcode == Opcode::StaGlobal
+                                                            && has_keyed
+                                                            && sum_store_idx == u32::MAX
+                                                        {
+                                                            sum_store_idx = unsafe {
+                                                                operand_constant_pool_idx_unchecked(
+                                                                    binstr, 0,
+                                                                )
+                                                            };
+                                                        }
+                                                    }
+                                                    // The array is the second LdaGlobalStar if
+                                                    // the first one was the sum variable.
+                                                    // If arr_idx2 == sum_store_idx, re-scan
+                                                    // for the next LdaGlobalStar.
+                                                    if arr_idx2 == sum_store_idx {
+                                                        arr_idx2 = u32::MAX;
+                                                        for bi in (pc + 3)..loop_end {
+                                                            let binstr = unsafe {
+                                                                instructions.get_unchecked(bi)
+                                                            };
+                                                            if binstr.opcode
+                                                                == Opcode::LdaGlobalStar
+                                                            {
+                                                                let idx = unsafe {
+                                                                    operand_constant_pool_idx_unchecked(
+                                                                        binstr, 0,
+                                                                    )
                                                                 };
-                                                                if binstr.opcode
-                                                                    == Opcode::LdaKeyedProperty
-                                                                {
-                                                                    has_keyed = true;
-                                                                }
-                                                                if binstr.opcode
-                                                                    == Opcode::StaGlobal
-                                                                    && has_keyed
-                                                                    && sum_store_idx == u32::MAX
-                                                                {
-                                                                    sum_store_idx = unsafe {
-                                                                        operand_constant_pool_idx_unchecked(binstr, 0)
-                                                                    };
-                                                                }
-                                                                if binstr.opcode
-                                                                    == Opcode::StaGlobal
-                                                                    && sum_store_idx != u32::MAX
-                                                                {
-                                                                    // Second StaGlobal is the counter
-                                                                    let idx = unsafe {
-                                                                        operand_constant_pool_idx_unchecked(binstr, 0)
-                                                                    };
-                                                                    if idx != sum_store_idx {
-                                                                        counter_idx2 = idx;
-                                                                    }
-                                                                }
-                                                            }
-                                                            // Find TestLessThanJump for exit
-                                                            let mut sum_exit_pc = 0usize;
-                                                            for bi in (pc + 2)..loop_end {
-                                                                let binstr = unsafe {
-                                                                    instructions.get_unchecked(bi)
-                                                                };
-                                                                if binstr.opcode
-                                                                    == Opcode::TestLessThanJump
-                                                                {
-                                                                    if let Some(Some(target)) =
-                                                                        jump_targets.get(bi)
-                                                                    {
-                                                                        sum_exit_pc = *target;
-                                                                    }
+                                                                if idx != sum_store_idx {
+                                                                    arr_idx2 = idx;
                                                                     break;
                                                                 }
                                                             }
-                                                            if has_keyed
-                                                                && sum_store_idx != u32::MAX
-                                                                && counter_idx2 != u32::MAX
-                                                                && sum_exit_pc > 0
-                                                            {
-                                                                if let (
-                                                                    Some(c_slot),
-                                                                    Some(a_slot),
-                                                                    Some(s_slot),
-                                                                ) = (
-                                                                    frame.global_ic_get(
-                                                                        counter_idx2,
-                                                                    ),
-                                                                    frame.global_ic_get(arr_idx2),
-                                                                    frame.global_ic_get(
-                                                                        sum_store_idx,
-                                                                    ),
-                                                                ) {
-                                                                    batch_plan = 2; // sum-array-smis
-                                                                    batch_sum_counter_slot =
-                                                                        c_slot.0;
-                                                                    batch_sum_arr_slot = a_slot.0;
-                                                                    batch_sum_sum_slot = s_slot.0;
-                                                                }
-                                                            }
+                                                        }
+                                                    }
+                                                    if has_keyed
+                                                        && sum_store_idx != u32::MAX
+                                                        && arr_idx2 != u32::MAX
+                                                        && sum_store_idx != counter_idx
+                                                    {
+                                                        if let (
+                                                            Some(c_slot),
+                                                            Some(a_slot),
+                                                            Some(s_slot),
+                                                        ) = (
+                                                            frame.global_ic_get(counter_idx),
+                                                            frame.global_ic_get(arr_idx2),
+                                                            frame.global_ic_get(sum_store_idx),
+                                                        ) {
+                                                            batch_plan = 2; // sum-array-smis
+                                                            batch_sum_counter_slot = c_slot.0;
+                                                            batch_sum_arr_slot = a_slot.0;
+                                                            batch_sum_sum_slot = s_slot.0;
                                                         }
                                                     }
                                                 }
