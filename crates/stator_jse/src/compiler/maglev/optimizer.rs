@@ -2882,7 +2882,12 @@ fn fuse_call_loops(graph: &mut MaglevGraph) {
     if loops.is_empty() {
         return;
     }
-    for lp in &loops {
+    eprintln!("FUSE_LOOPS: found {} loops", loops.len());
+    for (i, lp) in loops.iter().enumerate() {
+        eprintln!(
+            "FUSE_LOOPS[{i}]: header={} preheader={} body={:?}",
+            lp.header, lp.preheader, lp.body
+        );
         // Try push-loop fusion first (most specific pattern).
         if try_fuse_push_loop(graph, lp) {
             continue;
@@ -3179,6 +3184,11 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
 fn try_fuse_push_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
     // ── 1. Simple loop: header + 1 body block ────────────────────────────
     if lp.body.len() != 2 || !lp.body.contains(&lp.header) {
+        eprintln!(
+            "PUSH_FUSION[1]: bail body_len={} header_in_body={}",
+            lp.body.len(),
+            lp.body.contains(&lp.header)
+        );
         return false;
     }
 
@@ -3194,9 +3204,13 @@ fn try_fuse_push_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
                 if_true,
                 if_false,
             }) => (*condition, *if_true, *if_false),
-            _ => return false,
+            _ => {
+                eprintln!("PUSH_FUSION[2]: bail no Branch control");
+                return false;
+            }
         };
         if !lp.body.contains(&body_bi) {
+            eprintln!("PUSH_FUSION[3]: bail body_bi not in loop body");
             return false;
         }
         condition_id = cond;
@@ -3217,7 +3231,10 @@ fn try_fuse_push_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
         };
         match &body.control {
             Some(ControlNode::Jump { target }) if *target == lp.header => {}
-            _ => return false,
+            _ => {
+                eprintln!("PUSH_FUSION[4]: bail body doesn't jump to header");
+                return false;
+            }
         }
     }
 
@@ -3232,39 +3249,73 @@ fn try_fuse_push_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
         }
         match found {
             Some(ValueNode::Int32LessThan { left, right }) => (left, right),
-            _ => return false,
+            _ => {
+                eprintln!(
+                    "PUSH_FUSION[5]: bail condition is not Int32LessThan, cond_id={condition_id:?}, node={found:?}"
+                );
+                return false;
+            }
         }
     };
 
     // cmp_left must be a Phi (IV), cmp_right must be a constant (limit).
     let _iv_limit = match find_i32_constant(graph, cmp_right) {
         Some(v) => v,
-        None => return false,
+        None => {
+            eprintln!(
+                "PUSH_FUSION[6]: bail limit not constant, right_id={cmp_right:?}, node={:?}",
+                graph.node(cmp_right)
+            );
+            return false;
+        }
     };
 
     let iv_phi_inputs = match graph.node(cmp_left) {
         Some(ValueNode::Phi { inputs }) if inputs.len() == 2 => inputs.clone(),
-        _ => return false,
+        _ => {
+            eprintln!(
+                "PUSH_FUSION[7]: bail left not Phi(2), left_id={cmp_left:?}, node={:?}",
+                graph.node(cmp_left)
+            );
+            return false;
+        }
     };
 
     let back_pred_pos = match header_preds.iter().position(|&p| p == body_block_idx) {
         Some(pos) => pos,
-        None => return false,
+        None => {
+            eprintln!("PUSH_FUSION[8]: bail body_block not in header preds");
+            return false;
+        }
     };
     let entry_pos = match header_preds.iter().position(|&p| p == lp.preheader) {
         Some(pos) => pos,
-        None => return false,
+        None => {
+            eprintln!("PUSH_FUSION[9]: bail preheader not in header preds");
+            return false;
+        }
     };
 
     let iv_init_id = iv_phi_inputs[entry_pos];
     let _iv_init_val = match find_i32_constant(graph, iv_init_id) {
         Some(v) => v,
-        None => return false,
+        None => {
+            eprintln!(
+                "PUSH_FUSION[10]: bail iv_init not constant, id={iv_init_id:?}, node={:?}",
+                graph.node(iv_init_id)
+            );
+            return false;
+        }
     };
 
     // Check step == 1.
     let iv_step = find_increment_step(graph, iv_phi_inputs[back_pred_pos], cmp_left);
     if iv_step != Some(1) {
+        eprintln!(
+            "PUSH_FUSION[11]: bail step={iv_step:?}, back_edge_id={:?}, node={:?}",
+            iv_phi_inputs[back_pred_pos],
+            graph.node(iv_phi_inputs[back_pred_pos])
+        );
         return false;
     }
 
@@ -3297,7 +3348,19 @@ fn try_fuse_push_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
                 receiver_id = recv;
                 feedback_slot = fb;
             }
-            None => return false,
+            None => {
+                let body = graph.block(body_block_idx).unwrap();
+                let body_nodes: Vec<_> = body
+                    .nodes
+                    .iter()
+                    .map(|(nid, n)| format!("  n{nid:?}: {n:?}"))
+                    .collect();
+                eprintln!(
+                    "PUSH_FUSION[12]: bail no CallArrayPush with iv arg, iv_phi={cmp_left:?}\n{}",
+                    body_nodes.join("\n")
+                );
+                return false;
+            }
         }
     }
 
@@ -3362,6 +3425,7 @@ fn try_fuse_push_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
         }
     }
 
+    eprintln!("PUSH_FUSION[OK]: fused push loop, fusion_id={fusion_id:?}");
     true
 }
 
