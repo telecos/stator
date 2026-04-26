@@ -13225,7 +13225,7 @@ fn extract_inline_call_cache(ba: &BytecodeArray) -> Option<(usize, i32, u8)> {
     Some((slot, imm, op_tag))
 }
 
-pub(super) fn try_inline_small_function(
+pub(crate) fn try_inline_small_function(
     ba: &BytecodeArray,
     args: &[JsValue],
     global_env: &Rc<RefCell<GlobalEnv>>,
