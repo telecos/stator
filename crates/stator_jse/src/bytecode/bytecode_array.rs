@@ -402,18 +402,17 @@ type GlobalIcEntry = Option<(usize, u64)>;
 /// Flat `Vec` indexed by constant-pool index for O(1) lookups.
 type SharedGlobalIc = Rc<RefCell<Option<Box<Vec<GlobalIcEntry>>>>>;
 
-/// An immutable, compact representation of the bytecode for a single
-/// JavaScript function.
-#[derive(Debug, Clone)]
-pub struct BytecodeArray {
+/// Shared, immutable template data for a compiled JavaScript function.
+///
+/// All fields that are *not* per-closure-instance live here.  A single
+/// [`Rc<SharedBytecodeTemplate>`] is shared by every closure clone of the
+/// same function, so [`BytecodeArray::clone_for_closure`] only bumps one
+/// reference count instead of ~34.
+#[derive(Debug)]
+struct SharedBytecodeTemplate {
     /// The encoded bytecode stream.
-    ///
-    /// Wrapped in [`Rc`] so that closure clones share the same allocation
-    /// instead of copying the entire byte buffer.
     bytecodes: Rc<[u8]>,
     /// Literals referenced by [`bytecodes::Opcode::LdaConstant`].
-    ///
-    /// Wrapped in [`Rc`] so that closure clones share the same pool.
     constant_pool: Rc<[ConstantPoolEntry]>,
     /// Number of virtual registers (locals + temporaries) required.
     frame_size: u32,
@@ -422,55 +421,29 @@ pub struct BytecodeArray {
     /// `Function.prototype.length` metadata for this function.
     function_length: u32,
     /// Declared or inferred function name.
-    ///
-    /// Wrapped in [`Rc`] so that closure clones share the same string.
     function_name: Rc<str>,
     /// Optional source text used by `Function.prototype.toString()`.
-    ///
-    /// Wrapped in [`Rc`] so that closure clones share the same source text.
     source_text: Option<Rc<str>>,
     /// Visible binding-to-register mapping for direct `eval()`.
-    ///
-    /// Wrapped in [`Rc`] so that closure clones share the same map.
     binding_registers: Rc<HashMap<String, i32>>,
     /// Sparse mapping from bytecode offsets to source locations.
-    ///
-    /// Wrapped in [`Rc`] so that closure clones share the same table.
     source_positions: Rc<[SourcePosition]>,
     /// Compile-time description of all inline-cache feedback slots.
-    ///
-    /// Wrapped in [`Rc`] so that closure clones share the same metadata.
     feedback_metadata: Rc<FeedbackMetadata>,
     /// Runtime inline-cache feedback shared by all clones of this function.
-    ///
-    /// Higher JIT tiers snapshot this vector when compiling so optimisation
-    /// decisions reflect observed runtime behaviour rather than empty metadata.
     feedback_vector: SharedFeedbackVector,
     /// Per-function exception handler table (pre-peephole instruction indices).
     handler_table: Rc<Vec<HandlerTableEntry>>,
     /// Lazily-populated remapped handler table (post-peephole instruction
-    /// indices).  Populated on first decode when the peephole pass compacts
-    /// instructions.
+    /// indices).
     handler_table_remapped: Rc<OnceCell<Rc<Vec<HandlerTableEntry>>>>,
     /// Lazily-populated decoded instruction cache shared across clones.
     cached_decode: DecodedBytecodeCache,
     /// Lazily-populated fusion-pattern analysis cache shared across clones.
-    ///
-    /// Used by the [`SpeculativeCallFusion`] runtime stub to avoid
-    /// re-decoding the bytecodes on every invocation.
     fusion_pattern_cache: FusionPatternCache,
     /// Cached template objects keyed by bytecode offset.
-    ///
-    /// Tagged template sites must reuse the same frozen template object across
-    /// executions of the same compiled function. Clones of this bytecode array
-    /// share the cache so repeated calls observe the same identity.
     template_cache: Rc<RefCell<HashMap<u32, crate::objects::value::JsValue>>>,
     /// `true` if this bytecode belongs to a generator function (`function*`).
-    ///
-    /// When a generator function is *called*, the interpreter creates a fresh
-    /// [`crate::objects::value::GeneratorState`] and returns it as
-    /// [`crate::objects::value::JsValue::Generator`] without executing the
-    /// body immediately.
     is_generator: bool,
     /// `true` if this bytecode belongs to an async function or async generator.
     is_async: bool,
@@ -479,159 +452,90 @@ pub struct BytecodeArray {
     /// `true` if this bytecode was compiled in strict mode (`"use strict"`).
     is_strict: bool,
     /// `true` if this bytecode belongs to an arrow function (`=>`).
-    ///
-    /// Arrow functions are not constructable — invoking them with `new`
-    /// must throw a `TypeError`.
     is_arrow: bool,
     /// `true` if this bytecode belongs to a top-level script (not a function).
-    ///
-    /// Top-level scripts use global variables (`LdaGlobal` / `StaGlobal`)
-    /// for all `var` declarations, making speculative optimisations
-    /// unreliable.  Maglev and Turbofan skip these bytecodes and let
-    /// the baseline JIT handle them instead.
     is_top_level: bool,
     // ─── Tiering state (shared across clones via Rc / Arc) ───────────────────
     /// Number of times this function has been invoked.
-    ///
-    /// Wrapped in `Rc<Cell<_>>` so that every clone of this `BytecodeArray`
-    /// (including copies moved into interpreter frames or nested closures)
-    /// contributes to the same counter.  When the count reaches
-    /// [`TIERING_THRESHOLD`] the interpreter triggers baseline JIT compilation.
     invocation_count: Rc<Cell<u32>>,
     /// Cached baseline-JIT machine code and register-file slot count.
-    ///
-    /// Stores `(code_bytes, register_file_slots)` produced by
-    /// [`BaselineCompiler`][crate::compiler::baseline::compiler::BaselineCompiler].
-    /// `None` until tiering has been triggered and compilation succeeded.
     jit_code: JitCodeCache,
     /// Fast, shared flag indicating that some baseline JIT code is cached.
     has_jit_code: Rc<Cell<bool>>,
     /// Persistent executable JIT code cache.
-    ///
-    /// Created lazily on first baseline JIT execution.  Holds a persistent
-    /// `mmap`'d code region so subsequent calls avoid syscall overhead.
     jit_executable: JitExecutableCache,
     /// Cached Maglev-JIT machine code and register-file slot count.
-    ///
-    /// Uses [`Arc`] + [`Mutex`] so the background Maglev compilation thread
-    /// can write results while the interpreter runs on the main thread.
-    /// `None` until Maglev compilation finishes successfully.
     maglev_jit_code: MaglevJitCodeCache,
     /// Persistent executable Maglev code cache.
-    ///
-    /// Lazily initialised on first Maglev execution from the raw code bytes
-    /// in [`maglev_jit_code`].  Avoids `mmap`/`munmap` per call.
     maglev_executable: MaglevExecutableCache,
     /// Fast, shared flag indicating that Maglev JIT code has been cached.
-    ///
-    /// Set atomically by the background compilation thread after storing code
-    /// into `maglev_jit_code`, allowing the hot dispatch path to skip the
-    /// mutex lock when no Maglev code is available yet.
     has_maglev_jit_code_flag: Arc<AtomicBool>,
-    /// Set to `true` (via compare-exchange) when a Maglev compilation has been
-    /// scheduled so that only one background thread is spawned per function.
+    /// Set to `true` when a Maglev compilation has been scheduled.
     maglev_compile_started: Arc<AtomicBool>,
     /// Cached Turbofan (Cranelift optimising) JIT compiled code.
-    ///
-    /// Uses [`Arc`] + [`Mutex`] so the background Turbofan compilation thread
-    /// can write results while the interpreter runs on the main thread.
-    /// `None` until Turbofan compilation finishes successfully.
     turbofan_jit_code: TurbofanJitCodeCache,
     /// Fast, shared flag indicating that Turbofan JIT code has been cached.
-    ///
-    /// Set atomically by the background compilation thread after storing code
-    /// into `turbofan_jit_code`, allowing the hot dispatch path to skip the
-    /// mutex lock when no Turbofan code is available yet.
     has_turbofan_jit_code_flag: Arc<AtomicBool>,
-    /// Set to `true` (via compare-exchange) when a Turbofan compilation has
-    /// been scheduled so that only one background thread is spawned per
-    /// function.
+    /// Set to `true` when a Turbofan compilation has been scheduled.
     turbofan_compile_started: Arc<AtomicBool>,
     /// Set to `true` when baseline JIT code has deopted at least once.
-    ///
-    /// When `true`, the interpreter skips all baseline JIT execution attempts
-    /// for this function.  This prevents the overhead of repeatedly entering
-    /// and immediately exiting JIT code that contains unsupported opcodes
-    /// (e.g. `LdaCurrentContextSlot` in closures).
     jit_baseline_deopted: Rc<Cell<bool>>,
-    /// Number of times Maglev JIT execution has deopted.  After
-    /// [`MAX_MAGLEV_DEOPT_RETRIES`] deopts the interpreter permanently
-    /// skips Maglev for this function.  Wrapped in [`Rc`] so that
-    /// [`clone_for_closure`] shares the counter across all clones — a
-    /// deopt in one clone counts toward the limit for all of them.
+    /// Number of times Maglev JIT execution has deopted.
     jit_maglev_deopt_count: Rc<Cell<u32>>,
-    /// Invocation count at which Maglev should next be attempted after a
-    /// deopt.  When deopt happens, this is set to
-    /// `invocation_count + 1`, giving the interpreter one iteration to
-    /// warm ICs before retrying JIT.  The retry limit
-    /// [`MAX_MAGLEV_DEOPT_RETRIES`] prevents infinite deopt loops.
+    /// Invocation count at which Maglev should next be attempted after a deopt.
     maglev_next_try_at: Rc<Cell<u32>>,
-    /// Captured closure context set by `CreateClosure`.
-    ///
-    /// When a function is created as a closure, this holds the enclosing
-    /// scope's context so that inner code can walk the context chain to
-    /// reach captured variables.  `None` for top-level scripts and functions
-    /// that do not close over any variables.
-    closure_context: Option<Rc<RefCell<JsContext>>>,
     /// `true` if this function's bytecode writes to any captured closure
     /// variable (via `StaContextSlot` or `StaCurrentContextSlot`).
-    ///
-    /// When `false` the [`CreateClosure`](super::bytecodes::Opcode::CreateClosure)
-    /// handler can create a lightweight clone that shares all immutable
-    /// bytecode data with the template, because the closure only *reads*
-    /// from captured variables.
     writes_closure_vars: bool,
-    /// `true` if `fn_props_set` has been called on this `BytecodeArray`.
-    ///
-    /// When `false`, `restore_closure_context` can skip the expensive
-    /// `FUNCTION_PROPS` thread-local HashMap lookup entirely.  Set to
-    /// `true` by `fn_props_set` on first write.
-    has_fn_props: Cell<bool>,
     /// Register index for the named function expression self-reference.
-    ///
-    /// When a named function expression (`var f = function g() { … }`) is
-    /// called, the interpreter writes the callee function value into this
-    /// register so that the body can reference the function by its own
-    /// name.  `None` for anonymous functions, arrow functions, and
-    /// function declarations (which are hoisted into the enclosing scope
-    /// instead).
     self_name_register: Option<i32>,
     // ─── Constructor fast-path caches (shared across clones via Rc) ──────
-    /// Cached `.prototype` value resolved during the first `[[Construct]]`
-    /// call.  Avoids repeated `proto_lookup(&ctor, "prototype")` on
-    /// subsequent `new` invocations of the same constructor.
+    /// Cached `.prototype` value resolved during the first `[[Construct]]` call.
     construct_proto_cache: Rc<RefCell<Option<crate::objects::value::JsValue>>>,
-    /// Cached "boilerplate" shape (property keys + attributes) of the
-    /// `this` object produced by the first successful `[[Construct]]` call.
-    /// Subsequent constructions clone this shape and fill in fresh values,
-    /// avoiding per-property `insert` overhead.
+    /// Cached "boilerplate" shape of the `this` object from the first
+    /// successful `[[Construct]]` call.
     construct_boilerplate: Rc<RefCell<Option<ConstructBoilerplate>>>,
     // ─── Object-literal template cache (shared across clones via Rc) ────
-    /// Cached object-literal property templates keyed by feedback-slot
-    /// index.
-    ///
-    /// On the first execution of a `CreateObjectLiteral` bytecode the
-    /// resulting [`PropertyMap`] is recorded as
-    /// [`ObjectLiteralCacheEntry::Pending`].  The second execution
-    /// promotes the entry to [`ObjectLiteralCacheEntry::Cached`] by
-    /// capturing the first object's finalised key layout.  Third and
-    /// subsequent executions clone the cached template via
-    /// [`PropertyMap::clone_shape`] for O(1) object creation.
+    /// Cached object-literal property templates keyed by feedback-slot index.
     object_literal_templates: Rc<RefCell<HashMap<u32, ObjectLiteralCacheEntry>>>,
-    /// Shared megamorphic IC state that persists across invocations of the same
-    /// function.  New [`InterpreterFrame`]s seed their per-frame IC from this
-    /// shared cache and write back on return, giving subsequent calls a warm IC
-    /// without the cost of re-populating from scratch.
-    ///
-    /// Protected by `RefCell` and lazily allocated on first IC miss.
+    /// Shared megamorphic IC state for property loads.
     shared_mega_load_ic: SharedMegamorphicIc,
-    /// Shared megamorphic IC for property stores, mirroring `shared_mega_load_ic`.
+    /// Shared megamorphic IC for property stores.
     shared_mega_store_ic: SharedMegamorphicIc,
     /// Shared prototype-chain IC that persists across invocations.
-    /// Maps feedback slot to cached inherited-property lookup results.
     shared_proto_load_ic: SharedProtoLoadIc,
     /// Shared global variable IC (constant_pool_idx → (slot_index, generation)).
     shared_global_ic: SharedGlobalIc,
+}
+
+/// An immutable, compact representation of the bytecode for a single
+/// JavaScript function.
+///
+/// Wraps a shared [`SharedBytecodeTemplate`] behind a single [`Rc`] so
+/// that [`clone_for_closure`](Self::clone_for_closure) only bumps one
+/// reference count instead of ~34.  Only the per-instance
+/// `closure_context` and `has_fn_props` fields live directly on this
+/// struct.
+#[derive(Debug)]
+pub struct BytecodeArray {
+    /// Shared template data (code, constants, tiering state, IC caches, etc.)
+    /// wrapped in a single [`Rc`] so that [`clone_for_closure`](Self::clone_for_closure)
+    /// only bumps one reference count instead of ~34.
+    inner: Rc<SharedBytecodeTemplate>,
+    /// Per-closure captured context.
+    closure_context: Option<Rc<RefCell<JsContext>>>,
+    /// Per-instance flag for function properties.
+    has_fn_props: Cell<bool>,
+}
+
+impl Clone for BytecodeArray {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Rc::clone(&self.inner),
+            closure_context: self.closure_context.clone(),
+            has_fn_props: self.has_fn_props.clone(),
+        }
+    }
 }
 
 /// Cached property-key layout captured after the first successful
@@ -678,25 +582,25 @@ impl PartialEq for BytecodeArray {
     /// caches (`template_cache`) are intentionally excluded from the
     /// comparison.
     fn eq(&self, other: &Self) -> bool {
-        self.bytecodes == other.bytecodes
-            && self.constant_pool == other.constant_pool
-            && self.frame_size == other.frame_size
-            && self.parameter_count == other.parameter_count
-            && self.function_length == other.function_length
-            && self.function_name == other.function_name
-            && self.source_text == other.source_text
-            && self.binding_registers == other.binding_registers
-            && self.source_positions == other.source_positions
-            && self.feedback_metadata == other.feedback_metadata
-            && self.handler_table == other.handler_table
-            && self.is_generator == other.is_generator
-            && self.is_async == other.is_async
-            && self.is_module == other.is_module
-            && self.is_strict == other.is_strict
-            && self.is_arrow == other.is_arrow
-            && self.is_top_level == other.is_top_level
-            && self.self_name_register == other.self_name_register
-            && self.writes_closure_vars == other.writes_closure_vars
+        self.inner.bytecodes == other.inner.bytecodes
+            && self.inner.constant_pool == other.inner.constant_pool
+            && self.inner.frame_size == other.inner.frame_size
+            && self.inner.parameter_count == other.inner.parameter_count
+            && self.inner.function_length == other.inner.function_length
+            && self.inner.function_name == other.inner.function_name
+            && self.inner.source_text == other.inner.source_text
+            && self.inner.binding_registers == other.inner.binding_registers
+            && self.inner.source_positions == other.inner.source_positions
+            && self.inner.feedback_metadata == other.inner.feedback_metadata
+            && self.inner.handler_table == other.inner.handler_table
+            && self.inner.is_generator == other.inner.is_generator
+            && self.inner.is_async == other.inner.is_async
+            && self.inner.is_module == other.inner.is_module
+            && self.inner.is_strict == other.inner.is_strict
+            && self.inner.is_arrow == other.inner.is_arrow
+            && self.inner.is_top_level == other.inner.is_top_level
+            && self.inner.self_name_register == other.inner.self_name_register
+            && self.inner.writes_closure_vars == other.inner.writes_closure_vars
     }
 }
 
@@ -725,53 +629,55 @@ impl BytecodeArray {
     ) -> Self {
         let feedback_vector = FeedbackVector::new(&feedback_metadata);
         Self {
-            bytecodes: bytecodes.into(),
-            constant_pool: constant_pool.into(),
-            frame_size,
-            parameter_count,
-            function_length: parameter_count,
-            function_name: Rc::from(""),
-            source_text: None,
-            binding_registers: Rc::new(HashMap::new()),
-            source_positions: source_positions.into(),
-            feedback_metadata: Rc::new(feedback_metadata),
-            feedback_vector: Rc::new(RefCell::new(feedback_vector)),
-            handler_table: Rc::new(handler_table),
-            handler_table_remapped: Rc::new(OnceCell::new()),
-            cached_decode: Rc::new(OnceCell::new()),
-            fusion_pattern_cache: Rc::new(OnceCell::new()),
-            template_cache: Rc::new(RefCell::new(HashMap::new())),
-            is_generator: false,
-            is_async: false,
-            is_module: false,
-            is_strict: false,
-            is_arrow: false,
-            is_top_level: false,
-            invocation_count: Rc::new(Cell::new(0)),
-            jit_code: Rc::new(RefCell::new(None)),
-            has_jit_code: Rc::new(Cell::new(false)),
-            jit_executable: Rc::new(RefCell::new(None)),
-            maglev_jit_code: Arc::new(Mutex::new(None)),
-            maglev_executable: Rc::new(RefCell::new(None)),
-            has_maglev_jit_code_flag: Arc::new(AtomicBool::new(false)),
-            maglev_compile_started: Arc::new(AtomicBool::new(false)),
-            turbofan_jit_code: Arc::new(Mutex::new(None)),
-            has_turbofan_jit_code_flag: Arc::new(AtomicBool::new(false)),
-            turbofan_compile_started: Arc::new(AtomicBool::new(false)),
-            jit_baseline_deopted: Rc::new(Cell::new(false)),
-            jit_maglev_deopt_count: Rc::new(Cell::new(0)),
-            maglev_next_try_at: Rc::new(Cell::new(0)),
+            inner: Rc::new(SharedBytecodeTemplate {
+                bytecodes: bytecodes.into(),
+                constant_pool: constant_pool.into(),
+                frame_size,
+                parameter_count,
+                function_length: parameter_count,
+                function_name: Rc::from(""),
+                source_text: None,
+                binding_registers: Rc::new(HashMap::new()),
+                source_positions: source_positions.into(),
+                feedback_metadata: Rc::new(feedback_metadata),
+                feedback_vector: Rc::new(RefCell::new(feedback_vector)),
+                handler_table: Rc::new(handler_table),
+                handler_table_remapped: Rc::new(OnceCell::new()),
+                cached_decode: Rc::new(OnceCell::new()),
+                fusion_pattern_cache: Rc::new(OnceCell::new()),
+                template_cache: Rc::new(RefCell::new(HashMap::new())),
+                is_generator: false,
+                is_async: false,
+                is_module: false,
+                is_strict: false,
+                is_arrow: false,
+                is_top_level: false,
+                invocation_count: Rc::new(Cell::new(0)),
+                jit_code: Rc::new(RefCell::new(None)),
+                has_jit_code: Rc::new(Cell::new(false)),
+                jit_executable: Rc::new(RefCell::new(None)),
+                maglev_jit_code: Arc::new(Mutex::new(None)),
+                maglev_executable: Rc::new(RefCell::new(None)),
+                has_maglev_jit_code_flag: Arc::new(AtomicBool::new(false)),
+                maglev_compile_started: Arc::new(AtomicBool::new(false)),
+                turbofan_jit_code: Arc::new(Mutex::new(None)),
+                has_turbofan_jit_code_flag: Arc::new(AtomicBool::new(false)),
+                turbofan_compile_started: Arc::new(AtomicBool::new(false)),
+                jit_baseline_deopted: Rc::new(Cell::new(false)),
+                jit_maglev_deopt_count: Rc::new(Cell::new(0)),
+                maglev_next_try_at: Rc::new(Cell::new(0)),
+                writes_closure_vars: false,
+                self_name_register: None,
+                construct_proto_cache: Rc::new(RefCell::new(None)),
+                construct_boilerplate: Rc::new(RefCell::new(None)),
+                object_literal_templates: Rc::new(RefCell::new(HashMap::new())),
+                shared_mega_load_ic: Rc::new(RefCell::new(None)),
+                shared_mega_store_ic: Rc::new(RefCell::new(None)),
+                shared_proto_load_ic: Rc::new(RefCell::new(None)),
+                shared_global_ic: Rc::new(RefCell::new(None)),
+            }),
             closure_context: None,
-            writes_closure_vars: false,
             has_fn_props: Cell::new(false),
-            self_name_register: None,
-            construct_proto_cache: Rc::new(RefCell::new(None)),
-            construct_boilerplate: Rc::new(RefCell::new(None)),
-            object_literal_templates: Rc::new(RefCell::new(HashMap::new())),
-            shared_mega_load_ic: Rc::new(RefCell::new(None)),
-            shared_mega_store_ic: Rc::new(RefCell::new(None)),
-            shared_proto_load_ic: Rc::new(RefCell::new(None)),
-            shared_global_ic: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -780,7 +686,11 @@ impl BytecodeArray {
         &self,
         bytecode_offset: u32,
     ) -> Option<crate::objects::value::JsValue> {
-        self.template_cache.borrow().get(&bytecode_offset).cloned()
+        self.inner
+            .template_cache
+            .borrow()
+            .get(&bytecode_offset)
+            .cloned()
     }
 
     /// Cache a template object for the given bytecode offset.
@@ -789,7 +699,8 @@ impl BytecodeArray {
         bytecode_offset: u32,
         value: crate::objects::value::JsValue,
     ) {
-        self.template_cache
+        self.inner
+            .template_cache
             .borrow_mut()
             .insert(bytecode_offset, value);
     }
@@ -797,7 +708,7 @@ impl BytecodeArray {
     /// Return the number of cached template objects.
     #[cfg(test)]
     pub(crate) fn template_cache_len(&self) -> usize {
-        self.template_cache.borrow().len()
+        self.inner.template_cache.borrow().len()
     }
 
     /// Mark this [`BytecodeArray`] as belonging to a generator function.
@@ -811,13 +722,15 @@ impl BytecodeArray {
     /// assert!(ba.is_generator());
     /// ```
     pub fn with_generator_flag(mut self, flag: bool) -> Self {
-        self.is_generator = flag;
+        Rc::get_mut(&mut self.inner)
+            .expect("with_generator_flag called after sharing")
+            .is_generator = flag;
         self
     }
 
     /// Returns `true` if this bytecode belongs to a `function*` generator.
     pub fn is_generator(&self) -> bool {
-        self.is_generator
+        self.inner.is_generator
     }
 
     /// Mark this [`BytecodeArray`] as belonging to an async function.
@@ -825,36 +738,42 @@ impl BytecodeArray {
     /// When combined with [`BytecodeArray::with_generator_flag`] this marks
     /// the function as an async generator (`async function*`).
     pub fn with_async_flag(mut self, flag: bool) -> Self {
-        self.is_async = flag;
+        Rc::get_mut(&mut self.inner)
+            .expect("with_async_flag called after sharing")
+            .is_async = flag;
         self
     }
 
     /// Returns `true` if this bytecode belongs to an `async function` or
     /// `async function*`.
     pub fn is_async(&self) -> bool {
-        self.is_async
+        self.inner.is_async
     }
 
     /// Mark this [`BytecodeArray`] as belonging to an ES module.
     pub fn with_module_flag(mut self, flag: bool) -> Self {
-        self.is_module = flag;
+        Rc::get_mut(&mut self.inner)
+            .expect("with_module_flag called after sharing")
+            .is_module = flag;
         self
     }
 
     /// Returns `true` if this bytecode belongs to an ES module.
     pub fn is_module(&self) -> bool {
-        self.is_module
+        self.inner.is_module
     }
 
     /// Mark this [`BytecodeArray`] as compiled in strict mode.
     pub fn with_strict_flag(mut self, flag: bool) -> Self {
-        self.is_strict = flag;
+        Rc::get_mut(&mut self.inner)
+            .expect("with_strict_flag called after sharing")
+            .is_strict = flag;
         self
     }
 
     /// Returns `true` if this bytecode was compiled in strict mode.
     pub fn is_strict(&self) -> bool {
-        self.is_strict
+        self.inner.is_strict
     }
 
     /// Mark this [`BytecodeArray`] as belonging to an arrow function.
@@ -862,13 +781,15 @@ impl BytecodeArray {
     /// Arrow functions are not constructable — invoking them with `new`
     /// must throw a `TypeError` per ES §15.3.4.
     pub fn with_arrow_flag(mut self, flag: bool) -> Self {
-        self.is_arrow = flag;
+        Rc::get_mut(&mut self.inner)
+            .expect("with_arrow_flag called after sharing")
+            .is_arrow = flag;
         self
     }
 
     /// Returns `true` if this bytecode belongs to an arrow function (`=>`).
     pub fn is_arrow(&self) -> bool {
-        self.is_arrow
+        self.inner.is_arrow
     }
 
     /// Returns `true` when the function body is trivial — it only sets up
@@ -878,7 +799,7 @@ impl BytecodeArray {
     /// The construct fast-path uses this to skip interpreter re-entry.
     pub fn has_trivial_body(&self) -> bool {
         use super::bytecodes::{Opcode, decode};
-        let instrs = match decode(&self.bytecodes) {
+        let instrs = match decode(&self.inner.bytecodes) {
             Ok(v) => v,
             Err(_) => return false,
         };
@@ -903,17 +824,21 @@ impl BytecodeArray {
 
     /// Mark this bytecode as a top-level script.
     pub fn set_top_level(&mut self, flag: bool) {
-        self.is_top_level = flag;
+        Rc::get_mut(&mut self.inner)
+            .expect("set_top_level called after sharing")
+            .is_top_level = flag;
     }
 
     /// Returns `true` if this bytecode belongs to a top-level script.
     pub fn is_top_level(&self) -> bool {
-        self.is_top_level
+        self.inner.is_top_level
     }
 
     /// Builder-style: mark this bytecode as a top-level script.
     pub fn with_top_level_flag(mut self, flag: bool) -> Self {
-        self.is_top_level = flag;
+        Rc::get_mut(&mut self.inner)
+            .expect("with_top_level_flag called after sharing")
+            .is_top_level = flag;
         self
     }
 
@@ -928,7 +853,7 @@ impl BytecodeArray {
     /// [`OnceCell::get_or_init`] on the returned cell so that the expensive
     /// bytecode decode + pattern match runs at most once per template.
     pub fn fusion_pattern_cache(&self) -> &OnceCell<Option<(usize, i64)>> {
-        &self.fusion_pattern_cache
+        &self.inner.fusion_pattern_cache
     }
 
     /// Attach a captured closure context to this [`BytecodeArray`].
@@ -939,7 +864,7 @@ impl BytecodeArray {
     /// Returns `true` if this function's bytecode writes to any captured
     /// closure variable.
     pub fn writes_closure_vars(&self) -> bool {
-        self.writes_closure_vars
+        self.inner.writes_closure_vars
     }
 
     /// Returns `true` if `fn_props_set` has been called on this bytecode
@@ -958,7 +883,9 @@ impl BytecodeArray {
 
     /// Mark whether this function writes to captured closure variables.
     pub fn with_writes_closure_vars(mut self, flag: bool) -> Self {
-        self.writes_closure_vars = flag;
+        Rc::get_mut(&mut self.inner)
+            .expect("with_writes_closure_vars called after sharing")
+            .writes_closure_vars = flag;
         self
     }
 
@@ -970,19 +897,22 @@ impl BytecodeArray {
     /// this operation O(1) regardless of function size.
     pub fn clone_for_closure(&self, ctx: Option<Rc<RefCell<JsContext>>>) -> Self {
         Self {
+            inner: Rc::clone(&self.inner),
             closure_context: ctx,
-            ..self.clone()
+            has_fn_props: Cell::new(false),
         }
     }
 
     /// Register index for a named function expression's self-reference.
     pub fn self_name_register(&self) -> Option<i32> {
-        self.self_name_register
+        self.inner.self_name_register
     }
 
     /// Set the self-name register for named function expressions.
     pub fn with_self_name_register(mut self, reg: i32) -> Self {
-        self.self_name_register = Some(reg);
+        Rc::get_mut(&mut self.inner)
+            .expect("with_self_name_register called after sharing")
+            .self_name_register = Some(reg);
         self
     }
 
@@ -990,24 +920,24 @@ impl BytecodeArray {
 
     /// Returns the cached constructor `.prototype` value, if populated.
     pub fn cached_construct_proto(&self) -> Option<crate::objects::value::JsValue> {
-        self.construct_proto_cache.borrow().clone()
+        self.inner.construct_proto_cache.borrow().clone()
     }
 
     /// Stores a constructor `.prototype` value for reuse on subsequent
     /// `[[Construct]]` calls.
     pub fn set_construct_proto_cache(&self, proto: crate::objects::value::JsValue) {
-        *self.construct_proto_cache.borrow_mut() = Some(proto);
+        *self.inner.construct_proto_cache.borrow_mut() = Some(proto);
     }
 
     /// Returns a clone of the cached construct boilerplate, if populated.
     pub fn cached_construct_boilerplate(&self) -> Option<ConstructBoilerplate> {
-        self.construct_boilerplate.borrow().clone()
+        self.inner.construct_boilerplate.borrow().clone()
     }
 
     /// Stores a construct boilerplate captured from the first successful
     /// `[[Construct]]` execution.
     pub fn set_construct_boilerplate(&self, bp: ConstructBoilerplate) {
-        *self.construct_boilerplate.borrow_mut() = Some(bp);
+        *self.inner.construct_boilerplate.borrow_mut() = Some(bp);
     }
 
     // ─── Object-literal template cache API ───────────────────────────────
@@ -1015,7 +945,7 @@ impl BytecodeArray {
     /// If a cached object-literal template exists for `slot`, returns a
     /// fresh [`PropertyMap`] instantiated from it.
     pub fn clone_object_literal_template(&self, slot: u32) -> Option<PropertyMap> {
-        let borrow = self.object_literal_templates.borrow();
+        let borrow = self.inner.object_literal_templates.borrow();
         match borrow.get(&slot) {
             Some(ObjectLiteralCacheEntry::Cached(template)) => Some(template.instantiate()),
             _ => None,
@@ -1031,7 +961,7 @@ impl BytecodeArray {
     /// no properties (nothing worth caching).
     pub fn promote_object_literal_template(&self, slot: u32) -> Option<PropertyMap> {
         let pending_rc = {
-            let borrow = self.object_literal_templates.borrow();
+            let borrow = self.inner.object_literal_templates.borrow();
             match borrow.get(&slot) {
                 Some(ObjectLiteralCacheEntry::Pending(rc)) => Some(Rc::clone(rc)),
                 _ => None,
@@ -1042,7 +972,8 @@ impl BytecodeArray {
         let template = ObjectLiteralTemplate::capture(&first_borrow)?;
         let cloned = template.instantiate();
         drop(first_borrow);
-        self.object_literal_templates
+        self.inner
+            .object_literal_templates
             .borrow_mut()
             .insert(slot, ObjectLiteralCacheEntry::Cached(Box::new(template)));
         Some(cloned)
@@ -1063,7 +994,7 @@ impl BytecodeArray {
         slot: u32,
         values: Vec<JsValue>,
     ) -> Option<PropertyMap> {
-        let borrow = self.object_literal_templates.borrow();
+        let borrow = self.inner.object_literal_templates.borrow();
         match borrow.get(&slot) {
             Some(ObjectLiteralCacheEntry::Cached(template)) => {
                 Some(template.instantiate_with_values(values))
@@ -1080,7 +1011,7 @@ impl BytecodeArray {
         values: Vec<JsValue>,
     ) -> Option<PropertyMap> {
         let pending_rc = {
-            let borrow = self.object_literal_templates.borrow();
+            let borrow = self.inner.object_literal_templates.borrow();
             match borrow.get(&slot) {
                 Some(ObjectLiteralCacheEntry::Pending(rc)) => Some(Rc::clone(rc)),
                 _ => None,
@@ -1091,7 +1022,8 @@ impl BytecodeArray {
         let template = ObjectLiteralTemplate::capture(&first_borrow)?;
         let cloned = template.instantiate_with_values(values);
         drop(first_borrow);
-        self.object_literal_templates
+        self.inner
+            .object_literal_templates
             .borrow_mut()
             .insert(slot, ObjectLiteralCacheEntry::Cached(Box::new(template)));
         Some(cloned)
@@ -1100,7 +1032,8 @@ impl BytecodeArray {
     /// Records a [`Pending`](ObjectLiteralCacheEntry::Pending)
     /// first-instance for `slot`.
     pub fn set_object_literal_pending(&self, slot: u32, map: Rc<RefCell<PropertyMap>>) {
-        self.object_literal_templates
+        self.inner
+            .object_literal_templates
             .borrow_mut()
             .insert(slot, ObjectLiteralCacheEntry::Pending(map));
     }
@@ -1120,7 +1053,7 @@ impl BytecodeArray {
     /// The caller must ensure the [`BytecodeArray`] outlives the pointer.
     #[cfg(all(target_arch = "x86_64", unix))]
     pub(crate) fn get_cached_template_ptr(&self, slot: u32) -> *const ObjectLiteralTemplate {
-        let borrow = self.object_literal_templates.borrow();
+        let borrow = self.inner.object_literal_templates.borrow();
         match borrow.get(&slot) {
             Some(ObjectLiteralCacheEntry::Cached(template)) => {
                 &**template as *const ObjectLiteralTemplate
@@ -1136,7 +1069,7 @@ impl BytecodeArray {
         &self,
         slot: u32,
     ) -> Option<Rc<RefCell<PropertyMap>>> {
-        let borrow = self.object_literal_templates.borrow();
+        let borrow = self.inner.object_literal_templates.borrow();
         match borrow.get(&slot) {
             Some(ObjectLiteralCacheEntry::Cached(template)) => {
                 Some(acquire_object_rc_from_template(template))
@@ -1157,7 +1090,7 @@ impl BytecodeArray {
         slot: u32,
     ) -> Option<Rc<RefCell<PropertyMap>>> {
         // SAFETY: single-threaded interpreter — no concurrent borrows.
-        let map = unsafe { &*self.object_literal_templates.as_ptr() };
+        let map = unsafe { &*self.inner.object_literal_templates.as_ptr() };
         match map.get(&slot) {
             Some(ObjectLiteralCacheEntry::Cached(template)) => {
                 Some(acquire_object_rc_from_template(template))
@@ -1185,7 +1118,7 @@ impl BytecodeArray {
         slot: u32,
     ) -> Option<&ObjectLiteralTemplate> {
         // SAFETY: single-threaded interpreter — no concurrent borrows.
-        let map = unsafe { &*self.object_literal_templates.as_ptr() };
+        let map = unsafe { &*self.inner.object_literal_templates.as_ptr() };
         match map.get(&slot) {
             Some(ObjectLiteralCacheEntry::Cached(template)) => Some(template),
             _ => None,
@@ -1205,7 +1138,7 @@ impl BytecodeArray {
         values: &[JsValue],
     ) -> Option<Rc<RefCell<PropertyMap>>> {
         // SAFETY: single-threaded interpreter — no concurrent borrows.
-        let map = unsafe { &*self.object_literal_templates.as_ptr() };
+        let map = unsafe { &*self.inner.object_literal_templates.as_ptr() };
         match map.get(&slot) {
             Some(ObjectLiteralCacheEntry::Cached(template)) => Some(
                 acquire_object_rc_from_template_with_values(template, values),
@@ -1227,7 +1160,7 @@ impl BytecodeArray {
         map_rc: Rc<RefCell<PropertyMap>>,
     ) {
         // SAFETY: single-threaded interpreter — no concurrent borrows.
-        let cache = unsafe { &mut *self.object_literal_templates.as_ptr() };
+        let cache = unsafe { &mut *self.inner.object_literal_templates.as_ptr() };
         cache.insert(slot, ObjectLiteralCacheEntry::Pending(map_rc));
     }
 
@@ -1241,7 +1174,7 @@ impl BytecodeArray {
         slot: u32,
     ) -> Option<Rc<RefCell<PropertyMap>>> {
         let pending_rc = {
-            let borrow = self.object_literal_templates.borrow();
+            let borrow = self.inner.object_literal_templates.borrow();
             match borrow.get(&slot) {
                 Some(ObjectLiteralCacheEntry::Pending(rc)) => Some(Rc::clone(rc)),
                 _ => None,
@@ -1253,7 +1186,8 @@ impl BytecodeArray {
         let rc = acquire_object_rc_from_template(&template);
         drop(first_borrow);
         template.pre_warm_pool();
-        self.object_literal_templates
+        self.inner
+            .object_literal_templates
             .borrow_mut()
             .insert(slot, ObjectLiteralCacheEntry::Cached(Box::new(template)));
         Some(rc)
@@ -1266,7 +1200,7 @@ impl BytecodeArray {
         slot: u32,
         values: &[JsValue],
     ) -> Option<Rc<RefCell<PropertyMap>>> {
-        let borrow = self.object_literal_templates.borrow();
+        let borrow = self.inner.object_literal_templates.borrow();
         match borrow.get(&slot) {
             Some(ObjectLiteralCacheEntry::Cached(template)) => Some(
                 acquire_object_rc_from_template_with_values(template, values),
@@ -1287,7 +1221,7 @@ impl BytecodeArray {
         values: &[JsValue],
     ) -> Option<Rc<RefCell<PropertyMap>>> {
         let pending_rc = {
-            let borrow = self.object_literal_templates.borrow();
+            let borrow = self.inner.object_literal_templates.borrow();
             match borrow.get(&slot) {
                 Some(ObjectLiteralCacheEntry::Pending(rc)) => Some(Rc::clone(rc)),
                 _ => None,
@@ -1302,7 +1236,8 @@ impl BytecodeArray {
         // same function invocation find pool entries immediately,
         // avoiding per-object Rc::new allocation.
         template.pre_warm_pool();
-        self.object_literal_templates
+        self.inner
+            .object_literal_templates
             .borrow_mut()
             .insert(slot, ObjectLiteralCacheEntry::Cached(Box::new(template)));
         Some(rc)
@@ -1313,65 +1248,65 @@ impl BytecodeArray {
     /// Returns a clone of the shared megamorphic load IC, if one has been
     /// populated by a previous invocation.
     pub fn shared_mega_load_ic(&self) -> Option<Box<crate::interpreter::MegamorphicIc>> {
-        self.shared_mega_load_ic.borrow().clone()
+        self.inner.shared_mega_load_ic.borrow().clone()
     }
 
     /// Writes back a megamorphic load IC to the shared cache so that
     /// subsequent invocations start warm.
     pub fn set_shared_mega_load_ic(&self, ic: Box<crate::interpreter::MegamorphicIc>) {
-        *self.shared_mega_load_ic.borrow_mut() = Some(ic);
+        *self.inner.shared_mega_load_ic.borrow_mut() = Some(ic);
     }
 
     /// Returns a clone of the shared megamorphic store IC, if one has been
     /// populated by a previous invocation.
     pub fn shared_mega_store_ic(&self) -> Option<Box<crate::interpreter::MegamorphicIc>> {
-        self.shared_mega_store_ic.borrow().clone()
+        self.inner.shared_mega_store_ic.borrow().clone()
     }
 
     /// Writes back a megamorphic store IC to the shared cache so that
     /// subsequent invocations start warm.
     pub fn set_shared_mega_store_ic(&self, ic: Box<crate::interpreter::MegamorphicIc>) {
-        *self.shared_mega_store_ic.borrow_mut() = Some(ic);
+        *self.inner.shared_mega_store_ic.borrow_mut() = Some(ic);
     }
 
     /// Returns a clone of the shared prototype-chain load IC, if populated.
     pub fn shared_proto_load_ic(&self) -> Option<Box<crate::interpreter::ProtoIcCache>> {
-        self.shared_proto_load_ic.borrow().clone()
+        self.inner.shared_proto_load_ic.borrow().clone()
     }
 
     /// Writes back a prototype-chain load IC to the shared cache.
     pub fn set_shared_proto_load_ic(&self, ic: Box<crate::interpreter::ProtoIcCache>) {
-        *self.shared_proto_load_ic.borrow_mut() = Some(ic);
+        *self.inner.shared_proto_load_ic.borrow_mut() = Some(ic);
     }
 
     /// Returns a clone of the shared global variable IC, if populated.
     pub fn shared_global_ic(&self) -> Option<Box<Vec<GlobalIcEntry>>> {
-        self.shared_global_ic.borrow().clone()
+        self.inner.shared_global_ic.borrow().clone()
     }
 
     /// Writes back a global variable IC to the shared cache.
     pub fn set_shared_global_ic(&self, ic: Box<Vec<GlobalIcEntry>>) {
-        *self.shared_global_ic.borrow_mut() = Some(ic);
+        *self.inner.shared_global_ic.borrow_mut() = Some(ic);
     }
 
     /// The raw encoded bytecode bytes.
     pub fn bytecodes(&self) -> &[u8] {
-        &self.bytecodes
+        &self.inner.bytecodes
     }
 
     /// The constant pool for this function.
     pub fn constant_pool(&self) -> &[ConstantPoolEntry] {
-        &self.constant_pool
+        &self.inner.constant_pool
     }
 
     /// Number of virtual registers required by this function's frame.
     pub fn frame_size(&self) -> u32 {
-        self.frame_size
+        self.inner.frame_size
     }
 
     /// Number of formal parameters declared by this function.
     pub fn parameter_count(&self) -> u32 {
-        self.parameter_count
+        self.inner.parameter_count
     }
 
     /// Number of decoded bytecode instructions after peephole fusion.
@@ -1386,83 +1321,95 @@ impl BytecodeArray {
 
     /// Returns `true` when this function has at least one exception handler.
     pub fn has_exception_handler(&self) -> bool {
-        !self.handler_table.is_empty()
+        !self.inner.handler_table.is_empty()
     }
 
     /// `Function.prototype.length` for this function.
     pub fn function_length(&self) -> u32 {
-        self.function_length
+        self.inner.function_length
     }
 
     /// Set `Function.prototype.length` metadata.
     pub fn with_function_length(mut self, length: u32) -> Self {
-        self.function_length = length;
+        Rc::get_mut(&mut self.inner)
+            .expect("with_function_length called after sharing")
+            .function_length = length;
         self
     }
 
     /// Declared or inferred function name.
     pub fn function_name(&self) -> &str {
-        &self.function_name
+        &self.inner.function_name
     }
 
     /// Set the declared or inferred function name.
     pub fn with_function_name(mut self, name: impl Into<String>) -> Self {
-        self.function_name = Rc::from(name.into());
+        Rc::get_mut(&mut self.inner)
+            .expect("with_function_name called after sharing")
+            .function_name = Rc::from(name.into());
         self
     }
 
     /// Source text used by `Function.prototype.toString()`, if any.
     pub fn source_text(&self) -> Option<&str> {
-        self.source_text.as_deref()
+        self.inner.source_text.as_deref()
     }
 
     /// Set the source text used by `Function.prototype.toString()`.
     pub fn with_source_text(mut self, source_text: impl Into<String>) -> Self {
-        self.source_text = Some(Rc::from(source_text.into()));
+        Rc::get_mut(&mut self.inner)
+            .expect("with_source_text called after sharing")
+            .source_text = Some(Rc::from(source_text.into()));
         self
     }
 
     /// Visible binding-to-register mapping for direct `eval()`.
     pub fn binding_registers(&self) -> &HashMap<String, i32> {
-        &self.binding_registers
+        &self.inner.binding_registers
     }
 
     /// Set the binding-to-register mapping used by direct `eval()`.
     pub fn with_binding_registers(mut self, binding_registers: HashMap<String, i32>) -> Self {
-        self.binding_registers = Rc::new(binding_registers);
+        Rc::get_mut(&mut self.inner)
+            .expect("with_binding_registers called after sharing")
+            .binding_registers = Rc::new(binding_registers);
         self
     }
 
     /// The source-position table (may be empty if debug info was stripped).
     pub fn source_positions(&self) -> &[SourcePosition] {
-        &self.source_positions
+        &self.inner.source_positions
     }
 
     /// The compile-time feedback metadata for all inline-cache slots.
     pub fn feedback_metadata(&self) -> &FeedbackMetadata {
-        &self.feedback_metadata
+        &self.inner.feedback_metadata
     }
 
     /// Return a snapshot of the current runtime feedback vector.
     pub fn feedback_vector_snapshot(&self) -> FeedbackVector {
-        self.feedback_vector.borrow().clone()
+        self.inner.feedback_vector.borrow().clone()
     }
 
     /// Return the current inline-cache state for `slot`.
     pub fn feedback_state(&self, slot: u32) -> Option<InlineCacheState> {
-        self.feedback_vector.borrow().get_state(slot)
+        self.inner.feedback_vector.borrow().get_state(slot)
     }
 
     /// Advance the feedback state for `slot` if `new_state` is hotter.
     pub fn feedback_transition(&self, slot: u32, new_state: InlineCacheState) -> bool {
-        self.feedback_vector
+        self.inner
+            .feedback_vector
             .borrow_mut()
             .transition(slot, new_state)
     }
 
     /// Overwrite the feedback state for `slot`.
     pub fn set_feedback_state(&self, slot: u32, state: InlineCacheState) -> bool {
-        self.feedback_vector.borrow_mut().set_state(slot, state)
+        self.inner
+            .feedback_vector
+            .borrow_mut()
+            .set_state(slot, state)
     }
 
     /// The per-function exception handler table.
@@ -1479,16 +1426,16 @@ impl BytecodeArray {
         // If we have a remapped table, we can't return a direct reference to
         // it because it's behind RefCell.  Fall back to the original table
         // (which is only used before first decode in practice).
-        self.handler_table.as_slice()
+        self.inner.handler_table.as_slice()
     }
 
     /// Return a shared reference-counted handle to the exception handler
     /// table, remapped for post-peephole instruction indices if available.
     pub(crate) fn shared_handler_table(&self) -> Rc<Vec<HandlerTableEntry>> {
-        if let Some(remapped) = self.handler_table_remapped.get() {
+        if let Some(remapped) = self.inner.handler_table_remapped.get() {
             Rc::clone(remapped)
         } else {
-            Rc::clone(&self.handler_table)
+            Rc::clone(&self.inner.handler_table)
         }
     }
 
@@ -1496,18 +1443,18 @@ impl BytecodeArray {
     ///
     /// Returns an error if the byte stream is malformed.
     pub fn instructions(&self) -> StatorResult<Vec<Instruction>> {
-        bytecodes::decode(&self.bytecodes)
+        bytecodes::decode(&self.inner.bytecodes)
     }
 
     fn ensure_decoded_instructions(&self) -> StatorResult<&Rc<DecodedBytecode>> {
-        if self.cached_decode.get().is_none() {
+        if self.inner.cached_decode.get().is_none() {
             let (mut instructions, mut byte_offsets) =
-                bytecodes::decode_with_byte_offsets(&self.bytecodes)?;
+                bytecodes::decode_with_byte_offsets(&self.inner.bytecodes)?;
 
             let remap = peephole::fuse_instructions_with_remap(
                 &mut instructions,
                 &mut byte_offsets,
-                Some(self.constant_pool()),
+                Some(&self.inner.constant_pool),
             );
 
             // Helper: map a pre-peephole instruction index to the first
@@ -1523,6 +1470,7 @@ impl BytecodeArray {
             // Remap the handler table entries from pre-peephole instruction
             // indices to post-peephole instruction indices.
             let remapped_handlers: Vec<HandlerTableEntry> = self
+                .inner
                 .handler_table
                 .iter()
                 .map(|entry| HandlerTableEntry {
@@ -1536,7 +1484,10 @@ impl BytecodeArray {
             // SAFETY: Interior mutability is acceptable here — the handler
             // table is initialised once during first decode, just like
             // cached_decode.
-            let _ = self.handler_table_remapped.set(Rc::new(remapped_handlers));
+            let _ = self
+                .inner
+                .handler_table_remapped
+                .set(Rc::new(remapped_handlers));
 
             let mut jump_targets = vec![None; instructions.len()];
             for (instruction_index, instruction) in instructions.iter().enumerate() {
@@ -1562,9 +1513,10 @@ impl BytecodeArray {
                 }
             }
             let decoded = Rc::new((instructions, byte_offsets, jump_targets));
-            let _ = self.cached_decode.set(decoded);
+            let _ = self.inner.cached_decode.set(decoded);
         }
         Ok(self
+            .inner
             .cached_decode
             .get()
             .expect("decoded bytecode cache must be initialized"))
@@ -1572,7 +1524,7 @@ impl BytecodeArray {
 
     /// Decode the bytecode stream once and return cached instructions, byte
     /// offsets, and pre-computed jump targets on subsequent calls.
-    pub fn decoded_instructions(&mut self) -> StatorResult<DecodedBytecodeRef<'_>> {
+    pub fn decoded_instructions(&self) -> StatorResult<DecodedBytecodeRef<'_>> {
         let decoded = self.ensure_decoded_instructions()?;
         Ok((
             decoded.0.as_slice(),
@@ -1590,7 +1542,7 @@ impl BytecodeArray {
     ///
     /// Returns `None` if `index` is out of range.
     pub fn get_constant(&self, index: u32) -> Option<&ConstantPoolEntry> {
-        self.constant_pool.get(index as usize)
+        self.inner.constant_pool.get(index as usize)
     }
 
     /// Return the [`SourcePosition`] that covers `bytecode_offset`, or `None`
@@ -1601,9 +1553,10 @@ impl BytecodeArray {
     /// is ≤ the given offset.
     pub fn source_position_for(&self, bytecode_offset: u32) -> Option<&SourcePosition> {
         let idx = self
+            .inner
             .source_positions
             .partition_point(|sp| sp.bytecode_offset <= bytecode_offset);
-        idx.checked_sub(1).map(|i| &self.source_positions[i])
+        idx.checked_sub(1).map(|i| &self.inner.source_positions[i])
     }
 
     // ─── Tiering helpers ──────────────────────────────────────────────────────
@@ -1617,7 +1570,7 @@ impl BytecodeArray {
     /// counter.
     #[inline(always)]
     pub fn increment_invocation_count(&self) -> u32 {
-        let old = self.invocation_count.get();
+        let old = self.inner.invocation_count.get();
         // Saturate at u32::MAX to avoid overflow while still
         // progressing past TURBOFAN_TIERING_THRESHOLD.  The tiering
         // checks in run_inner only fire on equality, so incrementing
@@ -1626,13 +1579,13 @@ impl BytecodeArray {
         // invocation_count against next_try_at, and capping it early
         // can permanently lock out re-optimisation.
         let new = old.saturating_add(1);
-        self.invocation_count.set(new);
+        self.inner.invocation_count.set(new);
         new
     }
 
     /// Returns the current invocation count without modifying it.
     pub fn invocation_count(&self) -> u32 {
-        self.invocation_count.get()
+        self.inner.invocation_count.get()
     }
 
     /// Store baseline-JIT cached executable code produced by the compiler.
@@ -1646,16 +1599,16 @@ impl BytecodeArray {
         &self,
         cached: crate::compiler::baseline::compiler::CachedExecutableCode,
     ) {
-        *self.jit_code.borrow_mut() = Some(cached);
-        self.has_jit_code.set(true);
+        *self.inner.jit_code.borrow_mut() = Some(cached);
+        self.inner.has_jit_code.set(true);
     }
 
     /// Store baseline-JIT machine code produced by the compiler (non-JIT
     /// platform fallback).
     #[cfg(not(all(target_arch = "x86_64", unix)))]
     pub fn store_jit_code(&self, code: Vec<u8>, register_file_slots: usize) {
-        *self.jit_code.borrow_mut() = Some((code, register_file_slots));
-        self.has_jit_code.set(true);
+        *self.inner.jit_code.borrow_mut() = Some((code, register_file_slots));
+        self.inner.has_jit_code.set(true);
     }
 
     /// Fast check for whether any JIT tier has compiled code for this function.
@@ -1665,9 +1618,12 @@ impl BytecodeArray {
     /// an earlier tier is already compiled.
     #[inline(always)]
     pub fn has_any_jit_code(&self) -> bool {
-        self.has_jit_code.get()
-            || self.has_maglev_jit_code_flag.load(Ordering::Relaxed)
-            || self.has_turbofan_jit_code_flag.load(Ordering::Relaxed)
+        self.inner.has_jit_code.get()
+            || self.inner.has_maglev_jit_code_flag.load(Ordering::Relaxed)
+            || self
+                .inner
+                .has_turbofan_jit_code_flag
+                .load(Ordering::Relaxed)
     }
 
     /// Borrows the cached JIT executable code, or returns `None` if baseline
@@ -1679,7 +1635,7 @@ impl BytecodeArray {
     pub fn try_get_jit_code(
         &self,
     ) -> std::cell::Ref<'_, Option<crate::compiler::baseline::compiler::CachedExecutableCode>> {
-        self.jit_code.borrow()
+        self.inner.jit_code.borrow()
     }
 
     /// Returns a clone of the cached JIT machine code and register-file slot
@@ -1687,12 +1643,13 @@ impl BytecodeArray {
     /// (non-JIT platform fallback).
     #[cfg(not(all(target_arch = "x86_64", unix)))]
     pub fn try_get_jit_code(&self) -> Option<(Vec<u8>, usize)> {
-        self.jit_code.borrow().clone()
+        self.inner.jit_code.borrow().clone()
     }
 
     /// Returns `true` when Maglev JIT code has been cached for this function.
     pub fn has_maglev_jit_code(&self) -> bool {
-        self.maglev_jit_code
+        self.inner
+            .maglev_jit_code
             .lock()
             .ok()
             .map(|g| g.is_some())
@@ -1714,7 +1671,7 @@ impl BytecodeArray {
         if !self.has_maglev_jit_code() {
             return false;
         }
-        for entry in self.constant_pool() {
+        for entry in self.inner.constant_pool.iter() {
             if let ConstantPoolEntry::Function(nested_ba) = entry {
                 // Recursively check nested functions at all depths.
                 if !nested_ba.has_all_maglev_jit_code() && !nested_ba.maglev_compile_attempted() {
@@ -1730,7 +1687,7 @@ impl BytecodeArray {
     /// The background compilation thread receives this `Arc` and writes the
     /// compiled code into it when compilation succeeds.
     pub fn maglev_jit_cache_arc(&self) -> MaglevJitCodeCache {
-        Arc::clone(&self.maglev_jit_code)
+        Arc::clone(&self.inner.maglev_jit_code)
     }
 
     /// Returns an [`Arc`] clone of the Maglev JIT-code-ready flag.
@@ -1738,7 +1695,7 @@ impl BytecodeArray {
     /// The background compilation thread sets this to `true` after storing
     /// compiled code, so the hot dispatch path can skip the mutex lock.
     pub fn maglev_jit_code_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.has_maglev_jit_code_flag)
+        Arc::clone(&self.inner.has_maglev_jit_code_flag)
     }
 
     /// Attempt to atomically mark this function as having a Maglev compilation
@@ -1748,7 +1705,8 @@ impl BytecodeArray {
     /// (the previous state was `false`); returns `false` if a compilation was
     /// already started or has been scheduled by another caller.
     pub fn try_start_maglev_compile(&self) -> bool {
-        self.maglev_compile_started
+        self.inner
+            .maglev_compile_started
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
@@ -1756,13 +1714,14 @@ impl BytecodeArray {
     /// Returns `true` if a Maglev compilation has been attempted for this
     /// function (regardless of whether it succeeded or failed).
     pub fn maglev_compile_attempted(&self) -> bool {
-        self.maglev_compile_started.load(Ordering::Acquire)
+        self.inner.maglev_compile_started.load(Ordering::Acquire)
     }
 
     /// Returns `true` if Turbofan compilation has finished and compiled code
     /// is available.
     pub fn has_turbofan_jit_code(&self) -> bool {
-        self.turbofan_jit_code
+        self.inner
+            .turbofan_jit_code
             .lock()
             .ok()
             .map(|g| g.is_some())
@@ -1774,7 +1733,7 @@ impl BytecodeArray {
     /// The background compilation thread receives this `Arc` and writes the
     /// compiled [`TurbofanCompiledCode`] into it when compilation succeeds.
     pub fn turbofan_jit_cache_arc(&self) -> TurbofanJitCodeCache {
-        Arc::clone(&self.turbofan_jit_code)
+        Arc::clone(&self.inner.turbofan_jit_code)
     }
 
     /// Returns an [`Arc`] clone of the Turbofan JIT-code-ready flag.
@@ -1782,7 +1741,7 @@ impl BytecodeArray {
     /// The background compilation thread sets this to `true` after storing
     /// compiled code, so the hot dispatch path can skip the mutex lock.
     pub fn turbofan_jit_code_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.has_turbofan_jit_code_flag)
+        Arc::clone(&self.inner.has_turbofan_jit_code_flag)
     }
 
     /// Attempt to atomically mark this function as having a Turbofan
@@ -1792,7 +1751,8 @@ impl BytecodeArray {
     /// (the previous state was `false`); returns `false` if a compilation was
     /// already started or has been scheduled by another caller.
     pub fn try_start_turbofan_compile(&self) -> bool {
-        self.turbofan_compile_started
+        self.inner
+            .turbofan_compile_started
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
@@ -1803,7 +1763,7 @@ impl BytecodeArray {
     /// and the caller should populate it via [`JitExecutableCode::new`].
     /// Subsequent calls return the cached executable code directly.
     pub fn jit_executable_cache(&self) -> &JitExecutableCache {
-        &self.jit_executable
+        &self.inner.jit_executable
     }
 
     /// Returns a reference to the cached Maglev executable code.
@@ -1811,14 +1771,14 @@ impl BytecodeArray {
     /// The cache is lazily initialised on first Maglev execution from the raw
     /// compiled code bytes.
     pub fn maglev_executable_cache(&self) -> &MaglevExecutableCache {
-        &self.maglev_executable
+        &self.inner.maglev_executable
     }
 
     /// Returns `true` if baseline JIT code has deopted at least once,
     /// indicating the generated code contains unsupported opcodes and
     /// should not be re-attempted.
     pub fn jit_baseline_has_deopted(&self) -> bool {
-        self.jit_baseline_deopted.get()
+        self.inner.jit_baseline_deopted.get()
     }
 
     /// Mark this function's baseline JIT code as having deopted.
@@ -1827,7 +1787,7 @@ impl BytecodeArray {
     /// attempts for this function to avoid the overhead of repeatedly
     /// entering and immediately exiting always-deopting code.
     pub fn mark_jit_baseline_deopted(&self) {
-        self.jit_baseline_deopted.set(true);
+        self.inner.jit_baseline_deopted.set(true);
     }
 
     /// Maximum number of Maglev deopt retries before permanently falling
@@ -1851,14 +1811,14 @@ impl BytecodeArray {
     /// 2. The function is in an exponential cooldown period after a recent
     ///    deopt (invocation_count < next_try_at).
     pub fn jit_maglev_has_deopted(&self) -> bool {
-        let count = self.jit_maglev_deopt_count.get();
+        let count = self.inner.jit_maglev_deopt_count.get();
         if count >= Self::MAX_MAGLEV_DEOPT_RETRIES {
             return true;
         }
         // Exponential cooldown: skip Maglev until enough interpreter
         // invocations have elapsed since last deopt.
-        let next = self.maglev_next_try_at.get();
-        if next > 0 && self.invocation_count.get() < next {
+        let next = self.inner.maglev_next_try_at.get();
+        if next > 0 && self.inner.invocation_count.get() < next {
             return true;
         }
         false
@@ -1866,7 +1826,7 @@ impl BytecodeArray {
 
     /// Returns the current Maglev deopt count for diagnostics.
     pub fn maglev_deopt_count(&self) -> u32 {
-        self.jit_maglev_deopt_count.get()
+        self.inner.jit_maglev_deopt_count.get()
     }
 
     /// Increment the Maglev deopt counter and set a minimal cooldown
@@ -1875,16 +1835,18 @@ impl BytecodeArray {
     /// aggressively.  After [`MAX_MAGLEV_DEOPT_RETRIES`] the interpreter
     /// will permanently skip Maglev for this function.
     pub fn mark_jit_maglev_deopted(&self) {
-        let count = self.jit_maglev_deopt_count.get();
-        self.jit_maglev_deopt_count.set(count.saturating_add(1));
+        let count = self.inner.jit_maglev_deopt_count.get();
+        self.inner
+            .jit_maglev_deopt_count
+            .set(count.saturating_add(1));
         // Constant 1-invocation cooldown: retry JIT on the very next
         // invocation after the interpreter runs once with warm ICs.
         // The previous linear backoff (3 * (count+1), up to 50) was too
         // slow — after 5 deopts the cumulative 45-invocation cooldown
         // plus the permanent block meant the JIT was never re-entered
         // during short benchmark measurement windows.
-        let next_try = self.invocation_count.get().saturating_add(1);
-        self.maglev_next_try_at.set(next_try);
+        let next_try = self.inner.invocation_count.get().saturating_add(1);
+        self.inner.maglev_next_try_at.set(next_try);
     }
 
     /// Reset the Maglev deopt counter, allowing re-optimization.
@@ -1892,11 +1854,11 @@ impl BytecodeArray {
     /// Called when the Maglev executable cache is re-initialised (e.g.,
     /// after recompilation with better type feedback).
     pub fn reset_maglev_deopt_count(&self) {
-        self.jit_maglev_deopt_count.set(0);
-        self.maglev_next_try_at.set(0);
+        self.inner.jit_maglev_deopt_count.set(0);
+        self.inner.maglev_next_try_at.set(0);
         // Recursively reset nested functions so inner closures can
         // also retry JIT execution after warmup.
-        for entry in self.constant_pool() {
+        for entry in self.inner.constant_pool.iter() {
             if let ConstantPoolEntry::Function(nested_ba) = entry {
                 nested_ba.reset_maglev_deopt_count();
             }
@@ -1905,12 +1867,12 @@ impl BytecodeArray {
 
     /// Returns the current `next_try_at` value for diagnostics.
     pub fn maglev_next_try_at(&self) -> u32 {
-        self.maglev_next_try_at.get()
+        self.inner.maglev_next_try_at.get()
     }
 
     /// Returns `true` if the Maglev executable cache has been populated.
     pub fn has_maglev_executable_cached(&self) -> bool {
-        self.maglev_executable.borrow().is_some()
+        self.inner.maglev_executable.borrow().is_some()
     }
 
     /// Returns a clone of the cached Maglev-JIT machine code and
@@ -1921,7 +1883,7 @@ impl BytecodeArray {
     /// raw bytes.  On x86-64 Unix, use [`maglev_jit_cache_arc`](Self::maglev_jit_cache_arc) directly.
     #[cfg(not(all(target_arch = "x86_64", unix)))]
     pub fn try_get_maglev_jit_code(&self) -> Option<(Vec<u8>, usize)> {
-        self.maglev_jit_code.lock().ok()?.clone()
+        self.inner.maglev_jit_code.lock().ok()?.clone()
     }
 }
 
