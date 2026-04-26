@@ -2231,12 +2231,20 @@ impl<'a> MaglevCodegen<'a> {
                     // Load value into RAX.
                     self.emit_load(*value, Reg64::Rax);
 
-                    // Check if the value is a Smi (fits in i32).
                     let mut slow_label = Label::new();
                     let mut done_label = Label::new();
-                    self.masm.movsxd_sign_extend(Reg64::R11, Reg64::Rax);
-                    self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
-                    self.masm.jne(&mut slow_label);
+
+                    // Skip Smi check if the value is already known to be
+                    // i32-range (e.g. result of Add with overflow check, or
+                    // Inc/Dec).  Saves movsxd + cmp + jne per store.
+                    let value_known_smi = self.i32_range.contains(value)
+                        || self.smi_guarded.contains(value)
+                        || self.narrow_int32.contains(value);
+                    if !value_known_smi {
+                        self.masm.movsxd_sign_extend(Reg64::R11, Reg64::Rax);
+                        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+                        self.masm.jne(&mut slow_label);
+                    }
 
                     // Load ctx_raw from register file.
                     self.masm
@@ -2259,14 +2267,36 @@ impl<'a> MaglevCodegen<'a> {
                         ctx_layout.slots_data_ptr_offset as i32,
                     );
 
-                    // Write Smi discriminant + i32 payload.
-                    self.masm.mov_store_byte_imm_base_disp32(
-                        Reg64::R11,
-                        disc_byte_offset,
-                        jv_layout.smi_disc,
-                    );
-                    self.masm
-                        .mov_store_dword_base_disp32(Reg64::R11, elem_byte_offset, Reg64::Rax);
+                    // Write JsValue::Smi at the slot.
+                    if jv_layout.disc_offset == 0 && jv_layout.smi_payload_offset == 4 {
+                        // Packed qword store: (value << 32) | smi_disc.
+                        // SHL RAX, 32
+                        self.masm.emit_byte(0x48);
+                        self.masm.emit_byte(0xC1);
+                        self.masm.emit_byte(0xE0);
+                        self.masm.emit_byte(0x20);
+                        // OR RAX, smi_disc
+                        self.masm.emit_byte(0x48);
+                        self.masm.emit_byte(0x83);
+                        self.masm.emit_byte(0xC8);
+                        self.masm.emit_byte(jv_layout.smi_disc);
+                        // Single qword store.
+                        let qword_offset =
+                            (slot_idx * jv_layout.jsvalue_size + jv_layout.disc_offset) as i32;
+                        self.masm
+                            .mov_store_base_disp32(Reg64::R11, qword_offset, Reg64::Rax);
+                    } else {
+                        self.masm.mov_store_byte_imm_base_disp32(
+                            Reg64::R11,
+                            disc_byte_offset,
+                            jv_layout.smi_disc,
+                        );
+                        self.masm.mov_store_dword_base_disp32(
+                            Reg64::R11,
+                            elem_byte_offset,
+                            Reg64::Rax,
+                        );
+                    }
                     self.masm.jmp(&mut done_label);
 
                     // Slow path: FFI call for non-Smi value or null ctx.
@@ -4216,10 +4246,15 @@ impl<'a> MaglevCodegen<'a> {
         // Load value into RAX.
         self.emit_load(value, Reg64::Rax);
 
-        // Check if the value is a Smi (fits in i32).
-        self.masm.movsxd_sign_extend(Reg64::R11, Reg64::Rax);
-        self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
-        self.masm.jne(&mut slow_label);
+        // Skip Smi check if the value is already known to be i32-range.
+        let value_known_smi = self.i32_range.contains(&value)
+            || self.smi_guarded.contains(&value)
+            || self.narrow_int32.contains(&value);
+        if !value_known_smi {
+            self.masm.movsxd_sign_extend(Reg64::R11, Reg64::Rax);
+            self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
+            self.masm.jne(&mut slow_label);
+        }
 
         // Load ctx_i64 into RDI.
         self.emit_load(context, Reg64::Rdi);
@@ -4249,11 +4284,31 @@ impl<'a> MaglevCodegen<'a> {
             ctx_layout.slots_data_ptr_offset as i32,
         );
 
-        // Write Smi discriminant + i32 payload.
-        self.masm
-            .mov_store_byte_imm_base_disp32(Reg64::R11, disc_byte_offset, jv_layout.smi_disc);
-        self.masm
-            .mov_store_dword_base_disp32(Reg64::R11, elem_byte_offset, Reg64::Rax);
+        // Write JsValue::Smi at the slot.
+        if jv_layout.disc_offset == 0 && jv_layout.smi_payload_offset == 4 {
+            // Packed qword store: (value << 32) | smi_disc.
+            // SHL RAX, 32
+            self.masm.emit_byte(0x48);
+            self.masm.emit_byte(0xC1);
+            self.masm.emit_byte(0xE0);
+            self.masm.emit_byte(0x20);
+            // OR RAX, smi_disc
+            self.masm.emit_byte(0x48);
+            self.masm.emit_byte(0x83);
+            self.masm.emit_byte(0xC8);
+            self.masm.emit_byte(jv_layout.smi_disc);
+            // Single qword store.
+            self.masm
+                .mov_store_base_disp32(Reg64::R11, disc_byte_offset, Reg64::Rax);
+        } else {
+            self.masm.mov_store_byte_imm_base_disp32(
+                Reg64::R11,
+                disc_byte_offset,
+                jv_layout.smi_disc,
+            );
+            self.masm
+                .mov_store_dword_base_disp32(Reg64::R11, elem_byte_offset, Reg64::Rax);
+        }
         self.masm.jmp(&mut done_label);
 
         // ── Slow path: save live regs and call lean stub ────────────
