@@ -1014,27 +1014,35 @@ static MAGLEV_COMPILATION_FAILED: std::sync::atomic::AtomicU32 =
 static MAGLEV_COMPILATION_PANICKED: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
-/// Atomic diagnostic: how many times try_execute_best_jit was entered.
-static DIAG_BEST_JIT_ENTERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Atomic diagnostic: how many times try_execute_maglev returned Some.
-static DIAG_MAGLEV_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Atomic diagnostic: how many times try_execute_maglev returned None.
-static DIAG_MAGLEV_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Atomic diagnostic: how many times `run_dispatch` was entered.
-static DIAG_RUN_DISPATCH_ENTERED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-/// Atomic diagnostic: how many times `run_inner` was entered.
-static DIAG_RUN_INNER_ENTERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Diagnostic: how many times try_execute_best_jit was entered.
+thread_local! {
+    static DIAG_BEST_JIT_ENTERED: Cell<u64> = const { Cell::new(0) };
+}
+// Diagnostic: how many times try_execute_maglev returned Some.
+thread_local! {
+    static DIAG_MAGLEV_HIT: Cell<u64> = const { Cell::new(0) };
+}
+// Diagnostic: how many times try_execute_maglev returned None.
+thread_local! {
+    static DIAG_MAGLEV_MISS: Cell<u64> = const { Cell::new(0) };
+}
+// Diagnostic: how many times `run_dispatch` was entered.
+thread_local! {
+    static DIAG_RUN_DISPATCH_ENTERED: Cell<u64> = const { Cell::new(0) };
+}
+// Diagnostic: how many times `run_inner` was entered.
+thread_local! {
+    static DIAG_RUN_INNER_ENTERED: Cell<u64> = const { Cell::new(0) };
+}
 
 /// Return a snapshot of the atomic JIT entry diagnostics.
 ///
 /// Returns `(best_jit_entered, maglev_hit, maglev_miss)`.
 pub fn jit_entry_diagnostics() -> (u64, u64, u64) {
-    use std::sync::atomic::Ordering::Relaxed;
     (
-        DIAG_BEST_JIT_ENTERED.load(Relaxed),
-        DIAG_MAGLEV_HIT.load(Relaxed),
-        DIAG_MAGLEV_MISS.load(Relaxed),
+        DIAG_BEST_JIT_ENTERED.with(Cell::get),
+        DIAG_MAGLEV_HIT.with(Cell::get),
+        DIAG_MAGLEV_MISS.with(Cell::get),
     )
 }
 
@@ -1042,10 +1050,9 @@ pub fn jit_entry_diagnostics() -> (u64, u64, u64) {
 ///
 /// Returns `(run_inner_entered, run_dispatch_entered)`.
 pub fn dispatch_entry_diagnostics() -> (u64, u64) {
-    use std::sync::atomic::Ordering::Relaxed;
     (
-        DIAG_RUN_INNER_ENTERED.load(Relaxed),
-        DIAG_RUN_DISPATCH_ENTERED.load(Relaxed),
+        DIAG_RUN_INNER_ENTERED.with(Cell::get),
+        DIAG_RUN_DISPATCH_ENTERED.with(Cell::get),
     )
 }
 
@@ -1769,7 +1776,7 @@ pub(super) fn try_execute_best_jit(
     ba: &BytecodeArray,
     args: &[JsValue],
 ) -> Option<StatorResult<JsValue>> {
-    DIAG_BEST_JIT_ENTERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DIAG_BEST_JIT_ENTERED.with(|c| c.set(c.get() + 1));
     // Never run JIT when a debugger is attached — the debugger needs
     // to single-step through interpreted bytecodes.
     if DEBUG_ATTACHED.with(|f| f.get()) {
@@ -1782,10 +1789,10 @@ pub(super) fn try_execute_best_jit(
     }
     // Then Maglev (register-allocated JIT).
     if let Some(r) = try_execute_maglev(ba, args) {
-        DIAG_MAGLEV_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        DIAG_MAGLEV_HIT.with(|c| c.set(c.get() + 1));
         return Some(r);
     }
-    DIAG_MAGLEV_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DIAG_MAGLEV_MISS.with(|c| c.set(c.get() + 1));
     // Baseline JIT (disabled — SIGSEGV from unsafe runtime stubs).
     try_execute_jit(ba, args)
 }
@@ -3362,7 +3369,7 @@ impl Interpreter {
     }
 
     fn run_inner(frame: &mut InterpreterFrame, skip_globals: bool) -> StatorResult<JsValue> {
-        DIAG_RUN_INNER_ENTERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        DIAG_RUN_INNER_ENTERED.with(|c| c.set(c.get() + 1));
 
         // Increment invocation count for tiering — ensures top-level code
         // (not just function calls) participates in JIT compilation decisions.
@@ -3422,15 +3429,10 @@ impl Interpreter {
             // called, regardless of stack-growth mechanics.
             #[cfg(all(target_arch = "x86_64", unix))]
             {
-                use crate::compiler::baseline::compiler::{
-                    jit_runtime_set_context, jit_runtime_set_global_env,
-                };
+                use crate::compiler::baseline::compiler::jit_runtime_set_global_env;
                 jit_runtime_set_global_env(frame.global_env.clone());
-                let ctx = frame.context.as_ref().and_then(|v| match v {
-                    JsValue::Context(rc) => Some(Rc::clone(rc)),
-                    _ => None,
-                });
-                jit_runtime_set_context(ctx);
+                // Note: jit_runtime_set_context is called inside
+                // try_execute_maglev, so we don't need to set it here.
             }
             if let Some(jit_result) = try_execute_best_jit(&frame.bytecode_array, &frame.call_args)
             {
@@ -3469,7 +3471,7 @@ impl Interpreter {
     /// inlining across the call.
     #[allow(clippy::collapsible_if)]
     fn run_dispatch(frame: &mut InterpreterFrame) -> StatorResult<JsValue> {
-        DIAG_RUN_DISPATCH_ENTERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        DIAG_RUN_DISPATCH_ENTERED.with(|c| c.set(c.get() + 1));
 
         // Provide the global environment to JIT runtime stubs so that
         // LdaGlobal / StaGlobal can access global variables.  This is
