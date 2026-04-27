@@ -11119,37 +11119,57 @@ pub(crate) mod jit_runtime {
     #[allow(dead_code)] // Called from JIT-generated machine code.
     pub extern "C" fn jit_runtime_batch_sum_smi(arr_i64: i64) -> i64 {
         if !is_heap_handle(arr_i64) {
+            eprintln!("FUSION_SUM_DIAG: fail=not_heap_handle arr_i64={arr_i64:#x}");
             return JIT_DEOPT;
         }
         let ptrs = RT_PTRS.with(|p| p.get());
         if !ptrs.is_cached() {
+            eprintln!("FUSION_SUM_DIAG: fail=ptrs_not_cached");
             return JIT_DEOPT;
         }
         let arr_idx = (arr_i64 - JIT_HEAP_TAG) as usize;
         // SAFETY: cached pointers valid for thread lifetime; single-threaded.
         let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
         if arr_idx >= heap.len() {
+            eprintln!(
+                "FUSION_SUM_DIAG: fail=heap_oob idx={arr_idx} len={}",
+                heap.len()
+            );
             return JIT_DEOPT;
         }
         use crate::objects::value::JsValue;
         // SAFETY: bounds checked above.
         let items_rc = match unsafe { heap.get_unchecked(arr_idx) } {
             JsValue::Array(rc) => rc,
-            _ => return JIT_DEOPT,
+            _ => {
+                eprintln!(
+                    "FUSION_SUM_DIAG: fail=not_array idx={arr_idx} disc={:?}",
+                    std::mem::discriminant(unsafe { heap.get_unchecked(arr_idx) })
+                );
+                return JIT_DEOPT;
+            }
         };
         // SAFETY: single-threaded JIT; no concurrent borrows.
         let items = unsafe { &*items_rc.as_ptr() };
         let mut sum: i64 = 0;
-        for elem in items.iter() {
+        for (i, elem) in items.iter().enumerate() {
             match elem {
                 JsValue::Smi(v) => sum += *v as i64,
-                _ => return JIT_DEOPT,
+                _ => {
+                    eprintln!(
+                        "FUSION_SUM_DIAG: fail=non_smi_elem i={i} disc={:?}",
+                        std::mem::discriminant(elem)
+                    );
+                    return JIT_DEOPT;
+                }
             }
         }
         // Check i32 range — Smi result must fit in i32.
         if sum < i32::MIN as i64 || sum > i32::MAX as i64 {
+            eprintln!("FUSION_SUM_DIAG: fail=overflow sum={sum}");
             return JIT_DEOPT;
         }
+        eprintln!("FUSION_SUM_DIAG: ok len={} sum={sum}", items.len());
         sum
     }
 
@@ -11165,23 +11185,35 @@ pub(crate) mod jit_runtime {
     #[allow(dead_code)] // Called from JIT-generated machine code.
     pub extern "C" fn jit_runtime_batch_push_smi_range(arr_i64: i64, count: i64) -> i64 {
         if !is_heap_handle(arr_i64) {
+            eprintln!("FUSION_PUSH_DIAG: fail=not_heap_handle arr_i64={arr_i64:#x}");
             return JIT_DEOPT;
         }
         let ptrs = RT_PTRS.with(|p| p.get());
         if !ptrs.is_cached() {
+            eprintln!("FUSION_PUSH_DIAG: fail=ptrs_not_cached");
             return JIT_DEOPT;
         }
         let arr_idx = (arr_i64 - JIT_HEAP_TAG) as usize;
         // SAFETY: cached pointers valid for thread lifetime; single-threaded.
         let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
         if arr_idx >= heap.len() {
+            eprintln!(
+                "FUSION_PUSH_DIAG: fail=heap_oob idx={arr_idx} len={}",
+                heap.len()
+            );
             return JIT_DEOPT;
         }
         use crate::objects::value::JsValue;
         // SAFETY: bounds checked above.
         let items_rc = match unsafe { heap.get_unchecked(arr_idx) } {
             JsValue::Array(rc) => rc,
-            _ => return JIT_DEOPT,
+            _ => {
+                eprintln!(
+                    "FUSION_PUSH_DIAG: fail=not_array idx={arr_idx} disc={:?}",
+                    std::mem::discriminant(unsafe { heap.get_unchecked(arr_idx) })
+                );
+                return JIT_DEOPT;
+            }
         };
         let count = count as usize;
         // SAFETY: single-threaded JIT; no concurrent borrows.
@@ -11190,6 +11222,7 @@ pub(crate) mod jit_runtime {
         for i in 0..count {
             items.push(JsValue::Smi(i as i32));
         }
+        eprintln!("FUSION_PUSH_DIAG: ok count={count} len={}", items.len());
         items.len() as i64
     }
 }

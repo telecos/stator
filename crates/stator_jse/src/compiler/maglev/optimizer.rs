@@ -167,11 +167,8 @@ pub fn optimize(graph: &mut MaglevGraph) {
     eliminate_redundant_type_guards(graph);
     specialize_closure_calls(graph);
     fuse_call_loops(graph);
-    // NOTE: sum/push loop fusion disabled — causes deopt regression on
-    // array_push_sum_1k (13.7µs vs 6.2µs baseline).  The runtime stubs
-    // work correctly but the deopt fallback wipes JIT state, making
-    // subsequent iterations run at raw-interpreter speed.
-    // fuse_sum_loops(graph);
+    // NOTE: re-enabled with diagnostics to identify deopt cause.
+    fuse_sum_loops(graph);
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
     fuse_object_literal_stores(graph);
@@ -3247,7 +3244,6 @@ fn try_fuse_call_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
 //           Jump → header
 //   No calls, no stores, no extra side effects in body.
 
-#[allow(dead_code)] // Disabled pending deopt regression investigation.
 fn fuse_sum_loops(graph: &mut MaglevGraph) {
     let loops = licm::detect_loops(graph);
     if loops.is_empty() {
@@ -3260,7 +3256,6 @@ fn fuse_sum_loops(graph: &mut MaglevGraph) {
     }
 }
 
-#[allow(dead_code)] // Disabled pending deopt regression investigation.
 fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
     // ── 1. Simple loop: header + 1 body block ────────────────────────────
     if lp.body.len() != 2 || !lp.body.contains(&lp.header) {
@@ -3495,7 +3490,6 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
 
 /// Detect `for (i = 0; i < N; i++) arr.push(i)` and replace with
 /// [`ValueNode::SpeculativePushFusion`].
-#[allow(dead_code)] // Disabled pending deopt regression investigation.
 fn try_fuse_push_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
     // ── 1. Simple loop: header + 1 body block ────────────────────────────
     if lp.body.len() != 2 || !lp.body.contains(&lp.header) {
