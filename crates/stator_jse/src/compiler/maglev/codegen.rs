@@ -6333,15 +6333,16 @@ impl<'a> MaglevCodegen<'a> {
         let layout = cached_jsvalue_layout();
         let ic_base = self.array_ic_base;
         let ic_off_handle = ic_base;
-        // ic_off_data at +8 is still WRITTEN by the IC-fill stub but we
-        // deliberately ignore it on the fast path — see below.
-        let _ic_off_data = ic_base + 8;
+        // data_ptr at +8: written by the push IC-fill stub.  On handle
+        // match this is always fresh because the push slow path (which
+        // handles reallocations) refills the entire IC including data_ptr.
+        // Using it directly saves one dependent load vs dereferencing
+        // vec_ptr every iteration.
+        let ic_off_data = ic_base + 8;
         let ic_off_len = ic_base + 16;
-        // The store IC (and the load-IC fill stub) writes the Vec struct
-        // pointer at +24.  Unlike data_ptr, the Vec struct itself never
-        // moves (it lives inside a RefCell), so this pointer is always
-        // valid.  We dereference it at offset 0 to obtain the *current*
-        // buffer pointer, which may have changed after a reallocation.
+        // vec_ptr at +24: the Vec struct pointer (stable, never moves).
+        // Used as fallback when ic_off_data is null (e.g. the IC was
+        // filled by the load IC-fill stub which doesn't set +8).
         let ic_off_vec_ptr = ic_base + 24;
 
         let is_smi_specialized = self.smi_guarded.contains(&id) && !self.i32_range.contains(&id);
@@ -6376,12 +6377,21 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.cmp_rm(Reg64::R10, Reg64::Rbp, ic_off_len);
             self.masm.jcc(CondCode::AboveEq, &mut slow_label);
 
-            // Re-derive fresh data pointer.
+            // Load data_ptr directly from IC (+8).  Falls back to
+            // vec_ptr dereference if data_ptr is null (IC filled by
+            // the load-keyed fill stub, which doesn't set +8).
+            self.masm
+                .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_data);
+            self.masm.test_rr(Reg64::R11, Reg64::R11);
+            let mut deref_fallback = Label::new();
+            self.masm.jne(&mut deref_fallback);
+            // data_ptr was null: derive from vec_ptr.
             self.masm
                 .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_vec_ptr);
             let vec_layout = cached_vec_jsvalue_layout();
             self.masm
                 .mov_load_base_disp32(Reg64::R11, Reg64::R11, vec_layout.ptr_offset as i32);
+            self.masm.bind_label(&mut deref_fallback);
 
             // Compute element address.
             debug_assert_eq!(
