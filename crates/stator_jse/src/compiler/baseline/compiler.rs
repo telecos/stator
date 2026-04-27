@@ -8446,6 +8446,20 @@ pub(crate) mod jit_runtime {
                     hit: 1,
                 };
             }
+        } else if let JsValue::Array(arr_rc) = heap_val {
+            // Array `.length` fast path: return current length directly
+            // without filling the IC (length is dynamic, not cacheable
+            // at a fixed address).  This avoids the expensive fallthrough
+            // to `jit_runtime_lda_named_property`.
+            let prop_name = match get_rt_string_constant_ref(name_idx) {
+                Some(n) => n,
+                None => return NamedIcResult::MISS,
+            };
+            if prop_name == "length" {
+                // SAFETY: single-threaded JIT; no concurrent borrows.
+                let len = unsafe { &*arr_rc.as_ptr() }.len() as i64;
+                return NamedIcResult { value: len, hit: 1 };
+            }
         }
 
         // Fall back to the existing inline helper (probes proto IC too).
