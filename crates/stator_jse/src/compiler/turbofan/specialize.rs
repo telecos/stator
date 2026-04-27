@@ -1263,6 +1263,9 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
         SpeculativeCallFusion { callee, .. } => {
             *callee = resolve(*callee);
         }
+        SpeculativeSumFusion { array } => {
+            *array = resolve(*array);
+        }
 
         Construct {
             constructor, args, ..

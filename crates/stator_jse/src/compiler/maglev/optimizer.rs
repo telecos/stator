@@ -167,6 +167,7 @@ pub fn optimize(graph: &mut MaglevGraph) {
     eliminate_redundant_type_guards(graph);
     specialize_closure_calls(graph);
     fuse_call_loops(graph);
+    fuse_sum_loops(graph);
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
     fuse_object_literal_stores(graph);
@@ -1112,6 +1113,7 @@ fn visit_value_node_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
         }
 
         ValueNode::SpeculativeCallFusion { callee, .. } => f(*callee),
+        ValueNode::SpeculativeSumFusion { array } => f(*array),
 
         ValueNode::Construct {
             constructor, args, ..
@@ -2314,6 +2316,7 @@ fn is_user_call(node: &ValueNode) -> bool {
             | ValueNode::Construct { .. }
             | ValueNode::ConstructWithSpread { .. }
             | ValueNode::SpeculativeCallFusion { .. }
+            | ValueNode::SpeculativeSumFusion { .. }
     )
 }
 
@@ -3215,6 +3218,257 @@ fn try_fuse_call_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
             {
                 inputs[ep] = fusion_id;
                 inputs[bp] = *nid; // self-reference (identity)
+                break;
+            }
+        }
+    }
+
+    true
+}
+
+// ─── Speculative sum fusion ─────────────────────────────────────────────────
+//
+// Detects `for (i = 0; i < arr.length; i++) sum += arr[i]` and replaces
+// it with a single [`ValueNode::SpeculativeSumFusion`] in the preheader.
+// The codegen emits a call to a native Rust function that sums all Smi
+// elements in a tight loop.
+//
+// Exact required shape (v1):
+//   header: iv_phi(i: 0 → i+1), sum_phi(sum: 0 → add), cmp(i < len)
+//   body:   load = LoadKeyedGeneric(arr, i)
+//           add  = GenericAdd(sum, load)  (or reverse)
+//           i'   = increment(i)
+//           Jump → header
+//   No calls, no stores, no extra side effects in body.
+
+fn fuse_sum_loops(graph: &mut MaglevGraph) {
+    let loops = licm::detect_loops(graph);
+    if loops.is_empty() {
+        return;
+    }
+    for lp in &loops {
+        try_fuse_sum_loop(graph, lp);
+    }
+}
+
+fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
+    // ── 1. Simple loop: header + 1 body block ────────────────────────────
+    if lp.body.len() != 2 || !lp.body.contains(&lp.header) {
+        return false;
+    }
+
+    // Snapshot header info.
+    let (condition_id, body_block_idx, header_preds, header_nodes_snapshot);
+    {
+        let header = match graph.block(lp.header) {
+            Some(b) => b,
+            None => return false,
+        };
+        let (cond, body_bi, _exit) = match &header.control {
+            Some(ControlNode::Branch {
+                condition,
+                if_true,
+                if_false,
+            }) => (*condition, *if_true, *if_false),
+            _ => return false,
+        };
+        if !lp.body.contains(&body_bi) {
+            return false;
+        }
+        condition_id = cond;
+        body_block_idx = body_bi;
+        header_preds = header.predecessors.clone();
+        header_nodes_snapshot = header
+            .nodes
+            .iter()
+            .map(|(nid, node)| (*nid, node.clone()))
+            .collect::<Vec<_>>();
+    }
+
+    // Body must jump back to header.
+    {
+        let body = match graph.block(body_block_idx) {
+            Some(b) => b,
+            None => return false,
+        };
+        match &body.control {
+            Some(ControlNode::Jump { target }) if *target == lp.header => {}
+            _ => return false,
+        }
+    }
+
+    // ── 2. Find IV phi and trip count ────────────────────────────────────
+    let (cmp_left, cmp_right) = {
+        let mut found = None;
+        for (nid, node) in &header_nodes_snapshot {
+            if *nid == condition_id {
+                found = Some(node.clone());
+                break;
+            }
+        }
+        match found {
+            Some(ValueNode::Int32LessThan { left, right }) => (left, right),
+            _ => return false,
+        }
+    };
+
+    // IV must be a Phi starting at 0, incrementing by 1.
+    let back_pred_pos = match header_preds.iter().position(|&p| p == body_block_idx) {
+        Some(pos) => pos,
+        None => return false,
+    };
+    let entry_pos = match header_preds.iter().position(|&p| p == lp.preheader) {
+        Some(pos) => pos,
+        None => return false,
+    };
+
+    let iv_phi_id = cmp_left;
+    let iv_inputs = match graph.node(iv_phi_id) {
+        Some(ValueNode::Phi { inputs }) if inputs.len() == 2 => inputs.clone(),
+        _ => return false,
+    };
+
+    // IV init must be 0.
+    if find_i32_constant(graph, iv_inputs[entry_pos]) != Some(0) {
+        return false;
+    }
+    // IV step must be +1.
+    if find_increment_step(graph, iv_inputs[back_pred_pos], iv_phi_id) != Some(1) {
+        return false;
+    }
+
+    // ── 3. Limit must be arr.length ──────────────────────────────────────
+    // cmp_right must be a LoadNamedGeneric(arr, "length") or similar
+    // where arr is loop-invariant.
+    let arr_node_id = match graph.node(cmp_right) {
+        Some(ValueNode::LoadNamedGeneric { object, .. }) => *object,
+        _ => return false,
+    };
+
+    // Check arr is loop-invariant (defined outside the loop).
+    let loop_body_set: HashSet<u32> = lp.body.iter().copied().collect();
+    let arr_in_loop = loop_body_set.iter().any(|&bi| {
+        graph
+            .block(bi)
+            .map(|b| b.nodes.iter().any(|(nid, _)| *nid == arr_node_id))
+            .unwrap_or(false)
+    });
+    if arr_in_loop {
+        return false;
+    }
+
+    // ── 4. Find sum phi: sum = init → GenericAdd(sum, LoadKeyedGeneric(arr, iv)) ──
+    let mut sum_phi_id = None;
+    let mut add_node_id = None;
+    for (nid, node) in &header_nodes_snapshot {
+        if *nid == iv_phi_id || *nid == condition_id {
+            continue;
+        }
+        if let ValueNode::Phi { inputs } = node
+            && inputs.len() == 2
+        {
+            let init_id = inputs[entry_pos];
+            let back_id = inputs[back_pred_pos];
+
+            // init must be a Smi constant (typically 0).
+            if find_i32_constant(graph, init_id).is_none() {
+                continue;
+            }
+
+            // back-edge must be GenericAdd(sum_phi, LoadKeyedGeneric(arr, iv))
+            if let Some(add_node) = graph.node(back_id) {
+                let (add_left, add_right) = match add_node {
+                    ValueNode::GenericAdd { left, right, .. }
+                    | ValueNode::Int32Add { left, right }
+                    | ValueNode::CheckedSmiAdd { left, right } => (*left, *right),
+                    _ => continue,
+                };
+                // One operand must be the sum phi, the other a keyed load.
+                let load_id = if add_left == *nid {
+                    add_right
+                } else if add_right == *nid {
+                    add_left
+                } else {
+                    continue;
+                };
+                // load must be LoadKeyedGeneric(arr, iv).
+                if let Some(ValueNode::LoadKeyedGeneric { object, key, .. }) = graph.node(load_id)
+                    && *object == arr_node_id
+                    && *key == iv_phi_id
+                {
+                    sum_phi_id = Some(*nid);
+                    add_node_id = Some(back_id);
+                    break;
+                }
+            }
+        }
+    }
+
+    let sum_phi_id = match sum_phi_id {
+        Some(id) => id,
+        None => return false,
+    };
+    let _add_node_id = add_node_id.unwrap();
+
+    // ── 5. Verify body has no side effects beyond the add + increment ────
+    {
+        let body = graph.block(body_block_idx).unwrap();
+        for (_, node) in &body.nodes {
+            match node {
+                // Allowed: load keyed, add, increment, moves, phis.
+                ValueNode::LoadKeyedGeneric { .. }
+                | ValueNode::GenericAdd { .. }
+                | ValueNode::Int32Add { .. }
+                | ValueNode::CheckedSmiAdd { .. }
+                | ValueNode::GenericIncrement { .. }
+                | ValueNode::Int32Increment { .. }
+                | ValueNode::CheckedSmiIncrement { .. }
+                | ValueNode::Phi { .. }
+                | ValueNode::SmiConstant { .. }
+                | ValueNode::Int32Constant { .. }
+                | ValueNode::Float64Constant { .. } => {}
+                // Any call, store, delete, etc. → bail.
+                _ => return false,
+            }
+        }
+    }
+
+    // ── 6. Insert SpeculativeSumFusion in preheader ──────────────────────
+    let fusion_id = graph.alloc_node_id();
+    if let Some(pre) = graph.block_mut(lp.preheader) {
+        pre.push_with_id(
+            fusion_id,
+            ValueNode::SpeculativeSumFusion { array: arr_node_id },
+        );
+    }
+
+    // ── 7. Short-circuit: set IV entry to limit → loop exits immediately ──
+    {
+        let h = graph.block_mut(lp.header).unwrap();
+        for (nid, node) in &mut h.nodes {
+            if *nid == iv_phi_id {
+                if let ValueNode::Phi { inputs } = node
+                    && inputs.len() == 2
+                {
+                    inputs[entry_pos] = cmp_right;
+                    inputs[back_pred_pos] = *nid;
+                }
+                break;
+            }
+        }
+    }
+
+    // ── 8. Update sum phi: entry input = fusion result ──────────────────
+    {
+        let h = graph.block_mut(lp.header).unwrap();
+        for (nid, node) in &mut h.nodes {
+            if *nid == sum_phi_id {
+                if let ValueNode::Phi { inputs } = node
+                    && inputs.len() == 2
+                {
+                    inputs[entry_pos] = fusion_id;
+                    inputs[back_pred_pos] = *nid;
+                }
                 break;
             }
         }
@@ -4934,6 +5188,9 @@ fn collect_value_node_inputs(node: &ValueNode, live: &mut HashSet<NodeId>) {
         ValueNode::SpeculativeCallFusion { callee, .. } => {
             live.insert(*callee);
         }
+        ValueNode::SpeculativeSumFusion { array } => {
+            live.insert(*array);
+        }
 
         ValueNode::Construct {
             constructor, args, ..
@@ -4992,6 +5249,7 @@ fn has_side_effects(node: &ValueNode) -> bool {
             | ValueNode::Construct { .. }
             | ValueNode::ConstructWithSpread { .. }
             | ValueNode::SpeculativeCallFusion { .. }
+            | ValueNode::SpeculativeSumFusion { .. }
             // Allocations have side-effects (GC pressure / observable identity).
             | ValueNode::CreateObjectLiteral { .. }
             | ValueNode::CreateObjectLiteralWithProperties { .. }
@@ -5086,6 +5344,7 @@ fn can_invalidate_named_stores(node: &ValueNode) -> bool {
             | ValueNode::Construct { .. }
             | ValueNode::ConstructWithSpread { .. }
             | ValueNode::SpeculativeCallFusion { .. }
+            | ValueNode::SpeculativeSumFusion { .. }
             // Property deletion mutates objects.
             | ValueNode::DeleteProperty { .. }
             // For-in can invalidate caches.
@@ -5433,6 +5692,9 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
 
         ValueNode::SpeculativeCallFusion { callee, .. } => {
             *callee = resolve(*callee);
+        }
+        ValueNode::SpeculativeSumFusion { array } => {
+            *array = resolve(*array);
         }
 
         ValueNode::Construct {

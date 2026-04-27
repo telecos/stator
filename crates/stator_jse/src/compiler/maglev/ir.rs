@@ -1394,6 +1394,16 @@ pub enum ValueNode {
         resolved_k: Option<i64>,
     },
 
+    /// Speculative replacement for `for (i=0; i<arr.length; i++) sum += arr[i]`.
+    ///
+    /// Emits a call to a native Rust function that sums all Smi elements
+    /// of the array in a tight loop (LLVM-optimised).  Deopts if any
+    /// element is not a Smi or the receiver is not an Array.
+    SpeculativeSumFusion {
+        /// The array to sum over (`JsValue::Array` heap handle).
+        array: NodeId,
+    },
+
     /// Call to a builtin function by ID.
     CallBuiltin {
         /// Zero-based builtin function identifier.

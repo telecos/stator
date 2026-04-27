@@ -11106,6 +11106,52 @@ pub(crate) mod jit_runtime {
             _ => None,
         }
     }
+
+    /// Native sum of all Smi elements in an array.
+    ///
+    /// Called by [`ValueNode::SpeculativeSumFusion`] codegen.  Given a JIT
+    /// heap handle pointing to a `JsValue::Array`, iterates all elements
+    /// and returns their integer sum.  Returns [`JIT_DEOPT`] if:
+    /// - `arr_i64` is not a valid heap handle,
+    /// - the heap value is not `JsValue::Array`,
+    /// - any element is not `JsValue::Smi`,
+    /// - the sum overflows `i32`.
+    #[allow(dead_code)] // Called from JIT-generated machine code.
+    pub extern "C" fn jit_runtime_batch_sum_smi(arr_i64: i64) -> i64 {
+        if !is_heap_handle(arr_i64) {
+            return JIT_DEOPT;
+        }
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if !ptrs.is_cached() {
+            return JIT_DEOPT;
+        }
+        let arr_idx = (arr_i64 - JIT_HEAP_TAG) as usize;
+        // SAFETY: cached pointers valid for thread lifetime; single-threaded.
+        let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+        if arr_idx >= heap.len() {
+            return JIT_DEOPT;
+        }
+        use crate::objects::value::JsValue;
+        // SAFETY: bounds checked above.
+        let items_rc = match unsafe { heap.get_unchecked(arr_idx) } {
+            JsValue::Array(rc) => rc,
+            _ => return JIT_DEOPT,
+        };
+        // SAFETY: single-threaded JIT; no concurrent borrows.
+        let items = unsafe { &*items_rc.as_ptr() };
+        let mut sum: i64 = 0;
+        for elem in items.iter() {
+            match elem {
+                JsValue::Smi(v) => sum += *v as i64,
+                _ => return JIT_DEOPT,
+            }
+        }
+        // Check i32 range — Smi result must fit in i32.
+        if sum < i32::MIN as i64 || sum > i32::MAX as i64 {
+            return JIT_DEOPT;
+        }
+        sum
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]
