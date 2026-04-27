@@ -3450,11 +3450,10 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
         .map(|b| b.nodes.iter().map(|(nid, n)| (*nid, n.clone())).collect())
         .unwrap_or_default();
 
-    // 4a. Find LoadKeyedGeneric(_, iv_phi) in body OR header.
-    //     After optimizer passes, the keyed load may end up in the header
-    //     block rather than the body block.  The key may be the IV phi
-    //     directly, or a promoted-global copy phi whose back-edge is the
-    //     IV increment.
+    // 4a. Find element load in body OR header.
+    //     May be LoadKeyedGeneric (pre-specialization) or
+    //     LoadFixedArrayElement (after IC specialization).  The key/index
+    //     must be the IV phi or a promoted-global copy of it.
     let is_iv_key = |key: NodeId| -> bool {
         if key == iv_phi_id {
             return true;
@@ -3464,7 +3463,6 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
             && inputs.len() == 2
             && inputs[entry_pos] == iv_inputs[entry_pos]
         {
-            // Same init as the IV phi — likely a copy.
             return true;
         }
         false
@@ -3472,12 +3470,21 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
     let mut keyed_load_id = None;
     let mut keyed_load_obj = None;
     for (nid, node) in body_snapshot.iter().chain(header_nodes_snapshot.iter()) {
-        if let ValueNode::LoadKeyedGeneric { object, key, .. } = node
-            && is_iv_key(*key)
-        {
-            keyed_load_id = Some(*nid);
-            keyed_load_obj = Some(*object);
-            break;
+        match node {
+            ValueNode::LoadKeyedGeneric { object, key, .. } if is_iv_key(*key) => {
+                keyed_load_id = Some(*nid);
+                keyed_load_obj = Some(*object);
+                break;
+            }
+            ValueNode::LoadFixedArrayElement { elements, index }
+            | ValueNode::LoadFixedDoubleArrayElement { elements, index }
+                if is_iv_key(*index) =>
+            {
+                keyed_load_id = Some(*nid);
+                keyed_load_obj = Some(*elements);
+                break;
+            }
+            _ => {}
         }
     }
 
