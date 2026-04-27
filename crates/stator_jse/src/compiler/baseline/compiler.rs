@@ -1326,6 +1326,9 @@ pub(crate) mod jit_runtime {
 
         // ── Drain context recycling pool ───────────────────────────
         crate::objects::value::clear_context_pool();
+
+        // ── Drain array-vec recycling pool ─────────────────────────
+        crate::objects::value::clear_array_vec_pool();
     }
 
     /// Set the current closure context for context-slot stubs.
@@ -1347,6 +1350,12 @@ pub(crate) mod jit_runtime {
                 match val {
                     JsValue::PlainObject(rc) => recycle_object_rc(rc),
                     JsValue::Context(rc) => recycle_context_rc(rc),
+                    JsValue::Array(rc) => {
+                        // Recycle the inner Vec buffer if we're the sole owner.
+                        if let Ok(inner) = Rc::try_unwrap(rc) {
+                            crate::objects::value::recycle_array_vec(inner.into_inner());
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1369,6 +1378,11 @@ pub(crate) mod jit_runtime {
                 match val {
                     JsValue::PlainObject(rc) => recycle_object_rc(rc),
                     JsValue::Context(rc) => recycle_context_rc(rc),
+                    JsValue::Array(rc) => {
+                        if let Ok(inner) = Rc::try_unwrap(rc) {
+                            crate::objects::value::recycle_array_vec(inner.into_inner());
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -10323,7 +10337,8 @@ pub(crate) mod jit_runtime {
     /// Replaces the trampoline dispatch for `CreateEmptyArrayLiteral` and
     /// `CreateArrayLiteral` in Maglev.
     pub extern "C" fn jit_runtime_create_empty_array() -> i64 {
-        let arr = JsValue::Array(Rc::new(RefCell::new(Vec::new())));
+        let vec = crate::objects::value::take_recycled_array_vec();
+        let arr = JsValue::Array(Rc::new(RefCell::new(vec)));
         alloc_heap_handle(arr)
     }
 

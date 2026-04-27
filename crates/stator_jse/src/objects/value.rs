@@ -437,6 +437,52 @@ pub fn clear_context_pool() {
     let _ = CONTEXT_RC_POOL.try_with(|pool| pool.borrow_mut().clear());
 }
 
+// ── Array Vec<JsValue> recycling pool ──────────────────────────────────
+
+/// Maximum number of recycled `Vec<JsValue>` buffers kept in the pool.
+const ARRAY_VEC_POOL_CAP: usize = 4;
+
+thread_local! {
+    static ARRAY_VEC_POOL: RefCell<Vec<Vec<JsValue>>> =
+        RefCell::new(Vec::with_capacity(ARRAY_VEC_POOL_CAP));
+}
+
+/// Take a recycled `Vec<JsValue>` from the pool, if available.
+///
+/// The returned Vec is empty but retains its previous heap allocation,
+/// avoiding a fresh `reserve(1024)` allocation on first push.
+#[allow(dead_code)] // only called from JIT code on x86_64 unix
+pub(crate) fn take_recycled_array_vec() -> Vec<JsValue> {
+    ARRAY_VEC_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        pool.pop().unwrap_or_default()
+    })
+}
+
+/// Recycle a `Vec<JsValue>` buffer into the thread-local pool.
+///
+/// Only recycles buffers with capacity >= 1024 (the pre-allocation
+/// threshold) to avoid keeping tiny buffers that provide no benefit.
+#[allow(dead_code)] // only called from JIT heap recycling on x86_64 unix
+pub(crate) fn recycle_array_vec(mut vec: Vec<JsValue>) {
+    if vec.capacity() < 1024 {
+        return;
+    }
+    vec.clear();
+    let _ = ARRAY_VEC_POOL.try_with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < ARRAY_VEC_POOL_CAP {
+            pool.push(vec);
+        }
+    });
+}
+
+/// Drain the thread-local array-vec pool.
+#[allow(dead_code)] // only called from JIT teardown on x86_64 unix
+pub fn clear_array_vec_pool() {
+    let _ = ARRAY_VEC_POOL.try_with(|pool| pool.borrow_mut().clear());
+}
+
 // Manual Debug impl: NativeFunction can't derive Debug (dyn Fn).
 impl std::fmt::Debug for JsValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
