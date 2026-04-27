@@ -1404,6 +1404,18 @@ pub enum ValueNode {
         array: NodeId,
     },
 
+    /// Speculative replacement for `for (i=0; i<N; i++) arr.push(i)`.
+    ///
+    /// Emits a call to a native Rust function that pushes a sequential
+    /// range of Smi values into the array.  Deopts if the receiver is
+    /// not a `JsValue::Array`.
+    SpeculativePushFusion {
+        /// The array to push into (`JsValue::Array` heap handle).
+        array: NodeId,
+        /// Number of sequential Smi values to push (0..count).
+        count: u32,
+    },
+
     /// Call to a builtin function by ID.
     CallBuiltin {
         /// Zero-based builtin function identifier.

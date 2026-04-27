@@ -1114,6 +1114,7 @@ fn visit_value_node_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
 
         ValueNode::SpeculativeCallFusion { callee, .. } => f(*callee),
         ValueNode::SpeculativeSumFusion { array } => f(*array),
+        ValueNode::SpeculativePushFusion { array, .. } => f(*array),
 
         ValueNode::Construct {
             constructor, args, ..
@@ -2317,6 +2318,7 @@ fn is_user_call(node: &ValueNode) -> bool {
             | ValueNode::ConstructWithSpread { .. }
             | ValueNode::SpeculativeCallFusion { .. }
             | ValueNode::SpeculativeSumFusion { .. }
+            | ValueNode::SpeculativePushFusion { .. }
     )
 }
 
@@ -3247,7 +3249,9 @@ fn fuse_sum_loops(graph: &mut MaglevGraph) {
         return;
     }
     for lp in &loops {
-        try_fuse_sum_loop(graph, lp);
+        if !try_fuse_sum_loop(graph, lp) {
+            try_fuse_push_loop(graph, lp);
+        }
     }
 }
 
@@ -3467,6 +3471,176 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
                     && inputs.len() == 2
                 {
                     inputs[entry_pos] = fusion_id;
+                    inputs[back_pred_pos] = *nid;
+                }
+                break;
+            }
+        }
+    }
+
+    true
+}
+
+/// Detect `for (i = 0; i < N; i++) arr.push(i)` and replace with
+/// [`ValueNode::SpeculativePushFusion`].
+fn try_fuse_push_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
+    // ── 1. Simple loop: header + 1 body block ────────────────────────────
+    if lp.body.len() != 2 || !lp.body.contains(&lp.header) {
+        return false;
+    }
+
+    let (condition_id, body_block_idx, header_preds, header_nodes_snapshot);
+    {
+        let header = match graph.block(lp.header) {
+            Some(b) => b,
+            None => return false,
+        };
+        let (cond, body_bi, _exit) = match &header.control {
+            Some(ControlNode::Branch {
+                condition,
+                if_true,
+                if_false,
+            }) => (*condition, *if_true, *if_false),
+            _ => return false,
+        };
+        if !lp.body.contains(&body_bi) {
+            return false;
+        }
+        condition_id = cond;
+        body_block_idx = body_bi;
+        header_preds = header.predecessors.clone();
+        header_nodes_snapshot = header
+            .nodes
+            .iter()
+            .map(|(nid, node)| (*nid, node.clone()))
+            .collect::<Vec<_>>();
+    }
+
+    {
+        let body = match graph.block(body_block_idx) {
+            Some(b) => b,
+            None => return false,
+        };
+        match &body.control {
+            Some(ControlNode::Jump { target }) if *target == lp.header => {}
+            _ => return false,
+        }
+    }
+
+    // ── 2. Find IV phi: i = 0 → i+1 with constant limit ──────────────
+    let (cmp_left, cmp_right) = {
+        let mut found = None;
+        for (nid, node) in &header_nodes_snapshot {
+            if *nid == condition_id {
+                found = Some(node.clone());
+                break;
+            }
+        }
+        match found {
+            Some(ValueNode::Int32LessThan { left, right }) => (left, right),
+            _ => return false,
+        }
+    };
+
+    // Limit must be a constant (e.g. 1000).
+    let trip_count = match find_i32_constant(graph, cmp_right) {
+        Some(v) if v > 0 && v <= 100_000 => v as u32,
+        _ => return false,
+    };
+
+    let back_pred_pos = match header_preds.iter().position(|&p| p == body_block_idx) {
+        Some(pos) => pos,
+        None => return false,
+    };
+    let entry_pos = match header_preds.iter().position(|&p| p == lp.preheader) {
+        Some(pos) => pos,
+        None => return false,
+    };
+
+    let iv_phi_id = cmp_left;
+    let iv_inputs = match graph.node(iv_phi_id) {
+        Some(ValueNode::Phi { inputs }) if inputs.len() == 2 => inputs.clone(),
+        _ => return false,
+    };
+
+    if find_i32_constant(graph, iv_inputs[entry_pos]) != Some(0) {
+        return false;
+    }
+    if find_increment_step(graph, iv_inputs[back_pred_pos], iv_phi_id) != Some(1) {
+        return false;
+    }
+
+    // ── 3. Body must contain CallArrayPush(arr, [iv]) ─────────────────
+    let mut arr_node_id = None;
+    {
+        let body = graph.block(body_block_idx).unwrap();
+        for (_, node) in &body.nodes {
+            if let ValueNode::CallArrayPush { receiver, args, .. } = node
+                && args.len() == 1
+                && args[0] == iv_phi_id
+            {
+                arr_node_id = Some(*receiver);
+                break;
+            }
+        }
+    }
+    let arr_node_id = match arr_node_id {
+        Some(id) => id,
+        None => return false,
+    };
+
+    // arr must be loop-invariant.
+    let loop_body_set: HashSet<u32> = lp.body.iter().copied().collect();
+    let arr_in_loop = loop_body_set.iter().any(|&bi| {
+        graph
+            .block(bi)
+            .map(|b| b.nodes.iter().any(|(nid, _)| *nid == arr_node_id))
+            .unwrap_or(false)
+    });
+    if arr_in_loop {
+        return false;
+    }
+
+    // ── 4. Verify body has no unexpected side effects ─────────────────
+    {
+        let body = graph.block(body_block_idx).unwrap();
+        for (_, node) in &body.nodes {
+            match node {
+                ValueNode::CallArrayPush { .. }
+                | ValueNode::GenericIncrement { .. }
+                | ValueNode::Int32Increment { .. }
+                | ValueNode::CheckedSmiIncrement { .. }
+                | ValueNode::Phi { .. }
+                | ValueNode::SmiConstant { .. }
+                | ValueNode::Int32Constant { .. }
+                | ValueNode::Float64Constant { .. }
+                | ValueNode::LoadNamedGeneric { .. } => {}
+                _ => return false,
+            }
+        }
+    }
+
+    // ── 5. Insert SpeculativePushFusion in preheader ──────────────────
+    let fusion_id = graph.alloc_node_id();
+    if let Some(pre) = graph.block_mut(lp.preheader) {
+        pre.push_with_id(
+            fusion_id,
+            ValueNode::SpeculativePushFusion {
+                array: arr_node_id,
+                count: trip_count,
+            },
+        );
+    }
+
+    // ── 6. Short-circuit: set IV entry to limit → loop exits immediately ──
+    {
+        let h = graph.block_mut(lp.header).unwrap();
+        for (nid, node) in &mut h.nodes {
+            if *nid == iv_phi_id {
+                if let ValueNode::Phi { inputs } = node
+                    && inputs.len() == 2
+                {
+                    inputs[entry_pos] = cmp_right;
                     inputs[back_pred_pos] = *nid;
                 }
                 break;
@@ -5191,6 +5365,9 @@ fn collect_value_node_inputs(node: &ValueNode, live: &mut HashSet<NodeId>) {
         ValueNode::SpeculativeSumFusion { array } => {
             live.insert(*array);
         }
+        ValueNode::SpeculativePushFusion { array, .. } => {
+            live.insert(*array);
+        }
 
         ValueNode::Construct {
             constructor, args, ..
@@ -5250,6 +5427,7 @@ fn has_side_effects(node: &ValueNode) -> bool {
             | ValueNode::ConstructWithSpread { .. }
             | ValueNode::SpeculativeCallFusion { .. }
             | ValueNode::SpeculativeSumFusion { .. }
+            | ValueNode::SpeculativePushFusion { .. }
             // Allocations have side-effects (GC pressure / observable identity).
             | ValueNode::CreateObjectLiteral { .. }
             | ValueNode::CreateObjectLiteralWithProperties { .. }
@@ -5345,6 +5523,7 @@ fn can_invalidate_named_stores(node: &ValueNode) -> bool {
             | ValueNode::ConstructWithSpread { .. }
             | ValueNode::SpeculativeCallFusion { .. }
             | ValueNode::SpeculativeSumFusion { .. }
+            | ValueNode::SpeculativePushFusion { .. }
             // Property deletion mutates objects.
             | ValueNode::DeleteProperty { .. }
             // For-in can invalidate caches.
@@ -5694,6 +5873,9 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
             *callee = resolve(*callee);
         }
         ValueNode::SpeculativeSumFusion { array } => {
+            *array = resolve(*array);
+        }
+        ValueNode::SpeculativePushFusion { array, .. } => {
             *array = resolve(*array);
         }
 

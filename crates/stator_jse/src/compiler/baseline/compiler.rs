@@ -11152,6 +11152,46 @@ pub(crate) mod jit_runtime {
         }
         sum
     }
+
+    /// Native batch push of sequential Smi values `0..count` into an array.
+    ///
+    /// Called by [`ValueNode::SpeculativePushFusion`] codegen.  Given a JIT
+    /// heap handle pointing to a `JsValue::Array`, pushes `count` sequential
+    /// Smi values starting from 0.  The array is pre-allocated with
+    /// `reserve(count)` for a single allocation.
+    ///
+    /// Returns `count` (the new array length) on success, or [`JIT_DEOPT`]
+    /// if the handle is invalid or not an Array.
+    #[allow(dead_code)] // Called from JIT-generated machine code.
+    pub extern "C" fn jit_runtime_batch_push_smi_range(arr_i64: i64, count: i64) -> i64 {
+        if !is_heap_handle(arr_i64) {
+            return JIT_DEOPT;
+        }
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if !ptrs.is_cached() {
+            return JIT_DEOPT;
+        }
+        let arr_idx = (arr_i64 - JIT_HEAP_TAG) as usize;
+        // SAFETY: cached pointers valid for thread lifetime; single-threaded.
+        let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+        if arr_idx >= heap.len() {
+            return JIT_DEOPT;
+        }
+        use crate::objects::value::JsValue;
+        // SAFETY: bounds checked above.
+        let items_rc = match unsafe { heap.get_unchecked(arr_idx) } {
+            JsValue::Array(rc) => rc,
+            _ => return JIT_DEOPT,
+        };
+        let count = count as usize;
+        // SAFETY: single-threaded JIT; no concurrent borrows.
+        let items = unsafe { &mut *items_rc.as_ptr() };
+        items.reserve(count);
+        for i in 0..count {
+            items.push(JsValue::Smi(i as i32));
+        }
+        items.len() as i64
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]

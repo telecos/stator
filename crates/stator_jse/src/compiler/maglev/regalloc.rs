@@ -666,6 +666,9 @@ fn collect_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
         ValueNode::SpeculativeSumFusion { array } => {
             f(*array);
         }
+        ValueNode::SpeculativePushFusion { array, .. } => {
+            f(*array);
+        }
 
         ValueNode::CallBuiltin { args, .. } | ValueNode::CallRuntime { args, .. } => {
             for &a in args {

@@ -2499,11 +2499,23 @@ impl<'a> MaglevCodegen<'a> {
 
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::SpeculativeSumFusion { array } => {
-                // Emit: save live regs, load array handle into RDI,
-                // call jit_runtime_batch_sum_smi, check deopt, store result.
                 let saved = self.emit_save_live_regs(id);
                 self.emit_load(*array, Reg64::Rdi);
                 let addr = jit_runtime::jit_runtime_batch_sum_smi as *const () as usize as i64;
+                self.masm.mov_ri(Reg64::R11, addr);
+                self.masm.call_reg(Reg64::R11);
+                self.emit_restore_live_regs(saved);
+                self.emit_deopt_check_rax();
+                self.emit_store(id, Reg64::Rax);
+            }
+
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::SpeculativePushFusion { array, count } => {
+                let saved = self.emit_save_live_regs(id);
+                self.emit_load(*array, Reg64::Rdi);
+                self.masm.mov_ri(Reg64::Rsi, i64::from(*count));
+                let addr =
+                    jit_runtime::jit_runtime_batch_push_smi_range as *const () as usize as i64;
                 self.masm.mov_ri(Reg64::R11, addr);
                 self.masm.call_reg(Reg64::R11);
                 self.emit_restore_live_regs(saved);
@@ -4055,6 +4067,7 @@ impl<'a> MaglevCodegen<'a> {
                 | ValueNode::CallWithSpread { .. }
                 | ValueNode::SpeculativeCallFusion { .. }
                 | ValueNode::SpeculativeSumFusion { .. }
+                | ValueNode::SpeculativePushFusion { .. }
         )
     }
 
@@ -8589,6 +8602,9 @@ impl<'a> MaglevCodegen<'a> {
                 out.insert(*callee);
             }
             ValueNode::SpeculativeSumFusion { array } => {
+                out.insert(*array);
+            }
+            ValueNode::SpeculativePushFusion { array, .. } => {
                 out.insert(*array);
             }
             ValueNode::CallBuiltin { args, .. } | ValueNode::CallRuntime { args, .. } => {
