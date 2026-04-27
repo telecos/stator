@@ -1240,23 +1240,19 @@ pub(crate) mod jit_runtime {
 
     /// Clean up thread-local state after JIT execution.
     ///
+    /// Intentionally lightweight: skips heap recycling and RT_PTRS clearing
+    /// because [`jit_runtime_setup`] performs all the necessary cleanup at
+    /// the start of the next JIT entry.  This avoids ~5 redundant TLS
+    /// accesses per eval cycle and allows setup's `already_cached` fast
+    /// path to fire (skipping the 13-TLS-call `cache_rt_ptrs()`).
+    ///
     /// Note: does NOT clear `RT_GLOBAL` or `RT_PROP_IC` — they persist
     /// across JIT calls so that repeated invocations of the same function
     /// benefit from warm IC state.
     pub fn jit_runtime_teardown() {
-        RT_BYTECODE.with(|b| b.set(std::ptr::null()));
-        recycle_and_clear_heap();
-        // Drop stale Rc held by the Maglev callee cache so the old
-        // closure context is freed promptly (its BA is already gone
-        // after heap recycling).
-        MAGLEV_CALLEE_CACHE.with(|c| {
-            let old = c.get();
-            drop_cached_ctx_rc_raw(old.ctx_rc_raw);
-            c.set(MaglevCalleeCache::EMPTY);
-        });
-        // Property IC and array-method IC deliberately kept warm —
-        // cleared only when the BytecodeArray changes in jit_runtime_setup.
-        RT_PTRS.with(|p| p.set(RtPtrs::EMPTY));
+        // Intentionally empty — all cleanup is deferred to jit_runtime_setup.
+        // The only cost is that heap objects and cached Rc references live
+        // slightly longer (nanoseconds in a benchmark loop).
     }
 
     /// Comprehensive teardown of **all** JIT thread-local state.
