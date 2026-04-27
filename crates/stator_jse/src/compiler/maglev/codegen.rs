@@ -117,7 +117,7 @@ pub const NUM_PHYS_REGS: u32 = 9;
 /// cache: RBX(0), RCX(1), RDX(2), RSI(3), R8(4), R9(5).
 const NUM_REG_FWD: usize = 6;
 
-/// Bytes per monomorphic call-site cache slot (6 × i64 = 48 bytes).
+/// Bytes per monomorphic call-site cache slot (10 × i64 = 80 bytes).
 ///
 /// ```text
 /// [RBP - base - 0]   cached callee i64 (0 = empty)
@@ -126,9 +126,13 @@ const NUM_REG_FWD: usize = 6;
 /// [RBP - base - 24]  cached BA pointer
 /// [RBP - base - 32]  cached caller BA pointer
 /// [RBP - base - 40]  cached register file slot count (1–16)
+/// [RBP - base - 48]  inline flag: 0=not analyzed, 1=inlinable, -1=not inlinable
+/// [RBP - base - 56]  inline context slot index
+/// [RBP - base - 64]  inline operation tag (0=AddSmi, 1=SubSmi, 2=Inc, 3=Dec)
+/// [RBP - base - 72]  inline immediate value
 /// ```
 #[cfg(all(target_arch = "x86_64", unix))]
-const MONO_CACHE_SLOT_BYTES: i32 = 48;
+const MONO_CACHE_SLOT_BYTES: i32 = 80;
 
 /// Offset from the start of a mono-cache slot to each field.
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -143,6 +147,14 @@ const MONO_OFF_BA: i32 = 24;
 const MONO_OFF_CALLER_BA: i32 = 32;
 #[cfg(all(target_arch = "x86_64", unix))]
 const MONO_OFF_REG_SLOTS: i32 = 40;
+#[cfg(all(target_arch = "x86_64", unix))]
+const MONO_OFF_INLINE_FLAG: i32 = 48;
+#[cfg(all(target_arch = "x86_64", unix))]
+const MONO_OFF_INLINE_SLOT: i32 = 56;
+#[cfg(all(target_arch = "x86_64", unix))]
+const MONO_OFF_INLINE_OP: i32 = 64;
+#[cfg(all(target_arch = "x86_64", unix))]
+const MONO_OFF_INLINE_IMM: i32 = 72;
 
 /// Lazily probed [`JsValue`] byte layout, cached for the lifetime of the
 /// process.  Used by the inline array-access fast path.
@@ -7343,6 +7355,268 @@ impl<'a> MaglevCodegen<'a> {
 
         self.masm.cmp_rm(Reg64::R11, Reg64::Rbp, off_callee);
         self.masm.jne(&mut cache_miss);
+
+        // ── Speculative context-slot inline ──────────────────────────
+        //
+        // If the callee is a trivial context-slot-update closure
+        // (e.g. `function f() { count++; }`), bypass the call entirely
+        // and perform the update inline in the caller's Maglev code.
+        //
+        // Cache layout:
+        //   [off_inline_flag]  = 0 (not analyzed), 1 (inlinable), -1 (not)
+        //   [off_inline_slot]  = context slot index
+        //   [off_inline_op]    = operation tag (0=AddSmi, 1=SubSmi, 2=Inc, 3=Dec)
+        //   [off_inline_imm]   = immediate value for AddSmi/SubSmi
+
+        let off_inline_flag = slot_base - MONO_OFF_INLINE_FLAG;
+        let off_inline_slot = slot_base - MONO_OFF_INLINE_SLOT;
+        let off_inline_op = slot_base - MONO_OFF_INLINE_OP;
+        let off_inline_imm = slot_base - MONO_OFF_INLINE_IMM;
+
+        let mut normal_call = Label::new();
+        let mut analyze_callee = Label::new();
+
+        // Check inline_flag.
+        self.masm
+            .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, off_inline_flag);
+        self.masm.cmp_ri(Reg64::R10, 1);
+        self.masm.jne(&mut analyze_callee);
+
+        // ── Inline fast path: context-slot Smi update ───────────
+        {
+            let ctx_layout = cached_jscontext_layout();
+            let jv_layout = cached_jsvalue_layout();
+
+            let mut inline_bail = Label::new();
+
+            // Load ctx_ptr from mono cache.
+            self.masm
+                .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, off_ctx);
+            // R11 = ptr to RefCell<JsContext> (raw).
+
+            // Bounds check: inline_slot < slots.len.
+            self.masm
+                .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, off_inline_slot);
+            // R10 = slot index.
+            // Load slots.len into a scratch (RAX) for comparison.
+            self.masm.mov_load_base_disp32(
+                Reg64::Rax,
+                Reg64::R11,
+                ctx_layout.slots_len_offset as i32,
+            );
+            // Bail if slot >= len (signed compare, both non-negative).
+            self.masm.cmp_rr(Reg64::R10, Reg64::Rax);
+            self.masm.jcc(CondCode::GreaterEq, &mut inline_bail);
+
+            // Load Vec data pointer.
+            self.masm.mov_load_base_disp32(
+                Reg64::Rcx,
+                Reg64::R11,
+                ctx_layout.slots_data_ptr_offset as i32,
+            );
+            // RCX = data_ptr.
+
+            // Compute element address: data_ptr + slot * jsvalue_size.
+            debug_assert_eq!(jv_layout.jsvalue_size, 24);
+            // R10 = slot * 24 = slot * 3 * 8.
+            self.masm.lea_scaled(Reg64::R10, Reg64::R10, Reg64::R10, 2);
+            // SHL R10, 3
+            self.masm.emit_byte(0x49);
+            self.masm.emit_byte(0xC1);
+            self.masm.emit_byte(0xE2);
+            self.masm.emit_byte(0x03);
+            // R10 = element address.
+            self.masm.add_rr(Reg64::R10, Reg64::Rcx);
+
+            if jv_layout.disc_offset == 0 && jv_layout.smi_payload_offset == 4 {
+                // Packed qword load: disc in low byte, payload in upper 32 bits.
+                self.masm.mov_load_base_disp32(Reg64::Rax, Reg64::R10, 0);
+                // Check discriminant = Smi.
+                // CMP AL, smi_disc
+                self.masm.emit_byte(0x3C);
+                self.masm.emit_byte(jv_layout.smi_disc);
+                self.masm.jne(&mut inline_bail);
+                // Extract i32 payload: SAR RAX, 32.
+                self.masm.emit_byte(0x48);
+                self.masm.emit_byte(0xC1);
+                self.masm.emit_byte(0xF8);
+                self.masm.emit_byte(0x20);
+                // RAX = i32 Smi value (sign-extended to i64).
+
+                // Load operation tag and perform update.
+                self.masm
+                    .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_inline_op);
+                self.masm.test_rr(Reg64::Rcx, Reg64::Rcx);
+                let mut op_not_add = Label::new();
+                self.masm.jne(&mut op_not_add);
+
+                // Op 0 = AddSmi: RAX += imm.
+                self.masm
+                    .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_inline_imm);
+                // ADD EAX, ECX (32-bit add with overflow check).
+                self.masm.emit_byte(0x01); // ADD r/m32, r32
+                self.masm.emit_byte(0xC8); // EAX, ECX
+                self.masm.jcc(CondCode::Overflow, &mut inline_bail);
+                let mut op_done = Label::new();
+                self.masm.jmp(&mut op_done);
+
+                self.masm.bind_label(&mut op_not_add);
+                self.masm.cmp_ri(Reg64::Rcx, 1);
+                let mut op_not_sub = Label::new();
+                self.masm.jne(&mut op_not_sub);
+
+                // Op 1 = SubSmi: RAX -= imm.
+                self.masm
+                    .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_inline_imm);
+                // SUB EAX, ECX
+                self.masm.emit_byte(0x29); // SUB r/m32, r32
+                self.masm.emit_byte(0xC8); // EAX, ECX
+                self.masm.jcc(CondCode::Overflow, &mut inline_bail);
+                self.masm.jmp(&mut op_done);
+
+                self.masm.bind_label(&mut op_not_sub);
+                self.masm.cmp_ri(Reg64::Rcx, 2);
+                let mut op_not_inc = Label::new();
+                self.masm.jne(&mut op_not_inc);
+
+                // Op 2 = Inc: RAX += 1.
+                // ADD EAX, 1
+                self.masm.emit_byte(0x83); // ADD r/m32, imm8
+                self.masm.emit_byte(0xC0); // EAX
+                self.masm.emit_byte(0x01);
+                self.masm.jcc(CondCode::Overflow, &mut inline_bail);
+                self.masm.jmp(&mut op_done);
+
+                self.masm.bind_label(&mut op_not_inc);
+                // Op 3 = Dec: RAX -= 1.
+                // SUB EAX, 1
+                self.masm.emit_byte(0x83); // SUB r/m32, imm8
+                self.masm.emit_byte(0xE8); // EAX
+                self.masm.emit_byte(0x01);
+                self.masm.jcc(CondCode::Overflow, &mut inline_bail);
+
+                self.masm.bind_label(&mut op_done);
+                // RAX = new i32 value. Pack back: (value << 32) | smi_disc.
+                // MOVSXD RAX, EAX first to sign-extend.
+                self.masm.movsxd_rr(Reg64::Rax, Reg64::Rax);
+                // SHL RAX, 32
+                self.masm.emit_byte(0x48);
+                self.masm.emit_byte(0xC1);
+                self.masm.emit_byte(0xE0);
+                self.masm.emit_byte(0x20);
+                // OR RAX, smi_disc
+                self.masm.emit_byte(0x48);
+                self.masm.emit_byte(0x83);
+                self.masm.emit_byte(0xC8);
+                self.masm.emit_byte(jv_layout.smi_disc);
+                // Store back to context slot.
+                self.masm.mov_store_base_disp32(Reg64::R10, 0, Reg64::Rax);
+
+                // Extract result for caller: SAR RAX, 32.
+                self.masm.emit_byte(0x48);
+                self.masm.emit_byte(0xC1);
+                self.masm.emit_byte(0xF8);
+                self.masm.emit_byte(0x20);
+                // RAX = i32 result (JIT Smi representation).
+                self.masm.jmp(&mut done_label);
+            } else {
+                // Non-packed layout: bail to normal call.
+                self.masm.jmp(&mut inline_bail);
+            }
+
+            // Inline bail: disable speculative inline and fall through
+            // to the normal call path.
+            self.masm.bind_label(&mut inline_bail);
+            self.masm.mov_ri(Reg64::R10, -1);
+            self.masm
+                .mov_store_base_disp32(Reg64::Rbp, off_inline_flag, Reg64::R10);
+        }
+        self.masm.jmp(&mut normal_call);
+
+        // ── Analyze callee (inline_flag == 0 or -1) ─────────────────
+        self.masm.bind_label(&mut analyze_callee);
+        // If inline_flag == -1, skip analysis and go to normal call.
+        self.masm.cmp_ri(Reg64::R10, -1_i32);
+        self.masm.je(&mut normal_call);
+        // inline_flag == 0: first time. Analyze the callee.
+        // Save callee (R11) on stack since we need it after the call.
+        self.masm.push(Reg64::R11);
+        self.masm.push(Reg64::R11); // alignment padding
+        // Call jit_runtime_analyze_callee_inline(ba_ptr).
+        self.masm
+            .mov_load_base_disp32(Reg64::Rdi, Reg64::Rbp, off_ba);
+        let analyze_addr = jit_runtime::jit_runtime_analyze_callee_inline as *const () as usize;
+        self.masm.mov_ri(Reg64::R10, analyze_addr as i64);
+        self.masm.call_reg(Reg64::R10);
+        // RAX = packed result or 0.
+        self.masm.test_rr(Reg64::Rax, Reg64::Rax);
+        let mut not_inlinable = Label::new();
+        self.masm.je(&mut not_inlinable);
+        // Inlinable: unpack and store fields.
+        // flag = 1
+        self.masm.mov_ri(Reg64::R10, 1);
+        self.masm
+            .mov_store_base_disp32(Reg64::Rbp, off_inline_flag, Reg64::R10);
+        // slot = (RAX >> 48) & 0xFFFF
+        self.masm.mov_rr(Reg64::R10, Reg64::Rax);
+        // SHR R10, 48
+        self.masm.emit_byte(0x49);
+        self.masm.emit_byte(0xC1);
+        self.masm.emit_byte(0xEA);
+        self.masm.emit_byte(0x30);
+        // AND R10, 0xFFFF
+        self.masm.emit_byte(0x49);
+        self.masm.emit_byte(0x81);
+        self.masm.emit_byte(0xE2);
+        self.masm.emit_byte(0xFF);
+        self.masm.emit_byte(0xFF);
+        self.masm.emit_byte(0x00);
+        self.masm.emit_byte(0x00);
+        self.masm
+            .mov_store_base_disp32(Reg64::Rbp, off_inline_slot, Reg64::R10);
+        // op = (RAX >> 40) & 0xFF
+        self.masm.mov_rr(Reg64::R10, Reg64::Rax);
+        // SHR R10, 40
+        self.masm.emit_byte(0x49);
+        self.masm.emit_byte(0xC1);
+        self.masm.emit_byte(0xEA);
+        self.masm.emit_byte(0x28);
+        // AND R10, 0xFF
+        self.masm.emit_byte(0x49);
+        self.masm.emit_byte(0x81);
+        self.masm.emit_byte(0xE2);
+        self.masm.emit_byte(0xFF);
+        self.masm.emit_byte(0x00);
+        self.masm.emit_byte(0x00);
+        self.masm.emit_byte(0x00);
+        self.masm
+            .mov_store_base_disp32(Reg64::Rbp, off_inline_op, Reg64::R10);
+        // imm = (RAX >> 8) as i32 (sign-extended)
+        // SHR RAX, 8
+        self.masm.emit_byte(0x48);
+        self.masm.emit_byte(0xC1);
+        self.masm.emit_byte(0xE8);
+        self.masm.emit_byte(0x08);
+        // MOVSXD RAX, EAX (sign-extend i32 to i64)
+        self.masm.movsxd_rr(Reg64::Rax, Reg64::Rax);
+        self.masm
+            .mov_store_base_disp32(Reg64::Rbp, off_inline_imm, Reg64::Rax);
+        let mut analyze_done = Label::new();
+        self.masm.jmp(&mut analyze_done);
+
+        self.masm.bind_label(&mut not_inlinable);
+        // Set inline_flag = -1 to skip analysis on future calls.
+        self.masm.mov_ri(Reg64::R10, -1);
+        self.masm
+            .mov_store_base_disp32(Reg64::Rbp, off_inline_flag, Reg64::R10);
+
+        self.masm.bind_label(&mut analyze_done);
+        // Restore callee.
+        self.masm.pop(Reg64::R11); // padding
+        self.masm.pop(Reg64::R11); // callee
+        // Fall through to normal call.
+
+        self.masm.bind_label(&mut normal_call);
 
         // ── Mono HIT: fully inline dispatch (zero FFI) ────────────
         //

@@ -13366,6 +13366,13 @@ fn extract_inline_call_cache(ba: &BytecodeArray) -> Option<(usize, i32, u8)> {
     Some((slot, imm, op_tag))
 }
 
+/// Public wrapper for [`extract_inline_call_cache`] used by the JIT runtime
+/// to analyze callees for speculative inlining.
+#[allow(dead_code)] // Only called from JIT runtime on x86_64 unix.
+pub(crate) fn extract_inline_call_cache_pub(ba: &BytecodeArray) -> Option<(usize, i32, u8)> {
+    extract_inline_call_cache(ba)
+}
+
 pub(crate) fn try_inline_small_function(
     ba: &BytecodeArray,
     args: &[JsValue],

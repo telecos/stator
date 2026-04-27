@@ -5694,6 +5694,46 @@ pub(crate) mod jit_runtime {
         1 // success, no Maglev upgrade
     }
 
+    /// Analyze a callee's bytecode for speculative context-slot inlining.
+    ///
+    /// Called from Maglev-generated code on the first monomorphic cache hit
+    /// to determine if the callee is a trivial context-slot-update closure.
+    ///
+    /// # Calling convention (SysV AMD64)
+    ///
+    /// * `RDI` (`ba_ptr`) – raw pointer to callee's [`BytecodeArray`].
+    ///
+    /// Returns a packed result in `RAX`:
+    /// - If inlinable: `(slot << 48) | (op << 40) | (imm << 8) | 1`
+    ///   where slot = context slot index (u16), op = tag (u8), imm = i32
+    /// - If not inlinable: `0`
+    #[allow(dead_code)] // Called from JIT-generated machine code.
+    pub extern "C" fn jit_runtime_analyze_callee_inline(ba_ptr: i64) -> i64 {
+        if ba_ptr == 0 {
+            return 0;
+        }
+        // SAFETY: ba_ptr was obtained from the mono cache, which stores
+        // a valid BytecodeArray pointer for the callee.
+        let ba = unsafe { &*(ba_ptr as *const BytecodeArray) };
+        if ba.bytecode_count() > 40 || ba.has_exception_handler() {
+            return 0;
+        }
+        // Reuse the interpreter's existing pattern matcher.
+        use crate::interpreter::extract_inline_call_cache_pub;
+        match extract_inline_call_cache_pub(ba) {
+            Some((slot, imm, op)) => {
+                // Pack: flag=1, slot (16 bits), op (8 bits), imm (32 bits)
+                let slot_u16 = slot as u16;
+                let op_u8 = op;
+                ((slot_u16 as i64) << 48)
+                    | ((op_u8 as i64) << 40)
+                    | (((imm as u32) as i64) << 8)
+                    | 1
+            }
+            None => 0,
+        }
+    }
+
     /// Try to obtain the Maglev entry-point for `ba`, performing the lazy
     /// Arc→Rc transfer if necessary.
     ///
