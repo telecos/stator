@@ -167,10 +167,10 @@ pub fn optimize(graph: &mut MaglevGraph) {
     eliminate_redundant_type_guards(graph);
     specialize_closure_calls(graph);
     fuse_call_loops(graph);
-    // Full loop fusion: replace push + sum loops with batch operations.
-    // Both push AND sum fusion are enabled together — when both trigger,
-    // no per-element IC lookups are needed.
-    fuse_all_loops(graph);
+    // Sum-only fusion: replace `for (i=0; i<arr.length; i++) sum += arr[i]`
+    // with a single batch-sum call.  Push fusion is NOT enabled because it
+    // breaks the array IC (sum loop sees IC miss for every element).
+    fuse_sum_only_loops(graph);
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
     fuse_object_literal_stores(graph);
@@ -3248,7 +3248,6 @@ fn try_fuse_call_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
 
 /// Sum-only loop fusion: replaces sum loops with [`SpeculativeSumFusion`]
 /// without attempting push fusion (which breaks the array IC).
-#[allow(dead_code)]
 fn fuse_sum_only_loops(graph: &mut MaglevGraph) {
     let loops = licm::detect_loops(graph);
     for lp in &loops {
@@ -3259,6 +3258,7 @@ fn fuse_sum_only_loops(graph: &mut MaglevGraph) {
 /// Full loop fusion: replaces both push loops with [`SpeculativePushFusion`]
 /// and sum loops with [`SpeculativeSumFusion`].  When both trigger on the same
 /// array, no per-element IC lookups are needed.
+#[allow(dead_code)] // Disabled: push fusion breaks sum loop IC.
 fn fuse_all_loops(graph: &mut MaglevGraph) {
     let loops = licm::detect_loops(graph);
     for lp in &loops {
