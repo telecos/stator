@@ -129,7 +129,7 @@ const NUM_REG_FWD: usize = 6;
 /// [RBP - base - 48]  inline flag: 0=not analyzed, 1=inlinable, -1=not inlinable
 /// [RBP - base - 56]  inline context slot index
 /// [RBP - base - 64]  inline operation tag (0=AddSmi, 1=SubSmi, 2=Inc, 3=Dec)
-/// [RBP - base - 72]  inline immediate value
+/// [RBP - base - 72]  inline delta (pre-computed: AddSmi→+imm, SubSmi→-imm, Inc→+1, Dec→-1)
 /// ```
 #[cfg(all(target_arch = "x86_64", unix))]
 const MONO_CACHE_SLOT_BYTES: i32 = 80;
@@ -153,6 +153,7 @@ const MONO_OFF_INLINE_FLAG: i32 = 48;
 const MONO_OFF_INLINE_SLOT: i32 = 56;
 #[cfg(all(target_arch = "x86_64", unix))]
 const MONO_OFF_INLINE_OP: i32 = 64;
+/// Pre-computed delta: AddSmi→+imm, SubSmi→-imm, Inc→+1, Dec→-1.
 #[cfg(all(target_arch = "x86_64", unix))]
 const MONO_OFF_INLINE_IMM: i32 = 72;
 
@@ -7366,7 +7367,7 @@ impl<'a> MaglevCodegen<'a> {
         //   [off_inline_flag]  = 0 (not analyzed), 1 (inlinable), -1 (not)
         //   [off_inline_slot]  = context slot index
         //   [off_inline_op]    = operation tag (0=AddSmi, 1=SubSmi, 2=Inc, 3=Dec)
-        //   [off_inline_imm]   = immediate value for AddSmi/SubSmi
+        //   [off_inline_imm]   = pre-computed delta (+imm/-imm/+1/-1)
 
         let off_inline_flag = slot_base - MONO_OFF_INLINE_FLAG;
         let off_inline_slot = slot_base - MONO_OFF_INLINE_SLOT;
@@ -7443,59 +7444,15 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.emit_byte(0x20);
                 // RAX = i32 Smi value (sign-extended to i64).
 
-                // Load operation tag and perform update.
-                self.masm
-                    .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_inline_op);
-                self.masm.test_rr(Reg64::Rcx, Reg64::Rcx);
-                let mut op_not_add = Label::new();
-                self.masm.jne(&mut op_not_add);
-
-                // Op 0 = AddSmi: RAX += imm.
+                // Load pre-computed delta and add in one step.
+                // Delta is computed by jit_runtime_analyze_callee_inline:
+                //   AddSmi→+imm, SubSmi→-imm, Inc→+1, Dec→-1.
                 self.masm
                     .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_inline_imm);
                 // ADD EAX, ECX (32-bit add with overflow check).
                 self.masm.emit_byte(0x01); // ADD r/m32, r32
                 self.masm.emit_byte(0xC8); // EAX, ECX
                 self.masm.jcc(CondCode::Overflow, &mut inline_bail);
-                let mut op_done = Label::new();
-                self.masm.jmp(&mut op_done);
-
-                self.masm.bind_label(&mut op_not_add);
-                self.masm.cmp_ri(Reg64::Rcx, 1);
-                let mut op_not_sub = Label::new();
-                self.masm.jne(&mut op_not_sub);
-
-                // Op 1 = SubSmi: RAX -= imm.
-                self.masm
-                    .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_inline_imm);
-                // SUB EAX, ECX
-                self.masm.emit_byte(0x29); // SUB r/m32, r32
-                self.masm.emit_byte(0xC8); // EAX, ECX
-                self.masm.jcc(CondCode::Overflow, &mut inline_bail);
-                self.masm.jmp(&mut op_done);
-
-                self.masm.bind_label(&mut op_not_sub);
-                self.masm.cmp_ri(Reg64::Rcx, 2);
-                let mut op_not_inc = Label::new();
-                self.masm.jne(&mut op_not_inc);
-
-                // Op 2 = Inc: RAX += 1.
-                // ADD EAX, 1
-                self.masm.emit_byte(0x83); // ADD r/m32, imm8
-                self.masm.emit_byte(0xC0); // EAX
-                self.masm.emit_byte(0x01);
-                self.masm.jcc(CondCode::Overflow, &mut inline_bail);
-                self.masm.jmp(&mut op_done);
-
-                self.masm.bind_label(&mut op_not_inc);
-                // Op 3 = Dec: RAX -= 1.
-                // SUB EAX, 1
-                self.masm.emit_byte(0x83); // SUB r/m32, imm8
-                self.masm.emit_byte(0xE8); // EAX
-                self.masm.emit_byte(0x01);
-                self.masm.jcc(CondCode::Overflow, &mut inline_bail);
-
-                self.masm.bind_label(&mut op_done);
                 // RAX = new i32 value. Pack back: (value << 32) | smi_disc.
                 // MOVSXD RAX, EAX first to sign-extend.
                 self.masm.movsxd_rr(Reg64::Rax, Reg64::Rax);
@@ -7591,7 +7548,9 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.emit_byte(0x00);
         self.masm
             .mov_store_base_disp32(Reg64::Rbp, off_inline_op, Reg64::R10);
-        // imm = (RAX >> 8) as i32 (sign-extended)
+        // delta = (RAX >> 8) as i32 (sign-extended).
+        // Pre-computed by jit_runtime_analyze_callee_inline:
+        //   AddSmi→+imm, SubSmi→-imm, Inc→+1, Dec→-1.
         // SHR RAX, 8
         self.masm.emit_byte(0x48);
         self.masm.emit_byte(0xC1);
@@ -7749,6 +7708,12 @@ impl<'a> MaglevCodegen<'a> {
             .mov_store_base_disp32(Reg64::Rbp, off_entry, Reg64::R11);
         self.masm
             .mov_store_base_disp32(Reg64::Rbp, off_ctx, Reg64::R10);
+        // Reset inline metadata — the new callee may have different
+        // inline characteristics than the previous one.  Use RAX as
+        // scratch (clobbered by the BA read call below anyway).
+        self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+        self.masm
+            .mov_store_base_disp32(Reg64::Rbp, off_inline_flag, Reg64::Rax);
 
         // Read the current BA (set by get_jit_entry) for caching.
         self.masm.push(Reg64::R11);

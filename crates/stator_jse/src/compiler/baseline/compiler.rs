@@ -5722,12 +5722,24 @@ pub(crate) mod jit_runtime {
         use crate::interpreter::extract_inline_call_cache_pub;
         match extract_inline_call_cache_pub(ba) {
             Some((slot, imm, op)) => {
-                // Pack: flag=1, slot (16 bits), op (8 bits), imm (32 bits)
+                // Pre-compute delta so the hot path skips op dispatch:
+                //   AddSmi → +imm, SubSmi → -imm, Inc → +1, Dec → -1.
+                let delta: i32 = match op {
+                    0 => imm,
+                    1 => match imm.checked_neg() {
+                        Some(d) => d,
+                        None => return 0, // i32::MIN overflow
+                    },
+                    2 => 1,
+                    3 => -1,
+                    _ => return 0,
+                };
+                // Pack: flag=1, slot (16 bits), op (8 bits), delta (32 bits)
                 let slot_u16 = slot as u16;
                 let op_u8 = op;
                 ((slot_u16 as i64) << 48)
                     | ((op_u8 as i64) << 40)
-                    | (((imm as u32) as i64) << 8)
+                    | (((delta as u32) as i64) << 8)
                     | 1
             }
             None => 0,
@@ -11321,8 +11333,14 @@ pub(crate) mod jit_runtime {
         // SAFETY: single-threaded JIT; no concurrent borrows.
         let items = unsafe { &mut *items_rc.as_ptr() };
         items.reserve(count);
-        for i in 0..count {
-            items.push(JsValue::Smi(i as i32));
+        // SAFETY: reserve guarantees capacity; we write exactly `count` values.
+        let base_len = items.len();
+        unsafe {
+            let ptr = items.as_mut_ptr().add(base_len);
+            for i in 0..count {
+                ptr.add(i).write(JsValue::Smi(i as i32));
+            }
+            items.set_len(base_len + count);
         }
         items.len() as i64
     }
