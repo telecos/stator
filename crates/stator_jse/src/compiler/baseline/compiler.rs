@@ -4024,18 +4024,18 @@ pub(crate) mod jit_runtime {
         } else {
             RT_GLOBAL.with(|g| g.borrow().env.as_ref().cloned())
         };
-        if let Some(ref env) = env_opt {
-            if let Some(val) = try_inline_small_function(ba, &[], env) {
-                // Restore RT_BYTECODE — the inline path doesn't touch it
-                // but the caller expects it to be restored.
-                if !ptrs.bytecode.is_null() {
-                    // SAFETY: pointer set by cache_rt_ptrs; valid for thread lifetime.
-                    unsafe { &*ptrs.bytecode }.set(saved_ba);
-                } else {
-                    RT_BYTECODE.with(|b| b.set(saved_ba));
-                }
-                return Some(jsvalue_to_jit_i64(val));
+        if let Some(ref env) = env_opt
+            && let Some(val) = try_inline_small_function(ba, &[], env)
+        {
+            // Restore RT_BYTECODE — the inline path doesn't touch it
+            // but the caller expects it to be restored.
+            if !ptrs.bytecode.is_null() {
+                // SAFETY: pointer set by cache_rt_ptrs; valid for thread lifetime.
+                unsafe { &*ptrs.bytecode }.set(saved_ba);
+            } else {
+                RT_BYTECODE.with(|b| b.set(saved_ba));
             }
+            return Some(jsvalue_to_jit_i64(val));
         }
 
         // Bump invocation count so Maglev tiering still triggers for
