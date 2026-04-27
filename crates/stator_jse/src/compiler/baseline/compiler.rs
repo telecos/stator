@@ -1242,13 +1242,12 @@ pub(crate) mod jit_runtime {
     ///
     /// Performs the minimal cleanup needed for correctness: clears the
     /// bytecode pointer, recycles heap objects, and drops stale Maglev
-    /// callee cache entries.  The Sieve benchmark regresses to a timeout
-    /// when this function is a no-op (cause unknown — likely a subtle
-    /// stale-state issue in the keyed-store IC path).
+    /// callee cache entries.
     ///
-    /// Note: does NOT clear `RT_GLOBAL` or `RT_PROP_IC` — they persist
-    /// across JIT calls so that repeated invocations of the same function
-    /// benefit from warm IC state.
+    /// Note: does NOT clear `RT_GLOBAL`, `RT_PROP_IC`, or `RT_PTRS` —
+    /// they persist across JIT calls so that repeated invocations of the
+    /// same function benefit from warm IC state and skip the expensive
+    /// 13-TLS-call `cache_rt_ptrs()` in setup.
     pub fn jit_runtime_teardown() {
         RT_BYTECODE.with(|b| b.set(std::ptr::null()));
         recycle_and_clear_heap();
@@ -1259,9 +1258,6 @@ pub(crate) mod jit_runtime {
             drop_cached_ctx_rc_raw(old.ctx_rc_raw);
             c.set(MaglevCalleeCache::EMPTY);
         });
-        // Property IC and array-method IC deliberately kept warm —
-        // cleared only when the BytecodeArray changes in jit_runtime_setup.
-        RT_PTRS.with(|p| p.set(RtPtrs::EMPTY));
     }
 
     /// Comprehensive teardown of **all** JIT thread-local state.
