@@ -5600,12 +5600,55 @@ impl Interpreter {
                                                                         {
                                                                             let imm =
                                                                                 cached_call_imm;
+                                                                            // O(1) strength reduction: compute
+                                                                            // the final values in i64 to avoid
+                                                                            // intermediate overflow.
+                                                                            if add_imm > 0
+                                                                                && counter
+                                                                                    < limit_val
+                                                                            {
+                                                                                let c64 =
+                                                                                    counter as i64;
+                                                                                let l64 = limit_val
+                                                                                    as i64;
+                                                                                let a64 =
+                                                                                    add_imm as i64;
+                                                                                let remaining =
+                                                                                    (l64 - c64 - 1)
+                                                                                        / a64
+                                                                                        + 1;
+                                                                                let new_cv = call_val as i64 + imm as i64 * remaining;
+                                                                                let new_ctr = c64
+                                                                                    + remaining
+                                                                                        * a64;
+                                                                                if let (
+                                                                                    Ok(cv32),
+                                                                                    Ok(ctr32),
+                                                                                ) = (
+                                                                                    i32::try_from(
+                                                                                        new_cv,
+                                                                                    ),
+                                                                                    i32::try_from(
+                                                                                        new_ctr,
+                                                                                    ),
+                                                                                ) {
+                                                                                    call_val = cv32;
+                                                                                    counter = ctr32;
+                                                                                }
+                                                                            }
+                                                                            // Fallback loop for overflow or
+                                                                            // partial completion.
                                                                             loop {
+                                                                                if counter
+                                                                                    >= limit_val
+                                                                                {
+                                                                                    break;
+                                                                                }
                                                                                 if let Some(cv) = call_val.checked_add(imm) {
                                                                                     call_val = cv;
                                                                                     if let Some(nc) = counter.checked_add(add_imm) {
                                                                                         counter = nc;
-                                                                                        if nc < limit_val { continue; }
+                                                                                        continue;
                                                                                     }
                                                                                 }
                                                                                 break;
@@ -5614,12 +5657,53 @@ impl Interpreter {
                                                                             == 2
                                                                             && !is_leq
                                                                         {
+                                                                            // O(1) strength reduction for Inc.
+                                                                            if add_imm > 0
+                                                                                && counter
+                                                                                    < limit_val
+                                                                            {
+                                                                                let c64 =
+                                                                                    counter as i64;
+                                                                                let l64 = limit_val
+                                                                                    as i64;
+                                                                                let a64 =
+                                                                                    add_imm as i64;
+                                                                                let remaining =
+                                                                                    (l64 - c64 - 1)
+                                                                                        / a64
+                                                                                        + 1;
+                                                                                let new_cv =
+                                                                                    call_val as i64
+                                                                                        + remaining;
+                                                                                let new_ctr = c64
+                                                                                    + remaining
+                                                                                        * a64;
+                                                                                if let (
+                                                                                    Ok(cv32),
+                                                                                    Ok(ctr32),
+                                                                                ) = (
+                                                                                    i32::try_from(
+                                                                                        new_cv,
+                                                                                    ),
+                                                                                    i32::try_from(
+                                                                                        new_ctr,
+                                                                                    ),
+                                                                                ) {
+                                                                                    call_val = cv32;
+                                                                                    counter = ctr32;
+                                                                                }
+                                                                            }
                                                                             loop {
+                                                                                if counter
+                                                                                    >= limit_val
+                                                                                {
+                                                                                    break;
+                                                                                }
                                                                                 if let Some(cv) = call_val.checked_add(1) {
                                                                                     call_val = cv;
                                                                                     if let Some(nc) = counter.checked_add(add_imm) {
                                                                                         counter = nc;
-                                                                                        if nc < limit_val { continue; }
+                                                                                        continue;
                                                                                     }
                                                                                 }
                                                                                 break;
@@ -7394,12 +7478,45 @@ impl Interpreter {
                                                                             {
                                                                                 let imm =
                                                                                     cached_call_imm;
+                                                                                // O(1) strength reduction (i64).
+                                                                                if add_imm > 0
+                                                                                    && counter
+                                                                                        < limit_val
+                                                                                {
+                                                                                    let c64 =
+                                                                                        counter
+                                                                                            as i64;
+                                                                                    let l64 =
+                                                                                        limit_val
+                                                                                            as i64;
+                                                                                    let a64 =
+                                                                                        add_imm
+                                                                                            as i64;
+                                                                                    let remaining =
+                                                                                        (l64 - c64
+                                                                                            - 1)
+                                                                                            / a64
+                                                                                            + 1;
+                                                                                    let new_cv = call_val as i64 + imm as i64 * remaining;
+                                                                                    let new_ctr = c64 + remaining * a64;
+                                                                                    if let (Ok(cv32), Ok(ctr32)) =
+                                                                                        (i32::try_from(new_cv), i32::try_from(new_ctr))
+                                                                                    {
+                                                                                        call_val = cv32;
+                                                                                        counter = ctr32;
+                                                                                    }
+                                                                                }
                                                                                 loop {
+                                                                                    if counter
+                                                                                        >= limit_val
+                                                                                    {
+                                                                                        break;
+                                                                                    }
                                                                                     if let Some(cv) = call_val.checked_add(imm) {
                                                                                         call_val = cv;
                                                                                         if let Some(nc) = counter.checked_add(add_imm) {
                                                                                             counter = nc;
-                                                                                            if nc < limit_val { continue; }
+                                                                                            continue;
                                                                                         }
                                                                                     }
                                                                                     break;
@@ -7408,12 +7525,45 @@ impl Interpreter {
                                                                                 == 2
                                                                                 && !is_leq
                                                                             {
+                                                                                // O(1) strength reduction for Inc (i64).
+                                                                                if add_imm > 0
+                                                                                    && counter
+                                                                                        < limit_val
+                                                                                {
+                                                                                    let c64 =
+                                                                                        counter
+                                                                                            as i64;
+                                                                                    let l64 =
+                                                                                        limit_val
+                                                                                            as i64;
+                                                                                    let a64 =
+                                                                                        add_imm
+                                                                                            as i64;
+                                                                                    let remaining =
+                                                                                        (l64 - c64
+                                                                                            - 1)
+                                                                                            / a64
+                                                                                            + 1;
+                                                                                    let new_cv = call_val as i64 + remaining;
+                                                                                    let new_ctr = c64 + remaining * a64;
+                                                                                    if let (Ok(cv32), Ok(ctr32)) =
+                                                                                        (i32::try_from(new_cv), i32::try_from(new_ctr))
+                                                                                    {
+                                                                                        call_val = cv32;
+                                                                                        counter = ctr32;
+                                                                                    }
+                                                                                }
                                                                                 loop {
+                                                                                    if counter
+                                                                                        >= limit_val
+                                                                                    {
+                                                                                        break;
+                                                                                    }
                                                                                     if let Some(cv) = call_val.checked_add(1) {
                                                                                         call_val = cv;
                                                                                         if let Some(nc) = counter.checked_add(add_imm) {
                                                                                             counter = nc;
-                                                                                            if nc < limit_val { continue; }
+                                                                                            continue;
                                                                                         }
                                                                                     }
                                                                                     break;
