@@ -6405,16 +6405,37 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.emit_byte(0x03);
             self.masm.add_rr(Reg64::R11, Reg64::R10);
 
-            // Speculative Smi payload load (may read garbage for non-Smi
-            // elements, but the discriminant check catches that).
-            self.masm
-                .movsxd_base_disp32(Reg64::Rax, Reg64::R11, layout.smi_payload_offset as i32);
-            // Discriminant check — independent of MOVSXD for ILP.
-            self.masm
-                .movzx_byte_base_disp32(Reg64::R10, Reg64::R11, layout.disc_offset as i32);
-            self.masm.cmp_ri(Reg64::R10, layout.smi_disc as i32);
-            // Non-Smi element → deopt (smi_guarded contract).
-            self.masm.jne(&mut self.deopt_label);
+            if layout.disc_offset == 0 && layout.smi_payload_offset == 4 {
+                // Packed qword load: single 8-byte read, then extract
+                // disc (low byte) and payload (upper 32 bits) without
+                // a second dependent load.
+                //
+                // Layout (little-endian): [disc:8, pad:24, payload:32].
+                // MOV RAX, [R11]   → RAX = packed qword
+                // CMP AL, smi_disc → check discriminant
+                // SAR RAX, 32      → sign-extend payload into RAX
+                self.masm.mov_load_base_disp32(Reg64::Rax, Reg64::R11, 0);
+                // CMP AL, imm8  →  3C imm8
+                self.masm.emit_byte(0x3C);
+                self.masm.emit_byte(layout.smi_disc);
+                self.masm.jne(&mut self.deopt_label);
+                // SAR RAX, 32  →  REX.W C1 /7 RAX(0), imm8=32
+                self.masm.emit_byte(0x48);
+                self.masm.emit_byte(0xC1);
+                self.masm.emit_byte(0xF8);
+                self.masm.emit_byte(0x20);
+            } else {
+                // Fallback: two separate loads (disc + payload).
+                self.masm.movsxd_base_disp32(
+                    Reg64::Rax,
+                    Reg64::R11,
+                    layout.smi_payload_offset as i32,
+                );
+                self.masm
+                    .movzx_byte_base_disp32(Reg64::R10, Reg64::R11, layout.disc_offset as i32);
+                self.masm.cmp_ri(Reg64::R10, layout.smi_disc as i32);
+                self.masm.jne(&mut self.deopt_label);
+            }
             self.masm.jmp(&mut smi_fast_done);
 
             // ── Slow path: IC miss / OOB / non-heap ─────────────────
@@ -6917,6 +6938,7 @@ impl<'a> MaglevCodegen<'a> {
         let ic_base = self.array_ic_base;
         debug_assert_ne!(ic_base, 0);
         let ic_off_handle = ic_base;
+        let ic_off_data = ic_base + 8;
         let ic_off_len = ic_base + 16;
         let ic_off_vec_ptr = ic_base + 24;
 
@@ -6974,9 +6996,11 @@ impl<'a> MaglevCodegen<'a> {
 
         if layout.disc_offset == 0 && layout.smi_payload_offset == 4 {
             // ── Packed qword store: combine discriminant + payload ────
-            // R11 = vec_ptr → clobber with data_ptr, reload from IC later.
+            // Load data_ptr directly from IC (+8).  On handle hit the IC
+            // was previously filled (push slow path writes data_ptr after
+            // any reallocation), so data_ptr is always valid here.
             self.masm
-                .mov_load_base_disp32(Reg64::R11, Reg64::R11, vec_layout.ptr_offset as i32);
+                .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_data);
 
             // R10 = len * 24 (= len * 3 * 8).
             self.masm.lea_scaled(Reg64::R10, Reg64::R10, Reg64::R10, 2);
