@@ -11246,6 +11246,33 @@ pub(crate) mod jit_runtime {
         };
         // SAFETY: single-threaded JIT; no concurrent borrows.
         let items = unsafe { &*items_rc.as_ptr() };
+        let layout = jit_runtime::probe_jsvalue_layout();
+        // Fast path: use raw pointer arithmetic to read Smi payloads
+        // at a fixed stride, avoiding per-element pattern matching.
+        if layout.disc_offset == 0 && layout.smi_payload_offset == 4 {
+            let base = items.as_ptr() as *const u8;
+            let stride = layout.jsvalue_size;
+            let count = items.len();
+            let smi_disc = layout.smi_disc;
+            let mut sum: i64 = 0;
+            for i in 0..count {
+                // SAFETY: i < count ≤ items.len(); stride * i + 7 < stride * count
+                // which fits in the Vec's allocation.
+                let elem_ptr = unsafe { base.add(stride * i) };
+                let disc = unsafe { *elem_ptr };
+                if disc != smi_disc {
+                    return JIT_DEOPT;
+                }
+                // Read i32 payload at offset 4 (smi_payload_offset).
+                let payload = unsafe { *(elem_ptr.add(4) as *const i32) };
+                sum += payload as i64;
+            }
+            if sum < i32::MIN as i64 || sum > i32::MAX as i64 {
+                return JIT_DEOPT;
+            }
+            return sum;
+        }
+        // Fallback: safe pattern-matching path.
         let mut sum: i64 = 0;
         for elem in items.iter() {
             match elem {
