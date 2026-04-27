@@ -2176,15 +2176,31 @@ impl<'a> MaglevCodegen<'a> {
                         ctx_layout.slots_data_ptr_offset as i32,
                     );
 
-                    // Check discriminant: is it Smi?
-                    self.masm
-                        .movzx_byte_base_disp32(Reg64::Rax, Reg64::R11, disc_byte_offset);
-                    self.masm.cmp_ri(Reg64::Rax, jv_layout.smi_disc as i32);
-                    self.masm.jne(&mut slow_label);
-
-                    // Load Smi i32 payload, sign-extend to i64.
-                    self.masm
-                        .movsxd_base_disp32(Reg64::Rax, Reg64::R11, elem_byte_offset);
+                    if jv_layout.disc_offset == 0 && jv_layout.smi_payload_offset == 4 {
+                        // Packed qword load: single read for disc + payload.
+                        let qword_offset =
+                            (slot_idx * jv_layout.jsvalue_size + jv_layout.disc_offset) as i32;
+                        self.masm
+                            .mov_load_base_disp32(Reg64::Rax, Reg64::R11, qword_offset);
+                        // CMP AL, smi_disc
+                        self.masm.emit_byte(0x3C);
+                        self.masm.emit_byte(jv_layout.smi_disc);
+                        self.masm.jne(&mut slow_label);
+                        // SAR RAX, 32
+                        self.masm.emit_byte(0x48);
+                        self.masm.emit_byte(0xC1);
+                        self.masm.emit_byte(0xF8);
+                        self.masm.emit_byte(0x20);
+                    } else {
+                        // Check discriminant: is it Smi?
+                        self.masm
+                            .movzx_byte_base_disp32(Reg64::Rax, Reg64::R11, disc_byte_offset);
+                        self.masm.cmp_ri(Reg64::Rax, jv_layout.smi_disc as i32);
+                        self.masm.jne(&mut slow_label);
+                        // Load Smi i32 payload, sign-extend to i64.
+                        self.masm
+                            .movsxd_base_disp32(Reg64::Rax, Reg64::R11, elem_byte_offset);
+                    }
                     self.masm.jmp(&mut done_label);
 
                     // Slow path: FFI call for non-Smi or null context.
@@ -4189,15 +4205,29 @@ impl<'a> MaglevCodegen<'a> {
             ctx_layout.slots_data_ptr_offset as i32,
         );
 
-        // Check discriminant at slots[slot_idx]: Smi?
-        self.masm
-            .movzx_byte_base_disp32(Reg64::Rax, Reg64::R11, disc_byte_offset);
-        self.masm.cmp_ri(Reg64::Rax, jv_layout.smi_disc as i32);
-        self.masm.jne(&mut slow_label);
-
-        // Load Smi i32 payload, sign-extend to i64.
-        self.masm
-            .movsxd_base_disp32(Reg64::Rax, Reg64::R11, elem_byte_offset);
+        if jv_layout.disc_offset == 0 && jv_layout.smi_payload_offset == 4 {
+            // Packed qword load: single read for disc + payload.
+            self.masm
+                .mov_load_base_disp32(Reg64::Rax, Reg64::R11, disc_byte_offset);
+            // CMP AL, smi_disc
+            self.masm.emit_byte(0x3C);
+            self.masm.emit_byte(jv_layout.smi_disc);
+            self.masm.jne(&mut slow_label);
+            // SAR RAX, 32
+            self.masm.emit_byte(0x48);
+            self.masm.emit_byte(0xC1);
+            self.masm.emit_byte(0xF8);
+            self.masm.emit_byte(0x20);
+        } else {
+            // Check discriminant at slots[slot_idx]: Smi?
+            self.masm
+                .movzx_byte_base_disp32(Reg64::Rax, Reg64::R11, disc_byte_offset);
+            self.masm.cmp_ri(Reg64::Rax, jv_layout.smi_disc as i32);
+            self.masm.jne(&mut slow_label);
+            // Load Smi i32 payload, sign-extend to i64.
+            self.masm
+                .movsxd_base_disp32(Reg64::Rax, Reg64::R11, elem_byte_offset);
+        }
         self.masm.jmp(&mut done_label);
 
         // ── Slow path: save live regs and call lean stub ────────────
@@ -4465,13 +4495,26 @@ impl<'a> MaglevCodegen<'a> {
 
         // ── Inline Smi arithmetic ────────────────────────────────────
         self.masm.bind_label(&mut arith_label);
-        self.masm
-            .movzx_byte_base_disp32(Reg64::Rax, Reg64::R10, disc_offset);
-        self.masm.cmp_ri(Reg64::Rax, smi_disc as i32);
-        self.masm.jne(&mut self.deopt_stub_label);
-
-        self.masm
-            .movsxd_base_disp32(Reg64::Rax, Reg64::R10, payload_offset);
+        if disc_offset == 0 && payload_offset == 4 {
+            // Packed qword load: single read for disc + payload.
+            self.masm.mov_load_base_disp32(Reg64::Rax, Reg64::R10, 0);
+            // CMP AL, smi_disc
+            self.masm.emit_byte(0x3C);
+            self.masm.emit_byte(smi_disc);
+            self.masm.jne(&mut self.deopt_stub_label);
+            // SAR RAX, 32 → sign-extend payload
+            self.masm.emit_byte(0x48);
+            self.masm.emit_byte(0xC1);
+            self.masm.emit_byte(0xF8);
+            self.masm.emit_byte(0x20);
+        } else {
+            self.masm
+                .movzx_byte_base_disp32(Reg64::Rax, Reg64::R10, disc_offset);
+            self.masm.cmp_ri(Reg64::Rax, smi_disc as i32);
+            self.masm.jne(&mut self.deopt_stub_label);
+            self.masm
+                .movsxd_base_disp32(Reg64::Rax, Reg64::R10, payload_offset);
+        }
 
         // k * trip_count as a single compile-time constant.
         let k_times_n = k.wrapping_mul(i64::from(trip_count));
@@ -4512,13 +4555,25 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.test_rr(Reg64::R10, Reg64::R10);
         self.masm.je(&mut self.deopt_stub_label);
 
-        self.masm
-            .movzx_byte_base_disp32(Reg64::Rax, Reg64::R10, disc_offset);
-        self.masm.cmp_ri(Reg64::Rax, smi_disc as i32);
-        self.masm.jne(&mut self.deopt_stub_label);
-
-        self.masm
-            .movsxd_base_disp32(Reg64::Rax, Reg64::R10, payload_offset);
+        if disc_offset == 0 && payload_offset == 4 {
+            // Packed qword load: single read for disc + payload.
+            self.masm.mov_load_base_disp32(Reg64::Rax, Reg64::R10, 0);
+            self.masm.emit_byte(0x3C);
+            self.masm.emit_byte(smi_disc);
+            self.masm.jne(&mut self.deopt_stub_label);
+            // SAR RAX, 32
+            self.masm.emit_byte(0x48);
+            self.masm.emit_byte(0xC1);
+            self.masm.emit_byte(0xF8);
+            self.masm.emit_byte(0x20);
+        } else {
+            self.masm
+                .movzx_byte_base_disp32(Reg64::Rax, Reg64::R10, disc_offset);
+            self.masm.cmp_ri(Reg64::Rax, smi_disc as i32);
+            self.masm.jne(&mut self.deopt_stub_label);
+            self.masm
+                .movsxd_base_disp32(Reg64::Rax, Reg64::R10, payload_offset);
+        }
 
         self.masm
             .imul_rri(Reg64::Rdi, Reg64::Rdi, trip_count as i32);
@@ -6333,16 +6388,11 @@ impl<'a> MaglevCodegen<'a> {
         let layout = cached_jsvalue_layout();
         let ic_base = self.array_ic_base;
         let ic_off_handle = ic_base;
-        // data_ptr at +8: written by the push IC-fill stub.  On handle
-        // match this is always fresh because the push slow path (which
-        // handles reallocations) refills the entire IC including data_ptr.
-        // Using it directly saves one dependent load vs dereferencing
-        // vec_ptr every iteration.
+        // data_ptr at +8: written by both push and load-keyed IC-fill
+        // stubs.  On handle match, data_ptr is always valid and non-null.
         let ic_off_data = ic_base + 8;
         let ic_off_len = ic_base + 16;
-        // vec_ptr at +24: the Vec struct pointer (stable, never moves).
-        // Used as fallback when ic_off_data is null (e.g. the IC was
-        // filled by the load IC-fill stub which doesn't set +8).
+        #[allow(unused)]
         let ic_off_vec_ptr = ic_base + 24;
 
         let is_smi_specialized = self.smi_guarded.contains(&id) && !self.i32_range.contains(&id);
@@ -6377,21 +6427,11 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.cmp_rm(Reg64::R10, Reg64::Rbp, ic_off_len);
             self.masm.jcc(CondCode::AboveEq, &mut slow_label);
 
-            // Load data_ptr directly from IC (+8).  Falls back to
-            // vec_ptr dereference if data_ptr is null (IC filled by
-            // the load-keyed fill stub, which doesn't set +8).
+            // Load data_ptr directly from IC (+8).  Both the push and
+            // load-keyed IC fill stubs write data_ptr — so on IC hit
+            // (handle matched) data_ptr is always non-null.
             self.masm
                 .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_data);
-            self.masm.test_rr(Reg64::R11, Reg64::R11);
-            let mut deref_fallback = Label::new();
-            self.masm.jne(&mut deref_fallback);
-            // data_ptr was null: derive from vec_ptr.
-            self.masm
-                .mov_load_base_disp32(Reg64::R11, Reg64::Rbp, ic_off_vec_ptr);
-            let vec_layout = cached_vec_jsvalue_layout();
-            self.masm
-                .mov_load_base_disp32(Reg64::R11, Reg64::R11, vec_layout.ptr_offset as i32);
-            self.masm.bind_label(&mut deref_fallback);
 
             // Compute element address.
             debug_assert_eq!(
