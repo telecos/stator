@@ -3434,68 +3434,136 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
         }
     }
 
-    // ── 4. Find sum phi: sum = init → Add(sum, LoadKeyedGeneric(arr, iv)) ──
-    //     If limit_arr_node_id is None, discover arr from the LoadKeyedGeneric.
+    // ── 4. Find sum pattern ─────────────────────────────────────────────
+    //     After global promotion the GenericAdd's operands may be header
+    //     phis (not the sum phi or keyed-load directly).  Use a body-first
+    //     search: find LoadKeyedGeneric(arr, iv) in the body, find a
+    //     GenericAdd that consumes it (directly or through a phi), then
+    //     find the header phi whose back-edge is that Add.
     let mut sum_phi_id = None;
     let mut add_node_id = None;
     let mut arr_node_id = limit_arr_node_id;
-    for (nid, node) in &header_nodes_snapshot {
-        if *nid == iv_phi_id || *nid == condition_id {
-            continue;
-        }
-        if let ValueNode::Phi { inputs } = node
-            && inputs.len() == 2
+
+    // Snapshot body nodes.
+    let body_snapshot: Vec<_> = graph
+        .block(body_block_idx)
+        .map(|b| b.nodes.iter().map(|(nid, n)| (*nid, n.clone())).collect())
+        .unwrap_or_default();
+
+    // 4a. Find LoadKeyedGeneric(_, iv_phi) in body.
+    let mut keyed_load_id = None;
+    let mut keyed_load_obj = None;
+    for (nid, node) in &body_snapshot {
+        if let ValueNode::LoadKeyedGeneric { object, key, .. } = node
+            && *key == iv_phi_id
         {
-            let init_id = inputs[entry_pos];
-            let back_id = inputs[back_pred_pos];
+            keyed_load_id = Some(*nid);
+            keyed_load_obj = Some(*object);
+            break;
+        }
+    }
 
-            // init must be a Smi constant (typically 0).
-            if find_i32_constant(graph, init_id).is_none() {
-                continue;
-            }
-
-            // back-edge must be GenericAdd(sum_phi, LoadKeyedGeneric(arr, iv))
-            if let Some(add_node) = graph.node(back_id) {
-                let (add_left, add_right) = match add_node {
-                    ValueNode::GenericAdd { left, right, .. }
-                    | ValueNode::Int32Add { left, right }
-                    | ValueNode::CheckedSmiAdd { left, right } => (*left, *right),
-                    _ => continue,
-                };
-                // One operand must be the sum phi, the other a keyed load.
-                let load_id = if add_left == *nid {
-                    add_right
-                } else if add_right == *nid {
-                    add_left
-                } else {
-                    continue;
-                };
-                // load must be LoadKeyedGeneric(_, iv).
-                if let Some(ValueNode::LoadKeyedGeneric { object, key, .. }) = graph.node(load_id)
-                    && *key == iv_phi_id
-                {
-                    // Verify arr consistency.
-                    if let Some(expected_arr) = arr_node_id {
-                        if *object != expected_arr {
-                            continue;
-                        }
-                    } else {
-                        // Discover arr from the keyed load.  Must be loop-invariant.
-                        let obj_in_loop = loop_body_set.iter().any(|&bi| {
-                            graph
-                                .block(bi)
-                                .map(|b| b.nodes.iter().any(|(nid, _)| *nid == *object))
-                                .unwrap_or(false)
-                        });
-                        if obj_in_loop {
-                            continue;
-                        }
-                        arr_node_id = Some(*object);
-                    }
-                    sum_phi_id = Some(*nid);
-                    add_node_id = Some(back_id);
-                    break;
+    if let (Some(kl_id), Some(kl_obj)) = (keyed_load_id, keyed_load_obj) {
+        // Verify arr is loop-invariant.
+        let obj_in_loop = loop_body_set.iter().any(|&bi| {
+            graph
+                .block(bi)
+                .map(|b| b.nodes.iter().any(|(nid, _)| *nid == kl_obj))
+                .unwrap_or(false)
+        });
+        if !obj_in_loop {
+            if let Some(expected) = arr_node_id {
+                if kl_obj != expected {
+                    // arr mismatch — don't set sum_phi_id, will bail below.
                 }
+            } else {
+                arr_node_id = Some(kl_obj);
+            }
+        }
+
+        // 4b. Find a GenericAdd in body or header that uses the keyed load
+        //     (directly or through a promoted-global phi whose back-edge
+        //     IS the keyed load).
+        //
+        //     Helper: does `operand` resolve to `kl_id`?
+        let resolves_to_load = |operand: NodeId| -> bool {
+            if operand == kl_id {
+                return true;
+            }
+            // Promoted-global phi whose back-edge is the keyed load.
+            if let Some(ValueNode::Phi { inputs }) = graph.node(operand)
+                && inputs.len() == 2
+                && inputs[back_pred_pos] == kl_id
+            {
+                return true;
+            }
+            false
+        };
+
+        // Collect all Add nodes from body.
+        let mut add_candidates: Vec<(NodeId, NodeId, NodeId)> = Vec::new(); // (add_id, left, right)
+        for (nid, node) in &body_snapshot {
+            let (l, r) = match node {
+                ValueNode::GenericAdd { left, right, .. }
+                | ValueNode::Int32Add { left, right }
+                | ValueNode::CheckedSmiAdd { left, right } => (*left, *right),
+                _ => continue,
+            };
+            add_candidates.push((*nid, l, r));
+        }
+
+        for (a_id, a_left, a_right) in &add_candidates {
+            // One operand must resolve to the keyed load.
+            let other = if resolves_to_load(*a_left) {
+                *a_right
+            } else if resolves_to_load(*a_right) {
+                *a_left
+            } else {
+                continue;
+            };
+
+            // Find a header phi whose back-edge is this Add, and whose
+            // init is a numeric constant (the sum accumulator).
+            // `other` must resolve to that phi (directly or through a
+            // promoted-global phi).
+            for (hid, hnode) in &header_nodes_snapshot {
+                if *hid == iv_phi_id || *hid == condition_id {
+                    continue;
+                }
+                if let ValueNode::Phi { inputs } = hnode
+                    && inputs.len() == 2
+                {
+                    if find_i32_constant(graph, inputs[entry_pos]).is_none() {
+                        continue;
+                    }
+                    let back = inputs[back_pred_pos];
+                    // The phi's back-edge must be this Add.
+                    if back != *a_id {
+                        continue;
+                    }
+                    // `other` must be this phi or a phi that resolves
+                    // to this phi (promoted-global copy).
+                    let other_matches = other == *hid || {
+                        if let Some(ValueNode::Phi { inputs: oi }) = graph.node(other)
+                            && oi.len() == 2
+                        {
+                            // Promoted copy: same init, back also this Add.
+                            oi[back_pred_pos] == *a_id
+                                || oi[back_pred_pos] == *hid
+                                || oi[entry_pos] == inputs[entry_pos]
+                        } else {
+                            false
+                        }
+                    };
+                    if other_matches {
+                        sum_phi_id = Some(*hid);
+                        add_node_id = Some(*a_id);
+                        break;
+                    }
+                }
+            }
+            if sum_phi_id.is_some() {
+                break;
             }
         }
     }
@@ -3503,20 +3571,25 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
     let sum_phi_id = match sum_phi_id {
         Some(id) => id,
         None => {
-            // Detailed diagnostics: dump all header phis to help debug.
-            eprintln!("[SUM_FUSION] step4: no matching sum phi found. header phis:");
+            eprintln!("[SUM_FUSION] step4: no matching sum phi found.");
+            eprintln!("  keyed_load={keyed_load_id:?} obj={keyed_load_obj:?}");
+            eprintln!("  header phis:");
             for (nid, node) in &header_nodes_snapshot {
                 if let ValueNode::Phi { inputs } = node {
                     let init_id = inputs[entry_pos];
                     let back_id = inputs[back_pred_pos];
                     eprintln!(
-                        "  phi {:?}: init={:?} back={:?} back_node={:?}",
+                        "    phi {:?}: init={:?} back={:?} back_node={:?}",
                         nid,
                         init_id,
                         back_id,
                         graph.node(back_id)
                     );
                 }
+            }
+            eprintln!("  body nodes:");
+            for (nid, node) in &body_snapshot {
+                eprintln!("    {:?}: {:?}", nid, node);
             }
             return false;
         }
