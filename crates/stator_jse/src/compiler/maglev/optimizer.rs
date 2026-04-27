@@ -167,8 +167,11 @@ pub fn optimize(graph: &mut MaglevGraph) {
     eliminate_redundant_type_guards(graph);
     specialize_closure_calls(graph);
     fuse_call_loops(graph);
-    // NOTE: re-enabled with diagnostics to identify deopt cause.
-    fuse_sum_loops(graph);
+    // NOTE: sum/push loop fusion disabled — push fusion breaks the
+    // array IC (sum loop sees IC miss for every element → 25µs).
+    // Sum fusion never triggers (IR pattern mismatch).
+    // TODO: fix IC propagation after batch push, or implement sum fusion.
+    // fuse_sum_loops(graph);
     mark_inlining_candidates(graph);
     remove_redundant_check_maps(graph);
     fuse_object_literal_stores(graph);
@@ -3244,6 +3247,7 @@ fn try_fuse_call_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
 //           Jump → header
 //   No calls, no stores, no extra side effects in body.
 
+#[allow(dead_code)] // Disabled: push fusion breaks array IC (see optimizer call site).
 fn fuse_sum_loops(graph: &mut MaglevGraph) {
     let loops = licm::detect_loops(graph);
     if loops.is_empty() {
