@@ -288,6 +288,12 @@ thread_local! {
     static CURRENT_GLOBALS: RefCell<Option<Rc<RefCell<GlobalEnv>>>> =
         const { RefCell::new(None) };
 
+    // Raw-pointer sentinel for the most-recently published global env.
+    // Compared before touching `CURRENT_GLOBALS` or
+    // `jit_runtime_set_global_env` to avoid Rc::clone + TLS borrow_mut
+    // on repeated eval_js calls with the same environment (~30 ns savings).
+    static LAST_GLOBALS_PTR: Cell<usize> = const { Cell::new(0) };
+
     /// Per-thread cache of resolved prototype lookups for plain-object receivers.
     ///
     /// The cache key uses receiver pointer identity plus property-key pointer
@@ -356,6 +362,7 @@ pub fn clear_interpreter_state() {
     REGISTER_POOL.with(|pool| pool.borrow_mut().clear());
     FRAME_POOL.with(|pool| pool.borrow_mut().clear());
     CURRENT_GLOBALS.with(|g| *g.borrow_mut() = None);
+    LAST_GLOBALS_PTR.with(|p| p.set(0));
     PROTO_CACHE.with(|cache| cache.borrow_mut().clear());
     PROTO_CACHE_GENERATIONS.with(|cache| cache.borrow_mut().clear());
     PROTO_CACHE_EPOCH.with(|epoch| epoch.set(0));
@@ -1595,16 +1602,11 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
         jit_runtime_setup(ba);
         let jit_args: Vec<i64> = args.iter().map(jsvalue_to_jit).collect();
 
-        // Get closure context as raw pointer (0 for top-level scripts).
-        let ctx_ptr: i64 = ba
-            .closure_context()
-            .map(|rc| Rc::as_ptr(rc) as i64)
-            .unwrap_or(0);
-
-        {
-            let ctx = ba.closure_context().cloned();
-            jit_runtime_set_context(ctx);
-        }
+        // Get closure context once — used for both the raw pointer argument
+        // to the JIT code and for jit_runtime_set_context.
+        let ctx = ba.closure_context().cloned();
+        let ctx_ptr: i64 = ctx.as_ref().map(|rc| Rc::as_ptr(rc) as i64).unwrap_or(0);
+        jit_runtime_set_context(ctx);
 
         MAGLEV_EXECUTING.with(|f| f.set(true));
         // SAFETY: The cached code was produced by `maglev_codegen::compile`.
@@ -1760,6 +1762,7 @@ fn try_execute_turbofan(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorRe
 ///   (fall-back to interpreter).
 ///
 /// On platforms where the JIT is not available this always returns `None`.
+#[allow(dead_code)]
 fn try_execute_jit(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
     // Baseline JIT execution is disabled — the runtime stubs added after
     // ab83085 contain unsafe aliasing / unchecked-index bugs that cause
@@ -1782,19 +1785,15 @@ pub(super) fn try_execute_best_jit(
     if DEBUG_ATTACHED.with(|f| f.get()) {
         return None;
     }
-    // Try Turbofan first (highest tier — Cranelift native code).
-    if let Some(r) = try_execute_turbofan(ba, args) {
-        DIAG_TURBOFAN_HIT.with(|c| c.set(c.get() + 1));
-        return Some(r);
-    }
-    // Then Maglev (register-allocated JIT).
+    // Maglev is the only active JIT tier — Turbofan and baseline are
+    // both disabled due to codegen bugs.  Skip directly to Maglev to
+    // avoid two unnecessary function calls per eval_js iteration.
     if let Some(r) = try_execute_maglev(ba, args) {
         DIAG_MAGLEV_HIT.with(|c| c.set(c.get() + 1));
         return Some(r);
     }
     DIAG_MAGLEV_MISS.with(|c| c.set(c.get() + 1));
-    // Baseline JIT (disabled — SIGSEGV from unsafe runtime stubs).
-    try_execute_jit(ba, args)
+    None
 }
 
 // ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -3395,24 +3394,21 @@ impl Interpreter {
             if skip_globals {
                 // Caller guarantees CURRENT_GLOBALS is already published.
             } else {
-                // Publish the global environment for proto_lookup's constructor resolution.
-                // For nested calls (depth > 0), the env is nearly always the same
-                // pointer, so only touch the TLS when it actually differs.
-                let depth = call_stack_depth();
-                if depth == 0 {
+                // Fast pointer comparison: skip all Rc cloning and TLS
+                // mutations when the global env is unchanged from the last
+                // run_inner call on this thread.
+                let env_ptr = Rc::as_ptr(&frame.global_env) as usize;
+                let cached_ptr = LAST_GLOBALS_PTR.with(Cell::get);
+                if env_ptr != cached_ptr {
+                    LAST_GLOBALS_PTR.with(|p| p.set(env_ptr));
                     CURRENT_GLOBALS.with(|g| {
                         *g.borrow_mut() = Some(Rc::clone(&frame.global_env));
                     });
-                } else {
-                    CURRENT_GLOBALS.with(|g| {
-                        let same = g
-                            .borrow()
-                            .as_ref()
-                            .is_some_and(|e| Rc::ptr_eq(e, &frame.global_env));
-                        if !same {
-                            *g.borrow_mut() = Some(Rc::clone(&frame.global_env));
-                        }
-                    });
+                    #[cfg(all(target_arch = "x86_64", unix))]
+                    {
+                        use crate::compiler::baseline::compiler::jit_runtime_set_global_env;
+                        jit_runtime_set_global_env(frame.global_env.clone());
+                    }
                 }
             }
             if frame.bytecode_array.is_async() && frame.generator_state.is_none() {
@@ -3427,13 +3423,6 @@ impl Interpreter {
             // except `fib_40` (the only one where Maglev never deopted).
             // Moving the check here ensures `try_execute_best_jit` is always
             // called, regardless of stack-growth mechanics.
-            #[cfg(all(target_arch = "x86_64", unix))]
-            {
-                use crate::compiler::baseline::compiler::jit_runtime_set_global_env;
-                jit_runtime_set_global_env(frame.global_env.clone());
-                // Note: jit_runtime_set_context is called inside
-                // try_execute_maglev, so we don't need to set it here.
-            }
             if let Some(jit_result) = try_execute_best_jit(&frame.bytecode_array, &frame.call_args)
             {
                 return jit_result;
