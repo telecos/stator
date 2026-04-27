@@ -3626,9 +3626,13 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
         let body = graph.block(body_block_idx).unwrap();
         for (_, node) in &body.nodes {
             match node {
-                // Allowed: load keyed, add, increment, constants, phis,
-                // load/store globals (from pre-promotion remnants).
+                // Allowed: element loads (generic or specialised), add,
+                // increment, constants, phis, load/store globals (from
+                // pre-promotion remnants), guards.
                 ValueNode::LoadKeyedGeneric { .. }
+                | ValueNode::LoadFixedArrayElement { .. }
+                | ValueNode::LoadFixedDoubleArrayElement { .. }
+                | ValueNode::LoadHoleyFixedDoubleArrayElement { .. }
                 | ValueNode::GenericAdd { .. }
                 | ValueNode::Int32Add { .. }
                 | ValueNode::CheckedSmiAdd { .. }
