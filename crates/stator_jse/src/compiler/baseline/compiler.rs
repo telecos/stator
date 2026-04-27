@@ -330,6 +330,12 @@ pub(crate) mod jit_runtime {
         /// after nested JIT execution re-initialises thread-local state.
         static RT_SETUP_GEN: Cell<u64> = const { Cell::new(0) };
 
+        /// Set by [`jit_runtime_teardown`] after draining the heap.
+        /// Checked by [`jit_runtime_setup`] to skip the redundant
+        /// `recycle_and_clear_heap` + cache clears when teardown already
+        /// performed them.
+        static RT_HEAP_CLEAN: Cell<bool> = const { Cell::new(false) };
+
         /// Monotonically increasing counter bumped by every named-property
         /// store (STA) in JIT stubs.  Combined with the prototype-mutation
         /// epoch to guard proto-IC entries that cache own-property values.
@@ -1141,33 +1147,23 @@ pub(crate) mod jit_runtime {
         }
         let ba_ptr = ba as *const BytecodeArray;
         RT_BYTECODE.with(|b| b.set(ba_ptr));
-        recycle_and_clear_heap();
-        // The call-property1 IC caches heap handles that are invalidated
-        // by recycle_and_clear_heap, so clear it unconditionally.
-        RT_CALL_PROP1_IC.with(|c| c.set(CallProp1IcEntry::EMPTY));
-        // Push cache holds a raw Vec pointer into the heap — must be
-        // invalidated when the heap is recycled.
-        RT_PUSH_CACHE.with(|c| c.set(PushVecCache::EMPTY));
-        // The cached callee entry holds raw pointers (`ba_ptr`, `ctx_ptr`)
-        // derived from Rc values that lived in the now-cleared heap.
-        // A matching `callee_i64` (deterministic allocation from an empty
-        // heap) would cause a use-after-free via the stale `ba_ptr`.
-        CACHED_CALLEE.with(|c| {
-            let old = c.get();
-            drop_cached_ctx_rc_raw(old.ctx_rc_raw);
-            c.set(CachedCalleeEntry::EMPTY);
-        });
-        // The Maglev callee cache also holds a raw BA pointer and an
-        // Rc-reference-counted context pointer that are invalidated when
-        // the heap is cleared.  A stale `ba_ptr` is only used for
-        // equality checks (safe), but the `ctx_rc_raw` keeps the old
-        // context alive indefinitely and a stale `same_context` flag
-        // could cause incorrect context-swap decisions in edge cases.
-        MAGLEV_CALLEE_CACHE.with(|c| {
-            let old = c.get();
-            drop_cached_ctx_rc_raw(old.ctx_rc_raw);
-            c.set(MaglevCalleeCache::EMPTY);
-        });
+        // Skip heap recycle + cache clears when teardown already did them.
+        let heap_clean = RT_HEAP_CLEAN.with(|c| c.replace(false));
+        if !heap_clean {
+            recycle_and_clear_heap();
+            RT_CALL_PROP1_IC.with(|c| c.set(CallProp1IcEntry::EMPTY));
+            RT_PUSH_CACHE.with(|c| c.set(PushVecCache::EMPTY));
+            CACHED_CALLEE.with(|c| {
+                let old = c.get();
+                drop_cached_ctx_rc_raw(old.ctx_rc_raw);
+                c.set(CachedCalleeEntry::EMPTY);
+            });
+            MAGLEV_CALLEE_CACHE.with(|c| {
+                let old = c.get();
+                drop_cached_ctx_rc_raw(old.ctx_rc_raw);
+                c.set(MaglevCalleeCache::EMPTY);
+            });
+        }
         // Only reset the property and array-method ICs when the function
         // changes.  Re-entrant calls to the same BytecodeArray (e.g.
         // criterion iterations) keep warm IC state, saving ~190ns per
@@ -1266,6 +1262,16 @@ pub(crate) mod jit_runtime {
             drop_cached_ctx_rc_raw(old.ctx_rc_raw);
             c.set(MaglevCalleeCache::EMPTY);
         });
+        // Also clear the caches that setup would clear anyway — then
+        // set the flag so setup can skip the redundant work.
+        RT_CALL_PROP1_IC.with(|c| c.set(CallProp1IcEntry::EMPTY));
+        RT_PUSH_CACHE.with(|c| c.set(PushVecCache::EMPTY));
+        CACHED_CALLEE.with(|c| {
+            let old = c.get();
+            drop_cached_ctx_rc_raw(old.ctx_rc_raw);
+            c.set(CachedCalleeEntry::EMPTY);
+        });
+        RT_HEAP_CLEAN.with(|c| c.set(true));
     }
 
     /// Comprehensive teardown of **all** JIT thread-local state.
