@@ -380,12 +380,61 @@ pub struct JsContext {
 impl JsContext {
     /// Create a new context with `slot_count` slots initialised to `undefined`,
     /// chained to an optional parent context.
+    ///
+    /// Tries the thread-local recycling pool first to avoid heap allocation.
     pub fn new(slot_count: usize, parent: Option<Rc<RefCell<JsContext>>>) -> Rc<RefCell<Self>> {
-        Rc::new(RefCell::new(Self {
-            slots: vec![JsValue::Undefined; slot_count],
-            parent,
-        }))
+        // Try to reuse a recycled context from the pool.
+        let recycled = CONTEXT_RC_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            pool.pop()
+        });
+        if let Some(rc) = recycled {
+            // Re-initialise the recycled context in place.
+            let mut ctx = rc.borrow_mut();
+            ctx.slots.clear();
+            ctx.slots.resize(slot_count, JsValue::Undefined);
+            ctx.parent = parent;
+            drop(ctx);
+            rc
+        } else {
+            Rc::new(RefCell::new(Self {
+                slots: vec![JsValue::Undefined; slot_count],
+                parent,
+            }))
+        }
     }
+}
+
+/// Maximum number of recycled `Rc<RefCell<JsContext>>` kept in the pool.
+const CONTEXT_RC_POOL_CAP: usize = 8;
+
+thread_local! {
+    static CONTEXT_RC_POOL: RefCell<Vec<Rc<RefCell<JsContext>>>> =
+        RefCell::new(Vec::with_capacity(CONTEXT_RC_POOL_CAP));
+}
+
+/// Recycle an `Rc<RefCell<JsContext>>` into the thread-local pool for reuse.
+///
+/// Only recycles when the Rc has a strong count of 1 (sole owner) and the
+/// pool is not full.
+#[allow(dead_code)] // only called from JIT code on x86_64 unix
+pub(crate) fn recycle_context_rc(rc: Rc<RefCell<JsContext>>) {
+    if Rc::strong_count(&rc) != 1 {
+        return;
+    }
+    let _ = CONTEXT_RC_POOL.try_with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < CONTEXT_RC_POOL_CAP {
+            pool.push(rc);
+        }
+    });
+}
+
+/// Drain the thread-local context pool.  Must be called during full
+/// teardown to prevent dangling references.
+#[allow(dead_code)] // only called from JIT teardown on x86_64 unix
+pub fn clear_context_pool() {
+    let _ = CONTEXT_RC_POOL.try_with(|pool| pool.borrow_mut().clear());
 }
 
 // Manual Debug impl: NativeFunction can't derive Debug (dyn Fn).

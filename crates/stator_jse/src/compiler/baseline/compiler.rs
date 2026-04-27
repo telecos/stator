@@ -175,7 +175,7 @@ pub(crate) mod jit_runtime {
         acquire_object_rc_from_template_cached, acquire_object_rc_from_template_with_values_cached,
         recycle_object_rc,
     };
-    use crate::objects::value::{JsContext, JsValue, NativeIterator};
+    use crate::objects::value::{JsContext, JsValue, NativeIterator, recycle_context_rc};
 
     /// One slot of the own-property inline cache for `LdaNamedProperty`.
     #[derive(Clone, Copy)]
@@ -1304,6 +1304,9 @@ pub(crate) mod jit_runtime {
 
         // ── Drain property-map pools that may hold Rc/JsValue ──────
         crate::objects::property_map::clear_property_map_pools();
+
+        // ── Drain context recycling pool ───────────────────────────
+        crate::objects::value::clear_context_pool();
     }
 
     /// Set the current closure context for context-slot stubs.
@@ -1322,8 +1325,10 @@ pub(crate) mod jit_runtime {
         RT_HEAP.with(|h| {
             let mut heap = h.borrow_mut();
             for val in heap.drain(..) {
-                if let JsValue::PlainObject(rc) = val {
-                    recycle_object_rc(rc);
+                match val {
+                    JsValue::PlainObject(rc) => recycle_object_rc(rc),
+                    JsValue::Context(rc) => recycle_context_rc(rc),
+                    _ => {}
                 }
             }
             // Pre-reserve capacity on first use so that object-heavy
@@ -1342,8 +1347,10 @@ pub(crate) mod jit_runtime {
         RT_HEAP.with(|h| {
             let mut heap = h.borrow_mut();
             for val in heap.drain(base..) {
-                if let JsValue::PlainObject(rc) = val {
-                    recycle_object_rc(rc);
+                match val {
+                    JsValue::PlainObject(rc) => recycle_object_rc(rc),
+                    JsValue::Context(rc) => recycle_context_rc(rc),
+                    _ => {}
                 }
             }
         });
