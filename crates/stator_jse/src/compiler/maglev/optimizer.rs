@@ -3284,11 +3284,6 @@ fn fuse_sum_loops(graph: &mut MaglevGraph) {
 fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
     // ── 1. Simple loop: header + 1 body block ────────────────────────────
     if lp.body.len() != 2 || !lp.body.contains(&lp.header) {
-        eprintln!(
-            "[SUM_FUSION] step1: body.len={} has_header={}",
-            lp.body.len(),
-            lp.body.contains(&lp.header)
-        );
         return false;
     }
 
@@ -3343,61 +3338,32 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
         }
         match found {
             Some(ValueNode::Int32LessThan { left, right }) => (left, right),
-            _ => {
-                eprintln!(
-                    "[SUM_FUSION] step2: condition {condition_id:?} not Int32LessThan, found={found:?}"
-                );
-                return false;
-            }
+            _ => return false,
         }
     };
 
     // IV must be a Phi starting at 0, incrementing by 1.
     let back_pred_pos = match header_preds.iter().position(|&p| p == body_block_idx) {
         Some(pos) => pos,
-        None => {
-            eprintln!("[SUM_FUSION] step2b: no back_pred_pos for body_block={body_block_idx}");
-            return false;
-        }
+        None => return false,
     };
     let entry_pos = match header_preds.iter().position(|&p| p == lp.preheader) {
         Some(pos) => pos,
-        None => {
-            eprintln!(
-                "[SUM_FUSION] step2c: no entry_pos for preheader={}",
-                lp.preheader
-            );
-            return false;
-        }
+        None => return false,
     };
 
     let iv_phi_id = cmp_left;
     let iv_inputs = match graph.node(iv_phi_id) {
         Some(ValueNode::Phi { inputs }) if inputs.len() == 2 => inputs.clone(),
-        _ => {
-            eprintln!(
-                "[SUM_FUSION] step2d: iv_phi {:?} not Phi(2), got {:?}",
-                iv_phi_id,
-                graph.node(iv_phi_id)
-            );
-            return false;
-        }
+        _ => return false,
     };
 
     // IV init must be 0.
     if find_i32_constant(graph, iv_inputs[entry_pos]) != Some(0) {
-        eprintln!(
-            "[SUM_FUSION] step2e: iv init != 0, got {:?}",
-            find_i32_constant(graph, iv_inputs[entry_pos])
-        );
         return false;
     }
     // IV step must be +1.
     if find_increment_step(graph, iv_inputs[back_pred_pos], iv_phi_id) != Some(1) {
-        eprintln!(
-            "[SUM_FUSION] step2f: iv step != 1, got {:?}",
-            find_increment_step(graph, iv_inputs[back_pred_pos], iv_phi_id)
-        );
         return false;
     }
 
@@ -3409,14 +3375,7 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
     let limit_arr_node_id = match graph.node(cmp_right) {
         Some(ValueNode::LoadNamedGeneric { object, .. }) => Some(*object),
         Some(ValueNode::SmiConstant { .. } | ValueNode::Int32Constant { .. }) => None,
-        _ => {
-            eprintln!(
-                "[SUM_FUSION] step3: cmp_right {:?} unexpected type, got {:?}",
-                cmp_right,
-                graph.node(cmp_right)
-            );
-            return false;
-        }
+        _ => return false,
     };
 
     let loop_body_set: HashSet<u32> = lp.body.iter().copied().collect();
@@ -3595,29 +3554,7 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
 
     let sum_phi_id = match sum_phi_id {
         Some(id) => id,
-        None => {
-            eprintln!("[SUM_FUSION] step4: no matching sum phi found.");
-            eprintln!("  keyed_load={keyed_load_id:?} obj={keyed_load_obj:?}");
-            eprintln!("  header phis:");
-            for (nid, node) in &header_nodes_snapshot {
-                if let ValueNode::Phi { inputs } = node {
-                    let init_id = inputs[entry_pos];
-                    let back_id = inputs[back_pred_pos];
-                    eprintln!(
-                        "    phi {:?}: init={:?} back={:?} back_node={:?}",
-                        nid,
-                        init_id,
-                        back_id,
-                        graph.node(back_id)
-                    );
-                }
-            }
-            eprintln!("  body nodes:");
-            for (nid, node) in &body_snapshot {
-                eprintln!("    {:?}: {:?}", nid, node);
-            }
-            return false;
-        }
+        None => return false,
     };
     let _add_node_id = add_node_id.unwrap();
 
@@ -3649,10 +3586,7 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
                 | ValueNode::Int32LessThan { .. }
                 | ValueNode::CheckSmi { .. } => {}
                 // Any call, store keyed, delete, etc. → bail.
-                other => {
-                    eprintln!("[SUM_FUSION] step5: disallowed node in body: {other:?}");
-                    return false;
-                }
+                _other => return false,
             }
         }
     }
@@ -3662,7 +3596,6 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
         Some(id) => id,
         None => return false,
     };
-    eprintln!("[SUM_FUSION] ✓ match! arr={arr_node_id:?} iv={iv_phi_id:?} sum={sum_phi_id:?}");
     let fusion_id = graph.alloc_node_id();
     if let Some(pre) = graph.block_mut(lp.preheader) {
         pre.push_with_id(
