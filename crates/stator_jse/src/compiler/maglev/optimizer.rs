@@ -3401,14 +3401,17 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
         return false;
     }
 
-    // ── 3. Limit must be arr.length ──────────────────────────────────────
-    // cmp_right must be a LoadNamedGeneric(arr, "length") or similar
-    // where arr is loop-invariant.
-    let arr_node_id = match graph.node(cmp_right) {
-        Some(ValueNode::LoadNamedGeneric { object, .. }) => *object,
+    // ── 3. Limit: arr.length or a constant ───────────────────────────────
+    // cmp_right may be LoadNamedGeneric(arr, "length") or a constant
+    // (e.g. after store-to-load forwarding replaced arr.length with a
+    // SmiConstant).  In the constant case we infer arr from the body's
+    // LoadKeyedGeneric.
+    let limit_arr_node_id = match graph.node(cmp_right) {
+        Some(ValueNode::LoadNamedGeneric { object, .. }) => Some(*object),
+        Some(ValueNode::SmiConstant { .. } | ValueNode::Int32Constant { .. }) => None,
         _ => {
             eprintln!(
-                "[SUM_FUSION] step3: cmp_right {:?} not LoadNamedGeneric, got {:?}",
+                "[SUM_FUSION] step3: cmp_right {:?} unexpected type, got {:?}",
                 cmp_right,
                 graph.node(cmp_right)
             );
@@ -3416,21 +3419,26 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
         }
     };
 
-    // Check arr is loop-invariant (defined outside the loop).
     let loop_body_set: HashSet<u32> = lp.body.iter().copied().collect();
-    let arr_in_loop = loop_body_set.iter().any(|&bi| {
-        graph
-            .block(bi)
-            .map(|b| b.nodes.iter().any(|(nid, _)| *nid == arr_node_id))
-            .unwrap_or(false)
-    });
-    if arr_in_loop {
-        return false;
+
+    // If arr from limit, check it's loop-invariant.
+    if let Some(arr_id) = limit_arr_node_id {
+        let arr_in_loop = loop_body_set.iter().any(|&bi| {
+            graph
+                .block(bi)
+                .map(|b| b.nodes.iter().any(|(nid, _)| *nid == arr_id))
+                .unwrap_or(false)
+        });
+        if arr_in_loop {
+            return false;
+        }
     }
 
-    // ── 4. Find sum phi: sum = init → GenericAdd(sum, LoadKeyedGeneric(arr, iv)) ──
+    // ── 4. Find sum phi: sum = init → Add(sum, LoadKeyedGeneric(arr, iv)) ──
+    //     If limit_arr_node_id is None, discover arr from the LoadKeyedGeneric.
     let mut sum_phi_id = None;
     let mut add_node_id = None;
+    let mut arr_node_id = limit_arr_node_id;
     for (nid, node) in &header_nodes_snapshot {
         if *nid == iv_phi_id || *nid == condition_id {
             continue;
@@ -3462,11 +3470,28 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
                 } else {
                     continue;
                 };
-                // load must be LoadKeyedGeneric(arr, iv).
+                // load must be LoadKeyedGeneric(_, iv).
                 if let Some(ValueNode::LoadKeyedGeneric { object, key, .. }) = graph.node(load_id)
-                    && *object == arr_node_id
                     && *key == iv_phi_id
                 {
+                    // Verify arr consistency.
+                    if let Some(expected_arr) = arr_node_id {
+                        if *object != expected_arr {
+                            continue;
+                        }
+                    } else {
+                        // Discover arr from the keyed load.  Must be loop-invariant.
+                        let obj_in_loop = loop_body_set.iter().any(|&bi| {
+                            graph
+                                .block(bi)
+                                .map(|b| b.nodes.iter().any(|(nid, _)| *nid == *object))
+                                .unwrap_or(false)
+                        });
+                        if obj_in_loop {
+                            continue;
+                        }
+                        arr_node_id = Some(*object);
+                    }
                     sum_phi_id = Some(*nid);
                     add_node_id = Some(back_id);
                     break;
@@ -3531,6 +3556,10 @@ fn try_fuse_sum_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
     }
 
     // ── 6. Insert SpeculativeSumFusion in preheader ──────────────────────
+    let arr_node_id = match arr_node_id {
+        Some(id) => id,
+        None => return false,
+    };
     eprintln!("[SUM_FUSION] ✓ match! arr={arr_node_id:?} iv={iv_phi_id:?} sum={sum_phi_id:?}");
     let fusion_id = graph.alloc_node_id();
     if let Some(pre) = graph.block_mut(lp.preheader) {
