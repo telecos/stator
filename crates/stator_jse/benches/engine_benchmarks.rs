@@ -824,9 +824,18 @@ fn bench_sieve_primes_1k(c: &mut Criterion) {
     // Guarded to avoid polluting TLS state when another benchmark is targeted.
     if bench_selected("sieve_primes_1k") {
         reset_stub_deopt_counts();
-        // Maglev generates incorrect code for sieve's nested loops;
-        // use interpreter-only warmup (interpreter beats V8 handily).
-        warmup_eval_js_no_jit(source);
+        // Maglev JIT produces correct code for sieve via the eval_js path
+        // (777ns vs interpreter's 385µs). The precompiled path has a
+        // different warmup flow that triggers a JIT bug, but eval_js works.
+        warmup_eval_js(source);
+        // Verify the JIT code produces the correct result (168 primes ≤ 1000).
+        let result = eval_js(source).unwrap();
+        let count = result.to_number();
+        assert!(
+            (count - 168.0).abs() < 0.5,
+            "SIEVE CORRECTNESS FAIL: expected 168, got {count}"
+        );
+        eprintln!("SIEVE_DIAG sieve_result={count}");
         let counts = stub_deopt_counts();
         eprintln!("SIEVE_DIAG stub_deopts_after_warmup:");
         for i in 0..STUB_DEOPT_SLOTS {
