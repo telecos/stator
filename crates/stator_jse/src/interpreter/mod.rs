@@ -1424,9 +1424,13 @@ pub fn maybe_compile_maglev(ba: &BytecodeArray) {
                     }
                 }
                 let param_count = input.ba.parameter_count();
+                let bc_len = input.ba.bytecodes().len();
+                let t0 = std::time::Instant::now();
                 match GraphBuilder::build(&input.ba, &feedback) {
                     Ok(mut graph) => {
+                        let t_graph = t0.elapsed();
                         optimize(&mut graph);
+                        let t_opt = t0.elapsed();
 
                         // Skip compilation of degenerate graphs (entry block
                         // immediately deoptimises).  Registering such code would
@@ -1436,10 +1440,18 @@ pub fn maybe_compile_maglev(ba: &BytecodeArray) {
                         if graph.is_degenerate() {
                             MAGLEV_COMPILATION_FAILED
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            eprintln!(
+                                "MAGLEV_COMPILE: degenerate bc_len={bc_len} graph={t_graph:?} opt={t_opt:?}"
+                            );
                         } else {
                             match maglev_codegen::compile(&graph, param_count) {
                                 Ok(cc) => {
+                                    let t_codegen = t0.elapsed();
                                     let code_len = cc.code.len();
+                                    eprintln!(
+                                        "MAGLEV_COMPILE: ok bc_len={bc_len} code={code_len}B graph={t_graph:?} opt={:?} codegen={t_codegen:?}",
+                                        t_opt - t_graph
+                                    );
                                     if let Ok(mut guard) = input.result_cache.lock() {
                                         // SAFETY: `cc.code` was produced by `maglev_codegen::compile`.
                                         if let Ok(cached) = unsafe {
