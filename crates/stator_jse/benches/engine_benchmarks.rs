@@ -882,6 +882,14 @@ fn bench_sieve_primes_1k(c: &mut Criterion) {
         let ba = Rc::new(bytecode);
         let env = make_global_env();
 
+        // Tear down JIT runtime completely to clear stale TLS caches
+        // from previous benchmarks (CACHED_CALLEE, MAGLEV_CALLEE_CACHE,
+        // property map pools, etc.) that corrupt sieve's JIT execution.
+        clear_eval_cache();
+        stator_jse::interpreter::clear_interpreter_state();
+        #[cfg(all(target_arch = "x86_64", unix))]
+        stator_jse::compiler::baseline::BaselineCompiler::jit_full_teardown();
+
         // Warmup with Maglev (same pattern as precompiled benchmarks).
         install_sigsegv_handler();
         reset_stub_deopt_counts();
