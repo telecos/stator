@@ -26,6 +26,48 @@ use stator_jse::compiler::baseline::compiler::{
     STUB_DEOPT_SLOTS, STUB_NAMES, reset_stub_deopt_counts, stub_deopt_counts,
 };
 
+/// Install a SIGSEGV handler that prints diagnostic info before aborting.
+#[cfg(unix)]
+fn install_sigsegv_handler() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        extern "C" fn handler(
+            sig: libc::c_int,
+            info: *mut libc::siginfo_t,
+            _ctx: *mut libc::c_void,
+        ) {
+            let fault_addr = if info.is_null() {
+                0usize
+            } else {
+                // SAFETY: reading si_addr from a valid siginfo_t in signal context.
+                unsafe { (*info).si_addr() as usize }
+            };
+            let msg = format!(
+                "\n=== SIGSEGV HANDLER ===\nsignal={sig} fault_addr=0x{fault_addr:016x}\n\
+                 backtrace:\n{}\n=== END SIGSEGV ===\n",
+                std::backtrace::Backtrace::force_capture()
+            );
+            // SAFETY: write(2) is async-signal-safe; _exit terminates immediately.
+            unsafe {
+                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+                libc::_exit(11);
+            }
+        }
+        // SAFETY: installing a signal handler with valid sigaction struct.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = handler as *const () as usize;
+            sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESETHAND;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn install_sigsegv_handler() {}
+
 /// CI-friendly Criterion configuration with reduced samples to avoid timeouts.
 fn ci_config() -> Criterion {
     Criterion::default()
@@ -121,10 +163,17 @@ fn warmup_eval_js(source: &str) {
         {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        // Reset deopt counter so Phase 3 retries JIT with warm ICs,
+        // matching the precompiled warmup_with_maglev behaviour.
+        ba.reset_maglev_deopt_count();
     }
     // Phase 3: 100 more iterations with JIT code active to warm JIT ICs.
     for _ in 0..100 {
         let _ = eval_js(source);
+    }
+    // Final deopt reset before Criterion measurement.
+    if let Some(ref ba) = ba {
+        ba.reset_maglev_deopt_count();
     }
 }
 
@@ -942,6 +991,7 @@ criterion_group! {
 // Custom main that clears all thread-local caches before the process
 // exits, preventing SIGSEGV from non-deterministic TLS destruction order.
 fn main() {
+    install_sigsegv_handler();
     infra_benches();
     property_map_benches();
     jsvalue_benches();
