@@ -11267,17 +11267,23 @@ pub(crate) mod jit_runtime {
             let count = items.len();
             let smi_disc = layout.smi_disc;
             let mut sum: i64 = 0;
+            // Branchless discriminant accumulation: XOR each disc with the
+            // expected Smi discriminant and OR into `disc_mismatch`.  If any
+            // element is not a Smi the result is non-zero → deopt once at the
+            // end instead of branching per element.  This lets the CPU
+            // pipeline the loop without mispredicts.
+            let mut disc_mismatch: u8 = 0;
             for i in 0..count {
                 // SAFETY: i < count ≤ items.len(); stride * i + 7 < stride * count
                 // which fits in the Vec's allocation.
                 let elem_ptr = unsafe { base.add(stride * i) };
-                let disc = unsafe { *elem_ptr };
-                if disc != smi_disc {
-                    return JIT_DEOPT;
-                }
+                disc_mismatch |= unsafe { *elem_ptr } ^ smi_disc;
                 // Read i32 payload at offset 4 (smi_payload_offset).
                 let payload = unsafe { *(elem_ptr.add(4) as *const i32) };
                 sum += payload as i64;
+            }
+            if disc_mismatch != 0 {
+                return JIT_DEOPT;
             }
             if sum < i32::MIN as i64 || sum > i32::MAX as i64 {
                 return JIT_DEOPT;
