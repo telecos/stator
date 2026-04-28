@@ -850,24 +850,31 @@ fn bench_prototype_chain_1k(c: &mut Criterion) {
 }
 
 fn bench_sieve_primes_1k(c: &mut Criterion) {
+    // Wrap sieve in a function so Maglev JIT compiles the function body
+    // (which works correctly) rather than a top-level script.  The JIT
+    // has a codegen bug with nested loops in top-level script bytecode
+    // that causes the counting loop to return 0.
     let source = r#"
-        var n = 1000;
-        var sieve = [];
-        for (var i = 0; i <= n; i++) sieve[i] = true;
-        sieve[0] = false;
-        sieve[1] = false;
-        for (var i = 2; i * i <= n; i++) {
-            if (sieve[i]) {
-                for (var j = i * i; j <= n; j = j + i) {
-                    sieve[j] = false;
+        function sieve() {
+            var n = 1000;
+            var sieve = [];
+            for (var i = 0; i <= n; i++) sieve[i] = true;
+            sieve[0] = false;
+            sieve[1] = false;
+            for (var i = 2; i * i <= n; i++) {
+                if (sieve[i]) {
+                    for (var j = i * i; j <= n; j = j + i) {
+                        sieve[j] = false;
+                    }
                 }
             }
+            var count = 0;
+            for (var i = 0; i <= n; i++) {
+                if (sieve[i]) count = count + 1;
+            }
+            return count;
         }
-        var count = 0;
-        for (var i = 0; i <= n; i++) {
-            if (sieve[i]) count = count + 1;
-        }
-        count;
+        sieve();
     "#;
     // Print stub deopt diagnostics before and after for CI visibility.
     // Guarded to avoid polluting TLS state when another benchmark is targeted.
