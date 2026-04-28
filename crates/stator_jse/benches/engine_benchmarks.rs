@@ -872,10 +872,13 @@ fn bench_sieve_primes_1k(c: &mut Criterion) {
     // Print stub deopt diagnostics before and after for CI visibility.
     // Guarded to avoid polluting TLS state when another benchmark is targeted.
     if bench_selected("sieve_primes_1k") {
+        // Clear stale state from previous benchmarks — the shared
+        // CACHED_ENV accumulates global variables and IC state from
+        // earlier benchmarks which can corrupt sieve's array access
+        // patterns in the JIT.  Starting fresh isolates the sieve.
+        clear_eval_cache();
+        stator_jse::interpreter::clear_interpreter_state();
         reset_stub_deopt_counts();
-        // Maglev JIT produces correct code for sieve via the eval_js path
-        // (777ns vs interpreter's 385µs). The precompiled path has a
-        // different warmup flow that triggers a JIT bug, but eval_js works.
         warmup_eval_js(source);
         // Verify the JIT code produces the correct result (168 primes ≤ 1000).
         let result = eval_js(source).unwrap();
