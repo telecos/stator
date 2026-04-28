@@ -888,7 +888,7 @@ fn bench_sieve_primes_1k(c: &mut Criterion) {
         clear_eval_cache();
         stator_jse::interpreter::clear_interpreter_state();
         #[cfg(all(target_arch = "x86_64", unix))]
-        stator_jse::compiler::baseline::BaselineCompiler::jit_full_teardown();
+        stator_jse::compiler::baseline::compiler::jit_full_teardown();
 
         // Warmup with Maglev (same pattern as precompiled benchmarks).
         install_sigsegv_handler();
