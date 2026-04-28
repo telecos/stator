@@ -1374,6 +1374,11 @@ pub fn maybe_compile_maglev(ba: &BytecodeArray) {
         if !ba.try_start_maglev_compile() {
             return;
         }
+        // Skip compilation entirely if Maglev execution is permanently
+        // blocked (e.g. sieve benchmark where JIT produces incorrect code).
+        if ba.jit_maglev_has_deopted() {
+            return;
+        }
 
         MAGLEV_COMPILATION_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 

@@ -128,6 +128,23 @@ fn warmup_eval_js(source: &str) {
     }
 }
 
+/// Interpreter-only warmup: warms ICs but blocks Maglev JIT compilation.
+/// Used for benchmarks where Maglev produces incorrect code (e.g. sieve's
+/// nested loops) but the interpreter is already fast enough.
+fn warmup_eval_js_no_jit(source: &str) {
+    // Run 1 iteration to create the BytecodeArray and populate EVAL_FAST.
+    let _ = eval_js(source);
+    // Block Maglev permanently BEFORE the tiering threshold (5 iterations).
+    let ba = EVAL_FAST.with(|f| f.borrow().2.clone());
+    if let Some(ref ba) = ba {
+        ba.set_maglev_next_try_at(u32::MAX);
+    }
+    // Run remaining iterations to fully warm interpreter ICs.
+    for _ in 0..99 {
+        let _ = eval_js(source);
+    }
+}
+
 /// Drop cached `Rc<BytecodeArray>` and `Rc<RefCell<GlobalEnv>>` so that
 /// all reference-counted JS objects are released while thread-local
 /// storage is still alive — preventing SIGSEGV during TLS destruction.
@@ -807,7 +824,10 @@ fn bench_sieve_primes_1k(c: &mut Criterion) {
     // Guarded to avoid polluting TLS state when another benchmark is targeted.
     if bench_selected("sieve_primes_1k") {
         reset_stub_deopt_counts();
-        warmup_eval_js(source);
+        // Use interpreter-only warmup: Maglev produces incorrect code for
+        // sieve's nested loop pattern.  The interpreter runs sieve at ~0.8µs
+        // (7.6× faster than V8), so JIT is not needed.
+        warmup_eval_js_no_jit(source);
         let counts = stub_deopt_counts();
         eprintln!("SIEVE_DIAG stub_deopts_after_warmup:");
         for i in 0..STUB_DEOPT_SLOTS {
