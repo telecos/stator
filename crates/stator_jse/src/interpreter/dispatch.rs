@@ -204,7 +204,7 @@ fn private_kind_marker(obj: &JsValue, storage_key: &str) -> Option<String> {
 fn invalidate_plain_object_caches(ctx: &mut DispatchContext, map: &Rc<RefCell<PropertyMap>>) {
     let map_ptr = Rc::as_ptr(map) as usize;
     if let Some(cache) = &mut ctx.frame.mono_load_cache {
-        cache.retain(|_, (ptr, _)| *ptr != map_ptr);
+        cache.invalidate_layout(map_ptr);
     }
     if let Some(cache) = &mut ctx.frame.poly_load_cache {
         cache.retain(|_, entries| {
@@ -223,14 +223,7 @@ fn mono_load_probe(frame: &InterpreterFrame, slot: u32) -> Option<(usize, usize)
     frame
         .mono_load_cache
         .as_ref()
-        .and_then(|cache| cache.get(&slot))
-        .and_then(|(layout, offset_val)| {
-            if let JsValue::Smi(off) = offset_val {
-                Some((*layout, *off as usize))
-            } else {
-                None
-            }
-        })
+        .and_then(|cache| cache.probe(slot))
 }
 
 fn load_private_named_property(obj: &JsValue, storage_key: &str) -> StatorResult<JsValue> {
@@ -2761,6 +2754,36 @@ fn handle_call_property(
     let Operand::RegisterCount(arg_count) = *instr.operand(2) else {
         return Err(err_bad_operand("CallProperty", 2));
     };
+
+    // ── Inline fast path: arr.push(single_arg) ──
+    // Avoid Vec allocation and dispatch chain for the most common
+    // array method pattern.  We check the callee for the
+    // fast-array-method marker and the receiver for Array type.
+    if arg_count == 1 {
+        let callee_ref = ctx.frame.read_reg(callee_v)?;
+        if let JsValue::PlainObject(callee_map) = callee_ref {
+            let is_push = callee_map
+                .borrow()
+                .get(FAST_ARRAY_METHOD_KEY)
+                .is_some_and(|v| matches!(&v, JsValue::String(s) if s.as_ref() == "push"));
+            if is_push {
+                let this_val = ctx.frame.read_reg(recv_v)?;
+                if let JsValue::Array(arr) = this_val {
+                    let arr = Rc::clone(arr);
+                    let callee_flat = ctx.frame.reg_index(callee_v)?;
+                    let arg = ctx.frame.registers[callee_flat + 1].clone();
+                    let mut items = arr.borrow_mut();
+                    if items.capacity() == 0 {
+                        items.reserve(1024);
+                    }
+                    items.push(arg);
+                    ctx.frame.accumulator = JsValue::Smi(items.len() as i32);
+                    return Ok(DispatchAction::Continue);
+                }
+            }
+        }
+    }
+
     let callee = ctx.frame.read_reg(callee_v)?.cheap_clone();
     let this_val = ctx.frame.read_reg(recv_v)?.cheap_clone();
     // Arguments reside in the registers immediately following
@@ -3985,9 +4008,11 @@ fn handle_lda_named_property(
                         proto_layout: 0,
                     });
                     // Populate monomorphic fast-path cache.
-                    ctx.frame
-                        .mono_load_cache_mut()
-                        .insert(slot, (pm.layout_id() as usize, JsValue::Smi(offset as i32)));
+                    ctx.frame.mono_load_cache_mut().insert(
+                        slot,
+                        pm.layout_id() as usize,
+                        offset as i32,
+                    );
                 }
                 None => {
                     // Not an own property — check the immediate prototype
@@ -4157,7 +4182,7 @@ fn handle_sta_named_property(
                         // Invalidate value-based caches for this object.
                         let map_ptr = Rc::as_ptr(map) as usize;
                         if let Some(cache) = &mut ctx.frame.mono_load_cache {
-                            cache.retain(|_, (ptr, _)| *ptr != map_ptr);
+                            cache.invalidate_layout(map_ptr);
                         }
                         if let Some(cache) = &mut ctx.frame.poly_load_cache {
                             cache.retain(|_, entries| {
@@ -4262,13 +4287,14 @@ fn handle_sta_named_property(
                         });
                         ctx.frame.mono_load_cache_mut().insert(
                             slot,
-                            (receiver_layout as usize, JsValue::Smi(offset as i32)),
+                            receiver_layout as usize,
+                            offset as i32,
                         );
                     }
                     // Invalidate value-based caches for this object.
                     let map_ptr = Rc::as_ptr(map) as usize;
                     if let Some(cache) = &mut ctx.frame.mono_load_cache {
-                        cache.retain(|_, (ptr, _)| *ptr != map_ptr);
+                        cache.invalidate_layout(map_ptr);
                     }
                     if let Some(cache) = &mut ctx.frame.poly_load_cache {
                         cache.retain(|_, entries| {
@@ -4293,15 +4319,17 @@ fn handle_sta_named_property(
                         is_proto: false,
                         proto_layout: 0,
                     });
-                    ctx.frame
-                        .mono_load_cache_mut()
-                        .insert(slot, (pm.layout_id() as usize, JsValue::Smi(offset as i32)));
+                    ctx.frame.mono_load_cache_mut().insert(
+                        slot,
+                        pm.layout_id() as usize,
+                        offset as i32,
+                    );
                 }
             }
             // Invalidate value-based caches for this object.
             let map_ptr = Rc::as_ptr(map) as usize;
             if let Some(cache) = &mut ctx.frame.mono_load_cache {
-                cache.retain(|_, (ptr, _)| *ptr != map_ptr);
+                cache.invalidate_layout(map_ptr);
             }
             if let Some(cache) = &mut ctx.frame.poly_load_cache {
                 cache.retain(|_, entries| {

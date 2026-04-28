@@ -218,7 +218,57 @@ pub use crate::objects::value::{
 
 /// Property map for a single `Function` value in the side-table.
 type FnPropMap = Rc<RefCell<HashMap<String, JsValue>>>;
-type MonoLoadCache = HashMap<u32, (usize, JsValue)>;
+const MONO_LOAD_CACHE_SLOTS: usize = 128;
+
+#[derive(Clone)]
+/// Flat-array monomorphic property-load IC.  Indexed directly by feedback
+/// slot for O(1) lookup without hashing (same idea as [`GlobalIcCache`]).
+/// Each entry packs `(layout_id, property_offset)`.  A zero `layout_id`
+/// denotes an empty slot.
+pub struct MonoLoadCache {
+    entries: [(usize, i32); MONO_LOAD_CACHE_SLOTS],
+}
+
+impl MonoLoadCache {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            entries: [(0, 0); MONO_LOAD_CACHE_SLOTS],
+        }
+    }
+
+    /// Probe the cache for a hit.  Returns `(layout_id, offset)` if cached.
+    #[inline(always)]
+    fn probe(&self, slot: u32) -> Option<(usize, usize)> {
+        let idx = slot as usize;
+        if idx < MONO_LOAD_CACHE_SLOTS {
+            let (layout, offset) = self.entries[idx];
+            if layout != 0 {
+                return Some((layout, offset as usize));
+            }
+        }
+        None
+    }
+
+    /// Insert or update a cache entry.
+    #[inline]
+    fn insert(&mut self, slot: u32, layout: usize, offset: i32) {
+        let idx = slot as usize;
+        if idx < MONO_LOAD_CACHE_SLOTS {
+            self.entries[idx] = (layout, offset);
+        }
+    }
+
+    /// Invalidate all entries whose layout matches `layout_id`.
+    #[inline]
+    fn invalidate_layout(&mut self, layout_id: usize) {
+        for entry in &mut self.entries {
+            if entry.0 == layout_id {
+                entry.0 = 0;
+            }
+        }
+    }
+}
 type PolyLoadCache = HashMap<u32, Vec<(usize, JsValue)>>;
 type ProtoLoadIcCache = ProtoIcCache;
 type StringCache = HashMap<u32, Rc<str>>;
@@ -3092,7 +3142,7 @@ impl InterpreterFrame {
     #[inline]
     fn mono_load_cache_mut(&mut self) -> &mut MonoLoadCache {
         self.mono_load_cache
-            .get_or_insert_with(|| Box::new(HashMap::new()))
+            .get_or_insert_with(|| Box::new(MonoLoadCache::new()))
             .as_mut()
     }
 
