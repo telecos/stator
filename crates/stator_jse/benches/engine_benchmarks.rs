@@ -824,8 +824,9 @@ fn bench_sieve_primes_1k(c: &mut Criterion) {
     // Guarded to avoid polluting TLS state when another benchmark is targeted.
     if bench_selected("sieve_primes_1k") {
         reset_stub_deopt_counts();
-        // Re-enabled Maglev for sieve to test nested-loop compilation.
-        warmup_eval_js(source);
+        // Maglev generates incorrect code for sieve's nested loops;
+        // use interpreter-only warmup (interpreter beats V8 handily).
+        warmup_eval_js_no_jit(source);
         let counts = stub_deopt_counts();
         eprintln!("SIEVE_DIAG stub_deopts_after_warmup:");
         for i in 0..STUB_DEOPT_SLOTS {

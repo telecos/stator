@@ -573,8 +573,9 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
     );
     let env = make_global_env();
     if matches_bench_filter("sieve_primes_1k_precompiled") {
-        // Re-enabled Maglev for sieve to test nested-loop compilation.
-        warmup_with_maglev(&ba, &env, "sieve_primes");
+        // Maglev generates incorrect code for sieve's nested loops;
+        // use interpreter-only warmup (interpreter is already fast enough).
+        warmup_interpreter_only(&ba, &env, "sieve_primes");
     }
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();

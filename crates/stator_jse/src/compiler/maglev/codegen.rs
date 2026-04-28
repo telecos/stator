@@ -8166,13 +8166,7 @@ impl<'a> MaglevCodegen<'a> {
     ///
     /// Returns `true` if the back-edge was rotated (caller must NOT emit
     /// the unconditional JMP).
-    fn try_rotate_back_edge(&mut self, _body_end_idx: u32, _header_idx: u32) -> bool {
-        // Temporarily disabled to diagnose sieve nested-loop bug.
-        false
-    }
-
-    #[allow(dead_code)]
-    fn try_rotate_back_edge_impl(&mut self, body_end_idx: u32, header_idx: u32) -> bool {
+    fn try_rotate_back_edge(&mut self, body_end_idx: u32, header_idx: u32) -> bool {
         // Only for loop headers.
         let header = match self.graph.block(header_idx) {
             Some(b) if b.is_loop_header => b,
