@@ -1870,6 +1870,13 @@ impl BytecodeArray {
         self.inner.maglev_next_try_at.get()
     }
 
+    /// Sets the `next_try_at` threshold.  Setting this to [`u32::MAX`]
+    /// effectively blocks Maglev for this function until the counter is
+    /// reset.
+    pub fn set_maglev_next_try_at(&self, val: u32) {
+        self.inner.maglev_next_try_at.set(val);
+    }
+
     /// Returns `true` if the Maglev executable cache has been populated.
     pub fn has_maglev_executable_cached(&self) -> bool {
         self.inner.maglev_executable.borrow().is_some()
