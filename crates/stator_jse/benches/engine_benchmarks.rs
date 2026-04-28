@@ -830,7 +830,7 @@ fn bench_sieve_primes_1k(c: &mut Criterion) {
         warmup_eval_js(source);
         // Verify the JIT code produces the correct result (168 primes ≤ 1000).
         let result = eval_js(source).unwrap();
-        let count = result.to_number();
+        let count = result.to_number().unwrap();
         assert!(
             (count - 168.0).abs() < 0.5,
             "SIEVE CORRECTNESS FAIL: expected 168, got {count}"
