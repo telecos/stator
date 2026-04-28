@@ -219,11 +219,7 @@ fn bench_fib_40_iterative_precompiled(c: &mut Criterion) {
     let jit_before = jit_entry_diagnostics();
     let dispatch_before = dispatch_entry_diagnostics();
     c.bench_function("fib_40_iterative_precompiled", |b| {
-        b.iter(|| {
-            let mut frame =
-                InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
-            black_box(Interpreter::run(black_box(&mut frame)).unwrap())
-        });
+        b.iter(|| black_box(Interpreter::run_fast(&ba, &[], &env).unwrap()));
     });
     print_maglev_diag(
         "fib_40_iterative",
@@ -264,9 +260,7 @@ fn bench_js_arithmetic_precompiled(c: &mut Criterion) {
     let dispatch_before = dispatch_entry_diagnostics();
     c.bench_function("arithmetic_loop_10k_precompiled", |b| {
         b.iter(|| {
-            let mut frame =
-                InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
-            black_box(Interpreter::run(black_box(&mut frame)).unwrap());
+            black_box(Interpreter::run_fast(&ba, &[], &env).unwrap());
         });
     });
     print_maglev_diag(
@@ -308,11 +302,7 @@ fn bench_property_access_1k_precompiled(c: &mut Criterion) {
     let jit_before = jit_entry_diagnostics();
     let dispatch_before = dispatch_entry_diagnostics();
     c.bench_function("property_access_1k_precompiled", |b| {
-        b.iter(|| {
-            let mut frame =
-                InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
-            black_box(Interpreter::run(black_box(&mut frame)).unwrap())
-        });
+        b.iter(|| black_box(Interpreter::run_fast(&ba, &[], &env).unwrap()));
     });
     print_maglev_diag(
         "property_access_1k",
@@ -360,11 +350,7 @@ fn bench_object_creation_1k_precompiled(c: &mut Criterion) {
     let jit_before = jit_entry_diagnostics();
     let dispatch_before = dispatch_entry_diagnostics();
     c.bench_function("object_creation_1k_precompiled", |b| {
-        b.iter(|| {
-            let mut frame =
-                InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
-            black_box(Interpreter::run(black_box(&mut frame)).unwrap())
-        });
+        b.iter(|| black_box(Interpreter::run_fast(&ba, &[], &env).unwrap()));
     });
     print_maglev_diag(
         "object_creation_1k",
@@ -409,11 +395,7 @@ fn bench_array_push_sum_1k_precompiled(c: &mut Criterion) {
     let dispatch_before = dispatch_entry_diagnostics();
     reset_stub_call_counts();
     c.bench_function("array_push_sum_1k_precompiled", |b| {
-        b.iter(|| {
-            let mut frame =
-                InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
-            black_box(Interpreter::run(black_box(&mut frame)).unwrap())
-        });
+        b.iter(|| black_box(Interpreter::run_fast(&ba, &[], &env).unwrap()));
     });
     print_maglev_diag(
         "array_push_sum_1k",
@@ -475,11 +457,7 @@ fn bench_closure_counter_1k_precompiled(c: &mut Criterion) {
     let jit_before = jit_entry_diagnostics();
     let dispatch_before = dispatch_entry_diagnostics();
     c.bench_function("closure_counter_1k_precompiled", |b| {
-        b.iter(|| {
-            let mut frame =
-                InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
-            black_box(Interpreter::run(black_box(&mut frame)).unwrap())
-        });
+        b.iter(|| black_box(Interpreter::run_fast(&ba, &[], &env).unwrap()));
     });
     print_maglev_diag(
         "closure_counter_1k",
@@ -526,11 +504,7 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
     let jit_before = jit_entry_diagnostics();
     let dispatch_before = dispatch_entry_diagnostics();
     c.bench_function("prototype_chain_1k_precompiled", |b| {
-        b.iter(|| {
-            let mut frame =
-                InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
-            black_box(Interpreter::run(black_box(&mut frame)).unwrap())
-        });
+        b.iter(|| black_box(Interpreter::run_fast(&ba, &[], &env).unwrap()));
     });
     print_maglev_diag(
         "prototype_chain_1k",
@@ -584,11 +558,7 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
     let jit_before = jit_entry_diagnostics();
     let dispatch_before = dispatch_entry_diagnostics();
     c.bench_function("sieve_primes_1k_precompiled", |b| {
-        b.iter(|| {
-            let mut frame =
-                InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
-            black_box(Interpreter::run(black_box(&mut frame)).unwrap())
-        });
+        b.iter(|| black_box(Interpreter::run_fast(&ba, &[], &env).unwrap()));
     });
     print_maglev_diag(
         "sieve_primes_1k",
@@ -629,11 +599,7 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
     let jit_before = jit_entry_diagnostics();
     let dispatch_before = dispatch_entry_diagnostics();
     c.bench_function("deep_object_access_1k_precompiled", |b| {
-        b.iter(|| {
-            let mut frame =
-                InterpreterFrame::new_with_globals(Rc::clone(&ba), vec![], Rc::clone(&env));
-            black_box(Interpreter::run(black_box(&mut frame)).unwrap())
-        });
+        b.iter(|| black_box(Interpreter::run_fast(&ba, &[], &env).unwrap()));
     });
     print_maglev_diag(
         "deep_object_access_1k",

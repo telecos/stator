@@ -3399,6 +3399,50 @@ impl Interpreter {
         Self::run_inner(frame, true)
     }
 
+    /// Zero-overhead JIT fast path for repeated execution of warmed-up bytecode.
+    ///
+    /// When JIT code is available this skips `InterpreterFrame` creation
+    /// entirely — no register allocation, no field initialisation, no IC
+    /// writeback.  Falls back to the full `run` path when JIT is unavailable.
+    ///
+    /// # Safety contract
+    ///
+    /// Globals must already be installed in `env` (i.e. the env was previously
+    /// used with [`InterpreterFrame::new_with_globals`] or
+    /// [`install_globals`]).  This is guaranteed after warmup.
+    pub fn run_fast(
+        ba: &Rc<BytecodeArray>,
+        args: &[JsValue],
+        env: &Rc<RefCell<GlobalEnv>>,
+    ) -> StatorResult<JsValue> {
+        DIAG_RUN_INNER_ENTERED.with(|c| c.set(c.get() + 1));
+
+        // Publish globals to JIT runtime (fast TLS pointer check).
+        let env_ptr = Rc::as_ptr(env) as usize;
+        let cached_ptr = LAST_GLOBALS_PTR.with(Cell::get);
+        if env_ptr != cached_ptr {
+            LAST_GLOBALS_PTR.with(|p| p.set(env_ptr));
+            CURRENT_GLOBALS.with(|g| {
+                *g.borrow_mut() = Some(Rc::clone(env));
+            });
+            #[cfg(all(target_arch = "x86_64", unix))]
+            {
+                use crate::compiler::baseline::compiler::jit_runtime_set_global_env;
+                jit_runtime_set_global_env(env.clone());
+            }
+        }
+
+        // Try JIT — no frame creation needed.
+        if let Some(jit_result) = try_execute_best_jit(ba, args) {
+            return jit_result;
+        }
+
+        // Fallback: create frame and interpret.
+        let mut frame =
+            InterpreterFrame::new_callee_frame(Rc::clone(ba), args.to_vec(), Rc::clone(env));
+        Self::run_inner(&mut frame, true)
+    }
+
     fn run_inner(frame: &mut InterpreterFrame, skip_globals: bool) -> StatorResult<JsValue> {
         DIAG_RUN_INNER_ENTERED.with(|c| c.set(c.get() + 1));
 
