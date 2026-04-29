@@ -107,7 +107,7 @@ for (const name of shared) {
     const v8Med = v8.median_ns / 1000;
     const v8Min = v8.min_ns / 1000;
     const stMed = st.median_ns / 1000;
-    const ratio = v8Min / stMed;
+    const ratio = v8Med / stMed;
     const result = ratio >= 1.0 ? "🏆 BEAT" : "❌ LOSE";
     if (ratio >= 1.0) wins++;
 

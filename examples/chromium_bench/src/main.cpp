@@ -28,8 +28,8 @@
 #include "stator.h"
 
 // ─── Benchmark snippets ──────────────────────────────────────────────────
-// Identical to benchmarks/v8_comparison/benchmarks.js and the Criterion
-// suite in crates/stator_jse/benches/engine_benchmarks.rs.
+// Semantically aligned with benchmarks/v8_comparison/benchmarks.js and the
+// Criterion suite in crates/stator_jse/benches.
 
 struct BenchSpec {
     const char *name;
@@ -76,11 +76,14 @@ static const BenchSpec benchmarks[] = {
      200},
 
     {"closure_counter_1k",
-     "var count = 0;\n"
-     "var counter = function() { return count++; };\n"
-     "var sum = 0;\n"
-     "for (var i = 0; i < 1000; i++) { sum = sum + counter(); }\n"
-     "sum;\n",
+     "function make_counter() {\n"
+     "  var count = 0;\n"
+     "  return function() { count = count + 1; return count; };\n"
+     "}\n"
+     "var counter = make_counter();\n"
+     "var result = 0;\n"
+     "for (var i = 0; i < 1000; i++) { result = counter(); }\n"
+     "result;\n",
      200},
 
     {"prototype_chain_1k",
@@ -97,18 +100,21 @@ static const BenchSpec benchmarks[] = {
      200},
 
     {"sieve_primes_1k",
-     "var n = 1000;\n"
-     "var sieve = [];\n"
-     "for (var i = 0; i <= n; i++) sieve[i] = true;\n"
-     "sieve[0] = false; sieve[1] = false;\n"
-     "for (var i = 2; i * i <= n; i++) {\n"
-     "  if (sieve[i]) {\n"
-     "    for (var j = i * i; j <= n; j = j + i) { sieve[j] = false; }\n"
+     "function sieve_run() {\n"
+     "  var n = 1000;\n"
+     "  var sieve = [];\n"
+     "  for (var i = 0; i <= n; i++) sieve[i] = true;\n"
+     "  sieve[0] = false; sieve[1] = false;\n"
+     "  for (var i = 2; i * i <= n; i++) {\n"
+     "    if (sieve[i]) {\n"
+     "      for (var j = i * i; j <= n; j = j + i) { sieve[j] = false; }\n"
+     "    }\n"
      "  }\n"
+     "  var count = 0;\n"
+     "  for (var i = 0; i <= n; i++) { if (sieve[i]) count = count + 1; }\n"
+     "  return count;\n"
      "}\n"
-     "var count = 0;\n"
-     "for (var i = 0; i <= n; i++) { if (sieve[i]) count = count + 1; }\n"
-     "count;\n",
+     "sieve_run();\n",
      200},
 
     {"deep_object_access_1k",
@@ -146,10 +152,6 @@ static BenchResult run_bench(StatorIsolate *isolate, const BenchSpec &spec) {
         stator_context_destroy(ctx);
         return {spec.name, -1, -1, -1, 0};
     }
-    if (std::strcmp(spec.name, "sieve_primes_1k") == 0) {
-        stator_script_disable_jit(script);
-    }
-
     auto run_once = [&]() -> bool {
         StatorValue *val = stator_script_run(script, ctx);
         if (!val) return false;

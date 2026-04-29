@@ -41,7 +41,7 @@ jobs:
           echo "=== System Resources ==="
           free -h
           echo ""
-          echo "=== Running precompiled benchmarks (interpreter-only) ==="
+          echo "=== Running precompiled benchmarks ==="
           echo "Running each benchmark separately to stay within 7GB memory limit."
           echo ""
           passed=0
@@ -107,6 +107,7 @@ jobs:
           echo
           echo "Captured JSON output:"
           echo "$json_line"
+          printf '%s\n' "${json_line#V8_BENCHMARK_RESULTS_JSON=}" > v8.json
           echo
           echo "=== Parsed V8 Comparison Table ==="
           node - "$json_line" <<'NODE'
@@ -127,24 +128,51 @@ jobs:
 
       - name: Display pre-compiled benchmark results
         run: |
-          echo "=== Stator Pre-compiled Benchmarks (interpreter-only) ==="
+          echo "=== Stator Pre-compiled Benchmarks ==="
           echo "These benchmarks skip parsing and compilation to measure pure"
-          echo "interpreter speed — a fairer comparison against V8's JIT output."
+          echo "warmed execution speed — a fairer comparison against V8's JIT output."
           echo
-          # Extract Criterion results for precompiled benchmarks
-          for bench in fib_40_iterative_precompiled arithmetic_loop_10k_precompiled \
-                       property_access_1k_precompiled object_creation_1k_precompiled \
-                       array_push_sum_1k_precompiled closure_counter_1k_precompiled \
-                       prototype_chain_1k_precompiled sieve_primes_1k_precompiled \
-                       deep_object_access_1k_precompiled; do
-            estimate_file="target/criterion/${bench}/new/estimates.json"
-            if [ -f "$estimate_file" ]; then
-              median_ns=$(python3 -c "import json; d=json.load(open('$estimate_file')); print(f\"{d['median']['point_estimate']/1000:.1f}\")")
-              printf "%-40s %12s µs (median)\n" "$bench" "$median_ns"
-            else
-              printf "%-40s %s\n" "$bench" "(no results found)"
-            fi
-          done
+          python3 <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          benches = [
+              "fib_40_iterative_precompiled",
+              "arithmetic_loop_10k_precompiled",
+              "property_access_1k_precompiled",
+              "object_creation_1k_precompiled",
+              "array_push_sum_1k_precompiled",
+              "closure_counter_1k_precompiled",
+              "prototype_chain_1k_precompiled",
+              "sieve_primes_1k_precompiled",
+              "deep_object_access_1k_precompiled",
+          ]
+
+          rows = []
+          missing = []
+          for bench in benches:
+              estimate_file = pathlib.Path("target") / "criterion" / bench / "new" / "estimates.json"
+              if not estimate_file.exists():
+                  missing.append(bench)
+                  print(f"{bench:<40} (no results found)")
+                  continue
+              data = json.loads(estimate_file.read_text())
+              median_ns = data["median"]["point_estimate"]
+              name = bench.removesuffix("_precompiled")
+              rows.append({
+                  "name": name,
+                  "benchmark": bench,
+                  "median_ns": round(median_ns),
+                  "iterations": None,
+              })
+              print(f"{bench:<40} {median_ns / 1000:12.1f} us (median)")
+
+          pathlib.Path("stator_precompiled.json").write_text(json.dumps(rows, separators=(",", ":")))
+          if missing:
+              print(f"Missing precompiled benchmark results: {', '.join(missing)}", file=sys.stderr)
+              sys.exit(1)
+          PY
 
       - name: Build and run Stator FFI benchmarks (Chromium embedder path)
         run: |
@@ -158,6 +186,8 @@ jobs:
           cmake --build build
           echo ""
           echo "=== Running Stator FFI Benchmarks ==="
+          ffi_json="["
+          first=1
           for bench in fib_40_iterative \
                        arithmetic_loop_10k \
                        property_access_1k \
@@ -168,6 +198,27 @@ jobs:
                        sieve_primes_1k \
                        deep_object_access_1k; do
             echo "--- $bench ---"
-            timeout 120 ./build/chromium_bench --json --filter "$bench" 2>&1
+            output=$(timeout 120 ./build/chromium_bench --json --filter "$bench" 2>&1)
+            printf '%s\n' "$output"
+            json_line=$(printf '%s\n' "$output" | grep '^STATOR_FFI_BENCHMARK_RESULTS_JSON=' || true)
+            if [ -z "$json_line" ]; then
+              echo "Failed to capture Stator FFI benchmark JSON for $bench" >&2
+              exit 1
+            fi
+            bench_item=$(node -e 'const rows = JSON.parse(process.argv[1]); process.stdout.write(JSON.stringify(rows[0]));' "${json_line#STATOR_FFI_BENCHMARK_RESULTS_JSON=}")
+            if [ "$first" -eq 0 ]; then
+              ffi_json="${ffi_json},"
+            fi
+            ffi_json="${ffi_json}${bench_item}"
+            first=0
             echo ""
           done
+          ffi_json="${ffi_json}]"
+          printf '%s\n' "$ffi_json" > "$GITHUB_WORKSPACE/stator_ffi.json"
+
+      - name: Gate V8 performance comparison
+        run: |
+          node benchmarks/v8_comparison/gate_results.mjs \
+            --v8 v8.json \
+            --precompiled stator_precompiled.json \
+            --ffi stator_ffi.json

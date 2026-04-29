@@ -164,28 +164,6 @@ fn warmup_with_maglev(
     print_deopt_state(name, ba);
 }
 
-/// Interpreter-only warmup: warms ICs without triggering Maglev JIT.
-/// Used for benchmarks where Maglev produces incorrect code (e.g. sieve's
-/// nested loops) but the interpreter is already fast enough.
-fn warmup_interpreter_only(
-    ba: &Rc<stator_jse::bytecode::bytecode_array::BytecodeArray>,
-    env: &Rc<RefCell<GlobalEnv>>,
-    name: &str,
-) {
-    install_sigsegv_handler();
-    // Block Maglev permanently for this BytecodeArray by setting the
-    // next-try threshold to u32::MAX so jit_maglev_has_deopted() returns
-    // true on every check.
-    ba.set_maglev_next_try_at(u32::MAX);
-    for _ in 0..200 {
-        let mut frame = InterpreterFrame::new_with_globals(Rc::clone(ba), vec![], Rc::clone(env));
-        let _ = Interpreter::run(&mut frame);
-    }
-    eprintln!("BENCH_INTERP[{name}]: inv_count={}", ba.invocation_count(),);
-    reset_stub_deopt_counts();
-    reset_first_deopt_counts();
-}
-
 // ---------------------------------------------------------------------------
 // Precompiled benchmark functions
 // ---------------------------------------------------------------------------
@@ -519,23 +497,26 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
 
 fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
     let source = r#"
-        var n = 1000;
-        var sieve = [];
-        for (var i = 0; i <= n; i++) sieve[i] = true;
-        sieve[0] = false;
-        sieve[1] = false;
-        for (var i = 2; i * i <= n; i++) {
-            if (sieve[i]) {
-                for (var j = i * i; j <= n; j = j + i) {
-                    sieve[j] = false;
+        function sieve_run() {
+            var n = 1000;
+            var sieve = [];
+            for (var i = 0; i <= n; i++) sieve[i] = true;
+            sieve[0] = false;
+            sieve[1] = false;
+            for (var i = 2; i * i <= n; i++) {
+                if (sieve[i]) {
+                    for (var j = i * i; j <= n; j = j + i) {
+                        sieve[j] = false;
+                    }
                 }
             }
+            var count = 0;
+            for (var i = 0; i <= n; i++) {
+                if (sieve[i]) count = count + 1;
+            }
+            return count;
         }
-        var count = 0;
-        for (var i = 0; i <= n; i++) {
-            if (sieve[i]) count = count + 1;
-        }
-        count;
+        sieve_run();
     "#;
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
@@ -547,9 +528,7 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
     );
     let env = make_global_env();
     if matches_bench_filter("sieve_primes_1k_precompiled") {
-        // The interpreter fast path is already well below V8 for this workload,
-        // while Maglev can hang on the nested-loop shape on some CI runners.
-        warmup_interpreter_only(&ba, &env, "sieve_primes");
+        warmup_with_maglev(&ba, &env, "sieve_primes");
     }
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();
@@ -616,9 +595,11 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
 // Diagnostic helper
 // ---------------------------------------------------------------------------
 
+type MaglevDiagSnapshot = (u64, u64, u64, u64, u32, usize, u32, u32, u32, u64, u64, u64);
+
 fn print_maglev_diag(
     name: &str,
-    diag_before: &(u64, u64, u64, u64, u32, usize, u32, u32, u32, u64, u64, u64),
+    diag_before: &MaglevDiagSnapshot,
     cats_before: &[u64; 6],
     stubs_before: &[u64; STUB_DEOPT_SLOTS],
     first_deopts_before: &[u64; STUB_DEOPT_SLOTS],
