@@ -7444,6 +7444,10 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.emit_byte(0x20);
                 // RAX = i32 Smi value (sign-extended to i64).
 
+                // Save old value in RDI for post-increment ops.
+                // MOV RDI, RAX (always, branch-free; unused for pre-ops).
+                self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
+
                 // Load pre-computed delta and add in one step.
                 // Delta is computed by jit_runtime_analyze_callee_inline:
                 //   AddSmi→+imm, SubSmi→-imm, Inc→+1, Dec→-1.
@@ -7468,6 +7472,19 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.emit_byte(jv_layout.smi_disc);
                 // Store back to context slot.
                 self.masm.mov_store_base_disp32(Reg64::R10, 0, Reg64::Rax);
+
+                // Check if post-op (op >= 4): return old value from RDI.
+                // Load inline_op from IC metadata.
+                self.masm
+                    .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_inline_op);
+                // CMP ECX, 4
+                self.masm.cmp_ri(Reg64::Rcx, 4);
+                let mut pre_op_result = Label::new();
+                self.masm.jcc(CondCode::Less, &mut pre_op_result);
+                // Post-op: result = old value (RDI).
+                // MOV RAX, RDI
+                self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
+                self.masm.bind_label(&mut pre_op_result);
 
                 // Extract result for caller: SAR RAX, 32.
                 self.masm.emit_byte(0x48);

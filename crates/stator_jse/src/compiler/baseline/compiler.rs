@@ -5724,7 +5724,9 @@ pub(crate) mod jit_runtime {
             Some((slot, imm, op)) => {
                 // Pre-compute delta so the hot path skips op dispatch:
                 //   AddSmi → +imm, SubSmi → -imm, Inc → +1, Dec → -1.
-                let delta: i32 = match op {
+                // Post-ops (4-7) use same delta as pre-ops (0-3).
+                let base_op = op & 3;
+                let delta: i32 = match base_op {
                     0 => imm,
                     1 => match imm.checked_neg() {
                         Some(d) => d,

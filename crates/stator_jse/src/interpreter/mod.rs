@@ -5114,16 +5114,18 @@ impl Interpreter {
                                                     let remaining =
                                                         (batch_cc_limit - current_i) as i64;
                                                     let delta = match cached_call_op {
-                                                        // 0=AddSmi
-                                                        0 => remaining * (cached_call_imm as i64),
-                                                        // 1=SubSmi
-                                                        1 => {
+                                                        // 0=AddSmi, 4=PostAddSmi
+                                                        0 | 4 => {
+                                                            remaining * (cached_call_imm as i64)
+                                                        }
+                                                        // 1=SubSmi, 5=PostSubSmi
+                                                        1 | 5 => {
                                                             remaining * (-(cached_call_imm as i64))
                                                         }
-                                                        // 2=Inc
-                                                        2 => remaining,
-                                                        // 3=Dec
-                                                        3 => -remaining,
+                                                        // 2=Inc, 6=PostInc
+                                                        2 | 6 => remaining,
+                                                        // 3=Dec, 7=PostDec
+                                                        3 | 7 => -remaining,
                                                         _ => 0,
                                                     };
                                                     let new_slot = (slot_val as i64) + delta;
@@ -5131,6 +5133,14 @@ impl Interpreter {
                                                     if new_slot >= i32::MIN as i64
                                                         && new_slot <= i32::MAX as i64
                                                     {
+                                                        // For post-ops (4-7), last call returns old value
+                                                        // (before the last per-call increment).
+                                                        let per_call_delta = delta / remaining;
+                                                        let last_return = if cached_call_op >= 4 {
+                                                            new_slot - per_call_delta
+                                                        } else {
+                                                            new_slot
+                                                        };
                                                         *slot_ref = JsValue::Smi(new_slot as i32);
                                                         // Update counter global to limit.
                                                         unsafe {
@@ -5143,7 +5153,9 @@ impl Interpreter {
                                                             if batch_cc_result_slot != usize::MAX {
                                                                 (&mut (*env_ptr).slots)
                                                                     [batch_cc_result_slot] =
-                                                                    JsValue::Smi(new_slot as i32);
+                                                                    JsValue::Smi(
+                                                                        last_return as i32,
+                                                                    );
                                                             }
                                                             (*env_ptr).generation = (*env_ptr)
                                                                 .generation
@@ -5155,7 +5167,7 @@ impl Interpreter {
                                                         frame.instructions_executed +=
                                                             skipped * body_len;
                                                         // Accumulator = last call result.
-                                                        sa = new_slot as i32;
+                                                        sa = last_return as i32;
                                                         smi_acc_spilled = false;
                                                         smi_acc_bool = false;
                                                         hot_acc = Some(NanBoxedValue::from_smi(sa));
@@ -5414,15 +5426,16 @@ impl Interpreter {
                                             let slot_ref = unsafe { &mut *cached_call_slot_ptr };
                                             if let JsValue::Smi(val) = *slot_ref {
                                                 let next = match cached_call_op {
-                                                    0 => val.checked_add(cached_call_imm),
-                                                    1 => val.checked_sub(cached_call_imm),
-                                                    2 => val.checked_add(1),
-                                                    3 => val.checked_sub(1),
+                                                    0 | 4 => val.checked_add(cached_call_imm),
+                                                    1 | 5 => val.checked_sub(cached_call_imm),
+                                                    2 | 6 => val.checked_add(1),
+                                                    3 | 7 => val.checked_sub(1),
                                                     _ => None,
                                                 };
                                                 if let Some(r) = next {
                                                     *slot_ref = JsValue::Smi(r);
-                                                    sa = r;
+                                                    // Post-ops (4-7) return old value.
+                                                    sa = if cached_call_op >= 4 { val } else { r };
                                                     smi_acc_spilled = false;
                                                     smi_acc_bool = false;
                                                     hot_acc = None;
@@ -7353,15 +7366,20 @@ impl Interpreter {
                                                     unsafe { &mut *cached_call_slot_ptr };
                                                 if let JsValue::Smi(val) = *slot_ref {
                                                     let next = match cached_call_op {
-                                                        0 => val.checked_add(cached_call_imm),
-                                                        1 => val.checked_sub(cached_call_imm),
-                                                        2 => val.checked_add(1),
-                                                        3 => val.checked_sub(1),
+                                                        0 | 4 => val.checked_add(cached_call_imm),
+                                                        1 | 5 => val.checked_sub(cached_call_imm),
+                                                        2 | 6 => val.checked_add(1),
+                                                        3 | 7 => val.checked_sub(1),
                                                         _ => None,
                                                     };
                                                     if let Some(r) = next {
                                                         *slot_ref = JsValue::Smi(r);
-                                                        sa = r;
+                                                        // Post-ops (4-7) return old value.
+                                                        sa = if cached_call_op >= 4 {
+                                                            val
+                                                        } else {
+                                                            r
+                                                        };
                                                         smi_acc_spilled = false;
                                                         smi_acc_bool = false;
                                                         hot_acc = None;
@@ -7817,10 +7835,10 @@ impl Interpreter {
                                                             guard.slots[info.0]
                                                         {
                                                             let next = match info.2 {
-                                                                0 => val.checked_add(info.1),
-                                                                1 => val.checked_sub(info.1),
-                                                                2 => val.checked_add(1),
-                                                                3 => val.checked_sub(1),
+                                                                0 | 4 => val.checked_add(info.1),
+                                                                1 | 5 => val.checked_sub(info.1),
+                                                                2 | 6 => val.checked_add(1),
+                                                                3 | 7 => val.checked_sub(1),
                                                                 _ => None,
                                                             };
                                                             if let Some(r) = next {
@@ -7836,7 +7854,12 @@ impl Interpreter {
                                                                     *cached_call_slot_ptr =
                                                                         JsValue::Smi(r);
                                                                 }
-                                                                sa = r;
+                                                                // Post-ops (4-7) return old value.
+                                                                sa = if info.2 >= 4 {
+                                                                    val
+                                                                } else {
+                                                                    r
+                                                                };
                                                                 smi_acc_spilled = false;
                                                                 smi_acc_bool = false;
                                                                 hot_acc = None;
@@ -13464,29 +13487,57 @@ fn extract_inline_call_cache(ba: &BytecodeArray) -> Option<(usize, i32, u8)> {
         }
     }
 
-    // Match 4-instr or 5-instr current-context slot update patterns.
-    let (load, update) = match instrs {
+    // Match 4-instr or 5-instr current-context slot update patterns (pre-increment).
+    // Also match 5/6-instr post-increment: [load, Star rX, update, store, (Ldar rX,) Return].
+    let (load, update, is_post) = match instrs {
         [load, update, store, _ret]
             if is_inline_current_context_load(load.opcode)
                 && store.opcode == Opcode::StaCurrentContextSlot =>
         {
-            (load, update)
+            (load, update, false)
         }
         [load, update, _store, _reload, _ret]
             if is_inline_current_context_load(load.opcode)
                 && _store.opcode == Opcode::StaCurrentContextSlot
                 && is_inline_current_context_load(_reload.opcode) =>
         {
-            (load, update)
+            (load, update, false)
+        }
+        // Post-increment 6-instr: [load, Star rX, update, store, Ldar rX, Return]
+        [load, star, update, store, reload, _ret]
+            if is_inline_current_context_load(load.opcode)
+                && star.opcode == Opcode::Star
+                && store.opcode == Opcode::StaCurrentContextSlot
+                && reload.opcode == Opcode::Ldar
+                && _ret.opcode == Opcode::Return =>
+        {
+            // Verify Star and Ldar use the same register.
+            let star_reg = checked_operand_reg(star, 0)?;
+            let ldar_reg = checked_operand_reg(reload, 0)?;
+            if star_reg != ldar_reg {
+                return None;
+            }
+            (load, update, true)
+        }
+        // Post-increment 5-instr: [load, Star rX, update, store, Return]
+        [load, star, update, store, _ret]
+            if is_inline_current_context_load(load.opcode)
+                && star.opcode == Opcode::Star
+                && store.opcode == Opcode::StaCurrentContextSlot
+                && _ret.opcode == Opcode::Return =>
+        {
+            (load, update, true)
         }
         _ => return None,
     };
     let slot = checked_operand_constant_pool_idx(load, 0)? as usize;
+    // Post-increment ops use tags 4-7 (base_op + 4).
+    let post_offset: u8 = if is_post { 4 } else { 0 };
     let (imm, op_tag) = match update.opcode {
-        Opcode::AddSmi => (checked_operand_imm(update, 0)?, 0u8),
-        Opcode::SubSmi => (checked_operand_imm(update, 0)?, 1u8),
-        Opcode::Inc => (0, 2u8),
-        Opcode::Dec => (0, 3u8),
+        Opcode::AddSmi => (checked_operand_imm(update, 0)?, post_offset),
+        Opcode::SubSmi => (checked_operand_imm(update, 0)?, 1u8 + post_offset),
+        Opcode::Inc => (0, 2u8 + post_offset),
+        Opcode::Dec => (0, 3u8 + post_offset),
         _ => return None,
     };
     Some((slot, imm, op_tag))
