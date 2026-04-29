@@ -1231,6 +1231,17 @@ void stator_bytecode_dump(const struct StatorScript *script);
 size_t stator_script_bytecode_count(const struct StatorScript *script);
 
 /**
+ * Disable Maglev/Turbofan tier-up for a compiled script.
+ *
+ * This is intended for embedders that need deterministic interpreter
+ * execution for workloads whose JIT tier is known to be unstable.
+ *
+ * # Safety
+ * `script` must be either null or a valid, live [`StatorScript`] pointer.
+ */
+void stator_script_disable_jit(struct StatorScript *script);
+
+/**
  * Free a [`StatorScript`] previously returned by [`stator_script_compile`].
  *
  * # Safety

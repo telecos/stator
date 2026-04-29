@@ -30,8 +30,10 @@ set_target_properties(stator_jse_ffi PROPERTIES
 # ---------------------------------------------------------------------------
 add_executable(chromium_bench src/main.cpp)
 
-# Reuse headers from mini_browser's include/ (stator.h, v8_compat.h).
+# Prefer the generated FFI header; keep mini_browser include/ available for
+# compatibility shims used by other embedder examples.
 target_include_directories(chromium_bench PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../crates/stator_ffi/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/../mini_browser/include"
 )
 

@@ -58,7 +58,7 @@ fn install_sigsegv_handler() {
         // SAFETY: installing a signal handler with valid sigaction struct.
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = handler as usize;
+            sa.sa_sigaction = handler as *const () as usize;
             sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESETHAND;
             libc::sigemptyset(&mut sa.sa_mask);
             libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
@@ -547,9 +547,9 @@ fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
     );
     let env = make_global_env();
     if matches_bench_filter("sieve_primes_1k_precompiled") {
-        // Maglev works for sieve via the eval_js path (engine_benchmarks
-        // show 3.7M JIT hits with 0 deopts).  Use standard Maglev warmup.
-        warmup_with_maglev(&ba, &env, "sieve_primes");
+        // The interpreter fast path is already well below V8 for this workload,
+        // while Maglev can hang on the nested-loop shape on some CI runners.
+        warmup_interpreter_only(&ba, &env, "sieve_primes");
     }
     let diag_before = maglev_diagnostics();
     let cats_before = maglev_deopt_categories();

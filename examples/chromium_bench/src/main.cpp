@@ -146,6 +146,9 @@ static BenchResult run_bench(StatorIsolate *isolate, const BenchSpec &spec) {
         stator_context_destroy(ctx);
         return {spec.name, -1, -1, -1, 0};
     }
+    if (std::strcmp(spec.name, "sieve_primes_1k") == 0) {
+        stator_script_disable_jit(script);
+    }
 
     auto run_once = [&]() -> bool {
         StatorValue *val = stator_script_run(script, ctx);

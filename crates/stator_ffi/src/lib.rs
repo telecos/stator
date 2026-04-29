@@ -1974,6 +1974,24 @@ pub unsafe extern "C" fn stator_script_bytecode_count(script: *const StatorScrip
         .unwrap_or(0)
 }
 
+/// Disable Maglev/Turbofan tier-up for a compiled script.
+///
+/// This is intended for embedders that need deterministic interpreter
+/// execution for workloads whose JIT tier is known to be unstable.
+///
+/// # Safety
+/// `script` must be either null or a valid, live [`StatorScript`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_disable_jit(script: *mut StatorScript) {
+    if script.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `script` is valid.
+    if let Some(bytecodes) = unsafe { &(*script).bytecodes } {
+        bytecodes.set_maglev_next_try_at(u32::MAX);
+    }
+}
+
 /// Free a [`StatorScript`] previously returned by [`stator_script_compile`].
 ///
 /// # Safety
