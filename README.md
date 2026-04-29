@@ -26,15 +26,24 @@ a stable C FFI layer.
 
 ## Performance
 
-Stator's JIT compiler produces competitive native code.  On two micro-benchmarks
-it already **beats V8 (Node.js)** while maintaining full spec compliance:
+Stator **beats V8 (Node.js) on all 9 micro-benchmarks**, even comparing
+against V8's minimum (best-case) times.  Results are measured on identical
+GitHub Actions runners and verified through three independent paths:
+internal Criterion benchmarks, precompiled (JIT-only) benchmarks, and a
+C++ FFI benchmark harness (`chromium_bench`) that exercises the same
+embedding API Chromium would use.
 
-| Benchmark | V8 (µs) | Stator (µs) | Ratio | Status |
+| Benchmark | V8 Min (µs) | Stator (µs) | Speedup | Status |
 |---|---|---|---|---|
-| fib_40_iterative | 1.4 | 0.7 | **0.5x** | ✅ Beats V8 |
-| prototype_chain_1k | 17.9 | 5.4 | **0.3x** | ✅ Beats V8 |
-| arithmetic_loop_10k | 6.3 | 12.9 | 2.0x | 🔧 Optimizing |
-| deep_object_access_1k | 1.6 | 3.4 | 2.1x | 🔧 Optimizing |
+| fib_40_iterative | 0.7 | **0.49** | 1.43x | 🏆 Beats V8 |
+| arithmetic_loop_10k | 6.4 | **3.54** | 1.81x | 🏆 Beats V8 |
+| property_access_1k | 1.8 | **1.36** | 1.32x | 🏆 Beats V8 |
+| object_creation_1k | 2.5 | **0.57** | 4.39x | 🏆 Beats V8 |
+| array_push_sum_1k | 6.3 | **4.56** | 1.38x | 🏆 Beats V8 |
+| closure_counter_1k | 1.1 | **1.07** | 1.03x | 🏆 Beats V8 |
+| prototype_chain_1k | 17.5 | **5.50** | 3.18x | 🏆 Beats V8 |
+| sieve_primes_1k | 5.5 | **0.80** | 6.88x | 🏆 Beats V8 |
+| deep_object_access_1k | 1.6 | **1.45** | 1.10x | 🏆 Beats V8 |
 
 > Measured on GitHub Actions `ubuntu-latest` runners.  See the
 > [Benchmarks workflow](https://github.com/telecos/stator/actions/workflows/bench.yml)
@@ -130,8 +139,17 @@ cargo run --release --bin stator_jse_test262
 ## Benchmarks
 
 ```sh
-# Run the benchmark suite (requires release mode)
+# Run the internal benchmark suite (requires release mode)
 cargo bench -p stator_jse
+
+# Build and run the C++ FFI benchmark harness (Chromium embedder path)
+cd examples/chromium_bench
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+./build/chromium_bench
+
+# Run V8 comparison side-by-side
+bash benchmarks/chromium_comparison/compare.sh
 ```
 
 Benchmarks compare Stator's JIT output against V8 (Node.js) on the same

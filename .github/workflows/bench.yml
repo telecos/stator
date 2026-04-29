@@ -143,3 +143,15 @@ jobs:
               printf "%-40s %s\n" "$bench" "(no results found)"
             fi
           done
+
+      - name: Build and run Stator FFI benchmarks (Chromium embedder path)
+        run: |
+          echo "=== Building chromium_bench (C++ FFI benchmark harness) ==="
+          cd examples/chromium_bench
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+                -DSTATOR_LIB_DIR="$GITHUB_WORKSPACE/target/release"
+          cmake --build build
+          echo ""
+          echo "=== Running Stator FFI Benchmarks ==="
+          ./build/chromium_bench --json 2>&1
+        continue-on-error: true
