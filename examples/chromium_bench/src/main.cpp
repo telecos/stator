@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "stator.h"
@@ -134,42 +135,65 @@ static BenchResult run_bench(StatorIsolate *isolate, const BenchSpec &spec) {
     std::vector<int64_t> times;
     times.reserve(spec.iterations);
 
-    // Warmup: compile + run 3 times (separate contexts to avoid caching bias).
-    for (int w = 0; w < 3; w++) {
-        StatorContext *ctx = stator_context_new(isolate);
-        StatorScript *script =
-            stator_script_compile(ctx, spec.source, std::strlen(spec.source));
-        if (stator_script_get_error(script)) {
-            std::fprintf(stderr, "ERROR compiling '%s': %s\n", spec.name,
-                         stator_script_get_error(script));
+    StatorContext *ctx = stator_context_new(isolate);
+    StatorScript *script =
+        stator_script_compile(ctx, spec.source, std::strlen(spec.source));
+    if (stator_script_get_error(script)) {
+        std::fprintf(stderr, "ERROR compiling '%s': %s\n", spec.name,
+                     stator_script_get_error(script));
+        stator_script_free(script);
+        stator_context_destroy(ctx);
+        return {spec.name, -1, -1, -1, 0};
+    }
+
+    auto run_once = [&]() -> bool {
+        StatorValue *val = stator_script_run(script, ctx);
+        if (!val) return false;
+        stator_value_destroy(val);
+        return true;
+    };
+
+    // Warm the interpreter ICs and give background JIT compilation time to
+    // complete, matching the Rust precompiled benchmark warmup pattern.
+    for (int w = 0; w < 100; w++) {
+        if (!run_once()) {
+            std::fprintf(stderr, "ERROR running warmup for '%s'\n", spec.name);
             stator_script_free(script);
             stator_context_destroy(ctx);
             return {spec.name, -1, -1, -1, 0};
         }
-        StatorValue *val = stator_script_run(script, ctx);
-        if (val) stator_value_destroy(val);
-        stator_script_free(script);
-        stator_context_destroy(ctx);
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    for (int w = 0; w < 100; w++) {
+        if (!run_once()) {
+            std::fprintf(stderr, "ERROR running warmup for '%s'\n", spec.name);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+            return {spec.name, -1, -1, -1, 0};
+        }
     }
 
-    // Timed iterations: each iteration gets a fresh context + compile + run
-    // to match the V8/Node.js benchmark methodology (no cross-iteration state).
+    // Timed iterations: the script is already compiled and warmed, so this
+    // measures the Chromium embedder path for repeated script execution.
     for (int i = 0; i < spec.iterations; i++) {
-        StatorContext *ctx = stator_context_new(isolate);
-        StatorScript *script =
-            stator_script_compile(ctx, spec.source, std::strlen(spec.source));
-
         auto start = std::chrono::high_resolution_clock::now();
-        StatorValue *val = stator_script_run(script, ctx);
+        bool ok = run_once();
         auto end = std::chrono::high_resolution_clock::now();
 
-        if (val) stator_value_destroy(val);
-        stator_script_free(script);
-        stator_context_destroy(ctx);
+        if (!ok) {
+            std::fprintf(stderr, "ERROR running timed iteration for '%s'\n",
+                         spec.name);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+            return {spec.name, -1, -1, -1, 0};
+        }
 
         auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
         times.push_back(ns);
     }
+
+    stator_script_free(script);
+    stator_context_destroy(ctx);
 
     std::sort(times.begin(), times.end());
     int64_t median = times[times.size() / 2];

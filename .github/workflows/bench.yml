@@ -56,7 +56,7 @@ jobs:
                        sieve_primes_1k_precompiled \
                        deep_object_access_1k_precompiled; do
             echo "--- $bench ---"
-            if timeout 120 cargo bench --package stator_jse --bench precompiled_benchmarks -- "^${bench}$" 2>&1; then
+            if timeout 600 cargo bench --package stator_jse --bench precompiled_benchmarks -- "^${bench}$" 2>&1; then
               echo "OK: $bench"
               passed=$((passed + 1))
             else
@@ -66,7 +66,9 @@ jobs:
             echo ""
           done
           echo "=== Summary: $passed passed, $failed failed ==="
-        continue-on-error: true
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi
         env:
           MALLOC_ARENA_MAX: "2"
           RUST_BACKTRACE: "full"

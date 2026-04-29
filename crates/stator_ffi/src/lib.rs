@@ -1787,7 +1787,7 @@ pub unsafe extern "C" fn stator_heap_capacity(isolate: *const StatorIsolate) -> 
 /// Created by [`stator_script_compile`] and released by [`stator_script_free`].
 pub struct StatorScript {
     /// Compiled bytecodes on success; `None` on parse / compile error.
-    bytecodes: Option<BytecodeArray>,
+    bytecodes: Option<Rc<BytecodeArray>>,
     /// Human-readable error message, or `None` on success.
     error: Option<CString>,
 }
@@ -1838,7 +1838,7 @@ pub unsafe extern "C" fn stator_script_compile(
 
     let script = match result {
         Ok(bytecodes) => Box::new(StatorScript {
-            bytecodes: Some(bytecodes),
+            bytecodes: Some(Rc::new(bytecodes)),
             error: None,
         }),
         Err(e) => {
@@ -2038,8 +2038,18 @@ pub unsafe extern "C" fn stator_script_run(
         Rc::new(RefCell::new(GlobalEnv::new()))
     };
 
-    let mut frame = InterpreterFrame::new_with_globals(Rc::new(bytecodes), vec![], global_env);
-    match Interpreter::run(&mut frame) {
+    let result = if global_env.borrow().globals_installed {
+        Interpreter::run_fast(&bytecodes, &[], &global_env)
+    } else {
+        let mut frame = InterpreterFrame::new_with_globals(
+            Rc::clone(&bytecodes),
+            vec![],
+            Rc::clone(&global_env),
+        );
+        Interpreter::run(&mut frame)
+    };
+
+    match result {
         Ok(val) => {
             // Wrap the result in a StatorValue.  Use the isolate from the
             // context when available; null isolate means the handle is
@@ -4044,8 +4054,7 @@ pub unsafe extern "C" fn stator_debug_session_create(
         Some(bc) => bc.clone(),
         None => return std::ptr::null_mut(),
     };
-    let frame =
-        InterpreterFrame::new_with_globals(Rc::new(bytecodes), vec![], Rc::clone(&ctx_ref.globals));
+    let frame = InterpreterFrame::new_with_globals(bytecodes, vec![], Rc::clone(&ctx_ref.globals));
     let dbg = Rc::new(RefCell::new(Debugger::new()));
     Box::into_raw(Box::new(StatorDebugSession {
         frame,
