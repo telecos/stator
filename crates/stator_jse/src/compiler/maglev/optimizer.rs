@@ -4429,6 +4429,7 @@ fn resolve_fusion_pattern(
 ) -> (Option<u32>, Option<i64>) {
     // Walk through Phi nodes to find the ultimate definition.
     let mut target = callee_id;
+    let mut from_factory_call = false;
     for _ in 0..8 {
         match graph.node(target) {
             Some(ValueNode::CreateClosure {
@@ -4440,6 +4441,12 @@ fn resolve_fusion_pattern(
                 ..
             }) => {
                 if let Some(&(slot, k)) = graph.closure_fusion_patterns().get(shared_function_info)
+                {
+                    return (Some(slot), Some(k));
+                }
+                if from_factory_call
+                    && let Some(&(slot, k)) =
+                        graph.factory_fusion_patterns().get(shared_function_info)
                 {
                     return (Some(slot), Some(k));
                 }
@@ -4463,10 +4470,12 @@ fn resolve_fusion_pattern(
                 // The callee is the result of a zero-arg call (e.g.,
                 // `var counter = make_counter()`).  Trace through to
                 // the factory's callee to find factory fusion patterns.
+                from_factory_call = true;
                 target = *callee;
                 continue;
             }
             Some(ValueNode::CallKnownFunction { callee, args, .. }) if args.is_empty() => {
+                from_factory_call = true;
                 target = *callee;
                 continue;
             }

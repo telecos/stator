@@ -4128,6 +4128,18 @@ mod tests {
                     !degen,
                     "closure_counter_1k top-level script graph is degenerate — Maglev won't compile the hot loop"
                 );
+                #[cfg(all(target_arch = "x86_64", unix))]
+                assert!(
+                    graph_contains_value(&graph, |node| matches!(
+                        node,
+                        ValueNode::SpeculativeCallFusion {
+                            resolved_slot: Some(_),
+                            resolved_k: Some(_),
+                            ..
+                        }
+                    )),
+                    "closure_counter_1k should resolve the factory-returned closure fusion pattern"
+                );
             }
             Err(e) => {
                 panic!("GraphBuilder::build failed for top-level script: {e}");

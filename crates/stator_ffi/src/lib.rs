@@ -2029,25 +2029,24 @@ unsafe fn run_script_inner(
     }
     // SAFETY: caller guarantees `script` is valid.
     let bytecodes = match unsafe { &(*script).bytecodes } {
-        Some(b) => b.clone(),
+        Some(b) => b,
         None => return None,
     };
 
+    let owned_global_env;
     let global_env = if !ctx.is_null() {
         // SAFETY: caller guarantees `ctx` is valid.
-        Rc::clone(unsafe { &(*ctx).globals })
+        unsafe { &(*ctx).globals }
     } else {
-        Rc::new(RefCell::new(GlobalEnv::new()))
+        owned_global_env = Rc::new(RefCell::new(GlobalEnv::new()));
+        &owned_global_env
     };
 
     Some(if global_env.borrow().globals_installed {
-        Interpreter::run_fast(&bytecodes, &[], &global_env)
+        Interpreter::run_fast(bytecodes, &[], global_env)
     } else {
-        let mut frame = InterpreterFrame::new_with_globals(
-            Rc::clone(&bytecodes),
-            vec![],
-            Rc::clone(&global_env),
-        );
+        let mut frame =
+            InterpreterFrame::new_with_globals(Rc::clone(bytecodes), vec![], Rc::clone(global_env));
         Interpreter::run(&mut frame)
     })
 }
