@@ -158,4 +158,16 @@ jobs:
           cmake --build build
           echo ""
           echo "=== Running Stator FFI Benchmarks ==="
-          ./build/chromium_bench --json 2>&1
+          for bench in fib_40_iterative \
+                       arithmetic_loop_10k \
+                       property_access_1k \
+                       object_creation_1k \
+                       array_push_sum_1k \
+                       closure_counter_1k \
+                       prototype_chain_1k \
+                       sieve_primes_1k \
+                       deep_object_access_1k; do
+            echo "--- $bench ---"
+            timeout 120 ./build/chromium_bench --json --filter "$bench" 2>&1
+            echo ""
+          done

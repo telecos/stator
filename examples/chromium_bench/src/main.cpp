@@ -11,6 +11,7 @@
  *   chromium_bench              # default: 200 iterations, human-readable
  *   chromium_bench --json       # JSON output (same format as benchmarks.js)
  *   chromium_bench -n 500       # custom iteration count
+ *   chromium_bench --filter sieve_primes_1k
  */
 
 #include <algorithm>
@@ -244,12 +245,15 @@ static void print_table(const std::vector<BenchResult> &results) {
 int main(int argc, char *argv[]) {
     bool json_mode = false;
     int custom_iters = 0;
+    const char *filter = nullptr;
 
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--json") == 0) {
             json_mode = true;
         } else if (std::strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             custom_iters = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--filter") == 0 && i + 1 < argc) {
+            filter = argv[++i];
         }
     }
 
@@ -264,6 +268,9 @@ int main(int argc, char *argv[]) {
 
     for (int b = 0; b < NUM_BENCHMARKS; b++) {
         BenchSpec spec = benchmarks[b];
+        if (filter && std::strcmp(spec.name, filter) != 0) {
+            continue;
+        }
         if (custom_iters > 0) spec.iterations = custom_iters;
 
         if (!json_mode) {
@@ -275,6 +282,12 @@ int main(int argc, char *argv[]) {
     }
 
     stator_isolate_destroy(isolate);
+
+    if (results.empty()) {
+        std::fprintf(stderr, "No benchmark matched filter '%s'\n",
+                     filter ? filter : "");
+        return 1;
+    }
 
     if (json_mode) {
         print_json(results);

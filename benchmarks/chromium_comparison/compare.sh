@@ -34,9 +34,33 @@ echo "=== Running V8 (Node.js) benchmarks ==="
 v8_output=$(node "$REPO_ROOT/benchmarks/v8_comparison/benchmarks.js" 2>&1)
 v8_json=$(echo "$v8_output" | grep '^V8_BENCHMARK_RESULTS_JSON=' | sed 's/^V8_BENCHMARK_RESULTS_JSON=//')
 
+shared=(
+    "fib_40_iterative"
+    "arithmetic_loop_10k"
+    "property_access_1k"
+    "object_creation_1k"
+    "array_push_sum_1k"
+    "closure_counter_1k"
+    "prototype_chain_1k"
+    "sieve_primes_1k"
+    "deep_object_access_1k"
+)
+
 echo "=== Running Stator FFI benchmarks ==="
-stator_output=$("$CHROMIUM_BENCH" --json 2>&1)
-stator_json=$(echo "$stator_output" | grep '^STATOR_FFI_BENCHMARK_RESULTS_JSON=' | sed 's/^STATOR_FFI_BENCHMARK_RESULTS_JSON=//')
+stator_json="["
+first=1
+for bench in "${shared[@]}"; do
+    echo "--- $bench ---"
+    stator_output=$("$CHROMIUM_BENCH" --json --filter "$bench" 2>&1)
+    bench_json=$(echo "$stator_output" | grep '^STATOR_FFI_BENCHMARK_RESULTS_JSON=' | sed 's/^STATOR_FFI_BENCHMARK_RESULTS_JSON=//')
+    bench_item=$(node -e 'const rows = JSON.parse(process.argv[1]); process.stdout.write(JSON.stringify(rows[0]));' "$bench_json")
+    if [ "$first" -eq 0 ]; then
+        stator_json+=","
+    fi
+    stator_json+="$bench_item"
+    first=0
+done
+stator_json+="]"
 
 echo ""
 echo "=== V8 vs Stator-FFI Comparison ==="
@@ -51,7 +75,6 @@ const statorResults = JSON.parse(process.argv[3]);
 const v8Map = {};
 for (const r of v8Results) v8Map[r.name] = r;
 
-// Shared benchmarks (only those present in both suites).
 const shared = [
     "fib_40_iterative",
     "arithmetic_loop_10k",
