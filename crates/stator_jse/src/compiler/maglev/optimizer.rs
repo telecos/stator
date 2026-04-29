@@ -2300,35 +2300,35 @@ fn promote_loop_globals_counted(graph: &mut MaglevGraph) -> usize {
     }
 
     // Global promotion currently wires a single back-edge value into each
-    // inserted Phi.  That is only sound when loop-carried stores are executed
-    // unconditionally on every iteration.  If a loop body contains a branch
-    // that is not itself a detected nested-loop header, stores may be on only
-    // one side of the branch (e.g. sieve's `if (sieve[i]) { ... }`).  Skip
-    // promotion for the whole loop instead of materialising a wrong Phi input
-    // that can make the compiled loop non-terminating.
+    // inserted Phi.  In loops with conditional bodies, only stores in the
+    // latch/back-edge block are definitely executed before the next header
+    // visit.  Exclude globals stored elsewhere in such loops (e.g. sieve's
+    // branch-local `count++`, or nested-loop stores missed by loop detection)
+    // while still promoting the unconditional induction-variable stores.
     let loop_headers: HashSet<u32> = loops.iter().map(|lp| lp.header).collect();
-    let has_conditional_body: Vec<bool> = loops
+    let conditional_stores: Vec<HashSet<u32>> = loops
         .iter()
-        .map(|lp| loop_has_conditional_body(graph, lp, &loop_headers))
+        .map(|lp| conditionally_stored_globals(graph, lp, &loop_headers))
         .collect();
 
     let mut count = 0;
     for (i, lp) in loops.iter().enumerate() {
-        if has_conditional_body[i] {
+        let mut exclude_names = nested_stored[i].clone();
+        if !conditional_stores[i].is_empty() {
             OPT_GLOBALS_SKIPPED.fetch_add(1, Ordering::Relaxed);
-            continue;
+            exclude_names.extend(conditional_stores[i].iter().copied());
         }
-        count += promote_globals_in_loop(graph, lp, &nested_stored[i]);
+        count += promote_globals_in_loop(graph, lp, &exclude_names);
     }
     count
 }
 
-fn loop_has_conditional_body(
+fn conditionally_stored_globals(
     graph: &MaglevGraph,
     lp: &licm::NaturalLoop,
     loop_headers: &HashSet<u32>,
-) -> bool {
-    lp.body.iter().any(|&block_idx| {
+) -> HashSet<u32> {
+    let has_conditional_body = lp.body.iter().any(|&block_idx| {
         if block_idx == lp.header || loop_headers.contains(&block_idx) {
             return false;
         }
@@ -2338,7 +2338,37 @@ fn loop_has_conditional_body(
                 .and_then(|block| block.control.as_ref()),
             Some(ControlNode::Branch { .. })
         )
-    })
+    });
+    if !has_conditional_body {
+        return HashSet::new();
+    }
+
+    let backedge_blocks: HashSet<u32> = lp
+        .body
+        .iter()
+        .copied()
+        .filter(|&block_idx| {
+            graph
+                .block(block_idx)
+                .is_some_and(|block| licm::control_targets(block).contains(&lp.header))
+        })
+        .collect();
+
+    let mut names = HashSet::new();
+    for &block_idx in &lp.body {
+        if block_idx == lp.header || backedge_blocks.contains(&block_idx) {
+            continue;
+        }
+        let Some(block) = graph.block(block_idx) else {
+            continue;
+        };
+        for (_, node) in &block.nodes {
+            if let ValueNode::StoreGlobal { name, .. } = node {
+                names.insert(*name);
+            }
+        }
+    }
+    names
 }
 
 /// Return `true` if `node` is a user-visible function call that might read or
@@ -7376,6 +7406,17 @@ mod tests {
             .count()
     }
 
+    fn count_store_global_name(graph: &MaglevGraph, expected_name: u32) -> usize {
+        graph
+            .blocks()
+            .iter()
+            .flat_map(|block| block.nodes.iter())
+            .filter(|(_, node)| {
+                matches!(node, ValueNode::StoreGlobal { name, .. } if *name == expected_name)
+            })
+            .count()
+    }
+
     fn graph_has_header_phi(graph: &MaglevGraph, header: u32) -> bool {
         graph
             .block(header)
@@ -7461,7 +7502,7 @@ mod tests {
     }
 
     #[test]
-    fn test_promote_loop_globals_skips_conditional_body() {
+    fn test_promote_loop_globals_excludes_conditional_stores() {
         let mut graph = MaglevGraph::new(0);
         for id in 0..6 {
             graph.add_block(BasicBlock::new(id));
@@ -7551,9 +7592,10 @@ mod tests {
             .set_control(ControlNode::Return { value: undef });
 
         let stores_before = count_store_globals(&graph);
-        assert_eq!(promote_loop_globals_counted(&mut graph), 0);
+        assert_eq!(promote_loop_globals_counted(&mut graph), 1);
         assert_eq!(count_store_globals(&graph), stores_before);
-        assert!(!graph_has_header_phi(&graph, 1));
+        assert_eq!(count_store_global_name(&graph, 9), 1);
+        assert!(graph_has_header_phi(&graph, 1));
     }
 
     // ── Constant folding — Int32 ──────────────────────────────────────────────
