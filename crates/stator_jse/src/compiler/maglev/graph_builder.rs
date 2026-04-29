@@ -2382,19 +2382,15 @@ impl<'a> GraphBuilder<'a> {
             let all_same = values.windows(2).all(|w| w[0] == w[1]);
             if all_same {
                 self.env.slots[slot_idx] = values[0];
+            } else if values.iter().any(Option::is_none) {
+                self.env.slots[slot_idx] = None;
             } else {
-                let inputs: Vec<NodeId> = values.into_iter().flatten().collect();
-                if inputs.len() >= 2 {
-                    if let Some(phi_id) = self
-                        .graph
-                        .add_value_node(block_id, ValueNode::Phi { inputs })
-                    {
-                        self.env.slots[slot_idx] = Some(phi_id);
-                    }
-                } else if inputs.len() == 1 {
-                    self.env.slots[slot_idx] = Some(inputs[0]);
-                } else {
-                    self.env.slots[slot_idx] = None;
+                let inputs: Vec<NodeId> = values.into_iter().map(Option::unwrap).collect();
+                if let Some(phi_id) = self
+                    .graph
+                    .add_value_node(block_id, ValueNode::Phi { inputs })
+                {
+                    self.env.slots[slot_idx] = Some(phi_id);
                 }
             }
         }
@@ -3812,6 +3808,18 @@ mod tests {
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
         let feedback = FeedbackVector::new(ba.feedback_metadata());
         let graph = GraphBuilder::build(&ba, &feedback).unwrap();
+        for block in graph.blocks() {
+            for (_, node) in &block.nodes {
+                if let ValueNode::Phi { inputs } = node {
+                    assert_eq!(
+                        inputs.len(),
+                        block.predecessors.len(),
+                        "phi inputs must align with predecessor order in block {}",
+                        block.id
+                    );
+                }
+            }
+        }
         // Should contain keyed access nodes.
         let has_keyed = graph.blocks().iter().any(|b| {
             b.nodes.iter().any(|(_, n)| {

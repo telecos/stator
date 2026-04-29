@@ -2020,6 +2020,38 @@ type StatorNativeCallback = unsafe extern "C" fn(
     argc: i32,
 ) -> *mut StatorValue;
 
+unsafe fn run_script_inner(
+    script: *const StatorScript,
+    ctx: *mut StatorContext,
+) -> Option<stator_jse::error::StatorResult<JsValue>> {
+    if script.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees `script` is valid.
+    let bytecodes = match unsafe { &(*script).bytecodes } {
+        Some(b) => b.clone(),
+        None => return None,
+    };
+
+    let global_env = if !ctx.is_null() {
+        // SAFETY: caller guarantees `ctx` is valid.
+        Rc::clone(unsafe { &(*ctx).globals })
+    } else {
+        Rc::new(RefCell::new(GlobalEnv::new()))
+    };
+
+    Some(if global_env.borrow().globals_installed {
+        Interpreter::run_fast(&bytecodes, &[], &global_env)
+    } else {
+        let mut frame = InterpreterFrame::new_with_globals(
+            Rc::clone(&bytecodes),
+            vec![],
+            Rc::clone(&global_env),
+        );
+        Interpreter::run(&mut frame)
+    })
+}
+
 /// Execute a compiled script in `ctx` and return the result as a
 /// [`StatorValue`].
 ///
@@ -2039,32 +2071,9 @@ pub unsafe extern "C" fn stator_script_run(
     script: *const StatorScript,
     ctx: *mut StatorContext,
 ) -> *mut StatorValue {
-    if script.is_null() {
-        return std::ptr::null_mut();
-    }
-    // SAFETY: caller guarantees `script` is valid.
-    let bytecodes = match unsafe { &(*script).bytecodes } {
-        Some(b) => b.clone(),
+    let result = match unsafe { run_script_inner(script, ctx) } {
+        Some(result) => result,
         None => return std::ptr::null_mut(),
-    };
-
-    // Borrow the global environment from the context (if any).
-    let global_env = if !ctx.is_null() {
-        // SAFETY: caller guarantees `ctx` is valid.
-        Rc::clone(unsafe { &(*ctx).globals })
-    } else {
-        Rc::new(RefCell::new(GlobalEnv::new()))
-    };
-
-    let result = if global_env.borrow().globals_installed {
-        Interpreter::run_fast(&bytecodes, &[], &global_env)
-    } else {
-        let mut frame = InterpreterFrame::new_with_globals(
-            Rc::clone(&bytecodes),
-            vec![],
-            Rc::clone(&global_env),
-        );
-        Interpreter::run(&mut frame)
     };
 
     match result {
@@ -2086,6 +2095,27 @@ pub unsafe extern "C" fn stator_script_run(
             Box::into_raw(Box::new(StatorValue { inner, isolate }))
         }
         Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Execute a compiled script in `ctx` and discard the result.
+///
+/// Returns `true` when execution completes without an exception.  This avoids
+/// allocating an embedder-owned [`StatorValue`] for callers that only need to
+/// drive script execution and do not inspect the result.
+///
+/// # Safety
+/// - `script` must be a non-null pointer returned by [`stator_script_compile`].
+/// - `ctx` must be a valid, live [`StatorContext`] pointer, or null (in which
+///   case an empty global environment is used).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_run_no_result(
+    script: *const StatorScript,
+    ctx: *mut StatorContext,
+) -> bool {
+    match unsafe { run_script_inner(script, ctx) } {
+        Some(Ok(_)) => true,
+        Some(Err(_)) | None => false,
     }
 }
 
@@ -7791,6 +7821,27 @@ mod tests {
         // SAFETY: all pointers are non-null and live.
         unsafe {
             stator_value_destroy(result);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_script_run_no_result_reports_success() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let src = b"1 + 2";
+        // SAFETY: `ctx` is valid; `src` is valid UTF-8.
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        assert!(!script.is_null());
+
+        // SAFETY: `script` and `ctx` are valid.
+        assert!(unsafe { stator_script_run_no_result(script, ctx) });
+
+        // SAFETY: all pointers are non-null and live.
+        unsafe {
             stator_script_free(script);
             stator_context_destroy(ctx);
         }

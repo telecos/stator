@@ -3126,6 +3126,11 @@ impl<'a> MaglevCodegen<'a> {
             .iter()
             .filter_map(|(phi_id, node)| {
                 if let ValueNode::Phi { inputs } = node {
+                    debug_assert_eq!(
+                        inputs.len(),
+                        successor.predecessors.len(),
+                        "phi inputs must align with successor predecessors"
+                    );
                     inputs.get(pred_pos).map(|&src| (*phi_id, src))
                 } else {
                     None

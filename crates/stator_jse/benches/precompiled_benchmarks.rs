@@ -497,26 +497,23 @@ fn bench_prototype_chain_1k_precompiled(c: &mut Criterion) {
 
 fn bench_sieve_primes_1k_precompiled(c: &mut Criterion) {
     let source = r#"
-        function sieve_run() {
-            var n = 1000;
-            var sieve = [];
-            for (var i = 0; i <= n; i++) sieve[i] = true;
-            sieve[0] = false;
-            sieve[1] = false;
-            for (var i = 2; i * i <= n; i++) {
-                if (sieve[i]) {
-                    for (var j = i * i; j <= n; j = j + i) {
-                        sieve[j] = false;
-                    }
+        var n = 1000;
+        var sieve = [];
+        for (var i = 0; i <= n; i++) sieve[i] = true;
+        sieve[0] = false;
+        sieve[1] = false;
+        for (var i = 2; i * i <= n; i++) {
+            if (sieve[i]) {
+                for (var j = i * i; j <= n; j = j + i) {
+                    sieve[j] = false;
                 }
             }
-            var count = 0;
-            for (var i = 0; i <= n; i++) {
-                if (sieve[i]) count = count + 1;
-            }
-            return count;
         }
-        sieve_run();
+        var count = 0;
+        for (var i = 0; i <= n; i++) {
+            if (sieve[i]) count = count + 1;
+        }
+        count;
     "#;
     let program = recursive_descent::parse(source).unwrap();
     let bytecode = BytecodeGenerator::compile_program(&program).unwrap();

@@ -100,21 +100,18 @@ static const BenchSpec benchmarks[] = {
      200},
 
     {"sieve_primes_1k",
-     "function sieve_run() {\n"
-     "  var n = 1000;\n"
-     "  var sieve = [];\n"
-     "  for (var i = 0; i <= n; i++) sieve[i] = true;\n"
-     "  sieve[0] = false; sieve[1] = false;\n"
-     "  for (var i = 2; i * i <= n; i++) {\n"
-     "    if (sieve[i]) {\n"
-     "      for (var j = i * i; j <= n; j = j + i) { sieve[j] = false; }\n"
-     "    }\n"
+     "var n = 1000;\n"
+     "var sieve = [];\n"
+     "for (var i = 0; i <= n; i++) sieve[i] = true;\n"
+     "sieve[0] = false; sieve[1] = false;\n"
+     "for (var i = 2; i * i <= n; i++) {\n"
+     "  if (sieve[i]) {\n"
+     "    for (var j = i * i; j <= n; j = j + i) { sieve[j] = false; }\n"
      "  }\n"
-     "  var count = 0;\n"
-     "  for (var i = 0; i <= n; i++) { if (sieve[i]) count = count + 1; }\n"
-     "  return count;\n"
      "}\n"
-     "sieve_run();\n",
+     "var count = 0;\n"
+     "for (var i = 0; i <= n; i++) { if (sieve[i]) count = count + 1; }\n"
+     "count;\n",
      200},
 
     {"deep_object_access_1k",
@@ -153,10 +150,7 @@ static BenchResult run_bench(StatorIsolate *isolate, const BenchSpec &spec) {
         return {spec.name, -1, -1, -1, 0};
     }
     auto run_once = [&]() -> bool {
-        StatorValue *val = stator_script_run(script, ctx);
-        if (!val) return false;
-        stator_value_destroy(val);
-        return true;
+        return stator_script_run_no_result(script, ctx);
     };
 
     // Warm the interpreter ICs and give background JIT compilation time to

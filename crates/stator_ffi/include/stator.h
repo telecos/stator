@@ -1269,6 +1269,20 @@ void stator_script_free(struct StatorScript *script);
 struct StatorValue *stator_script_run(const struct StatorScript *script, struct StatorContext *ctx);
 
 /**
+ * Execute a compiled script in `ctx` and discard the result.
+ *
+ * Returns `true` when execution completes without an exception.  This avoids
+ * allocating an embedder-owned [`StatorValue`] for callers that only need to
+ * drive script execution and do not inspect the result.
+ *
+ * # Safety
+ * - `script` must be a non-null pointer returned by [`stator_script_compile`].
+ * - `ctx` must be a valid, live [`StatorContext`] pointer, or null (in which
+ *   case an empty global environment is used).
+ */
+bool stator_script_run_no_result(const struct StatorScript *script, struct StatorContext *ctx);
+
+/**
  * Convert the value `val` to a UTF-8 string and write it into `buf`.
  *
  * At most `buf_len` bytes (including the NUL terminator) are written.
