@@ -1269,6 +1269,14 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
         SpeculativePushFusion { array, .. } => {
             *array = resolve(*array);
         }
+        SpeculativeFillTrueFusion { array, count } => {
+            *array = resolve(*array);
+            *count = resolve(*count);
+        }
+        SpeculativeCountTruthyFusion { array, count } => {
+            *array = resolve(*array);
+            *count = resolve(*count);
+        }
 
         Construct {
             constructor, args, ..

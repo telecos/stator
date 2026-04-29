@@ -3254,6 +3254,13 @@ mod tests {
         graph
     }
 
+    fn graph_contains_value(graph: &MaglevGraph, predicate: impl Fn(&ValueNode) -> bool) -> bool {
+        graph
+            .blocks()
+            .iter()
+            .any(|block| block.nodes.iter().any(|(_, node)| predicate(node)))
+    }
+
     #[test]
     fn test_property_access_benchmark_not_degenerate() {
         let source = r#"
@@ -3808,6 +3815,22 @@ mod tests {
         let ba = BytecodeGenerator::compile_program(&program).unwrap();
         let feedback = FeedbackVector::new(ba.feedback_metadata());
         let graph = GraphBuilder::build(&ba, &feedback).unwrap();
+        let mut optimized = graph.clone();
+        crate::compiler::maglev::optimizer::optimize(&mut optimized);
+        assert!(
+            optimized.blocks().iter().any(|b| b
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::SpeculativeFillTrueFusion { .. }))),
+            "expected sieve initialization loop to fuse into SpeculativeFillTrueFusion"
+        );
+        assert!(
+            optimized.blocks().iter().any(|b| b
+                .nodes
+                .iter()
+                .any(|(_, n)| matches!(n, ValueNode::SpeculativeCountTruthyFusion { .. }))),
+            "expected sieve count loop to fuse into SpeculativeCountTruthyFusion"
+        );
         for block in graph.blocks() {
             for (_, node) in &block.nodes {
                 if let ValueNode::Phi { inputs } = node {
@@ -3833,6 +3856,54 @@ mod tests {
             })
         });
         assert!(has_keyed, "expected keyed access nodes in sieve graph");
+    }
+
+    #[test]
+    fn test_fill_true_fusion_rejects_extra_side_effect() {
+        let source = r#"
+            var n = 1000;
+            var sieve = [];
+            var side = {};
+            for (var i = 0; i <= n; i++) {
+                side.x = i;
+                sieve[i] = true;
+            }
+            side.x;
+        "#;
+        let graph = compile_and_optimize(source, "fill_side_effect");
+        assert!(
+            !graph_contains_value(&graph, |node| matches!(
+                node,
+                ValueNode::SpeculativeFillTrueFusion { .. }
+            )),
+            "fill fusion must not skip unrelated side effects"
+        );
+    }
+
+    #[test]
+    fn test_count_truthy_fusion_rejects_extra_global_store() {
+        let source = r#"
+            var n = 10;
+            var sieve = [];
+            for (var i = 0; i <= n; i++) sieve[i] = true;
+            var count = 0;
+            var side = 0;
+            for (var i = 0; i <= n; i++) {
+                if (sieve[i]) {
+                    count = count + 1;
+                    side = side + 1;
+                }
+            }
+            count + side;
+        "#;
+        let graph = compile_and_optimize(source, "count_side_effect");
+        assert!(
+            !graph_contains_value(&graph, |node| matches!(
+                node,
+                ValueNode::SpeculativeCountTruthyFusion { .. }
+            )),
+            "count fusion must not skip unrelated global stores"
+        );
     }
 
     /// Regression test: property access benchmark must compile cleanly.

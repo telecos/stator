@@ -11352,6 +11352,94 @@ pub(crate) mod jit_runtime {
         }
         items.len() as i64
     }
+
+    /// Native batch fill of an empty array with `true` values.
+    ///
+    /// Called by Maglev's sieve-style fill fusion.  The optimizer only emits
+    /// this for freshly-created arrays, and the runtime verifies that shape
+    /// before mutating so a stale speculative match deopts instead of changing
+    /// semantics.
+    #[allow(dead_code)] // Called from JIT-generated machine code.
+    pub extern "C" fn jit_runtime_batch_fill_true(arr_i64: i64, count_i64: i64) -> i64 {
+        if !is_heap_handle(arr_i64) || !(0..=100_000).contains(&count_i64) {
+            return JIT_DEOPT;
+        }
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if !ptrs.is_cached() {
+            return JIT_DEOPT;
+        }
+        let arr_idx = (arr_i64 - JIT_HEAP_TAG) as usize;
+        // SAFETY: cached pointers valid for thread lifetime; single-threaded.
+        let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+        if arr_idx >= heap.len() {
+            return JIT_DEOPT;
+        }
+        use crate::objects::value::JsValue;
+        // SAFETY: bounds checked above.
+        let items_rc = match unsafe { heap.get_unchecked(arr_idx) } {
+            JsValue::Array(rc) => rc,
+            _ => return JIT_DEOPT,
+        };
+        // SAFETY: single-threaded JIT; no concurrent borrows.
+        let items = unsafe { &mut *items_rc.as_ptr() };
+        if !items.is_empty() {
+            return JIT_DEOPT;
+        }
+        let count = count_i64 as usize;
+        items.reserve(count);
+        // SAFETY: reserve guarantees capacity; we write exactly `count` values.
+        unsafe {
+            let ptr = items.as_mut_ptr();
+            for i in 0..count {
+                ptr.add(i).write(JsValue::Boolean(true));
+            }
+            items.set_len(count);
+        }
+        count_i64
+    }
+
+    /// Native count of boolean-true entries in an array prefix.
+    ///
+    /// Called by Maglev's sieve count-loop fusion.  It intentionally accepts
+    /// only booleans so speculative matches deopt rather than applying JS
+    /// truthiness to shapes this narrow optimizer did not prove.
+    #[allow(dead_code)] // Called from JIT-generated machine code.
+    pub extern "C" fn jit_runtime_count_bool_true(arr_i64: i64, count_i64: i64) -> i64 {
+        if !is_heap_handle(arr_i64) || !(0..=100_000).contains(&count_i64) {
+            return JIT_DEOPT;
+        }
+        let ptrs = RT_PTRS.with(|p| p.get());
+        if !ptrs.is_cached() {
+            return JIT_DEOPT;
+        }
+        let arr_idx = (arr_i64 - JIT_HEAP_TAG) as usize;
+        // SAFETY: cached pointers valid for thread lifetime; single-threaded.
+        let heap = unsafe { &*(&*ptrs.heap).as_ptr() };
+        if arr_idx >= heap.len() {
+            return JIT_DEOPT;
+        }
+        use crate::objects::value::JsValue;
+        // SAFETY: bounds checked above.
+        let items_rc = match unsafe { heap.get_unchecked(arr_idx) } {
+            JsValue::Array(rc) => rc,
+            _ => return JIT_DEOPT,
+        };
+        // SAFETY: single-threaded JIT; no concurrent borrows.
+        let items = unsafe { &*items_rc.as_ptr() };
+        let count = count_i64 as usize;
+        if count > items.len() {
+            return JIT_DEOPT;
+        }
+        let mut total = 0i64;
+        for item in &items[..count] {
+            match item {
+                JsValue::Boolean(true) => total += 1,
+                JsValue::Boolean(false) => {}
+                _ => return JIT_DEOPT,
+            }
+        }
+        total
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]

@@ -777,6 +777,8 @@ fn loop_has_property_side_effects(graph: &MaglevGraph, loop_body: &HashSet<u32>)
                     | ValueNode::SpeculativeCallFusion { .. }
                     | ValueNode::SpeculativeSumFusion { .. }
                     | ValueNode::SpeculativePushFusion { .. }
+                    | ValueNode::SpeculativeFillTrueFusion { .. }
+                    | ValueNode::SpeculativeCountTruthyFusion { .. }
             ) {
                 return true;
             }
@@ -1166,6 +1168,14 @@ fn visit_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
         }
         ValueNode::SpeculativePushFusion { array, .. } => {
             f(*array);
+        }
+        ValueNode::SpeculativeFillTrueFusion { array, count } => {
+            f(*array);
+            f(*count);
+        }
+        ValueNode::SpeculativeCountTruthyFusion { array, count } => {
+            f(*array);
+            f(*count);
         }
 
         ValueNode::CallBuiltin { args, .. } | ValueNode::CallRuntime { args, .. } => {

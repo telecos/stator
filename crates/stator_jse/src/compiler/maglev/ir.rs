@@ -1416,6 +1416,31 @@ pub enum ValueNode {
         count: u32,
     },
 
+    /// Speculative replacement for `for (i=0; i<count; i++) arr[i] = true`.
+    ///
+    /// Emits a call to a native Rust function that fills a freshly-created
+    /// array with `true` values. Deopts if the receiver is not an empty array
+    /// or the count is not a non-negative small integer.
+    SpeculativeFillTrueFusion {
+        /// The array to fill (`JsValue::Array` heap handle).
+        array: NodeId,
+        /// Number of `true` values to write.
+        count: NodeId,
+    },
+
+    /// Speculative replacement for `for (i=0; i<count; i++) if (arr[i]) n++`.
+    ///
+    /// Emits a call to a native Rust function that counts boolean-`true`
+    /// elements in a tight loop. Deopts if the receiver is not an array, the
+    /// count is not a non-negative small integer, or an inspected element is
+    /// not a boolean.
+    SpeculativeCountTruthyFusion {
+        /// The array to count (`JsValue::Array` heap handle).
+        array: NodeId,
+        /// Number of elements to inspect.
+        count: NodeId,
+    },
+
     /// Call to a builtin function by ID.
     CallBuiltin {
         /// Zero-based builtin function identifier.

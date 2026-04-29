@@ -2548,6 +2548,32 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_store(id, Reg64::Rax);
             }
 
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::SpeculativeFillTrueFusion { array, count } => {
+                let saved = self.emit_save_live_regs(id);
+                self.emit_load(*array, Reg64::Rdi);
+                self.emit_load(*count, Reg64::Rsi);
+                let addr = jit_runtime::jit_runtime_batch_fill_true as *const () as usize as i64;
+                self.masm.mov_ri(Reg64::R11, addr);
+                self.masm.call_reg(Reg64::R11);
+                self.emit_restore_live_regs(saved);
+                self.emit_deopt_check_rax();
+                self.emit_store(id, Reg64::Rax);
+            }
+
+            #[cfg(all(target_arch = "x86_64", unix))]
+            ValueNode::SpeculativeCountTruthyFusion { array, count } => {
+                let saved = self.emit_save_live_regs(id);
+                self.emit_load(*array, Reg64::Rdi);
+                self.emit_load(*count, Reg64::Rsi);
+                let addr = jit_runtime::jit_runtime_count_bool_true as *const () as usize as i64;
+                self.masm.mov_ri(Reg64::R11, addr);
+                self.masm.call_reg(Reg64::R11);
+                self.emit_restore_live_regs(saved);
+                self.emit_deopt_check_rax();
+                self.emit_store(id, Reg64::Rax);
+            }
+
             // ── Object / array / closure creation ─────────────────────────────
             //
             // CreateObjectLiteral and CreateShallowObjectLiteral use a
@@ -4105,6 +4131,8 @@ impl<'a> MaglevCodegen<'a> {
                 | ValueNode::SpeculativeCallFusion { .. }
                 | ValueNode::SpeculativeSumFusion { .. }
                 | ValueNode::SpeculativePushFusion { .. }
+                | ValueNode::SpeculativeFillTrueFusion { .. }
+                | ValueNode::SpeculativeCountTruthyFusion { .. }
         )
     }
 
@@ -8886,6 +8914,14 @@ impl<'a> MaglevCodegen<'a> {
             }
             ValueNode::SpeculativePushFusion { array, .. } => {
                 out.insert(*array);
+            }
+            ValueNode::SpeculativeFillTrueFusion { array, count } => {
+                out.insert(*array);
+                out.insert(*count);
+            }
+            ValueNode::SpeculativeCountTruthyFusion { array, count } => {
+                out.insert(*array);
+                out.insert(*count);
             }
             ValueNode::CallBuiltin { args, .. } | ValueNode::CallRuntime { args, .. } => {
                 for a in args {

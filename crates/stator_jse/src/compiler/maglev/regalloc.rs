@@ -669,6 +669,14 @@ fn collect_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
         ValueNode::SpeculativePushFusion { array, .. } => {
             f(*array);
         }
+        ValueNode::SpeculativeFillTrueFusion { array, count } => {
+            f(*array);
+            f(*count);
+        }
+        ValueNode::SpeculativeCountTruthyFusion { array, count } => {
+            f(*array);
+            f(*count);
+        }
 
         ValueNode::CallBuiltin { args, .. } | ValueNode::CallRuntime { args, .. } => {
             for &a in args {

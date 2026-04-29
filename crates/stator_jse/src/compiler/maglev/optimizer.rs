@@ -176,6 +176,11 @@ pub fn optimize(graph: &mut MaglevGraph) {
     fuse_object_literal_stores(graph);
     forward_invariant_object_properties(graph);
     eliminate_store_to_load(graph);
+    // Store-to-load forwarding resolves freshly-created arrays loaded through
+    // globals (e.g. sieve) to their allocation nodes, exposing fill loops that
+    // are not safe to match earlier.
+    fuse_fill_true_loops(graph);
+    fuse_count_truthy_loops(graph);
     // Re-run constant folding: store-to-load forwarding may replace
     // LoadNamedGeneric with SmiConstants, enabling preheader GenericAdd
     // chains (from fold_invariant_addition_chains) to constant-fold.
@@ -1118,6 +1123,14 @@ fn visit_value_node_inputs(node: &ValueNode, f: &mut impl FnMut(NodeId)) {
         ValueNode::SpeculativeCallFusion { callee, .. } => f(*callee),
         ValueNode::SpeculativeSumFusion { array } => f(*array),
         ValueNode::SpeculativePushFusion { array, .. } => f(*array),
+        ValueNode::SpeculativeFillTrueFusion { array, count } => {
+            f(*array);
+            f(*count);
+        }
+        ValueNode::SpeculativeCountTruthyFusion { array, count } => {
+            f(*array);
+            f(*count);
+        }
 
         ValueNode::Construct {
             constructor, args, ..
@@ -2387,6 +2400,8 @@ fn is_user_call(node: &ValueNode) -> bool {
             | ValueNode::SpeculativeCallFusion { .. }
             | ValueNode::SpeculativeSumFusion { .. }
             | ValueNode::SpeculativePushFusion { .. }
+            | ValueNode::SpeculativeFillTrueFusion { .. }
+            | ValueNode::SpeculativeCountTruthyFusion { .. }
     )
 }
 
@@ -3327,9 +3342,27 @@ fn fuse_sum_only_loops(graph: &mut MaglevGraph) {
 fn fuse_all_loops(graph: &mut MaglevGraph) {
     let loops = licm::detect_loops(graph);
     for lp in &loops {
-        if !try_fuse_sum_loop(graph, lp) {
-            try_fuse_push_loop(graph, lp);
+        if !try_fuse_sum_loop(graph, lp) && !try_fuse_push_loop(graph, lp) {
+            try_fuse_fill_true_loop(graph, lp);
         }
+    }
+}
+
+/// Fill-loop fusion only. Used after store-to-load forwarding exposes arrays
+/// that were previously hidden behind globals.
+fn fuse_fill_true_loops(graph: &mut MaglevGraph) {
+    let loops = licm::detect_loops(graph);
+    for lp in &loops {
+        try_fuse_fill_true_loop(graph, lp);
+    }
+}
+
+/// Count-loop fusion only. Used after store-to-load forwarding so array loads
+/// and counter updates have their simplest graph shape.
+fn fuse_count_truthy_loops(graph: &mut MaglevGraph) {
+    let loops = licm::detect_loops(graph);
+    for lp in &loops {
+        try_fuse_count_truthy_loop(graph, lp);
     }
 }
 
@@ -3881,6 +3914,490 @@ fn try_fuse_push_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
     }
 
     true
+}
+
+/// Detect `for (i = 0; i < count; i++) arr[i] = true` and replace it with
+/// [`ValueNode::SpeculativeFillTrueFusion`].
+fn try_fuse_fill_true_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
+    if lp.body.len() != 2 || !lp.body.contains(&lp.header) {
+        return false;
+    }
+
+    let (condition_id, body_block_idx, header_preds, header_nodes_snapshot);
+    {
+        let header = match graph.block(lp.header) {
+            Some(b) => b,
+            None => return false,
+        };
+        let (cond, body_bi, _exit) = match &header.control {
+            Some(ControlNode::Branch {
+                condition,
+                if_true,
+                if_false,
+            }) => (*condition, *if_true, *if_false),
+            _ => return false,
+        };
+        if !lp.body.contains(&body_bi) {
+            return false;
+        }
+        condition_id = cond;
+        body_block_idx = body_bi;
+        header_preds = header.predecessors.clone();
+        header_nodes_snapshot = header
+            .nodes
+            .iter()
+            .map(|(nid, node)| (*nid, node.clone()))
+            .collect::<Vec<_>>();
+    }
+
+    let body = match graph.block(body_block_idx) {
+        Some(b) => b,
+        None => return false,
+    };
+    match &body.control {
+        Some(ControlNode::Jump { target }) if *target == lp.header => {}
+        _ => return false,
+    }
+
+    let (iv_phi_id, limit_id, inclusive_bound) = {
+        let mut found = None;
+        for (nid, node) in &header_nodes_snapshot {
+            if *nid == condition_id {
+                found = Some(node.clone());
+                break;
+            }
+        }
+        match found {
+            Some(ValueNode::Int32LessThan { left, right }) => (left, right, false),
+            Some(ValueNode::Int32LessThanOrEqual { left, right }) => (left, right, true),
+            _ => return false,
+        }
+    };
+
+    let back_pred_pos = match header_preds.iter().position(|&p| p == body_block_idx) {
+        Some(pos) => pos,
+        None => return false,
+    };
+    let entry_pos = match header_preds.iter().position(|&p| p == lp.preheader) {
+        Some(pos) => pos,
+        None => return false,
+    };
+
+    let iv_inputs = match graph.node(iv_phi_id) {
+        Some(ValueNode::Phi { inputs }) if inputs.len() == 2 => inputs.clone(),
+        _ => return false,
+    };
+    if find_i32_constant(graph, iv_inputs[entry_pos]) != Some(0) {
+        return false;
+    }
+    if find_increment_step(graph, iv_inputs[back_pred_pos], iv_phi_id) != Some(1) {
+        return false;
+    }
+
+    let body_snapshot: Vec<_> = body
+        .nodes
+        .iter()
+        .map(|(nid, node)| (*nid, node.clone()))
+        .collect();
+
+    let mut fill_store = None;
+    for (nid, node) in &body_snapshot {
+        match node {
+            ValueNode::StoreKeyedGeneric {
+                object, key, value, ..
+            } if *key == iv_phi_id
+                && matches!(graph.node(*value), Some(ValueNode::TrueConstant)) =>
+            {
+                fill_store = Some((*nid, *object));
+                break;
+            }
+            ValueNode::StoreFixedArrayElement {
+                elements,
+                index,
+                value,
+            } if *index == iv_phi_id
+                && matches!(graph.node(*value), Some(ValueNode::TrueConstant)) =>
+            {
+                fill_store = Some((*nid, *elements));
+                break;
+            }
+            _ => {}
+        }
+    }
+    let (store_id, array_id) = match fill_store {
+        Some(found) => found,
+        None => return false,
+    };
+
+    if !matches!(
+        graph.node(array_id),
+        Some(ValueNode::CreateEmptyArrayLiteral { .. })
+    ) {
+        return false;
+    }
+
+    let loop_body_set: HashSet<u32> = lp.body.iter().copied().collect();
+    let arr_in_loop = loop_body_set.iter().any(|&bi| {
+        graph
+            .block(bi)
+            .map(|b| b.nodes.iter().any(|(nid, _)| *nid == array_id))
+            .unwrap_or(false)
+    });
+    if arr_in_loop {
+        return false;
+    }
+
+    for &block_id in &lp.body {
+        let block = match graph.block(block_id) {
+            Some(block) => block,
+            None => return false,
+        };
+        for (nid, node) in &block.nodes {
+            if *nid == store_id {
+                continue;
+            }
+            match node {
+                ValueNode::GenericIncrement { .. }
+                | ValueNode::Int32Increment { .. }
+                | ValueNode::CheckedSmiIncrement { .. }
+                | ValueNode::GenericAdd { .. }
+                | ValueNode::Int32Add { .. }
+                | ValueNode::CheckedSmiAdd { .. }
+                | ValueNode::Phi { .. }
+                | ValueNode::SmiConstant { .. }
+                | ValueNode::Int32Constant { .. }
+                | ValueNode::TrueConstant
+                | ValueNode::Int32LessThan { .. }
+                | ValueNode::Int32LessThanOrEqual { .. }
+                | ValueNode::CheckSmi { .. } => {}
+                _ => return false,
+            }
+        }
+    }
+
+    let count_id = if inclusive_bound {
+        let one_id = graph.alloc_node_id();
+        let count_id = graph.alloc_node_id();
+        if let Some(pre) = graph.block_mut(lp.preheader) {
+            pre.push_with_id(one_id, ValueNode::SmiConstant { value: 1 });
+            pre.push_with_id(
+                count_id,
+                ValueNode::Int32Add {
+                    left: limit_id,
+                    right: one_id,
+                },
+            );
+        }
+        count_id
+    } else {
+        limit_id
+    };
+
+    let fusion_id = graph.alloc_node_id();
+    if let Some(pre) = graph.block_mut(lp.preheader) {
+        pre.push_with_id(
+            fusion_id,
+            ValueNode::SpeculativeFillTrueFusion {
+                array: array_id,
+                count: count_id,
+            },
+        );
+    }
+
+    if let Some(header) = graph.block_mut(lp.header) {
+        for (nid, node) in &mut header.nodes {
+            if *nid == iv_phi_id {
+                if let ValueNode::Phi { inputs } = node
+                    && inputs.len() == 2
+                {
+                    inputs[entry_pos] = count_id;
+                    inputs[back_pred_pos] = *nid;
+                }
+                break;
+            }
+        }
+    }
+
+    true
+}
+
+/// Detect `for (i = 0; i < count; i++) if (arr[i]) total++` and replace the
+/// loop body with [`ValueNode::SpeculativeCountTruthyFusion`].
+fn try_fuse_count_truthy_loop(graph: &mut MaglevGraph, lp: &licm::NaturalLoop) -> bool {
+    if !lp.body.contains(&lp.header) {
+        return false;
+    }
+
+    let header = match graph.block(lp.header) {
+        Some(block) => block,
+        None => return false,
+    };
+    let (condition_id, test_block_idx, exit_block_idx) = match &header.control {
+        Some(ControlNode::Branch {
+            condition,
+            if_true,
+            if_false,
+        }) => (*condition, *if_true, *if_false),
+        _ => return false,
+    };
+    if !lp.body.contains(&test_block_idx) || lp.body.contains(&exit_block_idx) {
+        return false;
+    }
+
+    let (iv_phi_id, limit_id, inclusive_bound) = match graph.node(condition_id) {
+        Some(ValueNode::Int32LessThan { left, right }) => (*left, *right, false),
+        Some(ValueNode::Int32LessThanOrEqual { left, right }) => (*left, *right, true),
+        _ => return false,
+    };
+
+    let back_pred_pos = match header
+        .predecessors
+        .iter()
+        .position(|&p| lp.body.contains(&p))
+    {
+        Some(pos) => pos,
+        None => return false,
+    };
+    let latch_block_idx = header.predecessors[back_pred_pos];
+    let entry_pos = match header.predecessors.iter().position(|&p| p == lp.preheader) {
+        Some(pos) => pos,
+        None => return false,
+    };
+
+    let iv_inputs = match graph.node(iv_phi_id) {
+        Some(ValueNode::Phi { inputs }) if inputs.len() == 2 => inputs.clone(),
+        _ => return false,
+    };
+    if find_i32_constant(graph, iv_inputs[entry_pos]) != Some(0) {
+        return false;
+    }
+    if find_increment_step(graph, iv_inputs[back_pred_pos], iv_phi_id) != Some(1) {
+        return false;
+    }
+
+    let latch_block = match graph.block(latch_block_idx) {
+        Some(block) => block,
+        None => return false,
+    };
+    if !matches!(
+        latch_block.control,
+        Some(ControlNode::Jump { target }) if target == lp.header
+    ) {
+        return false;
+    }
+
+    let test_block = match graph.block(test_block_idx) {
+        Some(block) => block,
+        None => return false,
+    };
+    let (load_id, then_block_idx, false_target_idx) = match &test_block.control {
+        Some(ControlNode::Branch {
+            condition,
+            if_true,
+            if_false,
+        }) => {
+            let load_id = match graph.node(*condition) {
+                Some(ValueNode::LoadKeyedGeneric { key, .. }) if *key == iv_phi_id => *condition,
+                Some(ValueNode::LoadFixedArrayElement { index, .. }) if *index == iv_phi_id => {
+                    *condition
+                }
+                Some(ValueNode::ToBoolean { value }) => match graph.node(*value) {
+                    Some(ValueNode::LoadKeyedGeneric { key, .. }) if *key == iv_phi_id => *value,
+                    Some(ValueNode::LoadFixedArrayElement { index, .. }) if *index == iv_phi_id => {
+                        *value
+                    }
+                    _ => return false,
+                },
+                _ => return false,
+            };
+            (load_id, *if_true, *if_false)
+        }
+        _ => return false,
+    };
+    if false_target_idx != latch_block_idx || !lp.body.contains(&then_block_idx) {
+        return false;
+    }
+
+    let array_id = match graph.node(load_id) {
+        Some(ValueNode::LoadKeyedGeneric { object, .. }) => *object,
+        Some(ValueNode::LoadFixedArrayElement { elements, .. }) => *elements,
+        _ => return false,
+    };
+    let array_in_loop = lp.body.iter().any(|&bi| {
+        graph
+            .block(bi)
+            .map(|b| b.nodes.iter().any(|(nid, _)| *nid == array_id))
+            .unwrap_or(false)
+    });
+    if array_in_loop {
+        return false;
+    }
+
+    let then_block = match graph.block(then_block_idx) {
+        Some(block) => block,
+        None => return false,
+    };
+    if !matches!(
+        then_block.control,
+        Some(ControlNode::Jump { target }) if target == latch_block_idx
+    ) {
+        return false;
+    }
+
+    let mut count_store = None;
+    for (store_id, node) in &then_block.nodes {
+        let ValueNode::StoreGlobal {
+            name,
+            value,
+            feedback_slot,
+        } = node
+        else {
+            continue;
+        };
+        let Some((left, right)) = add_operands(graph.node(*value)) else {
+            continue;
+        };
+        let other = if find_i32_constant(graph, left) == Some(1) {
+            right
+        } else if find_i32_constant(graph, right) == Some(1) {
+            left
+        } else {
+            continue;
+        };
+        if matches!(
+            graph.node(other),
+            Some(ValueNode::LoadGlobal { name: load_name, .. }) if load_name == name
+        ) {
+            count_store = Some((*store_id, *name, *feedback_slot));
+            break;
+        }
+    }
+    let (count_store_id, count_name, count_feedback_slot) = match count_store {
+        Some(found) => found,
+        None => return false,
+    };
+
+    let preheader = match graph.block(lp.preheader) {
+        Some(block) => block,
+        None => return false,
+    };
+    let count_initialized_to_zero = preheader.nodes.iter().any(|(_, node)| {
+        matches!(
+            node,
+            ValueNode::StoreGlobal { name, value, .. }
+                if *name == count_name && find_i32_constant(graph, *value) == Some(0)
+        )
+    });
+    if !count_initialized_to_zero {
+        return false;
+    }
+
+    for &block_id in &lp.body {
+        let block = match graph.block(block_id) {
+            Some(block) => block,
+            None => return false,
+        };
+        for (nid, node) in &block.nodes {
+            match node {
+                ValueNode::StoreGlobal { name, .. } => {
+                    if *nid != count_store_id || *name != count_name {
+                        return false;
+                    }
+                }
+                ValueNode::LoadGlobal { name, .. } => {
+                    if *name != count_name {
+                        return false;
+                    }
+                }
+                ValueNode::LoadKeyedGeneric { .. } | ValueNode::LoadFixedArrayElement { .. } => {
+                    if *nid != load_id {
+                        return false;
+                    }
+                }
+                ValueNode::ToBoolean { value } => {
+                    if *value != load_id {
+                        return false;
+                    }
+                }
+                ValueNode::GenericAdd { .. }
+                | ValueNode::Int32Add { .. }
+                | ValueNode::CheckedSmiAdd { .. }
+                | ValueNode::GenericIncrement { .. }
+                | ValueNode::Int32Increment { .. }
+                | ValueNode::CheckedSmiIncrement { .. }
+                | ValueNode::Phi { .. }
+                | ValueNode::SmiConstant { .. }
+                | ValueNode::Int32Constant { .. }
+                | ValueNode::Int32LessThan { .. }
+                | ValueNode::Int32LessThanOrEqual { .. }
+                | ValueNode::CheckSmi { .. } => {}
+                _ => return false,
+            }
+        }
+    }
+
+    let count_id = if inclusive_bound {
+        let one_id = graph.alloc_node_id();
+        let count_id = graph.alloc_node_id();
+        if let Some(pre) = graph.block_mut(lp.preheader) {
+            pre.push_with_id(one_id, ValueNode::SmiConstant { value: 1 });
+            pre.push_with_id(
+                count_id,
+                ValueNode::Int32Add {
+                    left: limit_id,
+                    right: one_id,
+                },
+            );
+        }
+        count_id
+    } else {
+        limit_id
+    };
+
+    let fusion_id = graph.alloc_node_id();
+    let store_id = graph.alloc_node_id();
+    if let Some(pre) = graph.block_mut(lp.preheader) {
+        pre.push_with_id(
+            fusion_id,
+            ValueNode::SpeculativeCountTruthyFusion {
+                array: array_id,
+                count: count_id,
+            },
+        );
+        pre.push_with_id(
+            store_id,
+            ValueNode::StoreGlobal {
+                name: count_name,
+                value: fusion_id,
+                feedback_slot: count_feedback_slot,
+            },
+        );
+    }
+
+    if let Some(header) = graph.block_mut(lp.header) {
+        for (nid, node) in &mut header.nodes {
+            if *nid == iv_phi_id {
+                if let ValueNode::Phi { inputs } = node
+                    && inputs.len() == 2
+                {
+                    inputs[entry_pos] = count_id;
+                    inputs[back_pred_pos] = *nid;
+                }
+                break;
+            }
+        }
+    }
+
+    true
+}
+
+fn add_operands(node: Option<&ValueNode>) -> Option<(NodeId, NodeId)> {
+    match node? {
+        ValueNode::GenericAdd { left, right, .. }
+        | ValueNode::Int32Add { left, right }
+        | ValueNode::CheckedSmiAdd { left, right } => Some((*left, *right)),
+        _ => None,
+    }
 }
 
 /// Extract callee NodeId from a Call/CallKnownFunction node (graph lookup version).
@@ -5208,22 +5725,30 @@ fn replace_dead_arguments(graph: &mut MaglevGraph) {
 /// Remove `ValueNode`s that are never used and have no observable side-effects.
 ///
 /// Algorithm:
-/// 1. Walk all blocks and collect every [`NodeId`] that is referenced — either
-///    as an input to another `ValueNode` or as the `value` of a `ControlNode`.
-/// 2. Walk all nodes; any node whose own [`NodeId`] is *not* in the live set
-///    AND is considered *pure* (no side-effects) is removed.
+/// Repeats the local cleanup until stable so dead pure expression chains are
+/// removed transitively.  A single pass removes only the final unused node in a
+/// chain, leaving stale intermediate uses that can block later loop analysis.
 fn eliminate_dead_code(graph: &mut MaglevGraph) {
-    let live = collect_live_ids(graph);
+    loop {
+        let live = collect_live_ids(graph);
+        let mut removed = 0usize;
 
-    for block in graph.blocks_mut() {
-        block.nodes.retain(|(id, node)| {
-            // Always keep nodes with side-effects.
-            if has_side_effects(node) {
-                return true;
-            }
-            // Keep pure nodes only if their result is consumed somewhere.
-            live.contains(id)
-        });
+        for block in graph.blocks_mut() {
+            let before = block.nodes.len();
+            block.nodes.retain(|(id, node)| {
+                // Always keep nodes with side-effects.
+                if has_side_effects(node) {
+                    return true;
+                }
+                // Keep pure nodes only if their result is consumed somewhere.
+                live.contains(id)
+            });
+            removed += before - block.nodes.len();
+        }
+
+        if removed == 0 {
+            break;
+        }
     }
 }
 
@@ -5600,6 +6125,14 @@ fn collect_value_node_inputs(node: &ValueNode, live: &mut HashSet<NodeId>) {
         ValueNode::SpeculativePushFusion { array, .. } => {
             live.insert(*array);
         }
+        ValueNode::SpeculativeFillTrueFusion { array, count } => {
+            live.insert(*array);
+            live.insert(*count);
+        }
+        ValueNode::SpeculativeCountTruthyFusion { array, count } => {
+            live.insert(*array);
+            live.insert(*count);
+        }
 
         ValueNode::Construct {
             constructor, args, ..
@@ -5660,6 +6193,8 @@ fn has_side_effects(node: &ValueNode) -> bool {
             | ValueNode::SpeculativeCallFusion { .. }
             | ValueNode::SpeculativeSumFusion { .. }
             | ValueNode::SpeculativePushFusion { .. }
+            | ValueNode::SpeculativeFillTrueFusion { .. }
+            | ValueNode::SpeculativeCountTruthyFusion { .. }
             // Allocations have side-effects (GC pressure / observable identity).
             | ValueNode::CreateObjectLiteral { .. }
             | ValueNode::CreateObjectLiteralWithProperties { .. }
@@ -5756,6 +6291,8 @@ fn can_invalidate_named_stores(node: &ValueNode) -> bool {
             | ValueNode::SpeculativeCallFusion { .. }
             | ValueNode::SpeculativeSumFusion { .. }
             | ValueNode::SpeculativePushFusion { .. }
+            | ValueNode::SpeculativeFillTrueFusion { .. }
+            | ValueNode::SpeculativeCountTruthyFusion { .. }
             // Property deletion mutates objects.
             | ValueNode::DeleteProperty { .. }
             // For-in can invalidate caches.
@@ -6109,6 +6646,14 @@ fn apply_subst_to_value_node(node: &mut ValueNode, resolve: &impl Fn(NodeId) -> 
         }
         ValueNode::SpeculativePushFusion { array, .. } => {
             *array = resolve(*array);
+        }
+        ValueNode::SpeculativeFillTrueFusion { array, count } => {
+            *array = resolve(*array);
+            *count = resolve(*count);
+        }
+        ValueNode::SpeculativeCountTruthyFusion { array, count } => {
+            *array = resolve(*array);
+            *count = resolve(*count);
         }
 
         ValueNode::Construct {
@@ -6997,7 +7542,40 @@ fn try_eliminate_constant_accumulator(
         }
     }
 
+    // The loop's induction variable has a statically known value after the
+    // loop exits.  Rewrite only post-loop uses; the loop body and header still
+    // see the real Phi so side effects remain ordered if the loop is live.
+    let final_iv = (iv_init as i128) + (iv_step_val as i128) * (trip_count as i128);
+    if (i32::MIN as i128..=i32::MAX as i128).contains(&final_iv) {
+        let final_iv_id = graph.alloc_node_id();
+        if let Some(pre) = graph.block_mut(lp.preheader) {
+            pre.push_with_id(
+                final_iv_id,
+                ValueNode::SmiConstant {
+                    value: final_iv as i32,
+                },
+            );
+        }
+        replace_uses_outside_loop(graph, lp, iv_phi_id, final_iv_id);
+    }
+
     true
+}
+
+/// Replace uses of `from` in blocks outside `lp`.
+fn replace_uses_outside_loop(
+    graph: &mut MaglevGraph,
+    lp: &licm::NaturalLoop,
+    from: NodeId,
+    to: NodeId,
+) {
+    let subst = HashMap::from([(from, to)]);
+    for block in graph.blocks_mut() {
+        if lp.body.contains(&block.id) {
+            continue;
+        }
+        apply_subst_to_block(block, &subst);
+    }
 }
 
 /// Estimate the maximum number of iterations for a loop by examining
