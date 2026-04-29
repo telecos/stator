@@ -2299,11 +2299,46 @@ fn promote_loop_globals_counted(graph: &mut MaglevGraph) -> usize {
         }
     }
 
+    // Global promotion currently wires a single back-edge value into each
+    // inserted Phi.  That is only sound when loop-carried stores are executed
+    // unconditionally on every iteration.  If a loop body contains a branch
+    // that is not itself a detected nested-loop header, stores may be on only
+    // one side of the branch (e.g. sieve's `if (sieve[i]) { ... }`).  Skip
+    // promotion for the whole loop instead of materialising a wrong Phi input
+    // that can make the compiled loop non-terminating.
+    let loop_headers: HashSet<u32> = loops.iter().map(|lp| lp.header).collect();
+    let has_conditional_body: Vec<bool> = loops
+        .iter()
+        .map(|lp| loop_has_conditional_body(graph, lp, &loop_headers))
+        .collect();
+
     let mut count = 0;
     for (i, lp) in loops.iter().enumerate() {
+        if has_conditional_body[i] {
+            OPT_GLOBALS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         count += promote_globals_in_loop(graph, lp, &nested_stored[i]);
     }
     count
+}
+
+fn loop_has_conditional_body(
+    graph: &MaglevGraph,
+    lp: &licm::NaturalLoop,
+    loop_headers: &HashSet<u32>,
+) -> bool {
+    lp.body.iter().any(|&block_idx| {
+        if block_idx == lp.header || loop_headers.contains(&block_idx) {
+            return false;
+        }
+        matches!(
+            graph
+                .block(block_idx)
+                .and_then(|block| block.control.as_ref()),
+            Some(ControlNode::Branch { .. })
+        )
+    })
 }
 
 /// Return `true` if `node` is a user-visible function call that might read or
@@ -7330,6 +7365,195 @@ mod tests {
     /// Return the single value node in block 0 at position `pos`.
     fn node_at(graph: &MaglevGraph, pos: usize) -> &ValueNode {
         &graph.blocks()[0].nodes[pos].1
+    }
+
+    fn count_store_globals(graph: &MaglevGraph) -> usize {
+        graph
+            .blocks()
+            .iter()
+            .flat_map(|block| block.nodes.iter())
+            .filter(|(_, node)| matches!(node, ValueNode::StoreGlobal { .. }))
+            .count()
+    }
+
+    fn graph_has_header_phi(graph: &MaglevGraph, header: u32) -> bool {
+        graph
+            .block(header)
+            .is_some_and(|block| matches!(block.nodes.first(), Some((_, ValueNode::Phi { .. }))))
+    }
+
+    #[test]
+    fn test_promote_loop_globals_unconditional_loop() {
+        let mut graph = MaglevGraph::new(0);
+        for id in 0..4 {
+            graph.add_block(BasicBlock::new(id));
+        }
+
+        let init = graph
+            .add_value_node(0, ValueNode::SmiConstant { value: 0 })
+            .unwrap();
+        graph
+            .add_value_node(
+                0,
+                ValueNode::StoreGlobal {
+                    name: 7,
+                    value: init,
+                    feedback_slot: 0,
+                },
+            )
+            .unwrap();
+        graph
+            .block_mut(0)
+            .unwrap()
+            .set_control(ControlNode::Jump { target: 1 });
+
+        graph.block_mut(1).unwrap().add_predecessor(0);
+        graph.block_mut(1).unwrap().add_predecessor(2);
+        let cond = graph.add_value_node(1, ValueNode::TrueConstant).unwrap();
+        graph
+            .block_mut(1)
+            .unwrap()
+            .set_control(ControlNode::Branch {
+                condition: cond,
+                if_true: 2,
+                if_false: 3,
+            });
+
+        graph.block_mut(2).unwrap().add_predecessor(1);
+        let load = graph
+            .add_value_node(
+                2,
+                ValueNode::LoadGlobal {
+                    name: 7,
+                    feedback_slot: 0,
+                },
+            )
+            .unwrap();
+        let inc = graph
+            .add_value_node(2, ValueNode::Int32Increment { value: load })
+            .unwrap();
+        graph
+            .add_value_node(
+                2,
+                ValueNode::StoreGlobal {
+                    name: 7,
+                    value: inc,
+                    feedback_slot: 0,
+                },
+            )
+            .unwrap();
+        graph
+            .block_mut(2)
+            .unwrap()
+            .set_control(ControlNode::Jump { target: 1 });
+
+        graph.block_mut(3).unwrap().add_predecessor(1);
+        let undef = graph
+            .add_value_node(3, ValueNode::UndefinedConstant)
+            .unwrap();
+        graph
+            .block_mut(3)
+            .unwrap()
+            .set_control(ControlNode::Return { value: undef });
+
+        assert_eq!(promote_loop_globals_counted(&mut graph), 1);
+        assert!(graph_has_header_phi(&graph, 1));
+    }
+
+    #[test]
+    fn test_promote_loop_globals_skips_conditional_body() {
+        let mut graph = MaglevGraph::new(0);
+        for id in 0..6 {
+            graph.add_block(BasicBlock::new(id));
+        }
+
+        let init = graph
+            .add_value_node(0, ValueNode::SmiConstant { value: 0 })
+            .unwrap();
+        graph
+            .add_value_node(
+                0,
+                ValueNode::StoreGlobal {
+                    name: 8,
+                    value: init,
+                    feedback_slot: 0,
+                },
+            )
+            .unwrap();
+        graph
+            .block_mut(0)
+            .unwrap()
+            .set_control(ControlNode::Jump { target: 1 });
+
+        graph.block_mut(1).unwrap().add_predecessor(0);
+        graph.block_mut(1).unwrap().add_predecessor(4);
+        let header_cond = graph.add_value_node(1, ValueNode::TrueConstant).unwrap();
+        graph
+            .block_mut(1)
+            .unwrap()
+            .set_control(ControlNode::Branch {
+                condition: header_cond,
+                if_true: 2,
+                if_false: 5,
+            });
+
+        graph.block_mut(2).unwrap().add_predecessor(1);
+        let body_cond = graph.add_value_node(2, ValueNode::TrueConstant).unwrap();
+        graph
+            .block_mut(2)
+            .unwrap()
+            .set_control(ControlNode::Branch {
+                condition: body_cond,
+                if_true: 3,
+                if_false: 4,
+            });
+
+        graph.block_mut(3).unwrap().add_predecessor(2);
+        graph
+            .add_value_node(
+                3,
+                ValueNode::StoreGlobal {
+                    name: 9,
+                    value: init,
+                    feedback_slot: 0,
+                },
+            )
+            .unwrap();
+        graph
+            .block_mut(3)
+            .unwrap()
+            .set_control(ControlNode::Jump { target: 4 });
+
+        graph.block_mut(4).unwrap().add_predecessor(2);
+        graph.block_mut(4).unwrap().add_predecessor(3);
+        graph
+            .add_value_node(
+                4,
+                ValueNode::StoreGlobal {
+                    name: 8,
+                    value: init,
+                    feedback_slot: 0,
+                },
+            )
+            .unwrap();
+        graph
+            .block_mut(4)
+            .unwrap()
+            .set_control(ControlNode::Jump { target: 1 });
+
+        graph.block_mut(5).unwrap().add_predecessor(1);
+        let undef = graph
+            .add_value_node(5, ValueNode::UndefinedConstant)
+            .unwrap();
+        graph
+            .block_mut(5)
+            .unwrap()
+            .set_control(ControlNode::Return { value: undef });
+
+        let stores_before = count_store_globals(&graph);
+        assert_eq!(promote_loop_globals_counted(&mut graph), 0);
+        assert_eq!(count_store_globals(&graph), stores_before);
+        assert!(!graph_has_header_phi(&graph, 1));
     }
 
     // ── Constant folding — Int32 ──────────────────────────────────────────────

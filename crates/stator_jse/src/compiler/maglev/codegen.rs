@@ -715,6 +715,8 @@ struct MaglevCodegen<'a> {
     /// main emit loop.
     #[cfg_attr(not(all(target_arch = "x86_64", unix)), allow(dead_code))]
     fused_skip: HashSet<NodeId>,
+    /// Release-mode guard for malformed IR discovered during emission.
+    codegen_aborted: Option<&'static str>,
 }
 
 /// A deferred cold-path branch emitted out-of-line after all blocks.
@@ -860,6 +862,7 @@ impl<'a> MaglevCodegen<'a> {
             reg_holds: [None; NUM_REG_FWD],
             fused_add_sub: HashMap::new(),
             fused_skip: HashSet::new(),
+            codegen_aborted: None,
         }
     }
 
@@ -922,11 +925,17 @@ impl<'a> MaglevCodegen<'a> {
 
         for block_idx in 0..self.graph.blocks().len() {
             self.emit_block(block_idx as u32);
+            if let Some(reason) = self.codegen_aborted {
+                return Err(StatorError::Internal(reason.into()));
+            }
         }
 
         // Emit deferred cold-path branches (loop exit paths placed
         // out-of-line so the hot loop body can fall through).
         self.emit_deferred_branches();
+        if let Some(reason) = self.codegen_aborted {
+            return Err(StatorError::Internal(reason.into()));
+        }
 
         self.emit_deopt_epilogue();
 
@@ -1086,6 +1095,9 @@ impl<'a> MaglevCodegen<'a> {
         for mut db in branches {
             self.masm.bind_label(&mut db.label);
             self.emit_phi_copies_for_successor(db.pred_idx, db.successor_idx);
+            if self.codegen_aborted.is_some() {
+                return;
+            }
             let target = db.target_block as usize;
             self.masm.jmp(&mut self.block_labels[target]);
         }
@@ -3121,21 +3133,28 @@ impl<'a> MaglevCodegen<'a> {
             None => return,
         };
 
-        let phi_ops: Vec<(NodeId, NodeId)> = successor
-            .nodes
-            .iter()
-            .filter_map(|(phi_id, node)| {
-                if let ValueNode::Phi { inputs } = node {
-                    debug_assert_eq!(
-                        inputs.len(),
-                        successor.predecessors.len(),
-                        "phi inputs must align with successor predecessors"
-                    );
-                    inputs.get(pred_pos).map(|&src| (*phi_id, src))
-                } else {
-                    None
+        let predecessor_count = successor.predecessors.len();
+        let mut phi_ops = Vec::new();
+        let mut phi_mismatch = false;
+        for (phi_id, node) in &successor.nodes {
+            if let ValueNode::Phi { inputs } = node {
+                if inputs.len() != predecessor_count {
+                    phi_mismatch = true;
+                    break;
                 }
-            })
+                if let Some(&src) = inputs.get(pred_pos) {
+                    phi_ops.push((*phi_id, src));
+                }
+            }
+        }
+        if phi_mismatch {
+            self.codegen_aborted =
+                Some("maglev codegen aborted: phi inputs do not align with predecessors");
+            return;
+        }
+
+        let phi_ops: Vec<(NodeId, NodeId)> = phi_ops
+            .into_iter()
             // Skip self-referential Phis (src == phi) and same-location copies.
             .filter(|(phi_id, src_id)| {
                 if phi_id == src_id {
@@ -9847,6 +9866,54 @@ mod tests {
 
     fn do_compile(graph: &MaglevGraph, param_count: u32) -> MaglevCompiledCode {
         compile(graph, param_count).expect("codegen failed")
+    }
+
+    #[test]
+    fn test_compile_rejects_misaligned_phi_inputs() {
+        let mut graph = MaglevGraph::new(0);
+        for id in 0..3 {
+            graph.add_block(BasicBlock::new(id));
+        }
+
+        let value = graph
+            .add_value_node(0, ValueNode::SmiConstant { value: 1 })
+            .unwrap();
+        let condition = graph.add_value_node(0, ValueNode::TrueConstant).unwrap();
+        graph
+            .block_mut(0)
+            .unwrap()
+            .set_control(ControlNode::Branch {
+                condition,
+                if_true: 1,
+                if_false: 2,
+            });
+
+        graph.block_mut(1).unwrap().add_predecessor(0);
+        graph.block_mut(1).unwrap().add_predecessor(2);
+        let phi = graph
+            .add_value_node(
+                1,
+                ValueNode::Phi {
+                    inputs: vec![value],
+                },
+            )
+            .unwrap();
+        graph
+            .block_mut(1)
+            .unwrap()
+            .set_control(ControlNode::Return { value: phi });
+
+        graph.block_mut(2).unwrap().add_predecessor(0);
+        graph
+            .block_mut(2)
+            .unwrap()
+            .set_control(ControlNode::Jump { target: 1 });
+
+        match compile(&graph, 0) {
+            Err(StatorError::Internal(msg)) => assert!(msg.contains("phi inputs")),
+            Err(err) => panic!("expected phi input error, got {err}"),
+            Ok(_) => panic!("misaligned Phi inputs must abort codegen"),
+        }
     }
 
     // ── Smoke tests (non-execution) ───────────────────────────────────────────
