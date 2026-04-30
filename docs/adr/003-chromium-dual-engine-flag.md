@@ -93,6 +93,12 @@ applied to the real DOM; the Stator execution runs on an isolated snapshot.
 After both complete, the harness compares the enumerable own string properties
 of the global object and reports any discrepancy.
 
+The same component also exposes a benchmark mode for Chromium integration
+experiments. Chromium supplies a primary-engine runner that prepares and runs a
+V8 snippet; the harness runs the matching Stator shadow snippet, reports median,
+mean, and minimum timings for both engines, and emits JSON rows compatible with
+automation and DevTools logging.
+
 Discrepancies are reported via a new DevTools Protocol event:
 
 ```json
@@ -191,7 +197,7 @@ way to compare the two engines under identical conditions.
 | `chromium/features/BUILD.gn`                         | GN `source_set("stator_features")`              |
 | `chromium/content/stator_engine_selector.h`          | `RendererType` enum + `IsStatorEnabledFor()`    |
 | `chromium/content/stator_engine_selector.cc`         | Phased rollout flag-check logic                 |
-| `chromium/content/stator_dual_engine.h`              | `DualEngineResult` + `RunDualEngine()`          |
-| `chromium/content/stator_dual_engine.cc`             | Differential-testing harness implementation     |
+| `chromium/content/stator_dual_engine.h`              | `DualEngineResult`, `RunDualEngine()`, and dual-engine benchmark API |
+| `chromium/content/stator_dual_engine.cc`             | Differential-testing and benchmark harness implementation |
 | `chromium/content/BUILD.gn`                          | GN source_sets for selector + dual-engine       |
 | `chromium/gin/BUILD.gn`                              | Updated to depend on `stator_features`          |

@@ -4,7 +4,8 @@
 # This directory provides two source_sets:
 #
 #   stator_engine_selector — IsStatorEnabledFor() per-context engine selection
-#   stator_dual_engine     — RunDualEngine() differential-testing harness
+#   stator_dual_engine     — RunDualEngine() differential-testing and benchmark
+#                            harness
 #
 # Usage in GN (from within a Chromium checkout):
 #
@@ -30,11 +31,12 @@ source_set("stator_engine_selector") {
 }
 
 # ---------------------------------------------------------------------------
-# stator_dual_engine — differential-testing harness.
+# stator_dual_engine — differential-testing and benchmark harness.
 #
 # Runs both V8 (primary) and Stator (shadow) on the same script and compares
-# the resulting global/DOM state.  Intended for canary / dev-channel testing
-# only; gated behind the kStatorDualEngine feature flag at runtime.
+# the resulting global/DOM state.  It also exposes benchmark helpers that time
+# the same snippets through both engines.  Intended for canary / dev-channel
+# testing only; gated behind the kStatorDualEngine feature flag at runtime.
 # ---------------------------------------------------------------------------
 source_set("stator_dual_engine") {
   sources = [

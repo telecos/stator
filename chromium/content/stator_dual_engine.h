@@ -31,6 +31,7 @@
 #ifndef CHROMIUM_CONTENT_STATOR_DUAL_ENGINE_H_
 #define CHROMIUM_CONTENT_STATOR_DUAL_ENGINE_H_
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -77,6 +78,58 @@ struct DualEngineResult {
   std::string discrepancy_description;
 };
 
+// A JavaScript benchmark snippet for dual-engine timing.  The source is
+// compiled/prepared once per engine, warmed, and then timed for `iterations`
+// executions.
+struct DualEngineBenchmarkSpec {
+  std::string name;
+  std::string script_utf8;
+  std::string context_json = "{}";
+  int warmup_iterations = 200;
+  int warmup_pause_ms = 2000;
+  int iterations = 200;
+};
+
+// Callback surface used by Chromium to provide the primary V8 execution path
+// without making this helper depend directly on V8 headers.  `setup` should
+// prepare a per-snippet executable state (for example, a compiled v8::Script),
+// `run` executes that prepared state once, and `teardown` releases it.
+//
+// `setup` and `teardown` are optional.  `run` is required; if no primary runner
+// is supplied, RunDualEngineBenchmarks() uses the Stator reference runner as a
+// local smoke-test fallback.
+using DualEngineBenchmarkSetupFn =
+    void* (*)(const DualEngineBenchmarkSpec& spec, void* user_data);
+using DualEngineBenchmarkRunFn = bool (*)(void* state, void* user_data);
+using DualEngineBenchmarkTeardownFn =
+    void (*)(void* state, void* user_data);
+
+struct DualEngineBenchmarkRunner {
+  DualEngineBenchmarkSetupFn setup = nullptr;
+  DualEngineBenchmarkRunFn run = nullptr;
+  DualEngineBenchmarkTeardownFn teardown = nullptr;
+  void* user_data = nullptr;
+};
+
+// Timing result for one snippet.  `stator_to_v8_ratio` is Stator median divided
+// by V8 median; values <= 1.0 mean Stator is faster or tied.  `speedup` is the
+// inverse, V8 median divided by Stator median.
+struct DualEngineBenchmarkResult {
+  std::string name;
+  bool v8_ok = false;
+  bool stator_ok = false;
+  bool stator_beats_v8 = false;
+  int iterations = 0;
+  std::int64_t v8_median_ns = -1;
+  std::int64_t v8_mean_ns = -1;
+  std::int64_t v8_min_ns = -1;
+  std::int64_t stator_median_ns = -1;
+  std::int64_t stator_mean_ns = -1;
+  std::int64_t stator_min_ns = -1;
+  double stator_to_v8_ratio = 0.0;
+  double speedup = 0.0;
+};
+
 // Runs `script_utf8` through both V8 (primary) and Stator (shadow) and
 // returns a DualEngineResult.
 //
@@ -94,6 +147,25 @@ DualEngineResult RunDualEngine(const char* script_utf8,
 // Converts a DualEngineResult into a JSON string suitable for embedding in a
 // DevTools Protocol event payload.
 std::string DualEngineResultToJson(const DualEngineResult& result);
+
+// Returns the same nine benchmark snippets used by the standalone
+// `examples/chromium_bench` FFI harness and V8 comparison gate.
+std::vector<DualEngineBenchmarkSpec> DefaultDualEngineBenchmarkSnippets();
+
+// Returns a runner that executes snippets through Stator.  This is used
+// internally for the shadow engine and can also be used as the primary runner
+// for local smoke tests when real V8 bindings are not linked.
+DualEngineBenchmarkRunner StatorReferenceBenchmarkRunner();
+
+// Benchmarks each snippet through the supplied primary runner (V8 in Chromium)
+// and through the Stator shadow runner, then returns comparable timing rows.
+std::vector<DualEngineBenchmarkResult> RunDualEngineBenchmarks(
+    const std::vector<DualEngineBenchmarkSpec>& specs,
+    const DualEngineBenchmarkRunner& v8_runner);
+
+// Converts benchmark rows into JSON suitable for logs or DevTools payloads.
+std::string DualEngineBenchmarkResultsToJson(
+    const std::vector<DualEngineBenchmarkResult>& results);
 
 }  // namespace content
 
