@@ -8,7 +8,14 @@ repository = "https://github.com/telecos/stator"
 homepage = "https://github.com/telecos/stator"
 keywords = ["javascript", "engine", "jit", "ecmascript", "interpreter"]
 categories = ["compilers", "wasm"]
-readme = "../../README.md"
+readme = "README.md"
+include = [
+    "Cargo.toml",
+    "README.md",
+    "src/**/*",
+    "benches/**/*",
+    "examples/**/*",
+]
 
 [lib]
 crate-type = ["rlib"]
