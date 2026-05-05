@@ -1242,6 +1242,18 @@ size_t stator_script_bytecode_count(const struct StatorScript *script);
 void stator_script_disable_jit(struct StatorScript *script);
 
 /**
+ * Reset JIT deopt backoff state for a compiled script.
+ *
+ * This lets embedders perform a warmup phase, clear transient first-run deopts,
+ * and then measure or execute with warmed inline caches. It does not discard
+ * compiled JIT code.
+ *
+ * # Safety
+ * `script` must be either null or a valid, live [`StatorScript`] pointer.
+ */
+void stator_script_reset_jit_deopts(struct StatorScript *script);
+
+/**
  * Free a [`StatorScript`] previously returned by [`stator_script_compile`].
  *
  * # Safety

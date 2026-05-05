@@ -164,6 +164,7 @@ static BenchResult run_bench(StatorIsolate *isolate, const BenchSpec &spec) {
         }
     }
     std::this_thread::sleep_for(std::chrono::seconds(2));
+    stator_script_reset_jit_deopts(script);
     for (int w = 0; w < 100; w++) {
         if (!run_once()) {
             std::fprintf(stderr, "ERROR running warmup for '%s'\n", spec.name);
@@ -172,6 +173,7 @@ static BenchResult run_bench(StatorIsolate *isolate, const BenchSpec &spec) {
             return {spec.name, -1, -1, -1, 0};
         }
     }
+    stator_script_reset_jit_deopts(script);
 
     // Timed iterations: the script is already compiled and warmed, so this
     // measures the Chromium embedder path for repeated script execution.

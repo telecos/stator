@@ -19,6 +19,7 @@ use std::rc::Rc;
 use stator_jse::bytecode::bytecode_array::BytecodeArray;
 use stator_jse::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_jse::bytecode::bytecodes::{Operand, decode};
+use stator_jse::compiler::baseline::compiler::{reset_first_deopt_counts, reset_stub_deopt_counts};
 use stator_jse::dom::{
     DomObjectWrap, DomWeakRef, IndexedPropertyHandlerConfig, NamedPropertyHandlerConfig,
 };
@@ -1989,6 +1990,27 @@ pub unsafe extern "C" fn stator_script_disable_jit(script: *mut StatorScript) {
     // SAFETY: caller guarantees `script` is valid.
     if let Some(bytecodes) = unsafe { &(*script).bytecodes } {
         bytecodes.set_maglev_next_try_at(u32::MAX);
+    }
+}
+
+/// Reset JIT deopt backoff state for a compiled script.
+///
+/// This lets embedders perform a warmup phase, clear transient first-run deopts,
+/// and then measure or execute with warmed inline caches. It does not discard
+/// compiled JIT code.
+///
+/// # Safety
+/// `script` must be either null or a valid, live [`StatorScript`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_reset_jit_deopts(script: *mut StatorScript) {
+    if script.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `script` is valid.
+    if let Some(bytecodes) = unsafe { &(*script).bytecodes } {
+        bytecodes.reset_maglev_deopt_count();
+        reset_stub_deopt_counts();
+        reset_first_deopt_counts();
     }
 }
 
