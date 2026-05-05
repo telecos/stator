@@ -2073,6 +2073,37 @@ unsafe fn run_script_inner(
     })
 }
 
+unsafe fn run_script_no_result_inner(
+    script: *const StatorScript,
+    ctx: *mut StatorContext,
+) -> Option<stator_jse::error::StatorResult<()>> {
+    if script.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees `script` is valid.
+    let bytecodes = match unsafe { &(*script).bytecodes } {
+        Some(b) => b,
+        None => return None,
+    };
+
+    let owned_global_env;
+    let global_env = if !ctx.is_null() {
+        // SAFETY: caller guarantees `ctx` is valid.
+        unsafe { &(*ctx).globals }
+    } else {
+        owned_global_env = Rc::new(RefCell::new(GlobalEnv::new()));
+        &owned_global_env
+    };
+
+    Some(if global_env.borrow().globals_installed {
+        Interpreter::run_fast_no_result(bytecodes, &[], global_env)
+    } else {
+        let mut frame =
+            InterpreterFrame::new_with_globals(Rc::clone(bytecodes), vec![], Rc::clone(global_env));
+        Interpreter::run(&mut frame).map(|_| ())
+    })
+}
+
 /// Execute a compiled script in `ctx` and return the result as a
 /// [`StatorValue`].
 ///
@@ -2134,7 +2165,7 @@ pub unsafe extern "C" fn stator_script_run_no_result(
     script: *const StatorScript,
     ctx: *mut StatorContext,
 ) -> bool {
-    match unsafe { run_script_inner(script, ctx) } {
+    match unsafe { run_script_no_result_inner(script, ctx) } {
         Some(Ok(_)) => true,
         Some(Err(_)) | None => false,
     }

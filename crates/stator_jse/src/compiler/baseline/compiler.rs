@@ -564,6 +564,9 @@ pub(crate) mod jit_runtime {
     /// Record a call to the FFI stub at the given index.
     #[inline]
     fn track_stub_call(idx: usize) {
+        #[cfg(not(debug_assertions))]
+        let _ = idx;
+        #[cfg(debug_assertions)]
         RT_STUB_CALL_COUNTS.with(|c| {
             let mut arr = c.get();
             arr[idx] = arr[idx].saturating_add(1);

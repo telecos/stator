@@ -1626,19 +1626,20 @@ pub fn compile_maglev_sync(ba: &BytecodeArray) -> bool {
 ///
 /// On platforms where the JIT is not available this always returns `None`.
 #[allow(dead_code)]
-fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
+fn try_execute_maglev_raw(ba: &BytecodeArray, args: &[JsValue]) -> Option<i64> {
     #[cfg(all(target_arch = "x86_64", unix))]
     {
         if ba.jit_maglev_has_deopted() {
+            #[cfg(debug_assertions)]
             MAGLEV_DIAG_BLOCKED.with(|c| c.set(c.get() + 1));
             return None;
         }
 
+        #[cfg(debug_assertions)]
         MAGLEV_DIAG_TRIED.with(|c| c.set(c.get() + 1));
 
         use crate::compiler::baseline::compiler::{
             JIT_DEOPT, jit_runtime_set_context, jit_runtime_setup, jit_runtime_teardown,
-            jit_to_jsvalue_ext,
         };
         use crate::compiler::maglev::codegen::CachedMaglevCode;
 
@@ -1661,6 +1662,7 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
                     >= crate::bytecode::bytecode_array::MAGLEV_TIERING_THRESHOLD
                 {
                     maybe_compile_maglev(ba);
+                    #[cfg(debug_assertions)]
                     MAGLEV_DIAG_NOT_READY.with(|c| c.set(c.get() + 1));
                 }
             }
@@ -1668,6 +1670,7 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
 
         let guard = cache.borrow();
         if guard.is_none() {
+            #[cfg(debug_assertions)]
             DIAG_MAGLEV_CACHE_EMPTY.with(|c| c.set(c.get() + 1));
             return None;
         }
@@ -1695,8 +1698,10 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
 
         let deopt_offset = (result as u64).wrapping_sub(JIT_DEOPT as u64);
         let ret = if deopt_offset <= 5 {
+            #[cfg(debug_assertions)]
             MAGLEV_DIAG_DEOPTED.with(|c| c.set(c.get() + 1));
             // Update per-category deopt counters.
+            #[cfg(debug_assertions)]
             MAGLEV_DIAG_DEOPT_CATS.with(|c| {
                 let mut cats = c.get();
                 let idx = deopt_offset as usize;
@@ -1708,12 +1713,37 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
             ba.mark_jit_maglev_deopted();
             None
         } else {
+            #[cfg(debug_assertions)]
             MAGLEV_DIAG_EXECUTED.with(|c| c.set(c.get() + 1));
-            jit_to_jsvalue_ext(result).map(Ok)
+            Some(result)
         };
 
         jit_runtime_teardown();
         return ret;
+    }
+    #[allow(unreachable_code)]
+    let _ = (ba, args);
+    None
+}
+
+#[allow(dead_code)]
+fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        use crate::compiler::baseline::compiler::jit_to_jsvalue_ext;
+        return try_execute_maglev_raw(ba, args)
+            .and_then(|result| jit_to_jsvalue_ext(result).map(Ok));
+    }
+    #[allow(unreachable_code)]
+    let _ = (ba, args);
+    None
+}
+
+#[allow(dead_code)]
+fn try_execute_maglev_no_result(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<()>> {
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        return try_execute_maglev_raw(ba, args).map(|_| Ok(()));
     }
     #[allow(unreachable_code)]
     let _ = (ba, args);
@@ -1860,6 +1890,7 @@ pub(super) fn try_execute_best_jit(
     ba: &BytecodeArray,
     args: &[JsValue],
 ) -> Option<StatorResult<JsValue>> {
+    #[cfg(debug_assertions)]
     DIAG_BEST_JIT_ENTERED.with(|c| c.set(c.get() + 1));
     // Never run JIT when a debugger is attached — the debugger needs
     // to single-step through interpreted bytecodes.
@@ -1870,9 +1901,31 @@ pub(super) fn try_execute_best_jit(
     // both disabled due to codegen bugs.  Skip directly to Maglev to
     // avoid two unnecessary function calls per eval_js iteration.
     if let Some(r) = try_execute_maglev(ba, args) {
+        #[cfg(debug_assertions)]
         DIAG_MAGLEV_HIT.with(|c| c.set(c.get() + 1));
         return Some(r);
     }
+    #[cfg(debug_assertions)]
+    DIAG_MAGLEV_MISS.with(|c| c.set(c.get() + 1));
+    None
+}
+
+#[inline(always)]
+pub(super) fn try_execute_best_jit_no_result(
+    ba: &BytecodeArray,
+    args: &[JsValue],
+) -> Option<StatorResult<()>> {
+    #[cfg(debug_assertions)]
+    DIAG_BEST_JIT_ENTERED.with(|c| c.set(c.get() + 1));
+    if DEBUG_ATTACHED.with(|f| f.get()) {
+        return None;
+    }
+    if let Some(r) = try_execute_maglev_no_result(ba, args) {
+        #[cfg(debug_assertions)]
+        DIAG_MAGLEV_HIT.with(|c| c.set(c.get() + 1));
+        return Some(r);
+    }
+    #[cfg(debug_assertions)]
     DIAG_MAGLEV_MISS.with(|c| c.set(c.get() + 1));
     None
 }
@@ -3455,6 +3508,24 @@ impl Interpreter {
         Self::run_inner(frame, true)
     }
 
+    #[inline(always)]
+    fn publish_fast_globals(env: &Rc<RefCell<GlobalEnv>>) {
+        // Publish globals to JIT runtime (fast TLS pointer check).
+        let env_ptr = Rc::as_ptr(env) as usize;
+        let cached_ptr = LAST_GLOBALS_PTR.with(Cell::get);
+        if env_ptr != cached_ptr {
+            LAST_GLOBALS_PTR.with(|p| p.set(env_ptr));
+            CURRENT_GLOBALS.with(|g| {
+                *g.borrow_mut() = Some(Rc::clone(env));
+            });
+            #[cfg(all(target_arch = "x86_64", unix))]
+            {
+                use crate::compiler::baseline::compiler::jit_runtime_set_global_env;
+                jit_runtime_set_global_env(env.clone());
+            }
+        }
+    }
+
     /// Zero-overhead JIT fast path for repeated execution of warmed-up bytecode.
     ///
     /// When JIT code is available this skips `InterpreterFrame` creation
@@ -3471,22 +3542,10 @@ impl Interpreter {
         args: &[JsValue],
         env: &Rc<RefCell<GlobalEnv>>,
     ) -> StatorResult<JsValue> {
+        #[cfg(debug_assertions)]
         DIAG_RUN_INNER_ENTERED.with(|c| c.set(c.get() + 1));
 
-        // Publish globals to JIT runtime (fast TLS pointer check).
-        let env_ptr = Rc::as_ptr(env) as usize;
-        let cached_ptr = LAST_GLOBALS_PTR.with(Cell::get);
-        if env_ptr != cached_ptr {
-            LAST_GLOBALS_PTR.with(|p| p.set(env_ptr));
-            CURRENT_GLOBALS.with(|g| {
-                *g.borrow_mut() = Some(Rc::clone(env));
-            });
-            #[cfg(all(target_arch = "x86_64", unix))]
-            {
-                use crate::compiler::baseline::compiler::jit_runtime_set_global_env;
-                jit_runtime_set_global_env(env.clone());
-            }
-        }
+        Self::publish_fast_globals(env);
 
         // Try JIT — no frame creation needed.
         if let Some(jit_result) = try_execute_best_jit(ba, args) {
@@ -3499,7 +3558,31 @@ impl Interpreter {
         Self::run_inner(&mut frame, true)
     }
 
+    /// JIT fast path for callers that only need to drive execution.
+    ///
+    /// This follows [`Self::run_fast`] but skips converting a successful JIT
+    /// return value back into [`JsValue`] when the result will be discarded.
+    pub fn run_fast_no_result(
+        ba: &Rc<BytecodeArray>,
+        args: &[JsValue],
+        env: &Rc<RefCell<GlobalEnv>>,
+    ) -> StatorResult<()> {
+        #[cfg(debug_assertions)]
+        DIAG_RUN_INNER_ENTERED.with(|c| c.set(c.get() + 1));
+
+        Self::publish_fast_globals(env);
+
+        if let Some(jit_result) = try_execute_best_jit_no_result(ba, args) {
+            return jit_result;
+        }
+
+        let mut frame =
+            InterpreterFrame::new_callee_frame(Rc::clone(ba), args.to_vec(), Rc::clone(env));
+        Self::run_inner(&mut frame, true).map(|_| ())
+    }
+
     fn run_inner(frame: &mut InterpreterFrame, skip_globals: bool) -> StatorResult<JsValue> {
+        #[cfg(debug_assertions)]
         DIAG_RUN_INNER_ENTERED.with(|c| c.set(c.get() + 1));
 
         // Increment invocation count for tiering — ensures top-level code
