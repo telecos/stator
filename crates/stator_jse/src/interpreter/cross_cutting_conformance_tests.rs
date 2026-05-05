@@ -388,4 +388,31 @@ mod tests {
     fn e2e_optional_chaining_with_nullish_coalescing() {
         assert_eval_true("var o = null; (o?.a ?? 'default') === 'default'");
     }
+
+    // ── Misc: lexical closure captures ───────────────────────────────────────
+
+    #[test]
+    fn e2e_closure_captures_let_initializer() {
+        assert_eval_true(
+            "function makeReader() { let n = 7; return function() { return n; }; } \
+             makeReader()() === 7",
+        );
+    }
+
+    #[test]
+    fn e2e_closure_updates_captured_let() {
+        assert_eval_true(
+            "function makeCounter() { let n = 0; return function() { n = n + 1; return n; }; } \
+             let counter = makeCounter(); \
+             counter() === 1 && counter() === 2 && counter() === 3",
+        );
+    }
+
+    #[test]
+    fn e2e_closure_captures_const_initializer() {
+        assert_eval_true(
+            "function makeReader() { const n = 11; return function() { return n; }; } \
+             makeReader()() === 11",
+        );
+    }
 }

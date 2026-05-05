@@ -1,6 +1,6 @@
 [package]
 name = "st8"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Stator JavaScript shell — interactive JS REPL and script runner (like V8's d8)"
 license = "MIT"

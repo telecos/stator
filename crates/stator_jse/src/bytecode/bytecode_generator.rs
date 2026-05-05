@@ -1721,7 +1721,14 @@ impl FunctionCompiler {
                     } else {
                         self.emit(Instruction::new_unchecked(Opcode::LdaUndefined, vec![]));
                     }
-                    self.emit_star(reg);
+                    if let Some(&slot) = self.context_bindings.get(&*ident.name) {
+                        self.emit(Instruction::new_unchecked(
+                            Opcode::StaCurrentContextSlot,
+                            vec![Operand::ConstantPoolIdx(slot)],
+                        ));
+                    } else {
+                        self.emit_star(reg);
+                    }
                     // Clear TDZ — the binding is now initialised.
                     self.mark_initialized(&ident.name);
                     Ok(Some(reg))
