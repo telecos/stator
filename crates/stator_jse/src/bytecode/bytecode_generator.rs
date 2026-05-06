@@ -42,10 +42,10 @@ use crate::bytecode::register::{Register, RegisterAllocator};
 use crate::error::{StatorError, StatorResult};
 use crate::parser::ast::{
     ArrowBody, ArrowExpr, AssignOp, AssignTarget, BinaryOp, BlockStmt, ExportDefaultExpr,
-    ExportNamedDecl, Expr, FnDecl, FnExpr, ForInit, ForStmt, ImportSpecifier, LogicalOp,
-    MemberProp, ModuleDecl, ModuleExportName, ObjectPatProp, ObjectProp, Param, Pat, Program,
-    ProgramItem, PropKey, PropValue, SourceLocation, SourceType, Stmt, UnaryOp, UpdateOp, VarDecl,
-    VarDeclarator, VarKind,
+    ExportNamedDecl, Expr, FnDecl, FnExpr, ForInOfLeft, ForInit, ForStmt, ImportSpecifier,
+    LogicalOp, MemberProp, ModuleDecl, ModuleExportName, ObjectPatProp, ObjectProp, Param, Pat,
+    Program, ProgramItem, PropKey, PropValue, SourceLocation, SourceType, Stmt, UnaryOp, UpdateOp,
+    VarDecl, VarDeclarator, VarKind,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -7177,277 +7177,99 @@ fn compile_function_with_private_names(
 // Closure capture analysis
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Collect all identifier references from statements without crossing into
-/// inner function/arrow boundaries.  Used to find free variables of inner
-/// functions for closure capture analysis.
-fn collect_refs_in_scope(stmts: &[Stmt], refs: &mut HashSet<String>) {
-    for stmt in stmts {
-        collect_refs_in_stmt(stmt, refs);
-    }
-}
-
-fn collect_refs_in_stmt(stmt: &Stmt, refs: &mut HashSet<String>) {
-    match stmt {
-        Stmt::Expr(es) => collect_refs_in_expr(&es.expr, refs),
-        Stmt::Return(r) => {
-            if let Some(e) = &r.argument {
-                collect_refs_in_expr(e, refs);
-            }
-        }
-        Stmt::Block(b) => collect_refs_in_scope(&b.body, refs),
-        Stmt::If(i) => {
-            collect_refs_in_expr(&i.test, refs);
-            collect_refs_in_stmt(&i.consequent, refs);
-            if let Some(alt) = &i.alternate {
-                collect_refs_in_stmt(alt, refs);
-            }
-        }
-        Stmt::While(w) => {
-            collect_refs_in_expr(&w.test, refs);
-            collect_refs_in_stmt(&w.body, refs);
-        }
-        Stmt::DoWhile(d) => {
-            collect_refs_in_stmt(&d.body, refs);
-            collect_refs_in_expr(&d.test, refs);
-        }
-        Stmt::For(f) => {
-            if let Some(init) = &f.init {
-                match init {
-                    ForInit::Expr(e) => collect_refs_in_expr(e, refs),
-                    ForInit::VarDecl(v) => collect_refs_in_var_decl_exprs(v, refs),
-                }
-            }
-            if let Some(test) = &f.test {
-                collect_refs_in_expr(test, refs);
-            }
-            if let Some(update) = &f.update {
-                collect_refs_in_expr(update, refs);
-            }
-            collect_refs_in_stmt(&f.body, refs);
-        }
-        Stmt::ForIn(fi) => {
-            collect_refs_in_expr(&fi.right, refs);
-            collect_refs_in_stmt(&fi.body, refs);
-        }
-        Stmt::ForOf(fo) => {
-            collect_refs_in_expr(&fo.right, refs);
-            collect_refs_in_stmt(&fo.body, refs);
-        }
-        Stmt::VarDecl(v) => collect_refs_in_var_decl_exprs(v, refs),
-        Stmt::Switch(s) => {
-            collect_refs_in_expr(&s.discriminant, refs);
-            for case in &s.cases {
-                if let Some(test) = &case.test {
-                    collect_refs_in_expr(test, refs);
-                }
-                collect_refs_in_scope(&case.consequent, refs);
-            }
-        }
-        Stmt::Throw(t) => collect_refs_in_expr(&t.argument, refs),
-        Stmt::Try(t) => {
-            collect_refs_in_scope(&t.block.body, refs);
-            if let Some(handler) = &t.handler {
-                collect_refs_in_scope(&handler.body.body, refs);
-            }
-            if let Some(finalizer) = &t.finalizer {
-                collect_refs_in_scope(&finalizer.body, refs);
-            }
-        }
-        Stmt::Labeled(l) => collect_refs_in_stmt(&l.body, refs),
-        Stmt::With(w) => {
-            collect_refs_in_expr(&w.object, refs);
-            collect_refs_in_stmt(&w.body, refs);
-        }
-        // FnDecl creates a new scope — don't recurse.
-        Stmt::FnDecl(_) => {}
-        _ => {}
-    }
-}
-
-fn collect_refs_in_expr(expr: &Expr, refs: &mut HashSet<String>) {
-    match expr {
-        Expr::Ident(id) => {
-            refs.insert(id.name.clone());
-        }
-        // Function/arrow/class boundaries — don't cross.
-        Expr::Fn(_) | Expr::Arrow(_) | Expr::Class(_) => {}
-        Expr::Unary(u) => collect_refs_in_expr(&u.argument, refs),
-        Expr::Update(u) => {
-            if let Expr::Ident(id) = u.argument.as_ref() {
-                refs.insert(id.name.clone());
-            } else {
-                collect_refs_in_expr(&u.argument, refs);
-            }
-        }
-        Expr::Binary(b) => {
-            collect_refs_in_expr(&b.left, refs);
-            collect_refs_in_expr(&b.right, refs);
-        }
-        Expr::Logical(l) => {
-            collect_refs_in_expr(&l.left, refs);
-            collect_refs_in_expr(&l.right, refs);
-        }
-        Expr::Assign(a) => {
-            match &a.left {
-                AssignTarget::Expr(e) => collect_refs_in_expr(e, refs),
-                AssignTarget::Pat(p) => collect_refs_in_pat(p, refs),
-            }
-            collect_refs_in_expr(&a.right, refs);
-        }
-        Expr::Conditional(c) => {
-            collect_refs_in_expr(&c.test, refs);
-            collect_refs_in_expr(&c.consequent, refs);
-            collect_refs_in_expr(&c.alternate, refs);
-        }
-        Expr::Call(c) => {
-            collect_refs_in_expr(&c.callee, refs);
-            for arg in &c.arguments {
-                collect_refs_in_expr(arg, refs);
-            }
-        }
-        Expr::New(n) => {
-            collect_refs_in_expr(&n.callee, refs);
-            for arg in &n.arguments {
-                collect_refs_in_expr(arg, refs);
-            }
-        }
-        Expr::Member(m) => {
-            collect_refs_in_expr(&m.object, refs);
-            if let MemberProp::Computed(e) = &m.property {
-                collect_refs_in_expr(e, refs);
-            }
-        }
-        Expr::OptionalMember(m) => {
-            collect_refs_in_expr(&m.object, refs);
-            if let MemberProp::Computed(e) = &m.property {
-                collect_refs_in_expr(e, refs);
-            }
-        }
-        Expr::OptionalCall(c) => {
-            collect_refs_in_expr(&c.callee, refs);
-            for arg in &c.arguments {
-                collect_refs_in_expr(arg, refs);
-            }
-        }
-        Expr::Sequence(s) => {
-            for e in &s.expressions {
-                collect_refs_in_expr(e, refs);
-            }
-        }
-        Expr::Array(a) => {
-            for elem in a.elements.iter().flatten() {
-                collect_refs_in_expr(elem, refs);
-            }
-        }
-        Expr::Object(o) => {
-            for prop in &o.properties {
-                match prop {
-                    ObjectProp::Prop(p) => {
-                        if p.is_computed
-                            && let PropKey::Ident(id) = &p.key
-                        {
-                            refs.insert(id.name.clone());
-                        }
-                        match &p.value {
-                            PropValue::Value(e) => collect_refs_in_expr(e, refs),
-                            PropValue::Shorthand => {
-                                if let PropKey::Ident(id) = &p.key {
-                                    refs.insert(id.name.clone());
-                                }
-                            }
-                            // Get/Set/Method are function boundaries — don't cross.
-                            _ => {}
-                        }
-                    }
-                    ObjectProp::Spread(s) => {
-                        collect_refs_in_expr(&s.argument, refs);
-                    }
-                }
-            }
-        }
-        Expr::Spread(s) => collect_refs_in_expr(&s.argument, refs),
-        Expr::Template(t) => {
-            for e in &t.expressions {
-                collect_refs_in_expr(e, refs);
-            }
-        }
-        Expr::TaggedTemplate(t) => {
-            collect_refs_in_expr(&t.tag, refs);
-            for e in &t.quasi.expressions {
-                collect_refs_in_expr(e, refs);
-            }
-        }
-        Expr::Yield(y) => {
-            if let Some(arg) = &y.argument {
-                collect_refs_in_expr(arg, refs);
-            }
-        }
-        Expr::Await(a) => collect_refs_in_expr(&a.argument, refs),
-        // Literals, this, etc. — no refs.
-        _ => {}
-    }
-}
-
-/// Collect refs from patterns (destructuring in assignment targets).
-fn collect_refs_in_pat(pat: &Pat, refs: &mut HashSet<String>) {
-    match pat {
-        Pat::Ident(id) => {
-            refs.insert(id.name.clone());
-        }
-        Pat::Array(a) => {
-            for p in a.elements.iter().flatten() {
-                collect_refs_in_pat(p, refs);
-            }
-        }
-        Pat::Object(o) => {
-            for prop in &o.properties {
-                match prop {
-                    ObjectPatProp::KeyValue(kv) => collect_refs_in_pat(&kv.value, refs),
-                    ObjectPatProp::Assign(a) => {
-                        refs.insert(a.key.name.clone());
-                        if let Some(default) = &a.value {
-                            collect_refs_in_expr(default, refs);
-                        }
-                    }
-                    ObjectPatProp::Rest(r) => collect_refs_in_pat(&r.argument, refs),
-                }
-            }
-        }
-        Pat::Assign(a) => {
-            collect_refs_in_pat(&a.left, refs);
-            collect_refs_in_expr(&a.right, refs);
-        }
-        Pat::Rest(r) => collect_refs_in_pat(&r.argument, refs),
-        Pat::Expr(e) => collect_refs_in_expr(e, refs),
-    }
-}
-
-/// Collect refs from variable declaration initializers only.
-fn collect_refs_in_var_decl_exprs(decl: &VarDecl, refs: &mut HashSet<String>) {
-    for d in &decl.declarators {
-        if let Some(init) = &d.init {
-            collect_refs_in_expr(init, refs);
-        }
-    }
-}
-
-/// Collect all declared names (var, let, const, params, function declarations)
-/// in a function scope.  Does NOT cross into inner function boundaries.
-fn collect_local_decl_names(params: &[Param], stmts: &[Stmt]) -> HashSet<String> {
+fn collect_function_scope_names(
+    params: &[Param],
+    stmts: &[Stmt],
+    self_name: Option<&str>,
+) -> HashSet<String> {
     let mut names = HashSet::new();
+    if let Some(name) = self_name {
+        names.insert(name.to_string());
+    }
     for p in params {
         collect_pat_binding_names(&p.pat, &mut names);
     }
-    collect_decl_names_in_stmts(stmts, &mut names);
+    collect_function_scope_decl_names_in_stmts(stmts, &mut names);
     names
 }
 
-fn collect_decl_names_in_stmts(stmts: &[Stmt], names: &mut HashSet<String>) {
+fn collect_function_scope_decl_names_in_stmts(stmts: &[Stmt], names: &mut HashSet<String>) {
+    for stmt in stmts {
+        collect_function_scope_decl_names_in_stmt(stmt, names);
+    }
+}
+
+fn collect_function_scope_decl_names_in_stmt(stmt: &Stmt, names: &mut HashSet<String>) {
+    match stmt {
+        Stmt::VarDecl(v) => {
+            if v.kind == VarKind::Var {
+                collect_var_decl_binding_names(v, names);
+            }
+        }
+        Stmt::FnDecl(f) => {
+            if let Some(id) = &f.id {
+                names.insert(id.name.clone());
+            }
+        }
+        Stmt::Block(b) => collect_function_scope_decl_names_in_stmts(&b.body, names),
+        Stmt::If(i) => {
+            collect_function_scope_decl_names_in_stmt(&i.consequent, names);
+            if let Some(alt) = &i.alternate {
+                collect_function_scope_decl_names_in_stmt(alt, names);
+            }
+        }
+        Stmt::While(w) => collect_function_scope_decl_names_in_stmt(&w.body, names),
+        Stmt::DoWhile(d) => collect_function_scope_decl_names_in_stmt(&d.body, names),
+        Stmt::For(f) => {
+            if let Some(ForInit::VarDecl(v)) = &f.init
+                && v.kind == VarKind::Var
+            {
+                collect_var_decl_binding_names(v, names);
+            }
+            collect_function_scope_decl_names_in_stmt(&f.body, names);
+        }
+        Stmt::ForIn(fi) => {
+            if let ForInOfLeft::VarDecl(v) = &fi.left
+                && v.kind == VarKind::Var
+            {
+                collect_var_decl_binding_names(v, names);
+            }
+            collect_function_scope_decl_names_in_stmt(&fi.body, names);
+        }
+        Stmt::ForOf(fo) => {
+            if let ForInOfLeft::VarDecl(v) = &fo.left
+                && v.kind == VarKind::Var
+            {
+                collect_var_decl_binding_names(v, names);
+            }
+            collect_function_scope_decl_names_in_stmt(&fo.body, names);
+        }
+        Stmt::Switch(s) => {
+            for case in &s.cases {
+                collect_function_scope_decl_names_in_stmts(&case.consequent, names);
+            }
+        }
+        Stmt::Try(t) => {
+            collect_function_scope_decl_names_in_stmts(&t.block.body, names);
+            if let Some(handler) = &t.handler {
+                collect_function_scope_decl_names_in_stmts(&handler.body.body, names);
+            }
+            if let Some(fin) = &t.finalizer {
+                collect_function_scope_decl_names_in_stmts(&fin.body, names);
+            }
+        }
+        Stmt::Labeled(l) => collect_function_scope_decl_names_in_stmt(&l.body, names),
+        _ => {}
+    }
+}
+
+fn collect_block_lexical_decl_names(stmts: &[Stmt]) -> HashSet<String> {
+    let mut names = HashSet::new();
     for stmt in stmts {
         match stmt {
             Stmt::VarDecl(v) => {
-                for d in &v.declarators {
-                    collect_pat_binding_names(&d.id, names);
+                if v.kind != VarKind::Var {
+                    collect_var_decl_binding_names(v, &mut names);
                 }
             }
             Stmt::FnDecl(f) => {
@@ -7455,45 +7277,21 @@ fn collect_decl_names_in_stmts(stmts: &[Stmt], names: &mut HashSet<String>) {
                     names.insert(id.name.clone());
                 }
             }
-            Stmt::Block(b) => collect_decl_names_in_stmts(&b.body, names),
-            Stmt::If(i) => {
-                collect_decl_names_in_stmts(&[(*i.consequent).clone()], names);
-                if let Some(alt) = &i.alternate {
-                    collect_decl_names_in_stmts(&[(**alt).clone()], names);
-                }
-            }
-            Stmt::While(w) => collect_decl_names_in_stmts(&[(*w.body).clone()], names),
-            Stmt::DoWhile(d) => collect_decl_names_in_stmts(&[(*d.body).clone()], names),
-            Stmt::For(f) => {
-                if let Some(ForInit::VarDecl(v)) = &f.init {
-                    for d in &v.declarators {
-                        collect_pat_binding_names(&d.id, names);
-                    }
-                }
-                collect_decl_names_in_stmts(&[(*f.body).clone()], names);
-            }
-            Stmt::ForIn(fi) => collect_decl_names_in_stmts(&[(*fi.body).clone()], names),
-            Stmt::ForOf(fo) => collect_decl_names_in_stmts(&[(*fo.body).clone()], names),
-            Stmt::Switch(s) => {
-                for case in &s.cases {
-                    collect_decl_names_in_stmts(&case.consequent, names);
-                }
-            }
-            Stmt::Try(t) => {
-                collect_decl_names_in_stmts(&t.block.body, names);
-                if let Some(handler) = &t.handler {
-                    if let Some(param) = &handler.param {
-                        collect_pat_binding_names(param, names);
-                    }
-                    collect_decl_names_in_stmts(&handler.body.body, names);
-                }
-                if let Some(fin) = &t.finalizer {
-                    collect_decl_names_in_stmts(&fin.body, names);
-                }
-            }
-            Stmt::Labeled(l) => collect_decl_names_in_stmts(&[(*l.body).clone()], names),
             _ => {}
         }
+    }
+    names
+}
+
+fn collect_var_decl_binding_names(decl: &VarDecl, names: &mut HashSet<String>) {
+    for d in &decl.declarators {
+        collect_pat_binding_names(&d.id, names);
+    }
+}
+
+fn collect_for_left_binding_names(left: &ForInOfLeft, names: &mut HashSet<String>) {
+    if let ForInOfLeft::VarDecl(v) = left {
+        collect_var_decl_binding_names(v, names);
     }
 }
 
@@ -7525,112 +7323,613 @@ fn collect_pat_binding_names(pat: &Pat, names: &mut HashSet<String>) {
     }
 }
 
-/// Find all captured variables: outer locals referenced by inner functions.
-fn find_captured_vars(outer_params: &[Param], body: &BlockStmt) -> HashSet<String> {
-    let outer_locals = collect_local_decl_names(outer_params, &body.body);
-    let mut captured = HashSet::new();
-    find_captures_in_stmts(&body.body, &outer_locals, &mut captured);
-    captured
+fn is_bound_in_scopes(name: &str, scopes: &[HashSet<String>]) -> bool {
+    scopes.iter().rev().any(|scope| scope.contains(name))
 }
 
-/// Walk statements looking for inner functions.
-fn find_captures_in_stmts(
-    stmts: &[Stmt],
-    outer_locals: &HashSet<String>,
-    captured: &mut HashSet<String>,
-) {
-    for stmt in stmts {
-        find_captures_in_stmt(stmt, outer_locals, captured);
+fn record_free_ref(name: &str, scopes: &[HashSet<String>], free_refs: &mut HashSet<String>) {
+    if !is_bound_in_scopes(name, scopes) {
+        free_refs.insert(name.to_string());
     }
 }
 
-fn find_captures_in_stmt(
-    stmt: &Stmt,
-    outer_locals: &HashSet<String>,
+fn capture_visible_free_refs(
+    free_refs: HashSet<String>,
+    scopes: &[HashSet<String>],
     captured: &mut HashSet<String>,
 ) {
+    for name in free_refs {
+        if is_bound_in_scopes(&name, scopes) {
+            captured.insert(name);
+        }
+    }
+}
+
+fn collect_function_free_refs(
+    params: &[Param],
+    stmts: &[Stmt],
+    self_name: Option<&str>,
+) -> HashSet<String> {
+    let function_scope = collect_function_scope_names(params, stmts, self_name);
+    let mut scopes = vec![function_scope];
+    let mut free_refs = HashSet::new();
+    collect_free_refs_in_params(params, &scopes, &mut free_refs);
+    collect_free_refs_in_block(stmts, &mut scopes, &mut free_refs);
+    free_refs
+}
+
+fn collect_arrow_free_refs(arrow: &ArrowExpr) -> HashSet<String> {
+    let mut scopes = vec![collect_function_scope_names(&arrow.params, &[], None)];
+    let mut free_refs = HashSet::new();
+    collect_free_refs_in_params(&arrow.params, &scopes, &mut free_refs);
+    match &arrow.body {
+        ArrowBody::Block(b) => collect_free_refs_in_block(&b.body, &mut scopes, &mut free_refs),
+        ArrowBody::Expr(e) => collect_free_refs_in_expr(e, &scopes, &mut free_refs),
+    }
+    free_refs
+}
+
+fn collect_free_refs_in_params(
+    params: &[Param],
+    scopes: &[HashSet<String>],
+    free_refs: &mut HashSet<String>,
+) {
+    for param in params {
+        collect_free_refs_in_pat_initializers(&param.pat, scopes, free_refs);
+        if let Some(default) = &param.default {
+            collect_free_refs_in_expr(default, scopes, free_refs);
+        }
+    }
+}
+
+fn collect_free_refs_in_block(
+    stmts: &[Stmt],
+    scopes: &mut Vec<HashSet<String>>,
+    free_refs: &mut HashSet<String>,
+) {
+    scopes.push(collect_block_lexical_decl_names(stmts));
+    for stmt in stmts {
+        collect_free_refs_in_stmt(stmt, scopes, free_refs);
+    }
+    scopes.pop();
+}
+
+fn collect_free_refs_in_stmt(
+    stmt: &Stmt,
+    scopes: &mut Vec<HashSet<String>>,
+    free_refs: &mut HashSet<String>,
+) {
     match stmt {
-        Stmt::Expr(es) => find_captures_in_expr(&es.expr, outer_locals, captured),
+        Stmt::Expr(es) => collect_free_refs_in_expr(&es.expr, scopes, free_refs),
         Stmt::Return(r) => {
             if let Some(e) = &r.argument {
-                find_captures_in_expr(e, outer_locals, captured);
+                collect_free_refs_in_expr(e, scopes, free_refs);
             }
         }
-        Stmt::Block(b) => find_captures_in_stmts(&b.body, outer_locals, captured),
+        Stmt::Block(b) => collect_free_refs_in_block(&b.body, scopes, free_refs),
         Stmt::If(i) => {
-            find_captures_in_expr(&i.test, outer_locals, captured);
-            find_captures_in_stmt(&i.consequent, outer_locals, captured);
+            collect_free_refs_in_expr(&i.test, scopes, free_refs);
+            collect_free_refs_in_stmt(&i.consequent, scopes, free_refs);
             if let Some(alt) = &i.alternate {
-                find_captures_in_stmt(alt, outer_locals, captured);
+                collect_free_refs_in_stmt(alt, scopes, free_refs);
             }
         }
         Stmt::While(w) => {
-            find_captures_in_expr(&w.test, outer_locals, captured);
-            find_captures_in_stmt(&w.body, outer_locals, captured);
+            collect_free_refs_in_expr(&w.test, scopes, free_refs);
+            collect_free_refs_in_stmt(&w.body, scopes, free_refs);
         }
         Stmt::DoWhile(d) => {
-            find_captures_in_stmt(&d.body, outer_locals, captured);
-            find_captures_in_expr(&d.test, outer_locals, captured);
+            collect_free_refs_in_stmt(&d.body, scopes, free_refs);
+            collect_free_refs_in_expr(&d.test, scopes, free_refs);
         }
         Stmt::For(f) => {
+            let pushed_loop_scope = push_for_init_scope(&f.init, scopes);
             if let Some(init) = &f.init {
                 match init {
-                    ForInit::Expr(e) => find_captures_in_expr(e, outer_locals, captured),
+                    ForInit::Expr(e) => collect_free_refs_in_expr(e, scopes, free_refs),
                     ForInit::VarDecl(v) => {
-                        for d in &v.declarators {
-                            if let Some(init) = &d.init {
-                                find_captures_in_expr(init, outer_locals, captured);
-                            }
-                        }
+                        collect_free_refs_in_var_decl_initializers(v, scopes, free_refs);
                     }
                 }
             }
             if let Some(test) = &f.test {
-                find_captures_in_expr(test, outer_locals, captured);
+                collect_free_refs_in_expr(test, scopes, free_refs);
             }
             if let Some(update) = &f.update {
-                find_captures_in_expr(update, outer_locals, captured);
+                collect_free_refs_in_expr(update, scopes, free_refs);
             }
-            find_captures_in_stmt(&f.body, outer_locals, captured);
+            collect_free_refs_in_stmt(&f.body, scopes, free_refs);
+            if pushed_loop_scope {
+                scopes.pop();
+            }
         }
         Stmt::ForIn(fi) => {
-            find_captures_in_expr(&fi.right, outer_locals, captured);
-            find_captures_in_stmt(&fi.body, outer_locals, captured);
+            let pushed_loop_scope = push_for_in_of_scope(&fi.left, scopes);
+            collect_free_refs_in_for_left(&fi.left, scopes, free_refs);
+            collect_free_refs_in_expr(&fi.right, scopes, free_refs);
+            collect_free_refs_in_stmt(&fi.body, scopes, free_refs);
+            if pushed_loop_scope {
+                scopes.pop();
+            }
         }
         Stmt::ForOf(fo) => {
-            find_captures_in_expr(&fo.right, outer_locals, captured);
-            find_captures_in_stmt(&fo.body, outer_locals, captured);
-        }
-        Stmt::VarDecl(v) => {
-            for d in &v.declarators {
-                if let Some(init) = &d.init {
-                    find_captures_in_expr(init, outer_locals, captured);
-                }
+            let pushed_loop_scope = push_for_in_of_scope(&fo.left, scopes);
+            collect_free_refs_in_for_left(&fo.left, scopes, free_refs);
+            collect_free_refs_in_expr(&fo.right, scopes, free_refs);
+            collect_free_refs_in_stmt(&fo.body, scopes, free_refs);
+            if pushed_loop_scope {
+                scopes.pop();
             }
         }
+        Stmt::VarDecl(v) => collect_free_refs_in_var_decl_initializers(v, scopes, free_refs),
         Stmt::Switch(s) => {
-            find_captures_in_expr(&s.discriminant, outer_locals, captured);
+            collect_free_refs_in_expr(&s.discriminant, scopes, free_refs);
+            scopes.push(collect_switch_lexical_decl_names(&s.cases));
             for case in &s.cases {
                 if let Some(test) = &case.test {
-                    find_captures_in_expr(test, outer_locals, captured);
+                    collect_free_refs_in_expr(test, scopes, free_refs);
                 }
-                find_captures_in_stmts(&case.consequent, outer_locals, captured);
+                for stmt in &case.consequent {
+                    collect_free_refs_in_stmt(stmt, scopes, free_refs);
+                }
             }
+            scopes.pop();
         }
-        Stmt::Throw(t) => find_captures_in_expr(&t.argument, outer_locals, captured),
+        Stmt::Throw(t) => collect_free_refs_in_expr(&t.argument, scopes, free_refs),
         Stmt::Try(t) => {
-            find_captures_in_stmts(&t.block.body, outer_locals, captured);
+            collect_free_refs_in_block(&t.block.body, scopes, free_refs);
             if let Some(handler) = &t.handler {
-                find_captures_in_stmts(&handler.body.body, outer_locals, captured);
+                let mut catch_scope = HashSet::new();
+                if let Some(param) = &handler.param {
+                    collect_pat_binding_names(param, &mut catch_scope);
+                    collect_free_refs_in_pat_initializers(param, scopes, free_refs);
+                }
+                scopes.push(catch_scope);
+                collect_free_refs_in_block(&handler.body.body, scopes, free_refs);
+                scopes.pop();
             }
             if let Some(fin) = &t.finalizer {
-                find_captures_in_stmts(&fin.body, outer_locals, captured);
+                collect_free_refs_in_block(&fin.body, scopes, free_refs);
             }
         }
-        Stmt::Labeled(l) => find_captures_in_stmt(&l.body, outer_locals, captured),
+        Stmt::Labeled(l) => collect_free_refs_in_stmt(&l.body, scopes, free_refs),
         Stmt::With(w) => {
-            find_captures_in_expr(&w.object, outer_locals, captured);
-            find_captures_in_stmt(&w.body, outer_locals, captured);
+            collect_free_refs_in_expr(&w.object, scopes, free_refs);
+            collect_free_refs_in_stmt(&w.body, scopes, free_refs);
+        }
+        Stmt::FnDecl(f) => {
+            let self_name = f.id.as_ref().map(|id| id.name.as_str());
+            let nested_free_refs = collect_function_free_refs(&f.params, &f.body.body, self_name);
+            for name in nested_free_refs {
+                record_free_ref(&name, scopes, free_refs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_free_refs_in_expr(
+    expr: &Expr,
+    scopes: &[HashSet<String>],
+    free_refs: &mut HashSet<String>,
+) {
+    match expr {
+        Expr::Ident(id) => record_free_ref(&id.name, scopes, free_refs),
+        Expr::Fn(f) => {
+            let self_name = f.id.as_ref().map(|id| id.name.as_str());
+            for name in collect_function_free_refs(&f.params, &f.body.body, self_name) {
+                record_free_ref(&name, scopes, free_refs);
+            }
+        }
+        Expr::Arrow(a) => {
+            for name in collect_arrow_free_refs(a) {
+                record_free_ref(&name, scopes, free_refs);
+            }
+        }
+        Expr::Class(_) => {}
+        Expr::Unary(u) => collect_free_refs_in_expr(&u.argument, scopes, free_refs),
+        Expr::Update(u) => collect_free_refs_in_expr(&u.argument, scopes, free_refs),
+        Expr::Binary(b) => {
+            collect_free_refs_in_expr(&b.left, scopes, free_refs);
+            collect_free_refs_in_expr(&b.right, scopes, free_refs);
+        }
+        Expr::Logical(l) => {
+            collect_free_refs_in_expr(&l.left, scopes, free_refs);
+            collect_free_refs_in_expr(&l.right, scopes, free_refs);
+        }
+        Expr::Assign(a) => {
+            match &a.left {
+                AssignTarget::Expr(e) => collect_free_refs_in_expr(e, scopes, free_refs),
+                AssignTarget::Pat(p) => collect_free_refs_in_pat_target(p, scopes, free_refs),
+            }
+            collect_free_refs_in_expr(&a.right, scopes, free_refs);
+        }
+        Expr::Conditional(c) => {
+            collect_free_refs_in_expr(&c.test, scopes, free_refs);
+            collect_free_refs_in_expr(&c.consequent, scopes, free_refs);
+            collect_free_refs_in_expr(&c.alternate, scopes, free_refs);
+        }
+        Expr::Call(c) => {
+            collect_free_refs_in_expr(&c.callee, scopes, free_refs);
+            for arg in &c.arguments {
+                collect_free_refs_in_expr(arg, scopes, free_refs);
+            }
+        }
+        Expr::New(n) => {
+            collect_free_refs_in_expr(&n.callee, scopes, free_refs);
+            for arg in &n.arguments {
+                collect_free_refs_in_expr(arg, scopes, free_refs);
+            }
+        }
+        Expr::Member(m) => {
+            collect_free_refs_in_expr(&m.object, scopes, free_refs);
+            if let MemberProp::Computed(e) = &m.property {
+                collect_free_refs_in_expr(e, scopes, free_refs);
+            }
+        }
+        Expr::OptionalMember(m) => {
+            collect_free_refs_in_expr(&m.object, scopes, free_refs);
+            if let MemberProp::Computed(e) = &m.property {
+                collect_free_refs_in_expr(e, scopes, free_refs);
+            }
+        }
+        Expr::OptionalCall(c) => {
+            collect_free_refs_in_expr(&c.callee, scopes, free_refs);
+            for arg in &c.arguments {
+                collect_free_refs_in_expr(arg, scopes, free_refs);
+            }
+        }
+        Expr::Sequence(s) => {
+            for e in &s.expressions {
+                collect_free_refs_in_expr(e, scopes, free_refs);
+            }
+        }
+        Expr::Array(a) => {
+            for elem in a.elements.iter().flatten() {
+                collect_free_refs_in_expr(elem, scopes, free_refs);
+            }
+        }
+        Expr::Object(o) => {
+            for prop in &o.properties {
+                match prop {
+                    ObjectProp::Prop(p) => {
+                        collect_free_refs_in_prop_key(&p.key, scopes, free_refs);
+                        match &p.value {
+                            PropValue::Value(e) => {
+                                collect_free_refs_in_expr(e, scopes, free_refs);
+                            }
+                            PropValue::Shorthand => {
+                                if let PropKey::Ident(id) = &p.key {
+                                    record_free_ref(&id.name, scopes, free_refs);
+                                }
+                            }
+                            PropValue::Get(f) | PropValue::Set(f) | PropValue::Method(f) => {
+                                let self_name = f.id.as_ref().map(|id| id.name.as_str());
+                                for name in
+                                    collect_function_free_refs(&f.params, &f.body.body, self_name)
+                                {
+                                    record_free_ref(&name, scopes, free_refs);
+                                }
+                            }
+                        }
+                    }
+                    ObjectProp::Spread(s) => {
+                        collect_free_refs_in_expr(&s.argument, scopes, free_refs);
+                    }
+                }
+            }
+        }
+        Expr::Spread(s) => collect_free_refs_in_expr(&s.argument, scopes, free_refs),
+        Expr::Template(t) => {
+            for e in &t.expressions {
+                collect_free_refs_in_expr(e, scopes, free_refs);
+            }
+        }
+        Expr::TaggedTemplate(t) => {
+            collect_free_refs_in_expr(&t.tag, scopes, free_refs);
+            for e in &t.quasi.expressions {
+                collect_free_refs_in_expr(e, scopes, free_refs);
+            }
+        }
+        Expr::Yield(y) => {
+            if let Some(arg) = &y.argument {
+                collect_free_refs_in_expr(arg, scopes, free_refs);
+            }
+        }
+        Expr::Await(a) => collect_free_refs_in_expr(&a.argument, scopes, free_refs),
+        _ => {}
+    }
+}
+
+fn collect_free_refs_in_prop_key(
+    key: &PropKey,
+    scopes: &[HashSet<String>],
+    free_refs: &mut HashSet<String>,
+) {
+    if let PropKey::Computed(expr) = key {
+        collect_free_refs_in_expr(expr, scopes, free_refs);
+    }
+}
+
+fn collect_free_refs_in_var_decl_initializers(
+    decl: &VarDecl,
+    scopes: &[HashSet<String>],
+    free_refs: &mut HashSet<String>,
+) {
+    for d in &decl.declarators {
+        collect_free_refs_in_pat_initializers(&d.id, scopes, free_refs);
+        if let Some(init) = &d.init {
+            collect_free_refs_in_expr(init, scopes, free_refs);
+        }
+    }
+}
+
+fn collect_free_refs_in_pat_initializers(
+    pat: &Pat,
+    scopes: &[HashSet<String>],
+    free_refs: &mut HashSet<String>,
+) {
+    match pat {
+        Pat::Array(a) => {
+            for p in a.elements.iter().flatten() {
+                collect_free_refs_in_pat_initializers(p, scopes, free_refs);
+            }
+        }
+        Pat::Object(o) => {
+            for prop in &o.properties {
+                match prop {
+                    ObjectPatProp::KeyValue(kv) => {
+                        collect_free_refs_in_prop_key(&kv.key, scopes, free_refs);
+                        collect_free_refs_in_pat_initializers(&kv.value, scopes, free_refs);
+                    }
+                    ObjectPatProp::Assign(a) => {
+                        if let Some(default) = &a.value {
+                            collect_free_refs_in_expr(default, scopes, free_refs);
+                        }
+                    }
+                    ObjectPatProp::Rest(r) => {
+                        collect_free_refs_in_pat_initializers(&r.argument, scopes, free_refs);
+                    }
+                }
+            }
+        }
+        Pat::Assign(a) => {
+            collect_free_refs_in_pat_initializers(&a.left, scopes, free_refs);
+            collect_free_refs_in_expr(&a.right, scopes, free_refs);
+        }
+        Pat::Rest(r) => collect_free_refs_in_pat_initializers(&r.argument, scopes, free_refs),
+        Pat::Expr(e) => collect_free_refs_in_expr(e, scopes, free_refs),
+        Pat::Ident(_) => {}
+    }
+}
+
+fn collect_free_refs_in_pat_target(
+    pat: &Pat,
+    scopes: &[HashSet<String>],
+    free_refs: &mut HashSet<String>,
+) {
+    match pat {
+        Pat::Ident(id) => record_free_ref(&id.name, scopes, free_refs),
+        Pat::Array(a) => {
+            for p in a.elements.iter().flatten() {
+                collect_free_refs_in_pat_target(p, scopes, free_refs);
+            }
+        }
+        Pat::Object(o) => {
+            for prop in &o.properties {
+                match prop {
+                    ObjectPatProp::KeyValue(kv) => {
+                        collect_free_refs_in_prop_key(&kv.key, scopes, free_refs);
+                        collect_free_refs_in_pat_target(&kv.value, scopes, free_refs);
+                    }
+                    ObjectPatProp::Assign(a) => {
+                        record_free_ref(&a.key.name, scopes, free_refs);
+                        if let Some(default) = &a.value {
+                            collect_free_refs_in_expr(default, scopes, free_refs);
+                        }
+                    }
+                    ObjectPatProp::Rest(r) => {
+                        collect_free_refs_in_pat_target(&r.argument, scopes, free_refs)
+                    }
+                }
+            }
+        }
+        Pat::Assign(a) => {
+            collect_free_refs_in_pat_target(&a.left, scopes, free_refs);
+            collect_free_refs_in_expr(&a.right, scopes, free_refs);
+        }
+        Pat::Rest(r) => collect_free_refs_in_pat_target(&r.argument, scopes, free_refs),
+        Pat::Expr(e) => collect_free_refs_in_expr(e, scopes, free_refs),
+    }
+}
+
+fn collect_free_refs_in_for_left(
+    left: &ForInOfLeft,
+    scopes: &[HashSet<String>],
+    free_refs: &mut HashSet<String>,
+) {
+    match left {
+        ForInOfLeft::VarDecl(v) => collect_free_refs_in_var_decl_initializers(v, scopes, free_refs),
+        ForInOfLeft::Pat(p) => collect_free_refs_in_pat_target(p, scopes, free_refs),
+        ForInOfLeft::Expr(e) => collect_free_refs_in_expr(e, scopes, free_refs),
+    }
+}
+
+fn push_for_init_scope(init: &Option<ForInit>, scopes: &mut Vec<HashSet<String>>) -> bool {
+    if let Some(ForInit::VarDecl(v)) = init
+        && v.kind != VarKind::Var
+    {
+        let mut names = HashSet::new();
+        collect_var_decl_binding_names(v, &mut names);
+        scopes.push(names);
+        return true;
+    }
+    false
+}
+
+fn push_for_in_of_scope(left: &ForInOfLeft, scopes: &mut Vec<HashSet<String>>) -> bool {
+    if let ForInOfLeft::VarDecl(v) = left
+        && v.kind != VarKind::Var
+    {
+        let mut names = HashSet::new();
+        collect_for_left_binding_names(left, &mut names);
+        scopes.push(names);
+        return true;
+    }
+    false
+}
+
+fn collect_switch_lexical_decl_names(cases: &[crate::parser::ast::SwitchCase]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    for case in cases {
+        names.extend(collect_block_lexical_decl_names(&case.consequent));
+    }
+    names
+}
+
+/// Find all captured variables: locals referenced by nested functions.
+fn find_captured_vars(outer_params: &[Param], body: &BlockStmt) -> HashSet<String> {
+    let function_scope = collect_function_scope_names(outer_params, &body.body, None);
+    let mut scopes = vec![function_scope];
+    let mut captured = HashSet::new();
+    find_captures_in_params(outer_params, &mut scopes, &mut captured);
+    find_captures_in_block(&body.body, &mut scopes, &mut captured);
+    captured
+}
+
+fn find_captures_in_params(
+    params: &[Param],
+    scopes: &mut Vec<HashSet<String>>,
+    captured: &mut HashSet<String>,
+) {
+    for param in params {
+        find_captures_in_pat_exprs(&param.pat, scopes, captured);
+        if let Some(default) = &param.default {
+            find_captures_in_expr(default, scopes, captured);
+        }
+    }
+}
+
+fn find_captures_in_block(
+    stmts: &[Stmt],
+    scopes: &mut Vec<HashSet<String>>,
+    captured: &mut HashSet<String>,
+) {
+    scopes.push(collect_block_lexical_decl_names(stmts));
+    for stmt in stmts {
+        find_captures_in_stmt(stmt, scopes, captured);
+    }
+    scopes.pop();
+}
+
+fn find_captures_in_stmt(
+    stmt: &Stmt,
+    scopes: &mut Vec<HashSet<String>>,
+    captured: &mut HashSet<String>,
+) {
+    match stmt {
+        Stmt::Expr(es) => find_captures_in_expr(&es.expr, scopes, captured),
+        Stmt::Return(r) => {
+            if let Some(e) = &r.argument {
+                find_captures_in_expr(e, scopes, captured);
+            }
+        }
+        Stmt::Block(b) => find_captures_in_block(&b.body, scopes, captured),
+        Stmt::If(i) => {
+            find_captures_in_expr(&i.test, scopes, captured);
+            find_captures_in_stmt(&i.consequent, scopes, captured);
+            if let Some(alt) = &i.alternate {
+                find_captures_in_stmt(alt, scopes, captured);
+            }
+        }
+        Stmt::While(w) => {
+            find_captures_in_expr(&w.test, scopes, captured);
+            find_captures_in_stmt(&w.body, scopes, captured);
+        }
+        Stmt::DoWhile(d) => {
+            find_captures_in_stmt(&d.body, scopes, captured);
+            find_captures_in_expr(&d.test, scopes, captured);
+        }
+        Stmt::For(f) => {
+            let pushed_loop_scope = push_for_init_scope(&f.init, scopes);
+            if let Some(init) = &f.init {
+                match init {
+                    ForInit::Expr(e) => find_captures_in_expr(e, scopes, captured),
+                    ForInit::VarDecl(v) => find_captures_in_var_decl(v, scopes, captured),
+                }
+            }
+            if let Some(test) = &f.test {
+                find_captures_in_expr(test, scopes, captured);
+            }
+            if let Some(update) = &f.update {
+                find_captures_in_expr(update, scopes, captured);
+            }
+            find_captures_in_stmt(&f.body, scopes, captured);
+            if pushed_loop_scope {
+                scopes.pop();
+            }
+        }
+        Stmt::ForIn(fi) => {
+            let pushed_loop_scope = push_for_in_of_scope(&fi.left, scopes);
+            find_captures_in_for_left(&fi.left, scopes, captured);
+            find_captures_in_expr(&fi.right, scopes, captured);
+            find_captures_in_stmt(&fi.body, scopes, captured);
+            if pushed_loop_scope {
+                scopes.pop();
+            }
+        }
+        Stmt::ForOf(fo) => {
+            let pushed_loop_scope = push_for_in_of_scope(&fo.left, scopes);
+            find_captures_in_for_left(&fo.left, scopes, captured);
+            find_captures_in_expr(&fo.right, scopes, captured);
+            find_captures_in_stmt(&fo.body, scopes, captured);
+            if pushed_loop_scope {
+                scopes.pop();
+            }
+        }
+        Stmt::VarDecl(v) => find_captures_in_var_decl(v, scopes, captured),
+        Stmt::Switch(s) => {
+            find_captures_in_expr(&s.discriminant, scopes, captured);
+            scopes.push(collect_switch_lexical_decl_names(&s.cases));
+            for case in &s.cases {
+                if let Some(test) = &case.test {
+                    find_captures_in_expr(test, scopes, captured);
+                }
+                for stmt in &case.consequent {
+                    find_captures_in_stmt(stmt, scopes, captured);
+                }
+            }
+            scopes.pop();
+        }
+        Stmt::Throw(t) => find_captures_in_expr(&t.argument, scopes, captured),
+        Stmt::Try(t) => {
+            find_captures_in_block(&t.block.body, scopes, captured);
+            if let Some(handler) = &t.handler {
+                let mut catch_scope = HashSet::new();
+                if let Some(param) = &handler.param {
+                    collect_pat_binding_names(param, &mut catch_scope);
+                    find_captures_in_pat_exprs(param, scopes, captured);
+                }
+                scopes.push(catch_scope);
+                find_captures_in_block(&handler.body.body, scopes, captured);
+                scopes.pop();
+            }
+            if let Some(fin) = &t.finalizer {
+                find_captures_in_block(&fin.body, scopes, captured);
+            }
+        }
+        Stmt::Labeled(l) => find_captures_in_stmt(&l.body, scopes, captured),
+        Stmt::With(w) => {
+            find_captures_in_expr(&w.object, scopes, captured);
+            find_captures_in_stmt(&w.body, scopes, captured);
+        }
+        Stmt::FnDecl(f) => {
+            let self_name = f.id.as_ref().map(|id| id.name.as_str());
+            capture_visible_free_refs(
+                collect_function_free_refs(&f.params, &f.body.body, self_name),
+                scopes,
+                captured,
+            );
         }
         _ => {}
     }
@@ -7638,134 +7937,201 @@ fn find_captures_in_stmt(
 
 fn find_captures_in_expr(
     expr: &Expr,
-    outer_locals: &HashSet<String>,
+    scopes: &mut Vec<HashSet<String>>,
     captured: &mut HashSet<String>,
 ) {
     match expr {
-        // Inner function boundary: compute its free vars.
         Expr::Fn(f) => {
-            let inner_locals = collect_local_decl_names(&f.params, &f.body.body);
-            let mut refs = HashSet::new();
-            collect_refs_in_scope(&f.body.body, &mut refs);
-            for name in &refs {
-                if outer_locals.contains(name) && !inner_locals.contains(name) {
-                    captured.insert(name.clone());
-                }
-            }
+            let self_name = f.id.as_ref().map(|id| id.name.as_str());
+            capture_visible_free_refs(
+                collect_function_free_refs(&f.params, &f.body.body, self_name),
+                scopes,
+                captured,
+            );
         }
         Expr::Arrow(a) => {
-            let inner_locals = match &a.body {
-                ArrowBody::Block(b) => collect_local_decl_names(&a.params, &b.body),
-                ArrowBody::Expr(_) => collect_local_decl_names(&a.params, &[]),
-            };
-            let mut refs = HashSet::new();
-            match &a.body {
-                ArrowBody::Block(b) => collect_refs_in_scope(&b.body, &mut refs),
-                ArrowBody::Expr(e) => collect_refs_in_expr(e, &mut refs),
-            }
-            for name in &refs {
-                if outer_locals.contains(name) && !inner_locals.contains(name) {
-                    captured.insert(name.clone());
-                }
-            }
+            capture_visible_free_refs(collect_arrow_free_refs(a), scopes, captured);
         }
-        // Recurse into sub-expressions to find nested inner functions.
-        Expr::Unary(u) => find_captures_in_expr(&u.argument, outer_locals, captured),
-        Expr::Update(u) => find_captures_in_expr(&u.argument, outer_locals, captured),
+        Expr::Class(_) => {}
+        Expr::Unary(u) => find_captures_in_expr(&u.argument, scopes, captured),
+        Expr::Update(u) => find_captures_in_expr(&u.argument, scopes, captured),
         Expr::Binary(b) => {
-            find_captures_in_expr(&b.left, outer_locals, captured);
-            find_captures_in_expr(&b.right, outer_locals, captured);
+            find_captures_in_expr(&b.left, scopes, captured);
+            find_captures_in_expr(&b.right, scopes, captured);
         }
         Expr::Logical(l) => {
-            find_captures_in_expr(&l.left, outer_locals, captured);
-            find_captures_in_expr(&l.right, outer_locals, captured);
+            find_captures_in_expr(&l.left, scopes, captured);
+            find_captures_in_expr(&l.right, scopes, captured);
         }
         Expr::Assign(a) => {
             match &a.left {
-                AssignTarget::Expr(e) => find_captures_in_expr(e, outer_locals, captured),
-                AssignTarget::Pat(_) => {}
+                AssignTarget::Expr(e) => find_captures_in_expr(e, scopes, captured),
+                AssignTarget::Pat(p) => find_captures_in_pat_exprs(p, scopes, captured),
             }
-            find_captures_in_expr(&a.right, outer_locals, captured);
+            find_captures_in_expr(&a.right, scopes, captured);
         }
         Expr::Conditional(c) => {
-            find_captures_in_expr(&c.test, outer_locals, captured);
-            find_captures_in_expr(&c.consequent, outer_locals, captured);
-            find_captures_in_expr(&c.alternate, outer_locals, captured);
+            find_captures_in_expr(&c.test, scopes, captured);
+            find_captures_in_expr(&c.consequent, scopes, captured);
+            find_captures_in_expr(&c.alternate, scopes, captured);
         }
         Expr::Call(c) => {
-            find_captures_in_expr(&c.callee, outer_locals, captured);
+            find_captures_in_expr(&c.callee, scopes, captured);
             for arg in &c.arguments {
-                find_captures_in_expr(arg, outer_locals, captured);
+                find_captures_in_expr(arg, scopes, captured);
             }
         }
         Expr::New(n) => {
-            find_captures_in_expr(&n.callee, outer_locals, captured);
+            find_captures_in_expr(&n.callee, scopes, captured);
             for arg in &n.arguments {
-                find_captures_in_expr(arg, outer_locals, captured);
+                find_captures_in_expr(arg, scopes, captured);
             }
         }
         Expr::Member(m) => {
-            find_captures_in_expr(&m.object, outer_locals, captured);
+            find_captures_in_expr(&m.object, scopes, captured);
             if let MemberProp::Computed(e) = &m.property {
-                find_captures_in_expr(e, outer_locals, captured);
+                find_captures_in_expr(e, scopes, captured);
+            }
+        }
+        Expr::OptionalMember(m) => {
+            find_captures_in_expr(&m.object, scopes, captured);
+            if let MemberProp::Computed(e) = &m.property {
+                find_captures_in_expr(e, scopes, captured);
+            }
+        }
+        Expr::OptionalCall(c) => {
+            find_captures_in_expr(&c.callee, scopes, captured);
+            for arg in &c.arguments {
+                find_captures_in_expr(arg, scopes, captured);
             }
         }
         Expr::Sequence(s) => {
             for e in &s.expressions {
-                find_captures_in_expr(e, outer_locals, captured);
+                find_captures_in_expr(e, scopes, captured);
             }
         }
         Expr::Array(a) => {
             for elem in a.elements.iter().flatten() {
-                find_captures_in_expr(elem, outer_locals, captured);
+                find_captures_in_expr(elem, scopes, captured);
             }
         }
         Expr::Object(o) => {
             for prop in &o.properties {
                 match prop {
                     ObjectProp::Prop(p) => {
-                        if let PropValue::Value(e) = &p.value {
-                            find_captures_in_expr(e, outer_locals, captured);
+                        find_captures_in_prop_key(&p.key, scopes, captured);
+                        match &p.value {
+                            PropValue::Value(e) => find_captures_in_expr(e, scopes, captured),
+                            PropValue::Get(f) | PropValue::Set(f) | PropValue::Method(f) => {
+                                let self_name = f.id.as_ref().map(|id| id.name.as_str());
+                                capture_visible_free_refs(
+                                    collect_function_free_refs(&f.params, &f.body.body, self_name),
+                                    scopes,
+                                    captured,
+                                );
+                            }
+                            PropValue::Shorthand => {}
                         }
                     }
                     ObjectProp::Spread(s) => {
-                        find_captures_in_expr(&s.argument, outer_locals, captured);
+                        find_captures_in_expr(&s.argument, scopes, captured);
                     }
                 }
             }
         }
-        Expr::Spread(s) => find_captures_in_expr(&s.argument, outer_locals, captured),
+        Expr::Spread(s) => find_captures_in_expr(&s.argument, scopes, captured),
         Expr::Template(t) => {
             for e in &t.expressions {
-                find_captures_in_expr(e, outer_locals, captured);
+                find_captures_in_expr(e, scopes, captured);
             }
         }
         Expr::TaggedTemplate(t) => {
-            find_captures_in_expr(&t.tag, outer_locals, captured);
+            find_captures_in_expr(&t.tag, scopes, captured);
             for e in &t.quasi.expressions {
-                find_captures_in_expr(e, outer_locals, captured);
+                find_captures_in_expr(e, scopes, captured);
             }
         }
         Expr::Yield(y) => {
             if let Some(arg) = &y.argument {
-                find_captures_in_expr(arg, outer_locals, captured);
+                find_captures_in_expr(arg, scopes, captured);
             }
         }
-        Expr::Await(a) => find_captures_in_expr(&a.argument, outer_locals, captured),
-        Expr::OptionalMember(m) => {
-            find_captures_in_expr(&m.object, outer_locals, captured);
-            if let MemberProp::Computed(e) = &m.property {
-                find_captures_in_expr(e, outer_locals, captured);
-            }
-        }
-        Expr::OptionalCall(c) => {
-            find_captures_in_expr(&c.callee, outer_locals, captured);
-            for arg in &c.arguments {
-                find_captures_in_expr(arg, outer_locals, captured);
-            }
-        }
-        // Literals, this, etc. — no inner functions.
+        Expr::Await(a) => find_captures_in_expr(&a.argument, scopes, captured),
         _ => {}
+    }
+}
+
+fn find_captures_in_var_decl(
+    decl: &VarDecl,
+    scopes: &mut Vec<HashSet<String>>,
+    captured: &mut HashSet<String>,
+) {
+    for d in &decl.declarators {
+        find_captures_in_pat_exprs(&d.id, scopes, captured);
+        if let Some(init) = &d.init {
+            find_captures_in_expr(init, scopes, captured);
+        }
+    }
+}
+
+fn find_captures_in_for_left(
+    left: &ForInOfLeft,
+    scopes: &mut Vec<HashSet<String>>,
+    captured: &mut HashSet<String>,
+) {
+    match left {
+        ForInOfLeft::VarDecl(v) => find_captures_in_var_decl(v, scopes, captured),
+        ForInOfLeft::Pat(p) => find_captures_in_pat_exprs(p, scopes, captured),
+        ForInOfLeft::Expr(e) => find_captures_in_expr(e, scopes, captured),
+    }
+}
+
+fn find_captures_in_prop_key(
+    key: &PropKey,
+    scopes: &mut Vec<HashSet<String>>,
+    captured: &mut HashSet<String>,
+) {
+    if let PropKey::Computed(expr) = key {
+        find_captures_in_expr(expr, scopes, captured);
+    }
+}
+
+fn find_captures_in_pat_exprs(
+    pat: &Pat,
+    scopes: &mut Vec<HashSet<String>>,
+    captured: &mut HashSet<String>,
+) {
+    match pat {
+        Pat::Array(a) => {
+            for p in a.elements.iter().flatten() {
+                find_captures_in_pat_exprs(p, scopes, captured);
+            }
+        }
+        Pat::Object(o) => {
+            for prop in &o.properties {
+                match prop {
+                    ObjectPatProp::KeyValue(kv) => {
+                        find_captures_in_prop_key(&kv.key, scopes, captured);
+                        find_captures_in_pat_exprs(&kv.value, scopes, captured);
+                    }
+                    ObjectPatProp::Assign(a) => {
+                        if let Some(default) = &a.value {
+                            find_captures_in_expr(default, scopes, captured);
+                        }
+                    }
+                    ObjectPatProp::Rest(r) => {
+                        find_captures_in_pat_exprs(&r.argument, scopes, captured)
+                    }
+                }
+            }
+        }
+        Pat::Assign(a) => {
+            find_captures_in_pat_exprs(&a.left, scopes, captured);
+            find_captures_in_expr(&a.right, scopes, captured);
+        }
+        Pat::Rest(r) => find_captures_in_pat_exprs(&r.argument, scopes, captured),
+        Pat::Expr(e) => find_captures_in_expr(e, scopes, captured),
+        Pat::Ident(_) => {}
     }
 }
 

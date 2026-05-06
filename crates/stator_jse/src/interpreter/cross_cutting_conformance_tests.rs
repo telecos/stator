@@ -66,6 +66,27 @@ mod tests {
         assert_eval_true("typeof function(){} === 'function' && typeof (() => {}) === 'function'");
     }
 
+    #[test]
+    fn e2e_nested_function_declaration_captures_outer_local() {
+        assert_eval_true(
+            "function outer(){ let x = 41; function inner(){ return x + 1; } return inner(); } outer() === 42",
+        );
+    }
+
+    #[test]
+    fn e2e_function_declaration_default_parameter_captures_outer_local() {
+        assert_eval_true(
+            "function outer(){ let x = 41; function inner(a = x + 1){ return a; } return inner(); } outer() === 42",
+        );
+    }
+
+    #[test]
+    fn e2e_function_declaration_capture_ignores_unrelated_block_local() {
+        assert_eval_true(
+            "function outer(){ let x = 40; function inner(){ { let x = 1; } return x + 2; } return inner(); } outer() === 42",
+        );
+    }
+
     // ── 2. void operator ────────────────────────────────────────────────────
 
     #[test]

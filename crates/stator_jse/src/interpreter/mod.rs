@@ -1226,6 +1226,39 @@ pub fn maglev_deopt_categories() -> [u64; 6] {
     [0; 6]
 }
 
+/// Reset interpreter/JIT tiering diagnostics collected on this thread.
+pub fn reset_tiering_stats() {
+    JIT_COMPILATION_COUNT.with(|c| c.set(0));
+    JIT_CODE_BYTES.with(|c| c.set(0));
+    DIAG_BEST_JIT_ENTERED.with(|c| c.set(0));
+    DIAG_MAGLEV_HIT.with(|c| c.set(0));
+    DIAG_MAGLEV_MISS.with(|c| c.set(0));
+    DIAG_RUN_DISPATCH_ENTERED.with(|c| c.set(0));
+    DIAG_RUN_INNER_ENTERED.with(|c| c.set(0));
+    DIAG_MAGLEV_CACHE_EMPTY.with(|c| c.set(0));
+    DIAG_TURBOFAN_HIT.with(|c| c.set(0));
+    MAGLEV_COMPILATION_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    MAGLEV_CODE_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+    TURBOFAN_COMPILATION_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+    TURBOFAN_CODE_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+    crate::compiler::baseline::compiler::reset_stub_deopt_counts();
+    crate::compiler::baseline::compiler::reset_first_deopt_counts();
+    crate::compiler::baseline::compiler::reset_stub_call_counts();
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        MAGLEV_DIAG_TRIED.with(|c| c.set(0));
+        MAGLEV_DIAG_EXECUTED.with(|c| c.set(0));
+        MAGLEV_DIAG_DEOPTED.with(|c| c.set(0));
+        MAGLEV_DIAG_DEOPT_CATS.with(|c| c.set([0; 6]));
+        MAGLEV_DIAG_NOT_READY.with(|c| c.set(0));
+        MAGLEV_DIAG_GLOBAL_DEOPT.with(|c| c.set(0));
+        MAGLEV_DIAG_BLOCKED.with(|c| c.set(0));
+        MAGLEV_COMPILATION_STARTED.store(0, std::sync::atomic::Ordering::Relaxed);
+        MAGLEV_COMPILATION_FAILED.store(0, std::sync::atomic::Ordering::Relaxed);
+        MAGLEV_COMPILATION_PANICKED.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Return LICM diagnostic counters.
 ///
 /// Returns `(loops_detected, nodes_hoisted, named_generic_hoisted,

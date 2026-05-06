@@ -4211,11 +4211,7 @@ pub(crate) mod jit_runtime {
         // SAFETY: single-threaded JIT; no concurrent mutation.
         let cache_ref = unsafe { &*exec_cache.as_ptr() };
         if let Some(exec) = cache_ref.as_ref() {
-            let base = exec as *const JitExecutableCode as *const u8;
-            // SAFETY: first field (ptr) is at offset 0.
-            let entry = unsafe { *(base as *const usize) };
-            let slots = exec.register_file_slots;
-            (entry, slots)
+            (exec.entry_point() as usize, exec.register_file_slots)
         } else {
             (0, 0)
         }
@@ -5183,7 +5179,7 @@ pub(crate) mod jit_runtime {
 
         // Scoped heap borrow: extract the exec-cache pointer and context
         // info, then drop the heap borrow before calling JIT code.
-        let (exec_ptr, reg_file_slots, ba_ptr, callee_ctx_ptr) = {
+        let (entry_point, ba_ptr, callee_ctx_ptr) = {
             // SAFETY: single-threaded JIT; no concurrent heap mutation.
             let heap = unsafe { &*heap_ref.as_ptr() };
             let callee = match heap.get(idx) {
@@ -5225,12 +5221,7 @@ pub(crate) mod jit_runtime {
                     if let Some(maglev_exec) =
                         maglev_ref.as_ref().filter(|e| e.register_file_slots <= 16)
                     {
-                        // SAFETY: CachedMaglevCode layout matches
-                        // JitExecutableCode (ptr, size, register_file_slots).
-                        let exec_raw = maglev_exec
-                            as *const crate::compiler::maglev::codegen::CachedMaglevCode
-                            as *const JitExecutableCode;
-                        (exec_raw, maglev_exec.register_file_slots, ba_raw, ctx)
+                        (maglev_exec.entry_point() as usize, ba_raw, ctx)
                     } else {
                         // Fallback: try baseline JIT cache.
                         let exec_cache = ba.jit_executable_cache();
@@ -5240,8 +5231,7 @@ pub(crate) mod jit_runtime {
                         if let Some(exec) =
                             cache_ref.as_ref().filter(|e| e.register_file_slots <= 16)
                         {
-                            let exec_raw = exec as *const JitExecutableCode;
-                            (exec_raw, exec.register_file_slots, ba_raw, ctx)
+                            (exec.entry_point() as usize, ba_raw, ctx)
                         } else {
                             // ── Eager compile for inner closures ──
                             // Neither Maglev nor baseline cache has code.
@@ -5260,10 +5250,7 @@ pub(crate) mod jit_runtime {
                             if let Some(maglev_exec) =
                                 maglev_ref2.as_ref().filter(|e| e.register_file_slots <= 16)
                             {
-                                let exec_raw = maglev_exec
-                                    as *const crate::compiler::maglev::codegen::CachedMaglevCode
-                                    as *const JitExecutableCode;
-                                (exec_raw, maglev_exec.register_file_slots, ba_raw, ctx)
+                                (maglev_exec.entry_point() as usize, ba_raw, ctx)
                             } else if !ba_ref.jit_baseline_has_deopted() {
                                 // Maglev failed — fall back to eager baseline.
                                 if let Ok(cc) = BaselineCompiler::compile(ba_ref) {
@@ -5289,8 +5276,7 @@ pub(crate) mod jit_runtime {
                                                 .as_ref()
                                                 .filter(|e| e.register_file_slots <= 16)
                                             {
-                                                let exec_raw = exec as *const JitExecutableCode;
-                                                (exec_raw, exec.register_file_slots, ba_raw, ctx)
+                                                (exec.entry_point() as usize, ba_raw, ctx)
                                             } else {
                                                 return null_info;
                                             }
@@ -5361,35 +5347,6 @@ pub(crate) mod jit_runtime {
             heap_base,
             ctx_changed: !same_context,
         });
-
-        // Extract the raw function pointer from JitExecutableCode.
-        // SAFETY: `exec_raw` points to a valid `JitExecutableCode` whose
-        // first field is `ptr: *mut u8`.  We call `execute` with a
-        // pre-allocated register file to obtain the same function pointer.
-        // Instead, we compute the entry point by reading the struct's
-        // internal pointer.  JitExecutableCode has fields:
-        //   ptr: *mut u8, size: usize, register_file_slots: usize
-        // The public `register_file_slots` at a known offset lets us
-        // verify the layout assumption.
-        let entry_point = {
-            // SAFETY: exec_raw is alive (held by Rc in the heap).
-            let exec = unsafe { &*exec_ptr };
-            // The only way to obtain the code pointer is through the
-            // struct's memory layout.  JitExecutableCode is a plain
-            // struct with 3 pointer-sized fields in declaration order.
-            let base = exec as *const JitExecutableCode as *const u8;
-            // Validate: register_file_slots (3rd field) should be at
-            // offset 2 * size_of::<usize>().
-            let expected_offset = 2 * std::mem::size_of::<usize>();
-            // SAFETY: reading within the struct's allocation.
-            let slots_at_offset = unsafe { *(base.add(expected_offset) as *const usize) };
-            debug_assert_eq!(
-                slots_at_offset, reg_file_slots,
-                "JitExecutableCode layout assumption violated"
-            );
-            // SAFETY: first field (ptr) is at offset 0.
-            unsafe { *(base as *const usize) }
-        };
 
         if entry_point == 0 {
             // Undo TLS changes.

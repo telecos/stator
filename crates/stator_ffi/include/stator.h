@@ -235,6 +235,158 @@ typedef struct StatorCompilationStats {
 } StatorCompilationStats;
 
 /**
+ * Extended tiering diagnostics for embedders.
+ */
+typedef struct StatorTieringStats {
+  /**
+   * Number of functions compiled by the baseline JIT.
+   */
+  uint32_t baseline_function_count;
+  /**
+   * Total baseline JIT code bytes.
+   */
+  size_t baseline_code_bytes;
+  /**
+   * Number of functions compiled by Maglev.
+   */
+  uint32_t maglev_function_count;
+  /**
+   * Total Maglev code bytes.
+   */
+  size_t maglev_code_bytes;
+  /**
+   * Number of functions compiled by Turbofan.
+   */
+  uint32_t turbofan_function_count;
+  /**
+   * Total Turbofan code bytes.
+   */
+  size_t turbofan_code_bytes;
+  /**
+   * Number of entries into the best-available-JIT dispatch helper.
+   */
+  uint64_t best_jit_entries;
+  /**
+   * Number of best-JIT lookups that executed Maglev.
+   */
+  uint64_t maglev_hits;
+  /**
+   * Number of best-JIT lookups that missed Maglev.
+   */
+  uint64_t maglev_misses;
+  /**
+   * Number of raw Maglev execution attempts.
+   */
+  uint64_t maglev_tried;
+  /**
+   * Number of Maglev executions that completed without deopt.
+   */
+  uint64_t maglev_executed;
+  /**
+   * Number of Maglev executions that deopted.
+   */
+  uint64_t maglev_deopts;
+  /**
+   * Number of times Maglev code was requested before it was ready.
+   */
+  uint64_t maglev_not_ready;
+  /**
+   * Number of Maglev attempts blocked by deopt backoff.
+   */
+  uint64_t maglev_blocked;
+  /**
+   * Number of times the Maglev executable cache was empty.
+   */
+  uint64_t maglev_cache_empty;
+  /**
+   * Number of Maglev compilation jobs started.
+   */
+  uint32_t maglev_compile_started;
+  /**
+   * Number of Maglev compilation jobs that failed.
+   */
+  uint32_t maglev_compile_failed;
+  /**
+   * Number of Maglev compilation jobs that panicked.
+   */
+  uint32_t maglev_compile_panicked;
+  /**
+   * Number of best-JIT lookups intercepted by Turbofan.
+   */
+  uint64_t turbofan_hits;
+  /**
+   * Number of interpreter run-inner entries.
+   */
+  uint64_t run_inner_entries;
+  /**
+   * Number of dispatch-loop entries.
+   */
+  uint64_t run_dispatch_entries;
+  /**
+   * Maglev deopt counters by reason.
+   */
+  uint64_t maglev_deopt_counts[6];
+  /**
+   * Runtime-stub deopt counters by stub slot.
+   */
+  uint64_t stub_deopt_counts[24];
+  /**
+   * First-deopt-per-invocation counters by stub slot.
+   */
+  uint64_t stub_first_deopt_counts[24];
+  /**
+   * Runtime-stub call counters by stub slot.
+   */
+  uint64_t stub_call_counts[24];
+} StatorTieringStats;
+
+/**
+ * Per-script tiering state visible to embedders.
+ */
+typedef struct StatorScriptTierStatus {
+  /**
+   * Number of bytecode instructions in the script.
+   */
+  size_t bytecode_count;
+  /**
+   * Number of times the script/function has been invoked.
+   */
+  uint32_t invocation_count;
+  /**
+   * Whether baseline JIT code is cached.
+   */
+  bool baseline_jit_compiled;
+  /**
+   * Whether Maglev JIT code is cached.
+   */
+  bool maglev_jit_compiled;
+  /**
+   * Whether an executable Maglev entry is cached.
+   */
+  bool maglev_executable_cached;
+  /**
+   * Whether Maglev compilation has been attempted.
+   */
+  bool maglev_compile_attempted;
+  /**
+   * Number of Maglev deopts recorded for this script.
+   */
+  uint32_t maglev_deopt_count;
+  /**
+   * Invocation count at which Maglev may be retried.
+   */
+  uint32_t maglev_next_try_at;
+  /**
+   * Whether Turbofan JIT code is cached.
+   */
+  bool turbofan_jit_compiled;
+  /**
+   * Whether this script is blocked from JIT tier execution.
+   */
+  bool jit_disabled;
+} StatorScriptTierStatus;
+
+/**
  * C-callable native-function signature.
  *
  * The callback receives the active context, an array of `argc` argument
@@ -535,6 +687,50 @@ void stator_isolate_gc(struct StatorIsolate *isolate);
  */
 void stator_isolate_get_stats(const struct StatorIsolate *_isolate,
                               struct StatorCompilationStats *stats);
+
+/**
+ * Fill `*stats` with current tiering diagnostics.
+ *
+ * Does nothing when `stats` is null. Passing a null isolate is permitted and
+ * still returns process/thread counters.
+ *
+ * # Safety
+ * - `isolate` must be either null or a valid, live `StatorIsolate` pointer.
+ * - `stats` must be null or valid for writes.
+ */
+void stator_isolate_get_tiering_stats(const struct StatorIsolate *_isolate,
+                                      struct StatorTieringStats *stats);
+
+/**
+ * Reset tiering diagnostics visible through `stator_isolate_get_tiering_stats`.
+ *
+ * A null isolate is accepted; counters are thread/process diagnostics rather
+ * than heap-owned state.
+ *
+ * # Safety
+ * `isolate` must be null or a valid, live `StatorIsolate` pointer.
+ */
+void stator_isolate_reset_tiering_stats(struct StatorIsolate *_isolate);
+
+/**
+ * Enable or disable JIT tiers for scripts run in `isolate`.
+ *
+ * Does nothing when `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be null or a valid, live `StatorIsolate` pointer.
+ */
+void stator_isolate_set_jit_disabled(struct StatorIsolate *isolate, bool disabled);
+
+/**
+ * Return whether JIT tiers are disabled for `isolate`.
+ *
+ * Returns `false` when `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be null or a valid, live `StatorIsolate` pointer.
+ */
+bool stator_isolate_jit_disabled(const struct StatorIsolate *isolate);
 
 /**
  * Create a new context associated with `isolate`.
@@ -1229,6 +1425,28 @@ void stator_bytecode_dump(const struct StatorScript *script);
  * `script` must be either null or a valid, live [`StatorScript`] pointer.
  */
 size_t stator_script_bytecode_count(const struct StatorScript *script);
+
+/**
+ * Fill `*status` with tiering state for `script`.
+ *
+ * Returns `false` when either pointer is null or the script failed to compile.
+ *
+ * # Safety
+ * - `script` must be null or a valid, live `StatorScript` pointer.
+ * - `status` must be null or valid for writes.
+ */
+bool stator_script_get_tier_status(const struct StatorScript *script,
+                                   struct StatorScriptTierStatus *status);
+
+/**
+ * Synchronously force Maglev compilation for `script` when the platform supports it.
+ *
+ * Returns `false` for null/failed scripts and on unsupported platforms.
+ *
+ * # Safety
+ * `script` must be null or a valid, live `StatorScript` pointer.
+ */
+bool stator_script_force_maglev_compile(struct StatorScript *script);
 
 /**
  * Disable Maglev/Turbofan tier-up for a compiled script.

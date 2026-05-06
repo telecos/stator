@@ -19,7 +19,10 @@ use std::rc::Rc;
 use stator_jse::bytecode::bytecode_array::BytecodeArray;
 use stator_jse::bytecode::bytecode_generator::BytecodeGenerator;
 use stator_jse::bytecode::bytecodes::{Operand, decode};
-use stator_jse::compiler::baseline::compiler::{reset_first_deopt_counts, reset_stub_deopt_counts};
+use stator_jse::compiler::baseline::compiler::{
+    first_deopt_counts, reset_first_deopt_counts, reset_stub_deopt_counts, stub_call_counts,
+    stub_deopt_counts,
+};
 use stator_jse::dom::{
     DomObjectWrap, DomWeakRef, IndexedPropertyHandlerConfig, NamedPropertyHandlerConfig,
 };
@@ -59,6 +62,9 @@ pub struct StatorIsolate {
     /// no scope is currently open.  This forms a linked list via each scope's
     /// `previous` field.
     active_handle_scope: *mut StatorHandleScope,
+    /// When true, FFI script execution blocks Stator's JIT tiers for scripts
+    /// run in this isolate.
+    jit_disabled: bool,
 }
 
 // SAFETY: `StatorIsolate` contains raw pointer fields that are only ever
@@ -81,6 +87,7 @@ pub extern "C" fn stator_isolate_create() -> *mut StatorIsolate {
         current_context: std::ptr::null_mut(),
         pending_exception: None,
         active_handle_scope: std::ptr::null_mut(),
+        jit_disabled: false,
     }))
 }
 
@@ -349,6 +356,175 @@ pub unsafe extern "C" fn stator_isolate_get_stats(
         (*stats).jit_functions_compiled = count;
         (*stats).jit_code_bytes = bytes;
     }
+}
+
+/// Extended tiering diagnostics for embedders.
+#[repr(C)]
+pub struct StatorTieringStats {
+    /// Number of functions compiled by the baseline JIT.
+    pub baseline_function_count: u32,
+    /// Total baseline JIT code bytes.
+    pub baseline_code_bytes: usize,
+    /// Number of functions compiled by Maglev.
+    pub maglev_function_count: u32,
+    /// Total Maglev code bytes.
+    pub maglev_code_bytes: usize,
+    /// Number of functions compiled by Turbofan.
+    pub turbofan_function_count: u32,
+    /// Total Turbofan code bytes.
+    pub turbofan_code_bytes: usize,
+    /// Number of entries into the best-available-JIT dispatch helper.
+    pub best_jit_entries: u64,
+    /// Number of best-JIT lookups that executed Maglev.
+    pub maglev_hits: u64,
+    /// Number of best-JIT lookups that missed Maglev.
+    pub maglev_misses: u64,
+    /// Number of raw Maglev execution attempts.
+    pub maglev_tried: u64,
+    /// Number of Maglev executions that completed without deopt.
+    pub maglev_executed: u64,
+    /// Number of Maglev executions that deopted.
+    pub maglev_deopts: u64,
+    /// Number of times Maglev code was requested before it was ready.
+    pub maglev_not_ready: u64,
+    /// Number of Maglev attempts blocked by deopt backoff.
+    pub maglev_blocked: u64,
+    /// Number of times the Maglev executable cache was empty.
+    pub maglev_cache_empty: u64,
+    /// Number of Maglev compilation jobs started.
+    pub maglev_compile_started: u32,
+    /// Number of Maglev compilation jobs that failed.
+    pub maglev_compile_failed: u32,
+    /// Number of Maglev compilation jobs that panicked.
+    pub maglev_compile_panicked: u32,
+    /// Number of best-JIT lookups intercepted by Turbofan.
+    pub turbofan_hits: u64,
+    /// Number of interpreter run-inner entries.
+    pub run_inner_entries: u64,
+    /// Number of dispatch-loop entries.
+    pub run_dispatch_entries: u64,
+    /// Maglev deopt counters by reason.
+    pub maglev_deopt_counts: [u64; 6],
+    /// Runtime-stub deopt counters by stub slot.
+    pub stub_deopt_counts: [u64; 24],
+    /// First-deopt-per-invocation counters by stub slot.
+    pub stub_first_deopt_counts: [u64; 24],
+    /// Runtime-stub call counters by stub slot.
+    pub stub_call_counts: [u64; 24],
+}
+
+/// Fill `*stats` with current tiering diagnostics.
+///
+/// Does nothing when `stats` is null. Passing a null isolate is permitted and
+/// still returns process/thread counters.
+///
+/// # Safety
+/// - `isolate` must be either null or a valid, live `StatorIsolate` pointer.
+/// - `stats` must be null or valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_get_tiering_stats(
+    _isolate: *const StatorIsolate,
+    stats: *mut StatorTieringStats,
+) {
+    if stats.is_null() {
+        return;
+    }
+    let (baseline_function_count, baseline_code_bytes) = stator_jse::interpreter::jit_stats();
+    let (maglev_function_count, maglev_code_bytes) = stator_jse::interpreter::maglev_stats();
+    let (turbofan_function_count, turbofan_code_bytes) = stator_jse::interpreter::turbofan_stats();
+    let (best_jit_entries, maglev_hits, maglev_misses) =
+        stator_jse::interpreter::jit_entry_diagnostics();
+    let (run_inner_entries, run_dispatch_entries) =
+        stator_jse::interpreter::dispatch_entry_diagnostics();
+    let (
+        maglev_tried,
+        maglev_executed,
+        maglev_deopts,
+        maglev_not_ready,
+        _maglev_compilations,
+        _maglev_bytes,
+        maglev_compile_started,
+        maglev_compile_failed,
+        maglev_compile_panicked,
+        maglev_blocked,
+        maglev_cache_empty,
+        turbofan_hits,
+    ) = stator_jse::interpreter::maglev_diagnostics();
+
+    // SAFETY: caller provided a valid output pointer.
+    unsafe {
+        *stats = StatorTieringStats {
+            baseline_function_count,
+            baseline_code_bytes,
+            maglev_function_count,
+            maglev_code_bytes,
+            turbofan_function_count,
+            turbofan_code_bytes,
+            best_jit_entries,
+            maglev_hits,
+            maglev_misses,
+            maglev_tried,
+            maglev_executed,
+            maglev_deopts,
+            maglev_not_ready,
+            maglev_blocked,
+            maglev_cache_empty,
+            maglev_compile_started,
+            maglev_compile_failed,
+            maglev_compile_panicked,
+            turbofan_hits,
+            run_inner_entries,
+            run_dispatch_entries,
+            maglev_deopt_counts: stator_jse::interpreter::maglev_deopt_categories(),
+            stub_deopt_counts: stub_deopt_counts(),
+            stub_first_deopt_counts: first_deopt_counts(),
+            stub_call_counts: stub_call_counts(),
+        };
+    }
+}
+
+/// Reset tiering diagnostics visible through `stator_isolate_get_tiering_stats`.
+///
+/// A null isolate is accepted; counters are thread/process diagnostics rather
+/// than heap-owned state.
+///
+/// # Safety
+/// `isolate` must be null or a valid, live `StatorIsolate` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_reset_tiering_stats(_isolate: *mut StatorIsolate) {
+    stator_jse::interpreter::reset_tiering_stats();
+}
+
+/// Enable or disable JIT tiers for scripts run in `isolate`.
+///
+/// Does nothing when `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be null or a valid, live `StatorIsolate` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_set_jit_disabled(
+    isolate: *mut StatorIsolate,
+    disabled: bool,
+) {
+    if !isolate.is_null() {
+        // SAFETY: caller guarantees `isolate` is valid.
+        unsafe { (*isolate).jit_disabled = disabled };
+    }
+}
+
+/// Return whether JIT tiers are disabled for `isolate`.
+///
+/// Returns `false` when `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be null or a valid, live `StatorIsolate` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_jit_disabled(isolate: *const StatorIsolate) -> bool {
+    if isolate.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe { (*isolate).jit_disabled }
 }
 
 // ── Context ──────────────────────────────────────────────────────────────────
@@ -1975,6 +2151,96 @@ pub unsafe extern "C" fn stator_script_bytecode_count(script: *const StatorScrip
         .unwrap_or(0)
 }
 
+/// Per-script tiering state visible to embedders.
+#[repr(C)]
+pub struct StatorScriptTierStatus {
+    /// Number of bytecode instructions in the script.
+    pub bytecode_count: usize,
+    /// Number of times the script/function has been invoked.
+    pub invocation_count: u32,
+    /// Whether baseline JIT code is cached.
+    pub baseline_jit_compiled: bool,
+    /// Whether Maglev JIT code is cached.
+    pub maglev_jit_compiled: bool,
+    /// Whether an executable Maglev entry is cached.
+    pub maglev_executable_cached: bool,
+    /// Whether Maglev compilation has been attempted.
+    pub maglev_compile_attempted: bool,
+    /// Number of Maglev deopts recorded for this script.
+    pub maglev_deopt_count: u32,
+    /// Invocation count at which Maglev may be retried.
+    pub maglev_next_try_at: u32,
+    /// Whether Turbofan JIT code is cached.
+    pub turbofan_jit_compiled: bool,
+    /// Whether this script is blocked from JIT tier execution.
+    pub jit_disabled: bool,
+}
+
+/// Fill `*status` with tiering state for `script`.
+///
+/// Returns `false` when either pointer is null or the script failed to compile.
+///
+/// # Safety
+/// - `script` must be null or a valid, live `StatorScript` pointer.
+/// - `status` must be null or valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_get_tier_status(
+    script: *const StatorScript,
+    status: *mut StatorScriptTierStatus,
+) -> bool {
+    if script.is_null() || status.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `script` is valid.
+    let bytecodes = match unsafe { &(*script).bytecodes } {
+        Some(b) => b,
+        None => return false,
+    };
+    // SAFETY: caller provided a valid output pointer.
+    unsafe {
+        *status = StatorScriptTierStatus {
+            bytecode_count: bytecodes.bytecode_count(),
+            invocation_count: bytecodes.invocation_count(),
+            baseline_jit_compiled: bytecodes.has_baseline_jit_code(),
+            maglev_jit_compiled: bytecodes.has_maglev_jit_code(),
+            maglev_executable_cached: bytecodes.has_maglev_executable_cached(),
+            maglev_compile_attempted: bytecodes.maglev_compile_attempted(),
+            maglev_deopt_count: bytecodes.maglev_deopt_count(),
+            maglev_next_try_at: bytecodes.maglev_next_try_at(),
+            turbofan_jit_compiled: bytecodes.has_turbofan_jit_code(),
+            jit_disabled: bytecodes.jit_disabled(),
+        };
+    }
+    true
+}
+
+/// Synchronously force Maglev compilation for `script` when the platform supports it.
+///
+/// Returns `false` for null/failed scripts and on unsupported platforms.
+///
+/// # Safety
+/// `script` must be null or a valid, live `StatorScript` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_force_maglev_compile(script: *mut StatorScript) -> bool {
+    if script.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `script` is valid.
+    let bytecodes = match unsafe { &(*script).bytecodes } {
+        Some(b) => b,
+        None => return false,
+    };
+    #[cfg(all(target_arch = "x86_64", unix))]
+    {
+        stator_jse::interpreter::compile_maglev_sync(bytecodes)
+    }
+    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    {
+        let _ = bytecodes;
+        false
+    }
+}
+
 /// Disable Maglev/Turbofan tier-up for a compiled script.
 ///
 /// This is intended for embedders that need deterministic interpreter
@@ -1989,7 +2255,7 @@ pub unsafe extern "C" fn stator_script_disable_jit(script: *mut StatorScript) {
     }
     // SAFETY: caller guarantees `script` is valid.
     if let Some(bytecodes) = unsafe { &(*script).bytecodes } {
-        bytecodes.set_maglev_next_try_at(u32::MAX);
+        bytecodes.set_jit_disabled(true);
     }
 }
 
@@ -2054,6 +2320,16 @@ unsafe fn run_script_inner(
         Some(b) => b,
         None => return None,
     };
+    if !ctx.is_null() {
+        // SAFETY: caller guarantees `ctx` is valid.
+        let isolate = unsafe { (*ctx)._isolate };
+        if !isolate.is_null() {
+            // SAFETY: context owns a live isolate pointer by construction.
+            if unsafe { (*isolate).jit_disabled } {
+                bytecodes.set_jit_disabled(true);
+            }
+        }
+    }
 
     let owned_global_env;
     let global_env = if !ctx.is_null() {
@@ -2085,6 +2361,16 @@ unsafe fn run_script_no_result_inner(
         Some(b) => b,
         None => return None,
     };
+    if !ctx.is_null() {
+        // SAFETY: caller guarantees `ctx` is valid.
+        let isolate = unsafe { (*ctx)._isolate };
+        if !isolate.is_null() {
+            // SAFETY: context owns a live isolate pointer by construction.
+            if unsafe { (*isolate).jit_disabled } {
+                bytecodes.set_jit_disabled(true);
+            }
+        }
+    }
 
     let owned_global_env;
     let global_env = if !ctx.is_null() {
@@ -5887,6 +6173,70 @@ mod tests {
         // SAFETY: `script` is non-null and live.
         let count = unsafe { stator_script_bytecode_count(script) };
         assert_eq!(count, 0, "expected 0 bytecodes on error");
+        // SAFETY: `script` is non-null and live.
+        unsafe { stator_script_free(script) };
+    }
+
+    #[test]
+    fn test_tiering_stats_null_safety() {
+        // SAFETY: null output is documented as a no-op.
+        unsafe { stator_isolate_get_tiering_stats(std::ptr::null(), std::ptr::null_mut()) };
+        // SAFETY: null isolate is accepted and `stats` is valid for writes.
+        let mut stats = unsafe { std::mem::zeroed::<StatorTieringStats>() };
+        unsafe { stator_isolate_get_tiering_stats(std::ptr::null(), &mut stats) };
+        // SAFETY: null isolate is accepted for resetting process/thread diagnostics.
+        unsafe { stator_isolate_reset_tiering_stats(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn test_isolate_jit_disabled_controls_are_null_safe() {
+        // SAFETY: null isolate is documented as a no-op.
+        unsafe { stator_isolate_set_jit_disabled(std::ptr::null_mut(), true) };
+        // SAFETY: null isolate returns false.
+        assert!(!unsafe { stator_isolate_jit_disabled(std::ptr::null()) });
+
+        let isolate = stator_isolate_create();
+        assert!(!isolate.is_null());
+        // SAFETY: `isolate` is non-null and live.
+        assert!(!unsafe { stator_isolate_jit_disabled(isolate) });
+        // SAFETY: `isolate` is non-null and live.
+        unsafe { stator_isolate_set_jit_disabled(isolate, true) };
+        // SAFETY: `isolate` is non-null and live.
+        assert!(unsafe { stator_isolate_jit_disabled(isolate) });
+        // SAFETY: `isolate` is non-null and live.
+        unsafe { stator_isolate_destroy(isolate) };
+    }
+
+    #[test]
+    fn test_script_tier_status_null_safety_and_success() {
+        let mut status = unsafe { std::mem::zeroed::<StatorScriptTierStatus>() };
+        // SAFETY: null script is accepted and returns false.
+        assert!(!unsafe { stator_script_get_tier_status(std::ptr::null(), &mut status) });
+
+        let script = compile_src("function f(){ return 1; } f();");
+        // SAFETY: `script` is non-null and live.
+        assert!(unsafe { stator_script_get_tier_status(script, &mut status) });
+        assert!(status.bytecode_count > 0);
+        // SAFETY: null output is accepted and returns false.
+        assert!(!unsafe { stator_script_get_tier_status(script, std::ptr::null_mut()) });
+        // SAFETY: `script` is non-null and live.
+        unsafe { stator_script_free(script) };
+    }
+
+    #[test]
+    fn test_script_force_maglev_compile_null_safe() {
+        // SAFETY: null script is accepted and returns false.
+        assert!(!unsafe { stator_script_force_maglev_compile(std::ptr::null_mut()) });
+
+        let script = compile_src("function f(){ return 1; } f();");
+        // SAFETY: `script` is non-null and live. Unsupported platforms return false.
+        let forced = unsafe { stator_script_force_maglev_compile(script) };
+        #[cfg(not(all(target_arch = "x86_64", unix)))]
+        assert!(!forced);
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            let _ = forced;
+        }
         // SAFETY: `script` is non-null and live.
         unsafe { stator_script_free(script) };
     }

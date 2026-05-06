@@ -962,24 +962,20 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.push(Reg64::R13);
         self.masm.push(Reg64::R12);
         self.masm.push(Reg64::R15);
-        // After 6 pushes (+ return-address by `call` = 7 total):
-        // RSP ≡ 8 mod 16.  Stub calls use selective save (with
-        // alignment padding when needed) to align RSP to 0 mod 16
-        // before the inner `call`.
-
         // Save the register-file pointer (RDI) into R14 immediately,
-        // BEFORE any function calls that would clobber caller-saved
-        // registers (RDI is caller-saved in SysV ABI).
+        // BEFORE any function calls that would clobber caller-saved registers.
         self.masm.mov_rr(Reg64::R14, Reg64::Rdi);
 
         // Cache the closure-context raw pointer (RSI) in a reserved
-        // register-file slot BEFORE any calls that might clobber RSI.
+        // register-file slot BEFORE any calls that might clobber it.
         // R14 now holds the register-file pointer.
         #[cfg(all(target_arch = "x86_64", unix))]
         if let Some(offset) = self.ctx_regfile_offset {
             self.masm
                 .mov_store_base_disp32(Reg64::R14, offset, Reg64::Rsi);
         }
+        #[cfg(not(all(target_arch = "x86_64", unix)))]
+        let _ = self.ctx_regfile_offset;
 
         // When the function has direct calls or keyed array accesses,
         // cache the RT_PTRS TLS Cell address in R15 to avoid per-call

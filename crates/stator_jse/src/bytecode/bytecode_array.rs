@@ -213,6 +213,11 @@ impl JitExecutableCode {
         })
     }
 
+    /// Returns the raw entry-point pointer of the compiled baseline code.
+    pub fn entry_point(&self) -> *const u8 {
+        self.mem.as_ptr()
+    }
+
     /// Execute the cached JIT code with the given register-file arguments.
     ///
     /// # Safety
