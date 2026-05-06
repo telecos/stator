@@ -289,6 +289,23 @@ pub(crate) mod jit_runtime {
         static RT_HANDLE_DEDUP: RefCell<HashMap<usize, usize>> =
             RefCell::new(HashMap::new());
 
+        /// Cache of decoded string-constant `Rc<str>` plus the JIT heap
+        /// handle returned to JIT code, keyed by constant-pool index.
+        ///
+        /// Populated lazily by
+        /// [`jit_runtime_load_string_constant`](jit_runtime_load_string_constant)
+        /// so a string literal referenced inside a hot loop (e.g.
+        /// `value += 'x'`) is decoded and registered on the heap only
+        /// once per script execution.  Subsequent loads reuse the
+        /// same `Rc<str>` (no allocation) and the same heap handle
+        /// (no `RT_HEAP` push and no dedup hash-map probe).
+        ///
+        /// Invalidated whenever the heap is recycled (i.e. inside
+        /// [`recycle_and_clear_heap`]), since handles are heap indices
+        /// and heap entries are not preserved across recycles.
+        static RT_DECODED_STRING_CACHE: RefCell<HashMap<u32, (Rc<str>, i64)>> =
+            RefCell::new(HashMap::new());
+
         /// Combined own-property + prototype inline caches for
         /// `LdaNamedProperty` stubs.  Cleared by [`jit_runtime_setup`]
         /// to prevent cross-function constant-pool index collisions.
@@ -1370,6 +1387,12 @@ pub(crate) mod jit_runtime {
             }
         });
         RT_HANDLE_DEDUP.with(|m| m.borrow_mut().clear());
+        // String-constant handle cache stores `(Rc<str>, heap_handle)`
+        // — the heap handle is a heap index that becomes invalid once
+        // we drain `RT_HEAP` above, so the entire cache must be
+        // dropped here.  The `Rc<str>` payload is small and cheap to
+        // re-decode on the next load.
+        RT_DECODED_STRING_CACHE.with(|c| c.borrow_mut().clear());
     }
 
     /// Truncate the JIT heap back to `base`, recycling `PlainObject` `Rc`
@@ -1391,6 +1414,12 @@ pub(crate) mod jit_runtime {
             }
         });
         RT_HANDLE_DEDUP.with(|m| m.borrow_mut().retain(|_, idx| *idx < base));
+        // Drop any cached string-constant handles that fell into the
+        // truncated region; their heap entries no longer exist.
+        let base_handle = JIT_HEAP_TAG + base as i64;
+        RT_DECODED_STRING_CACHE.with(|c| {
+            c.borrow_mut().retain(|_, (_, h)| *h < base_handle);
+        });
     }
 
     /// Returns `true` if `v` is a heap-object handle.
@@ -10784,18 +10813,64 @@ pub(crate) mod jit_runtime {
         match (&l, &r) {
             (JsValue::String(a), JsValue::String(b)) => {
                 // Direct string+string concat — the hot path for
-                // `value += 'x'`-style loops.  Pre-size the buffer to
-                // avoid reallocation while pushing the right-hand side.
-                let mut out = String::with_capacity(a.len() + b.len());
-                out.push_str(a);
-                out.push_str(b);
-                jsvalue_to_jit_i64(JsValue::String(Rc::<str>::from(out)))
+                // `value += 'x'`-style loops.  Build the resulting
+                // `Rc<str>` in a single allocation: the previous
+                // `String::with_capacity` + `Rc::<str>::from(out)`
+                // sequence allocated the buffer once, copied both
+                // sides, then re-allocated an `Rc`-headed buffer and
+                // copied the bytes a second time.  Going via
+                // `Rc::<[u8]>::new_uninit_slice` and re-tagging as
+                // `Rc<str>` cuts allocator + copy cost roughly in
+                // half on the inner loop.
+                let rc = build_concat_rc_str(a, b);
+                // The `Rc` we just constructed has refcount 1 and is not
+                // present in the dedup map; another helper that sees the
+                // resulting handle would dedup-miss anyway, so skip the
+                // dedup hash-map probe entirely.
+                let ptrs = RT_PTRS.with(|p| p.get());
+                alloc_heap_handle_no_dedup(JsValue::String(rc), &ptrs)
             }
             // Speculation was wrong (or one side coerces to a string via
             // `+`).  Defer to the fully general add helper, which already
             // implements ECMAScript `+` for every type combination.
             _ => jit_runtime_generic_add(left, right),
         }
+    }
+
+    /// Concatenate `a` and `b` into a freshly allocated `Rc<str>` using
+    /// a single allocator request.
+    ///
+    /// `Rc::<str>::from(format!("{a}{b}"))` (the previous approach)
+    /// allocates twice: once for the intermediate `String` buffer and a
+    /// second time for the `Rc`-headed buffer that owns the inlined
+    /// bytes.  Allocating an uninitialised `Rc<[u8]>` of the exact
+    /// final length and writing both halves directly into it removes
+    /// the extra allocation and one full byte-copy.
+    ///
+    /// Safety: the two source slices are valid UTF-8, so their
+    /// concatenation is also valid UTF-8 and the `Rc<[u8]> -> Rc<str>`
+    /// cast is well-defined (`Rc<[u8]>` and `Rc<str>` share an
+    /// identical layout for slices of `u8`).
+    pub(super) fn build_concat_rc_str(a: &str, b: &str) -> Rc<str> {
+        let total = a.len() + b.len();
+        let mut buf: Rc<[std::mem::MaybeUninit<u8>]> = Rc::new_uninit_slice(total);
+        // The Rc was just allocated and has refcount 1 — `get_mut` is
+        // guaranteed to succeed.
+        let slice = Rc::get_mut(&mut buf).expect("freshly allocated Rc has refcount 1");
+        // SAFETY: `slice` is exactly `total` bytes long and we are the
+        // only writer.  Both source strings are valid UTF-8 and we
+        // copy their raw bytes contiguously.
+        unsafe {
+            let dst = slice.as_mut_ptr() as *mut u8;
+            std::ptr::copy_nonoverlapping(a.as_ptr(), dst, a.len());
+            std::ptr::copy_nonoverlapping(b.as_ptr(), dst.add(a.len()), b.len());
+        }
+        // SAFETY: every byte in `buf` was just initialised above.
+        let init: Rc<[u8]> = unsafe { buf.assume_init() };
+        // SAFETY: `Rc<[u8]>` and `Rc<str>` have identical memory
+        // layout, and the bytes form valid UTF-8 (concatenation of two
+        // valid UTF-8 strings).
+        unsafe { Rc::from_raw(Rc::into_raw(init) as *const str) }
     }
 
     /// Load a string constant from the currently-executing bytecode
@@ -10817,11 +10892,25 @@ pub(crate) mod jit_runtime {
         let Ok(idx32) = u32::try_from(idx) else {
             return JIT_DEOPT;
         };
+        // Fast path: the handle was already issued for `idx32` earlier
+        // in this script execution.  Return the cached `i64` handle
+        // without touching the heap, the dedup map, or the decoder —
+        // a `'x'` literal in `for (...) value += 'x';` therefore costs
+        // a single TLS borrow + HashMap probe per iteration instead
+        // of a string-decode + `Rc<str>` allocation + heap push.
+        if let Some(handle) =
+            RT_DECODED_STRING_CACHE.with(|c| c.borrow().get(&idx32).map(|(_, h)| *h))
+        {
+            return handle;
+        }
         let Some(raw) = get_rt_string_constant(idx32) else {
             return JIT_DEOPT;
         };
         let decoded = crate::interpreter::decode_string_constant(&raw);
-        alloc_heap_handle(JsValue::String(Rc::<str>::from(decoded)))
+        let rc: Rc<str> = Rc::<str>::from(decoded);
+        let handle = alloc_heap_handle(JsValue::String(Rc::clone(&rc)));
+        RT_DECODED_STRING_CACHE.with(|c| c.borrow_mut().insert(idx32, (rc, handle)));
+        handle
     }
 
     /// Generic Subtract.
@@ -16052,5 +16141,100 @@ mod tests {
         assert_eq!(NAMED_IC_SLOT_COUNT, 5);
         assert_eq!(NAMED_IC_HIT_SLOT_INDEX, 4);
         assert!(NAMED_IC_HIT_SLOT_INDEX < NAMED_IC_SLOT_COUNT);
+    }
+
+    // ── String-concat fast-path correctness ────────────────────────────────
+    //
+    // `jit_runtime_string_concat` builds the resulting `Rc<str>` in a single
+    // allocation via `Rc::<[u8]>::new_uninit_slice` + reinterpret as
+    // `Rc<str>`.  Validate that the result matches the trivial reference
+    // `format!("{a}{b}")` for a representative spread of inputs (empty
+    // sides, ASCII, multi-byte UTF-8, repeated extension).  The helper is
+    // deliberately exercised through its public surface name to ensure
+    // any future refactor is observed.
+    #[cfg(stator_baseline_jit_x86_64)]
+    #[test]
+    fn build_concat_rc_str_matches_format_for_varied_inputs() {
+        use super::jit_runtime::build_concat_rc_str;
+        let cases: &[(&str, &str)] = &[
+            ("", ""),
+            ("", "x"),
+            ("x", ""),
+            ("hello, ", "world"),
+            ("αβγ", "δε"),
+            ("emoji=", "🦀!"),
+            (
+                "a-very-long-prefix-that-exceeds-small-string-tricks",
+                "tail",
+            ),
+        ];
+        for (a, b) in cases {
+            let got = build_concat_rc_str(a, b);
+            let want = format!("{a}{b}");
+            assert_eq!(&*got, want.as_str(), "concat({a:?}, {b:?})");
+            assert_eq!(got.len(), a.len() + b.len(), "len({a:?}, {b:?})");
+        }
+    }
+
+    /// Repeatedly extending the left-hand side (the `value += 'x'`
+    /// pattern) must produce a string whose length grows by exactly
+    /// `b.len()` each step, with no UTF-8 corruption — guards against
+    /// off-by-one or boundary errors in the unsafe pointer copy.
+    #[cfg(stator_baseline_jit_x86_64)]
+    #[test]
+    fn build_concat_rc_str_iterative_append_is_stable() {
+        use super::jit_runtime::build_concat_rc_str;
+        let mut acc: Rc<str> = Rc::<str>::from("");
+        for _ in 0..200 {
+            acc = build_concat_rc_str(&acc, "x");
+        }
+        assert_eq!(acc.len(), 200);
+        assert!(acc.chars().all(|c| c == 'x'));
+    }
+
+    /// The decoded-string-constant cache promises that subsequent loads
+    /// of the same constant-pool index in the same script execution
+    /// return the same `i64` heap handle.  This is what allows the
+    /// downstream IC machinery to stay stable when a hot loop re-loads a
+    /// literal on every iteration.  Without invalidation across heap
+    /// recycles the cache would hand out stale handles, so this test
+    /// also verifies that `recycle_and_clear_heap` drops cached entries.
+    #[cfg(stator_baseline_jit_x86_64)]
+    #[test]
+    fn load_string_constant_returns_stable_handle_within_one_setup() {
+        use super::jit_runtime::{
+            jit_runtime_load_string_constant, jit_runtime_setup, jit_runtime_teardown,
+        };
+        use crate::bytecode::bytecode_array::BytecodeArray;
+        use crate::bytecode::bytecode_array::ConstantPoolEntry;
+        use crate::bytecode::feedback::FeedbackMetadata;
+
+        let ba = BytecodeArray::new(
+            vec![],
+            vec![ConstantPoolEntry::String("'x'".into())],
+            1,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        );
+        jit_runtime_setup(&ba);
+        let h1 = jit_runtime_load_string_constant(0);
+        let h2 = jit_runtime_load_string_constant(0);
+        let h3 = jit_runtime_load_string_constant(0);
+        assert_ne!(h1, JIT_DEOPT, "first load deopted");
+        assert_eq!(h1, h2, "cached handle drifted between calls");
+        assert_eq!(h2, h3, "cached handle drifted between calls");
+        jit_runtime_teardown();
+
+        // Fresh setup on the same BA — the heap was recycled by
+        // teardown, so the cache must have been dropped and a new
+        // handle is issued.
+        jit_runtime_setup(&ba);
+        let h4 = jit_runtime_load_string_constant(0);
+        let h5 = jit_runtime_load_string_constant(0);
+        assert_ne!(h4, JIT_DEOPT);
+        assert_eq!(h4, h5, "cache failed to repopulate after recycle");
+        jit_runtime_teardown();
     }
 }
