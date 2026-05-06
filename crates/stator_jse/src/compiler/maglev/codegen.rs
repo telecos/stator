@@ -1003,14 +1003,12 @@ impl<'a> MaglevCodegen<'a> {
         // When the function has direct calls or keyed array accesses,
         // cache the RT_PTRS TLS Cell address in R15 to avoid per-call
         // TLS lookups.
-        // RSP ≡ 8 mod 16 here; push R11 to align to 0 mod 16 before
-        // call, so callee sees RSP ≡ 8 mod 16 per SysV ABI.
+        // RSP ≡ 8 mod 16 here; push R11 to align before the helper call.
         #[cfg(all(target_arch = "x86_64", unix))]
         if self.needs_r15 {
             self.masm.push(Reg64::R11); // alignment padding
             let addr = jit_runtime::jit_runtime_get_rt_ptrs_cell_addr as *const () as i64;
-            self.masm.mov_ri(Reg64::R11, addr);
-            self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_addr(addr);
             self.masm.mov_rr(Reg64::R15, Reg64::Rax);
             self.masm.pop(Reg64::R11); // restore alignment
         }
@@ -1985,24 +1983,21 @@ impl<'a> MaglevCodegen<'a> {
                     }
                 } else {
                     let saved = self.emit_save_live_regs(id);
-                    self.masm.mov_ri(Reg64::Rdi, i64::from(*name));
+                    self.emit_helper_arg_imm(0, i64::from(*name));
                     // When R15 is available, use the fast stub that takes
                     // the global-state pointer directly from [R15+offset],
                     // avoiding TLS lookup + Cell::get overhead.
-                    if self.needs_r15 {
+                    let addr = if self.needs_r15 {
                         self.masm.mov_load_base_disp32(
-                            Reg64::Rsi,
+                            Self::helper_arg_reg(1),
                             Reg64::R15,
                             jit_runtime::RT_PTRS_GLOBAL_OFFSET,
                         );
-                        let addr =
-                            jit_runtime::jit_runtime_lda_global_fast as *const () as usize as i64;
-                        self.masm.mov_ri(Reg64::R11, addr);
+                        jit_runtime::jit_runtime_lda_global_fast as *const () as usize as i64
                     } else {
-                        let addr = jit_runtime::jit_runtime_lda_global as *const () as usize as i64;
-                        self.masm.mov_ri(Reg64::R11, addr);
-                    }
-                    self.masm.call_reg(Reg64::R11);
+                        jit_runtime::jit_runtime_lda_global as *const () as usize as i64
+                    };
+                    self.emit_helper_call_addr(addr);
                     self.emit_restore_live_regs(saved);
                     self.emit_deopt_check_rax();
                     // Speculative Smi guard for non-promoted globals that
@@ -2044,29 +2039,27 @@ impl<'a> MaglevCodegen<'a> {
                     }
                 } else {
                     let saved = self.emit_save_live_regs(id);
-                    self.masm.mov_ri(Reg64::Rdi, i64::from(*name));
-                    self.emit_load(*value, Reg64::Rsi);
+                    self.emit_helper_arg_imm(0, i64::from(*name));
+                    let value_arg = Self::helper_arg_reg(1);
+                    self.emit_load(*value, value_arg);
                     // Sign-extend narrow values for the runtime stub.
                     if self.narrow_int32.contains(value) {
-                        self.masm.movsxd_sign_extend(Reg64::Rsi, Reg64::Rsi);
+                        self.masm.movsxd_sign_extend(value_arg, value_arg);
                     }
                     // When R15 is available, use the fast stub that takes
                     // the global-state pointer directly from [R15+offset],
                     // avoiding TLS lookup + Cell::get overhead.
-                    if self.needs_r15 {
+                    let addr = if self.needs_r15 {
                         self.masm.mov_load_base_disp32(
-                            Reg64::Rdx,
+                            Self::helper_arg_reg(2),
                             Reg64::R15,
                             jit_runtime::RT_PTRS_GLOBAL_OFFSET,
                         );
-                        let addr =
-                            jit_runtime::jit_runtime_sta_global_fast as *const () as usize as i64;
-                        self.masm.mov_ri(Reg64::R11, addr);
+                        jit_runtime::jit_runtime_sta_global_fast as *const () as usize as i64
                     } else {
-                        let addr = jit_runtime::jit_runtime_sta_global as *const () as usize as i64;
-                        self.masm.mov_ri(Reg64::R11, addr);
-                    }
-                    self.masm.call_reg(Reg64::R11);
+                        jit_runtime::jit_runtime_sta_global as *const () as usize as i64
+                    };
+                    self.emit_helper_call_addr(addr);
                     self.emit_restore_live_regs(saved);
                     self.emit_deopt_check_rax();
                     self.emit_store(id, Reg64::Rax);
@@ -2220,12 +2213,11 @@ impl<'a> MaglevCodegen<'a> {
                     self.masm.bind_label(&mut slow_label);
                     let saved = self.emit_save_live_regs(id);
                     self.masm
-                        .mov_load_base_disp32(Reg64::Rdi, Reg64::R14, ctx_off);
-                    self.masm.mov_ri(Reg64::Rsi, i64::from(*slot));
+                        .mov_load_base_disp32(Self::helper_arg_reg(0), Reg64::R14, ctx_off);
+                    self.emit_helper_arg_imm(1, i64::from(*slot));
                     let addr = jit_runtime::jit_runtime_lda_context_slot_direct as *const ()
                         as usize as i64;
-                    self.masm.mov_ri(Reg64::R11, addr);
-                    self.masm.call_reg(Reg64::R11);
+                    self.emit_helper_call_addr(addr);
                     self.emit_restore_live_regs(saved);
                     self.emit_deopt_check_rax();
 
@@ -2235,11 +2227,10 @@ impl<'a> MaglevCodegen<'a> {
                 } else {
                     // No cached context pointer: use TLS-based stub.
                     let saved = self.emit_save_live_regs(id);
-                    self.masm.mov_ri(Reg64::Rdi, i64::from(*slot));
+                    self.emit_helper_arg_imm(0, i64::from(*slot));
                     let addr =
                         jit_runtime::jit_runtime_lda_context_slot as *const () as usize as i64;
-                    self.masm.mov_ri(Reg64::R11, addr);
-                    self.masm.call_reg(Reg64::R11);
+                    self.emit_helper_call_addr(addr);
                     self.emit_restore_live_regs(saved);
                     self.emit_deopt_check_rax();
                     self.masm.mov_rr(Reg64::R11, Reg64::Rax);
@@ -2332,13 +2323,12 @@ impl<'a> MaglevCodegen<'a> {
                     self.masm.bind_label(&mut slow_label);
                     let saved = self.emit_save_live_regs(id);
                     self.masm
-                        .mov_load_base_disp32(Reg64::Rdi, Reg64::R14, ctx_off);
-                    self.masm.mov_ri(Reg64::Rsi, i64::from(*slot));
-                    self.emit_load(*value, Reg64::Rdx);
+                        .mov_load_base_disp32(Self::helper_arg_reg(0), Reg64::R14, ctx_off);
+                    self.emit_helper_arg_imm(1, i64::from(*slot));
+                    self.emit_load(*value, Self::helper_arg_reg(2));
                     let addr = jit_runtime::jit_runtime_sta_context_slot_direct as *const ()
                         as usize as i64;
-                    self.masm.mov_ri(Reg64::R11, addr);
-                    self.masm.call_reg(Reg64::R11);
+                    self.emit_helper_call_addr(addr);
                     self.emit_restore_live_regs(saved);
                     self.emit_deopt_check_rax();
 
@@ -2348,12 +2338,11 @@ impl<'a> MaglevCodegen<'a> {
                 } else {
                     // No cached context pointer: use TLS-based stub.
                     let saved = self.emit_save_live_regs(id);
-                    self.masm.mov_ri(Reg64::Rdi, i64::from(*slot));
-                    self.emit_load(*value, Reg64::Rsi);
+                    self.emit_helper_arg_imm(0, i64::from(*slot));
+                    self.emit_load(*value, Self::helper_arg_reg(1));
                     let addr =
                         jit_runtime::jit_runtime_sta_context_slot as *const () as usize as i64;
-                    self.masm.mov_ri(Reg64::R11, addr);
-                    self.masm.call_reg(Reg64::R11);
+                    self.emit_helper_call_addr(addr);
                     self.emit_restore_live_regs(saved);
                     self.emit_deopt_check_rax();
                     self.masm.mov_rr(Reg64::R11, Reg64::Rax);
@@ -2513,10 +2502,9 @@ impl<'a> MaglevCodegen<'a> {
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::SpeculativeSumFusion { array } => {
                 let saved = self.emit_save_live_regs(id);
-                self.emit_load(*array, Reg64::Rdi);
+                self.emit_load(*array, Self::helper_arg_reg(0));
                 let addr = jit_runtime::jit_runtime_batch_sum_smi as *const () as usize as i64;
-                self.masm.mov_ri(Reg64::R11, addr);
-                self.masm.call_reg(Reg64::R11);
+                self.emit_helper_call_addr(addr);
                 self.emit_restore_live_regs(saved);
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
@@ -2525,12 +2513,11 @@ impl<'a> MaglevCodegen<'a> {
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::SpeculativePushFusion { array, count } => {
                 let saved = self.emit_save_live_regs(id);
-                self.emit_load(*array, Reg64::Rdi);
-                self.masm.mov_ri(Reg64::Rsi, i64::from(*count));
+                self.emit_load(*array, Self::helper_arg_reg(0));
+                self.emit_helper_arg_imm(1, i64::from(*count));
                 let addr =
                     jit_runtime::jit_runtime_batch_push_smi_range as *const () as usize as i64;
-                self.masm.mov_ri(Reg64::R11, addr);
-                self.masm.call_reg(Reg64::R11);
+                self.emit_helper_call_addr(addr);
                 self.emit_restore_live_regs(saved);
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
@@ -2539,11 +2526,10 @@ impl<'a> MaglevCodegen<'a> {
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::SpeculativeFillTrueFusion { array, count } => {
                 let saved = self.emit_save_live_regs(id);
-                self.emit_load(*array, Reg64::Rdi);
-                self.emit_load(*count, Reg64::Rsi);
+                self.emit_load(*array, Self::helper_arg_reg(0));
+                self.emit_load(*count, Self::helper_arg_reg(1));
                 let addr = jit_runtime::jit_runtime_batch_fill_true as *const () as usize as i64;
-                self.masm.mov_ri(Reg64::R11, addr);
-                self.masm.call_reg(Reg64::R11);
+                self.emit_helper_call_addr(addr);
                 self.emit_restore_live_regs(saved);
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
@@ -2552,11 +2538,10 @@ impl<'a> MaglevCodegen<'a> {
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::SpeculativeCountTruthyFusion { array, count } => {
                 let saved = self.emit_save_live_regs(id);
-                self.emit_load(*array, Reg64::Rdi);
-                self.emit_load(*count, Reg64::Rsi);
+                self.emit_load(*array, Self::helper_arg_reg(0));
+                self.emit_load(*count, Self::helper_arg_reg(1));
                 let addr = jit_runtime::jit_runtime_count_bool_true as *const () as usize as i64;
-                self.masm.mov_ri(Reg64::R11, addr);
-                self.masm.call_reg(Reg64::R11);
+                self.emit_helper_call_addr(addr);
                 self.emit_restore_live_regs(saved);
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
@@ -2575,12 +2560,11 @@ impl<'a> MaglevCodegen<'a> {
                 ..
             } => {
                 let saved = self.emit_save_live_regs(id);
-                self.masm.mov_ri(Reg64::Rdi, i64::from(*feedback_slot));
-                self.masm.mov_ri(Reg64::Rsi, i64::from(*flags));
+                self.emit_helper_arg_imm(0, i64::from(*feedback_slot));
+                self.emit_helper_arg_imm(1, i64::from(*flags));
                 let addr = jit_runtime::jit_runtime_fast_create_object_literal as *const () as usize
                     as i64;
-                self.masm.mov_ri(Reg64::R11, addr);
-                self.masm.call_reg(Reg64::R11);
+                self.emit_helper_call_addr(addr);
                 self.emit_restore_live_regs(saved);
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
@@ -2672,12 +2656,11 @@ impl<'a> MaglevCodegen<'a> {
                 ..
             } => {
                 let saved = self.emit_save_live_regs(id);
-                self.masm.mov_ri(Reg64::Rdi, i64::from(*feedback_slot));
-                self.masm.mov_ri(Reg64::Rsi, i64::from(*flags));
+                self.emit_helper_arg_imm(0, i64::from(*feedback_slot));
+                self.emit_helper_arg_imm(1, i64::from(*flags));
                 let addr = jit_runtime::jit_runtime_fast_create_object_literal as *const () as usize
                     as i64;
-                self.masm.mov_ri(Reg64::R11, addr);
-                self.masm.call_reg(Reg64::R11);
+                self.emit_helper_call_addr(addr);
                 self.emit_restore_live_regs(saved);
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
@@ -2686,8 +2669,7 @@ impl<'a> MaglevCodegen<'a> {
             ValueNode::CreateEmptyObjectLiteral => {
                 let saved = self.emit_save_live_regs(id);
                 let addr = jit_runtime::jit_runtime_create_empty_object as *const () as usize;
-                self.masm.mov_ri(Reg64::R11, addr as i64);
-                self.masm.call_reg(Reg64::R11);
+                self.emit_helper_call_addr(addr as i64);
                 self.emit_restore_live_regs(saved);
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
@@ -2696,8 +2678,7 @@ impl<'a> MaglevCodegen<'a> {
             ValueNode::CreateEmptyArrayLiteral { .. } => {
                 let saved = self.emit_save_live_regs(id);
                 let addr = jit_runtime::jit_runtime_create_empty_array as *const () as usize;
-                self.masm.mov_ri(Reg64::R11, addr as i64);
-                self.masm.call_reg(Reg64::R11);
+                self.emit_helper_call_addr(addr as i64);
                 self.emit_restore_live_regs(saved);
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
@@ -2717,11 +2698,9 @@ impl<'a> MaglevCodegen<'a> {
             } => {
                 // Direct stub call — avoids trampoline dispatch overhead.
                 let saved = self.emit_save_live_regs(id);
-                self.masm
-                    .mov_ri(Reg64::Rdi, i64::from(*shared_function_info));
+                self.emit_helper_arg_imm(0, i64::from(*shared_function_info));
                 let addr = jit_runtime::jit_runtime_create_closure as *const () as usize;
-                self.masm.mov_ri(Reg64::R11, addr as i64);
-                self.masm.call_reg(Reg64::R11);
+                self.emit_helper_call_addr(addr as i64);
                 self.emit_restore_live_regs(saved);
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
@@ -2733,11 +2712,9 @@ impl<'a> MaglevCodegen<'a> {
             } => {
                 // Direct stub call — avoids trampoline dispatch overhead.
                 let saved = self.emit_save_live_regs(id);
-                self.masm
-                    .mov_ri(Reg64::Rdi, i64::from(*shared_function_info));
+                self.emit_helper_arg_imm(0, i64::from(*shared_function_info));
                 let addr = jit_runtime::jit_runtime_create_closure as *const () as usize;
-                self.masm.mov_ri(Reg64::R11, addr as i64);
-                self.masm.call_reg(Reg64::R11);
+                self.emit_helper_call_addr(addr as i64);
                 self.emit_restore_live_regs(saved);
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
@@ -2746,10 +2723,9 @@ impl<'a> MaglevCodegen<'a> {
             ValueNode::CreateFunctionContext { slot_count, .. } => {
                 // Direct stub call — avoids trampoline dispatch overhead.
                 let saved = self.emit_save_live_regs(id);
-                self.masm.mov_ri(Reg64::Rdi, i64::from(*slot_count));
+                self.emit_helper_arg_imm(0, i64::from(*slot_count));
                 let addr = jit_runtime::jit_runtime_create_function_context as *const () as usize;
-                self.masm.mov_ri(Reg64::R11, addr as i64);
-                self.masm.call_reg(Reg64::R11);
+                self.emit_helper_call_addr(addr as i64);
                 self.emit_restore_live_regs(saved);
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
@@ -2761,26 +2737,24 @@ impl<'a> MaglevCodegen<'a> {
                 // LoadCurrentContextSlot / StoreCurrentContextSlot stubs
                 // find the correct pointer (they read from [R14+ctx_off]).
                 let saved = self.emit_save_live_regs(id);
-                self.emit_load(*context, Reg64::Rdi);
+                self.emit_load(*context, Self::helper_arg_reg(0));
                 let push_addr = jit_runtime::jit_runtime_push_context as *const () as usize as i64;
-                self.masm.mov_ri(Reg64::R11, push_addr);
-                self.masm.call_reg(Reg64::R11);
+                self.emit_helper_call_addr(push_addr);
                 // RAX = old context (PushContext node result).
 
                 if let Some(ctx_off) = self.ctx_regfile_offset {
                     // Save the old-context result while we fetch the new
                     // context's raw pointer.  Two pushes keep RSP aligned.
+                    self.masm.push(Reg64::R11); // alignment padding
                     self.masm.push(Reg64::Rax);
-                    self.masm.sub_ri(Reg64::Rsp, 8);
                     let get_raw_addr = jit_runtime::jit_runtime_get_current_ctx_raw_ptr as *const ()
                         as usize as i64;
-                    self.masm.mov_ri(Reg64::R11, get_raw_addr);
-                    self.masm.call_reg(Reg64::R11);
+                    self.emit_helper_call_addr(get_raw_addr);
                     // RAX = new context raw pointer.
                     self.masm
                         .mov_store_base_disp32(Reg64::R14, ctx_off, Reg64::Rax);
-                    self.masm.add_ri(Reg64::Rsp, 8);
                     self.masm.pop(Reg64::Rax);
+                    self.masm.pop(Reg64::R11);
                 }
 
                 self.emit_restore_live_regs(saved);
@@ -2792,23 +2766,21 @@ impl<'a> MaglevCodegen<'a> {
                 // PopContext restores a previously saved context.  Like
                 // PushContext, we update the register-file ctx cache.
                 let saved = self.emit_save_live_regs(id);
-                self.emit_load(*context, Reg64::Rdi);
+                self.emit_load(*context, Self::helper_arg_reg(0));
                 let pop_addr = jit_runtime::jit_runtime_pop_context as *const () as usize as i64;
-                self.masm.mov_ri(Reg64::R11, pop_addr);
-                self.masm.call_reg(Reg64::R11);
+                self.emit_helper_call_addr(pop_addr);
                 // RAX = JIT_UNDEFINED.
 
                 if let Some(ctx_off) = self.ctx_regfile_offset {
+                    self.masm.push(Reg64::R11); // alignment padding
                     self.masm.push(Reg64::Rax);
-                    self.masm.sub_ri(Reg64::Rsp, 8);
                     let get_raw_addr = jit_runtime::jit_runtime_get_current_ctx_raw_ptr as *const ()
                         as usize as i64;
-                    self.masm.mov_ri(Reg64::R11, get_raw_addr);
-                    self.masm.call_reg(Reg64::R11);
+                    self.emit_helper_call_addr(get_raw_addr);
                     self.masm
                         .mov_store_base_disp32(Reg64::R14, ctx_off, Reg64::Rax);
-                    self.masm.add_ri(Reg64::Rsp, 8);
                     self.masm.pop(Reg64::Rax);
+                    self.masm.pop(Reg64::R11);
                 }
 
                 self.emit_restore_live_regs(saved);
@@ -3932,28 +3904,23 @@ impl<'a> MaglevCodegen<'a> {
             if self.promoted_globals.is_empty() {
                 return;
             }
-            // After the prologue (6 pushes + return addr = 7 items), RSP ≡ 8
-            // mod 16.  We need RSP ≡ 0 mod 16 before `call` so the callee
-            // sees RSP ≡ 8 mod 16 per SysV ABI.  A single dummy push fixes it.
+            // After the prologue, a single dummy push aligns RSP before helper
+            // calls; per-ABI helper pre/post adjustment handles shadow space.
             self.masm.push(Reg64::R11);
             for &(name_idx, slot) in &self.promoted_globals.clone() {
                 let off = (slot * 8) as i32;
-                // RDI = name_idx (SysV ABI first arg)
-                self.masm.mov_ri(Reg64::Rdi, i64::from(name_idx));
-                if self.needs_r15 {
+                self.emit_helper_arg_imm(0, i64::from(name_idx));
+                let addr = if self.needs_r15 {
                     self.masm.mov_load_base_disp32(
-                        Reg64::Rsi,
+                        Self::helper_arg_reg(1),
                         Reg64::R15,
                         jit_runtime::RT_PTRS_GLOBAL_OFFSET,
                     );
-                    let addr =
-                        jit_runtime::jit_runtime_lda_global_fast as *const () as usize as i64;
-                    self.masm.mov_ri(Reg64::R11, addr);
+                    jit_runtime::jit_runtime_lda_global_fast as *const () as usize as i64
                 } else {
-                    let addr = jit_runtime::jit_runtime_lda_global as *const () as usize as i64;
-                    self.masm.mov_ri(Reg64::R11, addr);
-                }
-                self.masm.call_reg(Reg64::R11);
+                    jit_runtime::jit_runtime_lda_global as *const () as usize as i64
+                };
+                self.emit_helper_call_addr(addr);
                 // If the stub returned JIT_DEOPT, bail out immediately.
                 self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
                 self.masm.cmp_rr(Reg64::Rax, Reg64::R11);
@@ -3981,24 +3948,20 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.push(Reg64::Rax);
             for &(name_idx, slot) in &self.promoted_globals.clone() {
                 let off = (slot * 8) as i32;
-                // RDI = name_idx
-                self.masm.mov_ri(Reg64::Rdi, i64::from(name_idx));
-                // RSI = value from promoted slot
-                self.masm.mov_load_base_disp32(Reg64::Rsi, Reg64::R14, off);
-                if self.needs_r15 {
+                self.emit_helper_arg_imm(0, i64::from(name_idx));
+                self.masm
+                    .mov_load_base_disp32(Self::helper_arg_reg(1), Reg64::R14, off);
+                let addr = if self.needs_r15 {
                     self.masm.mov_load_base_disp32(
-                        Reg64::Rdx,
+                        Self::helper_arg_reg(2),
                         Reg64::R15,
                         jit_runtime::RT_PTRS_GLOBAL_OFFSET,
                     );
-                    let addr =
-                        jit_runtime::jit_runtime_sta_global_fast as *const () as usize as i64;
-                    self.masm.mov_ri(Reg64::R11, addr);
+                    jit_runtime::jit_runtime_sta_global_fast as *const () as usize as i64
                 } else {
-                    let addr = jit_runtime::jit_runtime_sta_global as *const () as usize as i64;
-                    self.masm.mov_ri(Reg64::R11, addr);
-                }
-                self.masm.call_reg(Reg64::R11);
+                    jit_runtime::jit_runtime_sta_global as *const () as usize as i64
+                };
+                self.emit_helper_call_addr(addr);
             }
             // Restore the return value.
             self.masm.pop(Reg64::Rax);
@@ -4022,22 +3985,20 @@ impl<'a> MaglevCodegen<'a> {
             let saved = self.emit_save_live_regs(at_node);
             for &(name_idx, slot) in &self.promoted_globals.clone() {
                 let off = (slot * 8) as i32;
-                self.masm.mov_ri(Reg64::Rdi, i64::from(name_idx));
-                self.masm.mov_load_base_disp32(Reg64::Rsi, Reg64::R14, off);
-                if self.needs_r15 {
+                self.emit_helper_arg_imm(0, i64::from(name_idx));
+                self.masm
+                    .mov_load_base_disp32(Self::helper_arg_reg(1), Reg64::R14, off);
+                let addr = if self.needs_r15 {
                     self.masm.mov_load_base_disp32(
-                        Reg64::Rdx,
+                        Self::helper_arg_reg(2),
                         Reg64::R15,
                         jit_runtime::RT_PTRS_GLOBAL_OFFSET,
                     );
-                    let addr =
-                        jit_runtime::jit_runtime_sta_global_fast as *const () as usize as i64;
-                    self.masm.mov_ri(Reg64::R11, addr);
+                    jit_runtime::jit_runtime_sta_global_fast as *const () as usize as i64
                 } else {
-                    let addr = jit_runtime::jit_runtime_sta_global as *const () as usize as i64;
-                    self.masm.mov_ri(Reg64::R11, addr);
-                }
-                self.masm.call_reg(Reg64::R11);
+                    jit_runtime::jit_runtime_sta_global as *const () as usize as i64
+                };
+                self.emit_helper_call_addr(addr);
             }
             self.emit_restore_live_regs(saved);
         }
@@ -4069,21 +4030,18 @@ impl<'a> MaglevCodegen<'a> {
             let use_fast = self.needs_r15;
             for &(name_idx, slot) in &self.promoted_globals.clone() {
                 let off = (slot * 8) as i32;
-                self.masm.mov_ri(Reg64::Rdi, i64::from(name_idx));
-                if use_fast {
+                self.emit_helper_arg_imm(0, i64::from(name_idx));
+                let addr = if use_fast {
                     self.masm.mov_load_base_disp32(
-                        Reg64::Rsi,
+                        Self::helper_arg_reg(1),
                         Reg64::R15,
                         jit_runtime::RT_PTRS_GLOBAL_OFFSET,
                     );
-                    let addr =
-                        jit_runtime::jit_runtime_lda_global_fast as *const () as usize as i64;
-                    self.masm.mov_ri(Reg64::R11, addr);
+                    jit_runtime::jit_runtime_lda_global_fast as *const () as usize as i64
                 } else {
-                    let addr = jit_runtime::jit_runtime_lda_global as *const () as usize as i64;
-                    self.masm.mov_ri(Reg64::R11, addr);
-                }
-                self.masm.call_reg(Reg64::R11);
+                    jit_runtime::jit_runtime_lda_global as *const () as usize as i64
+                };
+                self.emit_helper_call_addr(addr);
                 // Deopt if global load failed.
                 self.masm.cmp_ri(Reg64::Rax, i32::MIN);
                 self.masm.jcc(CondCode::Less, &mut self.deopt_global_label);
@@ -4122,8 +4080,8 @@ impl<'a> MaglevCodegen<'a> {
     //
     // These helpers save only the caller-saved allocatable registers that are
     // **live across** the call (determined per-call-site by the register
-    // allocator's liveness data), set up arguments in SysV ABI order, call the
-    // extern "C" stub, check for JIT_DEOPT, and store the result.
+    // allocator's liveness data), set up arguments using the host helper-call
+    // ABI, call the extern "C" stub, check for JIT_DEOPT, and store the result.
 
     /// Save only the caller-saved registers that are **live across**
     /// `at_node`.  Returns a bitmask of the saved register indices so that
@@ -4245,6 +4203,15 @@ impl<'a> MaglevCodegen<'a> {
         if bytes != 0 {
             self.masm.add_ri(Reg64::Rsp, bytes);
         }
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[inline]
+    fn emit_helper_call_addr(&mut self, addr: i64) {
+        self.masm.mov_ri(Reg64::R11, addr);
+        let adj = self.emit_helper_call_pre_adjust();
+        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_post_adjust(adj);
     }
 
     /// Reserve the shadow space *and* the space needed for stack-passed
@@ -4468,10 +4435,10 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
         // RDI still holds ctx_i64 (not clobbered on the fast path).
-        self.masm.mov_ri(Reg64::Rsi, i64::from(slot));
+        self.emit_helper_arg_reg(0, Reg64::Rdi);
+        self.emit_helper_arg_imm(1, i64::from(slot));
         let addr = jit_runtime::jit_runtime_load_context_slot_lean as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(addr as i64);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
 
@@ -4578,12 +4545,13 @@ impl<'a> MaglevCodegen<'a> {
         // ── Slow path: save live regs and call lean stub ────────────
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
-        self.emit_load(context, Reg64::Rdi);
-        self.emit_load(value, Reg64::Rdx);
-        self.masm.mov_ri(Reg64::Rsi, i64::from(slot));
+        self.emit_load(context, Reg64::R10);
+        self.emit_load(value, Reg64::R11);
+        self.emit_helper_arg_reg(0, Reg64::R10);
+        self.emit_helper_arg_imm(1, i64::from(slot));
+        self.emit_helper_arg_reg(2, Reg64::R11);
         let addr = jit_runtime::jit_runtime_store_context_slot_lean as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(addr as i64);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
 
@@ -4715,11 +4683,10 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
         // R10 still holds the callee from emit_load above.
-        self.masm.mov_rr(Reg64::Rdi, Reg64::R10);
-        self.masm.mov_ri(Reg64::Rsi, i64::from(slot));
+        self.emit_helper_arg_reg(0, Reg64::R10);
+        self.emit_helper_arg_imm(1, i64::from(slot));
         let stub_addr = jit_runtime::jit_runtime_fusion_ctx_slot_ptr as *const () as usize as i64;
-        self.masm.mov_ri(Reg64::R11, stub_addr);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(stub_addr);
         self.masm.mov_rr(Reg64::R10, Reg64::Rax);
         self.emit_restore_live_regs(saved);
 
@@ -4777,10 +4744,9 @@ impl<'a> MaglevCodegen<'a> {
         smi_disc: u8,
     ) {
         let saved = self.emit_save_live_regs(id);
-        self.emit_load(callee, Reg64::Rdi);
+        self.emit_load(callee, Self::helper_arg_reg(0));
         let resolve_addr = jit_runtime::jit_runtime_fusion_resolve as *const () as usize as i64;
-        self.masm.mov_ri(Reg64::R11, resolve_addr);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(resolve_addr);
 
         self.masm.mov_rr(Reg64::R10, Reg64::Rax); // slot_ptr
         self.masm.mov_rr(Reg64::Rdi, Reg64::Rdx); // k
@@ -5058,10 +5024,10 @@ impl<'a> MaglevCodegen<'a> {
         // Slow path: save live regs, call stub, restore.
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
-        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+        self.emit_helper_arg_reg(0, Reg64::Rdi);
+        self.emit_helper_arg_reg(1, Reg64::R10);
         let addr = jit_runtime::jit_runtime_generic_add as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(addr as i64);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
 
@@ -5202,10 +5168,10 @@ impl<'a> MaglevCodegen<'a> {
 
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
-        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+        self.emit_helper_arg_reg(0, Reg64::Rdi);
+        self.emit_helper_arg_reg(1, Reg64::R10);
         let addr = jit_runtime::jit_runtime_generic_sub as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(addr as i64);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
 
@@ -5567,10 +5533,10 @@ impl<'a> MaglevCodegen<'a> {
 
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
-        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+        self.emit_helper_arg_reg(0, Reg64::Rdi);
+        self.emit_helper_arg_reg(1, Reg64::R10);
         let addr = jit_runtime::jit_runtime_generic_mul as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(addr as i64);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
 
@@ -5617,11 +5583,10 @@ impl<'a> MaglevCodegen<'a> {
 
             self.masm.bind_label(&mut slow_label);
             let saved = self.emit_save_live_regs(id);
-            self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
-            self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+            self.emit_helper_arg_reg(0, Reg64::Rax);
+            self.emit_helper_arg_reg(1, Reg64::R10);
             let addr = jit_runtime::jit_runtime_generic_mod as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, addr as i64);
-            self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_addr(addr as i64);
             self.emit_restore_live_regs(saved);
             self.emit_deopt_check_rax();
 
@@ -5660,10 +5625,10 @@ impl<'a> MaglevCodegen<'a> {
 
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
-        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+        self.emit_helper_arg_reg(0, Reg64::Rdi);
+        self.emit_helper_arg_reg(1, Reg64::R10);
         let addr = jit_runtime::jit_runtime_generic_mod as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(addr as i64);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
 
@@ -5701,11 +5666,10 @@ impl<'a> MaglevCodegen<'a> {
 
             self.masm.bind_label(&mut slow_label);
             let saved = self.emit_save_live_regs(id);
-            self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
-            self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+            self.emit_helper_arg_reg(0, Reg64::Rax);
+            self.emit_helper_arg_reg(1, Reg64::R10);
             let addr = jit_runtime::jit_runtime_generic_div as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, addr as i64);
-            self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_addr(addr as i64);
             self.emit_restore_live_regs(saved);
             self.emit_deopt_check_rax();
 
@@ -5742,10 +5706,10 @@ impl<'a> MaglevCodegen<'a> {
 
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
-        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+        self.emit_helper_arg_reg(0, Reg64::Rdi);
+        self.emit_helper_arg_reg(1, Reg64::R10);
         let addr = jit_runtime::jit_runtime_generic_div as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(addr as i64);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
 
@@ -5845,10 +5809,10 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.bind_label(&mut slow_label);
             self.emit_load(right, Reg64::R10);
             let saved = self.emit_save_live_regs(id);
-            self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+            self.emit_helper_arg_reg(0, Reg64::Rdi);
+            self.emit_helper_arg_reg(1, Reg64::R10);
             let addr = jit_runtime::jit_runtime_generic_bitwise_or as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, addr as i64);
-            self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_addr(addr as i64);
             self.emit_restore_live_regs(saved);
             self.emit_deopt_check_rax();
 
@@ -5876,10 +5840,10 @@ impl<'a> MaglevCodegen<'a> {
 
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
-        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+        self.emit_helper_arg_reg(0, Reg64::Rdi);
+        self.emit_helper_arg_reg(1, Reg64::R10);
         let addr = jit_runtime::jit_runtime_generic_bitwise_or as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(addr as i64);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
 
@@ -5951,10 +5915,10 @@ impl<'a> MaglevCodegen<'a> {
 
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
-        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+        self.emit_helper_arg_reg(0, Reg64::Rdi);
+        self.emit_helper_arg_reg(1, Reg64::R10);
         let addr = jit_runtime::jit_runtime_generic_bitwise_and as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(addr as i64);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
 
@@ -6026,10 +5990,10 @@ impl<'a> MaglevCodegen<'a> {
 
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
-        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+        self.emit_helper_arg_reg(0, Reg64::Rdi);
+        self.emit_helper_arg_reg(1, Reg64::R10);
         let addr = jit_runtime::jit_runtime_generic_bitwise_xor as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(addr as i64);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
 
@@ -6106,9 +6070,9 @@ impl<'a> MaglevCodegen<'a> {
 
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
+        self.emit_helper_arg_reg(0, Reg64::Rdi);
         let addr = jit_runtime::jit_runtime_generic_increment as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(addr as i64);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
 
@@ -6185,9 +6149,9 @@ impl<'a> MaglevCodegen<'a> {
 
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
+        self.emit_helper_arg_reg(0, Reg64::Rdi);
         let addr = jit_runtime::jit_runtime_generic_decrement as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(addr as i64);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
 
@@ -6237,9 +6201,9 @@ impl<'a> MaglevCodegen<'a> {
 
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
+        self.emit_helper_arg_reg(0, Reg64::Rdi);
         let addr = jit_runtime::jit_runtime_generic_negate as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(addr as i64);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
 
@@ -6280,9 +6244,9 @@ impl<'a> MaglevCodegen<'a> {
 
         self.masm.bind_label(&mut slow_label);
         let saved = self.emit_save_live_regs(id);
+        self.emit_helper_arg_reg(0, Reg64::Rdi);
         let addr = jit_runtime::jit_runtime_generic_bitwise_not as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(addr as i64);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
 
@@ -6413,15 +6377,16 @@ impl<'a> MaglevCodegen<'a> {
             // ── Slow path: IC miss ──────────────────────────────────
             self.masm.bind_label(&mut slow_label);
             let saved = self.emit_save_live_regs(id);
-            self.emit_load(object, Reg64::Rdi);
-            self.masm.push(Reg64::Rdi);
+            self.emit_load(object, Reg64::R10);
+            self.masm.push(Reg64::R10);
             self.masm.push(Reg64::R11); // alignment padding
-            self.masm.mov_ri(Reg64::Rsi, i64::from(name));
-            self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
-            self.masm.lea_base_disp32(Reg64::Rcx, Reg64::Rbp, ic_base);
+            self.emit_helper_arg_reg(0, Reg64::R10);
+            self.emit_helper_arg_imm(1, i64::from(name));
+            self.emit_helper_arg_reg(2, Reg64::R15);
+            self.masm
+                .lea_base_disp32(Self::helper_arg_reg(3), Reg64::Rbp, ic_base);
             let ic_fill_addr = jit_runtime::jit_runtime_fill_named_ic_r15 as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, ic_fill_addr as i64);
-            self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_addr(ic_fill_addr as i64);
             let mut generic_label = Label::new();
             self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
             self.masm.je(&mut generic_label);
@@ -6433,12 +6398,12 @@ impl<'a> MaglevCodegen<'a> {
             // ── Generic fallback ────────────────────────────────────
             self.masm.bind_label(&mut generic_label);
             self.masm.pop(Reg64::R11); // discard alignment padding
-            self.masm.pop(Reg64::Rdi); // restore saved object
-            self.masm.mov_ri(Reg64::Rsi, i64::from(name));
-            self.masm.mov_ri(Reg64::Rdx, i64::from(feedback_slot));
+            self.masm.pop(Reg64::R10); // restore saved object
+            self.emit_helper_arg_reg(0, Reg64::R10);
+            self.emit_helper_arg_imm(1, i64::from(name));
+            self.emit_helper_arg_imm(2, i64::from(feedback_slot));
             let stub_addr = jit_runtime::jit_runtime_lda_named_property as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, stub_addr as i64);
-            self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_addr(stub_addr as i64);
             self.emit_restore_live_regs(saved);
             self.emit_deopt_check_rax();
 
@@ -6483,11 +6448,10 @@ impl<'a> MaglevCodegen<'a> {
             // Other types (String, Object, …): allocate a heap handle.
             {
                 let saved = self.emit_save_live_regs(id);
-                self.masm.mov_rr(Reg64::Rdi, Reg64::R11);
+                self.emit_helper_arg_reg(0, Reg64::R11);
                 let alloc_addr =
                     jit_runtime::jit_runtime_alloc_handle_for_jsvalue as *const () as usize;
-                self.masm.mov_ri(Reg64::R11, alloc_addr as i64);
-                self.masm.call_reg(Reg64::R11);
+                self.emit_helper_call_addr(alloc_addr as i64);
                 self.emit_restore_live_regs(saved);
                 self.masm.jmp(&mut done_label);
             }
@@ -6513,15 +6477,16 @@ impl<'a> MaglevCodegen<'a> {
             // ── Slow path: IC miss / non-inlineable type ────────────
             self.masm.bind_label(&mut slow_label);
             let saved = self.emit_save_live_regs(id);
-            self.emit_load(object, Reg64::Rdi);
-            self.masm.push(Reg64::Rdi);
+            self.emit_load(object, Reg64::R10);
+            self.masm.push(Reg64::R10);
             self.masm.push(Reg64::R11); // alignment padding
-            self.masm.mov_ri(Reg64::Rsi, i64::from(name));
-            self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
-            self.masm.lea_base_disp32(Reg64::Rcx, Reg64::Rbp, ic_base);
+            self.emit_helper_arg_reg(0, Reg64::R10);
+            self.emit_helper_arg_imm(1, i64::from(name));
+            self.emit_helper_arg_reg(2, Reg64::R15);
+            self.masm
+                .lea_base_disp32(Self::helper_arg_reg(3), Reg64::Rbp, ic_base);
             let ic_fill_addr = jit_runtime::jit_runtime_fill_named_ic_r15 as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, ic_fill_addr as i64);
-            self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_addr(ic_fill_addr as i64);
             let mut generic_label = Label::new();
             self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
             self.masm.je(&mut generic_label);
@@ -6533,12 +6498,12 @@ impl<'a> MaglevCodegen<'a> {
             // ── Generic fallback ────────────────────────────────────
             self.masm.bind_label(&mut generic_label);
             self.masm.pop(Reg64::R11); // discard alignment padding
-            self.masm.pop(Reg64::Rdi); // restore saved object
-            self.masm.mov_ri(Reg64::Rsi, i64::from(name));
-            self.masm.mov_ri(Reg64::Rdx, i64::from(feedback_slot));
+            self.masm.pop(Reg64::R10); // restore saved object
+            self.emit_helper_arg_reg(0, Reg64::R10);
+            self.emit_helper_arg_imm(1, i64::from(name));
+            self.emit_helper_arg_imm(2, i64::from(feedback_slot));
             let stub_addr = jit_runtime::jit_runtime_lda_named_property as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, stub_addr as i64);
-            self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_addr(stub_addr as i64);
             self.emit_restore_live_regs(saved);
             self.emit_deopt_check_rax();
 
@@ -6715,17 +6680,19 @@ impl<'a> MaglevCodegen<'a> {
             // ── Slow path: IC miss / OOB / non-heap ─────────────────
             self.masm.bind_label(&mut slow_label);
             let saved = self.emit_save_live_regs(id);
-            self.emit_load(object, Reg64::Rdi);
-            self.emit_load(key, Reg64::Rsi);
-            self.masm.push(Reg64::Rsi);
-            self.masm.push(Reg64::Rdi);
-            self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
-            self.masm.lea_base_disp32(Reg64::Rcx, Reg64::Rbp, ic_base);
+            self.emit_load(object, Reg64::R10);
+            self.emit_load(key, Reg64::R11);
+            self.masm.push(Reg64::R11);
+            self.masm.push(Reg64::R10);
+            self.emit_helper_arg_reg(0, Reg64::R10);
+            self.emit_helper_arg_reg(1, Reg64::R11);
+            self.emit_helper_arg_reg(2, Reg64::R15);
+            self.masm
+                .lea_base_disp32(Self::helper_arg_reg(3), Reg64::Rbp, ic_base);
 
             let ic_fill_addr =
                 jit_runtime::jit_runtime_inline_load_keyed_smi_ic_r15 as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, ic_fill_addr as i64);
-            self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_addr(ic_fill_addr as i64);
 
             let mut generic_label = Label::new();
             self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
@@ -6737,18 +6704,19 @@ impl<'a> MaglevCodegen<'a> {
 
             // ── Generic fallback ────────────────────────────────────
             self.masm.bind_label(&mut generic_label);
-            self.masm.pop(Reg64::Rdi);
-            self.masm.pop(Reg64::Rsi);
+            self.masm.pop(Reg64::R10);
+            self.masm.pop(Reg64::R11);
+            self.emit_helper_arg_reg(0, Reg64::R10);
+            self.emit_helper_arg_reg(1, Reg64::R11);
             if self.needs_r15 {
-                self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
+                self.emit_helper_arg_reg(2, Reg64::R15);
                 let stub_addr =
                     jit_runtime::jit_runtime_lda_keyed_property_r15 as *const () as usize;
-                self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+                self.emit_helper_call_addr(stub_addr as i64);
             } else {
                 let stub_addr = jit_runtime::jit_runtime_lda_keyed_property as *const () as usize;
-                self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+                self.emit_helper_call_addr(stub_addr as i64);
             }
-            self.masm.call_reg(Reg64::R11);
             self.emit_restore_live_regs(saved);
             self.emit_deopt_check_rax();
 
@@ -6862,22 +6830,24 @@ impl<'a> MaglevCodegen<'a> {
             let saved = self.emit_save_live_regs(id);
 
             // Set up ABI args for jit_runtime_inline_load_keyed_smi_ic_r15:
-            //   RDI = obj, RSI = key, RDX = rt_ptrs (R15), RCX = &ic_slots
-            self.emit_load(object, Reg64::Rdi);
-            self.emit_load(key, Reg64::Rsi);
+            //   arg0 = obj, arg1 = key, arg2 = rt_ptrs (R15), arg3 = &ic_slots
+            self.emit_load(object, Reg64::R10);
+            self.emit_load(key, Reg64::R11);
             // Save object and key for the generic fallback path.  The IC
             // fill call clobbers caller-saved regs, and these inputs may
             // not be in the live set (last use) so restore_live_regs
             // won't recover them.  Two pushes preserve 16-byte alignment.
-            self.masm.push(Reg64::Rsi); // save key
-            self.masm.push(Reg64::Rdi); // save object
-            self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
-            self.masm.lea_base_disp32(Reg64::Rcx, Reg64::Rbp, ic_base);
+            self.masm.push(Reg64::R11); // save key
+            self.masm.push(Reg64::R10); // save object
+            self.emit_helper_arg_reg(0, Reg64::R10);
+            self.emit_helper_arg_reg(1, Reg64::R11);
+            self.emit_helper_arg_reg(2, Reg64::R15);
+            self.masm
+                .lea_base_disp32(Self::helper_arg_reg(3), Reg64::Rbp, ic_base);
 
             let ic_fill_addr =
                 jit_runtime::jit_runtime_inline_load_keyed_smi_ic_r15 as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, ic_fill_addr as i64);
-            self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_addr(ic_fill_addr as i64);
 
             // Result: RAX = value, RDX = hit flag.
             let mut generic_label = Label::new();
@@ -6893,19 +6863,19 @@ impl<'a> MaglevCodegen<'a> {
             // Pop saved object+key (safe even if they were last-use regs)
             // and reuse the original save_live_regs frame.
             self.masm.bind_label(&mut generic_label);
-            self.masm.pop(Reg64::Rdi); // restore saved object
-            self.masm.pop(Reg64::Rsi); // restore saved key
+            self.masm.pop(Reg64::R10); // restore saved object
+            self.masm.pop(Reg64::R11); // restore saved key
+            self.emit_helper_arg_reg(0, Reg64::R10);
+            self.emit_helper_arg_reg(1, Reg64::R11);
             if self.needs_r15 {
-                // Pass R15 (cached RT_PTRS cell) in RDX (3rd arg).
-                self.masm.mov_rr(Reg64::Rdx, Reg64::R15);
+                self.emit_helper_arg_reg(2, Reg64::R15);
                 let stub_addr =
                     jit_runtime::jit_runtime_lda_keyed_property_r15 as *const () as usize;
-                self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+                self.emit_helper_call_addr(stub_addr as i64);
             } else {
                 let stub_addr = jit_runtime::jit_runtime_lda_keyed_property as *const () as usize;
-                self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+                self.emit_helper_call_addr(stub_addr as i64);
             }
-            self.masm.call_reg(Reg64::R11);
 
             self.emit_restore_live_regs(saved);
             self.emit_deopt_check_rax();
@@ -7072,30 +7042,32 @@ impl<'a> MaglevCodegen<'a> {
         self.emit_load(object, Reg64::R11);
         self.emit_load(key, Reg64::R10);
         self.emit_load(value, Reg64::Rax);
-        self.masm.mov_rr(Reg64::Rdi, Reg64::R11);
-        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
-        self.masm.mov_rr(Reg64::Rdx, Reg64::Rax);
 
         if self.needs_r15 {
             // Fast path: merged grow + IC update in a single FFI call.
             // Saves args for rare generic fallback (non-array objects).
-            self.masm.push(Reg64::Rdx);
-            self.masm.push(Reg64::Rsi);
-            self.masm.push(Reg64::Rdi);
+            self.masm.push(Reg64::Rax);
+            self.masm.push(Reg64::R10);
+            self.masm.push(Reg64::R11);
             self.masm.push(Reg64::R11); // alignment padding
 
-            // Pass IC pointer in RCX and RT_PTRS cell in R8.
+            let adj = self.emit_helper_call_pre_adjust_for(5);
+            self.emit_helper_arg_reg(0, Reg64::R11);
+            self.emit_helper_arg_reg(1, Reg64::R10);
+            self.emit_helper_arg_reg(2, Reg64::Rax);
             if self.array_ic_base != 0 {
                 self.masm
-                    .lea_base_disp32(Reg64::Rcx, Reg64::Rbp, self.array_ic_base);
+                    .lea_base_disp32(Self::helper_arg_reg(3), Reg64::Rbp, self.array_ic_base);
             } else {
-                self.masm.xor_rr(Reg64::Rcx, Reg64::Rcx);
+                self.masm
+                    .xor_rr(Self::helper_arg_reg(3), Self::helper_arg_reg(3));
             }
-            self.masm.mov_rr(Reg64::R8, Reg64::R15);
+            self.emit_helper_arg_reg(4, Reg64::R15);
             let grow_addr =
                 jit_runtime::jit_runtime_inline_store_keyed_grow_ic_r15 as *const () as usize;
             self.masm.mov_ri(Reg64::R11, grow_addr as i64);
             self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_post_adjust(adj);
 
             // Check hit flag (RDX).
             let mut generic_label = Label::new();
@@ -7110,49 +7082,54 @@ impl<'a> MaglevCodegen<'a> {
 
             // Generic fallback (rare: non-array or error).
             self.masm.bind_label(&mut generic_label);
-            self.masm.pop(Reg64::R11);
-            self.masm.pop(Reg64::Rdi);
-            self.masm.pop(Reg64::Rsi);
-            self.masm.pop(Reg64::Rdx);
+            self.masm.pop(Reg64::R11); // discard alignment padding
+            self.masm.pop(Reg64::R11); // object
+            self.masm.pop(Reg64::R10); // key
+            self.masm.pop(Reg64::Rax); // value
 
             if self.array_ic_base != 0 {
+                let adj = self.emit_helper_call_pre_adjust_for(5);
+                self.emit_helper_arg_reg(0, Reg64::R11);
+                self.emit_helper_arg_reg(1, Reg64::R10);
+                self.emit_helper_arg_reg(2, Reg64::Rax);
                 self.masm
-                    .lea_base_disp32(Reg64::Rcx, Reg64::Rbp, self.array_ic_base);
-                if self.needs_r15 {
-                    // Pass R15 (cached RT_PTRS cell) in R8 (5th arg).
-                    self.masm.mov_rr(Reg64::R8, Reg64::R15);
-                    let stub_addr = jit_runtime::jit_runtime_sta_keyed_property_with_ic_r15
-                        as *const () as usize;
-                    self.masm.mov_ri(Reg64::R11, stub_addr as i64);
-                } else {
-                    let stub_addr =
-                        jit_runtime::jit_runtime_sta_keyed_property_with_ic as *const () as usize;
-                    self.masm.mov_ri(Reg64::R11, stub_addr as i64);
-                }
+                    .lea_base_disp32(Self::helper_arg_reg(3), Reg64::Rbp, self.array_ic_base);
+                self.emit_helper_arg_reg(4, Reg64::R15);
+                let stub_addr =
+                    jit_runtime::jit_runtime_sta_keyed_property_with_ic_r15 as *const () as usize;
+                self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+                self.masm.call_reg(Reg64::R11);
+                self.emit_helper_call_post_adjust(adj);
             } else if self.needs_r15 {
-                // Pass R15 (cached RT_PTRS cell) in RCX (4th arg).
-                self.masm.mov_rr(Reg64::Rcx, Reg64::R15);
+                self.emit_helper_arg_reg(0, Reg64::R11);
+                self.emit_helper_arg_reg(1, Reg64::R10);
+                self.emit_helper_arg_reg(2, Reg64::Rax);
+                self.emit_helper_arg_reg(3, Reg64::R15);
                 let stub_addr =
                     jit_runtime::jit_runtime_sta_keyed_property_r15 as *const () as usize;
-                self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+                self.emit_helper_call_addr(stub_addr as i64);
             } else {
+                self.emit_helper_arg_reg(0, Reg64::R11);
+                self.emit_helper_arg_reg(1, Reg64::R10);
+                self.emit_helper_arg_reg(2, Reg64::Rax);
                 let stub_addr = jit_runtime::jit_runtime_sta_keyed_property as *const () as usize;
-                self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+                self.emit_helper_call_addr(stub_addr as i64);
             }
-            self.masm.call_reg(Reg64::R11);
 
             self.emit_restore_live_regs(saved);
             self.emit_deopt_check_rax();
         } else {
             // Legacy 2-call path (no cached RT_PTRS).
-            self.masm.push(Reg64::Rdx);
-            self.masm.push(Reg64::Rsi);
-            self.masm.push(Reg64::Rdi);
+            self.masm.push(Reg64::Rax);
+            self.masm.push(Reg64::R10);
+            self.masm.push(Reg64::R11);
             self.masm.push(Reg64::R11); // alignment padding
 
+            self.emit_helper_arg_reg(0, Reg64::R11);
+            self.emit_helper_arg_reg(1, Reg64::R10);
+            self.emit_helper_arg_reg(2, Reg64::Rax);
             let inline_addr = jit_runtime::jit_runtime_inline_store_keyed_smi as *const () as usize;
-            self.masm.mov_ri(Reg64::R11, inline_addr as i64);
-            self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_addr(inline_addr as i64);
 
             let mut generic_label = Label::new();
             self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
@@ -7164,22 +7141,27 @@ impl<'a> MaglevCodegen<'a> {
             self.masm.jmp(&mut done_label);
 
             self.masm.bind_label(&mut generic_label);
-            self.masm.pop(Reg64::R11);
-            self.masm.pop(Reg64::Rdi);
-            self.masm.pop(Reg64::Rsi);
-            self.masm.pop(Reg64::Rdx);
+            self.masm.pop(Reg64::R11); // discard alignment padding
+            self.masm.pop(Reg64::R11); // object
+            self.masm.pop(Reg64::R10); // key
+            self.masm.pop(Reg64::Rax); // value
 
             if self.array_ic_base != 0 {
+                self.emit_helper_arg_reg(0, Reg64::R11);
+                self.emit_helper_arg_reg(1, Reg64::R10);
+                self.emit_helper_arg_reg(2, Reg64::Rax);
                 self.masm
-                    .lea_base_disp32(Reg64::Rcx, Reg64::Rbp, self.array_ic_base);
+                    .lea_base_disp32(Self::helper_arg_reg(3), Reg64::Rbp, self.array_ic_base);
                 let stub_addr =
                     jit_runtime::jit_runtime_sta_keyed_property_with_ic as *const () as usize;
-                self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+                self.emit_helper_call_addr(stub_addr as i64);
             } else {
+                self.emit_helper_arg_reg(0, Reg64::R11);
+                self.emit_helper_arg_reg(1, Reg64::R10);
+                self.emit_helper_arg_reg(2, Reg64::Rax);
                 let stub_addr = jit_runtime::jit_runtime_sta_keyed_property as *const () as usize;
-                self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+                self.emit_helper_call_addr(stub_addr as i64);
             }
-            self.masm.call_reg(Reg64::R11);
 
             self.emit_restore_live_regs(saved);
             self.emit_deopt_check_rax();
@@ -7356,15 +7338,14 @@ impl<'a> MaglevCodegen<'a> {
         // clobbering when the allocator placed them in ABI registers.
         self.emit_load(receiver, Reg64::R11);
         self.emit_load(value, Reg64::R10);
-        self.masm.mov_rr(Reg64::Rdi, Reg64::R11);
-        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
+        self.emit_helper_arg_reg(0, Reg64::R11);
+        self.emit_helper_arg_reg(1, Reg64::R10);
 
-        // Pass IC pointer in RDX (3rd arg).
-        self.masm.lea_base_disp32(Reg64::Rdx, Reg64::Rbp, ic_base);
+        self.masm
+            .lea_base_disp32(Self::helper_arg_reg(2), Reg64::Rbp, ic_base);
 
         let stub_addr = jit_runtime::jit_runtime_array_push_fill_ic as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, stub_addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(stub_addr as i64);
 
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
@@ -7727,10 +7708,9 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.push(Reg64::R11); // alignment padding
         // Call jit_runtime_analyze_callee_inline(ba_ptr).
         self.masm
-            .mov_load_base_disp32(Reg64::Rdi, Reg64::Rbp, off_ba);
+            .mov_load_base_disp32(Self::helper_arg_reg(0), Reg64::Rbp, off_ba);
         let analyze_addr = jit_runtime::jit_runtime_analyze_callee_inline as *const () as usize;
-        self.masm.mov_ri(Reg64::R10, analyze_addr as i64);
-        self.masm.call_reg(Reg64::R10);
+        self.emit_helper_call_addr(analyze_addr as i64);
         // RAX = packed result or 0.
         self.masm.test_rr(Reg64::Rax, Reg64::Rax);
         let mut not_inlinable = Label::new();
@@ -7893,27 +7873,25 @@ impl<'a> MaglevCodegen<'a> {
         // the stale JIT entry point on every subsequent iteration.
         self.masm.bind_label(&mut mono_hit_deopt);
         self.masm
-            .mov_load_base_disp32(Reg64::Rdi, Reg64::Rbp, off_callee);
+            .mov_load_base_disp32(Self::helper_arg_reg(0), Reg64::Rbp, off_callee);
         self.masm.xor_rr(Reg64::R10, Reg64::R10);
         self.masm
             .mov_store_base_disp32(Reg64::Rbp, off_callee, Reg64::R10);
         let mono_retry_addr =
             jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, mono_retry_addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(mono_retry_addr as i64);
         self.masm.jmp(&mut done_label);
 
         // ── Cache miss: full jit_runtime_get_jit_entry path ─────────
         self.masm.bind_label(&mut cache_miss);
 
-        self.masm.mov_rr(Reg64::Rdi, Reg64::R11); // callee
         // Push callee + padding (2 pushes → RSP ≡ 0 mod 16).
-        self.masm.push(Reg64::Rdi);
-        self.masm.push(Reg64::Rdi);
+        self.masm.push(Reg64::R11);
+        self.masm.push(Reg64::R11);
 
+        self.emit_helper_arg_reg(0, Reg64::R11);
         let get_entry_addr = jit_runtime::jit_runtime_get_jit_entry as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, get_entry_addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(get_entry_addr as i64);
 
         // Check entry_point == 0 → stub fallback.
         let mut stub_fallback = Label::new();
@@ -7944,18 +7922,16 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.push(Reg64::R11);
         self.masm.push(Reg64::R10);
         let ba_addr = jit_runtime::jit_runtime_read_current_ba as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, ba_addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(ba_addr as i64);
         self.masm
             .mov_store_base_disp32(Reg64::Rbp, off_ba, Reg64::Rax);
 
         // Read the callee's register file slot count from the BA and
         // cache it in the MIC slot for subsequent mono-hit zeroing.
         // RAX = ba_ptr (from jit_runtime_read_current_ba above).
-        self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
+        self.emit_helper_arg_reg(0, Reg64::Rax);
         let reg_slots_addr = jit_runtime::jit_runtime_read_reg_slots as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, reg_slots_addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(reg_slots_addr as i64);
         // RAX = reg_slots (1–16).
         self.masm
             .mov_store_base_disp32(Reg64::Rbp, off_reg_slots, Reg64::Rax);
@@ -7995,11 +7971,10 @@ impl<'a> MaglevCodegen<'a> {
 
         // Finish direct call (restores BA, context, truncates heap).
         // Pass R15 (RT_PTRS cell addr) as RSI (2nd arg) to skip TLS lookup.
-        self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
-        self.masm.mov_rr(Reg64::Rsi, Reg64::R15);
+        self.emit_helper_arg_reg(0, Reg64::Rax);
+        self.emit_helper_arg_reg(1, Reg64::R15);
         let finish_addr = jit_runtime::jit_runtime_finish_direct_call_r15 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, finish_addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(finish_addr as i64);
 
         // Cache the caller's BA (now restored by finish_direct_call)
         // so subsequent mono-cache hits can restore it without a
@@ -8023,12 +7998,12 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.xor_rr(Reg64::R10, Reg64::R10);
         self.masm
             .mov_store_base_disp32(Reg64::Rbp, off_callee, Reg64::R10);
-        self.masm.pop(Reg64::Rdi); // callee
+        self.masm.pop(Reg64::R10); // callee
         self.masm.add_ri(Reg64::Rsp, 8); // discard padding
+        self.emit_helper_arg_reg(0, Reg64::R10);
         let miss_retry_addr =
             jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, miss_retry_addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(miss_retry_addr as i64);
         self.masm.jmp(&mut done_label);
 
         self.masm.bind_label(&mut miss_ok);
@@ -8039,10 +8014,10 @@ impl<'a> MaglevCodegen<'a> {
         // ── Stub fallback (get_jit_entry returned 0) ────────────────
         self.masm.bind_label(&mut stub_fallback);
         self.masm.pop(Reg64::R11); // discard padding
-        self.masm.pop(Reg64::Rdi); // callee
+        self.masm.pop(Reg64::R10); // callee
+        self.emit_helper_arg_reg(0, Reg64::R10);
         let stub_addr = jit_runtime::jit_runtime_call_undefined_receiver0 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, stub_addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(stub_addr as i64);
 
         // ── Common exit ─────────────────────────────────────────────
         self.masm.bind_label(&mut done_label);
@@ -8064,10 +8039,9 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.push(Reg64::Rdi); // callee
 
         // Call jit_runtime_get_jit_entry(callee_i64).
-        // RDI already has callee.
+        self.emit_helper_arg_reg(0, Reg64::Rdi);
         let get_entry_addr = jit_runtime::jit_runtime_get_jit_entry as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, get_entry_addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(get_entry_addr as i64);
 
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
@@ -8102,11 +8076,10 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.add_ri(Reg64::Rsp, 128);
 
         // Finish direct call (R15 = RT_PTRS cell addr).
-        self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
-        self.masm.mov_rr(Reg64::Rsi, Reg64::R15);
+        self.emit_helper_arg_reg(0, Reg64::Rax);
+        self.emit_helper_arg_reg(1, Reg64::R15);
         let finish_addr = jit_runtime::jit_runtime_finish_direct_call_r15 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, finish_addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(finish_addr as i64);
 
         // If callee JIT returned JIT_DEOPT, fall back to runtime stub
         // instead of deopting the CALLER.
@@ -8114,12 +8087,13 @@ impl<'a> MaglevCodegen<'a> {
         let mut fast_ok = Label::new();
         self.masm.jcc(CondCode::GreaterEq, &mut fast_ok);
         // Callee deopt: callee + arg0 still on stack.
-        self.masm.pop(Reg64::Rdi); // callee
-        self.masm.pop(Reg64::Rsi); // arg0
+        self.masm.pop(Reg64::R10); // callee
+        self.masm.pop(Reg64::R11); // arg0
+        self.emit_helper_arg_reg(0, Reg64::R10);
+        self.emit_helper_arg_reg(1, Reg64::R11);
         let fast_retry_addr =
             jit_runtime::jit_runtime_call_undefined_receiver1 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, fast_retry_addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(fast_retry_addr as i64);
         self.masm.jmp(&mut done_label);
 
         self.masm.bind_label(&mut fast_ok);
@@ -8129,11 +8103,12 @@ impl<'a> MaglevCodegen<'a> {
 
         // ── Slow path ───────────────────────────────────────────────
         self.masm.bind_label(&mut slow_label);
-        self.masm.pop(Reg64::Rdi); // callee
-        self.masm.pop(Reg64::Rsi); // arg0
+        self.masm.pop(Reg64::R10); // callee
+        self.masm.pop(Reg64::R11); // arg0
+        self.emit_helper_arg_reg(0, Reg64::R10);
+        self.emit_helper_arg_reg(1, Reg64::R11);
         let stub_addr = jit_runtime::jit_runtime_call_undefined_receiver1 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, stub_addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(stub_addr as i64);
 
         // ── Common exit ─────────────────────────────────────────────
         self.masm.bind_label(&mut done_label);
@@ -8159,9 +8134,9 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.push(Reg64::Rdi); // padding
 
         // Call jit_runtime_get_jit_entry(callee_i64).
+        self.emit_helper_arg_reg(0, Reg64::Rdi);
         let get_entry_addr = jit_runtime::jit_runtime_get_jit_entry as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, get_entry_addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(get_entry_addr as i64);
 
         let mut slow_label = Label::new();
         let mut done_label = Label::new();
@@ -8197,11 +8172,10 @@ impl<'a> MaglevCodegen<'a> {
 
         self.masm.add_ri(Reg64::Rsp, 128);
 
-        self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
-        self.masm.mov_rr(Reg64::Rsi, Reg64::R15);
+        self.emit_helper_arg_reg(0, Reg64::Rax);
+        self.emit_helper_arg_reg(1, Reg64::R15);
         let finish_addr = jit_runtime::jit_runtime_finish_direct_call_r15 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, finish_addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(finish_addr as i64);
 
         // If callee JIT returned JIT_DEOPT, fall back to runtime stub
         // instead of deopting the CALLER.
@@ -8210,13 +8184,15 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.jcc(CondCode::GreaterEq, &mut fast_ok2);
         // Callee deopt: stack still has [padding, callee, arg0, arg1].
         self.masm.pop(Reg64::R11); // padding
-        self.masm.pop(Reg64::Rdi); // callee
-        self.masm.pop(Reg64::Rsi); // arg0
-        self.masm.pop(Reg64::Rdx); // arg1
+        self.masm.pop(Reg64::R10); // callee
+        self.masm.pop(Reg64::R11); // arg0
+        self.masm.pop(Reg64::Rax); // arg1
+        self.emit_helper_arg_reg(0, Reg64::R10);
+        self.emit_helper_arg_reg(1, Reg64::R11);
+        self.emit_helper_arg_reg(2, Reg64::Rax);
         let fast2_retry_addr =
             jit_runtime::jit_runtime_call_undefined_receiver2 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, fast2_retry_addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(fast2_retry_addr as i64);
         self.masm.jmp(&mut done_label);
 
         self.masm.bind_label(&mut fast_ok2);
@@ -8226,12 +8202,14 @@ impl<'a> MaglevCodegen<'a> {
         // ── Slow path ───────────────────────────────────────────────
         self.masm.bind_label(&mut slow_label);
         self.masm.pop(Reg64::R11); // padding
-        self.masm.pop(Reg64::Rdi); // callee
-        self.masm.pop(Reg64::Rsi); // arg0
-        self.masm.pop(Reg64::Rdx); // arg1
+        self.masm.pop(Reg64::R10); // callee
+        self.masm.pop(Reg64::R11); // arg0
+        self.masm.pop(Reg64::Rax); // arg1
+        self.emit_helper_arg_reg(0, Reg64::R10);
+        self.emit_helper_arg_reg(1, Reg64::R11);
+        self.emit_helper_arg_reg(2, Reg64::Rax);
         let stub_addr = jit_runtime::jit_runtime_call_undefined_receiver2 as *const () as usize;
-        self.masm.mov_ri(Reg64::R11, stub_addr as i64);
-        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_addr(stub_addr as i64);
 
         // ── Common exit ─────────────────────────────────────────────
         self.masm.bind_label(&mut done_label);
