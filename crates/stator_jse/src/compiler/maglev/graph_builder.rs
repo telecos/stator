@@ -2255,7 +2255,10 @@ impl<'a> GraphBuilder<'a> {
                     ValueNode::Float64Constant { value: v }
                 }
             }
-            ConstantPoolEntry::String(s) => ValueNode::StringConstant { value: s },
+            ConstantPoolEntry::String(s) => ValueNode::StringConstant {
+                value: s,
+                pool_index: Some(idx),
+            },
             ConstantPoolEntry::Boolean(true) => ValueNode::TrueConstant,
             ConstantPoolEntry::Boolean(false) => ValueNode::FalseConstant,
             ConstantPoolEntry::Null => ValueNode::NullConstant,
@@ -2708,7 +2711,7 @@ mod tests {
         let block = graph.entry_block().unwrap();
         assert!(matches!(
             &block.nodes[0].1,
-            ValueNode::StringConstant { value } if value == "hello"
+            ValueNode::StringConstant { value, .. } if value == "hello"
         ));
     }
 

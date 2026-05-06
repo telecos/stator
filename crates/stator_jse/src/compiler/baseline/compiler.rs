@@ -10641,6 +10641,37 @@ pub(crate) mod jit_runtime {
             }
             return alloc_heap_handle(JsValue::HeapNumber(left as f64 + right as f64));
         }
+        // String + String hot path (e.g. `value += 'x'` style loops).
+        // Read both heap slots once via the cached RT_PTRS pointer,
+        // confirm both are strings, and append directly into a
+        // pre-sized buffer.  Skips:
+        //   * the generic JsValue match in `generic_add_slow`
+        //   * the dedup HashMap GET/INSERT (the result is a fresh `Rc`
+        //     whose pointer identity has never been seen before)
+        //   * one of the two `RT_PTRS` thread-local lookups
+        // The fallback to `generic_add_slow` preserves all other
+        // semantics including ToPrimitive coercions.
+        if is_heap_handle(left) && is_heap_handle(right) {
+            let ptrs = RT_PTRS.with(|p| p.get());
+            if ptrs.is_cached() {
+                let l_idx = (left - JIT_HEAP_TAG) as usize;
+                let r_idx = (right - JIT_HEAP_TAG) as usize;
+                // SAFETY: cached pointer is valid for the thread
+                // lifetime; no concurrent borrows during JIT execution.
+                let heap = unsafe { &mut *(&*ptrs.heap).as_ptr() };
+                if l_idx < heap.len() && r_idx < heap.len() {
+                    if let (JsValue::String(a), JsValue::String(b)) = (&heap[l_idx], &heap[r_idx]) {
+                        let mut out = String::with_capacity(a.len() + b.len());
+                        out.push_str(a);
+                        out.push_str(b);
+                        let new_str: Rc<str> = Rc::<str>::from(out);
+                        let idx = heap.len();
+                        heap.push(JsValue::String(new_str));
+                        return JIT_HEAP_TAG + idx as i64;
+                    }
+                }
+            }
+        }
         generic_add_slow(left, right)
     }
 
@@ -10690,16 +10721,31 @@ pub(crate) mod jit_runtime {
             (JsValue::HeapNumber(a), JsValue::Smi(b)) => {
                 jsvalue_to_jit_i64(JsValue::HeapNumber(*a + *b as f64))
             }
+            // String + String fast path: pre-size the buffer (avoiding
+            // `format!`'s growth-doubling) and copy each side once.
+            // This is the dominant cost in `value += 'x'` style loops,
+            // so a tighter sequence here pays back across every iter
+            // before any cons-string / rope optimisation lands.
+            (JsValue::String(a), JsValue::String(b)) => {
+                let mut out = String::with_capacity(a.len() + b.len());
+                out.push_str(a);
+                out.push_str(b);
+                jsvalue_to_jit_i64(JsValue::String(Rc::<str>::from(out)))
+            }
             // String + anything → string concatenation (add only)
             (JsValue::String(s), other) => {
                 let rhs = other.to_js_string().unwrap_or_else(|_| String::new());
-                let result: Rc<str> = format!("{s}{rhs}").into();
-                jsvalue_to_jit_i64(JsValue::String(result))
+                let mut out = String::with_capacity(s.len() + rhs.len());
+                out.push_str(s);
+                out.push_str(&rhs);
+                jsvalue_to_jit_i64(JsValue::String(Rc::<str>::from(out)))
             }
             (other, JsValue::String(s)) => {
                 let lhs = other.to_js_string().unwrap_or_else(|_| String::new());
-                let result: Rc<str> = format!("{lhs}{s}").into();
-                jsvalue_to_jit_i64(JsValue::String(result))
+                let mut out = String::with_capacity(lhs.len() + s.len());
+                out.push_str(&lhs);
+                out.push_str(s);
+                jsvalue_to_jit_i64(JsValue::String(Rc::<str>::from(out)))
             }
             // All other types: ToNumber on both operands, then add as f64.
             _ => {
@@ -10717,6 +10763,65 @@ pub(crate) mod jit_runtime {
                 }
             }
         }
+    }
+
+    /// String concatenation helper for Maglev `ValueNode::StringConcat`
+    /// (created when feedback speculates that a `+` operator joins two
+    /// strings).  Both inputs are expected to be heap-allocated string
+    /// handles, but the implementation falls back to
+    /// [`jit_runtime_generic_add`] for any other type combination so that
+    /// a stale speculation cannot corrupt program state — the JIT will
+    /// simply observe the same numeric/coerced result the interpreter
+    /// would produce.
+    ///
+    /// Skipping the Smi inline-fast-path that `jit_runtime_generic_add`
+    /// performs is safe here because the caller has already filtered out
+    /// the Smi+Smi case via type feedback; emitting that check inline at
+    /// the call site would be dead code on the speculated-string path.
+    pub extern "C" fn jit_runtime_string_concat(left: i64, right: i64) -> i64 {
+        let l = jit_i64_to_jsvalue(left);
+        let r = jit_i64_to_jsvalue(right);
+        match (&l, &r) {
+            (JsValue::String(a), JsValue::String(b)) => {
+                // Direct string+string concat — the hot path for
+                // `value += 'x'`-style loops.  Pre-size the buffer to
+                // avoid reallocation while pushing the right-hand side.
+                let mut out = String::with_capacity(a.len() + b.len());
+                out.push_str(a);
+                out.push_str(b);
+                jsvalue_to_jit_i64(JsValue::String(Rc::<str>::from(out)))
+            }
+            // Speculation was wrong (or one side coerces to a string via
+            // `+`).  Defer to the fully general add helper, which already
+            // implements ECMAScript `+` for every type combination.
+            _ => jit_runtime_generic_add(left, right),
+        }
+    }
+
+    /// Load a string constant from the currently-executing bytecode
+    /// array's constant pool, decode its source form (strip quotes,
+    /// process escape sequences), and return a JIT heap handle.
+    ///
+    /// `idx` is the constant-pool index originally seen by the
+    /// graph-builder when it lowered an `LdaConstant` instruction
+    /// referencing a string entry.  Decoding is delegated to the
+    /// shared interpreter helper so semantics stay aligned with the
+    /// non-JIT path.
+    ///
+    /// Returns [`JIT_DEOPT`] when the bytecode pointer is null or the
+    /// indexed entry is not a string, so the caller's
+    /// `emit_deopt_check_rax` falls back to baseline.  In practice this
+    /// only happens if a non-graph-builder consumer of `StringConstant`
+    /// (e.g. `type_specialization` in tests) reaches Maglev codegen.
+    pub extern "C" fn jit_runtime_load_string_constant(idx: i64) -> i64 {
+        let Ok(idx32) = u32::try_from(idx) else {
+            return JIT_DEOPT;
+        };
+        let Some(raw) = get_rt_string_constant(idx32) else {
+            return JIT_DEOPT;
+        };
+        let decoded = crate::interpreter::decode_string_constant(&raw);
+        alloc_heap_handle(JsValue::String(Rc::<str>::from(decoded)))
     }
 
     /// Generic Subtract.

@@ -589,6 +589,172 @@ fn bench_deep_object_access_1k_precompiled(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Edge proof harness corpus (matches Edge's edge_stator_jse_perfproof.cc /
+// edge_stator_jse_test_cases.cc kEdgeStatorJsePerfCases). These three cases
+// are the required hot paths the Stator branch must beat V8 on.
+// ---------------------------------------------------------------------------
+
+fn bench_edge_proof_loop2k_precompiled(c: &mut Criterion) {
+    // Edge corpus: Loop2K — numeric loop with bitand reduction.
+    let source = "var total = 0; for (var i = 0; i < 2000; ++i) { total += (i & 7); } total;";
+    let program = recursive_descent::parse(source).unwrap();
+    let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    let ba = Rc::new(bytecode);
+    eprintln!(
+        "BENCH_SETUP[edge_loop2k]: ba_ptr={:p} bc_len={}",
+        &*ba as *const _,
+        ba.bytecodes().len()
+    );
+    let env = make_global_env();
+    if matches_bench_filter("edge_proof_loop2k_precompiled") {
+        warmup_with_maglev(&ba, &env, "edge_loop2k");
+    }
+    let diag_before = maglev_diagnostics();
+    let cats_before = maglev_deopt_categories();
+    let stubs_before = stub_deopt_counts();
+    let first_deopts_before = first_deopt_counts();
+    let jit_before = jit_entry_diagnostics();
+    let dispatch_before = dispatch_entry_diagnostics();
+    let calls_before = stub_call_counts();
+    reset_stub_call_counts();
+    c.bench_function("edge_proof_loop2k_precompiled", |b| {
+        b.iter(|| black_box(Interpreter::run_fast(&ba, &[], &env).unwrap()));
+    });
+    print_maglev_diag(
+        "edge_loop2k",
+        &diag_before,
+        &cats_before,
+        &stubs_before,
+        &first_deopts_before,
+        &jit_before,
+        &dispatch_before,
+    );
+    let calls_after = stub_call_counts();
+    let mut parts = Vec::new();
+    for i in 0..STUB_DEOPT_SLOTS {
+        let delta = calls_after[i].saturating_sub(calls_before[i]);
+        if delta > 0 {
+            parts.push(format!("{}={}", STUB_NAMES[i], delta));
+        }
+    }
+    eprintln!(
+        "STUB_CALLS[edge_loop2k]: {}",
+        if parts.is_empty() {
+            "(none)".to_string()
+        } else {
+            parts.join(" ")
+        }
+    );
+}
+
+fn bench_edge_proof_function_loop1k_precompiled(c: &mut Criterion) {
+    // Edge corpus: FunctionLoop1K — function-call loop with modulus.
+    let source = "function f(n) { var total = 0; for (var i = 0; i < n; ++i) { total \
+                  += (i % 5); } return total; } f(1000);";
+    let program = recursive_descent::parse(source).unwrap();
+    let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    let ba = Rc::new(bytecode);
+    eprintln!(
+        "BENCH_SETUP[edge_function_loop1k]: ba_ptr={:p} bc_len={}",
+        &*ba as *const _,
+        ba.bytecodes().len()
+    );
+    let env = make_global_env();
+    if matches_bench_filter("edge_proof_function_loop1k_precompiled") {
+        warmup_with_maglev(&ba, &env, "edge_function_loop1k");
+    }
+    let diag_before = maglev_diagnostics();
+    let cats_before = maglev_deopt_categories();
+    let stubs_before = stub_deopt_counts();
+    let first_deopts_before = first_deopt_counts();
+    let jit_before = jit_entry_diagnostics();
+    let dispatch_before = dispatch_entry_diagnostics();
+    let calls_before = stub_call_counts();
+    reset_stub_call_counts();
+    c.bench_function("edge_proof_function_loop1k_precompiled", |b| {
+        b.iter(|| black_box(Interpreter::run_fast(&ba, &[], &env).unwrap()));
+    });
+    print_maglev_diag(
+        "edge_function_loop1k",
+        &diag_before,
+        &cats_before,
+        &stubs_before,
+        &first_deopts_before,
+        &jit_before,
+        &dispatch_before,
+    );
+    let calls_after = stub_call_counts();
+    let mut parts = Vec::new();
+    for i in 0..STUB_DEOPT_SLOTS {
+        let delta = calls_after[i].saturating_sub(calls_before[i]);
+        if delta > 0 {
+            parts.push(format!("{}={}", STUB_NAMES[i], delta));
+        }
+    }
+    eprintln!(
+        "STUB_CALLS[edge_function_loop1k]: {}",
+        if parts.is_empty() {
+            "(none)".to_string()
+        } else {
+            parts.join(" ")
+        }
+    );
+}
+
+fn bench_edge_proof_string_append200_precompiled(c: &mut Criterion) {
+    // Edge corpus: StringAppend200 — repeated single-char string append.
+    let source = "var value = ''; for (var i = 0; i < 200; ++i) { value += 'x'; } value.length;";
+    let program = recursive_descent::parse(source).unwrap();
+    let bytecode = BytecodeGenerator::compile_program(&program).unwrap();
+    let ba = Rc::new(bytecode);
+    eprintln!(
+        "BENCH_SETUP[edge_string_append200]: ba_ptr={:p} bc_len={}",
+        &*ba as *const _,
+        ba.bytecodes().len()
+    );
+    let env = make_global_env();
+    if matches_bench_filter("edge_proof_string_append200_precompiled") {
+        warmup_with_maglev(&ba, &env, "edge_string_append200");
+    }
+    let diag_before = maglev_diagnostics();
+    let cats_before = maglev_deopt_categories();
+    let stubs_before = stub_deopt_counts();
+    let first_deopts_before = first_deopt_counts();
+    let jit_before = jit_entry_diagnostics();
+    let dispatch_before = dispatch_entry_diagnostics();
+    let calls_before = stub_call_counts();
+    reset_stub_call_counts();
+    c.bench_function("edge_proof_string_append200_precompiled", |b| {
+        b.iter(|| black_box(Interpreter::run_fast(&ba, &[], &env).unwrap()));
+    });
+    print_maglev_diag(
+        "edge_string_append200",
+        &diag_before,
+        &cats_before,
+        &stubs_before,
+        &first_deopts_before,
+        &jit_before,
+        &dispatch_before,
+    );
+    let calls_after = stub_call_counts();
+    let mut parts = Vec::new();
+    for i in 0..STUB_DEOPT_SLOTS {
+        let delta = calls_after[i].saturating_sub(calls_before[i]);
+        if delta > 0 {
+            parts.push(format!("{}={}", STUB_NAMES[i], delta));
+        }
+    }
+    eprintln!(
+        "STUB_CALLS[edge_string_append200]: {}",
+        if parts.is_empty() {
+            "(none)".to_string()
+        } else {
+            parts.join(" ")
+        }
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Diagnostic helper
 // ---------------------------------------------------------------------------
 
@@ -706,6 +872,9 @@ criterion_group! {
         bench_prototype_chain_1k_precompiled,
         bench_sieve_primes_1k_precompiled,
         bench_deep_object_access_1k_precompiled,
+        bench_edge_proof_loop2k_precompiled,
+        bench_edge_proof_function_loop1k_precompiled,
+        bench_edge_proof_string_append200_precompiled,
 }
 
 criterion_main!(v8_precompiled_benches);

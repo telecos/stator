@@ -12171,7 +12171,13 @@ fn push_string_escape_char(out: &mut String, pending_high_surrogate: &mut Option
     out.push(ch);
 }
 
-pub(super) fn decode_string_constant(raw: &str) -> String {
+/// Decode a JavaScript source-form string constant (raw text including
+/// surrounding quotes and escape sequences as found in the bytecode
+/// constant pool) into the unescaped runtime [`String`] value.
+///
+/// Shared with the JIT so its `LdaConstant`-equivalent stub produces
+/// identical results to the interpreter.
+pub fn decode_string_constant(raw: &str) -> String {
     let bytes = raw.as_bytes();
     if bytes.len() < 2 {
         return raw.to_owned();
@@ -30482,5 +30488,71 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Regression: graph-building a script with a string literal must
+    /// produce a `ValueNode::StringConstant` carrying its constant-pool
+    /// index, so the Maglev codegen `StringConstant { pool_index: Some(_) }`
+    /// arm fires (and the value is loaded via `jit_runtime_load_string_constant`)
+    /// instead of falling through to the catch-all
+    /// `emit_deopt_unconditional(0)` arm, which previously caused the
+    /// loop body to deopt on every Maglev invocation and exhaust
+    /// `MAX_MAGLEV_DEOPT_RETRIES` within ~15 calls.
+    #[test]
+    #[cfg(stator_maglev_jit_x86_64)]
+    fn maglev_string_append_graph_has_string_constant_with_pool_index() {
+        use crate::bytecode::bytecode_generator::BytecodeGenerator;
+        use crate::bytecode::feedback::FeedbackVector;
+        use crate::compiler::maglev::graph_builder::GraphBuilder;
+        use crate::compiler::maglev::ir::ValueNode;
+        use crate::compiler::maglev::optimizer::optimize;
+        use crate::parser::recursive_descent;
+        use std::rc::Rc;
+
+        let source =
+            "var value = ''; for (var i = 0; i < 200; ++i) { value += 'x'; } value.length;";
+        let program = recursive_descent::parse(source).unwrap();
+        let ba = Rc::new(BytecodeGenerator::compile_program(&program).unwrap());
+        let feedback = FeedbackVector::new(ba.feedback_metadata());
+
+        let mut graph = GraphBuilder::build(&ba, &feedback)
+            .expect("graph builder must succeed for a trivial string-append loop");
+        optimize(&mut graph);
+
+        let mut count_with_index = 0usize;
+        let mut count_without_index = 0usize;
+        for block in graph.blocks() {
+            for (_id, node) in &block.nodes {
+                if let ValueNode::StringConstant { pool_index, .. } = node {
+                    if pool_index.is_some() {
+                        count_with_index += 1;
+                    } else {
+                        count_without_index += 1;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            count_with_index >= 2,
+            "graph must contain `StringConstant` nodes carrying a `pool_index` \
+             (found with_index={count_with_index} without_index={count_without_index}) \
+             so Maglev codegen routes them through `jit_runtime_load_string_constant` \
+             instead of falling through to the unconditional-deopt `_other` arm"
+        );
+        assert_eq!(
+            count_without_index, 0,
+            "no `StringConstant` should be missing its `pool_index` \
+             (without_index={count_without_index}); a missing index would force \
+             Maglev to deopt on every invocation"
+        );
+
+        // And the lowered Maglev code must compile cleanly for this graph.
+        let result = crate::compiler::maglev::codegen::compile(&graph, ba.parameter_count());
+        assert!(
+            result.is_ok(),
+            "Maglev codegen must succeed for a string-append loop graph: {:?}",
+            result.err()
+        );
     }
 }

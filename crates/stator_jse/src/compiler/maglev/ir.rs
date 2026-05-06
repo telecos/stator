@@ -311,8 +311,21 @@ pub enum ValueNode {
 
     /// A string constant (interned).
     StringConstant {
-        /// The string value.
+        /// The string value (raw source form, including surrounding
+        /// quotes and unprocessed escape sequences — `decode` it via
+        /// the same path the interpreter uses to obtain the runtime
+        /// `String`).
         value: String,
+        /// Index into the bytecode array's constant pool when this
+        /// node was produced by the bytecode-graph builder.  Maglev
+        /// codegen uses the index to call back into the JIT runtime
+        /// (`jit_runtime_load_string_constant`), avoiding the cost of
+        /// embedding the string bytes into the emitted machine code.
+        ///
+        /// `None` when the node is synthesised by a transform that
+        /// does not own a constant-pool slot (e.g. `type_specialization`
+        /// in tests).  Such nodes deopt at runtime.
+        pool_index: Option<u32>,
     },
 
     /// A reference to a constant-pool entry by index.
@@ -2306,8 +2319,9 @@ mod tests {
         let mut block = BasicBlock::new(0);
         block.push_value(ValueNode::StringConstant {
             value: "hello".to_string(),
+            pool_index: None,
         });
-        if let ValueNode::StringConstant { value } = &block.nodes[0].1 {
+        if let ValueNode::StringConstant { value, .. } = &block.nodes[0].1 {
             assert_eq!(value, "hello");
         } else {
             panic!("expected StringConstant");

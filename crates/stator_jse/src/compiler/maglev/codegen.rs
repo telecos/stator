@@ -2871,6 +2871,29 @@ impl<'a> MaglevCodegen<'a> {
             ValueNode::GenericModulus { left, right, .. } => {
                 self.emit_inline_generic_mod(id, *left, *right);
             }
+            // ── String concatenation (speculated by type feedback) ───────
+            // Without this arm, `StringConcat` would fall into the
+            // `_other` catch-all below and emit an unconditional deopt
+            // — every string-append loop iteration would tier back to
+            // baseline, eventually tripping exponential-backoff and
+            // disabling Maglev entirely for the function.
+            #[cfg(stator_maglev_jit_x86_64)]
+            ValueNode::StringConcat { left, right } => {
+                self.emit_string_concat(id, *left, *right);
+            }
+            // ── String constant load (LdaConstant 'literal') ─────────────
+            // Without this arm, every string literal in a Maglev-compiled
+            // function falls through to the unconditional-deopt `_other`
+            // arm — every invocation would tier back to baseline,
+            // exhausting the deopt-retry budget within ~15 calls and
+            // permanently disabling Maglev for the function.
+            #[cfg(stator_maglev_jit_x86_64)]
+            ValueNode::StringConstant {
+                value: _,
+                pool_index: Some(idx),
+            } => {
+                self.emit_load_string_constant(id, *idx);
+            }
             #[cfg(stator_maglev_jit_x86_64)]
             ValueNode::GenericDivide { left, right, .. } => {
                 self.emit_inline_generic_div(id, *left, *right);
@@ -5052,6 +5075,70 @@ impl<'a> MaglevCodegen<'a> {
         self.emit_deopt_check_rax();
 
         self.masm.bind_label(&mut done_label);
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Emit code for `ValueNode::StringConcat`.
+    ///
+    /// The IR node is created by `type_specialization` when feedback for
+    /// a `+` operator speculates that both operands are strings.  At
+    /// runtime we therefore expect every call to take the slow,
+    /// allocating path inside [`jit_runtime::jit_runtime_string_concat`]
+    /// — there is no point inlining a Smi+Smi check that would never
+    /// hit (and that would mispredict on every iteration of a tight
+    /// `value += 'x'` loop).
+    ///
+    /// The emission shape mirrors the slow tail of
+    /// [`emit_inline_generic_add`](Self::emit_inline_generic_add):
+    /// load operands into the scratch registers, save live caller-saved
+    /// regs around the helper call, then deopt-check and store.  This
+    /// keeps register-allocation invariants identical to the existing
+    /// generic-add path so register pressure / spill placement remain
+    /// unchanged.
+    #[cfg(stator_maglev_jit_x86_64)]
+    fn emit_string_concat(&mut self, id: NodeId, left: NodeId, right: NodeId) {
+        // The helper writes its result through RAX and may clobber any
+        // caller-saved register, so we must invalidate forwarding.
+        self.clear_reg_forwarding();
+        self.emit_load(left, Reg64::Rdi);
+        self.emit_load(right, Reg64::R10);
+
+        let saved = self.emit_save_live_regs(id);
+        self.emit_helper_arg_reg(0, Reg64::Rdi);
+        self.emit_helper_arg_reg(1, Reg64::R10);
+        let addr = jit_runtime::jit_runtime_string_concat as *const () as usize;
+        self.emit_helper_call_addr(addr as i64);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+
+        self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Emit code for `ValueNode::StringConstant` whose value lives in
+    /// the bytecode constant pool.
+    ///
+    /// At runtime this calls
+    /// [`jit_runtime_load_string_constant`](jit_runtime::jit_runtime_load_string_constant)
+    /// with the constant-pool index, which decodes the source-form
+    /// string (strip quotes, process escapes) and returns a JIT heap
+    /// handle.  The result is shape-stable across calls because each
+    /// invocation produces a fresh `Rc<str>` and routes it through the
+    /// dedup map; consumers of this node (e.g. `GenericAdd` for
+    /// `value += 'x'`) therefore see a normal heap-handle Smi-miss
+    /// rather than tripping the unimplemented-node deopt.
+    #[cfg(stator_maglev_jit_x86_64)]
+    fn emit_load_string_constant(&mut self, id: NodeId, pool_index: u32) {
+        // The helper writes its result through RAX and may clobber any
+        // caller-saved register, so we must invalidate forwarding.
+        self.clear_reg_forwarding();
+
+        let saved = self.emit_save_live_regs(id);
+        self.emit_helper_arg_imm(0, i64::from(pool_index));
+        let addr = jit_runtime::jit_runtime_load_string_constant as *const () as usize;
+        self.emit_helper_call_addr(addr as i64);
+        self.emit_restore_live_regs(saved);
+        self.emit_deopt_check_rax();
+
         self.emit_store(id, Reg64::Rax);
     }
 
