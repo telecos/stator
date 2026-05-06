@@ -35,6 +35,8 @@
 //!     [`ValueRecovery`][`turbofan::deopt::ValueRecovery`] descriptors.
 //!   - [`turbofan::deopt::DeoptKind`] — Eager vs lazy deoptimisation trigger.
 
+/// x86-64 ABI abstraction (System V AMD64 vs Microsoft x64).
+pub mod abi_x64;
 /// Background compilation thread pool and priority job queue.
 pub mod background;
 /// Non-optimising baseline JIT compiler.

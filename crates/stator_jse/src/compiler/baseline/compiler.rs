@@ -12062,10 +12062,18 @@ impl<'a> BaselineCompiler<'a> {
         for &(_, phys_reg) in &self.cache_map {
             self.masm.push(phys_reg);
         }
-        self.masm.mov_rr(Reg64::R14, Reg64::Rdi);
-        // RSI carries the raw closure-context pointer (passed by execute).
-        // Store in RBX (callee-saved) for use by context-slot stubs.
-        self.masm.mov_rr(Reg64::Rbx, Reg64::Rsi);
+        // The 1st extern "C" argument carries the register-file pointer; the
+        // 2nd carries the raw closure-context pointer.  Both source registers
+        // are ABI-dependent (RDI/RSI on SysV, RCX/RDX on Win64); RBX is the
+        // callee-saved destination used by context-slot stubs.
+        self.masm.mov_rr(
+            Reg64::R14,
+            crate::compiler::abi_x64::NATIVE_ABI.entry_arg_register_file(),
+        );
+        self.masm.mov_rr(
+            Reg64::Rbx,
+            crate::compiler::abi_x64::NATIVE_ABI.entry_arg_closure_context(),
+        );
         self.masm.xor_rr(Reg64::R12, Reg64::R12);
         // Pre-load cached registers from the register file.
         #[cfg(all(target_arch = "x86_64", unix))]

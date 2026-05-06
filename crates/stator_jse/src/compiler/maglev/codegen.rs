@@ -962,17 +962,25 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.push(Reg64::R13);
         self.masm.push(Reg64::R12);
         self.masm.push(Reg64::R15);
-        // Save the register-file pointer (RDI) into R14 immediately,
-        // BEFORE any function calls that would clobber caller-saved registers.
-        self.masm.mov_rr(Reg64::R14, Reg64::Rdi);
+        // Save the register-file pointer into R14 immediately, BEFORE any
+        // function calls that would clobber caller-saved registers.  The
+        // entry register is ABI-dependent (RDI on SysV, RCX on Win64).
+        self.masm.mov_rr(
+            Reg64::R14,
+            crate::compiler::abi_x64::NATIVE_ABI.entry_arg_register_file(),
+        );
 
-        // Cache the closure-context raw pointer (RSI) in a reserved
-        // register-file slot BEFORE any calls that might clobber it.
-        // R14 now holds the register-file pointer.
+        // Cache the closure-context raw pointer in a reserved register-file
+        // slot BEFORE any calls that might clobber it.  R14 now holds the
+        // register-file pointer.  The closure-context entry register is
+        // also ABI-dependent (RSI on SysV, RDX on Win64).
         #[cfg(all(target_arch = "x86_64", unix))]
         if let Some(offset) = self.ctx_regfile_offset {
-            self.masm
-                .mov_store_base_disp32(Reg64::R14, offset, Reg64::Rsi);
+            self.masm.mov_store_base_disp32(
+                Reg64::R14,
+                offset,
+                crate::compiler::abi_x64::NATIVE_ABI.entry_arg_closure_context(),
+            );
         }
         #[cfg(not(all(target_arch = "x86_64", unix)))]
         let _ = self.ctx_regfile_offset;
