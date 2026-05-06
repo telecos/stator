@@ -282,6 +282,12 @@ pub(crate) mod jit_runtime {
         ic: [(u32, usize, u64); 64],
     }
 
+    /// Sentinel value for [`RT_STR_BUILDER_IDX`] meaning "no in-place
+    /// string-concat builder is currently active".  Chosen as
+    /// `usize::MAX` so the common case (no active builder) is a
+    /// single integer compare on the read path.
+    const STR_BUILDER_NONE: usize = usize::MAX;
+
     thread_local! {
         /// Raw pointer to the [`BytecodeArray`] of the currently-executing
         /// JIT function.  Set by [`jit_runtime_setup`], cleared by
@@ -326,6 +332,54 @@ pub(crate) mod jit_runtime {
         /// and heap entries are not preserved across recycles.
         static RT_DECODED_STRING_CACHE: RefCell<HashMap<u32, (Rc<str>, i64)>> =
             RefCell::new(HashMap::new());
+
+        /// Per–heap-slot growable string accumulator used by the JIT
+        /// in-place string-concat fast path.
+        ///
+        /// When [`jit_runtime_string_concat`] observes that the left
+        /// operand's `JsValue::String(Rc<str>)` is uniquely owned by
+        /// the heap slot (`Rc::strong_count == 1`) and the right
+        /// operand is also a string, it appends the right operand into
+        /// the `String` builder kept here — instead of allocating a
+        /// fresh `Rc<str>` of length `len(left) + len(right)` and
+        /// copying both halves on every iteration.  Amortised growth
+        /// in `String::push_str` makes the inner loop of patterns
+        /// like `value += 'x'` O(N) total work instead of O(N²) byte
+        /// copies and N allocator round trips.
+        ///
+        /// This is a **single-slot** cache: the in-place fast path
+        /// only holds an active builder for one heap slot at a time
+        /// (the index recorded in [`RT_STR_BUILDER_IDX`]).  Tight
+        /// `acc = acc + s` loops touch a single accumulator, so a
+        /// HashMap-keyed cache adds avoidable hash + RefCell-borrow
+        /// overhead on every iteration; a single slot collapses the
+        /// "did we see this index before?" probe into one `Cell`
+        /// load and an integer compare.  When a different slot tries
+        /// to enter the fast path, the previous builder is flushed
+        /// first (its accumulated content is materialised back into
+        /// its slot's `Rc<str>`), then the new slot takes over.
+        ///
+        /// The slot's `Rc<str>` is left stale while a builder is
+        /// active for it; reads via [`get_heap_object`] re-materialise
+        /// the `Rc<str>` from the builder lazily so external observers
+        /// (`.length`, `ToString`, deopt fallback, …) always see the
+        /// current accumulated value.
+        ///
+        /// Cleared on heap recycle / truncate; the builder is also
+        /// flushed when the slot's value is read out.
+        static RT_STR_BUILDER: RefCell<String> = const { RefCell::new(String::new()) };
+
+        /// Heap-slot index of the currently active in-place
+        /// string-concat builder, or [`STR_BUILDER_NONE`] when no
+        /// builder is active.  See [`RT_STR_BUILDER`].
+        static RT_STR_BUILDER_IDX: Cell<usize> = const { Cell::new(STR_BUILDER_NONE) };
+
+        /// Diagnostic counters for the in-place string-concat fast
+        /// path: `(fast_path_hits, slow_path_misses)`.  Used by unit
+        /// tests to validate that hot loops actually enter the
+        /// in-place path instead of silently falling back to the
+        /// allocating slow path.  Read via [`take_inplace_concat_stats`].
+        static RT_INPLACE_CONCAT_STATS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
 
         /// Combined own-property + prototype inline caches for
         /// `LdaNamedProperty` stubs.  Cleared by [`jit_runtime_setup`]
@@ -1414,6 +1468,12 @@ pub(crate) mod jit_runtime {
         // dropped here.  The `Rc<str>` payload is small and cheap to
         // re-decode on the next load.
         RT_DECODED_STRING_CACHE.with(|c| c.borrow_mut().clear());
+        // Drop any pending in-place string-concat builder along with
+        // the heap slot it shadowed.  Its accumulated content was
+        // owned by the slot that just got drained, so there is no
+        // value to flush back.
+        RT_STR_BUILDER.with(|b| b.borrow_mut().clear());
+        RT_STR_BUILDER_IDX.with(|c| c.set(STR_BUILDER_NONE));
     }
 
     /// Truncate the JIT heap back to `base`, recycling `PlainObject` `Rc`
@@ -1441,6 +1501,13 @@ pub(crate) mod jit_runtime {
         RT_DECODED_STRING_CACHE.with(|c| {
             c.borrow_mut().retain(|_, (_, h)| *h < base_handle);
         });
+        // Drop the in-place string-concat builder if its backing slot
+        // fell into the truncated region.
+        let active_idx = RT_STR_BUILDER_IDX.with(|c| c.get());
+        if active_idx != STR_BUILDER_NONE && active_idx >= base {
+            RT_STR_BUILDER.with(|b| b.borrow_mut().clear());
+            RT_STR_BUILDER_IDX.with(|c| c.set(STR_BUILDER_NONE));
+        }
     }
 
     /// Returns `true` if `v` is a heap-object handle.
@@ -1618,6 +1685,15 @@ pub(crate) mod jit_runtime {
             return None;
         }
         let idx = (handle - JIT_HEAP_TAG) as usize;
+        // Flush any pending in-place string-concat builder for this
+        // slot back into its `Rc<str>` so the caller observes the
+        // current accumulated value.  The single-slot design lets the
+        // common case (no active builder, or a builder for a
+        // different slot) reduce to one integer compare against the
+        // sentinel `STR_BUILDER_NONE`.
+        if RT_STR_BUILDER_IDX.with(|c| c.get()) == idx {
+            materialize_str_builder(idx);
+        }
         let ptrs = RT_PTRS.with(|p| p.get());
         if ptrs.is_cached() {
             // SAFETY: cached pointer valid for thread lifetime; no concurrent borrows.
@@ -10774,6 +10850,20 @@ pub(crate) mod jit_runtime {
         // The fallback to `generic_add_slow` preserves all other
         // semantics including ToPrimitive coercions.
         if is_heap_handle(left) && is_heap_handle(right) {
+            // First, try the in-place fast path that amortises growth
+            // into a side `String` builder.  This is identical to the
+            // optimisation `jit_runtime_string_concat` uses; we apply
+            // it here too because Maglev frequently emits a generic
+            // `Add` rather than a speculated `StringConcat` for the
+            // first iterations of a `value += 'x'` loop, before type
+            // feedback narrows.
+            if let Some(handle) = try_inplace_string_concat(left, right) {
+                RT_INPLACE_CONCAT_STATS.with(|c| {
+                    let (h, m) = c.get();
+                    c.set((h + 1, m));
+                });
+                return handle;
+            }
             let ptrs = RT_PTRS.with(|p| p.get());
             if ptrs.is_cached() {
                 let l_idx = (left - JIT_HEAP_TAG) as usize;
@@ -10783,6 +10873,10 @@ pub(crate) mod jit_runtime {
                 let heap = unsafe { &mut *(&*ptrs.heap).as_ptr() };
                 if l_idx < heap.len() && r_idx < heap.len() {
                     if let (JsValue::String(a), JsValue::String(b)) = (&heap[l_idx], &heap[r_idx]) {
+                        RT_INPLACE_CONCAT_STATS.with(|c| {
+                            let (h, m) = c.get();
+                            c.set((h, m + 1));
+                        });
                         let mut out = String::with_capacity(a.len() + b.len());
                         out.push_str(a);
                         out.push_str(b);
@@ -10901,6 +10995,28 @@ pub(crate) mod jit_runtime {
     /// the Smi+Smi case via type feedback; emitting that check inline at
     /// the call site would be dead code on the speculated-string path.
     pub extern "C" fn jit_runtime_string_concat(left: i64, right: i64) -> i64 {
+        // ── In-place fast path ─────────────────────────────────────
+        // For tight `acc = acc + s` loops the JIT register that
+        // holds `acc` ends up being the only owner of the heap slot
+        // populated on the previous iteration.  Detect that case and
+        // amortise the per-iteration work into a `String::push_str`
+        // on a builder we keep alongside the slot, instead of doing
+        // a full `Rc::<str>` re-allocation + memcpy of the whole
+        // accumulated value every time.  Falls back to the original
+        // single-allocation Rc path when conditions aren't met (e.g.
+        // first iteration where the empty-string handle is shared
+        // with the decoded-constant cache).
+        if let Some(handle) = try_inplace_string_concat(left, right) {
+            RT_INPLACE_CONCAT_STATS.with(|c| {
+                let (h, m) = c.get();
+                c.set((h + 1, m));
+            });
+            return handle;
+        }
+        RT_INPLACE_CONCAT_STATS.with(|c| {
+            let (h, m) = c.get();
+            c.set((h, m + 1));
+        });
         let l = jit_i64_to_jsvalue(left);
         let r = jit_i64_to_jsvalue(right);
         match (&l, &r) {
@@ -10928,6 +11044,167 @@ pub(crate) mod jit_runtime {
             // implements ECMAScript `+` for every type combination.
             _ => jit_runtime_generic_add(left, right),
         }
+    }
+
+    /// Try to perform `left = left + right` by extending an in-place
+    /// `String` builder kept alongside `left`'s heap slot.
+    ///
+    /// Returns `Some(left)` when the optimisation fires — the caller
+    /// then receives back the same heap handle, with the builder
+    /// updated to contain the concatenated bytes.  Reads of the
+    /// handle (via [`get_heap_object`]) re-materialise the slot's
+    /// `Rc<str>` lazily from the builder, so external observers
+    /// (`.length`, `ToString`, deopt fallback, …) always see the
+    /// current value.
+    ///
+    /// Returns `None` (so the caller falls back to the allocating
+    /// path) when:
+    ///
+    /// - `left` is not a heap handle, or its slot does not hold a
+    ///   `JsValue::String`;
+    /// - the slot's `Rc<str>` has refcount > 1 (some other reference
+    ///   is observing the current snapshot — mutating in place would
+    ///   silently change a value held elsewhere);
+    /// - `right` is not a string (the speculation is wrong; defer to
+    ///   the generic add path so semantics stay correct);
+    /// - the slot is otherwise unsuitable (out-of-range index,
+    ///   mismatched indices, …).
+    /// Read and clear the in-place string-concat fast-path
+    /// diagnostic counters.  Returns `(fast_path_hits,
+    /// slow_path_misses)` accumulated since the last call.  Test
+    /// helper — used by the focused unit tests to assert that hot
+    /// `value += s` loops actually enter the in-place path.
+    pub fn take_inplace_concat_stats() -> (u64, u64) {
+        RT_INPLACE_CONCAT_STATS.with(|c| {
+            let v = c.get();
+            c.set((0, 0));
+            v
+        })
+    }
+
+    /// Test-only re-export of [`jit_i64_to_jsvalue`] so the
+    /// in-place string-concat unit test can read a heap handle's
+    /// current value (and trigger pending-builder materialisation).
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn jit_i64_to_jsvalue_for_test(v: i64) -> JsValue {
+        jit_i64_to_jsvalue(v)
+    }
+
+    fn try_inplace_string_concat(left: i64, right: i64) -> Option<i64> {
+        if !is_heap_handle(left) {
+            return None;
+        }
+        let idx = (left - JIT_HEAP_TAG) as usize;
+
+        // If the builder is currently active for a *different* slot,
+        // flush it first so its accumulated content is preserved
+        // before we repurpose the single-slot cache for `idx`.
+        let active = RT_STR_BUILDER_IDX.with(|c| c.get());
+        if active != STR_BUILDER_NONE && active != idx {
+            materialize_str_builder(active);
+        }
+
+        // Decode `right`.  If it isn't a string the speculation was
+        // wrong and we must defer to the general path.  Decoding also
+        // flushes any pending builder for `right`'s slot, so the
+        // bytes we read below are current.
+        let r = jit_i64_to_jsvalue(right);
+        let JsValue::String(right_rc) = r else {
+            return None;
+        };
+
+        let (slot_was_empty, take_fast) = RT_HEAP.with(|heap| -> (bool, bool) {
+            let mut heap = heap.borrow_mut();
+            let Some(slot) = heap.get_mut(idx) else {
+                return (false, false);
+            };
+            let JsValue::String(left_rc) = slot else {
+                return (false, false);
+            };
+            // Refcount==1 means the heap slot is the only owner of
+            // this `Rc<str>`, so growing the logical value in place
+            // cannot be observed by anyone else.  A refcount of 2 or
+            // more typically means the decoded-string-constant cache
+            // (or another live JIT register) is also pointing here;
+            // fall back to allocating a fresh result so the existing
+            // observer sees an unchanged string.
+            if Rc::strong_count(left_rc) != 1 {
+                return (false, false);
+            }
+            (left_rc.is_empty(), true)
+        });
+        if !take_fast {
+            return None;
+        }
+
+        // Update the single-slot builder.  If we're switching to a
+        // new slot (or activating the builder for the first time)
+        // seed the buffer from the slot's current `Rc<str>` content;
+        // otherwise just append.
+        let switching = active != idx;
+        RT_STR_BUILDER.with(|b| {
+            let mut buf = b.borrow_mut();
+            if switching {
+                buf.clear();
+                if !slot_was_empty {
+                    // Seed from the slot's `Rc<str>`.  Re-borrow the
+                    // heap to grab the current bytes; we already
+                    // checked refcount==1 above and we hold no other
+                    // references to the slot's `Rc<str>`.
+                    RT_HEAP.with(|h| {
+                        let heap = h.borrow();
+                        if let Some(JsValue::String(rc)) = heap.get(idx) {
+                            buf.push_str(rc);
+                        }
+                    });
+                }
+            }
+            buf.push_str(&right_rc);
+        });
+        if switching {
+            RT_STR_BUILDER_IDX.with(|c| c.set(idx));
+        }
+        // Leave the slot's `Rc<str>` stale — `get_heap_object`
+        // refreshes it on demand from the builder.
+        Some(left)
+    }
+
+    /// Flush the pending in-place string-concat builder for slot
+    /// `idx` back into the slot's `JsValue::String(Rc<str>)`.
+    ///
+    /// Called from [`get_heap_object`] (gated by an integer compare
+    /// against [`RT_STR_BUILDER_IDX`]) immediately before the slot is
+    /// read out, so any external observer of the slot sees the
+    /// current accumulated value rather than the stale snapshot left
+    /// by the most recent in-place concat.  Also called from
+    /// [`try_inplace_string_concat`] when the active builder slot
+    /// changes, so an in-flight accumulator is never silently lost.
+    /// Resets [`RT_STR_BUILDER_IDX`] to the sentinel after flushing
+    /// so the next read of the same slot is a no-op.
+    fn materialize_str_builder(idx: usize) {
+        let active = RT_STR_BUILDER_IDX.with(|c| c.get());
+        if active != idx {
+            return;
+        }
+        let rc: Rc<str> = RT_STR_BUILDER.with(|b| {
+            let mut buf = b.borrow_mut();
+            // Allocate `Rc<str>` from the accumulated bytes via a
+            // single allocation.  Reset the builder to an empty
+            // string so the buffer's spare capacity stays available
+            // for the *next* accumulator without re-allocating from
+            // scratch.
+            let rc: Rc<str> = Rc::<str>::from(buf.as_str());
+            buf.clear();
+            rc
+        });
+        RT_STR_BUILDER_IDX.with(|c| c.set(STR_BUILDER_NONE));
+        RT_HEAP.with(|h| {
+            let mut heap = h.borrow_mut();
+            if let Some(slot) = heap.get_mut(idx) {
+                *slot = JsValue::String(rc);
+            }
+        });
     }
 
     /// Concatenate `a` and `b` into a freshly allocated `Rc<str>` using
@@ -11793,7 +12070,7 @@ pub use jit_runtime::{
 pub use jit_runtime::{
     ArrayIcInfo, JsContextLayout, JsValueLayout, VecJsValueLayout, jit_runtime_fill_array_ic_r15,
     jit_runtime_inline_load_keyed_smi_ic_r15, probe_jscontext_layout, probe_jsvalue_layout,
-    probe_vec_jsvalue_layout,
+    probe_vec_jsvalue_layout, take_inplace_concat_stats,
 };
 
 // ── Per-stub deopt tracking (platform-independent API) ──────────────────
@@ -16640,6 +16917,72 @@ mod tests {
         let h5 = jit_runtime_load_string_constant(0);
         assert_ne!(h4, JIT_DEOPT);
         assert_eq!(h4, h5, "cache failed to repopulate after recycle");
+        jit_runtime_teardown();
+    }
+
+    /// Iterating `value = value + 'x'` 200 times on the JIT runtime
+    /// must enter the in-place string-concat fast path on every
+    /// iteration after the first (the empty-string handle is shared
+    /// with the decoded-constant cache, so iteration #1 takes the
+    /// slow allocating path).  Verifies that the resulting `Rc<str>`
+    /// observed by an external read of the slot equals the byte-wise
+    /// concatenation of the inputs and has the expected length.
+    /// This is the exact pattern Edge's StringAppend200 perf proof
+    /// exercises.
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
+    #[test]
+    fn inplace_string_concat_fires_on_value_plus_eq_loop() {
+        use super::jit_runtime::{
+            alloc_jit_heap_handle, jit_runtime_setup, jit_runtime_string_concat,
+            jit_runtime_teardown, take_inplace_concat_stats,
+        };
+        use crate::bytecode::bytecode_array::BytecodeArray;
+        use crate::bytecode::feedback::FeedbackMetadata;
+        use crate::objects::value::JsValue;
+        use std::rc::Rc;
+
+        let ba = BytecodeArray::new(
+            vec![],
+            vec![],
+            1,
+            0,
+            vec![],
+            FeedbackMetadata::empty(),
+            vec![],
+        );
+        jit_runtime_setup(&ba);
+        let _ = take_inplace_concat_stats();
+
+        // Seed the accumulator with a fresh `Rc<str>` allocated on
+        // the heap (refcount==1, not aliased by the constant cache).
+        let mut value = alloc_jit_heap_handle(JsValue::String(Rc::<str>::from("")));
+        // Seed `'x'` similarly so it isn't tied to the constant
+        // cache; the in-place fast path only requires `right` to
+        // decode to a `JsValue::String` regardless of its origin.
+        let x_handle = alloc_jit_heap_handle(JsValue::String(Rc::<str>::from("x")));
+        for _ in 0..200 {
+            value = jit_runtime_string_concat(value, x_handle);
+        }
+
+        // Read the value out of the heap — this materialises the
+        // pending in-place builder back into the slot's `Rc<str>`.
+        let read_back = super::jit_runtime::jit_i64_to_jsvalue_for_test(value);
+        match read_back {
+            JsValue::String(rc) => {
+                assert_eq!(rc.len(), 200, "concat result length mismatch");
+                assert!(rc.chars().all(|c| c == 'x'), "concat content mismatch");
+            }
+            other => panic!("concat result is not a string: {other:?}"),
+        }
+
+        let (hits, misses) = take_inplace_concat_stats();
+        assert!(
+            hits >= 199,
+            "expected ≥199 in-place concat hits across 200 iters, got hits={hits} misses={misses}"
+        );
         jit_runtime_teardown();
     }
 }
