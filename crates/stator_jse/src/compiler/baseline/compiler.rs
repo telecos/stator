@@ -12250,6 +12250,49 @@ impl<'a> BaselineCompiler<'a> {
         }
     }
 
+    // ── ABI-aware helper-call primitives ─────────────────────────────────────
+
+    /// Look up the ABI-mandated argument register for the `i`-th helper
+    /// argument.  Resolves to `RDI/RSI/RDX/RCX/R8/R9` on SysV and
+    /// `RCX/RDX/R8/R9` on Win64.  Panics if `i` exceeds what the native
+    /// ABI passes in registers (callers should only invoke with indices
+    /// the migrated call sites are designed to support — at most 3 in
+    /// this slice, which both ABIs cover).
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[inline]
+    const fn helper_arg_reg(i: usize) -> Reg64 {
+        match crate::compiler::abi_x64::NATIVE_ABI.helper_arg_register(i) {
+            Some(r) => r,
+            None => panic!("helper_arg_reg: index out of range for NATIVE_ABI"),
+        }
+    }
+
+    /// Reserve the ABI-mandated shadow space immediately before a helper
+    /// `CALL`.  Returns the number of bytes reserved so the matching
+    /// [`Self::emit_helper_call_post_adjust`] can release the same amount.
+    ///
+    /// Emits no instructions on SysV (shadow space is 0 bytes).  On
+    /// Win64 it emits `sub rsp, 32`.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[inline]
+    fn emit_helper_call_pre_adjust(&mut self) -> i32 {
+        const ADJ: i32 = crate::compiler::abi_x64::NATIVE_ABI.helper_call_pre_stack_adjust();
+        if ADJ != 0 {
+            self.masm.sub_ri(Reg64::Rsp, ADJ);
+        }
+        ADJ
+    }
+
+    /// Release shadow space reserved by [`Self::emit_helper_call_pre_adjust`].
+    /// Emits no instructions when `bytes == 0`.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[inline]
+    fn emit_helper_call_post_adjust(&mut self, bytes: i32) {
+        if bytes != 0 {
+            self.masm.add_ri(Reg64::Rsp, bytes);
+        }
+    }
+
     // ── Global register promotion helpers ────────────────────────────────────
 
     /// Scan the decoded instruction stream and collect every unique
@@ -12308,10 +12351,13 @@ impl<'a> BaselineCompiler<'a> {
         {
             let addr = jit_runtime::jit_runtime_lda_global as *const () as usize as i64;
             for &(name_idx, flat) in &self.promoted_globals.clone() {
-                // RDI = name_idx
-                self.masm.mov_ri(Reg64::Rdi, i64::from(name_idx));
+                // arg 0 = name_idx
+                self.masm
+                    .mov_ri(Self::helper_arg_reg(0), i64::from(name_idx));
                 self.masm.mov_ri(Reg64::R11, addr);
+                let adj = self.emit_helper_call_pre_adjust();
                 self.masm.call_reg(Reg64::R11);
+                self.emit_helper_call_post_adjust(adj);
                 // Store result into promoted slot: [r14 + flat*8] = rax
                 self.masm.mov_store_base_disp32(
                     Reg64::R14,
@@ -12330,13 +12376,19 @@ impl<'a> BaselineCompiler<'a> {
         {
             let addr = jit_runtime::jit_runtime_sta_global as *const () as usize as i64;
             for &(name_idx, flat) in &self.promoted_globals.clone() {
-                // RDI = name_idx
-                self.masm.mov_ri(Reg64::Rdi, i64::from(name_idx));
-                // RSI = value from promoted slot
+                // arg 0 = name_idx
                 self.masm
-                    .mov_load_base_disp32(Reg64::Rsi, Reg64::R14, Self::promoted_offset(flat));
+                    .mov_ri(Self::helper_arg_reg(0), i64::from(name_idx));
+                // arg 1 = value from promoted slot
+                self.masm.mov_load_base_disp32(
+                    Self::helper_arg_reg(1),
+                    Reg64::R14,
+                    Self::promoted_offset(flat),
+                );
                 self.masm.mov_ri(Reg64::R11, addr);
+                let adj = self.emit_helper_call_pre_adjust();
                 self.masm.call_reg(Reg64::R11);
+                self.emit_helper_call_post_adjust(adj);
             }
         }
     }
@@ -12974,12 +13026,15 @@ impl<'a> BaselineCompiler<'a> {
     fn emit_lda_global_stub(&mut self, name_idx: u32, bytecode_offset: u32) {
         #[cfg(all(target_arch = "x86_64", unix))]
         {
-            // RDI = name_idx (constant-pool index).
-            self.masm.mov_ri(Reg64::Rdi, i64::from(name_idx));
+            // arg 0 = name_idx (constant-pool index).
+            self.masm
+                .mov_ri(Self::helper_arg_reg(0), i64::from(name_idx));
 
             let addr = jit_runtime::jit_runtime_lda_global as *const () as usize as i64;
             self.masm.mov_ri(Reg64::R11, addr);
+            let adj = self.emit_helper_call_pre_adjust();
             self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_post_adjust(adj);
 
             // ── Check for deopt ─────────────────────────────────────────
             self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
@@ -13012,14 +13067,17 @@ impl<'a> BaselineCompiler<'a> {
     fn emit_sta_global_stub(&mut self, name_idx: u32, bytecode_offset: u32) {
         #[cfg(all(target_arch = "x86_64", unix))]
         {
-            // RDI = name_idx (constant-pool index).
-            self.masm.mov_ri(Reg64::Rdi, i64::from(name_idx));
-            // RSI = accumulator value (the value to store).
-            self.masm.mov_rr(Reg64::Rsi, Reg64::R12);
+            // arg 0 = name_idx (constant-pool index).
+            self.masm
+                .mov_ri(Self::helper_arg_reg(0), i64::from(name_idx));
+            // arg 1 = accumulator value (the value to store).
+            self.masm.mov_rr(Self::helper_arg_reg(1), Reg64::R12);
 
             let addr = jit_runtime::jit_runtime_sta_global as *const () as usize as i64;
             self.masm.mov_ri(Reg64::R11, addr);
+            let adj = self.emit_helper_call_pre_adjust();
             self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_post_adjust(adj);
 
             // ── Check for deopt ─────────────────────────────────────────
             self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
@@ -13054,17 +13112,19 @@ impl<'a> BaselineCompiler<'a> {
     fn emit_lda_keyed_property_stub(&mut self, obj_flat: i64, bytecode_offset: u32) {
         #[cfg(all(target_arch = "x86_64", unix))]
         {
-            // RDI = receiver object from register file.
+            // arg 0 = receiver object from register file.
             let byte_offset = (obj_flat as i32) * 8;
             self.masm
-                .mov_load_base_disp32(Reg64::Rdi, Reg64::R14, byte_offset);
+                .mov_load_base_disp32(Self::helper_arg_reg(0), Reg64::R14, byte_offset);
 
-            // RSI = key (current accumulator value).
-            self.masm.mov_rr(Reg64::Rsi, Reg64::R12);
+            // arg 1 = key (current accumulator value).
+            self.masm.mov_rr(Self::helper_arg_reg(1), Reg64::R12);
 
             let addr = jit_runtime::jit_runtime_lda_keyed_property as *const () as usize as i64;
             self.masm.mov_ri(Reg64::R11, addr);
+            let adj = self.emit_helper_call_pre_adjust();
             self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_post_adjust(adj);
 
             // ── Check for deopt ─────────────────────────────────────────
             self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
@@ -13098,22 +13158,24 @@ impl<'a> BaselineCompiler<'a> {
     fn emit_sta_keyed_property_stub(&mut self, obj_flat: i64, key_flat: i64, bytecode_offset: u32) {
         #[cfg(all(target_arch = "x86_64", unix))]
         {
-            // RDI = receiver object from register file.
+            // arg 0 = receiver object from register file.
             let obj_byte_offset = (obj_flat as i32) * 8;
             self.masm
-                .mov_load_base_disp32(Reg64::Rdi, Reg64::R14, obj_byte_offset);
+                .mov_load_base_disp32(Self::helper_arg_reg(0), Reg64::R14, obj_byte_offset);
 
-            // RSI = key from register file.
+            // arg 1 = key from register file.
             let key_byte_offset = (key_flat as i32) * 8;
             self.masm
-                .mov_load_base_disp32(Reg64::Rsi, Reg64::R14, key_byte_offset);
+                .mov_load_base_disp32(Self::helper_arg_reg(1), Reg64::R14, key_byte_offset);
 
-            // RDX = value (current accumulator).
-            self.masm.mov_rr(Reg64::Rdx, Reg64::R12);
+            // arg 2 = value (current accumulator).
+            self.masm.mov_rr(Self::helper_arg_reg(2), Reg64::R12);
 
             let addr = jit_runtime::jit_runtime_sta_keyed_property as *const () as usize as i64;
             self.masm.mov_ri(Reg64::R11, addr);
+            let adj = self.emit_helper_call_pre_adjust();
             self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_post_adjust(adj);
 
             // ── Check for deopt ─────────────────────────────────────────
             self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
@@ -13147,14 +13209,17 @@ impl<'a> BaselineCompiler<'a> {
     fn emit_lda_context_slot_stub(&mut self, slot_idx: u32, bytecode_offset: u32) {
         #[cfg(all(target_arch = "x86_64", unix))]
         {
-            // RDI = ctx_raw (from RBX), RSI = slot_idx.
-            self.masm.mov_rr(Reg64::Rdi, Reg64::Rbx);
-            self.masm.mov_ri(Reg64::Rsi, i64::from(slot_idx));
+            // arg 0 = ctx_raw (from RBX), arg 1 = slot_idx.
+            self.masm.mov_rr(Self::helper_arg_reg(0), Reg64::Rbx);
+            self.masm
+                .mov_ri(Self::helper_arg_reg(1), i64::from(slot_idx));
 
             let addr =
                 jit_runtime::jit_runtime_lda_context_slot_direct as *const () as usize as i64;
             self.masm.mov_ri(Reg64::R11, addr);
+            let adj = self.emit_helper_call_pre_adjust();
             self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_post_adjust(adj);
 
             // ── Check for deopt ─────────────────────────────────────────
             self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
@@ -13186,15 +13251,18 @@ impl<'a> BaselineCompiler<'a> {
     fn emit_sta_context_slot_stub(&mut self, slot_idx: u32, bytecode_offset: u32) {
         #[cfg(all(target_arch = "x86_64", unix))]
         {
-            // RDI = ctx_raw (from RBX), RSI = slot_idx, RDX = value (R12).
-            self.masm.mov_rr(Reg64::Rdi, Reg64::Rbx);
-            self.masm.mov_ri(Reg64::Rsi, i64::from(slot_idx));
-            self.masm.mov_rr(Reg64::Rdx, Reg64::R12);
+            // arg 0 = ctx_raw (from RBX), arg 1 = slot_idx, arg 2 = value (R12).
+            self.masm.mov_rr(Self::helper_arg_reg(0), Reg64::Rbx);
+            self.masm
+                .mov_ri(Self::helper_arg_reg(1), i64::from(slot_idx));
+            self.masm.mov_rr(Self::helper_arg_reg(2), Reg64::R12);
 
             let addr =
                 jit_runtime::jit_runtime_sta_context_slot_direct as *const () as usize as i64;
             self.masm.mov_ri(Reg64::R11, addr);
+            let adj = self.emit_helper_call_pre_adjust();
             self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_post_adjust(adj);
 
             // ── Check for deopt ─────────────────────────────────────────
             self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
@@ -13224,20 +13292,23 @@ impl<'a> BaselineCompiler<'a> {
     fn emit_sta_named_property_stub(&mut self, obj_flat: i64, name_idx: u32, bytecode_offset: u32) {
         #[cfg(all(target_arch = "x86_64", unix))]
         {
-            // RDI = receiver object from register file.
+            // arg 0 = receiver object from register file.
             let obj_byte_offset = (obj_flat as i32) * 8;
             self.masm
-                .mov_load_base_disp32(Reg64::Rdi, Reg64::R14, obj_byte_offset);
+                .mov_load_base_disp32(Self::helper_arg_reg(0), Reg64::R14, obj_byte_offset);
 
-            // RSI = name_idx (constant-pool index).
-            self.masm.mov_ri(Reg64::Rsi, i64::from(name_idx));
+            // arg 1 = name_idx (constant-pool index).
+            self.masm
+                .mov_ri(Self::helper_arg_reg(1), i64::from(name_idx));
 
-            // RDX = value (current accumulator).
-            self.masm.mov_rr(Reg64::Rdx, Reg64::R12);
+            // arg 2 = value (current accumulator).
+            self.masm.mov_rr(Self::helper_arg_reg(2), Reg64::R12);
 
             let addr = jit_runtime::jit_runtime_sta_named_property as *const () as usize as i64;
             self.masm.mov_ri(Reg64::R11, addr);
+            let adj = self.emit_helper_call_pre_adjust();
             self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_post_adjust(adj);
 
             // ── Check for deopt ─────────────────────────────────────────
             self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
@@ -13272,19 +13343,24 @@ impl<'a> BaselineCompiler<'a> {
     ) {
         #[cfg(all(target_arch = "x86_64", unix))]
         {
-            // RDI = callee from register file.
+            // arg 0 = callee from register file.
             let callee_byte_offset = (callee_flat as i32) * 8;
             self.masm
-                .mov_load_base_disp32(Reg64::Rdi, Reg64::R14, callee_byte_offset);
+                .mov_load_base_disp32(Self::helper_arg_reg(0), Reg64::R14, callee_byte_offset);
 
-            // RSI = receiver from register file.
+            // arg 1 = receiver from register file.
             let receiver_byte_offset = (receiver_flat as i32) * 8;
-            self.masm
-                .mov_load_base_disp32(Reg64::Rsi, Reg64::R14, receiver_byte_offset);
+            self.masm.mov_load_base_disp32(
+                Self::helper_arg_reg(1),
+                Reg64::R14,
+                receiver_byte_offset,
+            );
 
             let addr = jit_runtime::jit_runtime_call_property0 as *const () as usize as i64;
             self.masm.mov_ri(Reg64::R11, addr);
+            let adj = self.emit_helper_call_pre_adjust();
             self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_post_adjust(adj);
 
             // ── Check for deopt ─────────────────────────────────────────
             self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
@@ -13320,24 +13396,29 @@ impl<'a> BaselineCompiler<'a> {
     ) {
         #[cfg(all(target_arch = "x86_64", unix))]
         {
-            // RDI = callee from register file.
+            // arg 0 = callee from register file.
             let callee_byte_offset = (callee_flat as i32) * 8;
             self.masm
-                .mov_load_base_disp32(Reg64::Rdi, Reg64::R14, callee_byte_offset);
+                .mov_load_base_disp32(Self::helper_arg_reg(0), Reg64::R14, callee_byte_offset);
 
-            // RSI = receiver from register file.
+            // arg 1 = receiver from register file.
             let receiver_byte_offset = (receiver_flat as i32) * 8;
-            self.masm
-                .mov_load_base_disp32(Reg64::Rsi, Reg64::R14, receiver_byte_offset);
+            self.masm.mov_load_base_disp32(
+                Self::helper_arg_reg(1),
+                Reg64::R14,
+                receiver_byte_offset,
+            );
 
-            // RDX = arg0 from register file.
+            // arg 2 = arg0 from register file.
             let arg0_byte_offset = (arg0_flat as i32) * 8;
             self.masm
-                .mov_load_base_disp32(Reg64::Rdx, Reg64::R14, arg0_byte_offset);
+                .mov_load_base_disp32(Self::helper_arg_reg(2), Reg64::R14, arg0_byte_offset);
 
             let addr = jit_runtime::jit_runtime_call_property1 as *const () as usize as i64;
             self.masm.mov_ri(Reg64::R11, addr);
+            let adj = self.emit_helper_call_pre_adjust();
             self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_post_adjust(adj);
 
             // ── Check for deopt ─────────────────────────────────────────
             self.masm.mov_ri(Reg64::R11, JIT_DEOPT);
