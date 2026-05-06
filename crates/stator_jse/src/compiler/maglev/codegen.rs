@@ -4739,9 +4739,9 @@ impl<'a> MaglevCodegen<'a> {
 
         // k * trip_count as a single compile-time constant.
         let k_times_n = k.wrapping_mul(i64::from(trip_count));
-        self.masm.mov_ri(Reg64::Rdi, k_times_n);
+        self.masm.mov_ri(Reg64::R11, k_times_n);
 
-        self.masm.add_rr(Reg64::Rax, Reg64::Rdi);
+        self.masm.add_rr(Reg64::Rax, Reg64::R11);
 
         self.masm.movsxd_sign_extend(Reg64::R11, Reg64::Rax);
         self.masm.cmp_rr(Reg64::R11, Reg64::Rax);
@@ -7672,9 +7672,9 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.emit_byte(0x20);
                 // RAX = i32 Smi value (sign-extended to i64).
 
-                // Save old value in RDI for post-increment ops.
-                // MOV RDI, RAX (always, branch-free; unused for pre-ops).
-                self.masm.mov_rr(Reg64::Rdi, Reg64::Rax);
+                // Save old value in RDX for post-increment ops.
+                // MOV RDX, RAX (always, branch-free; unused for pre-ops).
+                self.masm.mov_rr(Reg64::Rdx, Reg64::Rax);
 
                 // Load pre-computed delta and add in one step.
                 // Delta is computed by jit_runtime_analyze_callee_inline:
@@ -7709,9 +7709,9 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.cmp_ri(Reg64::Rcx, 4);
                 let mut pre_op_result = Label::new();
                 self.masm.jcc(CondCode::Less, &mut pre_op_result);
-                // Post-op: result = old value (RDI).
-                // MOV RAX, RDI
-                self.masm.mov_rr(Reg64::Rax, Reg64::Rdi);
+                // Post-op: result = old value (RDX).
+                // MOV RAX, RDX
+                self.masm.mov_rr(Reg64::Rax, Reg64::Rdx);
                 self.masm.bind_label(&mut pre_op_result);
 
                 // Extract result for caller: SAR RAX, 32.
@@ -7870,12 +7870,12 @@ impl<'a> MaglevCodegen<'a> {
         let mut skip_extra_zero = Label::new();
         self.masm.jcc(CondCode::LessEq, &mut skip_extra_zero);
         self.masm.sub_ri(Reg64::Rcx, 4);
-        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
-        self.masm.add_ri(Reg64::Rdi, 32);
+        self.masm.mov_rr(Reg64::Rdx, Reg64::Rsp);
+        self.masm.add_ri(Reg64::Rdx, 32);
         let mut extra_zero_loop = Label::new();
         self.masm.bind_label(&mut extra_zero_loop);
-        self.masm.mov_store_base_disp32(Reg64::Rdi, 0, Reg64::Rax);
-        self.masm.add_ri(Reg64::Rdi, 8);
+        self.masm.mov_store_base_disp32(Reg64::Rdx, 0, Reg64::Rax);
+        self.masm.add_ri(Reg64::Rdx, 8);
         self.masm.sub_ri(Reg64::Rcx, 1);
         self.masm.jne(&mut extra_zero_loop);
         self.masm.bind_label(&mut skip_extra_zero);
@@ -7990,14 +7990,14 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
         self.masm
             .mov_load_base_disp32(Reg64::Rcx, Reg64::Rbp, off_reg_slots);
-        self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
+        self.masm.mov_rr(Reg64::Rdx, Reg64::Rsp);
         self.masm.test_rr(Reg64::Rcx, Reg64::Rcx);
         let mut miss_skip_zero = Label::new();
         self.masm.je(&mut miss_skip_zero);
         let mut miss_zero_loop = Label::new();
         self.masm.bind_label(&mut miss_zero_loop);
-        self.masm.mov_store_base_disp32(Reg64::Rdi, 0, Reg64::Rax);
-        self.masm.add_ri(Reg64::Rdi, 8);
+        self.masm.mov_store_base_disp32(Reg64::Rdx, 0, Reg64::Rax);
+        self.masm.add_ri(Reg64::Rdx, 8);
         self.masm.sub_ri(Reg64::Rcx, 1);
         self.masm.jne(&mut miss_zero_loop);
         self.masm.bind_label(&mut miss_skip_zero);
@@ -8069,15 +8069,15 @@ impl<'a> MaglevCodegen<'a> {
     fn emit_direct_call_1(&mut self, id: NodeId, callee: NodeId, arg0: NodeId) {
         let saved = self.emit_save_live_regs(id);
 
-        // Load callee and arg0 into registers, then save to stack.
-        self.emit_load(callee, Reg64::Rdi);
-        self.emit_load(arg0, Reg64::Rsi);
+        // Load callee and arg0 into scratch registers, then save to stack.
+        self.emit_load(callee, Reg64::R10);
+        self.emit_load(arg0, Reg64::R11);
         // Push arg0, callee (2 pushes → RSP ≡ 0 mod 16).
-        self.masm.push(Reg64::Rsi); // arg0
-        self.masm.push(Reg64::Rdi); // callee
+        self.masm.push(Reg64::R11); // arg0
+        self.masm.push(Reg64::R10); // callee
 
         // Call jit_runtime_get_jit_entry(callee_i64).
-        self.emit_helper_arg_reg(0, Reg64::Rdi);
+        self.emit_helper_arg_reg(0, Reg64::R10);
         let get_entry_addr = jit_runtime::jit_runtime_get_jit_entry as *const () as usize;
         self.emit_helper_call_addr(get_entry_addr as i64);
 
@@ -8161,18 +8161,18 @@ impl<'a> MaglevCodegen<'a> {
         let saved = self.emit_save_live_regs(id);
 
         // Load all three values before pushing (avoids clobbering issues).
-        self.emit_load(callee, Reg64::Rdi);
-        self.emit_load(arg0, Reg64::Rsi);
-        self.emit_load(arg1, Reg64::Rdx);
+        self.emit_load(callee, Reg64::R10);
+        self.emit_load(arg0, Reg64::R11);
+        self.emit_load(arg1, Reg64::Rax);
         // 4 pushes → RSP ≡ 0 mod 16 (even count, but we started at
         // 0 mod 16, so 4×8 = 32 → still 0 mod 16).
-        self.masm.push(Reg64::Rdx); // arg1
-        self.masm.push(Reg64::Rsi); // arg0
-        self.masm.push(Reg64::Rdi); // callee
-        self.masm.push(Reg64::Rdi); // padding
+        self.masm.push(Reg64::Rax); // arg1
+        self.masm.push(Reg64::R11); // arg0
+        self.masm.push(Reg64::R10); // callee
+        self.masm.push(Reg64::R10); // padding
 
         // Call jit_runtime_get_jit_entry(callee_i64).
-        self.emit_helper_arg_reg(0, Reg64::Rdi);
+        self.emit_helper_arg_reg(0, Reg64::R10);
         let get_entry_addr = jit_runtime::jit_runtime_get_jit_entry as *const () as usize;
         self.emit_helper_call_addr(get_entry_addr as i64);
 
