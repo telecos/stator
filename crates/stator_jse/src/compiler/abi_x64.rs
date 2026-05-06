@@ -194,6 +194,81 @@ impl AbiX64 {
     pub const fn entry_must_preserve_rdi_rsi(self) -> bool {
         matches!(self, AbiX64::Win64)
     }
+
+    /// Maglev's allocatable physical-register **bank**, in
+    /// register-allocator-index order.
+    ///
+    /// Index `n` returned by the Maglev linear-scan allocator
+    /// corresponds to the `n`-th [`Reg64`] in this slice.  The bank is
+    /// currently identical for SysV and Win64:
+    ///
+    /// ```text
+    /// 0:RBX 1:RCX 2:RDX 3:RSI 4:R8 5:R9 6:R13 7:R12 8:R15
+    /// ```
+    ///
+    /// `RSI` is a SysV scratch register and a Win64 *callee-saved*
+    /// register — leaving it in the bank under Win64 is safe because
+    /// the JIT prologue/epilogue (see [`Self::extra_entry_callee_saved`])
+    /// already saves and restores it.  Helper-call clobber metadata,
+    /// however, *does* differ between ABIs and is exposed via
+    /// [`Self::maglev_caller_saved_indices`] /
+    /// [`Self::maglev_caller_saved_mask`].
+    pub const fn maglev_allocatable_registers(self) -> &'static [Reg64] {
+        // The bank is the same under both ABIs today; the only ABI
+        // variation lives in the caller-saved subset below.
+        const BANK: &[Reg64] = &[
+            Reg64::Rbx,
+            Reg64::Rcx,
+            Reg64::Rdx,
+            Reg64::Rsi,
+            Reg64::R8,
+            Reg64::R9,
+            Reg64::R13,
+            Reg64::R12,
+            Reg64::R15,
+        ];
+        let _ = self;
+        BANK
+    }
+
+    /// Number of allocatable physical registers Maglev exposes for a
+    /// function compiled under this ABI.
+    pub const fn maglev_register_bank_size(self) -> u32 {
+        self.maglev_allocatable_registers().len() as u32
+    }
+
+    /// Indices into [`Self::maglev_allocatable_registers`] whose
+    /// physical register is **caller-clobbered** across an
+    /// `extern "C"` helper / runtime call under this ABI.
+    ///
+    /// These are exactly the bank entries the Maglev codegen must
+    /// save around a helper call (in addition to scratch registers
+    /// outside the bank such as `RAX` / `R11`).
+    ///
+    /// - **SysV**: `RCX(1), RDX(2), RSI(3), R8(4), R9(5)`.
+    /// - **Win64**: `RCX(1), RDX(2), R8(4), R9(5)` — `RSI(3)` is
+    ///   non-volatile and is preserved by the JIT prologue.
+    pub const fn maglev_caller_saved_indices(self) -> &'static [u32] {
+        match self {
+            AbiX64::SysV => &[1, 2, 3, 4, 5],
+            AbiX64::Win64 => &[1, 2, 4, 5],
+        }
+    }
+
+    /// Bitmask form of [`Self::maglev_caller_saved_indices`]: bit `i`
+    /// is set iff bank index `i` is caller-clobbered under this ABI.
+    ///
+    /// The mask is intentionally narrow (`u8`) — current bank
+    /// caller-saved indices all fit in the low 8 bits.  An
+    /// out-of-range index would be a bug in
+    /// [`Self::maglev_caller_saved_indices`]; the unit tests in this
+    /// module cross-check the two representations.
+    pub const fn maglev_caller_saved_mask(self) -> u8 {
+        match self {
+            AbiX64::SysV => (1u8 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5),
+            AbiX64::Win64 => (1u8 << 1) | (1 << 2) | (1 << 4) | (1 << 5),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -439,5 +514,169 @@ mod tests {
                 Reg64::Rdi
             }
         );
+    }
+
+    /// The Maglev allocatable register bank is the contract between
+    /// the (ABI-agnostic) linear-scan allocator and the (ABI-specific)
+    /// codegen.  Its layout — including `Rsi` at index 3 — is locked
+    /// in for both ABIs.  Win64 keeps `Rsi` allocatable because the
+    /// JIT prologue saves it via `extra_entry_callee_saved`.
+    #[test]
+    fn maglev_bank_layout_is_stable_for_both_abis() {
+        let expected: &[Reg64] = &[
+            Reg64::Rbx,
+            Reg64::Rcx,
+            Reg64::Rdx,
+            Reg64::Rsi,
+            Reg64::R8,
+            Reg64::R9,
+            Reg64::R13,
+            Reg64::R12,
+            Reg64::R15,
+        ];
+        for abi in [AbiX64::SysV, AbiX64::Win64] {
+            assert_eq!(
+                abi.maglev_allocatable_registers(),
+                expected,
+                "Maglev bank changed for {:?} — review caller-saved \
+                 indices and codegen `phys_reg` mapping together",
+                abi
+            );
+            assert_eq!(abi.maglev_register_bank_size(), expected.len() as u32);
+        }
+    }
+
+    /// SysV must keep its current Maglev caller-saved set (RCX, RDX,
+    /// RSI, R8, R9 → indices 1..=5).  Any drift here would silently
+    /// change spill behaviour at every helper-call site.
+    #[test]
+    fn maglev_caller_saved_sysv_matches_legacy_indices_1_to_5() {
+        let abi = AbiX64::SysV;
+        assert_eq!(abi.maglev_caller_saved_indices(), &[1, 2, 3, 4, 5]);
+        assert_eq!(
+            abi.maglev_caller_saved_mask(),
+            (1u8 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5)
+        );
+    }
+
+    /// Win64 helper calls must **not** clobber `RSI` (it is
+    /// non-volatile on Win64 and is preserved by the JIT prologue),
+    /// but they do clobber `RCX, RDX, R8, R9`.
+    #[test]
+    fn maglev_caller_saved_win64_excludes_rsi() {
+        let abi = AbiX64::Win64;
+        let bank = abi.maglev_allocatable_registers();
+        let indices = abi.maglev_caller_saved_indices();
+        // RSI lives at bank index 3 — explicitly assert it is absent.
+        assert_eq!(bank[3], Reg64::Rsi);
+        assert!(
+            !indices.contains(&3),
+            "Win64 maglev_caller_saved_indices must exclude RSI (index 3): {:?}",
+            indices
+        );
+        assert_eq!(indices, &[1, 2, 4, 5]);
+
+        // Cross-check the mask form.
+        let expected_mask = (1u8 << 1) | (1 << 2) | (1 << 4) | (1 << 5);
+        assert_eq!(abi.maglev_caller_saved_mask(), expected_mask);
+        assert_eq!(abi.maglev_caller_saved_mask() & (1u8 << 3), 0);
+
+        // And cross-check that every named-volatile bank entry is
+        // actually a Win64 volatile integer register.
+        for &i in indices {
+            let r = bank[i as usize];
+            assert!(
+                matches!(r, Reg64::Rcx | Reg64::Rdx | Reg64::R8 | Reg64::R9),
+                "bank[{}] = {:?} is not a Win64 volatile integer reg",
+                i,
+                r
+            );
+        }
+    }
+
+    /// `maglev_caller_saved_mask` and `maglev_caller_saved_indices`
+    /// must agree bit-for-bit on every ABI, and every advertised
+    /// caller-saved index must fall inside the allocatable bank.
+    #[test]
+    fn maglev_caller_saved_mask_matches_indices() {
+        for abi in [AbiX64::SysV, AbiX64::Win64] {
+            let bank_size = abi.maglev_register_bank_size();
+            let mut from_indices: u8 = 0;
+            for &i in abi.maglev_caller_saved_indices() {
+                assert!(
+                    i < bank_size,
+                    "caller-saved index {} out of bank ({}) for {:?}",
+                    i,
+                    bank_size,
+                    abi
+                );
+                assert!(
+                    i < 8,
+                    "caller-saved index {} would not fit in u8 mask for {:?}",
+                    i,
+                    abi
+                );
+                from_indices |= 1u8 << i;
+            }
+            assert_eq!(
+                from_indices,
+                abi.maglev_caller_saved_mask(),
+                "indices/mask disagree for {:?}",
+                abi
+            );
+        }
+    }
+
+    /// The Maglev caller-saved set must be a subset of the registers
+    /// the Win64/SysV ABI actually treats as volatile across a C call.
+    /// In particular, on Win64 the set must avoid the non-volatile
+    /// integer registers that the JIT prologue already preserves.
+    #[test]
+    fn maglev_caller_saved_does_not_overlap_callee_saved() {
+        // Universal integer callee-saves (both ABIs).  RBP is the
+        // frame pointer and is intentionally excluded from the bank.
+        let universal_callee_saved = [Reg64::Rbx, Reg64::R12, Reg64::R13, Reg64::R14, Reg64::R15];
+        for abi in [AbiX64::SysV, AbiX64::Win64] {
+            let bank = abi.maglev_allocatable_registers();
+            for &i in abi.maglev_caller_saved_indices() {
+                let r = bank[i as usize];
+                assert!(
+                    !universal_callee_saved.contains(&r),
+                    "{:?} bank[{}] = {:?} is callee-saved on both ABIs and \
+                     must not appear in maglev_caller_saved_indices()",
+                    abi,
+                    i,
+                    r
+                );
+            }
+        }
+        // Win64-only: RDI/RSI are also callee-saved and must be
+        // absent from the Win64 caller-saved set.
+        let bank = AbiX64::Win64.maglev_allocatable_registers();
+        for &i in AbiX64::Win64.maglev_caller_saved_indices() {
+            let r = bank[i as usize];
+            assert!(
+                r != Reg64::Rdi && r != Reg64::Rsi,
+                "Win64 bank[{}] = {:?} is callee-saved on Win64",
+                i,
+                r
+            );
+        }
+    }
+
+    /// The bank/mask helpers must remain `const fn`-callable so the
+    /// codegen can build static tables from them.
+    #[test]
+    fn maglev_bank_helpers_are_const_evaluable() {
+        const SYSV_BANK_LEN: u32 = AbiX64::SysV.maglev_register_bank_size();
+        const WIN_BANK_LEN: u32 = AbiX64::Win64.maglev_register_bank_size();
+        const SYSV_MASK: u8 = AbiX64::SysV.maglev_caller_saved_mask();
+        const WIN_MASK: u8 = AbiX64::Win64.maglev_caller_saved_mask();
+        const NATIVE_MASK: u8 = NATIVE_ABI.maglev_caller_saved_mask();
+        assert_eq!(SYSV_BANK_LEN, 9);
+        assert_eq!(WIN_BANK_LEN, 9);
+        assert_ne!(SYSV_MASK, 0);
+        assert_ne!(WIN_MASK, 0);
+        assert!(NATIVE_MASK == SYSV_MASK || NATIVE_MASK == WIN_MASK);
     }
 }

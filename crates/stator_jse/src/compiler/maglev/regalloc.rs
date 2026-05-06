@@ -52,6 +52,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::compiler::abi_x64::NATIVE_ABI;
 use crate::compiler::maglev::ir::{ControlNode, MaglevGraph, NodeId, ValueNode};
 use crate::compiler::maglev::licm::detect_loops;
 
@@ -78,10 +79,16 @@ pub struct AllocationResult {
     /// Total number of stack slots allocated (i.e. the required stack-frame
     /// size in slots).
     spill_count: u32,
-    /// Per-node bitmask of caller-saved allocatable registers (indices 1–5:
-    /// RCX, RDX, RSI, R8, R9) that hold live values **across** that node.
-    /// A register is included only when its value is still needed *after* the
-    /// node, so stub-call arguments consumed at the call site are excluded.
+    /// Per-node bitmask of caller-saved allocatable registers (bits
+    /// indexed by Maglev's allocator-index space — see
+    /// [`crate::compiler::abi_x64::AbiX64::maglev_caller_saved_indices`])
+    /// that hold live values **across** that node.  A register is
+    /// included only when its value is still needed *after* the node,
+    /// so stub-call arguments consumed at the call site are excluded.
+    ///
+    /// The set of bits that may appear in this mask is ABI-dependent
+    /// (e.g. on Win64 bit 3 / `RSI` is callee-saved and never
+    /// appears).
     live_caller_saved: HashMap<NodeId, u8>,
 }
 
@@ -97,9 +104,13 @@ impl AllocationResult {
         self.spill_count
     }
 
-    /// Returns a bitmask of caller-saved allocatable registers (bits 1–5)
-    /// that hold values live *across* the given node.  Returns `0` when no
-    /// caller-saved register needs saving at that point.
+    /// Returns a bitmask of caller-saved allocatable register indices
+    /// that hold values live *across* the given node.  Bit positions
+    /// match the Maglev allocator-index space; the set of bits that
+    /// can ever be set is ABI-dependent (see
+    /// [`crate::compiler::abi_x64::AbiX64::maglev_caller_saved_indices`]).
+    /// Returns `0` when no caller-saved register needs saving at that
+    /// point.
     pub fn live_caller_saved_at(&self, id: NodeId) -> u8 {
         self.live_caller_saved.get(&id).copied().unwrap_or(0)
     }
@@ -726,6 +737,14 @@ fn collect_control_inputs(ctrl: &ControlNode, f: &mut impl FnMut(NodeId)) {
 /// the active interval with the farthest endpoint is spilled if it ends later
 /// than the current interval, otherwise the current interval is spilled.
 ///
+/// # ABI
+///
+/// The caller-saved liveness mask exposed via
+/// [`AllocationResult::live_caller_saved_at`] is computed for the
+/// **host ABI** ([`NATIVE_ABI`]).  Use [`allocate_with_caller_saved`]
+/// to override the caller-saved bank-index set explicitly (e.g. from
+/// unit tests targeting a non-host ABI).
+///
 /// # Loop awareness
 ///
 /// The current implementation does **not** weight spill decisions by loop
@@ -739,6 +758,23 @@ fn collect_control_inputs(ctrl: &ControlNode, f: &mut impl FnMut(NodeId)) {
 ///
 /// Panics if `num_regs` is `0`.
 pub fn allocate(graph: &MaglevGraph, num_regs: u32) -> AllocationResult {
+    allocate_with_caller_saved(graph, num_regs, NATIVE_ABI.maglev_caller_saved_mask())
+}
+
+/// Like [`allocate`], but takes an explicit `caller_saved_mask` over
+/// the Maglev allocator-index space.  Bit `i` set means "register
+/// allocated to bank index `i` is caller-clobbered across an
+/// `extern "C"` call under the target ABI" and so should appear in
+/// [`AllocationResult::live_caller_saved_at`] when live across a node.
+///
+/// This separation keeps the linear-scan core ABI-agnostic: the
+/// allocator never assumes that any particular contiguous index range
+/// is caller-saved.
+pub fn allocate_with_caller_saved(
+    graph: &MaglevGraph,
+    num_regs: u32,
+    caller_saved_mask: u8,
+) -> AllocationResult {
     assert!(num_regs > 0, "allocate: num_regs must be > 0");
 
     let mut intervals = compute_live_intervals(graph);
@@ -924,8 +960,10 @@ pub fn allocate(graph: &MaglevGraph, num_regs: u32) -> AllocationResult {
     // ── Per-node caller-saved liveness ──────────────────────────────────────
     //
     // For each node at program point P, compute a bitmask of caller-saved
-    // register indices (1–5) whose live intervals span *across* P, i.e. the
-    // value is defined before P and still needed after P.  This lets codegen
+    // register *bank indices* whose live intervals span *across* P, i.e. the
+    // value is defined before P and still needed after P.  Which indices count
+    // as caller-saved is supplied by `caller_saved_mask` so the allocator
+    // never bakes in a SysV-specific contiguous range.  This lets codegen
     // save only the registers that are truly live at each stub-call site.
 
     // Collect intervals that ended up in caller-saved registers.
@@ -933,9 +971,10 @@ pub fn allocate(graph: &MaglevGraph, num_regs: u32) -> AllocationResult {
         .iter()
         .filter_map(|iv| {
             if let Some(Location::Register(n)) = assignments.get(&iv.id)
-                && (1..=5).contains(n)
+                && *n < 8
+                && caller_saved_mask & (1u8 << *n) != 0
             {
-                return Some((iv.start, iv.end, 1u8 << n));
+                return Some((iv.start, iv.end, 1u8 << *n));
             }
             None
         })
@@ -1529,5 +1568,140 @@ mod tests {
         // With enough registers the original allocation should have no
         // conflicts (verified by the standard helper).
         assert_no_conflicts(&graph, &result, 4);
+    }
+
+    // ── Tests: ABI-aware caller-saved liveness ───────────────────────────────
+
+    use crate::compiler::abi_x64::AbiX64;
+
+    /// Build a small graph that keeps low-bank-index values live past
+    /// the definition of a later node, so the caller-saved liveness
+    /// pass has something to record.
+    ///
+    /// Layout (program points): pp0=v0, pp1=v1, pp2=v2, pp3=v3,
+    /// pp4=t0=v0+v1, pp5=t1=t0+v2, pp6=t2=t1+v3.  At pp4 (`t0`'s
+    /// definition) `v3` is still alive — and with 4 registers the
+    /// linear-scan order assigns `v3` to bank index 3, which the
+    /// caller-saved-liveness pass should flag for SysV but never for
+    /// Win64.
+    fn graph_with_long_lived_values() -> MaglevGraph {
+        let mut graph = MaglevGraph::new(0);
+        let mut block = BasicBlock::new(0);
+        let v0 = block.push_value(ValueNode::Int32Constant { value: 0 });
+        let v1 = block.push_value(ValueNode::Int32Constant { value: 1 });
+        let v2 = block.push_value(ValueNode::Int32Constant { value: 2 });
+        let v3 = block.push_value(ValueNode::Int32Constant { value: 3 });
+        let t0 = block.push_value(ValueNode::Int32Add {
+            left: v0,
+            right: v1,
+        });
+        let t1 = block.push_value(ValueNode::Int32Add {
+            left: t0,
+            right: v2,
+        });
+        let t2 = block.push_value(ValueNode::Int32Add {
+            left: t1,
+            right: v3,
+        });
+        block.set_control(ControlNode::Return { value: t2 });
+        graph.add_block(block);
+        graph
+    }
+
+    #[test]
+    fn live_caller_saved_uses_supplied_mask_not_hardcoded_range() {
+        let graph = graph_with_long_lived_values();
+
+        // 1) An empty caller-saved mask must produce an empty
+        //    per-node liveness map even though caller-saved bank
+        //    indices are assigned — proving the allocator no longer
+        //    bakes in the legacy `1..=5` range.
+        let empty = allocate_with_caller_saved(&graph, 4, 0u8);
+        for (nid, _) in &graph.blocks()[0].nodes {
+            assert_eq!(
+                empty.live_caller_saved_at(*nid),
+                0,
+                "with empty caller-saved mask, node {:?} must report 0",
+                nid
+            );
+        }
+
+        // 2) The SysV mask must flag at least one node where a
+        //    caller-saved register holds a value live across that
+        //    node, and every reported bit must be inside the supplied
+        //    SysV mask.
+        let sysv = allocate_with_caller_saved(&graph, 4, AbiX64::SysV.maglev_caller_saved_mask());
+        let any_set = graph.blocks()[0]
+            .nodes
+            .iter()
+            .any(|(nid, _)| sysv.live_caller_saved_at(*nid) != 0);
+        assert!(
+            any_set,
+            "expected SysV mask to flag at least one node as having a \
+             caller-saved register live across it"
+        );
+        for (nid, _) in &graph.blocks()[0].nodes {
+            let m = sysv.live_caller_saved_at(*nid);
+            assert_eq!(
+                m & !AbiX64::SysV.maglev_caller_saved_mask(),
+                0,
+                "SysV liveness mask {:#b} contains bits outside the \
+                 ABI's caller-saved set at {:?}",
+                m,
+                nid
+            );
+        }
+    }
+
+    /// The Win64 caller-saved mask must *never* set bit 3 (RSI) in
+    /// the per-node liveness map, even when bank index 3 is assigned
+    /// and live across a node — RSI is callee-saved on Win64.
+    #[test]
+    fn live_caller_saved_under_win64_never_sets_rsi_bit() {
+        let graph = graph_with_long_lived_values();
+        let win = allocate_with_caller_saved(&graph, 4, AbiX64::Win64.maglev_caller_saved_mask());
+        for (nid, _) in &graph.blocks()[0].nodes {
+            let mask = win.live_caller_saved_at(*nid);
+            assert_eq!(
+                mask & (1u8 << 3),
+                0,
+                "Win64 caller-saved liveness mask must not set bit 3 \
+                 (RSI is non-volatile on Win64); got {:#b} at {:?}",
+                mask,
+                nid
+            );
+            assert_eq!(
+                mask & !AbiX64::Win64.maglev_caller_saved_mask(),
+                0,
+                "Win64 liveness mask {:#b} contains bits outside the \
+                 ABI's caller-saved set {:#b}",
+                mask,
+                AbiX64::Win64.maglev_caller_saved_mask()
+            );
+        }
+    }
+
+    /// The default `allocate` wrapper must produce the same
+    /// caller-saved liveness results as
+    /// `allocate_with_caller_saved(NATIVE_ABI mask)`.  Pins down that
+    /// SysV behaviour is preserved on SysV hosts and Win64 behaviour
+    /// is in effect on Win64 hosts.
+    #[test]
+    fn allocate_defaults_match_native_abi_mask() {
+        let graph = graph_with_long_lived_values();
+        let default_result = allocate(&graph, 4);
+        let explicit_result = allocate_with_caller_saved(
+            &graph,
+            4,
+            crate::compiler::abi_x64::NATIVE_ABI.maglev_caller_saved_mask(),
+        );
+        for (nid, _) in &graph.blocks()[0].nodes {
+            assert_eq!(
+                default_result.live_caller_saved_at(*nid),
+                explicit_result.live_caller_saved_at(*nid),
+                "default `allocate` diverges from NATIVE_ABI mask at {:?}",
+                nid
+            );
+        }
     }
 }

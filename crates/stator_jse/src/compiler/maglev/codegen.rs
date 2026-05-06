@@ -111,7 +111,12 @@ pub fn codegen_globals_promoted_count() -> u32 {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Number of physical registers available to the Maglev register allocator.
-pub const NUM_PHYS_REGS: u32 = 9;
+///
+/// Sourced from the host ABI's [`maglev_register_bank_size`][bs] so the
+/// allocator-index space and the [`phys_reg`] mapping never drift.
+///
+/// [bs]: crate::compiler::abi_x64::AbiX64::maglev_register_bank_size
+pub const NUM_PHYS_REGS: u32 = crate::compiler::abi_x64::NATIVE_ABI.maglev_register_bank_size();
 
 /// Number of allocatable registers tracked by the `reg_holds` forwarding
 /// cache: RBX(0), RCX(1), RDX(2), RSI(3), R8(4), R9(5).
@@ -434,22 +439,23 @@ impl CachedMaglevCode {
 /// Map a register-allocator index (0 – [`NUM_PHYS_REGS`]-1) to the
 /// corresponding x86-64 [`Reg64`].
 ///
+/// The mapping comes from the host ABI's
+/// [`maglev_allocatable_registers`][bank] table so every consumer of
+/// the Maglev allocator sees the same index → physical-register
+/// contract.
+///
+/// [bank]: crate::compiler::abi_x64::AbiX64::maglev_allocatable_registers
+///
 /// # Panics
 ///
 /// Panics when `n >= NUM_PHYS_REGS`.
 fn phys_reg(n: u32) -> Reg64 {
-    match n {
-        0 => Reg64::Rbx,
-        1 => Reg64::Rcx,
-        2 => Reg64::Rdx,
-        3 => Reg64::Rsi,
-        4 => Reg64::R8,
-        5 => Reg64::R9,
-        6 => Reg64::R13,
-        7 => Reg64::R12,
-        8 => Reg64::R15,
-        _ => panic!("phys_reg: index {n} out of range (NUM_PHYS_REGS = {NUM_PHYS_REGS})"),
+    let bank = crate::compiler::abi_x64::NATIVE_ABI.maglev_allocatable_registers();
+    let idx = n as usize;
+    if idx >= bank.len() {
+        panic!("phys_reg: index {n} out of range (NUM_PHYS_REGS = {NUM_PHYS_REGS})");
     }
+    bank[idx]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -684,6 +690,10 @@ impl<'a> MaglevCodegen<'a> {
     fn new(graph: &'a MaglevGraph, alloc: &'a AllocationResult, param_count: u32) -> Self {
         let num_blocks = graph.blocks().len();
         // Precompute which caller-saved registers are actually allocated.
+        // The set of bank indices that count as caller-saved is sourced
+        // from the host ABI so this stays correct under both SysV
+        // (RCX/RDX/RSI/R8/R9) and Win64 (RCX/RDX/R8/R9 — no RSI).
+        let caller_saved_mask: u8 = crate::compiler::abi_x64::NATIVE_ABI.maglev_caller_saved_mask();
         let mut used_caller_saved: u8 = 0;
         // Count direct-call-0 sites for monomorphic cache allocation.
         let mut mono_call_sites: i32 = 0;
@@ -694,9 +704,10 @@ impl<'a> MaglevCodegen<'a> {
         for block in graph.blocks() {
             for (node_id, _) in &block.nodes {
                 if let Some(Location::Register(n)) = alloc.location(*node_id) {
-                    // Only track caller-saved: RCX(1), RDX(2), RSI(3), R8(4), R9(5)
-                    if (1..=5).contains(&n) {
-                        used_caller_saved |= 1 << n;
+                    // Track only caller-saved bank entries (the set
+                    // varies by ABI — see `maglev_caller_saved_mask`).
+                    if n < 8 && caller_saved_mask & (1u8 << n) != 0 {
+                        used_caller_saved |= 1u8 << n;
                     }
                 }
             }
@@ -4105,20 +4116,12 @@ impl<'a> MaglevCodegen<'a> {
         if count.is_multiple_of(2) {
             self.masm.push(Reg64::R11); // alignment padding
         }
-        if mask & (1 << 1) != 0 {
-            self.masm.push(Reg64::Rcx);
-        }
-        if mask & (1 << 2) != 0 {
-            self.masm.push(Reg64::Rdx);
-        }
-        if mask & (1 << 3) != 0 {
-            self.masm.push(Reg64::Rsi);
-        }
-        if mask & (1 << 4) != 0 {
-            self.masm.push(Reg64::R8);
-        }
-        if mask & (1 << 5) != 0 {
-            self.masm.push(Reg64::R9);
+        // Push caller-saved registers in ABI-defined index order so the
+        // matching pop in `emit_restore_live_regs` mirrors it exactly.
+        for &idx in crate::compiler::abi_x64::NATIVE_ABI.maglev_caller_saved_indices() {
+            if mask & (1u8 << idx) != 0 {
+                self.masm.push(phys_reg(idx));
+            }
         }
         mask
     }
@@ -4127,20 +4130,15 @@ impl<'a> MaglevCodegen<'a> {
     /// [`emit_save_live_regs`] (reverse push order).
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_restore_live_regs(&mut self, mask: u8) {
-        if mask & (1 << 5) != 0 {
-            self.masm.pop(Reg64::R9);
-        }
-        if mask & (1 << 4) != 0 {
-            self.masm.pop(Reg64::R8);
-        }
-        if mask & (1 << 3) != 0 {
-            self.masm.pop(Reg64::Rsi);
-        }
-        if mask & (1 << 2) != 0 {
-            self.masm.pop(Reg64::Rdx);
-        }
-        if mask & (1 << 1) != 0 {
-            self.masm.pop(Reg64::Rcx);
+        // Pop in reverse of the push order chosen by `emit_save_live_regs`.
+        for &idx in crate::compiler::abi_x64::NATIVE_ABI
+            .maglev_caller_saved_indices()
+            .iter()
+            .rev()
+        {
+            if mask & (1u8 << idx) != 0 {
+                self.masm.pop(phys_reg(idx));
+            }
         }
         let count = mask.count_ones();
         if count.is_multiple_of(2) {
