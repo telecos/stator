@@ -162,6 +162,22 @@ const MONO_OFF_INLINE_OP: i32 = 64;
 #[cfg(all(target_arch = "x86_64", unix))]
 const MONO_OFF_INLINE_IMM: i32 = 72;
 
+/// Bytes per named-property IC site on the stack: 5 × i64 =
+/// `[handle, map_ptr, shape_id, elem_addr, hit_flag]`.
+///
+/// The 5th slot (`hit_flag`, at offset `+32`) is the ABI-safe
+/// out-of-band hit indicator written by
+/// [`crate::compiler::baseline::compiler::jit_runtime::jit_runtime_fill_named_ic_r15`].
+/// Using a separate memory slot — instead of reading a second return
+/// register (`RDX`) — keeps the helper's FFI contract a single-register
+/// `i64` return, which is identical under SysV AMD64 and Win64.
+const NAMED_IC_SITE_BYTES: i32 = 40;
+
+/// Offset (from the IC site base) at which the helper writes the hit
+/// flag.  See [`NAMED_IC_SITE_BYTES`] for the layout.
+#[cfg(all(target_arch = "x86_64", unix))]
+const NAMED_IC_OFF_HIT: i32 = 32;
+
 /// Lazily probed [`JsValue`] byte layout, cached for the lifetime of the
 /// process.  Used by the inline array-access fast path.
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -755,9 +771,15 @@ impl<'a> MaglevCodegen<'a> {
         // Place it after the mono cache area on the stack.  Rounded up
         // so the combined reservation stays a multiple of 16.
         let array_ic_bytes: i32 = if has_keyed_sites { 32 } else { 0 };
-        // Named property IC: 32 bytes per site (4 x i64: handle,
-        // map_ptr, shape_id, offset).
-        let named_ic_bytes: i32 = named_site_count.saturating_mul(32);
+        // Named property IC: 40 bytes per site (5 x i64: handle,
+        // map_ptr, shape_id, elem_addr, hit_flag).  The 5th slot is
+        // an out-of-band hit indicator written by
+        // `jit_runtime_fill_named_ic_r15` so the helper's return
+        // value (in `RAX`) carries only the i64 property value —
+        // a single-register return that is identical under SysV and
+        // Win64.  See `compiler::baseline::compiler::jit_runtime`'s
+        // `NAMED_IC_SLOT_COUNT` for the matching layout constant.
+        let named_ic_bytes: i32 = named_site_count.saturating_mul(NAMED_IC_SITE_BYTES);
         let total_cache_bytes = {
             let raw = mono_call_cache_bytes + array_ic_bytes + named_ic_bytes;
             if raw == 0 { 0 } else { (raw + 15) & !15 }
@@ -6308,11 +6330,15 @@ impl<'a> MaglevCodegen<'a> {
         // Allocate this site's IC slot.
         let site = self.next_named_ic_site;
         self.next_named_ic_site += 1;
-        let ic_base = self.named_ic_base + site * 32;
+        let ic_base = self.named_ic_base + site * NAMED_IC_SITE_BYTES;
         let ic_off_handle = ic_base; // +0
         // +8 (map_ptr) and +16 (shape_id) are populated by IC fill but
         // no longer checked on the hit path — handle identity suffices.
         let ic_off_elem_addr = ic_base + 24; // +24  (absolute element address)
+        // +32: out-of-band hit flag written by the IC-fill helper —
+        // ABI-safe replacement for the SysV-only `RAX:RDX` two-register
+        // struct return.  See `NAMED_IC_SITE_BYTES`.
+        let ic_off_hit = ic_base + NAMED_IC_OFF_HIT;
 
         let is_smi_specialized = self.smi_guarded.contains(&id) && !self.i32_range.contains(&id);
 
@@ -6386,7 +6412,14 @@ impl<'a> MaglevCodegen<'a> {
             let ic_fill_addr = jit_runtime::jit_runtime_fill_named_ic_r15 as *const () as usize;
             self.emit_helper_call_addr(ic_fill_addr as i64);
             let mut generic_label = Label::new();
-            self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
+            // ABI-safe hit check: helper writes 0/1 to the IC site's
+            // out-of-band hit slot (ic_off_hit).  Reading it from
+            // memory replaces the SysV-only `RAX:RDX` two-register
+            // struct return — Win64 returns such structs via a hidden
+            // pointer, so `RDX` cannot be relied on as the second word.
+            self.masm
+                .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, ic_off_hit);
+            self.masm.test_rr(Reg64::R10, Reg64::R10);
             self.masm.je(&mut generic_label);
             self.masm.add_ri(Reg64::Rsp, 16);
             self.emit_restore_live_regs(saved);
@@ -6486,7 +6519,14 @@ impl<'a> MaglevCodegen<'a> {
             let ic_fill_addr = jit_runtime::jit_runtime_fill_named_ic_r15 as *const () as usize;
             self.emit_helper_call_addr(ic_fill_addr as i64);
             let mut generic_label = Label::new();
-            self.masm.test_rr(Reg64::Rdx, Reg64::Rdx);
+            // ABI-safe hit check: helper writes 0/1 to the IC site's
+            // out-of-band hit slot (ic_off_hit).  Reading it from
+            // memory replaces the SysV-only `RAX:RDX` two-register
+            // struct return — Win64 returns such structs via a hidden
+            // pointer, so `RDX` cannot be relied on as the second word.
+            self.masm
+                .mov_load_base_disp32(Reg64::R10, Reg64::Rbp, ic_off_hit);
+            self.masm.test_rr(Reg64::R10, Reg64::R10);
             self.masm.je(&mut generic_label);
             self.masm.add_ri(Reg64::Rsp, 16);
             self.emit_restore_live_regs(saved);

@@ -8342,9 +8342,14 @@ pub(crate) mod jit_runtime {
 
     // ── Named property inline-cache fill ────────────────────────────────
 
-    /// Result returned by [`jit_runtime_fill_named_ic_r15`].
+    /// Internal result of the named-property IC fill probe.
     ///
-    /// Returned via SysV AMD64 ABI in RAX:RDX.
+    /// This struct is **never** returned across the FFI boundary — see
+    /// [`jit_runtime_fill_named_ic_r15`] for the ABI-safe packed
+    /// contract that generated code consumes.  Two-register struct
+    /// returns (`RAX:RDX`) work under SysV but Win64 returns
+    /// > 8-byte structs via a hidden pointer, so the JIT cannot read
+    /// the second word from `RDX`.
     #[repr(C)]
     pub struct NamedIcResult {
         /// JIT i64 property value (meaningful only when `hit != 0`).
@@ -8357,31 +8362,75 @@ pub(crate) mod jit_runtime {
         const MISS: Self = Self { value: 0, hit: 0 };
     }
 
+    /// Index inside the per-site named-IC slot array at which
+    /// [`jit_runtime_fill_named_ic_r15`] writes the hit flag.
+    ///
+    /// The first four slots (`[0..=3]`) are populated by the IC fill
+    /// path with `[handle, map_ptr, shape_id, elem_addr]`; slot `4`
+    /// is reserved as the **out-of-band hit indicator** so that the
+    /// helper's return value (in `RAX`) carries only the JIT i64
+    /// value.  This keeps the FFI contract single-register and
+    /// therefore identical under SysV and Win64.
+    pub const NAMED_IC_HIT_SLOT_INDEX: usize = 4;
+
+    /// Number of `i64` slots reserved per named-property IC site
+    /// (`[handle, map_ptr, shape_id, elem_addr, hit]`).
+    pub const NAMED_IC_SLOT_COUNT: usize = 5;
+
     /// Combined named-property IC fill **and** load.
     ///
-    /// Resolves the heap handle, fills the 4-slot inline cache at
-    /// `ic_slots` (`[handle, map_ptr, shape_id, elem_addr]`), and performs
-    /// the property load — all in a single call.
+    /// Resolves the heap handle, fills the 5-slot inline cache at
+    /// `ic_slots` (`[handle, map_ptr, shape_id, elem_addr, hit]`), and
+    /// performs the property load — all in a single call.
     ///
     /// Only fills the IC for own data-property hits on `PlainObject`
     /// receivers (not prototype hits, getters, array length, etc.).
     ///
-    /// # Calling convention (SysV AMD64)
+    /// # ABI-safe calling convention
     ///
-    /// * `RDI` (`obj_i64`) – JIT i64 encoding of the receiver.
-    /// * `RSI` (`name_idx`) – constant-pool index of the property name.
-    /// * `RDX` (`rt_ptrs_cell`) – pointer to `Cell<RtPtrs>` TLS slot.
-    /// * `RCX` (`ic_slots`) – pointer to 4 consecutive `i64` on the
-    ///   stack: `[handle, map_ptr, shape_id, elem_addr]`.
+    /// Generated code passes the four integer/pointer arguments in
+    /// the host ABI's first four argument registers:
     ///
-    /// Returns [`NamedIcResult`] in `RAX:RDX`.
+    /// * arg 0 (`obj_i64`) – JIT i64 encoding of the receiver.
+    /// * arg 1 (`name_idx`) – constant-pool index of the property name.
+    /// * arg 2 (`rt_ptrs_cell`) – pointer to `Cell<RtPtrs>` TLS slot.
+    /// * arg 3 (`ic_slots`) – pointer to [`NAMED_IC_SLOT_COUNT`]
+    ///   consecutive `i64` slots on the stack.
+    ///
+    /// Returns the JIT i64 property value in `RAX` and writes the
+    /// hit/miss flag (`1` = hit, `0` = miss) into
+    /// `(*ic_slots)[NAMED_IC_HIT_SLOT_INDEX]`.  Using a single-register
+    /// `i64` return — instead of a `repr(C)` two-word struct returned
+    /// in `RAX:RDX` — keeps the FFI contract identical under SysV
+    /// AMD64 and Microsoft x64 (which would otherwise return such
+    /// structs via a hidden pointer).
     #[allow(dead_code)] // Called from JIT-generated machine code, not Rust.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub extern "C" fn jit_runtime_fill_named_ic_r15(
         obj_i64: i64,
         name_idx: u32,
         rt_ptrs_cell: i64,
-        ic_slots: *mut [i64; 4],
+        ic_slots: *mut [i64; NAMED_IC_SLOT_COUNT],
+    ) -> i64 {
+        let r = fill_named_ic_inner(obj_i64, name_idx, rt_ptrs_cell, ic_slots);
+        // Write the hit indicator out-of-band so the return value
+        // (`RAX`) is single-register and ABI-portable.
+        unsafe {
+            (*ic_slots)[NAMED_IC_HIT_SLOT_INDEX] = r.hit;
+        }
+        r.value
+    }
+
+    /// Implementation of [`jit_runtime_fill_named_ic_r15`] returning
+    /// the original [`NamedIcResult`] struct.  Kept as a private inner
+    /// function so the existing miss/hit logic does not need to be
+    /// rewritten when the FFI return shape changes.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    fn fill_named_ic_inner(
+        obj_i64: i64,
+        name_idx: u32,
+        rt_ptrs_cell: i64,
+        ic_slots: *mut [i64; NAMED_IC_SLOT_COUNT],
     ) -> NamedIcResult {
         if !is_heap_handle(obj_i64) {
             return NamedIcResult::MISS;
@@ -8463,11 +8512,10 @@ pub(crate) mod jit_runtime {
 
         // Fall back to the existing inline helper (probes proto IC too).
         let result = inline_lda_named_with_ptrs(obj_i64, name_idx, ptrs);
-        let r = NamedIcResult {
+        NamedIcResult {
             value: result.value,
             hit: result.hit,
-        };
-        r
+        }
     }
 
     /// Try to encode a property value as a JIT i64 without allocating.
@@ -15825,5 +15873,51 @@ mod tests {
             let decoded = decode_non_heap_value_fast(encoded).expect("decode boolean");
             assert_eq!(decoded, original);
         }
+    }
+
+    /// `jit_runtime_fill_named_ic_r15` must use a single-register `i64`
+    /// return value plus an out-of-band hit slot at
+    /// [`NAMED_IC_HIT_SLOT_INDEX`].  This keeps the FFI contract
+    /// identical under SysV AMD64 and Win64 (which would otherwise
+    /// return the legacy `NamedIcResult` struct via a hidden pointer).
+    ///
+    /// The miss path requires no thread-local state beyond
+    /// `is_heap_handle(obj_i64) == false`, so we exercise it directly.
+    #[test]
+    #[cfg(stator_baseline_jit_x86_64)]
+    fn named_ic_helper_packs_hit_into_slot_4_on_miss() {
+        use super::jit_runtime::{
+            NAMED_IC_HIT_SLOT_INDEX, NAMED_IC_SLOT_COUNT, jit_runtime_fill_named_ic_r15,
+        };
+        // Pre-fill the IC slots with a sentinel so we can confirm
+        // the helper writes the hit slot (and only the hit slot) on
+        // miss.
+        let mut slots: [i64; NAMED_IC_SLOT_COUNT] = [0x5A5A_5A5A_5A5A_5A5A; NAMED_IC_SLOT_COUNT];
+        // A non-heap-handle JIT i64 (Smi 0) deterministically misses.
+        let value = jit_runtime_fill_named_ic_r15(0, 0, 0, &mut slots as *mut _);
+        assert_eq!(value, 0, "miss must return 0 in RAX");
+        assert_eq!(
+            slots[NAMED_IC_HIT_SLOT_INDEX], 0,
+            "miss must write 0 to the out-of-band hit slot"
+        );
+        // The first four IC slots are untouched on miss.
+        for (i, &s) in slots.iter().enumerate().take(4) {
+            assert_eq!(
+                s, 0x5A5A_5A5A_5A5A_5A5A_u64 as i64,
+                "miss must not touch IC slot {i}"
+            );
+        }
+    }
+
+    /// Layout invariants the codegen relies on: the hit slot is the
+    /// last slot, and the per-site stride keeps the codegen and the
+    /// helper in lock-step.  Drift here would silently corrupt cache
+    /// state at every named-IC site.
+    #[test]
+    fn named_ic_layout_constants_are_consistent() {
+        use super::jit_runtime::{NAMED_IC_HIT_SLOT_INDEX, NAMED_IC_SLOT_COUNT};
+        assert_eq!(NAMED_IC_SLOT_COUNT, 5);
+        assert_eq!(NAMED_IC_HIT_SLOT_INDEX, 4);
+        assert!(NAMED_IC_HIT_SLOT_INDEX < NAMED_IC_SLOT_COUNT);
     }
 }
