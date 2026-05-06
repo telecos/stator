@@ -2230,11 +2230,11 @@ pub unsafe extern "C" fn stator_script_force_maglev_compile(script: *mut StatorS
         Some(b) => b,
         None => return false,
     };
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(stator_maglev_jit_x86_64)]
     {
         stator_jse::interpreter::compile_maglev_sync(bytecodes)
     }
-    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    #[cfg(not(stator_maglev_jit_x86_64))]
     {
         let _ = bytecodes;
         false
@@ -6231,9 +6231,9 @@ mod tests {
         let script = compile_src("function f(){ return 1; } f();");
         // SAFETY: `script` is non-null and live. Unsupported platforms return false.
         let forced = unsafe { stator_script_force_maglev_compile(script) };
-        #[cfg(not(all(target_arch = "x86_64", unix)))]
+        #[cfg(not(stator_maglev_jit_x86_64))]
         assert!(!forced);
-        #[cfg(all(target_arch = "x86_64", unix))]
+        #[cfg(stator_maglev_jit_x86_64)]
         {
             let _ = forced;
         }

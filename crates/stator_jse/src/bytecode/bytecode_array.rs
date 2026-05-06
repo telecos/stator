@@ -313,14 +313,14 @@ type FusionPatternCache = Rc<OnceCell<Option<(usize, i64)>>>;
 /// persistent `mmap`'d page of executable memory.  Uses [`Arc`] + [`Mutex`]
 /// so that the Maglev background compilation thread can write the compiled
 /// code into the cache while the interpreter runs on the main thread.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_maglev_jit_x86_64)]
 pub type MaglevJitCodeCache =
     Arc<Mutex<Option<crate::compiler::baseline::compiler::CachedExecutableCode>>>;
 
 /// Shared Maglev JIT code cache stored in a [`BytecodeArray`].
 ///
 /// On non-JIT platforms this stores raw bytes and register-file slot count.
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+#[cfg(not(stator_maglev_jit_x86_64))]
 pub type MaglevJitCodeCache = Arc<Mutex<Option<(Vec<u8>, usize)>>>;
 
 /// Persistent executable Maglev code cache shared among clones of a
@@ -329,11 +329,11 @@ pub type MaglevJitCodeCache = Arc<Mutex<Option<(Vec<u8>, usize)>>>;
 /// On x86-64 Unix, this wraps a [`CachedMaglevCode`] that keeps a
 /// persistent `mmap`'d page.  Lazily initialised from the raw code bytes
 /// in [`MaglevJitCodeCache`] on first execution.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_maglev_jit_x86_64)]
 pub type MaglevExecutableCache =
     Rc<RefCell<Option<crate::compiler::maglev::codegen::CachedMaglevCode>>>;
 /// Stub type for platforms without JIT support.
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+#[cfg(not(stator_maglev_jit_x86_64))]
 pub type MaglevExecutableCache = Rc<RefCell<Option<()>>>;
 
 /// Shared Turbofan JIT code cache stored in a [`BytecodeArray`].
@@ -1888,7 +1888,7 @@ impl BytecodeArray {
     ///
     /// Only available on non-JIT platforms where [`MaglevJitCodeCache`] stores
     /// raw bytes.  On x86-64 Unix, use [`maglev_jit_cache_arc`](Self::maglev_jit_cache_arc) directly.
-    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    #[cfg(not(stator_maglev_jit_x86_64))]
     pub fn try_get_maglev_jit_code(&self) -> Option<(Vec<u8>, usize)> {
         self.inner.maglev_jit_code.lock().ok()?.clone()
     }

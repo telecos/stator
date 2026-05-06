@@ -3537,7 +3537,7 @@ pub(crate) mod jit_runtime {
         // Once Maglev code is compiled the invocation count is only
         // used for tiering decisions that have already been made.
         // Skipping the increment avoids a Cell read+write per call.
-        #[cfg(all(target_arch = "x86_64", unix))]
+        #[cfg(stator_maglev_jit_x86_64)]
         {
             if !ba.jit_maglev_has_deopted() {
                 let maglev_cache = ba.maglev_executable_cache();
@@ -3564,7 +3564,7 @@ pub(crate) mod jit_runtime {
         let inv_count = ba.increment_invocation_count();
 
         // ── Try to trigger Maglev compilation ───────────────────────
-        #[cfg(all(target_arch = "x86_64", unix))]
+        #[cfg(stator_maglev_jit_x86_64)]
         {
             use crate::bytecode::bytecode_array::MAGLEV_TIERING_THRESHOLD;
             use crate::compiler::maglev::codegen::CachedMaglevCode;
@@ -3825,7 +3825,7 @@ pub(crate) mod jit_runtime {
     /// Uses [`MaglevCalleeCache`] to skip `closure_context()` lookup,
     /// context pointer comparison, and `skip_mapped_args` toggling when
     /// the same callee is called repeatedly (e.g. closures in a tight loop).
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(stator_maglev_jit_x86_64)]
     fn exec_maglev_callee(
         ba: &Rc<BytecodeArray>,
         maglev_exec: &crate::compiler::maglev::codegen::CachedMaglevCode,
@@ -4220,7 +4220,7 @@ pub(crate) mod jit_runtime {
     /// Extract the Maglev entry point and register-file slot count from
     /// a `BytecodeArray`'s Maglev executable cache, if available and not
     /// deopted.
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(stator_maglev_jit_x86_64)]
     fn extract_maglev_entry(ba: &BytecodeArray) -> (usize, usize) {
         if ba.jit_maglev_has_deopted() {
             return (0, 0);
@@ -4293,13 +4293,13 @@ pub(crate) mod jit_runtime {
                                     .closure_context()
                                     .map(|rc| Rc::into_raw(Rc::clone(rc)))
                                     .unwrap_or(std::ptr::null());
-                                #[cfg(all(target_arch = "x86_64", unix))]
+                                #[cfg(stator_maglev_jit_x86_64)]
                                 let (entry_fn, reg_slots) = extract_exec_entry(ba_ref);
-                                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                                #[cfg(not(stator_maglev_jit_x86_64))]
                                 let (entry_fn, reg_slots) = (0usize, 0usize);
-                                #[cfg(all(target_arch = "x86_64", unix))]
+                                #[cfg(stator_maglev_jit_x86_64)]
                                 let (maglev_fn, maglev_reg_slots) = extract_maglev_entry(ba_ref);
-                                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                                #[cfg(not(stator_maglev_jit_x86_64))]
                                 let (maglev_fn, maglev_reg_slots) = (0usize, 0usize);
                                 let entry = CachedCalleeEntry {
                                     callee_i64,
@@ -4539,7 +4539,7 @@ pub(crate) mod jit_runtime {
                 }
 
                 // ── Maglev fast path (preferred) ───────────────
-                #[cfg(all(target_arch = "x86_64", unix))]
+                #[cfg(stator_maglev_jit_x86_64)]
                 if !ba.jit_maglev_has_deopted() {
                     use crate::compiler::maglev::codegen::CachedMaglevCode;
 
@@ -5113,20 +5113,23 @@ pub(crate) mod jit_runtime {
     // baseline JIT code directly, bypassing the full runtime stub overhead.
     //
     // Flow:
-    //   1. Generated code calls `jit_runtime_get_jit_entry(callee_i64)`
-    //      which returns a `JitEntryInfo { entry_point, ctx_ptr }`.
-    //   2. If `entry_point != 0`, generated code allocates a register file
-    //      on the stack, stores arguments, and calls the entry point directly.
+    //   1. Generated code calls `jit_runtime_get_jit_entry(callee_i64,
+    //      &mut ctx_out)` which returns the entry point as `i64` and
+    //      writes the closure-context raw pointer into `*ctx_out`.
+    //   2. If the returned entry is non-zero, generated code allocates a
+    //      register file on the stack, stores arguments, and calls the
+    //      entry point directly using `ctx_out` as the second argument.
     //   3. After the call, generated code calls
     //      `jit_runtime_finish_direct_call(result)` to restore TLS state
     //      and encode the result.
-    //   4. If `entry_point == 0`, generated code falls back to the normal
-    //      runtime stub (e.g. `jit_runtime_call_undefined_receiver0`).
+    //   4. If the returned entry is zero, generated code falls back to the
+    //      normal runtime stub (e.g. `jit_runtime_call_undefined_receiver0`).
 
-    /// Return type for [`jit_runtime_get_jit_entry`].
-    ///
-    /// Returned in RAX:RDX per the SysV AMD64 ABI (two-member C struct).
+    /// Legacy struct shape kept for documentation purposes; no longer used
+    /// as the FFI return of [`jit_runtime_get_jit_entry`].  See the helper
+    /// docs for the current single-`i64`-return contract.
     #[repr(C)]
+    #[allow(dead_code)]
     pub struct JitEntryInfo {
         /// JIT code entry point, or 0 if no JIT code is available.
         pub entry_point: usize,
@@ -5147,27 +5150,34 @@ pub(crate) mod jit_runtime {
     /// The caller **must** call [`jit_runtime_finish_direct_call`] after
     /// the direct call completes to restore TLS state.
     ///
-    /// Returns `JitEntryInfo { 0, 0 }` if the callee does not have
-    /// baseline JIT code cached (fall back to the full stub).
+    /// Returns `0` (with `*ctx_out` set to 0) if the callee does not have
+    /// baseline or Maglev JIT code cached (fall back to the full stub).
     ///
-    /// # Calling convention (SysV AMD64)
+    /// # Calling convention
     ///
-    /// * `RDI` (`callee_i64`) – JIT i64 encoding of the callee.
+    /// Single-register `i64` return so the FFI signature matches under
+    /// both SysV AMD64 and Win64.  The closure-context pointer is written
+    /// to `*ctx_out` (caller-provided, never null).  The caller pre-zeroes
+    /// the slot, so an early-return path leaves it zero.
     ///
-    /// Returns `JitEntryInfo` in `RAX` (entry_point) and `RDX` (ctx_ptr).
-    pub extern "C" fn jit_runtime_get_jit_entry(callee_i64: i64) -> JitEntryInfo {
-        let null_info = JitEntryInfo {
-            entry_point: 0,
-            ctx_ptr: 0,
-        };
+    /// * SysV AMD64: `RDI` = `callee_i64`, `RSI` = `ctx_out`, returns in `RAX`.
+    /// * Win64:      `RCX` = `callee_i64`, `RDX` = `ctx_out`, returns in `RAX`.
+    pub extern "C" fn jit_runtime_get_jit_entry(callee_i64: i64, ctx_out: *mut i64) -> i64 {
+        // Safety net: caller always passes a valid pre-zeroed slot in
+        // current emitters, so `ctx_out` is never null.  We still guard
+        // against accidental misuse from non-emitted callers.
+        if !ctx_out.is_null() {
+            // SAFETY: caller-owned 8-byte stack slot, valid for the call.
+            unsafe { *ctx_out = 0 };
+        }
 
         if callee_i64 < JIT_HEAP_TAG {
-            return null_info;
+            return 0;
         }
 
         let ptrs = RT_PTRS.with(|p| p.get());
         if !ptrs.is_cached() {
-            return null_info;
+            return 0;
         }
 
         // SAFETY: cached pointer set by cache_rt_ptrs; valid for thread lifetime.
@@ -5184,7 +5194,7 @@ pub(crate) mod jit_runtime {
             let heap = unsafe { &*heap_ref.as_ptr() };
             let callee = match heap.get(idx) {
                 Some(v) => v,
-                None => return null_info,
+                None => return 0,
             };
             match callee {
                 JsValue::Function(ba) => {
@@ -5199,7 +5209,7 @@ pub(crate) mod jit_runtime {
                     // JitExecutableCode (ptr, size, register_file_slots),
                     // so the pointer extraction in the caller works.
                     let maglev_entry: Option<usize> = {
-                        #[cfg(all(target_arch = "x86_64", unix))]
+                        #[cfg(stator_maglev_jit_x86_64)]
                         {
                             use crate::compiler::maglev::codegen::CachedMaglevCode;
                             let maglev_cache = ba.maglev_executable_cache();
@@ -5228,7 +5238,7 @@ pub(crate) mod jit_runtime {
                                 .filter(|e| e.register_file_slots <= 16)
                                 .map(|e| e.entry_point() as usize)
                         }
-                        #[cfg(not(all(target_arch = "x86_64", unix)))]
+                        #[cfg(not(stator_maglev_jit_x86_64))]
                         {
                             None::<usize>
                         }
@@ -5257,7 +5267,7 @@ pub(crate) mod jit_runtime {
                             // Synchronous Maglev compilation (fast for small
                             // closure bodies like `count = count + 1`).
                             let maglev_sync_entry: Option<usize> = {
-                                #[cfg(all(target_arch = "x86_64", unix))]
+                                #[cfg(stator_maglev_jit_x86_64)]
                                 {
                                     if !ba_ref.jit_maglev_has_deopted() {
                                         crate::interpreter::compile_maglev_sync(ba_ref);
@@ -5269,7 +5279,7 @@ pub(crate) mod jit_runtime {
                                         .filter(|e| e.register_file_slots <= 16)
                                         .map(|e| e.entry_point() as usize)
                                 }
-                                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                                #[cfg(not(stator_maglev_jit_x86_64))]
                                 {
                                     None::<usize>
                                 }
@@ -5303,26 +5313,26 @@ pub(crate) mod jit_runtime {
                                             {
                                                 (exec.entry_point() as usize, ba_raw, ctx)
                                             } else {
-                                                return null_info;
+                                                return 0;
                                             }
                                         } else {
-                                            return null_info;
+                                            return 0;
                                         }
                                     } else {
                                         ba_ref.mark_jit_baseline_deopted();
-                                        return null_info;
+                                        return 0;
                                     }
                                 } else {
                                     ba_ref.mark_jit_baseline_deopted();
-                                    return null_info;
+                                    return 0;
                                 }
                             } else {
-                                return null_info;
+                                return 0;
                             }
                         }
                     }
                 }
-                _ => return null_info,
+                _ => return 0,
             }
         };
         // Heap borrow is dropped.
@@ -5376,13 +5386,18 @@ pub(crate) mod jit_runtime {
         if entry_point == 0 {
             // Undo TLS changes.
             bc_ref.set(saved_ba);
-            return null_info;
+            return 0;
         }
 
-        JitEntryInfo {
-            entry_point,
-            ctx_ptr: callee_ctx_ptr as i64,
+        // Write the closure-context raw pointer to the caller-provided
+        // out-slot.  Equivalent to the second return value in the legacy
+        // `JitEntryInfo` struct return; here it is communicated via memory
+        // so the FFI signature is single-register on both ABIs.
+        if !ctx_out.is_null() {
+            // SAFETY: caller-owned 8-byte stack slot, valid for the call.
+            unsafe { *ctx_out = callee_ctx_ptr as i64 };
         }
+        entry_point as i64
     }
 
     /// Restore TLS state after a direct JIT-to-JIT call.
@@ -5570,7 +5585,7 @@ pub(crate) mod jit_runtime {
         // Check whether the callee has Maglev code available.  If so,
         // return its entry point (> 1) so the codegen can upgrade the
         // mono-cache slot.  Otherwise return 1 (plain success).
-        #[cfg(all(target_arch = "x86_64", unix))]
+        #[cfg(stator_maglev_jit_x86_64)]
         {
             let ba = unsafe { &*(ba_ptr as *const BytecodeArray) };
             if let Some(ep) = try_get_maglev_entry_point(ba) {
@@ -5668,7 +5683,7 @@ pub(crate) mod jit_runtime {
         });
 
         // Check whether the callee has Maglev code available.
-        #[cfg(all(target_arch = "x86_64", unix))]
+        #[cfg(stator_maglev_jit_x86_64)]
         {
             let ba = unsafe { &*(ba_ptr as *const BytecodeArray) };
             if let Some(ep) = try_get_maglev_entry_point(ba) {
@@ -5738,7 +5753,7 @@ pub(crate) mod jit_runtime {
     ///
     /// Returns `Some(entry_point_as_i64)` (always > 1) when Maglev code is
     /// available, or `None` otherwise.
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(stator_maglev_jit_x86_64)]
     fn try_get_maglev_entry_point(ba: &BytecodeArray) -> Option<i64> {
         use crate::compiler::maglev::codegen::CachedMaglevCode;
 
@@ -5902,7 +5917,7 @@ pub(crate) mod jit_runtime {
             ctx_changed: false,
         });
 
-        #[cfg(all(target_arch = "x86_64", unix))]
+        #[cfg(stator_maglev_jit_x86_64)]
         {
             let ba = unsafe { &*(ba_ptr as *const BytecodeArray) };
             if let Some(ep) = try_get_maglev_entry_point(ba) {
@@ -9505,7 +9520,7 @@ pub(crate) mod jit_runtime {
                         Err(_) => None,
                     };
                 }
-                #[cfg(all(target_arch = "x86_64", unix))]
+                #[cfg(stator_maglev_jit_x86_64)]
                 CalleeInfo::JsFunction(ba_ptr) => {
                     // User-defined JS function (e.g. obj.getX()).
                     // Execute via Maglev if available, passing receiver
@@ -9588,7 +9603,7 @@ pub(crate) mod jit_runtime {
                     // No Maglev code — deopt to interpreter.
                     return None;
                 }
-                #[cfg(not(all(target_arch = "x86_64", unix)))]
+                #[cfg(not(stator_maglev_jit_x86_64))]
                 CalleeInfo::JsFunction(_) => return None,
                 CalleeInfo::Other => return None,
             }
@@ -9938,7 +9953,7 @@ pub(crate) mod jit_runtime {
             }
 
             // User-defined JS function (e.g. Base.call(this) in constructors).
-            #[cfg(all(target_arch = "x86_64", unix))]
+            #[cfg(stator_maglev_jit_x86_64)]
             if let Some(JsValue::Function(ba_rc)) = heap.get(callee_idx) {
                 let ba_ptr: *const BytecodeArray = Rc::as_ptr(ba_rc);
                 // SAFETY: ba_ptr from Rc::as_ptr; heap entry outlives call.
@@ -13053,18 +13068,31 @@ impl<'a> BaselineCompiler<'a> {
             self.masm.push(Reg64::Rdi);
             self.masm.push(Reg64::Rdi);
 
+            // Reserve a 16-byte ctx_out slot (8 bytes used + 8 padding)
+            // so the helper can return the closure-context pointer by
+            // reference instead of in a second return register — making
+            // the FFI signature single-register and ABI-portable.
+            self.masm.sub_ri(Reg64::Rsp, 16);
+            self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+            self.masm.mov_store_base_disp32(Reg64::Rsp, 0, Reg64::Rax);
+            // Second arg = &ctx_out (RSI under SysV).
+            self.masm.lea_base_disp32(Reg64::Rsi, Reg64::Rsp, 0);
+
             let get_entry_addr = jit_runtime::jit_runtime_get_jit_entry as *const () as usize;
             self.masm.mov_ri(Reg64::R11, get_entry_addr as i64);
             self.masm.call_reg(Reg64::R11);
+
+            // Read ctx_out and release the slot.
+            self.masm.mov_load_base_disp32(Reg64::R10, Reg64::Rsp, 0);
+            self.masm.add_ri(Reg64::Rsp, 16);
 
             // Check entry_point == 0 → stub fallback.
             let mut stub_fallback = Label::new();
             self.masm.test_rr(Reg64::Rax, Reg64::Rax);
             self.masm.je(&mut stub_fallback);
 
-            // RAX = entry_point, RDX = ctx_ptr.
+            // RAX = entry_point, R10 = ctx_ptr (from out-slot).
             self.masm.mov_rr(Reg64::R11, Reg64::Rax); // entry
-            self.masm.mov_rr(Reg64::R10, Reg64::Rdx); // ctx
 
             // ── Populate mono cache ─────────────────────────────────────
             self.masm.mov_load_base_disp32(Reg64::Rax, Reg64::Rsp, 0);

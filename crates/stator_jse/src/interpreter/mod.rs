@@ -186,14 +186,16 @@ use crate::builtins::error::{
 };
 use crate::builtins::function::{function_bound_name, function_length, function_to_string};
 use crate::builtins::proxy::{proxy_apply, proxy_get_with_receiver, proxy_set_with_receiver};
+#[cfg(stator_maglev_jit_x86_64)]
+use crate::bytecode::bytecode_array::MaglevJitCodeCache;
+#[cfg(all(target_arch = "x86_64", unix))]
+use crate::bytecode::bytecode_array::TurbofanJitCodeCache;
 use crate::bytecode::bytecode_array::{
     BytecodeArray, ConstantPoolEntry, ConstructBoilerplate, HandlerTableEntry,
     MAGLEV_TIERING_THRESHOLD, TIERING_THRESHOLD, TURBOFAN_TIERING_THRESHOLD,
 };
-#[cfg(all(target_arch = "x86_64", unix))]
-use crate::bytecode::bytecode_array::{MaglevJitCodeCache, TurbofanJitCodeCache};
 use crate::bytecode::bytecodes::{Instruction, Opcode, Operand};
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_maglev_jit_x86_64)]
 use crate::bytecode::feedback::{FeedbackSlotKind, FeedbackVector, InlineCacheState};
 use crate::error::{StatorError, StatorResult};
 use crate::inspector::debugger::Debugger;
@@ -991,7 +993,7 @@ thread_local! {
 }
 
 // ── Maglev diagnostic counters (per-thread) ──────────────────────────────────
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_maglev_jit_x86_64)]
 thread_local! {
     /// How many times `try_execute_maglev` was entered (past the deopt guard).
     static MAGLEV_DIAG_TRIED: Cell<u64> = const { Cell::new(0) };
@@ -1016,7 +1018,7 @@ thread_local! {
 
 /// Increment the Maglev global-load deopt counter (called from
 /// [`jit_runtime_lda_global`] when it returns `JIT_DEOPT`).
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_maglev_jit_x86_64)]
 pub fn maglev_track_global_deopt() {
     MAGLEV_EXECUTING.with(|f| {
         if f.get() {
@@ -1026,7 +1028,7 @@ pub fn maglev_track_global_deopt() {
 }
 
 /// Stub for non-JIT platforms.
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+#[cfg(not(stator_maglev_jit_x86_64))]
 pub fn maglev_track_global_deopt() {}
 
 // ── Unconditional diagnostic counters (compile on all platforms) ──────────────
@@ -1064,17 +1066,17 @@ static MAGLEV_COMPILATION_COUNT: std::sync::atomic::AtomicU32 =
 static MAGLEV_CODE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Process-wide count of Maglev compilation attempts (threads spawned).
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_maglev_jit_x86_64)]
 static MAGLEV_COMPILATION_STARTED: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
 /// Process-wide count of Maglev compilation failures (graph build or codegen).
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_maglev_jit_x86_64)]
 static MAGLEV_COMPILATION_FAILED: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
 /// Process-wide count of Maglev compilation panics.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_maglev_jit_x86_64)]
 static MAGLEV_COMPILATION_PANICKED: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
@@ -1185,7 +1187,7 @@ pub fn turbofan_stats() -> (u32, usize) {
 pub fn maglev_diagnostics() -> (u64, u64, u64, u64, u32, usize, u32, u32, u32, u64, u64, u64) {
     let cache_empty = DIAG_MAGLEV_CACHE_EMPTY.with(|c| c.get());
     let turbofan_hit = DIAG_TURBOFAN_HIT.with(|c| c.get());
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(stator_maglev_jit_x86_64)]
     {
         let tried = MAGLEV_DIAG_TRIED.with(|c| c.get());
         let executed = MAGLEV_DIAG_EXECUTED.with(|c| c.get());
@@ -1218,7 +1220,7 @@ pub fn maglev_diagnostics() -> (u64, u64, u64, u64, u32, usize, u32, u32, u32, u
 /// Return per-category deopt counters:
 /// `[generic, overflow, stub, global, divzero, unknown]`.
 pub fn maglev_deopt_categories() -> [u64; 6] {
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(stator_maglev_jit_x86_64)]
     {
         return MAGLEV_DIAG_DEOPT_CATS.with(|c| c.get());
     }
@@ -1244,7 +1246,7 @@ pub fn reset_tiering_stats() {
     crate::compiler::baseline::compiler::reset_stub_deopt_counts();
     crate::compiler::baseline::compiler::reset_first_deopt_counts();
     crate::compiler::baseline::compiler::reset_stub_call_counts();
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(stator_maglev_jit_x86_64)]
     {
         MAGLEV_DIAG_TRIED.with(|c| c.set(0));
         MAGLEV_DIAG_EXECUTED.with(|c| c.set(0));
@@ -1292,7 +1294,7 @@ pub fn jit_tier_stats() -> (u64, u64, u64) {
 }
 
 #[allow(dead_code)]
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_maglev_jit_x86_64)]
 fn seed_jit_feedback(ba: &BytecodeArray) -> FeedbackVector {
     let mut feedback = ba.feedback_vector_snapshot();
     for slot in 0..ba.feedback_metadata().slot_count() {
@@ -1314,7 +1316,7 @@ fn seed_jit_feedback(ba: &BytecodeArray) -> FeedbackVector {
 /// All other types (objects, arrays, functions, strings, etc.) are stored
 /// in the thread-local heap side-table via [`alloc_jit_heap_handle`] and
 /// referenced by handle.  This makes JIT entry infallible for all types.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_maglev_jit_x86_64)]
 #[allow(dead_code)]
 fn jsvalue_to_jit(v: &JsValue) -> i64 {
     use crate::compiler::baseline::compiler::{
@@ -1378,7 +1380,7 @@ pub(super) fn maybe_compile_baseline(ba: &BytecodeArray) {
 /// `ConstantPoolEntry` reference node), so we replace the inner
 /// [`BytecodeArray`] with a fresh empty one whose `Rc`s are not shared with
 /// the main thread.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_maglev_jit_x86_64)]
 fn pool_for_compile_thread(pool: &[ConstantPoolEntry]) -> Vec<ConstantPoolEntry> {
     use crate::bytecode::feedback::FeedbackMetadata;
     pool.iter()
@@ -1409,16 +1411,16 @@ fn pool_for_compile_thread(pool: &[ConstantPoolEntry]) -> Vec<ConstantPoolEntry>
 /// transferred exclusively to ONE background thread.  No other thread may
 /// hold a reference to the same `Rc` instances while the background thread
 /// is running.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_maglev_jit_x86_64)]
 struct SendableBytecodesArray(BytecodeArray);
 
 // SAFETY: The BytecodeArray wrapped here is freshly constructed with Rc
 // instances that are not shared with any other thread.  We guarantee exclusive
 // ownership by the background compilation thread.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_maglev_jit_x86_64)]
 unsafe impl Send for SendableBytecodesArray {}
 
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_maglev_jit_x86_64)]
 impl std::ops::Deref for SendableBytecodesArray {
     type Target = BytecodeArray;
     fn deref(&self) -> &BytecodeArray {
@@ -1430,7 +1432,7 @@ impl std::ops::Deref for SendableBytecodesArray {
 ///
 /// All fields are owned and trivially-`Send`.  The `BytecodeArray` is wrapped
 /// in [`SendableBytecodesArray`] which declares exclusive ownership.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_maglev_jit_x86_64)]
 struct MaglevCompileInput {
     ba: SendableBytecodesArray,
     result_cache: MaglevJitCodeCache,
@@ -1447,7 +1449,7 @@ struct MaglevCompileInput {
 /// - compilation has already been started (atomic flag check), or
 /// - the platform does not support JIT.
 pub fn maybe_compile_maglev(ba: &BytecodeArray) {
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(stator_maglev_jit_x86_64)]
     {
         use crate::bytecode::feedback::FeedbackVector;
         use crate::compiler::maglev::codegen as maglev_codegen;
@@ -1584,7 +1586,7 @@ pub fn maybe_compile_maglev(ba: &BytecodeArray) {
             }
         });
     }
-    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    #[cfg(not(stator_maglev_jit_x86_64))]
     let _ = ba;
 }
 
@@ -1597,7 +1599,7 @@ pub fn maybe_compile_maglev(ba: &BytecodeArray) {
 /// the very first call to a closure already caches the Maglev entry point
 /// instead of falling back to baseline JIT (which uses per-access FFI
 /// stubs for context slots).
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_maglev_jit_x86_64)]
 pub fn compile_maglev_sync(ba: &BytecodeArray) -> bool {
     use crate::bytecode::feedback::{FeedbackSlotKind, FeedbackVector, InlineCacheState};
     use crate::compiler::maglev::codegen as maglev_codegen;
@@ -1660,7 +1662,7 @@ pub fn compile_maglev_sync(ba: &BytecodeArray) -> bool {
 /// On platforms where the JIT is not available this always returns `None`.
 #[allow(dead_code)]
 fn try_execute_maglev_raw(ba: &BytecodeArray, args: &[JsValue]) -> Option<i64> {
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(stator_maglev_jit_x86_64)]
     {
         if ba.jit_maglev_has_deopted() {
             #[cfg(debug_assertions)]
@@ -1761,7 +1763,7 @@ fn try_execute_maglev_raw(ba: &BytecodeArray, args: &[JsValue]) -> Option<i64> {
 
 #[allow(dead_code)]
 fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<JsValue>> {
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(stator_maglev_jit_x86_64)]
     {
         use crate::compiler::baseline::compiler::jit_to_jsvalue_ext;
         return try_execute_maglev_raw(ba, args)
@@ -1774,7 +1776,7 @@ fn try_execute_maglev(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResu
 
 #[allow(dead_code)]
 fn try_execute_maglev_no_result(ba: &BytecodeArray, args: &[JsValue]) -> Option<StatorResult<()>> {
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(stator_maglev_jit_x86_64)]
     {
         return try_execute_maglev_raw(ba, args).map(|_| Ok(()));
     }
@@ -20860,6 +20862,75 @@ mod tests {
         }
     }
 
+    /// Synchronously compile a small callee through Maglev and execute it
+    /// via the interpreter on every supported target (x86-64 Unix and
+    /// Windows).  Unlike `test_maglev_compiled_after_threshold`, this test
+    /// is non-ignored: it does not rely on background compilation or
+    /// timing-based polling, so it runs in CI on every Maglev target.
+    #[test]
+    #[cfg(stator_maglev_jit_x86_64)]
+    fn maglev_jit_compiles_simple_callee_on_supported_targets() {
+        use super::compile_maglev_sync;
+
+        let add_ba = make_add_bytecode();
+
+        // Synchronously compile the inner function with Maglev.
+        assert!(
+            compile_maglev_sync(&add_ba),
+            "compile_maglev_sync must succeed on a simple add(a, b) callee"
+        );
+        // `compile_maglev_sync` writes the executable code directly into
+        // the per-BA `Rc<RefCell>` Maglev cache (not the `Arc<Mutex>`
+        // tier-up cache that `has_maglev_jit_code` inspects), so check
+        // the executable cache here.
+        assert!(
+            add_ba.maglev_executable_cache().borrow().is_some(),
+            "Maglev executable cache must be populated after compile_maglev_sync"
+        );
+
+        let outer_instrs = vec![
+            Instruction::new_unchecked(
+                Opcode::CreateClosure,
+                vec![
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(0),
+                    Operand::Flag(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(2)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(2)]),
+            Instruction::new_unchecked(
+                Opcode::CallAnyReceiver,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::RegisterCount(2),
+                    Operand::FeedbackSlot(1),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let pool = vec![ConstantPoolEntry::Function(Rc::new(add_ba))];
+        let outer_ba = make_bytecode_with_pool(outer_instrs, pool, 3, 0);
+
+        // Run a few times to exercise both the cache-miss and cache-hit
+        // paths through the Maglev-compiled callee.  The Win64 ABI fix
+        // for `jit_runtime_get_jit_entry` is exercised here on the very
+        // first iteration.
+        for _ in 0..4 {
+            let mut frame = InterpreterFrame::new(Rc::new(outer_ba.clone()), vec![]);
+            let result = Interpreter::run(&mut frame).unwrap();
+            assert_eq!(
+                result,
+                JsValue::Smi(3),
+                "Maglev-compiled add(1, 2) must return 3 on every invocation"
+            );
+        }
+    }
+
     /// Calling a hot function more than [`MAGLEV_TIERING_THRESHOLD`] times must
     /// schedule a background Maglev compilation and eventually cache the result.
     ///
@@ -20915,7 +20986,7 @@ mod tests {
         // On x86-64 Unix, wait briefly for the background Maglev compilation
         // to finish, then verify the cache is populated and the function still
         // returns the correct result via the Maglev tier.
-        #[cfg(all(target_arch = "x86_64", unix))]
+        #[cfg(stator_maglev_jit_x86_64)]
         {
             let inner_ba: &BytecodeArray = match outer_ba.constant_pool().first().unwrap() {
                 ConstantPoolEntry::Function(rc_ba) => rc_ba.as_ref(),

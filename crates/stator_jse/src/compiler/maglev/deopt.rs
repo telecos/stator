@@ -374,7 +374,7 @@ mod tests {
     /// (speculative Smi addition), execute it with values whose sum overflows
     /// into the 33-bit range so the overflow guard fires, then verify that the
     /// deoptimiser falls back to the interpreter and produces the correct result.
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(stator_maglev_jit_x86_64)]
     #[test]
     #[ignore = "narrow-Int32 analysis is disabled (SIGSEGV); 64-bit add does not overflow at 2^32"]
     fn test_deoptimize_via_type_change() {
