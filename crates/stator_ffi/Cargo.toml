@@ -1,6 +1,6 @@
 [package]
 name = "stator_jse_ffi"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Stator JavaScript engine — stable C FFI layer for embedding"
 license = "MIT"
@@ -11,6 +11,7 @@ keywords = ["javascript", "engine", "ffi", "embedding"]
 categories = ["compilers", "external-ffi-bindings"]
 include = [
     "Cargo.toml",
+    "LICENSE-MIT",
     "README.md",
     "build.rs",
     "cbindgen.toml",
