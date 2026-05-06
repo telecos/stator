@@ -1671,7 +1671,7 @@ dependencies = [
 
 [[package]]
 name = "stator_jse"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "arrayvec",
  "bitflags 2.11.1",
@@ -1700,7 +1700,7 @@ dependencies = [
 
 [[package]]
 name = "stator_jse_ffi"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "cbindgen",
  "log",

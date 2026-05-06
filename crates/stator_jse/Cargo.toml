@@ -1,6 +1,6 @@
 [package]
 name = "stator_jse"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Stator JavaScript engine core — parser, bytecode compiler, Maglev JIT, interpreter, GC"
 license = "MIT"
