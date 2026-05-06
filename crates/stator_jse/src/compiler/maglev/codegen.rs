@@ -4208,13 +4208,60 @@ impl<'a> MaglevCodegen<'a> {
         self.masm.jcc(CondCode::Less, &mut self.deopt_stub_label);
     }
 
+    /// ABI-aware helper-call argument register at index `i`.
+    ///
+    /// On SysV this returns `RDI, RSI, RDX, RCX, R8, R9` for `i = 0..=5`.
+    /// On Win64 it returns `RCX, RDX, R8, R9` for `i = 0..=3`.  Centralising
+    /// the lookup lets the migrated stub-call wrappers stay free of
+    /// hard-coded SysV register names.
+    ///
+    /// Panics (at compile time when the caller's index is a constant
+    /// out of range under the host ABI) if `i` exceeds the number of
+    /// register-passed arguments for [`NATIVE_ABI`].
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[inline]
+    const fn helper_arg_reg(i: usize) -> Reg64 {
+        match crate::compiler::abi_x64::NATIVE_ABI.helper_arg_register(i) {
+            Some(r) => r,
+            None => panic!("helper_arg_reg: index out of range for NATIVE_ABI"),
+        }
+    }
+
+    /// Reserve the ABI-mandated shadow space immediately before a helper
+    /// `CALL`.  Returns the number of bytes reserved so the matching
+    /// [`Self::emit_helper_call_post_adjust`] can release the same amount.
+    ///
+    /// Emits no instructions on SysV (shadow space is 0 bytes).  On
+    /// Win64 it emits `sub rsp, 32`.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[inline]
+    fn emit_helper_call_pre_adjust(&mut self) -> i32 {
+        const ADJ: i32 = crate::compiler::abi_x64::NATIVE_ABI.helper_call_pre_stack_adjust();
+        if ADJ != 0 {
+            self.masm.sub_ri(Reg64::Rsp, ADJ);
+        }
+        ADJ
+    }
+
+    /// Release shadow space reserved by [`Self::emit_helper_call_pre_adjust`].
+    /// Emits no instructions when `bytes == 0`.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[inline]
+    fn emit_helper_call_post_adjust(&mut self, bytes: i32) {
+        if bytes != 0 {
+            self.masm.add_ri(Reg64::Rsp, bytes);
+        }
+    }
+
     /// Call a 1-arg stub: `stub(node_arg)`.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_stub_call_1node(&mut self, id: NodeId, arg0: NodeId, stub_addr: usize) {
         let saved = self.emit_save_live_regs(id);
-        self.emit_load(arg0, Reg64::Rdi);
+        self.emit_load(arg0, Self::helper_arg_reg(0));
         self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        let adj = self.emit_helper_call_pre_adjust();
         self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_post_adjust(adj);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
         self.emit_store(id, Reg64::Rax);
@@ -4224,10 +4271,12 @@ impl<'a> MaglevCodegen<'a> {
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_stub_call_2node(&mut self, id: NodeId, arg0: NodeId, arg1: NodeId, stub_addr: usize) {
         let saved = self.emit_save_live_regs(id);
-        self.emit_load(arg0, Reg64::Rdi);
-        self.emit_load(arg1, Reg64::Rsi);
+        self.emit_load(arg0, Self::helper_arg_reg(0));
+        self.emit_load(arg1, Self::helper_arg_reg(1));
         self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        let adj = self.emit_helper_call_pre_adjust();
         self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_post_adjust(adj);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
         self.emit_store(id, Reg64::Rax);
@@ -7233,17 +7282,21 @@ impl<'a> MaglevCodegen<'a> {
     ) {
         let saved = self.emit_save_live_regs(id);
         // Load all node args into non-allocatable scratch regs first
-        // to avoid ABI-register clobbering.  RSI (phys_reg 3) and
-        // RDX (phys_reg 2) are allocatable, so loading `arg1` → RSI
-        // can clobber `arg2` if the allocator placed it in RSI.
+        // to avoid ABI-register clobbering.  Under SysV, RSI (phys_reg
+        // 3) and RDX (phys_reg 2) are allocatable, so loading
+        // `arg1` → arg-reg 1 can clobber `arg2` if the allocator
+        // placed it there.  The same hazard applies under Win64 for
+        // RDX/R8, so the scratch-then-shuffle pattern is preserved.
         self.emit_load(arg0, Reg64::R11);
         self.emit_load(arg1, Reg64::R10);
         self.emit_load(arg2, Reg64::Rax);
-        self.masm.mov_rr(Reg64::Rdi, Reg64::R11);
-        self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
-        self.masm.mov_rr(Reg64::Rdx, Reg64::Rax);
+        self.masm.mov_rr(Self::helper_arg_reg(0), Reg64::R11);
+        self.masm.mov_rr(Self::helper_arg_reg(1), Reg64::R10);
+        self.masm.mov_rr(Self::helper_arg_reg(2), Reg64::Rax);
         self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        let adj = self.emit_helper_call_pre_adjust();
         self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_post_adjust(adj);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
         self.emit_store(id, Reg64::Rax);
@@ -7262,17 +7315,19 @@ impl<'a> MaglevCodegen<'a> {
     ) {
         let saved = self.emit_save_live_regs(id);
         // Load all node arguments BEFORE setting any immediates into
-        // allocatable registers (RSI = phys_reg(3)).  The old order
-        // clobbered RSI with arg1_imm before loading arg2, which could
-        // read from RSI if the allocator placed it there.
-        self.emit_load(arg0_node, Reg64::Rdi);
+        // allocatable registers.  Under SysV the old order clobbered
+        // RSI with arg1_imm before loading arg2, which could read from
+        // RSI if the allocator placed it there.
+        self.emit_load(arg0_node, Self::helper_arg_reg(0));
         match arg2 {
-            NodeOrImm::Node(n) => self.emit_load(n, Reg64::Rdx),
-            NodeOrImm::Imm(v) => self.masm.mov_ri(Reg64::Rdx, v),
+            NodeOrImm::Node(n) => self.emit_load(n, Self::helper_arg_reg(2)),
+            NodeOrImm::Imm(v) => self.masm.mov_ri(Self::helper_arg_reg(2), v),
         }
-        self.masm.mov_ri(Reg64::Rsi, arg1_imm);
+        self.masm.mov_ri(Self::helper_arg_reg(1), arg1_imm);
         self.masm.mov_ri(Reg64::R11, stub_addr as i64);
+        let adj = self.emit_helper_call_pre_adjust();
         self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_post_adjust(adj);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
         self.emit_store(id, Reg64::Rax);
@@ -7285,22 +7340,33 @@ impl<'a> MaglevCodegen<'a> {
     ///
     /// We pass R14 (register-file base) as `regs` and R12 (accumulator) as
     /// `acc`, though most creation ops only use `operand1`/`operand2` and TLS.
+    ///
+    /// **Win64 TODO (blocker):** the 5th argument (`operand2`) does not fit
+    /// in a Win64 helper-argument register and must be written to the
+    /// caller-allocated stack slot at `[RSP + shadow_space_bytes]` instead
+    /// of `R8`.  This wrapper is currently `cfg(unix)`-gated, so SysV is
+    /// the only ABI exercised at runtime; when the cfg gate is dropped this
+    /// site needs the stack-arg layout implemented before it can be called
+    /// on Windows.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_trampoline_call(&mut self, id: NodeId, opcode: u8, operand1: i64, operand2: i64) {
         let saved = self.emit_save_live_regs(id);
-        // RDI = opcode
-        self.masm.mov_ri(Reg64::Rdi, i64::from(opcode));
-        // RSI = register-file base (R14)
-        self.masm.mov_rr(Reg64::Rsi, Reg64::R14);
-        // RDX = accumulator (R12)
-        self.masm.mov_rr(Reg64::Rdx, Reg64::R12);
-        // RCX = operand1
-        self.masm.mov_ri(Reg64::Rcx, operand1);
-        // R8 = operand2
-        self.masm.mov_ri(Reg64::R8, operand2);
+        // arg 0: opcode
+        self.masm.mov_ri(Self::helper_arg_reg(0), i64::from(opcode));
+        // arg 1: register-file base (R14)
+        self.masm.mov_rr(Self::helper_arg_reg(1), Reg64::R14);
+        // arg 2: accumulator (R12)
+        self.masm.mov_rr(Self::helper_arg_reg(2), Reg64::R12);
+        // arg 3: operand1
+        self.masm.mov_ri(Self::helper_arg_reg(3), operand1);
+        // arg 4: operand2 — fits in a register under SysV (R8) but is a
+        // stack argument under Win64 (see TODO above).
+        self.masm.mov_ri(Self::helper_arg_reg(4), operand2);
         let addr = jit_runtime::jit_runtime_trampoline as *const () as usize;
         self.masm.mov_ri(Reg64::R11, addr as i64);
+        let adj = self.emit_helper_call_pre_adjust();
         self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_post_adjust(adj);
         self.emit_restore_live_regs(saved);
         self.emit_deopt_check_rax();
         self.emit_store(id, Reg64::Rax);
