@@ -1624,56 +1624,50 @@ mod tests {
         assert_eq!(m.position(), 2);
     }
 
-    // ── FFI execution test (x86-64 + Unix only) ───────────────────────────────
+    // ── FFI execution test (x86-64) ───────────────────────────────────────────
 
     /// Call emitted machine code via a raw function pointer.
     ///
-    /// This test allocates a page of read-write-execute memory with `mmap`,
-    /// copies the emitted bytes into it, then invokes the resulting function
+    /// This test allocates a W^X executable region via the
+    /// [`executable_memory`](crate::executable_memory) abstraction, copies
+    /// the emitted bytes into it, then invokes the resulting function
     /// pointer through Rust's `extern "C"` FFI.
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_emit_add_and_call_via_ffi() {
-        // Emit: fn add(a: i64, b: i64) -> i64 { a + b }
+        use crate::executable_memory::ExecutableMemory;
+
+        // Emit: fn add(a: i64, b: i64) -> i64 { a + b } using the SysV AMD64
+        // calling convention (rdi/rsi).
         let mut masm = MacroAssembler::new();
         masm.mov_rr(Reg64::Rax, Reg64::Rdi);
         masm.add_rr(Reg64::Rax, Reg64::Rsi);
         masm.ret();
 
         let code = masm.into_code();
-        let size = code.len();
+        let mem = ExecutableMemory::new(&code).expect("executable allocation must succeed");
 
-        // Allocate a page of RWX memory and copy the code in.
-        // SAFETY: We pass valid arguments to mmap and check the return value.
-        let mem = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(mem, libc::MAP_FAILED, "mmap failed");
-
-        // SAFETY:
-        // - `mem` is a valid, non-null, page-aligned pointer to `size` bytes of
-        //   RWX memory returned by mmap.
-        // - We copy exactly `size` bytes of correctly-encoded x86-64 machine
-        //   code into it.
-        // - We transmute the pointer to an `extern "C"` function type whose
-        //   signature matches the emitted calling convention (SysV AMD64).
-        // - We unmap the memory after the last call.
+        // The emitted code uses SysV AMD64 argument registers (rdi/rsi),
+        // so only Unix targets will receive arguments correctly through the
+        // platform `extern "C"` ABI.  On Windows we exercise just the
+        // allocation path; a portable execution smoke-test lives in
+        // `crate::executable_memory::tests::executes_tiny_x86_64_blob`.
+        #[cfg(unix)]
         unsafe {
-            std::ptr::copy_nonoverlapping(code.as_ptr(), mem.cast::<u8>(), size);
-            let f: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(mem);
+            // SAFETY: `mem` is a valid R+X mapping containing correctly-
+            // encoded x86-64 machine code.  The function signature matches
+            // the SysV AMD64 calling convention.
+            let f: extern "C" fn(i64, i64) -> i64 = std::mem::transmute(mem.as_ptr());
             assert_eq!(f(3, 4), 7);
             assert_eq!(f(-1, 1), 0);
             assert_eq!(f(100, -50), 50);
             assert_eq!(f(0, 0), 0);
             assert_eq!(f(i64::MAX, 0), i64::MAX);
-            libc::munmap(mem, size);
+        }
+
+        #[cfg(not(unix))]
+        {
+            assert_eq!(mem.len(), code.len());
         }
     }
 }

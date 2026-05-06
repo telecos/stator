@@ -11755,37 +11755,37 @@ impl CompiledCode {
     /// The `code` bytes inside this [`CompiledCode`] must be valid x86-64
     /// machine code emitted by [`BaselineCompiler`].  Executing arbitrary or
     /// malformed bytes via `mmap` and a function pointer is undefined behaviour.
+    /// Execute the compiled code on x86-64 Linux/macOS by allocating a
+    /// W^X executable region via the
+    /// [`executable_memory`](crate::executable_memory) abstraction, copying
+    /// the code bytes into it, and invoking the JIT function.
+    ///
+    /// `args` provides the initial values for the parameter slots.  Missing
+    /// arguments are filled with `0` (`Smi(0)`); extra arguments are ignored.
+    ///
+    /// Returns the accumulator value on success.  Returns
+    /// [`StatorError::Internal`] if executable allocation fails.
+    ///
+    /// If the JIT function returns [`JIT_DEOPT`], the result is
+    /// `Err(StatorError::Internal("jit deopt"))`.
+    ///
+    /// # Safety
+    ///
+    /// The `code` bytes inside this [`CompiledCode`] must be valid x86-64
+    /// machine code emitted by [`BaselineCompiler`].  Executing arbitrary or
+    /// malformed bytes via a function pointer is undefined behaviour.
     #[cfg(all(target_arch = "x86_64", unix))]
     pub unsafe fn execute(&self, args: &[i64]) -> StatorResult<i64> {
-        use std::ptr;
+        use crate::executable_memory::ExecutableMemory;
 
         let code_size = self.code.len();
         if code_size == 0 {
             return Err(StatorError::Internal("compiled code is empty".into()));
         }
 
-        // Allocate a page of read/write/execute memory.
-        //
-        // SAFETY: arguments are valid; the return value is checked against
-        // MAP_FAILED before use.
-        let mem = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                code_size,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if mem == libc::MAP_FAILED {
-            return Err(StatorError::Internal("mmap failed for JIT code".into()));
-        }
-
-        // SAFETY: `mem` is valid, page-aligned, and sized for `code_size` bytes.
-        unsafe {
-            ptr::copy_nonoverlapping(self.code.as_ptr(), mem.cast::<u8>(), code_size);
-        }
+        let mem = ExecutableMemory::new(&self.code).map_err(|e| {
+            StatorError::Internal(format!("executable memory allocation failed: {e}").into())
+        })?;
 
         // Keep small register files on the stack to avoid per-call heap churn
         // on hot JIT entry paths.
@@ -11800,14 +11800,12 @@ impl CompiledCode {
         //   `extern "C" fn(*mut i64) -> i64` (SysV AMD64).
         // - `regs.as_mut_ptr()` is valid for the lifetime of the call.
         let result = unsafe {
-            let f: extern "C" fn(*mut i64) -> i64 = std::mem::transmute(mem);
+            let f: extern "C" fn(*mut i64) -> i64 = std::mem::transmute(mem.as_ptr());
             f(regs.as_mut_ptr())
         };
 
-        // SAFETY: `mem` is a valid mapping of `code_size` bytes.
-        unsafe {
-            libc::munmap(mem, code_size);
-        }
+        // `mem` is dropped here, releasing the executable region.
+        drop(mem);
 
         if jit_runtime::is_jit_deopt(result) {
             Err(StatorError::Internal("jit deopt".into()))
@@ -11819,30 +11817,31 @@ impl CompiledCode {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Persistent JIT code page that caches the `mmap`'d executable memory.
+/// Persistent JIT code page that caches an executable region for reuse.
 ///
 /// The page is allocated once (by [`CachedExecutableCode::from_compiled`]) and
-/// reused for all subsequent calls, eliminating the per-call `mmap`/`munmap`
-/// syscall overhead.
+/// reused for all subsequent calls, eliminating the per-call allocation
+/// overhead of [`CompiledCode::execute`].
 #[cfg(all(target_arch = "x86_64", unix))]
 pub struct CachedExecutableCode {
-    /// Pointer to the `mmap`'d executable memory.
-    ptr: *mut u8,
-    /// Size of the `mmap`'d region.
-    len: usize,
-    /// Function pointer to the JIT code (transmuted from `ptr`).
+    /// Owning handle to the executable region.
+    mem: crate::executable_memory::ExecutableMemory,
+    /// Function pointer to the JIT code (transmuted from the region's start
+    /// pointer).
     func: extern "C" fn(*mut i64) -> i64,
     /// Number of `i64` slots needed in the register file.
     pub register_file_slots: usize,
 }
 
-// SAFETY: The mmap'd code is position-independent and can be shared across
-// threads.  The memory is owned exclusively by this struct and freed on Drop.
+// SAFETY: The executable code is position-independent and can be shared
+// across threads.  The memory is owned exclusively by this struct and
+// freed on Drop via the inner `ExecutableMemory`.
 #[cfg(all(target_arch = "x86_64", unix))]
 unsafe impl Send for CachedExecutableCode {}
 
-// SAFETY: The mmap'd code is immutable after construction and the function
-// pointer is safe to call from any thread (the register file is caller-owned).
+// SAFETY: The executable code is immutable after construction and the
+// function pointer is safe to call from any thread (the register file is
+// caller-owned).
 #[cfg(all(target_arch = "x86_64", unix))]
 unsafe impl Sync for CachedExecutableCode {}
 
@@ -11850,20 +11849,9 @@ unsafe impl Sync for CachedExecutableCode {}
 impl std::fmt::Debug for CachedExecutableCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedExecutableCode")
-            .field("len", &self.len)
+            .field("len", &self.mem.len())
             .field("register_file_slots", &self.register_file_slots)
             .finish()
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", unix))]
-impl Drop for CachedExecutableCode {
-    fn drop(&mut self) {
-        // SAFETY: `ptr` and `len` were set by a successful `mmap` call in
-        // `from_compiled`.
-        unsafe {
-            libc::munmap(self.ptr.cast(), self.len);
-        }
     }
 }
 
@@ -11872,76 +11860,58 @@ impl CachedExecutableCode {
     /// Allocate executable memory, copy `code` into it, and transmute to a
     /// persistent function pointer.
     ///
-    /// This performs the `mmap` + `copy_nonoverlapping` + `transmute` sequence
-    /// **once**.  The resulting [`CachedExecutableCode`] can then be called
-    /// many times via [`execute`](Self::execute) without further syscalls.
+    /// This performs the allocation + `copy_nonoverlapping` + `transmute`
+    /// sequence **once**.  The resulting [`CachedExecutableCode`] can then
+    /// be called many times via [`execute`](Self::execute) without further
+    /// syscalls.
     ///
     /// # Errors
     ///
-    /// Returns [`StatorError::Internal`] if `code` is empty or `mmap` fails.
+    /// Returns [`StatorError::Internal`] if `code` is empty or executable
+    /// allocation fails.
     ///
     /// # Safety
     ///
     /// `code` must be valid x86-64 machine code emitted by the baseline or
     /// Maglev compiler.
     pub unsafe fn from_compiled(code: &[u8], register_file_slots: usize) -> StatorResult<Self> {
-        use std::ptr;
+        use crate::executable_memory::ExecutableMemory;
 
-        let code_size = code.len();
-        if code_size == 0 {
+        if code.is_empty() {
             return Err(StatorError::Internal("compiled code is empty".into()));
         }
 
-        // SAFETY: arguments are valid; MAP_FAILED is checked before use.
-        let mem = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                code_size,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if mem == libc::MAP_FAILED {
-            return Err(StatorError::Internal("mmap failed for JIT code".into()));
-        }
-
-        // SAFETY: `mem` is valid, page-aligned, and sized for `code_size` bytes.
-        unsafe {
-            ptr::copy_nonoverlapping(code.as_ptr(), mem.cast::<u8>(), code_size);
-        }
+        let mem = ExecutableMemory::new(code).map_err(|e| {
+            StatorError::Internal(format!("executable memory allocation failed: {e}").into())
+        })?;
 
         // SAFETY:
         // - `mem` contains correctly-encoded x86-64 machine code.
         // - The function signature matches the JIT calling convention:
         //   `extern "C" fn(*mut i64) -> i64` (SysV AMD64).
-        let func: extern "C" fn(*mut i64) -> i64 = unsafe { std::mem::transmute(mem) };
+        let func: extern "C" fn(*mut i64) -> i64 = unsafe { std::mem::transmute(mem.as_ptr()) };
 
         Ok(Self {
-            ptr: mem.cast::<u8>(),
-            len: code_size,
+            mem,
             func,
             register_file_slots,
         })
     }
 
-    /// Returns the mmap'd executable code as a byte slice.
+    /// Returns the executable code as a byte slice.
     ///
     /// Used by the interpreter to lazily initialise a
     /// [`JitExecutableCode`](crate::bytecode::bytecode_array::JitExecutableCode)
     /// or [`CachedMaglevCode`](crate::compiler::maglev::codegen::CachedMaglevCode)
     /// from a previously-cached compilation result.
     pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: `self.ptr` and `self.len` were set by a successful `mmap`
-        // call in `from_compiled`.
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        self.mem.as_bytes()
     }
 
     /// Execute the cached JIT code with the given arguments.
     ///
     /// Allocates only the register file and calls the persistent function
-    /// pointer.  Small register files stay on the stack; no `mmap`/`munmap`
+    /// pointer.  Small register files stay on the stack; no allocation
     /// syscalls are issued.
     ///
     /// `args` provides the initial values for the parameter slots.  Missing
@@ -11966,14 +11936,12 @@ impl CachedExecutableCode {
         }
     }
 
-    /// Returns the raw machine-code bytes stored in the `mmap`'d region.
+    /// Returns the raw machine-code bytes stored in the executable region.
     ///
     /// Used to seed a [`JitExecutableCode`](crate::bytecode::bytecode_array::JitExecutableCode)
     /// from the persistent cache without re-compiling.
     pub fn code_bytes(&self) -> &[u8] {
-        // SAFETY: `ptr` and `len` were set by a successful `mmap` in
-        // `from_compiled`; the region remains valid until `Drop`.
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        self.mem.as_bytes()
     }
 }
 

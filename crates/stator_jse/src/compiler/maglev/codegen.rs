@@ -278,33 +278,17 @@ impl MaglevCompiledCode {
     /// pointer is undefined behaviour.
     #[cfg(all(target_arch = "x86_64", unix))]
     pub unsafe fn execute(&self, args: &[i64]) -> StatorResult<i64> {
+        use crate::executable_memory::ExecutableMemory;
         use smallvec::{SmallVec, smallvec};
-        use std::ptr;
 
         let code_size = self.native_code_len;
         if code_size == 0 {
             return Err(StatorError::Internal("compiled code is empty".into()));
         }
 
-        // SAFETY: arguments are valid; MAP_FAILED is checked before use.
-        let mem = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                code_size,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if mem == libc::MAP_FAILED {
-            return Err(StatorError::Internal("mmap failed for JIT code".into()));
-        }
-
-        // SAFETY: `mem` is valid and sized for `code_size` bytes.
-        unsafe {
-            ptr::copy_nonoverlapping(self.code.as_ptr(), mem.cast::<u8>(), code_size);
-        }
+        let mem = ExecutableMemory::new(&self.code[..code_size]).map_err(|e| {
+            StatorError::Internal(format!("executable memory allocation failed: {e}").into())
+        })?;
 
         let mut regs: SmallVec<[i64; 32]> = smallvec![0i64; self.register_file_slots];
         for (i, &value) in args.iter().enumerate().take(regs.len()) {
@@ -317,14 +301,12 @@ impl MaglevCompiledCode {
         //   calling convention (SysV AMD64 ABI): RDI=reg_file, RSI=ctx_ptr.
         // - `regs` remains live for the duration of the call.
         let result = unsafe {
-            let f: extern "C" fn(*mut i64, i64) -> i64 = std::mem::transmute(mem);
+            let f: extern "C" fn(*mut i64, i64) -> i64 = std::mem::transmute(mem.as_ptr());
             f(regs.as_mut_ptr(), 0)
         };
 
-        // SAFETY: `mem` is a valid mapping of `code_size` bytes.
-        unsafe {
-            libc::munmap(mem, code_size);
-        }
+        // `mem` is dropped here, releasing the executable region.
+        drop(mem);
 
         if result == JIT_DEOPT {
             Err(StatorError::Internal("maglev deopt".into()))
@@ -336,14 +318,16 @@ impl MaglevCompiledCode {
 
 /// Persistent executable Maglev code cache.
 ///
-/// Unlike [`MaglevCompiledCode::execute`] which does `mmap`/`munmap` on every
-/// call, this struct keeps the executable page alive for the lifetime of the
-/// cache entry.  A thread-local register file is reused across calls to
-/// eliminate per-call heap allocation.
+/// Unlike [`MaglevCompiledCode::execute`] which allocates a fresh executable
+/// region on every call, this struct keeps the executable region alive for
+/// the lifetime of the cache entry through the
+/// [`executable_memory`](crate::executable_memory) abstraction.  A
+/// thread-local register file is reused across calls to eliminate per-call
+/// heap allocation.
 #[cfg(all(target_arch = "x86_64", unix))]
 pub struct CachedMaglevCode {
-    ptr: *mut u8,
-    size: usize,
+    /// Owning handle to the executable region.
+    mem: crate::executable_memory::ExecutableMemory,
     /// Total number of `i64` slots in the register file.
     pub register_file_slots: usize,
 }
@@ -352,15 +336,15 @@ pub struct CachedMaglevCode {
 impl std::fmt::Debug for CachedMaglevCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedMaglevCode")
-            .field("size", &self.size)
+            .field("size", &self.mem.len())
             .field("register_file_slots", &self.register_file_slots)
             .finish()
     }
 }
 
-// SAFETY: The mmap'd page is process-global memory.  We only access it
-// through an `extern "C"` function-pointer call, which is thread-safe as
-// long as the code is read-only (which it is after the initial memcpy).
+// SAFETY: The executable region is process-global memory.  We only access
+// it through an `extern "C"` function-pointer call, which is thread-safe as
+// long as the code is read-only (which it is after the initial copy).
 #[cfg(all(target_arch = "x86_64", unix))]
 unsafe impl Send for CachedMaglevCode {}
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -370,53 +354,27 @@ unsafe impl Sync for CachedMaglevCode {}
 impl CachedMaglevCode {
     /// Create a new cached Maglev code entry from a compiled code buffer.
     ///
-    /// Returns `None` if the code is empty or `mmap` fails.
+    /// Returns `None` if the code is empty or executable allocation fails.
     ///
     /// # Safety
     ///
     /// `code` must contain valid x86-64 machine code produced by
     /// [`compile`].
     pub unsafe fn new(code: &[u8], register_file_slots: usize) -> Option<Self> {
-        use std::ptr;
-
-        if code.is_empty() {
-            return None;
-        }
-
-        // SAFETY: arguments are valid; MAP_FAILED is checked before use.
-        let mem = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                code.len(),
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if mem == libc::MAP_FAILED {
-            return None;
-        }
-
-        // SAFETY: `mem` is valid for `code.len()` bytes.
-        unsafe {
-            ptr::copy_nonoverlapping(code.as_ptr(), mem.cast::<u8>(), code.len());
-        }
-
+        let mem = crate::executable_memory::ExecutableMemory::new(code).ok()?;
         Some(Self {
-            ptr: mem.cast::<u8>(),
-            size: code.len(),
+            mem,
             register_file_slots,
         })
     }
 
     /// Returns the raw entry-point pointer of the compiled Maglev code.
     ///
-    /// This is the `mmap`'d executable page that can be called as
+    /// This is the executable region that can be called as
     /// `extern "C" fn(*mut i64) -> i64`.  Used by the mono-cache upgrade
     /// path to patch a cached baseline entry point with the Maglev one.
     pub fn entry_point(&self) -> *const u8 {
-        self.ptr
+        self.mem.as_ptr()
     }
 
     /// Execute the cached Maglev code with the given arguments.
@@ -440,8 +398,9 @@ impl CachedMaglevCode {
             for (i, &v) in args.iter().enumerate().take(n) {
                 regs[i] = v;
             }
-            // SAFETY: `self.ptr` holds valid x86-64 machine code.
-            let f: extern "C" fn(*mut i64, i64) -> i64 = unsafe { std::mem::transmute(self.ptr) };
+            // SAFETY: `self.mem` holds valid x86-64 machine code.
+            let f: extern "C" fn(*mut i64, i64) -> i64 =
+                unsafe { std::mem::transmute(self.mem.as_ptr()) };
             return f(regs.as_mut_ptr(), ctx_ptr);
         }
 
@@ -460,20 +419,11 @@ impl CachedMaglevCode {
                 regs[i] = v;
             }
 
-            // SAFETY: `self.ptr` holds valid x86-64 machine code.
-            let f: extern "C" fn(*mut i64, i64) -> i64 = unsafe { std::mem::transmute(self.ptr) };
+            // SAFETY: `self.mem` holds valid x86-64 machine code.
+            let f: extern "C" fn(*mut i64, i64) -> i64 =
+                unsafe { std::mem::transmute(self.mem.as_ptr()) };
             f(regs.as_mut_ptr(), ctx_ptr)
         })
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", unix))]
-impl Drop for CachedMaglevCode {
-    fn drop(&mut self) {
-        // SAFETY: `self.ptr` is a valid mmap'd region of `self.size` bytes.
-        unsafe {
-            libc::munmap(self.ptr.cast(), self.size);
-        }
     }
 }
 

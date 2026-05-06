@@ -49,6 +49,9 @@ pub mod error;
 /// Event loop integration: macrotask scheduling, timer management, and
 /// microtask queue draining for embedder coordination.
 pub mod event_loop;
+/// Cross-platform abstraction for allocating, populating, and releasing
+/// W^X executable memory regions used by the baseline and Maglev JIT tiers.
+pub mod executable_memory;
 /// V8-compatible FFI wrapper types (`V8Object`, `V8Array`, `V8Number`, etc.).
 pub mod ffi;
 /// Garbage collector infrastructure: heap, tracing, and handle scopes.

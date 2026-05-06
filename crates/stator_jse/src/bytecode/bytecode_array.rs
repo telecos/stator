@@ -179,17 +179,16 @@ type JitCodeCache = Rc<RefCell<Option<(Vec<u8>, usize)>>>;
 
 /// Persistent executable JIT code region.
 ///
-/// Holds an `mmap`'d region of executable memory that persists across calls,
-/// avoiding the cost of `mmap`/`munmap` per invocation (two syscalls per call).
-/// Created lazily on first JIT execution and freed when the last
-/// [`BytecodeArray`] clone referencing it is dropped.
+/// Wraps an [`ExecutableMemory`](crate::executable_memory::ExecutableMemory)
+/// region that persists across calls, avoiding the cost of allocating a
+/// fresh executable page on every invocation.  Created lazily on first JIT
+/// execution and freed when the last [`BytecodeArray`] clone referencing it
+/// is dropped.
 #[cfg(all(target_arch = "x86_64", unix))]
 #[derive(Debug)]
 pub struct JitExecutableCode {
-    /// Pointer to `mmap`'d executable memory.
-    ptr: *mut u8,
-    /// Size of the `mmap`'d region in bytes.
-    size: usize,
+    /// Owning handle to the executable region.
+    mem: crate::executable_memory::ExecutableMemory,
     /// Number of `i64` register-file slots the JIT code expects.
     pub register_file_slots: usize,
 }
@@ -198,40 +197,18 @@ pub struct JitExecutableCode {
 impl JitExecutableCode {
     /// Create a new executable code region from raw machine code bytes.
     ///
-    /// Allocates a read-write-execute memory region via `mmap`, copies the
-    /// code into it, and returns the persistent handle.
+    /// Allocates a W^X executable region via the
+    /// [`executable_memory`](crate::executable_memory) abstraction, copies
+    /// the code into it, and returns the persistent handle.
     ///
     /// # Safety
     ///
     /// The caller must ensure `code` contains valid x86-64 machine code
     /// following the JIT calling convention.
     pub unsafe fn new(code: &[u8], register_file_slots: usize) -> Option<Self> {
-        use std::ptr;
-        if code.is_empty() {
-            return None;
-        }
-        let size = code.len();
-        // SAFETY: arguments are valid; MAP_FAILED is checked below.
-        let mem = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if mem == libc::MAP_FAILED {
-            return None;
-        }
-        // SAFETY: `mem` is valid, page-aligned, and sized for `size` bytes.
-        unsafe {
-            ptr::copy_nonoverlapping(code.as_ptr(), mem.cast::<u8>(), size);
-        }
+        let mem = crate::executable_memory::ExecutableMemory::new(code).ok()?;
         Some(Self {
-            ptr: mem.cast::<u8>(),
-            size,
+            mem,
             register_file_slots,
         })
     }
@@ -252,8 +229,9 @@ impl JitExecutableCode {
             for (i, &v) in args.iter().enumerate().take(n) {
                 regs[i] = v;
             }
-            // SAFETY: `self.ptr` contains valid x86-64 JIT code.
-            let f: extern "C" fn(*mut i64, i64) -> i64 = unsafe { std::mem::transmute(self.ptr) };
+            // SAFETY: `self.mem` contains valid x86-64 JIT code.
+            let f: extern "C" fn(*mut i64, i64) -> i64 =
+                unsafe { std::mem::transmute(self.mem.as_ptr()) };
             return f(regs.as_mut_ptr(), ctx_ptr);
         }
 
@@ -270,9 +248,10 @@ impl JitExecutableCode {
             for (i, &v) in args.iter().enumerate().take(n) {
                 regs[i] = v;
             }
-            // SAFETY: `self.ptr` contains valid x86-64 JIT code.
+            // SAFETY: `self.mem` contains valid x86-64 JIT code.
             // Second parameter (RSI) carries the raw context pointer.
-            let f: extern "C" fn(*mut i64, i64) -> i64 = unsafe { std::mem::transmute(self.ptr) };
+            let f: extern "C" fn(*mut i64, i64) -> i64 =
+                unsafe { std::mem::transmute(self.mem.as_ptr()) };
             f(regs.as_mut_ptr(), ctx_ptr)
         })
     }
@@ -281,17 +260,13 @@ impl JitExecutableCode {
 #[cfg(all(target_arch = "x86_64", unix))]
 impl Drop for JitExecutableCode {
     fn drop(&mut self) {
-        if !self.ptr.is_null() && self.size > 0 {
-            // SAFETY: `self.ptr` is a valid `mmap`'d region of `self.size` bytes.
-            unsafe {
-                libc::munmap(self.ptr.cast(), self.size);
-            }
-        }
+        // The wrapped `ExecutableMemory` releases the page in its own
+        // `Drop` impl; nothing to do here.
     }
 }
 
 // SAFETY: JitExecutableCode is only accessed from the interpreter's single
-// thread.  The mmap'd memory is read-only after initial copy.
+// thread.  The executable memory is read-only after initial copy.
 #[cfg(all(target_arch = "x86_64", unix))]
 unsafe impl Send for JitExecutableCode {}
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -1626,6 +1601,11 @@ impl BytecodeArray {
                 .load(Ordering::Relaxed)
     }
 
+    /// Returns `true` when baseline JIT code has been cached for this function.
+    pub fn has_baseline_jit_code(&self) -> bool {
+        self.inner.has_jit_code.get()
+    }
+
     /// Borrows the cached JIT executable code, or returns `None` if baseline
     /// compilation has not been triggered yet.
     ///
@@ -1875,6 +1855,21 @@ impl BytecodeArray {
     /// reset.
     pub fn set_maglev_next_try_at(&self, val: u32) {
         self.inner.maglev_next_try_at.set(val);
+    }
+
+    /// Enable or disable JIT tier execution for this function and nested functions.
+    pub fn set_jit_disabled(&self, disabled: bool) {
+        self.set_maglev_next_try_at(if disabled { u32::MAX } else { 0 });
+        for entry in self.inner.constant_pool.iter() {
+            if let ConstantPoolEntry::Function(nested_ba) = entry {
+                nested_ba.set_jit_disabled(disabled);
+            }
+        }
+    }
+
+    /// Returns `true` if this function is currently blocked from Maglev execution.
+    pub fn jit_disabled(&self) -> bool {
+        self.maglev_next_try_at() == u32::MAX
     }
 
     /// Returns `true` if the Maglev executable cache has been populated.
