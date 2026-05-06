@@ -1349,7 +1349,7 @@ fn jsvalue_to_jit(v: &JsValue) -> i64 {
 /// and stores the cached executable code via [`BytecodeArray::store_jit_code`].
 /// On other platforms this is a no-op.
 pub(super) fn maybe_compile_baseline(ba: &BytecodeArray) {
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(stator_baseline_jit_x86_64)]
     {
         use crate::compiler::baseline::compiler::{BaselineCompiler, CachedExecutableCode};
         if let Ok(cc) = BaselineCompiler::compile(ba) {
@@ -1364,7 +1364,7 @@ pub(super) fn maybe_compile_baseline(ba: &BytecodeArray) {
             }
         }
     }
-    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    #[cfg(not(stator_baseline_jit_x86_64))]
     let _ = ba;
 }
 
@@ -3551,7 +3551,7 @@ impl Interpreter {
             CURRENT_GLOBALS.with(|g| {
                 *g.borrow_mut() = Some(Rc::clone(env));
             });
-            #[cfg(all(target_arch = "x86_64", unix))]
+            #[cfg(stator_baseline_jit_x86_64)]
             {
                 use crate::compiler::baseline::compiler::jit_runtime_set_global_env;
                 jit_runtime_set_global_env(env.clone());
@@ -3625,7 +3625,7 @@ impl Interpreter {
         // Trigger JIT compilation based on invocation count so that top-level
         // scripts (called via Interpreter::run()) participate in tiering, not
         // only through OSR loop back-edges.
-        #[cfg(all(target_arch = "x86_64", unix))]
+        #[cfg(stator_baseline_jit_x86_64)]
         {
             if inv_count == TIERING_THRESHOLD {
                 maybe_compile_baseline(&frame.bytecode_array);
@@ -3635,7 +3635,7 @@ impl Interpreter {
                 maybe_compile_turbofan(&frame.bytecode_array);
             }
         }
-        #[cfg(not(all(target_arch = "x86_64", unix)))]
+        #[cfg(not(stator_baseline_jit_x86_64))]
         let _ = inv_count;
 
         let result = (|| {
@@ -3652,7 +3652,7 @@ impl Interpreter {
                     CURRENT_GLOBALS.with(|g| {
                         *g.borrow_mut() = Some(Rc::clone(&frame.global_env));
                     });
-                    #[cfg(all(target_arch = "x86_64", unix))]
+                    #[cfg(stator_baseline_jit_x86_64)]
                     {
                         use crate::compiler::baseline::compiler::jit_runtime_set_global_env;
                         jit_runtime_set_global_env(frame.global_env.clone());
@@ -3716,7 +3716,7 @@ impl Interpreter {
         // loop (e.g. dispatch_call).  The primary JIT entry check now
         // lives in `run_inner`, but nested function calls inside the
         // loop still need the runtime pointers.
-        #[cfg(all(target_arch = "x86_64", unix))]
+        #[cfg(stator_baseline_jit_x86_64)]
         {
             use crate::compiler::baseline::compiler::jit_runtime_set_global_env;
             jit_runtime_set_global_env(frame.global_env.clone());
@@ -3724,7 +3724,7 @@ impl Interpreter {
 
         // Provide the closure context to JIT runtime stubs so that
         // LdaCurrentContextSlot / StaCurrentContextSlot work.
-        #[cfg(all(target_arch = "x86_64", unix))]
+        #[cfg(stator_baseline_jit_x86_64)]
         {
             use crate::compiler::baseline::compiler::jit_runtime_set_context;
             let ctx = frame.context.as_ref().and_then(|v| match v {
@@ -20502,12 +20502,12 @@ mod tests {
         // Regardless of JIT availability the interpreter result must be correct.
         assert_eq!(last_result, JsValue::Smi(3), "add(1, 2) must return 3");
 
-        // On x86-64 Unix some JIT tier should have compiled code for the
-        // inner function.  When Maglev is active it may compile both the
-        // outer caller and the inner callee, in which case JIT-to-JIT
+        // On x86-64 Unix or Windows some JIT tier should have compiled code
+        // for the inner function.  When Maglev is active it may compile both
+        // the outer caller and the inner callee, in which case JIT-to-JIT
         // calls bypass the interpreter tiering path and baseline JIT may
         // never be triggered.  Accept either baseline or Maglev code.
-        #[cfg(all(target_arch = "x86_64", unix))]
+        #[cfg(stator_baseline_jit_x86_64)]
         {
             // Each outer_ba call creates a fresh closure via CreateClosure which
             // clones the inner BytecodeArray. All those clones share the same
@@ -20707,9 +20707,9 @@ mod tests {
         // The loop result must be correct.
         assert_eq!(result, JsValue::Smi(2000), "loop should count to 2000");
 
-        // On x86-64 Unix, OSR should have triggered JIT compilation.
+        // On x86-64 Unix or Windows, OSR should have triggered JIT compilation.
         // The looper_ba and the frame's clone share the same Rc jit_code.
-        #[cfg(all(target_arch = "x86_64", unix))]
+        #[cfg(stator_baseline_jit_x86_64)]
         assert!(
             looper_ba.try_get_jit_code().is_some(),
             "OSR: JIT code should be cached after a long-running loop"
@@ -20764,9 +20764,9 @@ mod tests {
 
         let (count_after, bytes_after) = jit_stats();
 
-        // On x86-64 Unix the stats must increase; on other platforms both
-        // counters remain zero.
-        #[cfg(all(target_arch = "x86_64", unix))]
+        // On x86-64 Unix or Windows the stats must increase; on other
+        // platforms both counters remain zero.
+        #[cfg(stator_baseline_jit_x86_64)]
         {
             assert!(
                 count_after > count_before,
@@ -20777,7 +20777,7 @@ mod tests {
                 "jit_stats().1 must increase after tiering (before={bytes_before}, after={bytes_after})"
             );
         }
-        #[cfg(not(all(target_arch = "x86_64", unix)))]
+        #[cfg(not(stator_baseline_jit_x86_64))]
         {
             assert_eq!(
                 count_after, 0,
@@ -20787,6 +20787,76 @@ mod tests {
                 bytes_after, 0,
                 "jit_stats bytes must be zero on non-JIT platform"
             );
+        }
+    }
+
+    /// Focused regression test for the Windows baseline-JIT slice: a small
+    /// hot loop that calls a callee enough times to cross
+    /// [`TIERING_THRESHOLD`] must trigger baseline compilation on every
+    /// `stator_baseline_jit_x86_64` platform (x86_64 Linux *and* Windows),
+    /// without depending on any Maglev background-compilation polling.
+    ///
+    /// Mirrors `test_jit_stats_updated_after_compilation` but is *not*
+    /// `#[ignore]`d because it never waits on Maglev.  Maglev is a no-op on
+    /// Windows, so this completes in milliseconds on both platforms.
+    #[test]
+    fn baseline_jit_compiles_hot_callee_on_supported_targets() {
+        use super::jit_stats;
+        use crate::bytecode::bytecode_array::TIERING_THRESHOLD;
+
+        let add_ba = make_add_bytecode();
+        let outer_instrs = vec![
+            Instruction::new_unchecked(
+                Opcode::CreateClosure,
+                vec![
+                    Operand::ConstantPoolIdx(0),
+                    Operand::FeedbackSlot(0),
+                    Operand::Flag(0),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(0)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(1)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(1)]),
+            Instruction::new_unchecked(Opcode::LdaSmi, vec![Operand::Immediate(2)]),
+            Instruction::new_unchecked(Opcode::Star, vec![Operand::Register(2)]),
+            Instruction::new_unchecked(
+                Opcode::CallAnyReceiver,
+                vec![
+                    Operand::Register(0),
+                    Operand::Register(1),
+                    Operand::RegisterCount(2),
+                    Operand::FeedbackSlot(1),
+                ],
+            ),
+            Instruction::new_unchecked(Opcode::Return, vec![]),
+        ];
+        let pool = vec![ConstantPoolEntry::Function(Rc::new(add_ba))];
+        let outer_ba = make_bytecode_with_pool(outer_instrs, pool, 3, 0);
+
+        let (count_before, bytes_before) = jit_stats();
+
+        for _ in 0..(TIERING_THRESHOLD + 5) {
+            let mut frame = InterpreterFrame::new(Rc::new(outer_ba.clone()), vec![]);
+            Interpreter::run(&mut frame).unwrap();
+        }
+
+        let (count_after, bytes_after) = jit_stats();
+
+        #[cfg(stator_baseline_jit_x86_64)]
+        {
+            assert!(
+                count_after > count_before,
+                "baseline compilation count must increase on x86_64 (before={count_before}, after={count_after})"
+            );
+            assert!(
+                bytes_after > bytes_before,
+                "baseline compiled-bytes must increase on x86_64 (before={bytes_before}, after={bytes_after})"
+            );
+        }
+        #[cfg(not(stator_baseline_jit_x86_64))]
+        {
+            assert_eq!(count_after, count_before);
+            assert_eq!(bytes_after, bytes_before);
         }
     }
 

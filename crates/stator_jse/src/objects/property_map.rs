@@ -320,7 +320,7 @@ pub(crate) fn acquire_object_rc_from_template_with_values(
 ///
 /// The returned pointer is valid for the current thread's lifetime.
 /// The caller must ensure single-threaded access (no concurrent borrows).
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_baseline_jit_x86_64)]
 pub(crate) fn object_rc_pool_ptr() -> *const RefCell<Vec<Rc<RefCell<PropertyMap>>>> {
     OBJECT_RC_POOL.with(|pool| pool as *const _)
 }
@@ -329,7 +329,7 @@ pub(crate) fn object_rc_pool_ptr() -> *const RefCell<Vec<Rc<RefCell<PropertyMap>
 /// the pool is empty during the IC-hit hot path.  Amortises the cost
 /// of `Rc::new` across subsequent loop iterations so they hit the
 /// pool instead of falling back to per-object allocation.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_baseline_jit_x86_64)]
 const POOL_BATCH_SIZE: usize = 32;
 
 /// Like [`acquire_object_rc_from_template_with_values`] but uses a
@@ -340,7 +340,7 @@ const POOL_BATCH_SIZE: usize = 32;
 ///
 /// `pool_ptr` must point to a live `RefCell<Vec<…>>` on the current
 /// thread (as returned by [`object_rc_pool_ptr`]).
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_baseline_jit_x86_64)]
 #[inline(always)]
 pub(crate) fn acquire_object_rc_from_template_with_values_cached(
     template: &ObjectLiteralTemplate,
@@ -382,7 +382,7 @@ pub(crate) fn acquire_object_rc_from_template_with_values_cached(
 /// # Safety
 ///
 /// Same as [`acquire_object_rc_from_template_with_values_cached`].
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_baseline_jit_x86_64)]
 #[inline(always)]
 pub(crate) fn acquire_object_rc_from_template_cached(
     template: &ObjectLiteralTemplate,
@@ -418,7 +418,7 @@ pub(crate) fn acquire_object_rc_from_template_cached(
 /// `pool_ptr` must point to a live `RefCell<Vec<…>>` on the current
 /// thread (as returned by [`object_rc_pool_ptr`]).  The caller must
 /// ensure no concurrent borrows exist (single-threaded JIT guarantee).
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_baseline_jit_x86_64)]
 #[inline(always)]
 #[allow(dead_code)]
 pub(crate) fn recycle_object_rc_cached(
@@ -454,7 +454,7 @@ pub(crate) fn recycle_object_rc(rc: Rc<RefCell<PropertyMap>>) {
     }
 
     // Fast path: bypass RefCell overhead via raw pointer (x86_64 unix).
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(stator_baseline_jit_x86_64)]
     {
         let pool_ptr = object_rc_pool_ptr();
         if !pool_ptr.is_null() {

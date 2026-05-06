@@ -168,13 +168,13 @@ impl SourcePosition {
 ///
 /// The outer [`Rc`] allows all clones of a [`BytecodeArray`] to share the
 /// same cache without copying.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_baseline_jit_x86_64)]
 type JitCodeCache = Rc<RefCell<Option<crate::compiler::baseline::compiler::CachedExecutableCode>>>;
 
 /// Shared JIT code cache stored in a [`BytecodeArray`].
 ///
 /// On non-JIT platforms this is a no-op placeholder.
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+#[cfg(not(stator_baseline_jit_x86_64))]
 type JitCodeCache = Rc<RefCell<Option<(Vec<u8>, usize)>>>;
 
 /// Persistent executable JIT code region.
@@ -184,7 +184,7 @@ type JitCodeCache = Rc<RefCell<Option<(Vec<u8>, usize)>>>;
 /// fresh executable page on every invocation.  Created lazily on first JIT
 /// execution and freed when the last [`BytecodeArray`] clone referencing it
 /// is dropped.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_baseline_jit_x86_64)]
 #[derive(Debug)]
 pub struct JitExecutableCode {
     /// Owning handle to the executable region.
@@ -193,7 +193,7 @@ pub struct JitExecutableCode {
     pub register_file_slots: usize,
 }
 
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_baseline_jit_x86_64)]
 impl JitExecutableCode {
     /// Create a new executable code region from raw machine code bytes.
     ///
@@ -262,7 +262,7 @@ impl JitExecutableCode {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_baseline_jit_x86_64)]
 impl Drop for JitExecutableCode {
     fn drop(&mut self) {
         // The wrapped `ExecutableMemory` releases the page in its own
@@ -272,19 +272,19 @@ impl Drop for JitExecutableCode {
 
 // SAFETY: JitExecutableCode is only accessed from the interpreter's single
 // thread.  The executable memory is read-only after initial copy.
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_baseline_jit_x86_64)]
 unsafe impl Send for JitExecutableCode {}
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_baseline_jit_x86_64)]
 unsafe impl Sync for JitExecutableCode {}
 
 /// Shared persistent executable JIT code cache.
 ///
 /// Created lazily on first baseline JIT execution.  All clones of a
 /// [`BytecodeArray`] share the same cache via [`Rc`].
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(stator_baseline_jit_x86_64)]
 pub type JitExecutableCache = Rc<RefCell<Option<JitExecutableCode>>>;
 /// Stub type for platforms without JIT support.
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+#[cfg(not(stator_baseline_jit_x86_64))]
 pub type JitExecutableCache = Rc<RefCell<Option<()>>>;
 
 /// Shared decoded bytecode cache stored in a [`BytecodeArray`].
@@ -1031,7 +1031,7 @@ impl BytecodeArray {
     /// # Safety
     ///
     /// The caller must ensure the [`BytecodeArray`] outlives the pointer.
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(stator_baseline_jit_x86_64)]
     pub(crate) fn get_cached_template_ptr(&self, slot: u32) -> *const ObjectLiteralTemplate {
         let borrow = self.inner.object_literal_templates.borrow();
         match borrow.get(&slot) {
@@ -1574,7 +1574,7 @@ impl BytecodeArray {
     /// page of executable memory.
     ///
     /// All clones of this [`BytecodeArray`] share the same JIT cache.
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(stator_baseline_jit_x86_64)]
     pub fn store_jit_code(
         &self,
         cached: crate::compiler::baseline::compiler::CachedExecutableCode,
@@ -1585,7 +1585,7 @@ impl BytecodeArray {
 
     /// Store baseline-JIT machine code produced by the compiler (non-JIT
     /// platform fallback).
-    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    #[cfg(not(stator_baseline_jit_x86_64))]
     pub fn store_jit_code(&self, code: Vec<u8>, register_file_slots: usize) {
         *self.inner.jit_code.borrow_mut() = Some((code, register_file_slots));
         self.inner.has_jit_code.set(true);
@@ -1616,7 +1616,7 @@ impl BytecodeArray {
     ///
     /// The caller can call [`CachedExecutableCode::execute`] on the borrowed
     /// reference without cloning or allocating executable memory.
-    #[cfg(all(target_arch = "x86_64", unix))]
+    #[cfg(stator_baseline_jit_x86_64)]
     pub fn try_get_jit_code(
         &self,
     ) -> std::cell::Ref<'_, Option<crate::compiler::baseline::compiler::CachedExecutableCode>> {
@@ -1626,7 +1626,7 @@ impl BytecodeArray {
     /// Returns a clone of the cached JIT machine code and register-file slot
     /// count, or `None` if baseline compilation has not been triggered yet
     /// (non-JIT platform fallback).
-    #[cfg(not(all(target_arch = "x86_64", unix)))]
+    #[cfg(not(stator_baseline_jit_x86_64))]
     pub fn try_get_jit_code(&self) -> Option<(Vec<u8>, usize)> {
         self.inner.jit_code.borrow().clone()
     }
