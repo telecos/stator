@@ -360,6 +360,7 @@ pub unsafe extern "C" fn stator_isolate_get_stats(
 
 /// Extended tiering diagnostics for embedders.
 #[repr(C)]
+#[derive(Debug)]
 pub struct StatorTieringStats {
     /// Number of functions compiled by the baseline JIT.
     pub baseline_function_count: u32,
@@ -8833,5 +8834,144 @@ mod tests {
         unsafe { stator_dom_weak_ref_invoke(std::ptr::null()) };
         unsafe { stator_dom_weak_ref_clear(std::ptr::null()) };
         unsafe { stator_dom_weak_ref_destroy(std::ptr::null_mut()) };
+    }
+
+    // ── Edge-proof Maglev tiering parity ──────────────────────────────────────
+
+    /// Helper: read tiering stats via the FFI surface (same path Edge uses).
+    fn read_tiering_stats(iso: *const StatorIsolate) -> StatorTieringStats {
+        let mut stats: StatorTieringStats = unsafe { std::mem::zeroed() };
+        unsafe { stator_isolate_get_tiering_stats(iso, &mut stats as *mut _) };
+        stats
+    }
+
+    /// Run an Edge-proof shaped workload (compile once, warmup + measured)
+    /// against `source` and return `(final_number_result, stats)`.
+    ///
+    /// Mirrors the Edge proof harness: 5 warmup runs followed by 20 measured
+    /// runs over the SAME compiled script (the "compiled_run" path).
+    #[cfg(stator_maglev_jit_x86_64)]
+    fn run_edge_proof_compiled(source: &[u8]) -> (f64, StatorTieringStats) {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        // SAFETY: `iso` is valid.
+        unsafe { stator_isolate_reset_tiering_stats(iso.as_ptr()) };
+
+        // SAFETY: `ctx` is valid; `source` is a valid byte slice.
+        let script =
+            unsafe { stator_script_compile(ctx, source.as_ptr() as *const c_char, source.len()) };
+        assert!(!script.is_null(), "script must compile");
+        // SAFETY: `script` is non-null.
+        let err = unsafe { stator_script_get_error(script) };
+        assert!(err.is_null(), "unexpected compile error");
+
+        let mut last = f64::NAN;
+        // 5 warmup + 20 measured = 25 total runs over the same compiled BA.
+        for i in 0..25 {
+            // SAFETY: `script` and `ctx` are valid.
+            let result = unsafe { stator_script_run(script, ctx) };
+            assert!(!result.is_null(), "run {i} returned null");
+            // SAFETY: `result` is non-null.
+            last = unsafe { stator_value_as_number(result) };
+            // SAFETY: `result` is non-null.
+            unsafe { stator_value_destroy(result) };
+            // Give the background Maglev thread a moment to install code
+            // before the next run picks it up.  Mirrors Edge's per-iteration
+            // pacing (each measured iteration is hundreds of microseconds).
+            if i < 6 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
+        let stats = read_tiering_stats(iso.as_ptr());
+
+        // SAFETY: pointers are live.
+        unsafe {
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
+        (last, stats)
+    }
+
+    /// Loop2K from Edge `edge_stator_jse_test_cases.cc`: `7000`.
+    #[cfg(stator_maglev_jit_x86_64)]
+    #[test]
+    fn edge_proof_loop2k_executes_maglev() {
+        let src = b"var total = 0; for (var i = 0; i < 2000; ++i) { total += (i & 7); } total;";
+        let (result, stats) = run_edge_proof_compiled(src);
+        assert!(
+            (result - 7000.0).abs() < f64::EPSILON,
+            "Loop2K must return 7000, got {result}"
+        );
+        assert!(
+            stats.maglev_function_count > 0,
+            "Maglev should have compiled at least one function: {stats:?}"
+        );
+        assert!(
+            stats.maglev_executed > 0,
+            "Maglev should have executed at least once over 25 runs (compiled={}, tried={}, executed={}, deopts={}, not_ready={}, blocked={}, cache_empty={})",
+            stats.maglev_function_count,
+            stats.maglev_tried,
+            stats.maglev_executed,
+            stats.maglev_deopts,
+            stats.maglev_not_ready,
+            stats.maglev_blocked,
+            stats.maglev_cache_empty,
+        );
+    }
+
+    /// FunctionLoop1K from Edge `edge_stator_jse_test_cases.cc`: `2000`.
+    #[cfg(stator_maglev_jit_x86_64)]
+    #[test]
+    fn edge_proof_function_loop1k_executes_maglev() {
+        let src = b"function f(n) { var total = 0; for (var i = 0; i < n; ++i) { total += (i % 5); } return total; } f(1000);";
+        let (result, stats) = run_edge_proof_compiled(src);
+        assert!(
+            (result - 2000.0).abs() < f64::EPSILON,
+            "FunctionLoop1K must return 2000, got {result}"
+        );
+        assert!(
+            stats.maglev_function_count > 0,
+            "Maglev should have compiled at least one function: {stats:?}"
+        );
+        assert!(
+            stats.maglev_executed > 0,
+            "Maglev should have executed at least once over 25 runs (compiled={}, tried={}, executed={}, deopts={}, not_ready={}, blocked={}, cache_empty={})",
+            stats.maglev_function_count,
+            stats.maglev_tried,
+            stats.maglev_executed,
+            stats.maglev_deopts,
+            stats.maglev_not_ready,
+            stats.maglev_blocked,
+            stats.maglev_cache_empty,
+        );
+    }
+
+    /// StringAppend200 from Edge `edge_stator_jse_test_cases.cc`: `200`.
+    #[cfg(stator_maglev_jit_x86_64)]
+    #[test]
+    fn edge_proof_string_append200_executes_maglev() {
+        let src = b"var value = ''; for (var i = 0; i < 200; ++i) { value += 'x'; } value.length;";
+        let (result, stats) = run_edge_proof_compiled(src);
+        assert!(
+            (result - 200.0).abs() < f64::EPSILON,
+            "StringAppend200 must return 200, got {result}"
+        );
+        assert!(
+            stats.maglev_function_count > 0,
+            "Maglev should have compiled at least one function: {stats:?}"
+        );
+        assert!(
+            stats.maglev_executed > 0,
+            "Maglev should have executed at least once over 25 runs (compiled={}, tried={}, executed={}, deopts={}, not_ready={}, blocked={}, cache_empty={})",
+            stats.maglev_function_count,
+            stats.maglev_tried,
+            stats.maglev_executed,
+            stats.maglev_deopts,
+            stats.maglev_not_ready,
+            stats.maglev_blocked,
+            stats.maglev_cache_empty,
+        );
     }
 }

@@ -1665,12 +1665,10 @@ fn try_execute_maglev_raw(ba: &BytecodeArray, args: &[JsValue]) -> Option<i64> {
     #[cfg(stator_maglev_jit_x86_64)]
     {
         if ba.jit_maglev_has_deopted() {
-            #[cfg(debug_assertions)]
             MAGLEV_DIAG_BLOCKED.with(|c| c.set(c.get() + 1));
             return None;
         }
 
-        #[cfg(debug_assertions)]
         MAGLEV_DIAG_TRIED.with(|c| c.set(c.get() + 1));
 
         use crate::compiler::baseline::compiler::{
@@ -1697,7 +1695,6 @@ fn try_execute_maglev_raw(ba: &BytecodeArray, args: &[JsValue]) -> Option<i64> {
                     >= crate::bytecode::bytecode_array::MAGLEV_TIERING_THRESHOLD
                 {
                     maybe_compile_maglev(ba);
-                    #[cfg(debug_assertions)]
                     MAGLEV_DIAG_NOT_READY.with(|c| c.set(c.get() + 1));
                 }
             }
@@ -1705,7 +1702,6 @@ fn try_execute_maglev_raw(ba: &BytecodeArray, args: &[JsValue]) -> Option<i64> {
 
         let guard = cache.borrow();
         if guard.is_none() {
-            #[cfg(debug_assertions)]
             DIAG_MAGLEV_CACHE_EMPTY.with(|c| c.set(c.get() + 1));
             return None;
         }
@@ -1733,10 +1729,8 @@ fn try_execute_maglev_raw(ba: &BytecodeArray, args: &[JsValue]) -> Option<i64> {
 
         let deopt_offset = (result as u64).wrapping_sub(JIT_DEOPT as u64);
         let ret = if deopt_offset <= 5 {
-            #[cfg(debug_assertions)]
             MAGLEV_DIAG_DEOPTED.with(|c| c.set(c.get() + 1));
             // Update per-category deopt counters.
-            #[cfg(debug_assertions)]
             MAGLEV_DIAG_DEOPT_CATS.with(|c| {
                 let mut cats = c.get();
                 let idx = deopt_offset as usize;
@@ -1748,7 +1742,6 @@ fn try_execute_maglev_raw(ba: &BytecodeArray, args: &[JsValue]) -> Option<i64> {
             ba.mark_jit_maglev_deopted();
             None
         } else {
-            #[cfg(debug_assertions)]
             MAGLEV_DIAG_EXECUTED.with(|c| c.set(c.get() + 1));
             Some(result)
         };
@@ -1925,7 +1918,6 @@ pub(super) fn try_execute_best_jit(
     ba: &BytecodeArray,
     args: &[JsValue],
 ) -> Option<StatorResult<JsValue>> {
-    #[cfg(debug_assertions)]
     DIAG_BEST_JIT_ENTERED.with(|c| c.set(c.get() + 1));
     // Never run JIT when a debugger is attached — the debugger needs
     // to single-step through interpreted bytecodes.
@@ -1936,11 +1928,9 @@ pub(super) fn try_execute_best_jit(
     // both disabled due to codegen bugs.  Skip directly to Maglev to
     // avoid two unnecessary function calls per eval_js iteration.
     if let Some(r) = try_execute_maglev(ba, args) {
-        #[cfg(debug_assertions)]
         DIAG_MAGLEV_HIT.with(|c| c.set(c.get() + 1));
         return Some(r);
     }
-    #[cfg(debug_assertions)]
     DIAG_MAGLEV_MISS.with(|c| c.set(c.get() + 1));
     None
 }
@@ -1950,17 +1940,14 @@ pub(super) fn try_execute_best_jit_no_result(
     ba: &BytecodeArray,
     args: &[JsValue],
 ) -> Option<StatorResult<()>> {
-    #[cfg(debug_assertions)]
     DIAG_BEST_JIT_ENTERED.with(|c| c.set(c.get() + 1));
     if DEBUG_ATTACHED.with(|f| f.get()) {
         return None;
     }
     if let Some(r) = try_execute_maglev_no_result(ba, args) {
-        #[cfg(debug_assertions)]
         DIAG_MAGLEV_HIT.with(|c| c.set(c.get() + 1));
         return Some(r);
     }
-    #[cfg(debug_assertions)]
     DIAG_MAGLEV_MISS.with(|c| c.set(c.get() + 1));
     None
 }
@@ -3577,7 +3564,6 @@ impl Interpreter {
         args: &[JsValue],
         env: &Rc<RefCell<GlobalEnv>>,
     ) -> StatorResult<JsValue> {
-        #[cfg(debug_assertions)]
         DIAG_RUN_INNER_ENTERED.with(|c| c.set(c.get() + 1));
 
         Self::publish_fast_globals(env);
@@ -3602,7 +3588,6 @@ impl Interpreter {
         args: &[JsValue],
         env: &Rc<RefCell<GlobalEnv>>,
     ) -> StatorResult<()> {
-        #[cfg(debug_assertions)]
         DIAG_RUN_INNER_ENTERED.with(|c| c.set(c.get() + 1));
 
         Self::publish_fast_globals(env);
@@ -3617,7 +3602,6 @@ impl Interpreter {
     }
 
     fn run_inner(frame: &mut InterpreterFrame, skip_globals: bool) -> StatorResult<JsValue> {
-        #[cfg(debug_assertions)]
         DIAG_RUN_INNER_ENTERED.with(|c| c.set(c.get() + 1));
 
         // Increment invocation count for tiering — ensures top-level code
