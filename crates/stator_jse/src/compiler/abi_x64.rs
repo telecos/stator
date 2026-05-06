@@ -111,6 +111,16 @@ impl AbiX64 {
         self.shadow_space_bytes()
     }
 
+    /// Stack adjustment (in bytes) a generated-code caller must reserve
+    /// immediately before a direct JIT-entry `CALL`.
+    ///
+    /// Direct entry calls share the same shadow-space contract as helper
+    /// calls, but exposing a distinct fact keeps call-site code explicit
+    /// about the callee ABI it is satisfying.
+    pub const fn entry_call_pre_stack_adjust(self) -> i32 {
+        self.shadow_space_bytes()
+    }
+
     /// Required `RSP` alignment (in bytes) at the point a `CALL`
     /// instruction is executed.  Both SysV and Win64 mandate 16-byte
     /// alignment.
@@ -185,6 +195,11 @@ mod tests {
         assert_eq!(AbiX64::Win64.shadow_space_bytes(), 32);
         assert_eq!(
             AbiX64::Win64.helper_call_pre_stack_adjust(),
+            AbiX64::Win64.shadow_space_bytes()
+        );
+        assert_eq!(AbiX64::SysV.entry_call_pre_stack_adjust(), 0);
+        assert_eq!(
+            AbiX64::Win64.entry_call_pre_stack_adjust(),
             AbiX64::Win64.shadow_space_bytes()
         );
     }

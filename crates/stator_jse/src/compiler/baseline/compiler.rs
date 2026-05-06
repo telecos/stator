@@ -12293,6 +12293,36 @@ impl<'a> BaselineCompiler<'a> {
         }
     }
 
+    // ── ABI-aware JIT-entry call primitives ─────────────────────────────────
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[inline]
+    fn emit_jit_entry_arg_setup(&mut self, register_file: Reg64, closure_context: Reg64) {
+        let register_file_arg = crate::compiler::abi_x64::NATIVE_ABI.entry_arg_register_file();
+        let closure_context_arg = crate::compiler::abi_x64::NATIVE_ABI.entry_arg_closure_context();
+
+        if register_file != register_file_arg {
+            self.masm.mov_rr(register_file_arg, register_file);
+        }
+        if closure_context != closure_context_arg {
+            self.masm.mov_rr(closure_context_arg, closure_context);
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[inline]
+    fn emit_jit_entry_call(&mut self, entry: Reg64, register_file: Reg64, closure_context: Reg64) {
+        self.emit_jit_entry_arg_setup(register_file, closure_context);
+        const ADJ: i32 = crate::compiler::abi_x64::NATIVE_ABI.entry_call_pre_stack_adjust();
+        if ADJ != 0 {
+            self.masm.sub_ri(Reg64::Rsp, ADJ);
+        }
+        self.masm.call_reg(entry);
+        if ADJ != 0 {
+            self.masm.add_ri(Reg64::Rsp, ADJ);
+        }
+    }
+
     // ── Global register promotion helpers ────────────────────────────────────
 
     /// Scan the decoded instruction stream and collect every unique
@@ -12843,9 +12873,8 @@ impl<'a> BaselineCompiler<'a> {
             self.masm
                 .mov_load_base_disp32(Reg64::Rsi, Reg64::Rbp, off_ctx);
 
-            // CALL entry point: RDI = register file, RSI = ctx_ptr.
-            self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
-            self.masm.call_reg(Reg64::R11);
+            // CALL entry point with platform JIT-entry ABI args.
+            self.emit_jit_entry_call(Reg64::R11, Reg64::Rsp, Reg64::Rsi);
 
             // Deallocate register file.
             self.masm.add_ri(Reg64::Rsp, 128);
@@ -12918,9 +12947,7 @@ impl<'a> BaselineCompiler<'a> {
                 self.masm
                     .mov_store_base_disp32(Reg64::Rsp, i * 8, Reg64::Rax);
             }
-            self.masm.mov_rr(Reg64::Rdi, Reg64::Rsp);
-            self.masm.mov_rr(Reg64::Rsi, Reg64::R10);
-            self.masm.call_reg(Reg64::R11);
+            self.emit_jit_entry_call(Reg64::R11, Reg64::Rsp, Reg64::R10);
             self.masm.add_ri(Reg64::Rsp, 128);
 
             // Finish direct call (restores BA, context, truncates heap).
