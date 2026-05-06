@@ -81,11 +81,20 @@
 //! assert!(!compiled.code.is_empty());
 //! ```
 
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 use crate::bytecode::bytecodes::Opcode;
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 use crate::compiler::baseline::compiler::JIT_HEAP_TAG;
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 use crate::compiler::baseline::compiler::jit_runtime;
 use crate::compiler::baseline::compiler::{
     DeoptEntry, JIT_DEOPT, JIT_FALSE, JIT_NULL, JIT_TRUE, JIT_UNDEFINED, METADATA_MAGIC,
@@ -136,30 +145,63 @@ const NUM_REG_FWD: usize = 6;
 /// [RBP - base - 64]  inline operation tag (0=AddSmi, 1=SubSmi, 2=Inc, 3=Dec)
 /// [RBP - base - 72]  inline delta (pre-computed: AddSmi→+imm, SubSmi→-imm, Inc→+1, Dec→-1)
 /// ```
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 const MONO_CACHE_SLOT_BYTES: i32 = 80;
 
 /// Offset from the start of a mono-cache slot to each field.
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 const MONO_OFF_CALLEE: i32 = 0;
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 const MONO_OFF_ENTRY: i32 = 8;
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 const MONO_OFF_CTX: i32 = 16;
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 const MONO_OFF_BA: i32 = 24;
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 const MONO_OFF_CALLER_BA: i32 = 32;
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 const MONO_OFF_REG_SLOTS: i32 = 40;
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 const MONO_OFF_INLINE_FLAG: i32 = 48;
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 const MONO_OFF_INLINE_SLOT: i32 = 56;
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 const MONO_OFF_INLINE_OP: i32 = 64;
 /// Pre-computed delta: AddSmi→+imm, SubSmi→-imm, Inc→+1, Dec→-1.
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 const MONO_OFF_INLINE_IMM: i32 = 72;
 
 /// Bytes per named-property IC site on the stack: 5 × i64 =
@@ -175,12 +217,18 @@ const NAMED_IC_SITE_BYTES: i32 = 40;
 
 /// Offset (from the IC site base) at which the helper writes the hit
 /// flag.  See [`NAMED_IC_SITE_BYTES`] for the layout.
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 const NAMED_IC_OFF_HIT: i32 = 32;
 
 /// Lazily probed [`JsValue`] byte layout, cached for the lifetime of the
 /// process.  Used by the inline array-access fast path.
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 fn cached_jsvalue_layout() -> &'static jit_runtime::JsValueLayout {
     use std::sync::OnceLock;
     static LAYOUT: OnceLock<jit_runtime::JsValueLayout> = OnceLock::new();
@@ -189,7 +237,10 @@ fn cached_jsvalue_layout() -> &'static jit_runtime::JsValueLayout {
 
 /// Cache the `RefCell<JsContext>` byte layout for inline context-slot
 /// access in the Maglev codegen.
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 fn cached_jscontext_layout() -> &'static jit_runtime::JsContextLayout {
     use std::sync::OnceLock;
     static LAYOUT: OnceLock<jit_runtime::JsContextLayout> = OnceLock::new();
@@ -198,7 +249,10 @@ fn cached_jscontext_layout() -> &'static jit_runtime::JsContextLayout {
 
 /// Cache the `Vec<JsValue>` byte layout for inline array append
 /// in the Maglev codegen.
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 fn cached_vec_jsvalue_layout() -> &'static jit_runtime::VecJsValueLayout {
     use std::sync::OnceLock;
     static LAYOUT: OnceLock<jit_runtime::VecJsValueLayout> = OnceLock::new();
@@ -207,7 +261,10 @@ fn cached_vec_jsvalue_layout() -> &'static jit_runtime::VecJsValueLayout {
 
 /// Cache the [`PropertyMap`] byte layout for inline named-property IC
 /// in the Maglev codegen.
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 #[allow(dead_code)] // IC fill path still populates map_ptr/shape_id slots
 fn cached_propertymap_layout() -> &'static jit_runtime::PropertyMapLayout {
     use std::sync::OnceLock;
@@ -216,7 +273,10 @@ fn cached_propertymap_layout() -> &'static jit_runtime::PropertyMapLayout {
 }
 
 /// A stub call argument that is either a Maglev IR node or an immediate i64.
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 enum NodeOrImm {
     Node(NodeId),
     #[allow(dead_code)]
@@ -297,7 +357,10 @@ impl MaglevCompiledCode {
     /// The `code` bytes must be valid x86-64 machine code emitted by
     /// [`compile`].  Executing arbitrary bytes via a transmuted function
     /// pointer is undefined behaviour.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     pub unsafe fn execute(&self, args: &[i64]) -> StatorResult<i64> {
         use crate::executable_memory::ExecutableMemory;
         use smallvec::{SmallVec, smallvec};
@@ -345,7 +408,10 @@ impl MaglevCompiledCode {
 /// [`executable_memory`](crate::executable_memory) abstraction.  A
 /// thread-local register file is reused across calls to eliminate per-call
 /// heap allocation.
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 pub struct CachedMaglevCode {
     /// Owning handle to the executable region.
     mem: crate::executable_memory::ExecutableMemory,
@@ -353,7 +419,10 @@ pub struct CachedMaglevCode {
     pub register_file_slots: usize,
 }
 
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 impl std::fmt::Debug for CachedMaglevCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedMaglevCode")
@@ -366,12 +435,21 @@ impl std::fmt::Debug for CachedMaglevCode {
 // SAFETY: The executable region is process-global memory.  We only access
 // it through an `extern "C"` function-pointer call, which is thread-safe as
 // long as the code is read-only (which it is after the initial copy).
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 unsafe impl Send for CachedMaglevCode {}
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 unsafe impl Sync for CachedMaglevCode {}
 
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 impl CachedMaglevCode {
     /// Create a new cached Maglev code entry from a compiled code buffer.
     ///
@@ -755,9 +833,15 @@ impl<'a> MaglevCodegen<'a> {
                 }
             }
         }
-        #[cfg(stator_maglev_jit_x86_64)]
+        #[cfg(any(
+            stator_maglev_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         let mono_call_cache_bytes = mono_call_sites.saturating_mul(MONO_CACHE_SLOT_BYTES);
-        #[cfg(not(stator_maglev_jit_x86_64))]
+        #[cfg(not(any(
+            stator_maglev_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        )))]
         let mono_call_cache_bytes = 0i32;
         // Keep the total a multiple of 16 for stack alignment preservation.
         let mono_call_cache_bytes = (mono_call_cache_bytes + 15) & !15;
@@ -1022,7 +1106,10 @@ impl<'a> MaglevCodegen<'a> {
         // slot BEFORE any calls that might clobber it.  R14 now holds the
         // register-file pointer.  The closure-context entry register is
         // also ABI-dependent (RSI on SysV, RDX on Win64).
-        #[cfg(stator_maglev_jit_x86_64)]
+        #[cfg(any(
+            stator_maglev_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         if let Some(offset) = self.ctx_regfile_offset {
             self.masm.mov_store_base_disp32(
                 Reg64::R14,
@@ -1030,14 +1117,20 @@ impl<'a> MaglevCodegen<'a> {
                 crate::compiler::abi_x64::NATIVE_ABI.entry_arg_closure_context(),
             );
         }
-        #[cfg(not(stator_maglev_jit_x86_64))]
+        #[cfg(not(any(
+            stator_maglev_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        )))]
         let _ = self.ctx_regfile_offset;
 
         // When the function has direct calls or keyed array accesses,
         // cache the RT_PTRS TLS Cell address in R15 to avoid per-call
         // TLS lookups.
         // RSP ≡ 8 mod 16 here; push R11 to align before the helper call.
-        #[cfg(stator_maglev_jit_x86_64)]
+        #[cfg(any(
+            stator_maglev_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         if self.needs_r15 {
             self.masm.push(Reg64::R11); // alignment padding
             let addr = jit_runtime::jit_runtime_get_rt_ptrs_cell_addr as *const () as i64;
@@ -1834,7 +1927,10 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_store(id, Reg64::R11);
             }
 
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::TestNullOrUndefined { value } => {
                 // Returns JIT_TRUE if value is null or undefined,
                 // JIT_FALSE otherwise.
@@ -1858,7 +1954,10 @@ impl<'a> MaglevCodegen<'a> {
                 self.masm.bind_label(&mut done);
                 self.emit_store(id, Reg64::R11);
             }
-            #[cfg(not(stator_maglev_jit_x86_64))]
+            #[cfg(not(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            )))]
             ValueNode::TestNullOrUndefined { .. } => {
                 self.emit_store(id, Reg64::R11);
             }
@@ -1970,7 +2069,10 @@ impl<'a> MaglevCodegen<'a> {
             // register-file slot during the prologue.  LoadGlobal reads from
             // the slot; StoreGlobal writes to it.  The epilogue flushes all
             // promoted slots back to the runtime GlobalEnv.
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::LoadGlobal {
                 name,
                 feedback_slot,
@@ -2043,7 +2145,10 @@ impl<'a> MaglevCodegen<'a> {
                     self.emit_store(id, Reg64::Rax);
                 }
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::StoreGlobal {
                 name,
                 value,
@@ -2098,7 +2203,10 @@ impl<'a> MaglevCodegen<'a> {
                     self.emit_store(id, Reg64::Rax);
                 }
             }
-            #[cfg(not(stator_maglev_jit_x86_64))]
+            #[cfg(not(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            )))]
             ValueNode::LoadGlobal { .. } | ValueNode::StoreGlobal { .. } => {
                 self.emit_store(id, Reg64::R11);
             }
@@ -2108,7 +2216,10 @@ impl<'a> MaglevCodegen<'a> {
             // LoadNamedGeneric uses an inline IC fast path: a lean helper
             // probes the own-property and prototype ICs without a full stub
             // call.  On miss, falls back to the generic stub.
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::LoadNamedGeneric {
                 object,
                 name,
@@ -2116,7 +2227,10 @@ impl<'a> MaglevCodegen<'a> {
             } => {
                 self.emit_inline_load_named(id, *object, *name, *feedback_slot);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::StoreNamedGeneric {
                 object,
                 name,
@@ -2134,11 +2248,17 @@ impl<'a> MaglevCodegen<'a> {
             // Always use the inline keyed path — it has a built-in
             // fallback to the full stub on miss, so the only extra cost
             // for non-Smi keys is a fast inline check (~5 cycles).
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::LoadKeyedGeneric { object, key, .. } => {
                 self.emit_inline_load_keyed_smi(id, *object, *key);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::StoreKeyedGeneric {
                 object, key, value, ..
             } => {
@@ -2146,13 +2266,19 @@ impl<'a> MaglevCodegen<'a> {
             }
 
             // ── FixedArray element access (routed through keyed-property stubs) ──
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::LoadFixedArrayElement { elements, index }
             | ValueNode::LoadFixedDoubleArrayElement { elements, index }
             | ValueNode::LoadHoleyFixedDoubleArrayElement { elements, index } => {
                 self.emit_inline_load_keyed_smi(id, *elements, *index);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::StoreFixedArrayElement {
                 elements,
                 index,
@@ -2178,7 +2304,10 @@ impl<'a> MaglevCodegen<'a> {
             }
 
             // ── Context slot access — inline x86 with FFI fallback ────────────
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::LoadCurrentContextSlot { slot } => {
                 if let Some(ctx_off) = self.ctx_regfile_offset {
                     let ctx_layout = cached_jscontext_layout();
@@ -2270,7 +2399,10 @@ impl<'a> MaglevCodegen<'a> {
                     self.emit_store(id, Reg64::R11);
                 }
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::StoreCurrentContextSlot { slot, value } => {
                 if let Some(ctx_off) = self.ctx_regfile_offset {
                     let ctx_layout = cached_jscontext_layout();
@@ -2384,7 +2516,10 @@ impl<'a> MaglevCodegen<'a> {
             }
 
             // ── Function calls — direct JIT-to-JIT with stub fallback ──────
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::Call {
                 callee,
                 receiver,
@@ -2445,7 +2580,10 @@ impl<'a> MaglevCodegen<'a> {
             // (no callee needed, skips IC resolution).  The optimizer
             // does NOT treat this as a user call, so global promotion
             // can proceed in push loops.
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::CallArrayPush { receiver, args, .. } => {
                 debug_assert_eq!(args.len(), 1);
                 if self.array_ic_base != 0 {
@@ -2459,7 +2597,10 @@ impl<'a> MaglevCodegen<'a> {
                     );
                 }
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::CallKnownFunction {
                 callee,
                 receiver,
@@ -2516,7 +2657,10 @@ impl<'a> MaglevCodegen<'a> {
             //
             // Falls back to full deopt if the resolve fails or the slot is
             // not a Smi / the result overflows i32.
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::SpeculativeCallFusion {
                 callee,
                 trip_count,
@@ -2532,7 +2676,10 @@ impl<'a> MaglevCodegen<'a> {
                 );
             }
 
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::SpeculativeSumFusion { array } => {
                 let saved = self.emit_save_live_regs(id);
                 self.emit_load(*array, Self::helper_arg_reg(0));
@@ -2543,7 +2690,10 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_store(id, Reg64::Rax);
             }
 
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::SpeculativePushFusion { array, count } => {
                 let saved = self.emit_save_live_regs(id);
                 self.emit_load(*array, Self::helper_arg_reg(0));
@@ -2556,7 +2706,10 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_store(id, Reg64::Rax);
             }
 
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::SpeculativeFillTrueFusion { array, count } => {
                 let saved = self.emit_save_live_regs(id);
                 self.emit_load(*array, Self::helper_arg_reg(0));
@@ -2568,7 +2721,10 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_store(id, Reg64::Rax);
             }
 
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::SpeculativeCountTruthyFusion { array, count } => {
                 let saved = self.emit_save_live_regs(id);
                 self.emit_load(*array, Self::helper_arg_reg(0));
@@ -2586,7 +2742,10 @@ impl<'a> MaglevCodegen<'a> {
             // direct stub call (2 immediate args) instead of the generic
             // trampoline to avoid the 5-arg setup and opcode-dispatch
             // overhead.
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::CreateObjectLiteral {
                 feedback_slot,
                 flags,
@@ -2619,7 +2778,10 @@ impl<'a> MaglevCodegen<'a> {
             // stack; Win64 passes args 0-3 in registers and args 4-7 on
             // the stack above the 32-byte shadow space.  The matching
             // pre-call reservation sizes itself accordingly.
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::CreateObjectLiteralWithProperties {
                 feedback_slot,
                 names,
@@ -2682,7 +2844,10 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::CreateShallowObjectLiteral {
                 feedback_slot,
                 flags,
@@ -2698,7 +2863,10 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::CreateEmptyObjectLiteral => {
                 let saved = self.emit_save_live_regs(id);
                 let addr = jit_runtime::jit_runtime_create_empty_object as *const () as usize;
@@ -2707,7 +2875,10 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::CreateEmptyArrayLiteral { .. } => {
                 let saved = self.emit_save_live_regs(id);
                 let addr = jit_runtime::jit_runtime_create_empty_array as *const () as usize;
@@ -2716,7 +2887,10 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::CreateArrayLiteral { .. } | ValueNode::CreateShallowArrayLiteral { .. } => {
                 // Populated array literals require a runtime stub that
                 // populates the elements from the constant pool.  No such
@@ -2724,7 +2898,10 @@ impl<'a> MaglevCodegen<'a> {
                 // handles them correctly.
                 self.masm.jmp(&mut self.deopt_label);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::CreateClosure {
                 shared_function_info,
                 ..
@@ -2738,7 +2915,10 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::FastCreateClosure {
                 shared_function_info,
                 ..
@@ -2752,7 +2932,10 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::CreateFunctionContext { slot_count, .. } => {
                 // Direct stub call — avoids trampoline dispatch overhead.
                 let saved = self.emit_save_live_regs(id);
@@ -2763,7 +2946,10 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::PushContext { context } => {
                 // PushContext sets a new TLS context.  We must also update
                 // the register-file ctx cache so that subsequent
@@ -2794,7 +2980,10 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::PopContext { context } => {
                 // PopContext restores a previously saved context.  Like
                 // PushContext, we update the register-file ctx cache.
@@ -2821,7 +3010,10 @@ impl<'a> MaglevCodegen<'a> {
             }
 
             // ── Construct via dedicated stub ──────────────────────────────────
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::Construct {
                 constructor, args, ..
             } => {
@@ -2855,19 +3047,31 @@ impl<'a> MaglevCodegen<'a> {
             }
 
             // ── Generic arithmetic via dedicated stubs ────────────────────────
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::GenericAdd { left, right, .. } => {
                 self.emit_inline_generic_add(id, *left, *right);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::GenericSubtract { left, right, .. } => {
                 self.emit_inline_generic_sub(id, *left, *right);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::GenericMultiply { left, right, .. } => {
                 self.emit_inline_generic_mul(id, *left, *right);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::GenericModulus { left, right, .. } => {
                 self.emit_inline_generic_mod(id, *left, *right);
             }
@@ -2877,7 +3081,10 @@ impl<'a> MaglevCodegen<'a> {
             // — every string-append loop iteration would tier back to
             // baseline, eventually tripping exponential-backoff and
             // disabling Maglev entirely for the function.
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::StringConcat { left, right } => {
                 self.emit_string_concat(id, *left, *right);
             }
@@ -2887,30 +3094,48 @@ impl<'a> MaglevCodegen<'a> {
             // arm — every invocation would tier back to baseline,
             // exhausting the deopt-retry budget within ~15 calls and
             // permanently disabling Maglev for the function.
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::StringConstant {
                 value: _,
                 pool_index: Some(idx),
             } => {
                 self.emit_load_string_constant(id, *idx);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::GenericDivide { left, right, .. } => {
                 self.emit_inline_generic_div(id, *left, *right);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::GenericBitwiseAnd { left, right, .. } => {
                 self.emit_inline_generic_bitand(id, *left, *right);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::GenericBitwiseOr { left, right, .. } => {
                 self.emit_inline_generic_bitor(id, *left, *right);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::GenericBitwiseXor { left, right, .. } => {
                 self.emit_inline_generic_bitxor(id, *left, *right);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::GenericShiftLeft { left, right, .. } => {
                 self.emit_stub_call_2node(
                     id,
@@ -2919,7 +3144,10 @@ impl<'a> MaglevCodegen<'a> {
                     jit_runtime::jit_runtime_generic_shift_left as *const () as usize,
                 );
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::GenericShiftRight { left, right, .. } => {
                 self.emit_stub_call_2node(
                     id,
@@ -2928,7 +3156,10 @@ impl<'a> MaglevCodegen<'a> {
                     jit_runtime::jit_runtime_generic_shift_right as *const () as usize,
                 );
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::GenericShiftRightLogical { left, right, .. } => {
                 self.emit_stub_call_2node(
                     id,
@@ -2937,29 +3168,47 @@ impl<'a> MaglevCodegen<'a> {
                     jit_runtime::jit_runtime_generic_shift_right_logical as *const () as usize,
                 );
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::GenericNegate { value, .. } => {
                 self.emit_inline_generic_negate(id, *value);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::GenericIncrement { value, .. } => {
                 self.emit_inline_generic_inc(id, *value);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::GenericDecrement { value, .. } => {
                 self.emit_inline_generic_dec(id, *value);
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::GenericBitwiseNot { value, .. } => {
                 self.emit_inline_generic_bitnot(id, *value);
             }
 
             // ── Type checks and conversions via trampoline ────────────────────
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::CheckHeapObject { .. } => {
                 // Guard pass-through — no code needed.
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::ToString { value, .. } => {
                 self.emit_stub_call_1node(
                     id,
@@ -2967,7 +3216,10 @@ impl<'a> MaglevCodegen<'a> {
                     jit_runtime::jit_runtime_tostring as *const () as usize,
                 );
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::ToNumber { value, .. } => {
                 self.emit_stub_call_1node(
                     id,
@@ -2975,7 +3227,10 @@ impl<'a> MaglevCodegen<'a> {
                     jit_runtime::jit_runtime_tonumber as *const () as usize,
                 );
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::TypeOf { value } => {
                 self.emit_stub_call_1node(
                     id,
@@ -2994,7 +3249,10 @@ impl<'a> MaglevCodegen<'a> {
             //
             // Depth > 0 still falls back to the trampoline which can walk
             // the scope chain via the register file.
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::LoadContextSlot {
                 context,
                 depth,
@@ -3012,7 +3270,10 @@ impl<'a> MaglevCodegen<'a> {
                     );
                 }
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::StoreContextSlot {
                 context,
                 depth,
@@ -3036,7 +3297,10 @@ impl<'a> MaglevCodegen<'a> {
             }
 
             // ── Tagged equality ───────────────────────────────────────────────
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::TaggedEqual { left, right, .. } => {
                 self.emit_stub_call_2node(
                     id,
@@ -3045,7 +3309,10 @@ impl<'a> MaglevCodegen<'a> {
                     jit_runtime::jit_runtime_tagged_equal as *const () as usize,
                 );
             }
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             ValueNode::TaggedNotEqual { left, right, .. } => {
                 self.emit_stub_call_2node(
                     id,
@@ -3498,7 +3765,10 @@ impl<'a> MaglevCodegen<'a> {
     /// Checks both the static node type and the `i32_range` set which
     /// includes Phi nodes whose inputs are all provably i32 (e.g. loop
     /// counters after range analysis).
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[allow(dead_code)] // May be used in future keyed access codegen.
     fn is_known_int32_key(&self, id: NodeId) -> bool {
         // The i32_range set (computed via fixed-point) includes Phi nodes
@@ -3955,7 +4225,10 @@ impl<'a> MaglevCodegen<'a> {
     /// hold live values, so we can freely clobber caller-saved registers.
     #[allow(unused_variables)]
     fn emit_promoted_global_loads(&mut self) {
-        #[cfg(stator_maglev_jit_x86_64)]
+        #[cfg(any(
+            stator_maglev_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             if self.promoted_globals.is_empty() {
                 return;
@@ -3995,7 +4268,10 @@ impl<'a> MaglevCodegen<'a> {
     /// because it already holds the return value.
     #[allow(unused_variables)]
     fn emit_promoted_global_stores(&mut self) {
-        #[cfg(stator_maglev_jit_x86_64)]
+        #[cfg(any(
+            stator_maglev_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             if self.promoted_globals.is_empty() {
                 return;
@@ -4031,7 +4307,10 @@ impl<'a> MaglevCodegen<'a> {
     /// [`emit_value_node`] around Call / Construct nodes.
     #[allow(dead_code, unused_variables)]
     fn emit_flush_promoted_for_call(&mut self, at_node: NodeId) {
-        #[cfg(stator_maglev_jit_x86_64)]
+        #[cfg(any(
+            stator_maglev_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             if self.promoted_globals.is_empty() {
                 return;
@@ -4068,7 +4347,10 @@ impl<'a> MaglevCodegen<'a> {
     /// the precise post-call liveness is not easily available.
     #[allow(dead_code, unused_variables)]
     fn emit_reload_promoted_after_call(&mut self) {
-        #[cfg(stator_maglev_jit_x86_64)]
+        #[cfg(any(
+            stator_maglev_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             if self.promoted_globals.is_empty() {
                 return;
@@ -4142,7 +4424,10 @@ impl<'a> MaglevCodegen<'a> {
     /// Save only the caller-saved registers that are **live across**
     /// `at_node`.  Returns a bitmask of the saved register indices so that
     /// [`emit_restore_live_regs`] can pop exactly the right set.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_save_live_regs(&mut self, at_node: NodeId) -> u8 {
         // A stub call clobbers RAX (return value), so invalidate forwarding.
         self.clear_reg_forwarding();
@@ -4173,7 +4458,10 @@ impl<'a> MaglevCodegen<'a> {
 
     /// Restore caller-saved registers previously saved by
     /// [`emit_save_live_regs`] (reverse push order).
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_restore_live_regs(&mut self, mask: u8) {
         // Pop in reverse of the push order chosen by `emit_save_live_regs`.
         for &idx in crate::compiler::abi_x64::NATIVE_ABI
@@ -4197,7 +4485,10 @@ impl<'a> MaglevCodegen<'a> {
     /// All deopt values are i64::MIN..i64::MIN+5 (< i32::MIN).  Valid
     /// results are always ≥ i32::MIN.  A single `CMP RAX, i32::MIN; JL`
     /// replaces the old 3-instruction `MOV R11, JIT_DEOPT; CMP; JE`.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_deopt_check_rax(&mut self) {
         self.masm.cmp_ri(Reg64::Rax, i32::MIN);
         self.masm.jcc(CondCode::Less, &mut self.deopt_stub_label);
@@ -4213,7 +4504,10 @@ impl<'a> MaglevCodegen<'a> {
     /// Panics (at compile time when the caller's index is a constant
     /// out of range under the host ABI) if `i` exceeds the number of
     /// register-passed arguments for [`NATIVE_ABI`].
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[inline]
     const fn helper_arg_reg(i: usize) -> Reg64 {
         match crate::compiler::abi_x64::NATIVE_ABI.helper_arg_register(i) {
@@ -4228,7 +4522,10 @@ impl<'a> MaglevCodegen<'a> {
     ///
     /// Emits no instructions on SysV (shadow space is 0 bytes).  On
     /// Win64 it emits `sub rsp, 32`.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[inline]
     fn emit_helper_call_pre_adjust(&mut self) -> i32 {
         const ADJ: i32 = crate::compiler::abi_x64::NATIVE_ABI.helper_call_pre_stack_adjust();
@@ -4240,7 +4537,10 @@ impl<'a> MaglevCodegen<'a> {
 
     /// Release shadow space reserved by [`Self::emit_helper_call_pre_adjust`].
     /// Emits no instructions when `bytes == 0`.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[inline]
     fn emit_helper_call_post_adjust(&mut self, bytes: i32) {
         if bytes != 0 {
@@ -4248,7 +4548,10 @@ impl<'a> MaglevCodegen<'a> {
         }
     }
 
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[inline]
     fn emit_helper_call_addr(&mut self, addr: i64) {
         self.masm.mov_ri(Reg64::R11, addr);
@@ -4265,7 +4568,10 @@ impl<'a> MaglevCodegen<'a> {
     /// `RSP` is 16-byte aligned at the point of reservation — the
     /// alignment contract still holds at the `CALL`.  Pair with
     /// [`Self::emit_helper_call_post_adjust`] using the returned value.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[inline]
     fn emit_helper_call_pre_adjust_for(&mut self, total_args: usize) -> i32 {
         let adj = crate::compiler::abi_x64::NATIVE_ABI.helper_call_pre_stack_adjust_for(total_args);
@@ -4278,7 +4584,10 @@ impl<'a> MaglevCodegen<'a> {
     /// Stack offset (from `RSP`, after [`Self::emit_helper_call_pre_adjust_for`]
     /// has reserved its frame) at which stack-passed helper argument `i`
     /// must be written.  `i` must be ≥ the ABI's helper register count.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[inline]
     const fn helper_stack_arg_offset(i: usize) -> i32 {
         crate::compiler::abi_x64::NATIVE_ABI.helper_stack_arg_offset(i)
@@ -4289,7 +4598,10 @@ impl<'a> MaglevCodegen<'a> {
     /// host ABI, otherwise the corresponding stack slot (using `R11`
     /// as a scratch).  The caller must have already reserved the
     /// outgoing-args region via [`Self::emit_helper_call_pre_adjust_for`].
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[inline]
     fn emit_helper_arg_imm(&mut self, i: usize, imm: i64) {
         if let Some(reg) = crate::compiler::abi_x64::NATIVE_ABI.helper_arg_register(i) {
@@ -4306,7 +4618,10 @@ impl<'a> MaglevCodegen<'a> {
     /// otherwise the corresponding stack slot.  The caller must have
     /// already reserved the outgoing-args region via
     /// [`Self::emit_helper_call_pre_adjust_for`].
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[inline]
     fn emit_helper_arg_reg(&mut self, i: usize, src: Reg64) {
         if let Some(reg) = crate::compiler::abi_x64::NATIVE_ABI.helper_arg_register(i) {
@@ -4325,7 +4640,10 @@ impl<'a> MaglevCodegen<'a> {
     /// into `R11` and spilled to the corresponding stack slot.  The
     /// caller must have already reserved the outgoing-args region via
     /// [`Self::emit_helper_call_pre_adjust_for`].
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[inline]
     fn emit_helper_arg_node(&mut self, i: usize, node: NodeId) {
         if let Some(reg) = crate::compiler::abi_x64::NATIVE_ABI.helper_arg_register(i) {
@@ -4339,7 +4657,10 @@ impl<'a> MaglevCodegen<'a> {
 
     // ── ABI-aware JIT-entry call primitives ─────────────────────────────────
 
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[inline]
     fn emit_jit_entry_arg_setup(&mut self, register_file: Reg64, closure_context: Reg64) {
         let register_file_arg = crate::compiler::abi_x64::NATIVE_ABI.entry_arg_register_file();
@@ -4353,7 +4674,10 @@ impl<'a> MaglevCodegen<'a> {
         }
     }
 
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[inline]
     fn emit_jit_entry_call(&mut self, entry: Reg64, register_file: Reg64, closure_context: Reg64) {
         self.emit_jit_entry_arg_setup(register_file, closure_context);
@@ -4368,7 +4692,10 @@ impl<'a> MaglevCodegen<'a> {
     }
 
     /// Call a 1-arg stub: `stub(node_arg)`.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_stub_call_1node(&mut self, id: NodeId, arg0: NodeId, stub_addr: usize) {
         let saved = self.emit_save_live_regs(id);
         self.emit_load(arg0, Self::helper_arg_reg(0));
@@ -4382,7 +4709,10 @@ impl<'a> MaglevCodegen<'a> {
     }
 
     /// Call a 2-node-arg stub: `stub(node0, node1)`.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_stub_call_2node(&mut self, id: NodeId, arg0: NodeId, arg1: NodeId, stub_addr: usize) {
         let saved = self.emit_save_live_regs(id);
         self.emit_load(arg0, Self::helper_arg_reg(0));
@@ -4406,7 +4736,10 @@ impl<'a> MaglevCodegen<'a> {
     ///
     /// Non-Smi slots or non-raw-pointer contexts fall through to the
     /// slow path which calls `jit_runtime_load_context_slot_lean`.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_inline_load_context_slot(&mut self, id: NodeId, context: NodeId, slot: u32) {
         let ctx_layout = cached_jscontext_layout();
         let jv_layout = cached_jsvalue_layout();
@@ -4498,7 +4831,10 @@ impl<'a> MaglevCodegen<'a> {
     ///
     /// Falls back to `jit_runtime_store_context_slot_lean` for non-Smi
     /// values or non-raw-pointer contexts.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_inline_store_context_slot(
         &mut self,
         id: NodeId,
@@ -4643,7 +4979,10 @@ impl<'a> MaglevCodegen<'a> {
     ///
     /// When `resolved_slot` / `resolved_k` are `None`, falls back to the
     /// original [`jit_runtime_fusion_resolve`] stub path.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_inline_speculative_call_fusion(
         &mut self,
         id: NodeId,
@@ -4686,7 +5025,10 @@ impl<'a> MaglevCodegen<'a> {
 
     /// Resolved fusion fast path: global inline cache with zero-call hot
     /// path and a lightweight stub fallback.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[allow(clippy::too_many_arguments)]
     fn emit_resolved_fusion(
         &mut self,
@@ -4776,7 +5118,10 @@ impl<'a> MaglevCodegen<'a> {
 
     /// Unresolved fusion legacy path: calls [`jit_runtime_fusion_resolve`]
     /// to obtain `(slot_ptr, k)` at runtime.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_unresolved_fusion(
         &mut self,
         id: NodeId,
@@ -4856,7 +5201,10 @@ impl<'a> MaglevCodegen<'a> {
     /// done:
     ///   mov    <dest>, rax
     /// ```
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_inline_generic_add(&mut self, id: NodeId, left: NodeId, right: NodeId) {
         // When both inputs are provably i32, the 64-bit ADD can never
         // overflow (i32 + i32 fits in i64) — emit bare ADD with no
@@ -5095,7 +5443,10 @@ impl<'a> MaglevCodegen<'a> {
     /// keeps register-allocation invariants identical to the existing
     /// generic-add path so register pressure / spill placement remain
     /// unchanged.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_string_concat(&mut self, id: NodeId, left: NodeId, right: NodeId) {
         // The helper writes its result through RAX and may clobber any
         // caller-saved register, so we must invalidate forwarding.
@@ -5126,7 +5477,10 @@ impl<'a> MaglevCodegen<'a> {
     /// dedup map; consumers of this node (e.g. `GenericAdd` for
     /// `value += 'x'`) therefore see a normal heap-handle Smi-miss
     /// rather than tripping the unimplemented-node deopt.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_load_string_constant(&mut self, id: NodeId, pool_index: u32) {
         // The helper writes its result through RAX and may clobber any
         // caller-saved register, so we must invalidate forwarding.
@@ -5145,7 +5499,10 @@ impl<'a> MaglevCodegen<'a> {
     /// Inline Smi fast path for `GenericSubtract`.  Same structure as
     /// [`emit_inline_generic_add`](Self::emit_inline_generic_add) but
     /// emits `SUB` instead of `ADD`.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_inline_generic_sub(&mut self, id: NodeId, left: NodeId, right: NodeId) {
         if self.i32_range.contains(&left) && self.i32_range.contains(&right) {
             match self.alloc.location(id) {
@@ -5289,7 +5646,10 @@ impl<'a> MaglevCodegen<'a> {
     /// Inline Smi fast path for `GenericMultiply`.  Uses 64-bit `IMUL` so
     /// the product of two i32 values fits in i64; the result is then
     /// range-checked back to i32 (deopt on overflow).
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_inline_generic_mul(&mut self, id: NodeId, left: NodeId, right: NodeId) {
         if self.i32_range.contains(&left) && self.i32_range.contains(&right) {
             // i32 × i32 always fits in i64, but we need the result to
@@ -5666,7 +6026,10 @@ impl<'a> MaglevCodegen<'a> {
     ///   idiv r10d            ; EAX = quotient, EDX = remainder
     ///   movsxd rax, edx      ; result = remainder (sign-extended)
     /// ```
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_inline_generic_mod(&mut self, id: NodeId, left: NodeId, right: NodeId) {
         // When both inputs are smi_guarded, skip Smi checks but guard
         // against division by zero.
@@ -5749,7 +6112,10 @@ impl<'a> MaglevCodegen<'a> {
     /// quotient (EAX) instead of the remainder (EDX).  Falls back to
     /// the stub for non-integer results (when remainder != 0, JS `/`
     /// must return a float).
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_inline_generic_div(&mut self, id: NodeId, left: NodeId, right: NodeId) {
         if self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right) {
             self.emit_load(left, Reg64::Rax);
@@ -5828,7 +6194,10 @@ impl<'a> MaglevCodegen<'a> {
     ///
     /// Bitwise OR of two i32 values always fits in i32, so no overflow
     /// check is needed — just Smi-check both operands and emit `OR`.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_inline_generic_bitor(&mut self, id: NodeId, left: NodeId, right: NodeId) {
         // Bitwise OR of two Smi/i32 values always fits in i32.
         if (self.i32_range.contains(&left) && self.i32_range.contains(&right))
@@ -5959,7 +6328,10 @@ impl<'a> MaglevCodegen<'a> {
     }
 
     /// Inline Smi fast path for `GenericBitwiseAnd`.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_inline_generic_bitand(&mut self, id: NodeId, left: NodeId, right: NodeId) {
         if (self.i32_range.contains(&left) && self.i32_range.contains(&right))
             || (self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right))
@@ -6034,7 +6406,10 @@ impl<'a> MaglevCodegen<'a> {
     }
 
     /// Inline Smi fast path for `GenericBitwiseXor`.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_inline_generic_bitxor(&mut self, id: NodeId, left: NodeId, right: NodeId) {
         if (self.i32_range.contains(&left) && self.i32_range.contains(&right))
             || (self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right))
@@ -6109,7 +6484,10 @@ impl<'a> MaglevCodegen<'a> {
     }
 
     /// Inline Smi fast path for `GenericIncrement` (`value + 1`).
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_inline_generic_inc(&mut self, id: NodeId, value: NodeId) {
         if self.i32_range.contains(&value) {
             match self.alloc.location(id) {
@@ -6188,7 +6566,10 @@ impl<'a> MaglevCodegen<'a> {
     }
 
     /// Inline Smi fast path for `GenericDecrement` (`value - 1`).
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_inline_generic_dec(&mut self, id: NodeId, value: NodeId) {
         if self.i32_range.contains(&value) {
             match self.alloc.location(id) {
@@ -6267,7 +6648,10 @@ impl<'a> MaglevCodegen<'a> {
     }
 
     /// Inline Smi fast path for `GenericNegate` (`-value`).
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_inline_generic_negate(&mut self, id: NodeId, value: NodeId) {
         if self.i32_range.contains(&value) {
             self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
@@ -6321,7 +6705,10 @@ impl<'a> MaglevCodegen<'a> {
     /// Inline Smi fast path for `GenericBitwiseNot` (`~value`).
     ///
     /// `~x` for i32 always produces an i32, so no overflow check needed.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_inline_generic_bitnot(&mut self, id: NodeId, value: NodeId) {
         // ~x for i32 always produces i32 — no overflow check needed.
         if self.i32_range.contains(&value) || self.smi_guarded.contains(&value) {
@@ -6379,7 +6766,10 @@ impl<'a> MaglevCodegen<'a> {
     /// done:
     ///   restore live regs; deopt check; store result
     /// ```
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     /// Emit a **true-inline** fast path for named property load.
     ///
     /// ## Fast path (≈20 x86 instructions, ZERO function calls)
@@ -6697,7 +7087,10 @@ impl<'a> MaglevCodegen<'a> {
     ///
     /// When `array_ic_base == 0` there are no keyed sites in this
     /// function — nothing to invalidate.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_invalidate_array_ic(&mut self) {
         if self.array_ic_base != 0 {
             // XOR R11,R11 is 3 bytes; MOV [RBP+disp32],R11 is 7 bytes.
@@ -6707,7 +7100,10 @@ impl<'a> MaglevCodegen<'a> {
         }
     }
 
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_inline_load_keyed_smi(&mut self, id: NodeId, object: NodeId, key: NodeId) {
         let layout = cached_jsvalue_layout();
         let ic_base = self.array_ic_base;
@@ -7027,7 +7423,10 @@ impl<'a> MaglevCodegen<'a> {
     /// directly; on a miss the generic `jit_runtime_sta_keyed_property`
     /// stub is called as a fallback.  Only the slow path invalidates the
     /// array IC (out-of-bounds stores may cause Vec reallocation).
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_inline_store_keyed_smi(
         &mut self,
         id: NodeId,
@@ -7312,7 +7711,10 @@ impl<'a> MaglevCodegen<'a> {
     /// Calls `jit_runtime_array_push_fill_ic` which performs the push
     /// via Rust's `Vec::push` and fills the IC on success, so the next
     /// iteration hits the fast path.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_inline_array_push(&mut self, id: NodeId, receiver: NodeId, value: NodeId) {
         let layout = cached_jsvalue_layout();
         let vec_layout = cached_vec_jsvalue_layout();
@@ -7481,7 +7883,10 @@ impl<'a> MaglevCodegen<'a> {
     }
 
     /// Call a 3-node-arg stub: `stub(node0, node1, node2)`.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_stub_call_3node(
         &mut self,
         id: NodeId,
@@ -7514,7 +7919,10 @@ impl<'a> MaglevCodegen<'a> {
 
     /// Call a 3-arg stub where arg0 is a node, arg1 is an immediate i64,
     /// and arg2 is either a node or an immediate (see [`NodeOrImm`]).
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_stub_call_3arg(
         &mut self,
         id: NodeId,
@@ -7557,7 +7965,10 @@ impl<'a> MaglevCodegen<'a> {
     /// `[RSP + shadow_space]` and the pre-call reservation is widened
     /// to cover both shadow space and that slot while keeping `RSP`
     /// 16-byte aligned.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_trampoline_call(&mut self, id: NodeId, opcode: u8, operand1: i64, operand2: i64) {
         let saved = self.emit_save_live_regs(id);
         const TOTAL_ARGS: usize = 5;
@@ -7633,7 +8044,10 @@ impl<'a> MaglevCodegen<'a> {
     ///  ; on success: populate cache, call entry_point, finish
     ///  ; on failure: fall back to call_undefined_receiver0 stub
     /// ```
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_direct_call_0(&mut self, id: NodeId, callee: NodeId) {
         // Claim a mono-cache slot from the frame.  Offsets are relative
         // to RBP.  After the prologue pushes (40 bytes from RBP) and the
@@ -8165,7 +8579,10 @@ impl<'a> MaglevCodegen<'a> {
     }
 
     /// Emit a direct-call fast path for `CallUndefinedReceiver1`.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_direct_call_1(&mut self, id: NodeId, callee: NodeId, arg0: NodeId) {
         let saved = self.emit_save_live_regs(id);
 
@@ -8271,7 +8688,10 @@ impl<'a> MaglevCodegen<'a> {
     }
 
     /// Emit a direct-call fast path for `CallUndefinedReceiver2`.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_direct_call_2(&mut self, id: NodeId, callee: NodeId, arg0: NodeId, arg1: NodeId) {
         let saved = self.emit_save_live_regs(id);
 
@@ -11072,7 +11492,10 @@ mod tests {
 
     // ── Execution tests (x86-64 / unix only) ─────────────────────────────────
 
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     mod exec {
         use super::*;
 

@@ -168,13 +168,19 @@ impl SourcePosition {
 ///
 /// The outer [`Rc`] allows all clones of a [`BytecodeArray`] to share the
 /// same cache without copying.
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 type JitCodeCache = Rc<RefCell<Option<crate::compiler::baseline::compiler::CachedExecutableCode>>>;
 
 /// Shared JIT code cache stored in a [`BytecodeArray`].
 ///
 /// On non-JIT platforms this is a no-op placeholder.
-#[cfg(not(stator_baseline_jit_x86_64))]
+#[cfg(not(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+)))]
 type JitCodeCache = Rc<RefCell<Option<(Vec<u8>, usize)>>>;
 
 /// Persistent executable JIT code region.
@@ -184,7 +190,10 @@ type JitCodeCache = Rc<RefCell<Option<(Vec<u8>, usize)>>>;
 /// fresh executable page on every invocation.  Created lazily on first JIT
 /// execution and freed when the last [`BytecodeArray`] clone referencing it
 /// is dropped.
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 #[derive(Debug)]
 pub struct JitExecutableCode {
     /// Owning handle to the executable region.
@@ -193,7 +202,10 @@ pub struct JitExecutableCode {
     pub register_file_slots: usize,
 }
 
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 impl JitExecutableCode {
     /// Create a new executable code region from raw machine code bytes.
     ///
@@ -262,7 +274,10 @@ impl JitExecutableCode {
     }
 }
 
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 impl Drop for JitExecutableCode {
     fn drop(&mut self) {
         // The wrapped `ExecutableMemory` releases the page in its own
@@ -272,19 +287,31 @@ impl Drop for JitExecutableCode {
 
 // SAFETY: JitExecutableCode is only accessed from the interpreter's single
 // thread.  The executable memory is read-only after initial copy.
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 unsafe impl Send for JitExecutableCode {}
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 unsafe impl Sync for JitExecutableCode {}
 
 /// Shared persistent executable JIT code cache.
 ///
 /// Created lazily on first baseline JIT execution.  All clones of a
 /// [`BytecodeArray`] share the same cache via [`Rc`].
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 pub type JitExecutableCache = Rc<RefCell<Option<JitExecutableCode>>>;
 /// Stub type for platforms without JIT support.
-#[cfg(not(stator_baseline_jit_x86_64))]
+#[cfg(not(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+)))]
 pub type JitExecutableCache = Rc<RefCell<Option<()>>>;
 
 /// Shared decoded bytecode cache stored in a [`BytecodeArray`].
@@ -313,14 +340,20 @@ type FusionPatternCache = Rc<OnceCell<Option<(usize, i64)>>>;
 /// persistent `mmap`'d page of executable memory.  Uses [`Arc`] + [`Mutex`]
 /// so that the Maglev background compilation thread can write the compiled
 /// code into the cache while the interpreter runs on the main thread.
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 pub type MaglevJitCodeCache =
     Arc<Mutex<Option<crate::compiler::baseline::compiler::CachedExecutableCode>>>;
 
 /// Shared Maglev JIT code cache stored in a [`BytecodeArray`].
 ///
 /// On non-JIT platforms this stores raw bytes and register-file slot count.
-#[cfg(not(stator_maglev_jit_x86_64))]
+#[cfg(not(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+)))]
 pub type MaglevJitCodeCache = Arc<Mutex<Option<(Vec<u8>, usize)>>>;
 
 /// Persistent executable Maglev code cache shared among clones of a
@@ -329,11 +362,17 @@ pub type MaglevJitCodeCache = Arc<Mutex<Option<(Vec<u8>, usize)>>>;
 /// On x86-64 Unix, this wraps a [`CachedMaglevCode`] that keeps a
 /// persistent `mmap`'d page.  Lazily initialised from the raw code bytes
 /// in [`MaglevJitCodeCache`] on first execution.
-#[cfg(stator_maglev_jit_x86_64)]
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 pub type MaglevExecutableCache =
     Rc<RefCell<Option<crate::compiler::maglev::codegen::CachedMaglevCode>>>;
 /// Stub type for platforms without JIT support.
-#[cfg(not(stator_maglev_jit_x86_64))]
+#[cfg(not(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+)))]
 pub type MaglevExecutableCache = Rc<RefCell<Option<()>>>;
 
 /// Shared Turbofan JIT code cache stored in a [`BytecodeArray`].
@@ -1031,7 +1070,10 @@ impl BytecodeArray {
     /// # Safety
     ///
     /// The caller must ensure the [`BytecodeArray`] outlives the pointer.
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     pub(crate) fn get_cached_template_ptr(&self, slot: u32) -> *const ObjectLiteralTemplate {
         let borrow = self.inner.object_literal_templates.borrow();
         match borrow.get(&slot) {
@@ -1574,7 +1616,10 @@ impl BytecodeArray {
     /// page of executable memory.
     ///
     /// All clones of this [`BytecodeArray`] share the same JIT cache.
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     pub fn store_jit_code(
         &self,
         cached: crate::compiler::baseline::compiler::CachedExecutableCode,
@@ -1585,7 +1630,10 @@ impl BytecodeArray {
 
     /// Store baseline-JIT machine code produced by the compiler (non-JIT
     /// platform fallback).
-    #[cfg(not(stator_baseline_jit_x86_64))]
+    #[cfg(not(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    )))]
     pub fn store_jit_code(&self, code: Vec<u8>, register_file_slots: usize) {
         *self.inner.jit_code.borrow_mut() = Some((code, register_file_slots));
         self.inner.has_jit_code.set(true);
@@ -1616,7 +1664,10 @@ impl BytecodeArray {
     ///
     /// The caller can call [`CachedExecutableCode::execute`] on the borrowed
     /// reference without cloning or allocating executable memory.
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     pub fn try_get_jit_code(
         &self,
     ) -> std::cell::Ref<'_, Option<crate::compiler::baseline::compiler::CachedExecutableCode>> {
@@ -1626,7 +1677,10 @@ impl BytecodeArray {
     /// Returns a clone of the cached JIT machine code and register-file slot
     /// count, or `None` if baseline compilation has not been triggered yet
     /// (non-JIT platform fallback).
-    #[cfg(not(stator_baseline_jit_x86_64))]
+    #[cfg(not(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    )))]
     pub fn try_get_jit_code(&self) -> Option<(Vec<u8>, usize)> {
         self.inner.jit_code.borrow().clone()
     }
@@ -1888,7 +1942,10 @@ impl BytecodeArray {
     ///
     /// Only available on non-JIT platforms where [`MaglevJitCodeCache`] stores
     /// raw bytes.  On x86-64 Unix, use [`maglev_jit_cache_arc`](Self::maglev_jit_cache_arc) directly.
-    #[cfg(not(stator_maglev_jit_x86_64))]
+    #[cfg(not(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    )))]
     pub fn try_get_maglev_jit_code(&self) -> Option<(Vec<u8>, usize)> {
         self.inner.maglev_jit_code.lock().ok()?.clone()
     }

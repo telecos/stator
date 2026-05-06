@@ -1612,7 +1612,10 @@ impl<'a> GraphBuilder<'a> {
 
                 // Pre-analyse the callee's bytecodes for the fusion pattern
                 // so the optimizer can embed (slot, k) at compile time.
-                #[cfg(stator_maglev_jit_x86_64)]
+                #[cfg(any(
+                    stator_maglev_jit_x86_64,
+                    all(target_arch = "x86_64", any(unix, windows))
+                ))]
                 if let Some(ConstantPoolEntry::Function(callee_ba)) =
                     self.bytecode.constant_pool().get(func_idx as usize)
                 {
@@ -4131,7 +4134,10 @@ mod tests {
                     !degen,
                     "closure_counter_1k top-level script graph is degenerate — Maglev won't compile the hot loop"
                 );
-                #[cfg(stator_maglev_jit_x86_64)]
+                #[cfg(any(
+                    stator_maglev_jit_x86_64,
+                    all(target_arch = "x86_64", any(unix, windows))
+                ))]
                 assert!(
                     graph_contains_value(&graph, |node| matches!(
                         node,

@@ -2231,11 +2231,17 @@ pub unsafe extern "C" fn stator_script_force_maglev_compile(script: *mut StatorS
         Some(b) => b,
         None => return false,
     };
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     {
         stator_jse::interpreter::compile_maglev_sync(bytecodes)
     }
-    #[cfg(not(stator_maglev_jit_x86_64))]
+    #[cfg(not(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    )))]
     {
         let _ = bytecodes;
         false
@@ -6232,9 +6238,15 @@ mod tests {
         let script = compile_src("function f(){ return 1; } f();");
         // SAFETY: `script` is non-null and live. Unsupported platforms return false.
         let forced = unsafe { stator_script_force_maglev_compile(script) };
-        #[cfg(not(stator_maglev_jit_x86_64))]
+        #[cfg(not(any(
+            stator_maglev_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        )))]
         assert!(!forced);
-        #[cfg(stator_maglev_jit_x86_64)]
+        #[cfg(any(
+            stator_maglev_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             let _ = forced;
         }
@@ -8850,7 +8862,10 @@ mod tests {
     ///
     /// Mirrors the Edge proof harness: 5 warmup runs followed by 20 measured
     /// runs over the SAME compiled script (the "compiled_run" path).
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn run_edge_proof_compiled(source: &[u8]) -> (f64, StatorTieringStats) {
         let iso = IsolateGuard::new();
         // SAFETY: `iso` is valid.
@@ -8895,7 +8910,10 @@ mod tests {
     }
 
     /// Loop2K from Edge `edge_stator_jse_test_cases.cc`: `7000`.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[test]
     fn edge_proof_loop2k_executes_maglev() {
         let src = b"var total = 0; for (var i = 0; i < 2000; ++i) { total += (i & 7); } total;";
@@ -8922,7 +8940,10 @@ mod tests {
     }
 
     /// FunctionLoop1K from Edge `edge_stator_jse_test_cases.cc`: `2000`.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[test]
     fn edge_proof_function_loop1k_executes_maglev() {
         let src = b"function f(n) { var total = 0; for (var i = 0; i < n; ++i) { total += (i % 5); } return total; } f(1000);";
@@ -8948,8 +8969,183 @@ mod tests {
         );
     }
 
+    /// Edge-pattern release-mode timing harness.
+    ///
+    /// Mirrors the Edge "compiled_run" benchmark exactly:
+    ///   - `stator_script_compile` once
+    ///   - 5 warmup `stator_script_run` calls
+    ///   - `MEASURED` measured `stator_script_run` calls (same compiled script)
+    ///
+    /// Returns `(median_ns, mean_ns, min_ns, max_ns, last_value, stats)`.
+    ///
+    /// Uses `Instant::now()` around the *exact* `stator_script_run` body —
+    /// the same function Edge wraps in its perf timer.  The harness does not
+    /// sleep between iterations once warmup has completed (Edge's measured
+    /// loop also runs back-to-back).
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
+    fn edge_pattern_timed(
+        source: &[u8],
+        measured: usize,
+    ) -> (u128, u128, u128, u128, f64, StatorTieringStats) {
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        unsafe { stator_isolate_reset_tiering_stats(iso.as_ptr()) };
+
+        let script =
+            unsafe { stator_script_compile(ctx, source.as_ptr() as *const c_char, source.len()) };
+        assert!(!script.is_null());
+        let err = unsafe { stator_script_get_error(script) };
+        assert!(err.is_null(), "unexpected compile error");
+
+        // 5 warmup runs (with brief sleeps so the background Maglev compile
+        // has a chance to install code, just like the existing edge-proof
+        // tests above).
+        let mut last = f64::NAN;
+        for _ in 0..5 {
+            let r = unsafe { stator_script_run(script, ctx) };
+            assert!(!r.is_null(), "warmup run returned null");
+            last = unsafe { stator_value_as_number(r) };
+            unsafe { stator_value_destroy(r) };
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // Measured runs — back-to-back, no sleeps, no extra work in the
+        // timed body.
+        let mut samples: Vec<u128> = Vec::with_capacity(measured);
+        for _ in 0..measured {
+            let t0 = std::time::Instant::now();
+            let r = unsafe { stator_script_run(script, ctx) };
+            let elapsed = t0.elapsed().as_nanos();
+            assert!(!r.is_null(), "measured run returned null");
+            last = unsafe { stator_value_as_number(r) };
+            unsafe { stator_value_destroy(r) };
+            samples.push(elapsed);
+        }
+        samples.sort_unstable();
+        let min = *samples.first().unwrap();
+        let max = *samples.last().unwrap();
+        let median = samples[samples.len() / 2];
+        let mean = samples.iter().sum::<u128>() / samples.len() as u128;
+
+        let stats = read_tiering_stats(iso.as_ptr());
+        unsafe {
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
+        (median, mean, min, max, last, stats)
+    }
+
+    /// Print release-mode timings for the three Edge perf-proof scripts
+    /// using exactly the FFI pattern Edge times.  Ignored by default so it
+    /// does not slow down `cargo test`; run with:
+    ///   `cargo test -p stator_jse_ffi --release \
+    ///        edge_pattern_timing_release -- --ignored --nocapture`
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
+    #[test]
+    #[ignore]
+    fn edge_pattern_timing_release() {
+        let scripts: &[(&str, &[u8], f64)] = &[
+            (
+                "Loop2K",
+                b"var total = 0; for (var i = 0; i < 2000; ++i) { total += (i & 7); } total;",
+                7000.0,
+            ),
+            (
+                "FunctionLoop1K",
+                b"function f(n) { var total = 0; for (var i = 0; i < n; ++i) { total += (i % 5); } return total; } f(1000);",
+                2000.0,
+            ),
+            (
+                "StringAppend200",
+                b"var value = ''; for (var i = 0; i < 200; ++i) { value += 'x'; } value.length;",
+                200.0,
+            ),
+        ];
+
+        eprintln!(
+            "EDGE_FFI_TIMING(stator_script_run): script | median_us | mean_us | min_us | max_us | maglev_executed/tried | result"
+        );
+        for (name, src, expected) in scripts {
+            let (median, mean, min, max, last, stats) = edge_pattern_timed(src, 25);
+            assert!(
+                (last - expected).abs() < f64::EPSILON,
+                "{name}: expected {expected}, got {last}"
+            );
+            eprintln!(
+                "EDGE_FFI_TIMING: {name:<16} | {:>9.3} | {:>8.3} | {:>7.3} | {:>7.3} | {:>5}/{:<5} | {}",
+                median as f64 / 1000.0,
+                mean as f64 / 1000.0,
+                min as f64 / 1000.0,
+                max as f64 / 1000.0,
+                stats.maglev_executed,
+                stats.maglev_tried,
+                last,
+            );
+        }
+
+        // Reconciliation diagnostic: also time the same scripts with JIT
+        // tiers disabled (interpreter only).  The Edge perf proof at 0.2.0
+        // reported maglev_executed=0 because the diagnostic counters were
+        // gated behind cfg(debug_assertions) before commit 86e2865a; that
+        // value, combined with Edge's per-iteration times in the hundreds
+        // of microseconds, is consistent with the interpreter path running
+        // (i.e. Maglev cache miss / Maglev cfg disabled in Edge build).
+        eprintln!(
+            "EDGE_FFI_TIMING(jit_disabled, interpreter only): script | median_us | mean_us | min_us | max_us | result"
+        );
+        for (name, src, expected) in scripts {
+            let iso = IsolateGuard::new();
+            unsafe { stator_isolate_set_jit_disabled(iso.as_ptr(), true) };
+            let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+            let script =
+                unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+            assert!(!script.is_null());
+            // Warmup.
+            for _ in 0..5 {
+                let r = unsafe { stator_script_run(script, ctx) };
+                if !r.is_null() {
+                    unsafe { stator_value_destroy(r) };
+                }
+            }
+            let mut samples = Vec::with_capacity(25);
+            let mut last = f64::NAN;
+            for _ in 0..25 {
+                let t0 = std::time::Instant::now();
+                let r = unsafe { stator_script_run(script, ctx) };
+                let elapsed = t0.elapsed().as_nanos();
+                assert!(!r.is_null());
+                last = unsafe { stator_value_as_number(r) };
+                unsafe { stator_value_destroy(r) };
+                samples.push(elapsed);
+            }
+            samples.sort_unstable();
+            assert!((last - expected).abs() < f64::EPSILON);
+            eprintln!(
+                "EDGE_FFI_TIMING(interp): {name:<16} | {:>9.3} | {:>8.3} | {:>7.3} | {:>7.3} | {}",
+                samples[samples.len() / 2] as f64 / 1000.0,
+                (samples.iter().sum::<u128>() / samples.len() as u128) as f64 / 1000.0,
+                *samples.first().unwrap() as f64 / 1000.0,
+                *samples.last().unwrap() as f64 / 1000.0,
+                last,
+            );
+            unsafe {
+                stator_script_free(script);
+                stator_context_destroy(ctx);
+            }
+        }
+    }
+
     /// StringAppend200 from Edge `edge_stator_jse_test_cases.cc`: `200`.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[test]
     fn edge_proof_string_append200_executes_maglev() {
         let src = b"var value = ''; for (var i = 0; i < 200; ++i) { value += 'x'; } value.length;";

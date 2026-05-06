@@ -57,13 +57,25 @@ use crate::bytecode::bytecodes::{Instruction, Opcode, Operand, decode_with_byte_
 use crate::compiler::baseline::masm_x64::{CondCode, Label, MacroAssembler, Reg64};
 use crate::error::{StatorError, StatorResult};
 
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 use std::cell::{Cell, RefCell};
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 use std::collections::HashMap;
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 use std::rc::Rc;
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 use std::sync::atomic::AtomicU32;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -119,7 +131,10 @@ pub const JIT_DEOPT_DIVZERO: i64 = i64::MIN + 5;
 /// cannot be represented as a plain `i64` are stored in a thread-local side
 /// table.  The handle `JIT_HEAP_TAG + index` is placed in the register file
 /// instead.
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 pub(crate) const JIT_HEAP_TAG: i64 = 0x2_0000_0000_i64;
 
 /// Convert a JIT `i64` value back to a [`crate::objects::value::JsValue`].
@@ -158,13 +173,19 @@ pub fn jit_to_jsvalue(v: i64) -> Option<crate::objects::value::JsValue> {
 
 // Re-export `jit_full_teardown` so benchmark crates can access it as
 // `compiler::baseline::compiler::jit_full_teardown()`.
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 pub use jit_runtime::jit_full_teardown;
 
 /// Thread-local state used by the JIT runtime trampoline to access the
 /// constant pool and to store heap-allocated JavaScript objects that cannot
 /// be encoded as plain `i64` values.
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 pub(crate) mod jit_runtime {
     use super::*;
     use crate::bytecode::bytecode_array::JitExecutableCode;
@@ -3566,7 +3587,10 @@ pub(crate) mod jit_runtime {
         // Once Maglev code is compiled the invocation count is only
         // used for tiering decisions that have already been made.
         // Skipping the increment avoids a Cell read+write per call.
-        #[cfg(stator_maglev_jit_x86_64)]
+        #[cfg(any(
+            stator_maglev_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             if !ba.jit_maglev_has_deopted() {
                 let maglev_cache = ba.maglev_executable_cache();
@@ -3593,7 +3617,10 @@ pub(crate) mod jit_runtime {
         let inv_count = ba.increment_invocation_count();
 
         // ── Try to trigger Maglev compilation ───────────────────────
-        #[cfg(stator_maglev_jit_x86_64)]
+        #[cfg(any(
+            stator_maglev_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             use crate::bytecode::bytecode_array::MAGLEV_TIERING_THRESHOLD;
             use crate::compiler::maglev::codegen::CachedMaglevCode;
@@ -3854,7 +3881,10 @@ pub(crate) mod jit_runtime {
     /// Uses [`MaglevCalleeCache`] to skip `closure_context()` lookup,
     /// context pointer comparison, and `skip_mapped_args` toggling when
     /// the same callee is called repeatedly (e.g. closures in a tight loop).
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn exec_maglev_callee(
         ba: &Rc<BytecodeArray>,
         maglev_exec: &crate::compiler::maglev::codegen::CachedMaglevCode,
@@ -4125,7 +4155,10 @@ pub(crate) mod jit_runtime {
         // Bump invocation count so Maglev tiering still triggers for
         // callees that graduate from the interpreter path.
         ba.increment_invocation_count();
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         crate::interpreter::maybe_compile_maglev(ba);
 
         let result = if let Some(env) = env_opt {
@@ -4234,7 +4267,10 @@ pub(crate) mod jit_runtime {
 
     /// Extract the raw JIT entry point and register-file slot count from
     /// a `BytecodeArray`'s executable cache, if available.
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn extract_exec_entry(ba: &BytecodeArray) -> (usize, usize) {
         let exec_cache = ba.jit_executable_cache();
         // SAFETY: single-threaded JIT; no concurrent mutation.
@@ -4249,7 +4285,10 @@ pub(crate) mod jit_runtime {
     /// Extract the Maglev entry point and register-file slot count from
     /// a `BytecodeArray`'s Maglev executable cache, if available and not
     /// deopted.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn extract_maglev_entry(ba: &BytecodeArray) -> (usize, usize) {
         if ba.jit_maglev_has_deopted() {
             return (0, 0);
@@ -4322,13 +4361,25 @@ pub(crate) mod jit_runtime {
                                     .closure_context()
                                     .map(|rc| Rc::into_raw(Rc::clone(rc)))
                                     .unwrap_or(std::ptr::null());
-                                #[cfg(stator_maglev_jit_x86_64)]
+                                #[cfg(any(
+                                    stator_maglev_jit_x86_64,
+                                    all(target_arch = "x86_64", any(unix, windows))
+                                ))]
                                 let (entry_fn, reg_slots) = extract_exec_entry(ba_ref);
-                                #[cfg(not(stator_maglev_jit_x86_64))]
+                                #[cfg(not(any(
+                                    stator_maglev_jit_x86_64,
+                                    all(target_arch = "x86_64", any(unix, windows))
+                                )))]
                                 let (entry_fn, reg_slots) = (0usize, 0usize);
-                                #[cfg(stator_maglev_jit_x86_64)]
+                                #[cfg(any(
+                                    stator_maglev_jit_x86_64,
+                                    all(target_arch = "x86_64", any(unix, windows))
+                                ))]
                                 let (maglev_fn, maglev_reg_slots) = extract_maglev_entry(ba_ref);
-                                #[cfg(not(stator_maglev_jit_x86_64))]
+                                #[cfg(not(any(
+                                    stator_maglev_jit_x86_64,
+                                    all(target_arch = "x86_64", any(unix, windows))
+                                )))]
                                 let (maglev_fn, maglev_reg_slots) = (0usize, 0usize);
                                 let entry = CachedCalleeEntry {
                                     callee_i64,
@@ -4385,7 +4436,10 @@ pub(crate) mod jit_runtime {
                 // Uses MaglevCalleeCache for the context comparison so
                 // that repeated calls to the same closure skip the
                 // TLS context read and pointer comparison.
-                #[cfg(stator_baseline_jit_x86_64)]
+                #[cfg(any(
+                    stator_baseline_jit_x86_64,
+                    all(target_arch = "x86_64", any(unix, windows))
+                ))]
                 if cached_entry.maglev_fn != 0 && !ba.jit_maglev_has_deopted() {
                     let ctx_ref = unsafe { &*ptrs.context };
 
@@ -4568,7 +4622,10 @@ pub(crate) mod jit_runtime {
                 }
 
                 // ── Maglev fast path (preferred) ───────────────
-                #[cfg(stator_maglev_jit_x86_64)]
+                #[cfg(any(
+                    stator_maglev_jit_x86_64,
+                    all(target_arch = "x86_64", any(unix, windows))
+                ))]
                 if !ba.jit_maglev_has_deopted() {
                     use crate::compiler::maglev::codegen::CachedMaglevCode;
 
@@ -4697,7 +4754,10 @@ pub(crate) mod jit_runtime {
                 }
 
                 // ── Cached baseline fast path ───────────────────
-                #[cfg(stator_baseline_jit_x86_64)]
+                #[cfg(any(
+                    stator_baseline_jit_x86_64,
+                    all(target_arch = "x86_64", any(unix, windows))
+                ))]
                 {
                     let mut entry = cached_entry;
                     if entry.entry_fn == 0 {
@@ -5238,7 +5298,10 @@ pub(crate) mod jit_runtime {
                     // JitExecutableCode (ptr, size, register_file_slots),
                     // so the pointer extraction in the caller works.
                     let maglev_entry: Option<usize> = {
-                        #[cfg(stator_maglev_jit_x86_64)]
+                        #[cfg(any(
+                            stator_maglev_jit_x86_64,
+                            all(target_arch = "x86_64", any(unix, windows))
+                        ))]
                         {
                             use crate::compiler::maglev::codegen::CachedMaglevCode;
                             let maglev_cache = ba.maglev_executable_cache();
@@ -5267,7 +5330,10 @@ pub(crate) mod jit_runtime {
                                 .filter(|e| e.register_file_slots <= 16)
                                 .map(|e| e.entry_point() as usize)
                         }
-                        #[cfg(not(stator_maglev_jit_x86_64))]
+                        #[cfg(not(any(
+                            stator_maglev_jit_x86_64,
+                            all(target_arch = "x86_64", any(unix, windows))
+                        )))]
                         {
                             None::<usize>
                         }
@@ -5296,7 +5362,10 @@ pub(crate) mod jit_runtime {
                             // Synchronous Maglev compilation (fast for small
                             // closure bodies like `count = count + 1`).
                             let maglev_sync_entry: Option<usize> = {
-                                #[cfg(stator_maglev_jit_x86_64)]
+                                #[cfg(any(
+                                    stator_maglev_jit_x86_64,
+                                    all(target_arch = "x86_64", any(unix, windows))
+                                ))]
                                 {
                                     if !ba_ref.jit_maglev_has_deopted() {
                                         crate::interpreter::compile_maglev_sync(ba_ref);
@@ -5308,7 +5377,10 @@ pub(crate) mod jit_runtime {
                                         .filter(|e| e.register_file_slots <= 16)
                                         .map(|e| e.entry_point() as usize)
                                 }
-                                #[cfg(not(stator_maglev_jit_x86_64))]
+                                #[cfg(not(any(
+                                    stator_maglev_jit_x86_64,
+                                    all(target_arch = "x86_64", any(unix, windows))
+                                )))]
                                 {
                                     None::<usize>
                                 }
@@ -5614,7 +5686,10 @@ pub(crate) mod jit_runtime {
         // Check whether the callee has Maglev code available.  If so,
         // return its entry point (> 1) so the codegen can upgrade the
         // mono-cache slot.  Otherwise return 1 (plain success).
-        #[cfg(stator_maglev_jit_x86_64)]
+        #[cfg(any(
+            stator_maglev_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             let ba = unsafe { &*(ba_ptr as *const BytecodeArray) };
             if let Some(ep) = try_get_maglev_entry_point(ba) {
@@ -5712,7 +5787,10 @@ pub(crate) mod jit_runtime {
         });
 
         // Check whether the callee has Maglev code available.
-        #[cfg(stator_maglev_jit_x86_64)]
+        #[cfg(any(
+            stator_maglev_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             let ba = unsafe { &*(ba_ptr as *const BytecodeArray) };
             if let Some(ep) = try_get_maglev_entry_point(ba) {
@@ -5782,7 +5860,10 @@ pub(crate) mod jit_runtime {
     ///
     /// Returns `Some(entry_point_as_i64)` (always > 1) when Maglev code is
     /// available, or `None` otherwise.
-    #[cfg(stator_maglev_jit_x86_64)]
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn try_get_maglev_entry_point(ba: &BytecodeArray) -> Option<i64> {
         use crate::compiler::maglev::codegen::CachedMaglevCode;
 
@@ -5946,7 +6027,10 @@ pub(crate) mod jit_runtime {
             ctx_changed: false,
         });
 
-        #[cfg(stator_maglev_jit_x86_64)]
+        #[cfg(any(
+            stator_maglev_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             let ba = unsafe { &*(ba_ptr as *const BytecodeArray) };
             if let Some(ep) = try_get_maglev_entry_point(ba) {
@@ -9549,7 +9633,10 @@ pub(crate) mod jit_runtime {
                         Err(_) => None,
                     };
                 }
-                #[cfg(stator_maglev_jit_x86_64)]
+                #[cfg(any(
+                    stator_maglev_jit_x86_64,
+                    all(target_arch = "x86_64", any(unix, windows))
+                ))]
                 CalleeInfo::JsFunction(ba_ptr) => {
                     // User-defined JS function (e.g. obj.getX()).
                     // Execute via Maglev if available, passing receiver
@@ -9632,7 +9719,10 @@ pub(crate) mod jit_runtime {
                     // No Maglev code — deopt to interpreter.
                     return None;
                 }
-                #[cfg(not(stator_maglev_jit_x86_64))]
+                #[cfg(not(any(
+                    stator_maglev_jit_x86_64,
+                    all(target_arch = "x86_64", any(unix, windows))
+                )))]
                 CalleeInfo::JsFunction(_) => return None,
                 CalleeInfo::Other => return None,
             }
@@ -9982,7 +10072,10 @@ pub(crate) mod jit_runtime {
             }
 
             // User-defined JS function (e.g. Base.call(this) in constructors).
-            #[cfg(stator_maglev_jit_x86_64)]
+            #[cfg(any(
+                stator_maglev_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             if let Some(JsValue::Function(ba_rc)) = heap.get(callee_idx) {
                 let ba_ptr: *const BytecodeArray = Rc::as_ptr(ba_rc);
                 // SAFETY: ba_ptr from Rc::as_ptr; heap entry outlives call.
@@ -11684,13 +11777,19 @@ pub(crate) mod jit_runtime {
     }
 }
 
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 pub use jit_runtime::{
     alloc_jit_heap_handle, jit_runtime_set_context, jit_runtime_set_global_env, jit_runtime_setup,
     jit_runtime_teardown, jit_to_jsvalue_ext,
 };
 
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 pub use jit_runtime::{
     ArrayIcInfo, JsContextLayout, JsValueLayout, VecJsValueLayout, jit_runtime_fill_array_ic_r15,
     jit_runtime_inline_load_keyed_smi_ic_r15, probe_jscontext_layout, probe_jsvalue_layout,
@@ -11734,11 +11833,17 @@ pub const STUB_NAMES: [&str; STUB_DEOPT_SLOTS] = [
 ///
 /// On platforms without the JIT (non-x86-64/non-Unix), returns all zeros.
 pub fn stub_deopt_counts() -> [u64; STUB_DEOPT_SLOTS] {
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     {
         jit_runtime::stub_deopt_counts()
     }
-    #[cfg(not(stator_baseline_jit_x86_64))]
+    #[cfg(not(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    )))]
     {
         [0; STUB_DEOPT_SLOTS]
     }
@@ -11748,7 +11853,10 @@ pub fn stub_deopt_counts() -> [u64; STUB_DEOPT_SLOTS] {
 ///
 /// On platforms without the JIT this is a no-op.
 pub fn reset_stub_deopt_counts() {
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     {
         jit_runtime::reset_stub_deopt_counts();
     }
@@ -11762,11 +11870,17 @@ pub fn reset_stub_deopt_counts() {
 ///
 /// On platforms without the JIT (non-x86-64/non-Unix), returns all zeros.
 pub fn first_deopt_counts() -> [u64; STUB_DEOPT_SLOTS] {
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     {
         jit_runtime::first_deopt_counts()
     }
-    #[cfg(not(stator_baseline_jit_x86_64))]
+    #[cfg(not(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    )))]
     {
         [0; STUB_DEOPT_SLOTS]
     }
@@ -11776,7 +11890,10 @@ pub fn first_deopt_counts() -> [u64; STUB_DEOPT_SLOTS] {
 ///
 /// On platforms without the JIT this is a no-op.
 pub fn reset_first_deopt_counts() {
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     {
         jit_runtime::reset_first_deopt_counts();
     }
@@ -11786,11 +11903,17 @@ pub fn reset_first_deopt_counts() {
 ///
 /// On platforms without the JIT (non-x86-64/non-Unix), returns all zeros.
 pub fn stub_call_counts() -> [u64; STUB_DEOPT_SLOTS] {
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     {
         jit_runtime::stub_call_counts()
     }
-    #[cfg(not(stator_baseline_jit_x86_64))]
+    #[cfg(not(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    )))]
     {
         [0; STUB_DEOPT_SLOTS]
     }
@@ -11800,7 +11923,10 @@ pub fn stub_call_counts() -> [u64; STUB_DEOPT_SLOTS] {
 ///
 /// On platforms without the JIT this is a no-op.
 pub fn reset_stub_call_counts() {
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     {
         jit_runtime::reset_stub_call_counts();
     }
@@ -11872,10 +11998,16 @@ struct MetadataFooter {
     deopt_table_start: u32,
 }
 
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 const STACK_REGISTER_FILE_SLOTS: usize = 32;
 
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 fn init_register_file(
     args: &[i64],
     register_file_slots: usize,
@@ -12013,7 +12145,10 @@ impl CompiledCode {
     /// The `code` bytes inside this [`CompiledCode`] must be valid x86-64
     /// machine code emitted by [`BaselineCompiler`].  Executing arbitrary or
     /// malformed bytes via a function pointer is undefined behaviour.
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     pub unsafe fn execute(&self, args: &[i64]) -> StatorResult<i64> {
         use crate::executable_memory::ExecutableMemory;
 
@@ -12061,7 +12196,10 @@ impl CompiledCode {
 /// The page is allocated once (by [`CachedExecutableCode::from_compiled`]) and
 /// reused for all subsequent calls, eliminating the per-call allocation
 /// overhead of [`CompiledCode::execute`].
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 pub struct CachedExecutableCode {
     /// Owning handle to the executable region.
     mem: crate::executable_memory::ExecutableMemory,
@@ -12075,16 +12213,25 @@ pub struct CachedExecutableCode {
 // SAFETY: The executable code is position-independent and can be shared
 // across threads.  The memory is owned exclusively by this struct and
 // freed on Drop via the inner `ExecutableMemory`.
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 unsafe impl Send for CachedExecutableCode {}
 
 // SAFETY: The executable code is immutable after construction and the
 // function pointer is safe to call from any thread (the register file is
 // caller-owned).
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 unsafe impl Sync for CachedExecutableCode {}
 
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 impl std::fmt::Debug for CachedExecutableCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedExecutableCode")
@@ -12094,7 +12241,10 @@ impl std::fmt::Debug for CachedExecutableCode {
     }
 }
 
-#[cfg(stator_baseline_jit_x86_64)]
+#[cfg(any(
+    stator_baseline_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
 impl CachedExecutableCode {
     /// Allocate executable memory, copy `code` into it, and transmute to a
     /// persistent function pointer.
@@ -12217,23 +12367,38 @@ pub struct BaselineCompiler<'a> {
     /// Mapping from register-file operand value to a callee-saved physical
     /// register used as a cache.  Loads from cached slots read the physical
     /// register directly; stores write both memory and the cached register.
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     cache_map: Vec<(u32, Reg64)>,
     /// Number of `CallUndefinedReceiver0` call sites in the bytecode.
     /// Used to allocate monomorphic inline cache slots in the frame.
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     mono_call_sites: i32,
     /// Counter used during emission to assign sequential cache-slot
     /// offsets to each `CallUndefinedReceiver0` site.
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     next_mono_site: i32,
     /// Total bytes reserved on the stack for monomorphic call cache
     /// slots (aligned to preserve RSP ≡ 0 mod 16 after sub).
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     mono_cache_bytes: i32,
     /// RBP offset of the first mono-cache slot's callee field.
     /// E.g. −40 means `[RBP − 40]` holds slot 0's callee_i64.
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     mono_cache_base: i32,
 }
 
@@ -12255,15 +12420,30 @@ impl<'a> BaselineCompiler<'a> {
             deopt_label: Label::new(),
             promoted_globals: Vec::new(),
             promoted_extra_slots: 0,
-            #[cfg(stator_baseline_jit_x86_64)]
+            #[cfg(any(
+                stator_baseline_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             cache_map: Vec::new(),
-            #[cfg(stator_baseline_jit_x86_64)]
+            #[cfg(any(
+                stator_baseline_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             mono_call_sites: 0,
-            #[cfg(stator_baseline_jit_x86_64)]
+            #[cfg(any(
+                stator_baseline_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             next_mono_site: 0,
-            #[cfg(stator_baseline_jit_x86_64)]
+            #[cfg(any(
+                stator_baseline_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             mono_cache_bytes: 0,
-            #[cfg(stator_baseline_jit_x86_64)]
+            #[cfg(any(
+                stator_baseline_jit_x86_64,
+                all(target_arch = "x86_64", any(unix, windows))
+            ))]
             mono_cache_base: 0,
         };
         c.compile_function()?;
@@ -12356,7 +12536,10 @@ impl<'a> BaselineCompiler<'a> {
             self.masm.push(reg);
         }
         // Push callee-saved registers used for register-file caching.
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         for &(_, phys_reg) in &self.cache_map {
             self.masm.push(phys_reg);
         }
@@ -12374,7 +12557,10 @@ impl<'a> BaselineCompiler<'a> {
         );
         self.masm.xor_rr(Reg64::R12, Reg64::R12);
         // Pre-load cached registers from the register file.
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         for &(virt_reg, phys_reg) in &self.cache_map {
             let off = self.reg_offset(virt_reg);
             self.masm.mov_load_base_disp32(phys_reg, Reg64::R14, off);
@@ -12382,7 +12568,10 @@ impl<'a> BaselineCompiler<'a> {
 
         // When there are CallUndefinedReceiver0 sites, load R15 with the
         // RT_PTRS TLS Cell address for zero-FFI monomorphic call dispatch.
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         if self.mono_call_sites > 0 {
             // After fixed pushes (5) + cache_map pushes (N):
             //   N even → RSP ≡ 0 mod 16 → call-ready
@@ -12425,12 +12614,18 @@ impl<'a> BaselineCompiler<'a> {
     fn emit_normal_epilogue(&mut self) {
         self.masm.mov_rr(Reg64::Rax, Reg64::R12);
         // Deallocate mono-cache slots.
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         if self.mono_cache_bytes > 0 {
             self.masm.add_ri(Reg64::Rsp, self.mono_cache_bytes);
         }
         // Pop cache registers in reverse push order.
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         for &(_, phys_reg) in self.cache_map.iter().rev() {
             self.masm.pop(phys_reg);
         }
@@ -12505,7 +12700,10 @@ impl<'a> BaselineCompiler<'a> {
     /// When register caching is active and `v` is cached in a physical
     /// register, emits a register-to-register move instead of a memory load.
     fn emit_load_reg(&mut self, dst: Reg64, v: u32) {
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         if let Some(&(_, phys)) = self.cache_map.iter().find(|(vr, _)| *vr == v) {
             if dst != phys {
                 self.masm.mov_rr(dst, phys);
@@ -12524,7 +12722,10 @@ impl<'a> BaselineCompiler<'a> {
     fn emit_store_reg(&mut self, v: u32, src: Reg64) {
         let off = self.reg_offset(v);
         self.masm.mov_store_base_disp32(Reg64::R14, off, src);
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         if let Some(&(_, phys)) = self.cache_map.iter().find(|(vr, _)| *vr == v)
             && src != phys
         {
@@ -12540,7 +12741,10 @@ impl<'a> BaselineCompiler<'a> {
     /// ABI passes in registers (callers should only invoke with indices
     /// the migrated call sites are designed to support — at most 3 in
     /// this slice, which both ABIs cover).
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[inline]
     const fn helper_arg_reg(i: usize) -> Reg64 {
         match crate::compiler::abi_x64::NATIVE_ABI.helper_arg_register(i) {
@@ -12555,7 +12759,10 @@ impl<'a> BaselineCompiler<'a> {
     ///
     /// Emits no instructions on SysV (shadow space is 0 bytes).  On
     /// Win64 it emits `sub rsp, 32`.
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[inline]
     fn emit_helper_call_pre_adjust(&mut self) -> i32 {
         const ADJ: i32 = crate::compiler::abi_x64::NATIVE_ABI.helper_call_pre_stack_adjust();
@@ -12567,7 +12774,10 @@ impl<'a> BaselineCompiler<'a> {
 
     /// Release shadow space reserved by [`Self::emit_helper_call_pre_adjust`].
     /// Emits no instructions when `bytes == 0`.
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[inline]
     fn emit_helper_call_post_adjust(&mut self, bytes: i32) {
         if bytes != 0 {
@@ -12583,7 +12793,10 @@ impl<'a> BaselineCompiler<'a> {
     /// `RSP` is 16-byte aligned at the point of reservation — the
     /// alignment contract still holds at the `CALL`.  Pair with
     /// [`Self::emit_helper_call_post_adjust`] using the returned value.
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[inline]
     fn emit_helper_call_pre_adjust_for(&mut self, total_args: usize) -> i32 {
         let adj = crate::compiler::abi_x64::NATIVE_ABI.helper_call_pre_stack_adjust_for(total_args);
@@ -12596,7 +12809,10 @@ impl<'a> BaselineCompiler<'a> {
     /// Stack offset (from `RSP`, after [`Self::emit_helper_call_pre_adjust_for`]
     /// has reserved its frame) at which stack-passed helper argument `i`
     /// must be written.  `i` must be ≥ the ABI's helper register count.
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[inline]
     const fn helper_stack_arg_offset(i: usize) -> i32 {
         crate::compiler::abi_x64::NATIVE_ABI.helper_stack_arg_offset(i)
@@ -12607,7 +12823,10 @@ impl<'a> BaselineCompiler<'a> {
     /// host ABI, otherwise the corresponding stack slot (using `R11`
     /// as a scratch).  The caller must have already reserved the
     /// outgoing-args region via [`Self::emit_helper_call_pre_adjust_for`].
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[inline]
     fn emit_helper_arg_imm(&mut self, i: usize, imm: i64) {
         if let Some(reg) = crate::compiler::abi_x64::NATIVE_ABI.helper_arg_register(i) {
@@ -12624,7 +12843,10 @@ impl<'a> BaselineCompiler<'a> {
     /// otherwise the corresponding stack slot.  The caller must have
     /// already reserved the outgoing-args region via
     /// [`Self::emit_helper_call_pre_adjust_for`].
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[inline]
     fn emit_helper_arg_reg(&mut self, i: usize, src: Reg64) {
         if let Some(reg) = crate::compiler::abi_x64::NATIVE_ABI.helper_arg_register(i) {
@@ -12639,7 +12861,10 @@ impl<'a> BaselineCompiler<'a> {
 
     // ── ABI-aware JIT-entry call primitives ─────────────────────────────────
 
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[inline]
     fn emit_jit_entry_arg_setup(&mut self, register_file: Reg64, closure_context: Reg64) {
         let register_file_arg = crate::compiler::abi_x64::NATIVE_ABI.entry_arg_register_file();
@@ -12653,7 +12878,10 @@ impl<'a> BaselineCompiler<'a> {
         }
     }
 
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[inline]
     fn emit_jit_entry_call(&mut self, entry: Reg64, register_file: Reg64, closure_context: Reg64) {
         self.emit_jit_entry_arg_setup(register_file, closure_context);
@@ -12721,7 +12949,10 @@ impl<'a> BaselineCompiler<'a> {
     /// sentinel and will be caught later when the value is used.
     #[allow(unused_variables)]
     fn emit_promoted_global_loads(&mut self) {
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             let addr = jit_runtime::jit_runtime_lda_global as *const () as usize as i64;
             for &(name_idx, flat) in &self.promoted_globals.clone() {
@@ -12746,7 +12977,10 @@ impl<'a> BaselineCompiler<'a> {
     /// slots back to `GlobalEnv` via [`jit_runtime_sta_global`].
     #[allow(unused_variables)]
     fn emit_promoted_global_stores(&mut self) {
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             let addr = jit_runtime::jit_runtime_sta_global as *const () as usize as i64;
             for &(name_idx, flat) in &self.promoted_globals.clone() {
@@ -12877,7 +13111,10 @@ impl<'a> BaselineCompiler<'a> {
     /// - `xor r12d, r12d` for zero (3 bytes vs 7).
     /// - `mov r12d, imm32` for positive values (6 bytes vs 7).
     /// - `mov r12, imm64` (sign-extended i32) for negative values (7 bytes).
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_lda_smi_optimized(&mut self, imm: i32) {
         if imm == 0 {
             self.masm.xor_rr(Reg64::R12, Reg64::R12);
@@ -12894,7 +13131,10 @@ impl<'a> BaselineCompiler<'a> {
     /// from the scratch register (R11) into the accumulator (R12).
     ///
     /// `is_sub` selects between ADD and SUB.
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_arith_with_overflow_check(&mut self, v: u32, bytecode_offset: u32, is_sub: bool) {
         self.emit_load_reg(Reg64::Rax, v);
         self.masm.mov_rr(Reg64::R11, Reg64::R12);
@@ -12919,7 +13159,10 @@ impl<'a> BaselineCompiler<'a> {
     ///
     /// On overflow, jumps to a deopt stub.  On success, commits the result
     /// from the scratch register (R11) into the accumulator (R12).
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn emit_mul_with_overflow_check(&mut self, v: u32, bytecode_offset: u32) {
         self.emit_load_reg(Reg64::Rax, v);
         self.masm.mov_rr(Reg64::R11, Reg64::R12);
@@ -12940,7 +13183,10 @@ impl<'a> BaselineCompiler<'a> {
     ///
     /// Only the first (outermost) loop is considered.  At most 3 registers
     /// are cached.
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn analyze_register_caching(
         instructions: &[Instruction],
         byte_offsets: &[usize],
@@ -13066,7 +13312,10 @@ impl<'a> BaselineCompiler<'a> {
         operand2: i64,
         bytecode_offset: u32,
     ) {
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             // ── Set up helper-call arguments via the ABI abstraction ────
             //
@@ -13128,7 +13377,10 @@ impl<'a> BaselineCompiler<'a> {
     /// skips generic opcode dispatch and uses shape-based inline caching.
     #[allow(unused_variables)]
     fn emit_lda_named_property_stub(&mut self, obj_flat: i64, name_idx: u32, bytecode_offset: u32) {
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             // Load object value from register file: RDI = regs[obj_flat].
             let byte_offset = (obj_flat as i32) * 8;
@@ -13177,7 +13429,10 @@ impl<'a> BaselineCompiler<'a> {
     /// to the full runtime stub when no JIT entry is available.
     #[allow(unused_variables)]
     fn emit_call_undefined_receiver0_stub(&mut self, callee_flat: i64, bytecode_offset: u32) {
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         if self.mono_call_sites > 0 {
             let byte_offset = (callee_flat as i32) * 8;
 
@@ -13377,7 +13632,10 @@ impl<'a> BaselineCompiler<'a> {
             return;
         }
 
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             // Load callee value from register file: RDI = regs[callee_flat].
             let byte_offset = (callee_flat as i32) * 8;
@@ -13419,7 +13677,10 @@ impl<'a> BaselineCompiler<'a> {
     /// dispatch.
     #[allow(unused_variables)]
     fn emit_lda_global_stub(&mut self, name_idx: u32, bytecode_offset: u32) {
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             // arg 0 = name_idx (constant-pool index).
             self.masm
@@ -13460,7 +13721,10 @@ impl<'a> BaselineCompiler<'a> {
     /// value to a dedicated function.
     #[allow(unused_variables)]
     fn emit_sta_global_stub(&mut self, name_idx: u32, bytecode_offset: u32) {
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             // arg 0 = name_idx (constant-pool index).
             self.masm
@@ -13505,7 +13769,10 @@ impl<'a> BaselineCompiler<'a> {
     /// skips generic opcode dispatch.
     #[allow(unused_variables)]
     fn emit_lda_keyed_property_stub(&mut self, obj_flat: i64, bytecode_offset: u32) {
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             // arg 0 = receiver object from register file.
             let byte_offset = (obj_flat as i32) * 8;
@@ -13551,7 +13818,10 @@ impl<'a> BaselineCompiler<'a> {
     /// function that skips generic opcode dispatch.
     #[allow(unused_variables)]
     fn emit_sta_keyed_property_stub(&mut self, obj_flat: i64, key_flat: i64, bytecode_offset: u32) {
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             // arg 0 = receiver object from register file.
             let obj_byte_offset = (obj_flat as i32) * 8;
@@ -13602,7 +13872,10 @@ impl<'a> BaselineCompiler<'a> {
     /// prologue from the RSI parameter passed by `execute`).
     #[allow(unused_variables)]
     fn emit_lda_context_slot_stub(&mut self, slot_idx: u32, bytecode_offset: u32) {
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             // arg 0 = ctx_raw (from RBX), arg 1 = slot_idx.
             self.masm.mov_rr(Self::helper_arg_reg(0), Reg64::Rbx);
@@ -13644,7 +13917,10 @@ impl<'a> BaselineCompiler<'a> {
     /// RBX carries the raw `RefCell<JsContext>` pointer.
     #[allow(unused_variables)]
     fn emit_sta_context_slot_stub(&mut self, slot_idx: u32, bytecode_offset: u32) {
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             // arg 0 = ctx_raw (from RBX), arg 1 = slot_idx, arg 2 = value (R12).
             self.masm.mov_rr(Self::helper_arg_reg(0), Reg64::Rbx);
@@ -13685,7 +13961,10 @@ impl<'a> BaselineCompiler<'a> {
     /// `StaNamedProperty` / `StaNamedOwnProperty` / `DefineNamedOwnProperty`.
     #[allow(unused_variables)]
     fn emit_sta_named_property_stub(&mut self, obj_flat: i64, name_idx: u32, bytecode_offset: u32) {
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             // arg 0 = receiver object from register file.
             let obj_byte_offset = (obj_flat as i32) * 8;
@@ -13736,7 +14015,10 @@ impl<'a> BaselineCompiler<'a> {
         receiver_flat: i64,
         bytecode_offset: u32,
     ) {
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             // arg 0 = callee from register file.
             let callee_byte_offset = (callee_flat as i32) * 8;
@@ -13789,7 +14071,10 @@ impl<'a> BaselineCompiler<'a> {
         arg0_flat: i64,
         bytecode_offset: u32,
     ) {
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             // arg 0 = callee from register file.
             let callee_byte_offset = (callee_flat as i32) * 8;
@@ -13854,7 +14139,10 @@ impl<'a> BaselineCompiler<'a> {
 
         // Analyse register usage in loop bodies and set up the cache map
         // before emitting the prologue (which pushes the cache registers).
-        #[cfg(stator_baseline_jit_x86_64)]
+        #[cfg(any(
+            stator_baseline_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
         {
             // Count CallUndefinedReceiver0 sites for monomorphic inline cache.
             let call0_sites = instructions
@@ -13953,11 +14241,17 @@ impl<'a> BaselineCompiler<'a> {
                 let Operand::Immediate(v) = *instr.operand(0) else {
                     return Err(bad_operand("LdaSmi", 0));
                 };
-                #[cfg(stator_baseline_jit_x86_64)]
+                #[cfg(any(
+                    stator_baseline_jit_x86_64,
+                    all(target_arch = "x86_64", any(unix, windows))
+                ))]
                 {
                     self.emit_lda_smi_optimized(v);
                 }
-                #[cfg(not(stator_baseline_jit_x86_64))]
+                #[cfg(not(any(
+                    stator_baseline_jit_x86_64,
+                    all(target_arch = "x86_64", any(unix, windows))
+                )))]
                 {
                     self.masm.mov_ri(Reg64::R12, v as i64);
                 }
@@ -13969,11 +14263,17 @@ impl<'a> BaselineCompiler<'a> {
                 let Operand::Register(dst) = *instr.operand(1) else {
                     return Err(bad_operand("LdaSmiStar", 1));
                 };
-                #[cfg(stator_baseline_jit_x86_64)]
+                #[cfg(any(
+                    stator_baseline_jit_x86_64,
+                    all(target_arch = "x86_64", any(unix, windows))
+                ))]
                 {
                     self.emit_lda_smi_optimized(v);
                 }
-                #[cfg(not(stator_baseline_jit_x86_64))]
+                #[cfg(not(any(
+                    stator_baseline_jit_x86_64,
+                    all(target_arch = "x86_64", any(unix, windows))
+                )))]
                 {
                     self.masm.mov_ri(Reg64::R12, v as i64);
                 }
@@ -14111,11 +14411,17 @@ impl<'a> BaselineCompiler<'a> {
                 let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("Add", 0));
                 };
-                #[cfg(stator_baseline_jit_x86_64)]
+                #[cfg(any(
+                    stator_baseline_jit_x86_64,
+                    all(target_arch = "x86_64", any(unix, windows))
+                ))]
                 {
                     self.emit_arith_with_overflow_check(v, bytecode_offset, false);
                 }
-                #[cfg(not(stator_baseline_jit_x86_64))]
+                #[cfg(not(any(
+                    stator_baseline_jit_x86_64,
+                    all(target_arch = "x86_64", any(unix, windows))
+                )))]
                 {
                     self.emit_load_reg(Reg64::R11, v);
                     self.masm.add_rr(Reg64::R12, Reg64::R11);
@@ -14125,11 +14431,17 @@ impl<'a> BaselineCompiler<'a> {
                 let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("Sub", 0));
                 };
-                #[cfg(stator_baseline_jit_x86_64)]
+                #[cfg(any(
+                    stator_baseline_jit_x86_64,
+                    all(target_arch = "x86_64", any(unix, windows))
+                ))]
                 {
                     self.emit_arith_with_overflow_check(v, bytecode_offset, true);
                 }
-                #[cfg(not(stator_baseline_jit_x86_64))]
+                #[cfg(not(any(
+                    stator_baseline_jit_x86_64,
+                    all(target_arch = "x86_64", any(unix, windows))
+                )))]
                 {
                     self.emit_load_reg(Reg64::R11, v);
                     self.masm.sub_rr(Reg64::R12, Reg64::R11);
@@ -14139,11 +14451,17 @@ impl<'a> BaselineCompiler<'a> {
                 let Operand::Register(v) = *instr.operand(0) else {
                     return Err(bad_operand("Mul", 0));
                 };
-                #[cfg(stator_baseline_jit_x86_64)]
+                #[cfg(any(
+                    stator_baseline_jit_x86_64,
+                    all(target_arch = "x86_64", any(unix, windows))
+                ))]
                 {
                     self.emit_mul_with_overflow_check(v, bytecode_offset);
                 }
-                #[cfg(not(stator_baseline_jit_x86_64))]
+                #[cfg(not(any(
+                    stator_baseline_jit_x86_64,
+                    all(target_arch = "x86_64", any(unix, windows))
+                )))]
                 {
                     self.emit_load_reg(Reg64::R11, v);
                     self.masm.imul_rr(Reg64::R12, Reg64::R11);
@@ -14937,7 +15255,10 @@ impl<'a> BaselineCompiler<'a> {
                 #[allow(unused_variables)]
                 if let Some(flat) = self.promoted_slot_for(name_idx) {
                     // Promoted: load directly from register file.
-                    #[cfg(stator_baseline_jit_x86_64)]
+                    #[cfg(any(
+                        stator_baseline_jit_x86_64,
+                        all(target_arch = "x86_64", any(unix, windows))
+                    ))]
                     {
                         self.masm.mov_load_base_disp32(
                             Reg64::R12,
@@ -14945,7 +15266,10 @@ impl<'a> BaselineCompiler<'a> {
                             Self::promoted_offset(flat),
                         );
                     }
-                    #[cfg(not(stator_baseline_jit_x86_64))]
+                    #[cfg(not(any(
+                        stator_baseline_jit_x86_64,
+                        all(target_arch = "x86_64", any(unix, windows))
+                    )))]
                     {
                         self.emit_deopt(bytecode_offset);
                     }
@@ -14963,7 +15287,10 @@ impl<'a> BaselineCompiler<'a> {
                 };
                 #[allow(unused_variables)]
                 if let Some(flat) = self.promoted_slot_for(name_idx) {
-                    #[cfg(stator_baseline_jit_x86_64)]
+                    #[cfg(any(
+                        stator_baseline_jit_x86_64,
+                        all(target_arch = "x86_64", any(unix, windows))
+                    ))]
                     {
                         self.masm.mov_load_base_disp32(
                             Reg64::R12,
@@ -14972,7 +15299,10 @@ impl<'a> BaselineCompiler<'a> {
                         );
                         self.emit_store_reg(dst, Reg64::R12);
                     }
-                    #[cfg(not(stator_baseline_jit_x86_64))]
+                    #[cfg(not(any(
+                        stator_baseline_jit_x86_64,
+                        all(target_arch = "x86_64", any(unix, windows))
+                    )))]
                     {
                         self.emit_deopt(bytecode_offset);
                     }
@@ -14989,7 +15319,10 @@ impl<'a> BaselineCompiler<'a> {
                 #[allow(unused_variables)]
                 if let Some(flat) = self.promoted_slot_for(name_idx) {
                     // Promoted: store directly into register file.
-                    #[cfg(stator_baseline_jit_x86_64)]
+                    #[cfg(any(
+                        stator_baseline_jit_x86_64,
+                        all(target_arch = "x86_64", any(unix, windows))
+                    ))]
                     {
                         self.masm.mov_store_base_disp32(
                             Reg64::R14,
@@ -14997,7 +15330,10 @@ impl<'a> BaselineCompiler<'a> {
                             Reg64::R12,
                         );
                     }
-                    #[cfg(not(stator_baseline_jit_x86_64))]
+                    #[cfg(not(any(
+                        stator_baseline_jit_x86_64,
+                        all(target_arch = "x86_64", any(unix, windows))
+                    )))]
                     {
                         self.emit_deopt(bytecode_offset);
                     }
@@ -15484,14 +15820,20 @@ mod tests {
 
     /// Compile `ba`, execute the JIT code with `args`, and return the raw i64
     /// accumulator value.
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn jit_run(ba: &BytecodeArray, args: &[i64]) -> i64 {
         let cc = BaselineCompiler::compile(ba).expect("compile failed");
         unsafe { cc.execute(args).expect("jit execute failed") }
     }
 
     #[test]
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn test_jit_lda_smi_return() {
         // LdaSmi(42), Return  →  42
         let ba = bytecode(vec![
@@ -15504,7 +15846,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn test_jit_lda_zero_return() {
         // LdaZero, Return  →  0
         let ba = bytecode(vec![
@@ -15517,7 +15862,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn test_jit_addition() {
         // LdaSmi(3), Star(r0), LdaSmi(2), Add(r0, _), Return  →  5
         let ba = bytecode(vec![
@@ -15537,7 +15885,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn test_jit_subtraction() {
         // LdaSmi(10) → r0; LdaSmi(4) → acc; Sub(r0): acc = acc − r0 = 4 − 10 = −6
         let ba = bytecode(vec![
@@ -15557,7 +15908,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn test_jit_multiplication() {
         // LdaSmi(6), Star(r0), LdaSmi(7), Mul(r0, _), Return  →  42
         let ba = bytecode(vec![
@@ -15577,7 +15931,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn test_jit_increment() {
         // LdaSmi(99), Inc(_), Return  →  100
         let ba = bytecode(vec![
@@ -15592,7 +15949,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn test_jit_negate() {
         // LdaSmi(7), Negate(_), Return  →  -7
         // Note: Negate is not yet implemented in the tree-walking interpreter,
@@ -15607,7 +15967,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn test_jit_comparison_less_than_true() {
         // Store 5 in r0; load 3 into acc; TestLessThan(r0): acc = (3 < 5) = true → JIT_TRUE
         let ba = bytecode(vec![
@@ -15627,7 +15990,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn test_jit_comparison_less_than_false() {
         // Store 3 in r0; load 5 into acc; TestLessThan(r0): acc = (5 < 3) = false → JIT_FALSE
         let ba = bytecode(vec![
@@ -15647,7 +16013,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn test_jit_unconditional_jump() {
         // LdaSmi(1), Jump(+2 bytes → Return), LdaSmi(99), Return
         // (Jump skips the LdaSmi(99); should return 1)
@@ -15671,7 +16040,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn test_jit_sum_loop() {
         // Compute sum = 0; for (let i = 1; i <= 5; i++) sum += i;
         // Equivalent bytecode:
@@ -15806,7 +16178,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn test_jit_lda_true_false() {
         let ba_true = bytecode(vec![
             Instruction::new_unchecked(Opcode::LdaTrue, vec![]),
@@ -15822,7 +16197,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn test_jit_logical_not() {
         let ba = bytecode(vec![
             Instruction::new_unchecked(Opcode::LdaTrue, vec![]),
@@ -15833,7 +16211,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn test_jit_deopt_for_global_load() {
         let ba = bytecode(vec![
             Instruction::new_unchecked(
@@ -16040,7 +16421,10 @@ mod tests {
     /// as booleans — this is the hot path for sieve-style benchmarks
     /// where `sta_keyed` stores booleans into arrays.
     #[test]
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn test_decode_non_heap_value_fast_booleans() {
         use super::jit_runtime::decode_non_heap_value_fast;
         assert_eq!(
@@ -16055,7 +16439,10 @@ mod tests {
 
     /// `decode_non_heap_value_fast` must still handle Smi and Undefined.
     #[test]
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn test_decode_non_heap_value_fast_smi_and_undefined() {
         use super::jit_runtime::decode_non_heap_value_fast;
         assert_eq!(decode_non_heap_value_fast(0), Some(JsValue::Smi(0)));
@@ -16070,7 +16457,10 @@ mod tests {
     /// `encode_array_element` must roundtrip booleans through the JIT
     /// encoding so that `lda_keyed` returns the correct boolean values.
     #[test]
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn test_encode_array_element_booleans() {
         use super::jit_runtime::encode_array_element;
         assert_eq!(
@@ -16086,7 +16476,10 @@ mod tests {
     /// Boolean JIT roundtrip: encoding then decoding must recover the
     /// original `JsValue::Boolean`.
     #[test]
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn test_boolean_jit_roundtrip() {
         use super::jit_runtime::{decode_non_heap_value_fast, encode_array_element};
         for b in [true, false] {
@@ -16106,7 +16499,10 @@ mod tests {
     /// The miss path requires no thread-local state beyond
     /// `is_heap_handle(obj_i64) == false`, so we exercise it directly.
     #[test]
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     fn named_ic_helper_packs_hit_into_slot_4_on_miss() {
         use super::jit_runtime::{
             NAMED_IC_HIT_SLOT_INDEX, NAMED_IC_SLOT_COUNT, jit_runtime_fill_named_ic_r15,
@@ -16152,7 +16548,10 @@ mod tests {
     // sides, ASCII, multi-byte UTF-8, repeated extension).  The helper is
     // deliberately exercised through its public surface name to ensure
     // any future refactor is observed.
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[test]
     fn build_concat_rc_str_matches_format_for_varied_inputs() {
         use super::jit_runtime::build_concat_rc_str;
@@ -16180,7 +16579,10 @@ mod tests {
     /// pattern) must produce a string whose length grows by exactly
     /// `b.len()` each step, with no UTF-8 corruption — guards against
     /// off-by-one or boundary errors in the unsafe pointer copy.
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[test]
     fn build_concat_rc_str_iterative_append_is_stable() {
         use super::jit_runtime::build_concat_rc_str;
@@ -16199,7 +16601,10 @@ mod tests {
     /// literal on every iteration.  Without invalidation across heap
     /// recycles the cache would hand out stale handles, so this test
     /// also verifies that `recycle_and_clear_heap` drops cached entries.
-    #[cfg(stator_baseline_jit_x86_64)]
+    #[cfg(any(
+        stator_baseline_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
     #[test]
     fn load_string_constant_returns_stable_handle_within_one_setup() {
         use super::jit_runtime::{
