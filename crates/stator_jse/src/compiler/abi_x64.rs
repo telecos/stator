@@ -206,6 +206,51 @@ mod tests {
         assert!(AbiX64::Win64.entry_must_preserve_rdi_rsi());
     }
 
+    /// The baseline and Maglev prologues rely on
+    /// `extra_entry_callee_saved()` having an even number of elements so
+    /// they can push/pop the set without disturbing the existing 16-byte
+    /// stack-alignment math.  Validate that invariant for every ABI.
+    #[test]
+    fn extra_entry_callee_saved_has_even_cardinality() {
+        for abi in [AbiX64::SysV, AbiX64::Win64] {
+            let saved = abi.extra_entry_callee_saved();
+            assert_eq!(
+                saved.len() % 2,
+                0,
+                "extra_entry_callee_saved() must have even length to preserve \
+                 16-byte stack alignment in JIT prologues (abi = {:?}, set = {:?})",
+                abi,
+                saved
+            );
+        }
+    }
+
+    /// `extra_entry_callee_saved()` must not include any register that the
+    /// JIT relies on as a fixed callee-saved (RBP/RBX/R12-R15) — otherwise
+    /// the prologue would push the same physical register twice.
+    #[test]
+    fn extra_entry_callee_saved_disjoint_from_fixed_callee_saved() {
+        let fixed = [
+            Reg64::Rbp,
+            Reg64::Rbx,
+            Reg64::R12,
+            Reg64::R13,
+            Reg64::R14,
+            Reg64::R15,
+        ];
+        for abi in [AbiX64::SysV, AbiX64::Win64] {
+            for reg in abi.extra_entry_callee_saved() {
+                assert!(
+                    !fixed.contains(reg),
+                    "{:?} must not appear in extra_entry_callee_saved() for {:?} \
+                     (it is already in the fixed callee-saved push block)",
+                    reg,
+                    abi
+                );
+            }
+        }
+    }
+
     #[test]
     fn native_abi_matches_target_os() {
         if cfg!(target_os = "windows") {
