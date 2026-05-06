@@ -128,6 +128,53 @@ impl AbiX64 {
         16
     }
 
+    /// Number of helper-call arguments at indices ≥
+    /// [`Self::helper_arg_register_count`] for a call of `total_args`
+    /// integer/pointer arguments — i.e. the count that must be passed
+    /// on the stack rather than in registers.
+    ///
+    /// Returns `0` when every argument fits in the ABI's register set.
+    pub const fn helper_stack_arg_count(self, total_args: usize) -> usize {
+        let regs = self.helper_arg_register_count();
+        if total_args > regs {
+            total_args - regs
+        } else {
+            0
+        }
+    }
+
+    /// Stack offset (bytes from `RSP` *after* the matching
+    /// [`Self::helper_call_pre_stack_adjust_for`] reservation has been
+    /// emitted) at which the `i`-th helper argument is stored.
+    ///
+    /// `i` must be ≥ [`Self::helper_arg_register_count`]; smaller
+    /// indices are passed in registers and have no stack home in the
+    /// outgoing-args region.  Win64 places stack args immediately above
+    /// the 32-byte shadow region (so the 5th arg lands at `[RSP+32]`);
+    /// SysV places them at offset `0` because it has no shadow space.
+    pub const fn helper_stack_arg_offset(self, i: usize) -> i32 {
+        let regs = self.helper_arg_register_count();
+        // Caller responsibility: this is undefined for register-passed
+        // arguments.  We compute as if the i-th outgoing slot follows
+        // the shadow space so that Win64 lays out arg 4 at +32.
+        self.shadow_space_bytes() + ((i - regs) as i32) * 8
+    }
+
+    /// Total bytes the caller must reserve below `RSP` immediately
+    /// before issuing a runtime helper `CALL` of `total_args`
+    /// integer/pointer arguments.
+    ///
+    /// The returned value covers both the ABI shadow space (32 bytes
+    /// on Win64, none on SysV) and 8 bytes per stack-passed argument,
+    /// rounded up to [`Self::call_site_stack_alignment`] so that — given
+    /// `RSP` is 16-byte aligned at the point of reservation — the
+    /// alignment contract still holds at the `CALL`.
+    pub const fn helper_call_pre_stack_adjust_for(self, total_args: usize) -> i32 {
+        let raw = self.shadow_space_bytes() + (self.helper_stack_arg_count(total_args) as i32) * 8;
+        let align = self.call_site_stack_alignment();
+        (raw + align - 1) & !(align - 1)
+    }
+
     /// Extra registers that are **callee-saved on this ABI** but not
     /// on SysV — and therefore must be saved/restored by a JIT
     /// function's prologue/epilogue when this ABI is in effect.
@@ -208,6 +255,106 @@ mod tests {
     fn call_sites_are_16_byte_aligned_under_both_abis() {
         assert_eq!(AbiX64::SysV.call_site_stack_alignment(), 16);
         assert_eq!(AbiX64::Win64.call_site_stack_alignment(), 16);
+    }
+
+    #[test]
+    fn helper_stack_arg_count_matches_register_capacity() {
+        // SysV passes 6 in registers; Win64 passes 4.
+        for n in 0..=6 {
+            assert_eq!(AbiX64::SysV.helper_stack_arg_count(n), 0);
+        }
+        assert_eq!(AbiX64::SysV.helper_stack_arg_count(7), 1);
+        assert_eq!(AbiX64::SysV.helper_stack_arg_count(8), 2);
+
+        for n in 0..=4 {
+            assert_eq!(AbiX64::Win64.helper_stack_arg_count(n), 0);
+        }
+        assert_eq!(AbiX64::Win64.helper_stack_arg_count(5), 1);
+        assert_eq!(AbiX64::Win64.helper_stack_arg_count(7), 3);
+        assert_eq!(AbiX64::Win64.helper_stack_arg_count(8), 4);
+    }
+
+    #[test]
+    fn helper_stack_arg_offset_layout() {
+        // SysV: stack args start at +0 (no shadow).  arg index 6 is the
+        // first stack arg, then +8 per slot.
+        assert_eq!(AbiX64::SysV.helper_stack_arg_offset(6), 0);
+        assert_eq!(AbiX64::SysV.helper_stack_arg_offset(7), 8);
+
+        // Win64: stack args start immediately above the 32-byte shadow
+        // region.  arg index 4 (the 5th arg) lives at +32.
+        assert_eq!(AbiX64::Win64.helper_stack_arg_offset(4), 32);
+        assert_eq!(AbiX64::Win64.helper_stack_arg_offset(5), 40);
+        assert_eq!(AbiX64::Win64.helper_stack_arg_offset(6), 48);
+        assert_eq!(AbiX64::Win64.helper_stack_arg_offset(7), 56);
+    }
+
+    #[test]
+    fn helper_call_pre_stack_adjust_for_total_args() {
+        // SysV: zero shadow.  With ≤ 6 args nothing is reserved.
+        for n in 0..=6 {
+            assert_eq!(AbiX64::SysV.helper_call_pre_stack_adjust_for(n), 0);
+        }
+        // SysV stack args are 8 bytes each, rounded up to 16.
+        assert_eq!(AbiX64::SysV.helper_call_pre_stack_adjust_for(7), 16);
+        assert_eq!(AbiX64::SysV.helper_call_pre_stack_adjust_for(8), 16);
+        assert_eq!(AbiX64::SysV.helper_call_pre_stack_adjust_for(9), 32);
+
+        // Win64: shadow space is always reserved.
+        for n in 0..=4 {
+            assert_eq!(
+                AbiX64::Win64.helper_call_pre_stack_adjust_for(n),
+                AbiX64::Win64.shadow_space_bytes()
+            );
+        }
+        // Shadow (32) + per-stack-arg, rounded up to 16.
+        assert_eq!(AbiX64::Win64.helper_call_pre_stack_adjust_for(5), 48); // 32+8 → 48
+        assert_eq!(AbiX64::Win64.helper_call_pre_stack_adjust_for(6), 48); // 32+16 → 48
+        assert_eq!(AbiX64::Win64.helper_call_pre_stack_adjust_for(7), 64); // 32+24 → 64
+        assert_eq!(AbiX64::Win64.helper_call_pre_stack_adjust_for(8), 64); // 32+32 → 64
+        assert_eq!(AbiX64::Win64.helper_call_pre_stack_adjust_for(9), 80); // 32+40 → 80
+    }
+
+    /// Reservations returned by [`AbiX64::helper_call_pre_stack_adjust_for`]
+    /// must always be a multiple of the call-site alignment so that the
+    /// caller's prior 16-byte alignment is preserved through the `CALL`.
+    #[test]
+    fn helper_call_pre_stack_adjust_for_is_16_byte_aligned() {
+        for abi in [AbiX64::SysV, AbiX64::Win64] {
+            for n in 0..=10 {
+                let adj = abi.helper_call_pre_stack_adjust_for(n);
+                assert_eq!(
+                    adj % abi.call_site_stack_alignment(),
+                    0,
+                    "pre-call adjust must preserve 16-byte alignment \
+                     (abi = {:?}, total_args = {}, adj = {})",
+                    abi,
+                    n,
+                    adj
+                );
+            }
+        }
+    }
+
+    /// For ≤ register-arg-count helper calls, the new
+    /// `helper_call_pre_stack_adjust_for` must agree with the original
+    /// `helper_call_pre_stack_adjust` (= shadow space) — preserving the
+    /// behaviour of every previously-migrated ≤4-arg call site.
+    #[test]
+    fn pre_stack_adjust_for_matches_simple_helper_adjust_when_no_stack_args() {
+        for abi in [AbiX64::SysV, AbiX64::Win64] {
+            let regs = abi.helper_arg_register_count();
+            for n in 0..=regs {
+                assert_eq!(
+                    abi.helper_call_pre_stack_adjust_for(n),
+                    abi.helper_call_pre_stack_adjust(),
+                    "no-stack-arg call must reserve only the shadow space \
+                     (abi = {:?}, total_args = {})",
+                    abi,
+                    n
+                );
+            }
+        }
     }
 
     #[test]

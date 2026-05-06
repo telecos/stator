@@ -12293,6 +12293,68 @@ impl<'a> BaselineCompiler<'a> {
         }
     }
 
+    /// Reserve the shadow space *and* the space needed for stack-passed
+    /// arguments of a helper `CALL` taking `total_args` integer/pointer
+    /// arguments.  Returns the number of bytes reserved.
+    ///
+    /// The total reservation is rounded up to 16 bytes so that — given
+    /// `RSP` is 16-byte aligned at the point of reservation — the
+    /// alignment contract still holds at the `CALL`.  Pair with
+    /// [`Self::emit_helper_call_post_adjust`] using the returned value.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[inline]
+    fn emit_helper_call_pre_adjust_for(&mut self, total_args: usize) -> i32 {
+        let adj = crate::compiler::abi_x64::NATIVE_ABI.helper_call_pre_stack_adjust_for(total_args);
+        if adj != 0 {
+            self.masm.sub_ri(Reg64::Rsp, adj);
+        }
+        adj
+    }
+
+    /// Stack offset (from `RSP`, after [`Self::emit_helper_call_pre_adjust_for`]
+    /// has reserved its frame) at which stack-passed helper argument `i`
+    /// must be written.  `i` must be ≥ the ABI's helper register count.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[inline]
+    const fn helper_stack_arg_offset(i: usize) -> i32 {
+        crate::compiler::abi_x64::NATIVE_ABI.helper_stack_arg_offset(i)
+    }
+
+    /// Place the immediate `imm` into the `i`-th helper-call argument
+    /// slot — a register when one is defined for this index by the
+    /// host ABI, otherwise the corresponding stack slot (using `R11`
+    /// as a scratch).  The caller must have already reserved the
+    /// outgoing-args region via [`Self::emit_helper_call_pre_adjust_for`].
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[inline]
+    fn emit_helper_arg_imm(&mut self, i: usize, imm: i64) {
+        if let Some(reg) = crate::compiler::abi_x64::NATIVE_ABI.helper_arg_register(i) {
+            self.masm.mov_ri(reg, imm);
+        } else {
+            let off = Self::helper_stack_arg_offset(i);
+            self.masm.mov_ri(Reg64::R11, imm);
+            self.masm.mov_store_base_disp32(Reg64::Rsp, off, Reg64::R11);
+        }
+    }
+
+    /// Move `src` into the `i`-th helper-call argument slot — a
+    /// register when one is defined for this index by the host ABI,
+    /// otherwise the corresponding stack slot.  The caller must have
+    /// already reserved the outgoing-args region via
+    /// [`Self::emit_helper_call_pre_adjust_for`].
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[inline]
+    fn emit_helper_arg_reg(&mut self, i: usize, src: Reg64) {
+        if let Some(reg) = crate::compiler::abi_x64::NATIVE_ABI.helper_arg_register(i) {
+            if reg != src {
+                self.masm.mov_rr(reg, src);
+            }
+        } else {
+            let off = Self::helper_stack_arg_offset(i);
+            self.masm.mov_store_base_disp32(Reg64::Rsp, off, src);
+        }
+    }
+
     // ── ABI-aware JIT-entry call primitives ─────────────────────────────────
 
     #[cfg(all(target_arch = "x86_64", unix))]
@@ -12724,22 +12786,33 @@ impl<'a> BaselineCompiler<'a> {
     ) {
         #[cfg(all(target_arch = "x86_64", unix))]
         {
-            // ── Set up SysV AMD64 arguments ─────────────────────────────
-            //   RDI = opcode (u32)
-            //   RSI = register-file base pointer (R14)
-            //   RDX = accumulator value (R12)
-            //   RCX = operand1
-            //   R8  = operand2
-            self.masm.mov_ri(Reg64::Rdi, opcode as u8 as i64);
-            self.masm.mov_rr(Reg64::Rsi, Reg64::R14);
-            self.masm.mov_rr(Reg64::Rdx, Reg64::R12);
-            self.masm.mov_ri(Reg64::Rcx, operand1);
-            self.masm.mov_ri(Reg64::R8, operand2);
+            // ── Set up helper-call arguments via the ABI abstraction ────
+            //
+            //   arg 0 = opcode (u32)
+            //   arg 1 = register-file base pointer (R14)
+            //   arg 2 = accumulator value (R12)
+            //   arg 3 = operand1
+            //   arg 4 = operand2
+            //
+            // SysV passes all 5 in registers (RDI/RSI/RDX/RCX/R8); Win64
+            // only has 4 helper-arg registers (RCX/RDX/R8/R9), so arg 4
+            // becomes a stack argument at `[RSP + shadow_space]`.  The
+            // ABI-aware reservation rounds the shadow + stack-arg slot
+            // up to 16 bytes so the call site stays 16-byte aligned.
+            const TOTAL_ARGS: usize = 5;
+            let adj = self.emit_helper_call_pre_adjust_for(TOTAL_ARGS);
+
+            self.emit_helper_arg_imm(0, opcode as u8 as i64);
+            self.emit_helper_arg_reg(1, Reg64::R14);
+            self.emit_helper_arg_reg(2, Reg64::R12);
+            self.emit_helper_arg_imm(3, operand1);
+            self.emit_helper_arg_imm(4, operand2);
 
             // Load trampoline address into R11 and call.
             let trampoline_addr = jit_runtime::jit_runtime_trampoline as *const () as usize as i64;
             self.masm.mov_ri(Reg64::R11, trampoline_addr);
             self.masm.call_reg(Reg64::R11);
+            self.emit_helper_call_post_adjust(adj);
 
             // ── Check for deopt ─────────────────────────────────────────
             self.masm.mov_ri(Reg64::R11, JIT_DEOPT);

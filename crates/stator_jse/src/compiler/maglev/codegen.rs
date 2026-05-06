@@ -2590,12 +2590,18 @@ impl<'a> MaglevCodegen<'a> {
             // Creates the object and fills all properties in a single stub
             // call, eliminating N separate TLS lookups and function calls.
             //
-            // Calling convention:
-            //   RDI = feedback_slot
-            //   RSI = names_packed (up to 3 name indices as u16 + count)
-            //   RDX = val0
-            //   RCX = val1 (or 0)
-            //   R8  = val2 (or 0)
+            // Helper signature (ABI-aware layout):
+            //   arg 0   = feedback_slot
+            //   arg 1   = names_packed (up to 5 name indices as 12-bit
+            //             fields + 4-bit count)
+            //   arg 2-6 = val0..val4 (zero-filled when fewer values)
+            //   arg 7   = rt_ptrs_cell (only when `needs_r15`; the other
+            //             stub variant has 7 args total)
+            //
+            // SysV passes args 0-5 in registers and args 6-7 on the
+            // stack; Win64 passes args 0-3 in registers and args 4-7 on
+            // the stack above the 32-byte shadow space.  The matching
+            // pre-call reservation sizes itself accordingly.
             #[cfg(all(target_arch = "x86_64", unix))]
             ValueNode::CreateObjectLiteralWithProperties {
                 feedback_slot,
@@ -2605,29 +2611,20 @@ impl<'a> MaglevCodegen<'a> {
             } => {
                 let saved = self.emit_save_live_regs(id);
 
-                // Load value arguments into registers FIRST (before
-                // clobbering any allocatable registers with immediates).
-                // Values go into RDX, RCX, R8, R9 (first 4 in registers).
-                let val_regs = [Reg64::Rdx, Reg64::Rcx, Reg64::R8, Reg64::R9];
-                let reg_count = values.len().min(4);
-                for (i, &v) in values.iter().take(reg_count).enumerate() {
-                    self.emit_load(v, val_regs[i]);
-                }
-                // Zero-fill unused register value slots.
-                for reg in &val_regs[reg_count..4] {
-                    self.masm.mov_ri(*reg, 0);
-                }
+                let total_args = if self.needs_r15 { 8 } else { 7 };
+                let adj = self.emit_helper_call_pre_adjust_for(total_args);
 
-                // 7th arg (5th value) goes on the stack.  Always allocate
-                // 16 bytes to maintain 16-byte alignment after the pushes
-                // from emit_save_live_regs.
-                self.masm.sub_ri(Reg64::Rsp, 16);
-                if values.len() > 4 {
-                    self.emit_load(values[4], Reg64::R11);
-                    self.masm.mov_store_base_disp32(Reg64::Rsp, 0, Reg64::R11);
-                } else {
-                    self.masm.mov_ri(Reg64::R11, 0);
-                    self.masm.mov_store_base_disp32(Reg64::Rsp, 0, Reg64::R11);
+                // Place value arguments first (arg indices 2..=6).
+                // Loads from the register file go into the assigned arg
+                // register (or scratch + stack store) and never clobber
+                // R14, so order with the immediate args below is free.
+                for i in 0..5 {
+                    let arg_idx = 2 + i;
+                    if i < values.len() {
+                        self.emit_helper_arg_node(arg_idx, values[i]);
+                    } else {
+                        self.emit_helper_arg_imm(arg_idx, 0);
+                    }
                 }
 
                 // Pack name indices using 12-bit encoding:
@@ -2647,26 +2644,23 @@ impl<'a> MaglevCodegen<'a> {
                 } else {
                     i64::from(*feedback_slot)
                 };
-                self.masm.mov_ri(Reg64::Rdi, slot_i64);
-                self.masm.mov_ri(Reg64::Rsi, packed as i64);
+                self.emit_helper_arg_imm(0, slot_i64);
+                self.emit_helper_arg_imm(1, packed as i64);
 
                 // When R15 caches the RT_PTRS cell address, pass it as
-                // the 8th argument (stack slot +8) so the runtime stub
-                // can skip the TLS lookup entirely.
-                if self.needs_r15 {
-                    self.masm.mov_store_base_disp32(Reg64::Rsp, 8, Reg64::R15);
-                    let addr = jit_runtime::jit_runtime_create_object_with_props_r15 as *const ()
-                        as usize as i64;
-                    self.masm.mov_ri(Reg64::R11, addr);
+                // the 8th argument so the runtime stub can skip the TLS
+                // lookup entirely.  Otherwise fall through to the 7-arg
+                // variant, which has no rt_ptrs_cell parameter.
+                let addr = if self.needs_r15 {
+                    self.emit_helper_arg_reg(7, Reg64::R15);
+                    jit_runtime::jit_runtime_create_object_with_props_r15 as *const () as usize
+                        as i64
                 } else {
-                    self.masm.mov_ri(Reg64::R11, 0);
-                    self.masm.mov_store_base_disp32(Reg64::Rsp, 8, Reg64::R11);
-                    let addr = jit_runtime::jit_runtime_create_object_with_props as *const ()
-                        as usize as i64;
-                    self.masm.mov_ri(Reg64::R11, addr);
-                }
+                    jit_runtime::jit_runtime_create_object_with_props as *const () as usize as i64
+                };
+                self.masm.mov_ri(Reg64::R11, addr);
                 self.masm.call_reg(Reg64::R11);
-                self.masm.add_ri(Reg64::Rsp, 16);
+                self.emit_helper_call_post_adjust(adj);
                 self.emit_restore_live_regs(saved);
                 self.emit_deopt_check_rax();
                 self.emit_store(id, Reg64::Rax);
@@ -4250,6 +4244,86 @@ impl<'a> MaglevCodegen<'a> {
     fn emit_helper_call_post_adjust(&mut self, bytes: i32) {
         if bytes != 0 {
             self.masm.add_ri(Reg64::Rsp, bytes);
+        }
+    }
+
+    /// Reserve the shadow space *and* the space needed for stack-passed
+    /// arguments of a helper `CALL` taking `total_args` integer/pointer
+    /// arguments.  Returns the number of bytes reserved.
+    ///
+    /// The total reservation is rounded up to 16 bytes so that — given
+    /// `RSP` is 16-byte aligned at the point of reservation — the
+    /// alignment contract still holds at the `CALL`.  Pair with
+    /// [`Self::emit_helper_call_post_adjust`] using the returned value.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[inline]
+    fn emit_helper_call_pre_adjust_for(&mut self, total_args: usize) -> i32 {
+        let adj = crate::compiler::abi_x64::NATIVE_ABI.helper_call_pre_stack_adjust_for(total_args);
+        if adj != 0 {
+            self.masm.sub_ri(Reg64::Rsp, adj);
+        }
+        adj
+    }
+
+    /// Stack offset (from `RSP`, after [`Self::emit_helper_call_pre_adjust_for`]
+    /// has reserved its frame) at which stack-passed helper argument `i`
+    /// must be written.  `i` must be ≥ the ABI's helper register count.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[inline]
+    const fn helper_stack_arg_offset(i: usize) -> i32 {
+        crate::compiler::abi_x64::NATIVE_ABI.helper_stack_arg_offset(i)
+    }
+
+    /// Place the immediate `imm` into the `i`-th helper-call argument
+    /// slot — a register when one is defined for this index by the
+    /// host ABI, otherwise the corresponding stack slot (using `R11`
+    /// as a scratch).  The caller must have already reserved the
+    /// outgoing-args region via [`Self::emit_helper_call_pre_adjust_for`].
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[inline]
+    fn emit_helper_arg_imm(&mut self, i: usize, imm: i64) {
+        if let Some(reg) = crate::compiler::abi_x64::NATIVE_ABI.helper_arg_register(i) {
+            self.masm.mov_ri(reg, imm);
+        } else {
+            let off = Self::helper_stack_arg_offset(i);
+            self.masm.mov_ri(Reg64::R11, imm);
+            self.masm.mov_store_base_disp32(Reg64::Rsp, off, Reg64::R11);
+        }
+    }
+
+    /// Move `src` into the `i`-th helper-call argument slot — a
+    /// register when one is defined for this index by the host ABI,
+    /// otherwise the corresponding stack slot.  The caller must have
+    /// already reserved the outgoing-args region via
+    /// [`Self::emit_helper_call_pre_adjust_for`].
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[inline]
+    fn emit_helper_arg_reg(&mut self, i: usize, src: Reg64) {
+        if let Some(reg) = crate::compiler::abi_x64::NATIVE_ABI.helper_arg_register(i) {
+            if reg != src {
+                self.masm.mov_rr(reg, src);
+            }
+        } else {
+            let off = Self::helper_stack_arg_offset(i);
+            self.masm.mov_store_base_disp32(Reg64::Rsp, off, src);
+        }
+    }
+
+    /// Load register-file slot `node` into the `i`-th helper-call
+    /// argument slot.  When a register is available for this index
+    /// the load goes there directly; otherwise the value is loaded
+    /// into `R11` and spilled to the corresponding stack slot.  The
+    /// caller must have already reserved the outgoing-args region via
+    /// [`Self::emit_helper_call_pre_adjust_for`].
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[inline]
+    fn emit_helper_arg_node(&mut self, i: usize, node: NodeId) {
+        if let Some(reg) = crate::compiler::abi_x64::NATIVE_ABI.helper_arg_register(i) {
+            self.emit_load(node, reg);
+        } else {
+            let off = Self::helper_stack_arg_offset(i);
+            self.emit_load(node, Reg64::R11);
+            self.masm.mov_store_base_disp32(Reg64::Rsp, off, Reg64::R11);
         }
     }
 
@@ -7371,30 +7445,29 @@ impl<'a> MaglevCodegen<'a> {
     /// We pass R14 (register-file base) as `regs` and R12 (accumulator) as
     /// `acc`, though most creation ops only use `operand1`/`operand2` and TLS.
     ///
-    /// **Win64 TODO (blocker):** the 5th argument (`operand2`) does not fit
-    /// in a Win64 helper-argument register and must be written to the
-    /// caller-allocated stack slot at `[RSP + shadow_space_bytes]` instead
-    /// of `R8`.  This wrapper is currently `cfg(unix)`-gated, so SysV is
-    /// the only ABI exercised at runtime; when the cfg gate is dropped this
-    /// site needs the stack-arg layout implemented before it can be called
-    /// on Windows.
+    /// Argument layout is ABI-aware: SysV passes all 5 in registers
+    /// (`RDI/RSI/RDX/RCX/R8`); Win64 has only 4 helper-arg registers
+    /// (`RCX/RDX/R8/R9`) so `operand2` becomes a stack argument at
+    /// `[RSP + shadow_space]` and the pre-call reservation is widened
+    /// to cover both shadow space and that slot while keeping `RSP`
+    /// 16-byte aligned.
     #[cfg(all(target_arch = "x86_64", unix))]
     fn emit_trampoline_call(&mut self, id: NodeId, opcode: u8, operand1: i64, operand2: i64) {
         let saved = self.emit_save_live_regs(id);
+        const TOTAL_ARGS: usize = 5;
+        let adj = self.emit_helper_call_pre_adjust_for(TOTAL_ARGS);
         // arg 0: opcode
-        self.masm.mov_ri(Self::helper_arg_reg(0), i64::from(opcode));
+        self.emit_helper_arg_imm(0, i64::from(opcode));
         // arg 1: register-file base (R14)
-        self.masm.mov_rr(Self::helper_arg_reg(1), Reg64::R14);
+        self.emit_helper_arg_reg(1, Reg64::R14);
         // arg 2: accumulator (R12)
-        self.masm.mov_rr(Self::helper_arg_reg(2), Reg64::R12);
+        self.emit_helper_arg_reg(2, Reg64::R12);
         // arg 3: operand1
-        self.masm.mov_ri(Self::helper_arg_reg(3), operand1);
-        // arg 4: operand2 — fits in a register under SysV (R8) but is a
-        // stack argument under Win64 (see TODO above).
-        self.masm.mov_ri(Self::helper_arg_reg(4), operand2);
+        self.emit_helper_arg_imm(3, operand1);
+        // arg 4: operand2 — register on SysV (R8), stack on Win64.
+        self.emit_helper_arg_imm(4, operand2);
         let addr = jit_runtime::jit_runtime_trampoline as *const () as usize;
         self.masm.mov_ri(Reg64::R11, addr as i64);
-        let adj = self.emit_helper_call_pre_adjust();
         self.masm.call_reg(Reg64::R11);
         self.emit_helper_call_post_adjust(adj);
         self.emit_restore_live_regs(saved);
