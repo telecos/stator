@@ -164,7 +164,11 @@ fn next_promise_id() -> usize {
     })
 }
 
-fn enqueue_rejection_event(kind: PromiseRejectionEventKind, promise_id: usize, reason: &JsValue) {
+fn enqueue_rejection_event(
+    kind: PromiseRejectionEventKind,
+    promise_id: usize,
+    reason: &JsValue,
+) {
     ACTIVE_REJECTION_EVENTS.with(|cell| {
         cell.borrow_mut().push_back(PromiseRejectionEvent {
             kind,
