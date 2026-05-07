@@ -54,10 +54,14 @@ pub struct StatorIsolate {
     /// cleared via [`stator_context_destroy`].  Non-owning; the context is
     /// owned by the embedder and must outlive the isolate or be destroyed first.
     current_context: *mut StatorContext,
-    /// Pending exception stored by [`stator_isolate_throw_exception`].
-    /// Non-owning; the value is owned by the embedder.  `None` means no
-    /// pending exception is set.
+    /// Pending exception stored by [`stator_isolate_throw_exception`] or by
+    /// FFI script execution when an interpreter error crosses the boundary.
+    /// Embedder-thrown values remain embedder-owned; internally-created script
+    /// error values are tracked by `pending_exception_owned`.
     pending_exception: Option<*mut StatorValue>,
+    /// Whether `pending_exception` is owned by the FFI layer and should be
+    /// destroyed when a try-catch scope clears it.
+    pending_exception_owned: bool,
     /// The innermost active [`StatorHandleScope`] on this isolate, or null if
     /// no scope is currently open.  This forms a linked list via each scope's
     /// `previous` field.
@@ -94,6 +98,7 @@ pub extern "C" fn stator_isolate_create() -> *mut StatorIsolate {
         enter_count: 0,
         current_context: std::ptr::null_mut(),
         pending_exception: None,
+        pending_exception_owned: false,
         active_handle_scope: std::ptr::null_mut(),
         jit_disabled: false,
         terminating: false,
@@ -297,16 +302,8 @@ pub unsafe extern "C" fn stator_isolate_throw_exception(
     isolate: *mut StatorIsolate,
     exception: *mut StatorValue,
 ) {
-    if !isolate.is_null() {
-        // SAFETY: caller guarantees `isolate` is valid.
-        unsafe {
-            (*isolate).pending_exception = if exception.is_null() {
-                None
-            } else {
-                Some(exception)
-            }
-        };
-    }
+    // SAFETY: caller guarantees `isolate` and `exception` validity.
+    unsafe { set_pending_exception(isolate, exception, false) };
 }
 
 /// Return the context most recently made current on `isolate`.
@@ -362,10 +359,13 @@ pub unsafe extern "C" fn stator_isolate_clear_pending_exception(
     }
     // SAFETY: caller guarantees `isolate` is valid.
     unsafe {
-        (*isolate)
+        let isolate_ref = &mut *isolate;
+        let exception = isolate_ref
             .pending_exception
             .take()
-            .unwrap_or(std::ptr::null_mut())
+            .unwrap_or(std::ptr::null_mut());
+        isolate_ref.pending_exception_owned = false;
+        exception
     }
 }
 
@@ -2559,6 +2559,48 @@ type StatorNativeCallback = unsafe extern "C" fn(
     argc: i32,
 ) -> *mut StatorValue;
 
+unsafe fn set_pending_exception(
+    isolate: *mut StatorIsolate,
+    exception: *mut StatorValue,
+    owns_exception: bool,
+) {
+    if isolate.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    let isolate_ref = unsafe { &mut *isolate };
+    if isolate_ref.pending_exception_owned
+        && let Some(previous) = isolate_ref.pending_exception.take()
+    {
+        // SAFETY: owned pending exceptions are allocated by this FFI layer.
+        unsafe { stator_value_destroy(previous) };
+    }
+    isolate_ref.pending_exception = if exception.is_null() {
+        None
+    } else {
+        Some(exception)
+    };
+    isolate_ref.pending_exception_owned = owns_exception && !exception.is_null();
+}
+
+unsafe fn record_script_error(ctx: *mut StatorContext, error: &stator_jse::error::StatorError) {
+    if ctx.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `ctx` is valid.
+    let isolate = unsafe { (*ctx)._isolate };
+    if isolate.is_null() {
+        return;
+    }
+    let message = error.to_string();
+    // SAFETY: `isolate` is valid and `message` is copied by the callee.
+    let exception = unsafe {
+        stator_value_new_string(isolate, message.as_ptr() as *const c_char, message.len())
+    };
+    // SAFETY: `exception` was allocated for ownership by the pending exception.
+    unsafe { set_pending_exception(isolate, exception, true) };
+}
+
 unsafe fn context_is_execution_terminating(ctx: *mut StatorContext) -> bool {
     if ctx.is_null() {
         return false;
@@ -2702,7 +2744,11 @@ pub unsafe extern "C" fn stator_script_run(
             }
             Box::into_raw(Box::new(StatorValue { inner, isolate }))
         }
-        Err(_) => std::ptr::null_mut(),
+        Err(error) => {
+            // SAFETY: `ctx` is valid for the duration of script execution.
+            unsafe { record_script_error(ctx, &error) };
+            std::ptr::null_mut()
+        }
     }
 }
 
@@ -2723,7 +2769,12 @@ pub unsafe extern "C" fn stator_script_run_no_result(
 ) -> bool {
     match unsafe { run_script_no_result_inner(script, ctx) } {
         Some(Ok(_)) => true,
-        Some(Err(_)) | None => false,
+        Some(Err(error)) => {
+            // SAFETY: `ctx` is valid for the duration of script execution.
+            unsafe { record_script_error(ctx, &error) };
+            false
+        }
+        None => false,
     }
 }
 
@@ -3986,6 +4037,7 @@ pub struct StatorTryCatch {
     /// The exception value captured when the scope is checked, or null if no
     /// exception was caught.
     exception: *mut StatorValue,
+    owns_exception: bool,
     /// Whether an exception has been caught by this scope.
     has_caught: bool,
 }
@@ -4008,6 +4060,7 @@ pub unsafe extern "C" fn stator_try_catch_new(isolate: *mut StatorIsolate) -> *m
     Box::into_raw(Box::new(StatorTryCatch {
         isolate,
         exception: std::ptr::null_mut(),
+        owns_exception: false,
         has_caught: false,
     }))
 }
@@ -4035,6 +4088,8 @@ pub unsafe extern "C" fn stator_try_catch_has_caught(tc: *mut StatorTryCatch) ->
         let pending = unsafe { (*tc_ref.isolate).pending_exception.take() };
         if let Some(exc) = pending {
             tc_ref.exception = exc;
+            tc_ref.owns_exception = unsafe { (*tc_ref.isolate).pending_exception_owned };
+            unsafe { (*tc_ref.isolate).pending_exception_owned = false };
             tc_ref.has_caught = true;
         }
     }
@@ -4070,7 +4125,11 @@ pub unsafe extern "C" fn stator_try_catch_reset(tc: *mut StatorTryCatch) {
     if !tc.is_null() {
         // SAFETY: caller guarantees `tc` is valid.
         unsafe {
+            if (*tc).owns_exception && !(*tc).exception.is_null() {
+                stator_value_destroy((*tc).exception);
+            }
             (*tc).exception = std::ptr::null_mut();
+            (*tc).owns_exception = false;
             (*tc).has_caught = false;
         }
     }
@@ -4078,10 +4137,9 @@ pub unsafe extern "C" fn stator_try_catch_reset(tc: *mut StatorTryCatch) {
 
 /// Destroy a try-catch scope previously created with [`stator_try_catch_new`].
 ///
-/// If the scope holds a caught exception that has not been cleared via
-/// [`stator_try_catch_reset`], the exception value is **not** destroyed (the
-/// caller retains ownership of exception values passed to
-/// [`stator_isolate_throw_exception`]).
+/// If the scope holds a caught exception created internally by script
+/// execution, it is destroyed with the scope.  Embedder-owned exception values
+/// passed to [`stator_isolate_throw_exception`] are not destroyed.
 ///
 /// Does nothing if `tc` is null.
 ///
@@ -4091,6 +4149,8 @@ pub unsafe extern "C" fn stator_try_catch_reset(tc: *mut StatorTryCatch) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_try_catch_destroy(tc: *mut StatorTryCatch) {
     if !tc.is_null() {
+        // SAFETY: `tc` is valid and may own its current exception.
+        unsafe { stator_try_catch_reset(tc) };
         // SAFETY: pointer was created by `Box::into_raw`.
         drop(unsafe { Box::from_raw(tc) });
     }
@@ -8985,6 +9045,42 @@ mod tests {
         unsafe {
             stator_try_catch_destroy(tc);
             stator_value_destroy(exc);
+        }
+    }
+
+    #[test]
+    fn test_try_catch_catches_script_run_error_message() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        assert!(!ctx.is_null());
+        // SAFETY: `iso` is valid.
+        let tc = unsafe { stator_try_catch_new(iso.as_ptr()) };
+        assert!(!tc.is_null());
+        let src = b"var edgeStatorNonFunction = 1; edgeStatorNonFunction();";
+        // SAFETY: `ctx` is valid; `src` is valid UTF-8.
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        assert!(!script.is_null());
+
+        // SAFETY: all pointers are valid and live.
+        unsafe {
+            assert!(stator_script_run(script, ctx).is_null());
+            assert!(stator_try_catch_has_caught(tc));
+            let exception = stator_try_catch_exception(tc);
+            assert!(!exception.is_null());
+            let len = stator_value_to_string_utf8(exception, std::ptr::null_mut(), 0);
+            assert!(len > 0);
+            let mut buffer = vec![0 as c_char; len as usize + 1];
+            stator_value_to_string_utf8(exception, buffer.as_mut_ptr(), buffer.len());
+            let message = CStr::from_ptr(buffer.as_ptr()).to_string_lossy();
+            assert!(
+                message.contains("TypeError") && message.contains("callee is not a function"),
+                "unexpected message: {message}"
+            );
+            stator_try_catch_destroy(tc);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
         }
     }
 

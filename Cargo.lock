@@ -1700,7 +1700,7 @@ dependencies = [
 
 [[package]]
 name = "stator_jse_ffi"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "cbindgen",
  "log",

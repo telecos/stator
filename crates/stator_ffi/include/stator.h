@@ -2068,10 +2068,9 @@ void stator_try_catch_reset(struct StatorTryCatch *tc);
 /**
  * Destroy a try-catch scope previously created with [`stator_try_catch_new`].
  *
- * If the scope holds a caught exception that has not been cleared via
- * [`stator_try_catch_reset`], the exception value is **not** destroyed (the
- * caller retains ownership of exception values passed to
- * [`stator_isolate_throw_exception`]).
+ * If the scope holds a caught exception created internally by script
+ * execution, it is destroyed with the scope.  Embedder-owned exception values
+ * passed to [`stator_isolate_throw_exception`] are not destroyed.
  *
  * Does nothing if `tc` is null.
  *
