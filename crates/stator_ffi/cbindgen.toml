@@ -37,6 +37,8 @@ include = [
     "StatorCompilationStats",
     "StatorTieringStats",
     "StatorScriptTierStatus",
+    "StatorPromiseRejectionEventKind",
+    "StatorPromiseRejectionEventCallback",
     "stator_isolate_create",
     "stator_isolate_destroy",
     "stator_isolate_gc",
@@ -90,4 +92,6 @@ include = [
     "stator_isolate_has_pending_exception",
     "stator_isolate_clear_pending_exception",
     "stator_drain_active_microtask_queue",
+    "stator_drain_active_promise_rejection_events",
+    "stator_discard_active_promise_rejection_events",
 ]

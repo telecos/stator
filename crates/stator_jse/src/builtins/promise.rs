@@ -60,6 +60,9 @@ thread_local! {
     /// The active microtask queue for the current thread, set by
     /// [`install_active_microtask_queue`] during globals installation.
     static ACTIVE_MTQ: RefCell<Option<MicrotaskQueue>> = const { RefCell::new(None) };
+    static NEXT_PROMISE_ID: Cell<usize> = const { Cell::new(1) };
+    static ACTIVE_REJECTION_EVENTS: RefCell<VecDeque<PromiseRejectionEvent>> =
+        const { RefCell::new(VecDeque::new()) };
 }
 
 /// Install a [`MicrotaskQueue`] as the thread-local active queue.
@@ -116,6 +119,73 @@ pub fn enqueue_active_microtask(task: Box<dyn FnOnce()>) -> bool {
 /// Call this when tearing down globals to avoid stale references.
 pub fn clear_active_microtask_queue() {
     ACTIVE_MTQ.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// Host-visible Promise rejection event kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromiseRejectionEventKind {
+    /// A Promise was rejected with no rejection handler attached.
+    RejectedWithNoHandler,
+    /// A rejection handler was attached after the host observed an unhandled rejection.
+    HandlerAddedAfterReject,
+}
+
+/// Host-visible Promise rejection event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromiseRejectionEvent {
+    /// Event kind.
+    pub kind: PromiseRejectionEventKind,
+    /// Stable process-local Promise identifier for correlating reject/handled events.
+    pub promise_id: usize,
+    /// Console-safe string form of the rejection reason.
+    pub reason: String,
+}
+
+/// Drain and return pending host-visible Promise rejection events.
+pub fn drain_active_promise_rejection_events() -> Vec<PromiseRejectionEvent> {
+    ACTIVE_REJECTION_EVENTS.with(|cell| cell.borrow_mut().drain(..).collect())
+}
+
+/// Return the number of pending host-visible Promise rejection events.
+pub fn active_promise_rejection_event_count() -> usize {
+    ACTIVE_REJECTION_EVENTS.with(|cell| cell.borrow().len())
+}
+
+/// Clear pending host-visible Promise rejection events.
+pub fn clear_active_promise_rejection_events() {
+    ACTIVE_REJECTION_EVENTS.with(|cell| cell.borrow_mut().clear());
+}
+
+fn next_promise_id() -> usize {
+    NEXT_PROMISE_ID.with(|cell| {
+        let id = cell.get();
+        cell.set(id.saturating_add(1).max(1));
+        id
+    })
+}
+
+fn enqueue_rejection_event(kind: PromiseRejectionEventKind, promise_id: usize, reason: &JsValue) {
+    ACTIVE_REJECTION_EVENTS.with(|cell| {
+        cell.borrow_mut().push_back(PromiseRejectionEvent {
+            kind,
+            promise_id,
+            reason: reason.to_display_string(),
+        });
+    });
+}
+
+fn cancel_queued_rejected_with_no_handler(promise_id: usize) -> bool {
+    ACTIVE_REJECTION_EVENTS.with(|cell| {
+        let mut events = cell.borrow_mut();
+        if let Some(index) = events.iter().position(|event| {
+            event.promise_id == promise_id
+                && event.kind == PromiseRejectionEventKind::RejectedWithNoHandler
+        }) {
+            events.remove(index);
+            return true;
+        }
+        false
+    })
 }
 
 // ── MicrotaskQueue ─────────────────────────────────────────────────────────────
@@ -207,10 +277,13 @@ enum PromiseStateInner {
 }
 
 struct PromiseInner {
+    promise_id: usize,
     state: PromiseStateInner,
     /// Whether at least one rejection handler has been attached.
     /// Used by [`UnhandledRejectionTracker`] to detect unhandled rejections.
     is_handled: bool,
+    /// Whether a rejected-with-no-handler event has been made visible to the host.
+    reported_unhandled: bool,
     /// Optional explicit prototype used for subclassed promises.
     prototype: Option<JsValue>,
 }
@@ -273,11 +346,13 @@ impl PartialEq for JsPromise {
 impl JsPromise {
     fn new_pending() -> Self {
         Self(Rc::new(RefCell::new(PromiseInner {
+            promise_id: next_promise_id(),
             state: PromiseStateInner::Pending {
                 fulfill_reactions: Vec::new(),
                 reject_reactions: Vec::new(),
             },
             is_handled: false,
+            reported_unhandled: false,
             prototype: None,
         })))
     }
@@ -309,6 +384,11 @@ impl JsPromise {
     /// Returns `true` if at least one rejection handler has been attached.
     pub fn is_handled(&self) -> bool {
         self.0.borrow().is_handled
+    }
+
+    /// Returns the process-local host rejection identifier for this Promise.
+    pub fn promise_id(&self) -> usize {
+        self.0.borrow().promise_id
     }
 
     pub(crate) fn prototype(&self) -> Option<JsValue> {
@@ -442,22 +522,35 @@ impl JsPromise {
     /// all pending rejection reactions as microtasks on `queue`.
     /// A no-op if the promise is already settled.
     fn reject(&self, reason: JsValue, queue: &MicrotaskQueue) {
-        let reactions = {
+        let (promise_id, should_report_unhandled, reactions) = {
             let mut inner = self.0.borrow_mut();
             if !matches!(inner.state, PromiseStateInner::Pending { .. }) {
                 return;
+            }
+            let promise_id = inner.promise_id;
+            let should_report_unhandled = !inner.is_handled;
+            if should_report_unhandled {
+                inner.reported_unhandled = true;
             }
             let old = std::mem::replace(
                 &mut inner.state,
                 PromiseStateInner::Rejected(reason.clone()),
             );
-            match old {
+            let reactions = match old {
                 PromiseStateInner::Pending {
                     reject_reactions, ..
                 } => reject_reactions,
                 _ => unreachable!(),
-            }
+            };
+            (promise_id, should_report_unhandled, reactions)
         };
+        if should_report_unhandled {
+            enqueue_rejection_event(
+                PromiseRejectionEventKind::RejectedWithNoHandler,
+                promise_id,
+                &reason,
+            );
+        }
         for reaction in reactions {
             let r = reason.clone();
             queue.enqueue(Box::new(move || reaction(r)));
@@ -479,22 +572,49 @@ impl JsPromise {
             Fulfilled(JsValue),
             Rejected(JsValue),
         }
+        let mut handler_added_after_reject = None;
         let settled = {
             let mut inner = self.0.borrow_mut();
             inner.is_handled = true;
-            match &mut inner.state {
-                PromiseStateInner::Pending {
-                    fulfill_reactions,
-                    reject_reactions,
-                } => {
-                    fulfill_reactions.push(fulfill);
-                    reject_reactions.push(reject);
-                    return;
-                }
-                PromiseStateInner::Fulfilled(v) => Settled::Fulfilled(v.clone()),
-                PromiseStateInner::Rejected(r) => Settled::Rejected(r.clone()),
+            if let PromiseStateInner::Pending {
+                fulfill_reactions,
+                reject_reactions,
+            } = &mut inner.state
+            {
+                fulfill_reactions.push(fulfill);
+                reject_reactions.push(reject);
+                return;
             }
+
+            let promise_id = inner.promise_id;
+            let reported_unhandled = inner.reported_unhandled;
+            let settled = match &inner.state {
+                PromiseStateInner::Pending {
+                    fulfill_reactions: _,
+                    reject_reactions: _,
+                } => unreachable!(),
+                PromiseStateInner::Fulfilled(v) => Settled::Fulfilled(v.clone()),
+                PromiseStateInner::Rejected(r) => {
+                    if reported_unhandled {
+                        handler_added_after_reject = Some((promise_id, r.clone()));
+                    }
+                    Settled::Rejected(r.clone())
+                }
+            };
+            if reported_unhandled {
+                inner.reported_unhandled = false;
+            }
+            settled
         };
+        if let Some((promise_id, reason)) = handler_added_after_reject
+            && !cancel_queued_rejected_with_no_handler(promise_id)
+        {
+            enqueue_rejection_event(
+                PromiseRejectionEventKind::HandlerAddedAfterReject,
+                promise_id,
+                &reason,
+            );
+        }
         match settled {
             Settled::Fulfilled(v) => queue.enqueue(Box::new(move || fulfill(v))),
             Settled::Rejected(r) => queue.enqueue(Box::new(move || reject(r))),
@@ -1351,10 +1471,59 @@ mod tests {
 
     #[test]
     fn test_promise_reject_static() {
+        clear_active_promise_rejection_events();
         let queue = MicrotaskQueue::new();
         let p = promise_reject(JsValue::Smi(0), &queue);
         assert!(p.is_rejected());
         assert_eq!(p.reason(), Some(JsValue::Smi(0)));
+    }
+
+    #[test]
+    fn test_active_rejection_events_report_unhandled_rejection() {
+        clear_active_promise_rejection_events();
+        let queue = MicrotaskQueue::new();
+        let p = promise_reject(JsValue::String("edge-reject".into()), &queue);
+
+        let events = drain_active_promise_rejection_events();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].kind,
+            PromiseRejectionEventKind::RejectedWithNoHandler
+        );
+        assert_eq!(events[0].promise_id, p.promise_id());
+        assert_eq!(events[0].reason, "edge-reject");
+    }
+
+    #[test]
+    fn test_active_rejection_events_cancel_when_handler_added_before_drain() {
+        clear_active_promise_rejection_events();
+        let queue = MicrotaskQueue::new();
+        let p = promise_reject(JsValue::String("handled".into()), &queue);
+
+        promise_catch(&p, Box::new(|_| Ok(JsValue::Undefined)), &queue);
+
+        assert!(drain_active_promise_rejection_events().is_empty());
+    }
+
+    #[test]
+    fn test_active_rejection_events_report_handler_after_host_observed() {
+        clear_active_promise_rejection_events();
+        let queue = MicrotaskQueue::new();
+        let p = promise_reject(JsValue::String("late".into()), &queue);
+        let rejected_events = drain_active_promise_rejection_events();
+        assert_eq!(rejected_events.len(), 1);
+
+        promise_catch(&p, Box::new(|_| Ok(JsValue::Undefined)), &queue);
+        let handled_events = drain_active_promise_rejection_events();
+
+        assert_eq!(handled_events.len(), 1);
+        assert_eq!(
+            handled_events[0].kind,
+            PromiseRejectionEventKind::HandlerAddedAfterReject
+        );
+        assert_eq!(handled_events[0].promise_id, p.promise_id());
+        assert_eq!(handled_events[0].reason, "late");
     }
 
     // ── promise_then chains ───────────────────────────────────────────────────

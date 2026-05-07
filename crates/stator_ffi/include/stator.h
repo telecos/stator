@@ -12,6 +12,20 @@
 #include <stdlib.h>
 
 /**
+ * Host-visible Promise rejection event kind.
+ */
+typedef enum StatorPromiseRejectionEventKind {
+  /**
+   * A Promise was rejected with no rejection handler attached.
+   */
+  StatorPromiseRejectionEventKindRejectedWithNoHandler = 0,
+  /**
+   * A rejection handler was attached after the host observed the rejection.
+   */
+  StatorPromiseRejectionEventKindHandlerAddedAfterReject = 1,
+} StatorPromiseRejectionEventKind;
+
+/**
  * An opaque handle to a CDP WebSocket server.
  *
  * Created with [`stator_cdp_server_create`] and freed with
@@ -487,6 +501,18 @@ typedef bool (*StatorDomIndexedSetterCb)(uint32_t index, const struct StatorValu
  * garbage-collected.
  */
 typedef void (*StatorDomWeakCb)(void *data);
+
+/**
+ * C-callable Promise rejection event callback signature.
+ *
+ * `reason_utf8` is valid only for the duration of the callback and is not
+ * null-terminated. Embedders must copy it if they need to retain the string.
+ */
+typedef void (*StatorPromiseRejectionEventCallback)(enum StatorPromiseRejectionEventKind kind,
+                                                    size_t promise_id,
+                                                    const char *reason_utf8,
+                                                    size_t reason_len,
+                                                    void *user_data);
 
 /**
  * C function pointer types for embedder callbacks.
@@ -2622,6 +2648,25 @@ void stator_dom_weak_ref_destroy(struct StatorDomWeakRef *weak);
  * the current thread.
  */
 size_t stator_drain_active_microtask_queue(void);
+
+/**
+ * Drain active host-visible Promise rejection events.
+ *
+ * Returns the number of drained events.
+ *
+ * # Safety
+ * `callback` must be safe to call for each pending event, and `user_data` must
+ * be valid for the callback's expectations.
+ */
+size_t stator_drain_active_promise_rejection_events(StatorPromiseRejectionEventCallback callback,
+                                                    void *user_data);
+
+/**
+ * Discard active host-visible Promise rejection events.
+ *
+ * Returns the number of discarded events.
+ */
+size_t stator_discard_active_promise_rejection_events(void);
 
 /**
  * Create a new event loop with default (no-op) callbacks.

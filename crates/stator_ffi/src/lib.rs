@@ -5411,7 +5411,10 @@ pub unsafe extern "C" fn stator_dom_weak_ref_destroy(weak: *mut StatorDomWeakRef
 
 // ── Event loop FFI ─────────────────────────────────────────────────────────────
 
-use stator_jse::builtins::promise::{MicrotaskQueue, drain_active_microtask_queue};
+use stator_jse::builtins::promise::{
+    MicrotaskQueue, PromiseRejectionEventKind, drain_active_microtask_queue,
+    drain_active_promise_rejection_events,
+};
 use stator_jse::event_loop::{DefaultCallbacks, EmbedderCallbacks, EventLoop, TimerHandle};
 
 /// Drain the active thread-local Promise microtask queue installed by Stator
@@ -5424,6 +5427,75 @@ use stator_jse::event_loop::{DefaultCallbacks, EmbedderCallbacks, EventLoop, Tim
 #[unsafe(no_mangle)]
 pub extern "C" fn stator_drain_active_microtask_queue() -> usize {
     drain_active_microtask_queue()
+}
+
+/// Host-visible Promise rejection event kind.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatorPromiseRejectionEventKind {
+    /// A Promise was rejected with no rejection handler attached.
+    StatorPromiseRejectionEventKindRejectedWithNoHandler = 0,
+    /// A rejection handler was attached after the host observed the rejection.
+    StatorPromiseRejectionEventKindHandlerAddedAfterReject = 1,
+}
+
+/// C-callable Promise rejection event callback signature.
+///
+/// `reason_utf8` is valid only for the duration of the callback and is not
+/// null-terminated. Embedders must copy it if they need to retain the string.
+pub type StatorPromiseRejectionEventCallback = unsafe extern "C" fn(
+    kind: StatorPromiseRejectionEventKind,
+    promise_id: usize,
+    reason_utf8: *const c_char,
+    reason_len: usize,
+    user_data: *mut c_void,
+);
+
+/// Drain active host-visible Promise rejection events.
+///
+/// Returns the number of drained events.
+///
+/// # Safety
+/// `callback` must be safe to call for each pending event, and `user_data` must
+/// be valid for the callback's expectations.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_drain_active_promise_rejection_events(
+    callback: StatorPromiseRejectionEventCallback,
+    user_data: *mut c_void,
+) -> usize {
+    let events = drain_active_promise_rejection_events();
+    let count = events.len();
+    for event in events {
+        let kind = match event.kind {
+            PromiseRejectionEventKind::RejectedWithNoHandler => {
+                StatorPromiseRejectionEventKind::StatorPromiseRejectionEventKindRejectedWithNoHandler
+            }
+            PromiseRejectionEventKind::HandlerAddedAfterReject => {
+                StatorPromiseRejectionEventKind::StatorPromiseRejectionEventKindHandlerAddedAfterReject
+            }
+        };
+        let reason = event.reason.as_bytes();
+        // SAFETY: `callback` was provided by the embedder, and `reason` points
+        // into `event` for the duration of this call.
+        unsafe {
+            callback(
+                kind,
+                event.promise_id,
+                reason.as_ptr() as *const c_char,
+                reason.len(),
+                user_data,
+            )
+        };
+    }
+    count
+}
+
+/// Discard active host-visible Promise rejection events.
+///
+/// Returns the number of discarded events.
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_discard_active_promise_rejection_events() -> usize {
+    drain_active_promise_rejection_events().len()
 }
 
 /// Opaque event loop handle.
@@ -8643,6 +8715,114 @@ mod tests {
             stator_script_free(script);
             stator_context_destroy(ctx);
         }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct SeenPromiseRejectionEvent {
+        kind: StatorPromiseRejectionEventKind,
+        promise_id: usize,
+        reason: String,
+    }
+
+    unsafe extern "C" fn collect_promise_rejection_event(
+        kind: StatorPromiseRejectionEventKind,
+        promise_id: usize,
+        reason_utf8: *const c_char,
+        reason_len: usize,
+        user_data: *mut c_void,
+    ) {
+        // SAFETY: the test passes a valid mutable Vec pointer as `user_data`.
+        let events = unsafe { &mut *(user_data as *mut Vec<SeenPromiseRejectionEvent>) };
+        let reason = if reason_utf8.is_null() || reason_len == 0 {
+            String::new()
+        } else {
+            // SAFETY: the callback contract guarantees the byte slice is valid
+            // for this call.
+            let bytes = unsafe { std::slice::from_raw_parts(reason_utf8 as *const u8, reason_len) };
+            String::from_utf8(bytes.to_vec()).expect("reason must be valid UTF-8")
+        };
+        events.push(SeenPromiseRejectionEvent {
+            kind,
+            promise_id,
+            reason,
+        });
+    }
+
+    fn drain_promise_rejection_events_for_test() -> Vec<SeenPromiseRejectionEvent> {
+        let mut events = Vec::new();
+        // SAFETY: the callback and `events` pointer are valid for this call.
+        unsafe {
+            stator_drain_active_promise_rejection_events(
+                collect_promise_rejection_event,
+                &mut events as *mut _ as *mut c_void,
+            );
+        }
+        events
+    }
+
+    fn run_script_for_promise_rejection_test(
+        ctx: *mut StatorContext,
+        source: &[u8],
+    ) -> *mut StatorValue {
+        // SAFETY: `ctx` is valid and `source` is a valid byte slice.
+        let script =
+            unsafe { stator_script_compile(ctx, source.as_ptr() as *const c_char, source.len()) };
+        assert!(!script.is_null());
+        // SAFETY: `script` is non-null.
+        assert!(unsafe { stator_script_get_error(script) }.is_null());
+        // SAFETY: `script` and `ctx` are valid.
+        let result = unsafe { stator_script_run(script, ctx) };
+        // SAFETY: `script` is non-null and no longer needed.
+        unsafe { stator_script_free(script) };
+        result
+    }
+
+    #[test]
+    fn test_drain_active_promise_rejection_events_reports_unhandled_and_handled() {
+        // Drain any thread-local events left by an earlier test running on the
+        // same worker thread.
+        stator_discard_active_promise_rejection_events();
+
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+
+        let rejected_result = run_script_for_promise_rejection_test(
+            ctx,
+            b"var edgeRejectedPromise = Promise.reject('edge-reject'); 'queued';",
+        );
+        assert!(!rejected_result.is_null());
+        // SAFETY: `rejected_result` is non-null and live.
+        unsafe { stator_value_destroy(rejected_result) };
+
+        let rejected_events = drain_promise_rejection_events_for_test();
+        assert_eq!(rejected_events.len(), 1);
+        assert_eq!(
+            rejected_events[0].kind,
+            StatorPromiseRejectionEventKind::StatorPromiseRejectionEventKindRejectedWithNoHandler
+        );
+        assert_ne!(rejected_events[0].promise_id, 0);
+        assert_eq!(rejected_events[0].reason, "edge-reject");
+
+        let handled_result = run_script_for_promise_rejection_test(
+            ctx,
+            b"edgeRejectedPromise.catch(function(reason) { return reason; }); 'handled';",
+        );
+        assert!(!handled_result.is_null());
+        // SAFETY: `handled_result` is non-null and live.
+        unsafe { stator_value_destroy(handled_result) };
+
+        let handled_events = drain_promise_rejection_events_for_test();
+        assert_eq!(handled_events.len(), 1);
+        assert_eq!(
+            handled_events[0].kind,
+            StatorPromiseRejectionEventKind::StatorPromiseRejectionEventKindHandlerAddedAfterReject
+        );
+        assert_eq!(handled_events[0].promise_id, rejected_events[0].promise_id);
+        assert_eq!(handled_events[0].reason, "edge-reject");
+
+        // SAFETY: `ctx` is non-null and live.
+        unsafe { stator_context_destroy(ctx) };
     }
 
     #[test]
