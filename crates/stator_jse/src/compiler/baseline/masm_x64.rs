@@ -738,6 +738,46 @@ impl MacroAssembler {
         }
     }
 
+    /// `SAR r64, imm8` — signed shift right (arithmetic) by `imm8` bits.
+    ///
+    /// Encoding: `REX.W C1 /7 imm8`.
+    pub fn sar_ri(&mut self, dst: Reg64, imm: u8) {
+        self.emit_rex_wrb(Reg64::Rax, dst);
+        self.buf.push(0xC1);
+        self.emit_modrm_digit(7, dst);
+        self.buf.push(imm & 0x3F);
+    }
+
+    /// `SAR r32, imm8` — 32-bit signed shift right by `imm8` bits.
+    ///
+    /// Encoding: `[REX] C1 /7 imm8`.
+    pub fn sar32_ri(&mut self, dst: Reg64, imm: u8) {
+        self.emit_rex_rb_if_needed(Reg64::Rax, dst);
+        self.buf.push(0xC1);
+        self.emit_modrm_digit(7, dst);
+        self.buf.push(imm & 0x1F);
+    }
+
+    /// `SHR r64, imm8` — unsigned (logical) shift right by `imm8` bits.
+    ///
+    /// Encoding: `REX.W C1 /5 imm8`.
+    pub fn shr_ri(&mut self, dst: Reg64, imm: u8) {
+        self.emit_rex_wrb(Reg64::Rax, dst);
+        self.buf.push(0xC1);
+        self.emit_modrm_digit(5, dst);
+        self.buf.push(imm & 0x3F);
+    }
+
+    /// `SHR r32, imm8` — 32-bit unsigned shift right by `imm8` bits.
+    ///
+    /// Encoding: `[REX] C1 /5 imm8`.
+    pub fn shr32_ri(&mut self, dst: Reg64, imm: u8) {
+        self.emit_rex_rb_if_needed(Reg64::Rax, dst);
+        self.buf.push(0xC1);
+        self.emit_modrm_digit(5, dst);
+        self.buf.push(imm & 0x1F);
+    }
+
     /// `MOVSXD dst, src` — sign-extend 32-bit register into 64-bit.
     ///
     /// Needed after 32-bit arithmetic to restore the 64-bit value for

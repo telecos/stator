@@ -2015,6 +2015,11 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_store(id, Reg64::R11);
             }
             ValueNode::Int32Modulus { left, right } => {
+                if let Some(d) = self.try_get_i32_constant(*right) {
+                    if self.try_emit_int32_mod_by_constant(id, *left, d) {
+                        return;
+                    }
+                }
                 self.emit_load(*left, Reg64::R11);
                 self.emit_load(*right, Reg64::R10);
                 self.emit_div_zero_check(0);
@@ -2038,6 +2043,11 @@ impl<'a> MaglevCodegen<'a> {
                 self.emit_store(id, Reg64::R11);
             }
             ValueNode::CheckedSmiModulus { left, right } => {
+                if let Some(d) = self.try_get_i32_constant(*right) {
+                    if self.try_emit_int32_mod_by_constant(id, *left, d) {
+                        return;
+                    }
+                }
                 self.emit_load(*left, Reg64::R11);
                 self.emit_load(*right, Reg64::R10);
                 self.emit_div_zero_check(0);
@@ -6031,6 +6041,17 @@ impl<'a> MaglevCodegen<'a> {
         all(target_arch = "x86_64", any(unix, windows))
     ))]
     fn emit_inline_generic_mod(&mut self, id: NodeId, left: NodeId, right: NodeId) {
+        // Constant-divisor fast path (smi-guarded dividend, compile-time
+        // i32 divisor).  Replaces the ~20-cycle IDIV with a 4–6 cycle
+        // multiply-by-magic sequence.  Critical for tight loops like
+        // `for (i…) total += (i % 5)`.
+        if self.smi_guarded.contains(&left) {
+            if let Some(d) = self.try_get_i32_constant(right) {
+                if self.try_emit_int32_mod_by_constant(id, left, d) {
+                    return;
+                }
+            }
+        }
         // When both inputs are smi_guarded, skip Smi checks but guard
         // against division by zero.
         if self.smi_guarded.contains(&left) && self.smi_guarded.contains(&right) {
@@ -6104,6 +6125,106 @@ impl<'a> MaglevCodegen<'a> {
 
         self.masm.bind_label(&mut done_label);
         self.emit_store(id, Reg64::Rax);
+    }
+
+    /// Try to emit a fast `n % d` sequence where `d` is a known compile-time
+    /// i32 constant.  Returns `true` when the fast path was emitted; the
+    /// caller should then skip the generic IDIV path.
+    ///
+    /// The fast path eliminates `IDIV` (≈20–26 cycles on modern x86-64) in
+    /// favour of either:
+    ///
+    /// - a single `XOR EAX, EAX` (when `|d| == 1`),
+    /// - a sign-corrected mask (when `|d|` is a power of two, ≈5 µops), or
+    /// - a magic-number multiply-and-shift (general non-power-of-two case,
+    ///   ≈8–10 µops).
+    ///
+    /// The dividend is read from `left`'s allocated location (assumed to be
+    /// a sign-extended Smi/i32 in the register file).  The result is stored
+    /// to `id`'s location, sign-extended to i64.
+    ///
+    /// Returns `false` for `d == 0` (caller must keep div-by-zero deopt) and
+    /// for the (degenerate) `i32::MIN` divisor where the magic-number
+    /// algorithm does not apply.
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
+    fn try_emit_int32_mod_by_constant(&mut self, id: NodeId, left: NodeId, d: i32) -> bool {
+        if d == 0 || d == i32::MIN {
+            return false;
+        }
+        // n % 1 == n % -1 == 0 for any n.
+        if d == 1 || d == -1 {
+            self.masm.xor_rr(Reg64::Rax, Reg64::Rax);
+            self.emit_store(id, Reg64::Rax);
+            return true;
+        }
+        let abs_d = d.unsigned_abs();
+        // Power-of-two divisor: branchless signed remainder via mask.
+        //
+        //   r10 = n
+        //   sar r10, 63           ; 0 (n>=0) or -1 (n<0)
+        //   shr r10, 64-k         ; 0 or |d|-1
+        //   add rax, r10          ; n + correction
+        //   and rax, |d|-1
+        //   sub rax, r10          ; signed remainder (truncation toward 0)
+        if abs_d.is_power_of_two() {
+            let k = abs_d.trailing_zeros() as u8; // k >= 1 because |d| >= 2
+            self.emit_load(left, Reg64::Rax);
+            self.masm.mov_rr(Reg64::R10, Reg64::Rax);
+            self.masm.sar_ri(Reg64::R10, 63);
+            self.masm.shr_ri(Reg64::R10, 64 - k);
+            self.masm.add_rr(Reg64::Rax, Reg64::R10);
+            self.masm.and_ri(Reg64::Rax, (abs_d - 1) as i32);
+            self.masm.sub_rr(Reg64::Rax, Reg64::R10);
+            self.emit_store(id, Reg64::Rax);
+            return true;
+        }
+        // General non-power-of-two case: signed magic-number remainder.
+        //
+        // Per Hacker's Delight §10-4, for |d| >= 2 there exist (M, s) with
+        // s in [0, 30] such that:
+        //
+        //   hi = signed_high32(n * M)         (i.e., (n * M) >> 32 as i32)
+        //   if d > 0 && M < 0: hi += n        (compensate for sign of M)
+        //   if d < 0 && M > 0: hi -= n
+        //   q  = hi >> s                      (arithmetic)
+        //   q += (q < 0 ? 1 : 0)              (round toward 0)
+        //
+        // and q == n / d for every i32 n.  The remainder is r = n - q * d.
+        let (magic, shift) = magic_signed_i32(d);
+        // Load n (sign-extended i64) into R11; keep it for the sign-of-M
+        // correction and the final `n - q*d`.
+        self.emit_load(left, Reg64::R11);
+        // RAX <- n * M  (magic is sign-extended to i64; both fit in 33 bits
+        // so the 64-bit truncated product equals the true product).
+        self.masm.mov_ri(Reg64::Rax, magic as i64);
+        self.masm.imul_rr(Reg64::Rax, Reg64::R11);
+        // hi32 = (n * M) >> 32, arithmetic, sign-extended to i64.
+        self.masm.sar_ri(Reg64::Rax, 32);
+        // Sign-of-magic correction on the high half.
+        if d > 0 && magic < 0 {
+            self.masm.add_rr(Reg64::Rax, Reg64::R11);
+        } else if d < 0 && magic > 0 {
+            self.masm.sub_rr(Reg64::Rax, Reg64::R11);
+        }
+        // q = hi32 >> s  (arithmetic).
+        if shift > 0 {
+            self.masm.sar_ri(Reg64::Rax, shift);
+        }
+        // q += (q < 0 ? 1 : 0)  ≡  q += unsigned(q) >> 63.
+        self.masm.mov_rr(Reg64::R10, Reg64::Rax);
+        self.masm.shr_ri(Reg64::R10, 63);
+        self.masm.add_rr(Reg64::Rax, Reg64::R10);
+        // RAX = q * d  (3-operand IMUL, 64-bit; no overflow since |q*d|
+        // < 2^32 plus a small slack).
+        self.masm.imul_rri(Reg64::Rax, Reg64::Rax, d);
+        // R11 = n - q*d  (signed remainder, fits in i32 and is correctly
+        // sign-extended in the i64 register).
+        self.masm.sub_rr(Reg64::R11, Reg64::Rax);
+        self.emit_store(id, Reg64::R11);
+        true
     }
 
     /// Inline Smi fast path for `GenericDivide`.
@@ -10600,6 +10721,61 @@ impl<'a> MaglevCodegen<'a> {
     }
 }
 
+/// Compute the signed-division magic number `(M, s)` for a 32-bit divisor
+/// `d`, per Hacker's Delight §10-4 (Figure 10-1).  For all i32 `n`,
+///
+/// ```text
+///   q = signed_high32(n * M) >> s
+///   if d > 0 && M < 0: q += n
+///   if d < 0 && M > 0: q -= n
+///   q += (q >> 31) & 1                  // round toward zero
+/// ```
+///
+/// yields `q == n / d`.  The shift `s` is in `[0, 30]` and `M` fits in
+/// i32 (sign-extended for use in 64-bit IMUL).
+///
+/// **Pre-conditions**: `d != 0`, `d != 1`, `d != -1`, `d != i32::MIN`.
+#[cfg(any(
+    stator_maglev_jit_x86_64,
+    all(target_arch = "x86_64", any(unix, windows))
+))]
+fn magic_signed_i32(d: i32) -> (i32, u8) {
+    debug_assert!(d != 0 && d != 1 && d != -1 && d != i32::MIN);
+    let two31: u32 = 0x8000_0000;
+    let ad: u32 = d.unsigned_abs();
+    let t: u32 = two31.wrapping_add((d as u32) >> 31);
+    let anc: u32 = t - 1 - t % ad;
+    let mut p: u32 = 31;
+    let mut q1: u32 = two31 / anc;
+    let mut r1: u32 = two31 - q1 * anc;
+    let mut q2: u32 = two31 / ad;
+    let mut r2: u32 = two31 - q2 * ad;
+    loop {
+        p += 1;
+        q1 = q1.wrapping_mul(2);
+        r1 = r1.wrapping_mul(2);
+        if r1 >= anc {
+            q1 = q1.wrapping_add(1);
+            r1 = r1.wrapping_sub(anc);
+        }
+        q2 = q2.wrapping_mul(2);
+        r2 = r2.wrapping_mul(2);
+        if r2 >= ad {
+            q2 = q2.wrapping_add(1);
+            r2 = r2.wrapping_sub(ad);
+        }
+        let delta = ad - r2;
+        if !(q1 < delta || (q1 == delta && r1 == 0)) {
+            break;
+        }
+    }
+    let mut magic = q2.wrapping_add(1) as i32;
+    if d < 0 {
+        magic = magic.wrapping_neg();
+    }
+    (magic, (p - 32) as u8)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -11762,6 +11938,169 @@ mod tests {
                 result.is_err(),
                 "Deoptimize control node must cause an error"
             );
+        }
+
+        // ── Constant-divisor modulus fast path ──────────────────────────
+
+        /// Build a graph that returns `param0 % d` using `Int32Modulus`
+        /// (the right operand is a `SmiConstant`, exercising the
+        /// magic-number / power-of-two fast path in
+        /// `try_emit_int32_mod_by_constant`).
+        fn build_mod_by_const_graph(d: i32) -> MaglevGraph {
+            let mut graph = MaglevGraph::new(1);
+            let mut block = BasicBlock::new(0);
+            let p0 = block.push_value(ValueNode::Parameter { index: 0 });
+            let c = block.push_value(ValueNode::SmiConstant { value: d });
+            let r = block.push_value(ValueNode::Int32Modulus { left: p0, right: c });
+            block.set_control(ControlNode::Return { value: r });
+            graph.add_block(block);
+            graph
+        }
+
+        fn check_mod(d: i32, samples: &[i32]) {
+            let graph = build_mod_by_const_graph(d);
+            let cc = do_compile(&graph, 1);
+            for &n in samples {
+                // SAFETY: code was produced by MaglevCodegen.
+                let got = unsafe { cc.execute(&[n as i64]).expect("exec") };
+                let want = (n % d) as i64;
+                assert_eq!(
+                    got, want,
+                    "Int32Modulus const fast path mismatch: {n} % {d} = {want}, got {got}"
+                );
+            }
+        }
+
+        #[test]
+        fn test_mod_by_constant_power_of_two() {
+            // |d| in {2, 4, 8, 16, 1024, 2^30}.
+            for &d in &[2i32, 4, 8, 16, 1024, 1 << 30, -2, -8, -1024] {
+                check_mod(
+                    d,
+                    &[
+                        0,
+                        1,
+                        -1,
+                        2,
+                        -2,
+                        7,
+                        -7,
+                        100,
+                        -100,
+                        12345,
+                        -12345,
+                        999_999,
+                        -999_999,
+                        i32::MAX,
+                        i32::MIN + 1,
+                    ],
+                );
+            }
+        }
+
+        #[test]
+        fn test_mod_by_constant_general() {
+            // Non-power-of-two divisors covering positive/negative magic.
+            for &d in &[3i32, 5, 6, 7, 9, 10, 11, 100, 1000, -3, -5, -7, -100] {
+                check_mod(
+                    d,
+                    &[
+                        0,
+                        1,
+                        -1,
+                        2,
+                        4,
+                        5,
+                        6,
+                        -5,
+                        -6,
+                        7,
+                        49,
+                        50,
+                        -49,
+                        -50,
+                        999,
+                        1000,
+                        -1000,
+                        12345,
+                        -12345,
+                        1_000_000,
+                        -1_000_000,
+                        i32::MAX,
+                        i32::MIN + 1,
+                    ],
+                );
+            }
+        }
+
+        #[test]
+        fn test_mod_by_one_returns_zero() {
+            for &d in &[1i32, -1] {
+                let graph = build_mod_by_const_graph(d);
+                let cc = do_compile(&graph, 1);
+                for &n in &[0i32, 1, -1, 42, -42, i32::MAX, i32::MIN + 1] {
+                    let got = unsafe { cc.execute(&[n as i64]).expect("exec") };
+                    assert_eq!(got, 0, "{n} % {d} must be 0");
+                }
+            }
+        }
+    }
+
+    // ── Magic-number computation ─────────────────────────────────────────
+
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
+    #[test]
+    fn test_magic_signed_i32_matches_division() {
+        // For each divisor, verify that the magic-number formula computes
+        // `n / d` for a wide sample of i32 values.
+        for &d in &[
+            2i32, 3, 5, 6, 7, 9, 10, 11, 25, 100, 1000, 0x12345, -3, -5, -7, -100, -1000,
+        ] {
+            let (m, s) = magic_signed_i32(d);
+            let m64 = m as i64;
+            for &n in &[
+                0i32,
+                1,
+                -1,
+                2,
+                -2,
+                5,
+                -5,
+                7,
+                -7,
+                10,
+                -10,
+                99,
+                -99,
+                1234,
+                -1234,
+                100_000,
+                -100_000,
+                1_000_000,
+                -1_000_000,
+                i32::MAX,
+                i32::MIN + 1,
+                i32::MAX - 1,
+            ] {
+                let prod = (n as i64).wrapping_mul(m64);
+                let mut hi = prod >> 32;
+                if d > 0 && m < 0 {
+                    hi += n as i64;
+                } else if d < 0 && m > 0 {
+                    hi -= n as i64;
+                }
+                let q_pre = (hi >> s) as i32;
+                let q = q_pre.wrapping_add(((q_pre as u32) >> 31) as i32);
+                assert_eq!(
+                    q,
+                    n.wrapping_div(d),
+                    "magic mismatch for n={n} d={d} (M={m:#x}, s={s}): got {q}, want {}",
+                    n.wrapping_div(d)
+                );
+            }
         }
     }
 }
