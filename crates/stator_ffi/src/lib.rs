@@ -2559,12 +2559,26 @@ type StatorNativeCallback = unsafe extern "C" fn(
     argc: i32,
 ) -> *mut StatorValue;
 
+unsafe fn context_is_execution_terminating(ctx: *mut StatorContext) -> bool {
+    if ctx.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `ctx` is valid.
+    let isolate = unsafe { (*ctx)._isolate };
+    !isolate.is_null() && unsafe { (*isolate).terminating }
+}
+
 unsafe fn run_script_inner(
     script: *const StatorScript,
     ctx: *mut StatorContext,
 ) -> Option<stator_jse::error::StatorResult<JsValue>> {
     if script.is_null() {
         return None;
+    }
+    if unsafe { context_is_execution_terminating(ctx) } {
+        return Some(Err(stator_jse::error::StatorError::Internal(
+            "script execution terminated".to_string(),
+        )));
     }
     // SAFETY: caller guarantees `script` is valid.
     let bytecodes = match unsafe { &(*script).bytecodes } {
@@ -2606,6 +2620,11 @@ unsafe fn run_script_no_result_inner(
 ) -> Option<stator_jse::error::StatorResult<()>> {
     if script.is_null() {
         return None;
+    }
+    if unsafe { context_is_execution_terminating(ctx) } {
+        return Some(Err(stator_jse::error::StatorError::Internal(
+            "script execution terminated".to_string(),
+        )));
     }
     // SAFETY: caller guarantees `script` is valid.
     let bytecodes = match unsafe { &(*script).bytecodes } {
@@ -9487,6 +9506,34 @@ mod tests {
             assert!(stator_isolate_is_execution_terminating(iso.as_ptr()));
             stator_isolate_cancel_terminate_execution(iso.as_ptr());
             assert!(!stator_isolate_is_execution_terminating(iso.as_ptr()));
+        }
+    }
+
+    #[test]
+    fn test_isolate_terminate_execution_blocks_script_start() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        assert!(!ctx.is_null());
+        let src = b"var edgeStatorTerminated = 1; edgeStatorTerminated;";
+        // SAFETY: `ctx` is valid; `src` is valid UTF-8.
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        assert!(!script.is_null());
+
+        // SAFETY: all pointers are valid and live.
+        unsafe {
+            stator_isolate_terminate_execution(iso.as_ptr());
+            assert!(stator_script_run(script, ctx).is_null());
+            assert!(!stator_script_run_no_result(script, ctx));
+
+            stator_isolate_cancel_terminate_execution(iso.as_ptr());
+            let result = stator_script_run(script, ctx);
+            assert!(!result.is_null());
+            assert_eq!(stator_value_as_number(result), 1.0);
+            stator_value_destroy(result);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
         }
     }
 
