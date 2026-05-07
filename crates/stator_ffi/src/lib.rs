@@ -5332,8 +5332,20 @@ pub unsafe extern "C" fn stator_dom_weak_ref_destroy(weak: *mut StatorDomWeakRef
 
 // ── Event loop FFI ─────────────────────────────────────────────────────────────
 
-use stator_jse::builtins::promise::MicrotaskQueue;
+use stator_jse::builtins::promise::{MicrotaskQueue, drain_active_microtask_queue};
 use stator_jse::event_loop::{DefaultCallbacks, EmbedderCallbacks, EventLoop, TimerHandle};
+
+/// Drain the active thread-local Promise microtask queue installed by Stator
+/// globals.
+///
+/// This mirrors an embedder microtask checkpoint for scripts that use
+/// `Promise.resolve(...).then(...)` and other Promise reaction jobs.  Returns the
+/// number of microtasks drained, or 0 when no active queue has been installed on
+/// the current thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_drain_active_microtask_queue() -> usize {
+    drain_active_microtask_queue()
+}
 
 /// Opaque event loop handle.
 pub struct StatorEventLoop {
@@ -8501,6 +8513,54 @@ mod tests {
 
         // SAFETY: all pointers are non-null and live.
         unsafe {
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_drain_active_microtask_queue_flushes_promise_reactions() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        let src = b"
+            var edgeStatorMicrotaskValue = 0;
+            Promise.resolve(41).then(function(value) {
+                edgeStatorMicrotaskValue = value + 1;
+            });
+            edgeStatorMicrotaskValue;
+        ";
+        // SAFETY: `ctx` is valid; `src` is valid UTF-8.
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        assert!(!script.is_null());
+
+        // SAFETY: `script` and `ctx` are valid.
+        let result = unsafe { stator_script_run(script, ctx) };
+        assert!(!result.is_null(), "expected an initial result");
+        // SAFETY: `result` is non-null and live.
+        unsafe { stator_value_destroy(result) };
+
+        let drained = stator_drain_active_microtask_queue();
+        assert!(drained > 0, "expected at least one Promise microtask");
+
+        let read_src = b"edgeStatorMicrotaskValue";
+        // SAFETY: `ctx` is valid; `read_src` is valid UTF-8.
+        let read_script = unsafe {
+            stator_script_compile(ctx, read_src.as_ptr() as *const c_char, read_src.len())
+        };
+        assert!(!read_script.is_null());
+        // SAFETY: `read_script` and `ctx` are valid.
+        let read_result = unsafe { stator_script_run(read_script, ctx) };
+        assert!(!read_result.is_null(), "expected a read result");
+        // SAFETY: `read_result` is non-null and live.
+        let n = unsafe { stator_value_as_number(read_result) };
+        assert_eq!(n, 42.0);
+
+        // SAFETY: all pointers are non-null and live.
+        unsafe {
+            stator_value_destroy(read_result);
+            stator_script_free(read_script);
             stator_script_free(script);
             stator_context_destroy(ctx);
         }

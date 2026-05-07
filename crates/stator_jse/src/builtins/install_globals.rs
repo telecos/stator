@@ -2338,19 +2338,31 @@ fn promise_species_result(
     Ok(result)
 }
 
+fn promise_method_receiver(
+    args: &[JsValue],
+    display_name: &str,
+) -> StatorResult<(crate::builtins::promise::JsPromise, usize)> {
+    if let Some(this_value) =
+        current_global_env().and_then(|global_env| global_env.borrow().get_this().cloned())
+        && let JsValue::Promise(promise) = this_value
+    {
+        return Ok((promise, 0));
+    }
+
+    match args.first() {
+        Some(JsValue::Promise(promise)) => Ok((promise.clone(), 1)),
+        _ => Err(StatorError::TypeError(format!(
+            "{display_name} called on non-Promise"
+        ))),
+    }
+}
+
 fn promise_then_method(queue: &crate::builtins::promise::MicrotaskQueue) -> JsValue {
     let q = queue.clone();
     builtin_fn("then", 2, move |args: Vec<JsValue>| {
-        let promise = match args.first() {
-            Some(JsValue::Promise(p)) => p.clone(),
-            _ => {
-                return Err(StatorError::TypeError(
-                    "Promise.prototype.then called on non-Promise".into(),
-                ));
-            }
-        };
-        let on_fulfilled = args.get(1).and_then(extract_handler);
-        let on_rejected = args.get(2).and_then(extract_handler);
+        let (promise, arg_offset) = promise_method_receiver(&args, "Promise.prototype.then")?;
+        let on_fulfilled = args.get(arg_offset).and_then(extract_handler);
+        let on_rejected = args.get(arg_offset + 1).and_then(extract_handler);
         let result_promise = promise_species_result(&promise)?;
         Ok(JsValue::Promise(
             crate::builtins::promise::promise_then_with_result(
@@ -2367,16 +2379,9 @@ fn promise_then_method(queue: &crate::builtins::promise::MicrotaskQueue) -> JsVa
 fn promise_catch_method(queue: &crate::builtins::promise::MicrotaskQueue) -> JsValue {
     let q = queue.clone();
     builtin_fn("catch", 1, move |args: Vec<JsValue>| {
-        let promise = match args.first() {
-            Some(JsValue::Promise(p)) => p.clone(),
-            _ => {
-                return Err(StatorError::TypeError(
-                    "Promise.prototype.catch called on non-Promise".into(),
-                ));
-            }
-        };
+        let (promise, arg_offset) = promise_method_receiver(&args, "Promise.prototype.catch")?;
         let handler = args
-            .get(1)
+            .get(arg_offset)
             .and_then(extract_handler)
             .unwrap_or_else(|| Box::new(Err));
         let result_promise = promise_species_result(&promise)?;
@@ -2394,15 +2399,8 @@ fn promise_catch_method(queue: &crate::builtins::promise::MicrotaskQueue) -> JsV
 fn promise_finally_method(queue: &crate::builtins::promise::MicrotaskQueue) -> JsValue {
     let q = queue.clone();
     builtin_fn("finally", 1, move |args: Vec<JsValue>| {
-        let promise = match args.first() {
-            Some(JsValue::Promise(p)) => p.clone(),
-            _ => {
-                return Err(StatorError::TypeError(
-                    "Promise.prototype.finally called on non-Promise".into(),
-                ));
-            }
-        };
-        let callback: crate::builtins::promise::PromiseFinallyHandler = match args.get(1) {
+        let (promise, arg_offset) = promise_method_receiver(&args, "Promise.prototype.finally")?;
+        let callback: crate::builtins::promise::PromiseFinallyHandler = match args.get(arg_offset) {
             Some(JsValue::NativeFunction(f)) => {
                 let f = Rc::clone(f);
                 Box::new(move || match f(vec![]) {

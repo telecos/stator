@@ -2614,6 +2614,17 @@ void stator_dom_weak_ref_clear(const struct StatorDomWeakRef *weak);
 void stator_dom_weak_ref_destroy(struct StatorDomWeakRef *weak);
 
 /**
+ * Drain the active thread-local Promise microtask queue installed by Stator
+ * globals.
+ *
+ * This mirrors an embedder microtask checkpoint for scripts that use
+ * `Promise.resolve(...).then(...)` and other Promise reaction jobs.  Returns the
+ * number of microtasks drained, or 0 when no active queue has been installed on
+ * the current thread.
+ */
+size_t stator_drain_active_microtask_queue(void);
+
+/**
  * Create a new event loop with default (no-op) callbacks.
  *
  * The returned pointer must be freed with [`stator_event_loop_destroy`].

@@ -12995,12 +12995,12 @@ pub(super) fn dispatch_call_property(
             }
         }
         JsValue::NativeFunction(f) => {
-            frame.accumulator = f(args.into_vec())?;
+            frame.accumulator = dispatch_native_method(frame, f, this_val, args)?;
             frame.global_cache_invalidate();
         }
         JsValue::PlainObject(map) => {
             if let Some(JsValue::NativeFunction(f)) = map.borrow().get("__call__").cloned() {
-                frame.accumulator = f(args.into_vec())?;
+                frame.accumulator = dispatch_native_method(frame, &f, this_val, args)?;
                 frame.global_cache_invalidate();
             } else {
                 return Err(StatorError::TypeError(
@@ -13015,6 +13015,22 @@ pub(super) fn dispatch_call_property(
         }
     }
     Ok(())
+}
+
+fn dispatch_native_method(
+    frame: &mut InterpreterFrame,
+    f: &crate::objects::value::NativeFn,
+    this_val: JsValue,
+    args: CallArgs,
+) -> StatorResult<JsValue> {
+    let old_this = frame.global_env.borrow().get_this().cloned();
+    frame.global_env.borrow_mut().set_this(this_val);
+    let result = f(args.into_vec());
+    match old_this {
+        Some(value) => frame.global_env.borrow_mut().set_this(value),
+        None => frame.global_env.borrow_mut().remove_this(),
+    }
+    result
 }
 
 pub(super) const FAST_ARRAY_METHOD_KEY: &str = "\0stator.fast_array_method";

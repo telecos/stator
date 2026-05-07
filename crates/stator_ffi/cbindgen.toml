@@ -89,4 +89,5 @@ include = [
     "stator_try_catch_destroy",
     "stator_isolate_has_pending_exception",
     "stator_isolate_clear_pending_exception",
+    "stator_drain_active_microtask_queue",
 ]
