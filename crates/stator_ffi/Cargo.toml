@@ -1,6 +1,6 @@
 [package]
 name = "stator_jse_ffi"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2024"
 description = "Stator JavaScript engine — stable C FFI layer for embedding"
 license = "MIT"
