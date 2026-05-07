@@ -65,6 +65,14 @@ pub struct StatorIsolate {
     /// When true, FFI script execution blocks Stator's JIT tiers for scripts
     /// run in this isolate.
     jit_disabled: bool,
+    /// When true, the embedder has requested that JavaScript execution on
+    /// this isolate be terminated.  Mirrors `v8::Isolate::TerminateExecution`.
+    ///
+    /// Today this flag is plumbing only: it can be set, queried, and cleared
+    /// via the `stator_isolate_*_terminate_execution` family, but the
+    /// interpreter does not yet honour it mid-execution.  Embedders may use it
+    /// pre-execution to short-circuit `stator_script_run`.
+    terminating: bool,
 }
 
 // SAFETY: `StatorIsolate` contains raw pointer fields that are only ever
@@ -88,6 +96,7 @@ pub extern "C" fn stator_isolate_create() -> *mut StatorIsolate {
         pending_exception: None,
         active_handle_scope: std::ptr::null_mut(),
         jit_disabled: false,
+        terminating: false,
     }))
 }
 
@@ -209,6 +218,66 @@ pub unsafe extern "C" fn stator_isolate_get_data(
     } else {
         std::ptr::null_mut()
     }
+}
+
+/// Request that JavaScript execution on `isolate` be terminated.
+///
+/// Mirrors `v8::Isolate::TerminateExecution`.  Sets a sticky flag on the
+/// isolate; subsequent calls to [`stator_script_run`] will refuse to start a
+/// new script while the flag is set, returning a null result and recording a
+/// JavaScript-style termination exception via [`stator_isolate_throw_exception`]
+/// where applicable.  The flag remains set until explicitly cleared via
+/// [`stator_isolate_cancel_terminate_execution`].
+///
+/// Note: This is currently plumbing only.  The interpreter does not yet poll
+/// the flag mid-execution; integration will follow in a subsequent change.
+///
+/// Does nothing when `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_terminate_execution(isolate: *mut StatorIsolate) {
+    if isolate.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe { (*isolate).terminating = true };
+}
+
+/// Clear a previously requested termination on `isolate`.
+///
+/// Mirrors `v8::Isolate::CancelTerminateExecution`.  After this call,
+/// [`stator_isolate_is_execution_terminating`] returns `false` until a new
+/// termination is requested.  Does nothing when `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_cancel_terminate_execution(isolate: *mut StatorIsolate) {
+    if isolate.is_null() {
+        return;
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe { (*isolate).terminating = false };
+}
+
+/// Return `true` if a termination has been requested on `isolate` and not
+/// yet cleared.
+///
+/// Returns `false` when `isolate` is null.
+///
+/// # Safety
+/// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_isolate_is_execution_terminating(
+    isolate: *const StatorIsolate,
+) -> bool {
+    if isolate.is_null() {
+        return false;
+    }
+    // SAFETY: caller guarantees `isolate` is valid.
+    unsafe { (*isolate).terminating }
 }
 
 /// Record `exception` as the pending exception on `isolate`.
@@ -549,6 +618,12 @@ pub struct StatorContext {
     /// [`stator_script_run`].  The map owns [`JsValue`] values (including
     /// [`JsValue::NativeFunction`] and [`JsValue::PlainObject`] wrappers).
     pub(crate) globals: Rc<RefCell<GlobalEnv>>,
+    /// Per-slot embedder data, mirroring [`StatorIsolate::embedder_data`] but
+    /// scoped to a single context.  Used by browser embedders (e.g. Blink) to
+    /// associate a `ScriptState` or `ExecutionContext` with the V8-equivalent
+    /// `Context`.  The pointers are owned by the embedder and are not freed
+    /// when the context is destroyed.
+    embedder_data: Vec<*mut c_void>,
 }
 
 // SAFETY: `StatorContext` only holds a pointer that is valid for the lifetime
@@ -579,6 +654,7 @@ pub unsafe extern "C" fn stator_context_new(isolate: *mut StatorIsolate) -> *mut
             isolate,
         },
         globals: Rc::new(RefCell::new(GlobalEnv::new())),
+        embedder_data: Vec::new(),
     }));
     // SAFETY: caller guarantees `isolate` is valid; `ctx` was just created.
     unsafe { (*isolate).current_context = ctx };
@@ -679,6 +755,62 @@ pub unsafe extern "C" fn stator_context_global(ctx: *mut StatorContext) -> *mut 
     // SAFETY: caller guarantees `ctx` is valid; we return a pointer to the
     // field inside the allocation, which is valid as long as `ctx` is alive.
     unsafe { &raw mut (*ctx).global }
+}
+
+/// Store an embedder-defined pointer in `slot` on `ctx`.
+///
+/// Slots grow on demand; previously-unset slots are treated as null.  Mirrors
+/// `v8::Context::SetAlignedPointerInEmbedderData` and is intended for use by
+/// browser embedders that need to associate per-context state (e.g. a
+/// `ScriptState` or `ExecutionContext`) with a Stator context.
+///
+/// The caller retains ownership of `data`; the context only stores the
+/// pointer and does not free it on destruction.
+///
+/// Does nothing when `ctx` is null.
+///
+/// # Safety
+/// `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_context_set_embedder_data(
+    ctx: *mut StatorContext,
+    slot: u32,
+    data: *mut c_void,
+) {
+    if ctx.is_null() {
+        return;
+    }
+    let slot = slot as usize;
+    // SAFETY: caller guarantees `ctx` is valid.
+    let slots = unsafe { &mut (*ctx).embedder_data };
+    if slot >= slots.len() {
+        slots.resize(slot + 1, std::ptr::null_mut());
+    }
+    slots[slot] = data;
+}
+
+/// Retrieve the embedder-defined pointer previously stored at `slot` on `ctx`.
+///
+/// Returns a null pointer when `ctx` is null or `slot` has not been set.
+///
+/// # Safety
+/// `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_context_get_embedder_data(
+    ctx: *const StatorContext,
+    slot: u32,
+) -> *mut c_void {
+    if ctx.is_null() {
+        return std::ptr::null_mut();
+    }
+    let slot = slot as usize;
+    // SAFETY: caller guarantees `ctx` is valid.
+    let slots = unsafe { &(*ctx).embedder_data };
+    if slot < slots.len() {
+        slots[slot]
+    } else {
+        std::ptr::null_mut()
+    }
 }
 
 // ── Value ─────────────────────────────────────────────────────────────────────
@@ -1968,6 +2100,16 @@ pub struct StatorScript {
     bytecodes: Option<Rc<BytecodeArray>>,
     /// Human-readable error message, or `None` on success.
     error: Option<CString>,
+    /// Resource name (typically a filename or URL) supplied by the embedder
+    /// via [`stator_script_set_origin`].  Mirrors `v8::ScriptOrigin::ResourceName`.
+    /// Used by browser embedders to attribute stack frames to source files.
+    resource_name: Option<CString>,
+    /// 1-based line offset of the script within `resource_name`.  Defaults to 0.
+    /// Mirrors `v8::ScriptOrigin::ResourceLineOffset`.
+    resource_line_offset: i32,
+    /// 1-based column offset of the script within `resource_name`.  Defaults
+    /// to 0.  Mirrors `v8::ScriptOrigin::ResourceColumnOffset`.
+    resource_column_offset: i32,
 }
 
 /// Compile `source` (a UTF-8 string of `source_len` bytes) into bytecode.
@@ -1993,6 +2135,9 @@ pub unsafe extern "C" fn stator_script_compile(
         let script = Box::new(StatorScript {
             bytecodes: None,
             error: Some(c"null source pointer".into()),
+            resource_name: None,
+            resource_line_offset: 0,
+            resource_column_offset: 0,
         });
         return Box::into_raw(script);
     }
@@ -2005,6 +2150,9 @@ pub unsafe extern "C" fn stator_script_compile(
             let script = Box::new(StatorScript {
                 bytecodes: None,
                 error: Some(c"source is not valid UTF-8".into()),
+                resource_name: None,
+                resource_line_offset: 0,
+                resource_column_offset: 0,
             });
             return Box::into_raw(script);
         }
@@ -2018,6 +2166,9 @@ pub unsafe extern "C" fn stator_script_compile(
         Ok(bytecodes) => Box::new(StatorScript {
             bytecodes: Some(Rc::new(bytecodes)),
             error: None,
+            resource_name: None,
+            resource_line_offset: 0,
+            resource_column_offset: 0,
         }),
         Err(e) => {
             let msg = e.to_string();
@@ -2025,6 +2176,9 @@ pub unsafe extern "C" fn stator_script_compile(
             Box::new(StatorScript {
                 bytecodes: None,
                 error: Some(cstring),
+                resource_name: None,
+                resource_line_offset: 0,
+                resource_column_offset: 0,
             })
         }
     };
@@ -2049,6 +2203,96 @@ pub unsafe extern "C" fn stator_script_get_error(script: *const StatorScript) ->
         Some(cs) => cs.as_ptr(),
         None => std::ptr::null(),
     }
+}
+
+/// Attach origin metadata (resource name and offsets) to `script`.
+///
+/// Mirrors the embedder-side construction of `v8::ScriptOrigin`.  The
+/// metadata is stored on the script and is intended to be surfaced through
+/// future stack-trace and error-reporting APIs; today it is plumbing only.
+///
+/// `resource_name` may be null to clear an existing name; otherwise it must
+/// be a valid, null-terminated UTF-8 C string.  The contents are copied; the
+/// caller retains ownership of the input buffer.
+///
+/// Does nothing when `script` is null.
+///
+/// # Safety
+/// - `script` must be either null or a valid, live [`StatorScript`] pointer.
+/// - When non-null, `resource_name` must be a valid, null-terminated UTF-8
+///   C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_set_origin(
+    script: *mut StatorScript,
+    resource_name: *const c_char,
+    line_offset: i32,
+    column_offset: i32,
+) {
+    if script.is_null() {
+        return;
+    }
+    let name = if resource_name.is_null() {
+        None
+    } else {
+        // SAFETY: caller guarantees `resource_name` is a valid null-terminated string.
+        let cstr = unsafe { CStr::from_ptr(resource_name) };
+        Some(CString::from(cstr))
+    };
+    // SAFETY: caller guarantees `script` is valid.
+    unsafe {
+        (*script).resource_name = name;
+        (*script).resource_line_offset = line_offset;
+        (*script).resource_column_offset = column_offset;
+    }
+}
+
+/// Return the resource name previously set on `script`, or null if none has
+/// been set.
+///
+/// The returned pointer is valid as long as `script` is alive (i.e. until
+/// [`stator_script_free`] is called) and as long as the origin is not
+/// overwritten by another call to [`stator_script_set_origin`].
+///
+/// # Safety
+/// `script` must be either null or a valid, live [`StatorScript`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_get_resource_name(
+    script: *const StatorScript,
+) -> *const c_char {
+    if script.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: caller guarantees `script` is valid.
+    match unsafe { &(*script).resource_name } {
+        Some(cs) => cs.as_ptr(),
+        None => std::ptr::null(),
+    }
+}
+
+/// Return the line offset previously set on `script` (default 0).
+///
+/// # Safety
+/// `script` must be either null or a valid, live [`StatorScript`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_get_line_offset(script: *const StatorScript) -> i32 {
+    if script.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `script` is valid.
+    unsafe { (*script).resource_line_offset }
+}
+
+/// Return the column offset previously set on `script` (default 0).
+///
+/// # Safety
+/// `script` must be either null or a valid, live [`StatorScript`] pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stator_script_get_column_offset(script: *const StatorScript) -> i32 {
+    if script.is_null() {
+        return 0;
+    }
+    // SAFETY: caller guarantees `script` is valid.
+    unsafe { (*script).resource_column_offset }
 }
 
 /// Print the decoded bytecode listing for `script` to standard output.
@@ -9169,5 +9413,108 @@ mod tests {
             stats.maglev_blocked,
             stats.maglev_cache_empty,
         );
+    }
+
+    // ── Browser P0 plumbing tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_isolate_terminate_execution_flag_roundtrip() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        unsafe {
+            assert!(!stator_isolate_is_execution_terminating(iso.as_ptr()));
+            stator_isolate_terminate_execution(iso.as_ptr());
+            assert!(stator_isolate_is_execution_terminating(iso.as_ptr()));
+            stator_isolate_cancel_terminate_execution(iso.as_ptr());
+            assert!(!stator_isolate_is_execution_terminating(iso.as_ptr()));
+        }
+    }
+
+    #[test]
+    fn test_isolate_terminate_null_is_safe() {
+        // SAFETY: passing null is explicitly documented as a no-op.
+        unsafe {
+            stator_isolate_terminate_execution(std::ptr::null_mut());
+            stator_isolate_cancel_terminate_execution(std::ptr::null_mut());
+            assert!(!stator_isolate_is_execution_terminating(std::ptr::null()));
+        }
+    }
+
+    #[test]
+    fn test_context_embedder_data_roundtrip() {
+        let iso = IsolateGuard::new();
+        // SAFETY: `iso` is valid.
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        assert!(!ctx.is_null());
+        let sentinel = 0xDEADBEEF_usize as *mut c_void;
+        // SAFETY: `ctx` is valid.
+        unsafe {
+            assert!(stator_context_get_embedder_data(ctx, 0).is_null());
+            stator_context_set_embedder_data(ctx, 3, sentinel);
+            assert_eq!(stator_context_get_embedder_data(ctx, 3), sentinel);
+            assert!(stator_context_get_embedder_data(ctx, 0).is_null());
+            assert!(stator_context_get_embedder_data(ctx, 2).is_null());
+            assert!(stator_context_get_embedder_data(ctx, 99).is_null());
+            stator_context_destroy(ctx);
+        }
+    }
+
+    #[test]
+    fn test_context_embedder_data_null_is_safe() {
+        // SAFETY: passing null is documented as a no-op.
+        unsafe {
+            stator_context_set_embedder_data(std::ptr::null_mut(), 0, std::ptr::null_mut());
+            assert!(stator_context_get_embedder_data(std::ptr::null(), 0).is_null());
+        }
+    }
+
+    #[test]
+    fn test_script_origin_defaults_and_roundtrip() {
+        let src = b"1 + 1\0";
+        // SAFETY: `src` is valid for 5 bytes.
+        let script = unsafe {
+            stator_script_compile(std::ptr::null_mut(), src.as_ptr() as *const c_char, 5)
+        };
+        assert!(!script.is_null());
+
+        // SAFETY: `script` is valid.
+        unsafe {
+            assert!(stator_script_get_resource_name(script).is_null());
+            assert_eq!(stator_script_get_line_offset(script), 0);
+            assert_eq!(stator_script_get_column_offset(script), 0);
+        }
+
+        let name = c"https://example.test/foo.js";
+        // SAFETY: `script` is valid; `name` is a valid C string.
+        unsafe {
+            stator_script_set_origin(script, name.as_ptr(), 7, 13);
+            let got = stator_script_get_resource_name(script);
+            assert!(!got.is_null());
+            let got_str = CStr::from_ptr(got).to_str().unwrap();
+            assert_eq!(got_str, "https://example.test/foo.js");
+            assert_eq!(stator_script_get_line_offset(script), 7);
+            assert_eq!(stator_script_get_column_offset(script), 13);
+        }
+
+        // Setting a null resource_name clears the previously-set name.
+        // SAFETY: `script` is valid.
+        unsafe {
+            stator_script_set_origin(script, std::ptr::null(), 0, 0);
+            assert!(stator_script_get_resource_name(script).is_null());
+            assert_eq!(stator_script_get_line_offset(script), 0);
+            assert_eq!(stator_script_get_column_offset(script), 0);
+            stator_script_free(script);
+        }
+    }
+
+    #[test]
+    fn test_script_origin_null_script_is_safe() {
+        // SAFETY: passing null is documented as a no-op / default.
+        unsafe {
+            stator_script_set_origin(std::ptr::null_mut(), std::ptr::null(), 1, 2);
+            assert!(stator_script_get_resource_name(std::ptr::null()).is_null());
+            assert_eq!(stator_script_get_line_offset(std::ptr::null()), 0);
+            assert_eq!(stator_script_get_column_offset(std::ptr::null()), 0);
+        }
     }
 }

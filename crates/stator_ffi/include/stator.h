@@ -612,6 +612,49 @@ void stator_isolate_set_data(struct StatorIsolate *isolate, uint32_t slot, void 
 void *stator_isolate_get_data(const struct StatorIsolate *isolate, uint32_t slot);
 
 /**
+ * Request that JavaScript execution on `isolate` be terminated.
+ *
+ * Mirrors `v8::Isolate::TerminateExecution`.  Sets a sticky flag on the
+ * isolate; subsequent calls to [`stator_script_run`] will refuse to start a
+ * new script while the flag is set, returning a null result and recording a
+ * JavaScript-style termination exception via [`stator_isolate_throw_exception`]
+ * where applicable.  The flag remains set until explicitly cleared via
+ * [`stator_isolate_cancel_terminate_execution`].
+ *
+ * Note: This is currently plumbing only.  The interpreter does not yet poll
+ * the flag mid-execution; integration will follow in a subsequent change.
+ *
+ * Does nothing when `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ */
+void stator_isolate_terminate_execution(struct StatorIsolate *isolate);
+
+/**
+ * Clear a previously requested termination on `isolate`.
+ *
+ * Mirrors `v8::Isolate::CancelTerminateExecution`.  After this call,
+ * [`stator_isolate_is_execution_terminating`] returns `false` until a new
+ * termination is requested.  Does nothing when `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ */
+void stator_isolate_cancel_terminate_execution(struct StatorIsolate *isolate);
+
+/**
+ * Return `true` if a termination has been requested on `isolate` and not
+ * yet cleared.
+ *
+ * Returns `false` when `isolate` is null.
+ *
+ * # Safety
+ * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
+ */
+bool stator_isolate_is_execution_terminating(const struct StatorIsolate *isolate);
+
+/**
  * Record `exception` as the pending exception on `isolate`.
  *
  * At most one pending exception is stored at a time; a subsequent call
@@ -797,6 +840,34 @@ void stator_context_exit(struct StatorContext *ctx);
  * `ctx` must be either null or a valid, live [`StatorContext`] pointer.
  */
 struct StatorObject *stator_context_global(struct StatorContext *ctx);
+
+/**
+ * Store an embedder-defined pointer in `slot` on `ctx`.
+ *
+ * Slots grow on demand; previously-unset slots are treated as null.  Mirrors
+ * `v8::Context::SetAlignedPointerInEmbedderData` and is intended for use by
+ * browser embedders that need to associate per-context state (e.g. a
+ * `ScriptState` or `ExecutionContext`) with a Stator context.
+ *
+ * The caller retains ownership of `data`; the context only stores the
+ * pointer and does not free it on destruction.
+ *
+ * Does nothing when `ctx` is null.
+ *
+ * # Safety
+ * `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+ */
+void stator_context_set_embedder_data(struct StatorContext *ctx, uint32_t slot, void *data);
+
+/**
+ * Retrieve the embedder-defined pointer previously stored at `slot` on `ctx`.
+ *
+ * Returns a null pointer when `ctx` is null or `slot` has not been set.
+ *
+ * # Safety
+ * `ctx` must be either null or a valid, live [`StatorContext`] pointer.
+ */
+void *stator_context_get_embedder_data(const struct StatorContext *ctx, uint32_t slot);
 
 /**
  * Create a new number value.
@@ -1401,6 +1472,58 @@ struct StatorScript *stator_script_compile(struct StatorContext *_ctx,
  * `script` must be a non-null pointer returned by [`stator_script_compile`].
  */
 const char *stator_script_get_error(const struct StatorScript *script);
+
+/**
+ * Attach origin metadata (resource name and offsets) to `script`.
+ *
+ * Mirrors the embedder-side construction of `v8::ScriptOrigin`.  The
+ * metadata is stored on the script and is intended to be surfaced through
+ * future stack-trace and error-reporting APIs; today it is plumbing only.
+ *
+ * `resource_name` may be null to clear an existing name; otherwise it must
+ * be a valid, null-terminated UTF-8 C string.  The contents are copied; the
+ * caller retains ownership of the input buffer.
+ *
+ * Does nothing when `script` is null.
+ *
+ * # Safety
+ * - `script` must be either null or a valid, live [`StatorScript`] pointer.
+ * - When non-null, `resource_name` must be a valid, null-terminated UTF-8
+ *   C string.
+ */
+void stator_script_set_origin(struct StatorScript *script,
+                              const char *resource_name,
+                              int32_t line_offset,
+                              int32_t column_offset);
+
+/**
+ * Return the resource name previously set on `script`, or null if none has
+ * been set.
+ *
+ * The returned pointer is valid as long as `script` is alive (i.e. until
+ * [`stator_script_free`] is called) and as long as the origin is not
+ * overwritten by another call to [`stator_script_set_origin`].
+ *
+ * # Safety
+ * `script` must be either null or a valid, live [`StatorScript`] pointer.
+ */
+const char *stator_script_get_resource_name(const struct StatorScript *script);
+
+/**
+ * Return the line offset previously set on `script` (default 0).
+ *
+ * # Safety
+ * `script` must be either null or a valid, live [`StatorScript`] pointer.
+ */
+int32_t stator_script_get_line_offset(const struct StatorScript *script);
+
+/**
+ * Return the column offset previously set on `script` (default 0).
+ *
+ * # Safety
+ * `script` must be either null or a valid, live [`StatorScript`] pointer.
+ */
+int32_t stator_script_get_column_offset(const struct StatorScript *script);
 
 /**
  * Print the decoded bytecode listing for `script` to standard output.
