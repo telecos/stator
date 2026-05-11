@@ -4466,7 +4466,7 @@ impl<'a> MaglevCodegen<'a> {
     ///
     /// Calls the `extern "C"` thunk
     /// [`crate::interpreter::stator_jit_poll_terminated`] which returns a
-    /// `u8` (`1` ⇒ embedder requested termination on this thread, `0`
+    /// `u32` (`1` ⇒ embedder requested termination on this thread, `0`
     /// otherwise).  On a non-zero return the generated code jumps to
     /// `deopt_terminated_label`, which loads `JIT_DEOPT_TERMINATED` into
     /// RAX and falls through the common deopt epilogue (callee-saved pop
@@ -4485,7 +4485,7 @@ impl<'a> MaglevCodegen<'a> {
     ///   call r11
     ///   [add rsp, 32]                ; Win64 shadow space only
     ///   pop  r11                    ; un-align
-    ///   test al, al
+    ///   test rax, rax
     ///   jne  deopt_terminated_label
     /// ```
     #[cfg(any(
