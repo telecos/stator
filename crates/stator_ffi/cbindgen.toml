@@ -121,4 +121,10 @@ include = [
     "stator_object_has_property",
     "stator_object_delete_property",
     "stator_value_call",
+    "StatorWasmValueKind",
+    "StatorWasmValuePayload",
+    "StatorWasmValue",
+    "StatorWasmHostFuncCallback",
+    "StatorWasmHostFunc",
+    "StatorWasmImports",
 ]

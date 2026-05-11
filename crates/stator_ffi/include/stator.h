@@ -131,6 +131,37 @@ typedef enum StatorMessageKind {
 } StatorMessageKind;
 
 /**
+ * C-ABI Wasm value kind used by host-import marshalling.
+ *
+ * Discriminants are stable and embedders may rely on them.
+ */
+enum StatorWasmValueKind
+#ifdef __cplusplus
+  : uint32_t
+#endif // __cplusplus
+ {
+  /**
+   * 32-bit signed integer (`i32`).
+   */
+  StatorWasmValueKindI32 = 0,
+  /**
+   * 64-bit signed integer (`i64`).
+   */
+  StatorWasmValueKindI64 = 1,
+  /**
+   * 32-bit IEEE-754 float (`f32`).
+   */
+  StatorWasmValueKindF32 = 2,
+  /**
+   * 64-bit IEEE-754 float (`f64`).
+   */
+  StatorWasmValueKindF64 = 3,
+};
+#ifndef __cplusplus
+typedef uint32_t StatorWasmValueKind;
+#endif // __cplusplus
+
+/**
  * Host-visible Promise rejection event kind.
  */
 typedef enum StatorPromiseRejectionEventKind {
@@ -615,6 +646,119 @@ typedef struct StatorPlatformVTable {
 } StatorPlatformVTable;
 
 /**
+ * C-ABI union payload of a [`StatorWasmValue`].
+ *
+ * Only the variant indicated by the containing [`StatorWasmValue::kind`] is
+ * well-defined; reading any other variant is undefined behavior.
+ */
+typedef union StatorWasmValuePayload {
+  /**
+   * `i32` storage.
+   */
+  int32_t i32_;
+  /**
+   * `i64` storage.
+   */
+  int64_t i64_;
+  /**
+   * `f32` storage.
+   */
+  float f32_;
+  /**
+   * `f64` storage.
+   */
+  double f64_;
+} StatorWasmValuePayload;
+
+/**
+ * A typed Wasm value used at the host-import boundary.
+ *
+ * `kind` discriminates the active union member.  Embedders must initialise
+ * the payload member matching `kind`; Stator only reads the active member.
+ */
+typedef struct StatorWasmValue {
+  /**
+   * Discriminant for the active member of `value`.
+   */
+  StatorWasmValueKind kind;
+  /**
+   * Typed payload.  The active member is selected by `kind`.
+   */
+  union StatorWasmValuePayload value;
+} StatorWasmValue;
+
+/**
+ * Declaration of a single Wasm host-function import.
+ *
+ * `module_name` and `field_name` form the fully-qualified Wasm import name
+ * the module expects (e.g. `env` / `add`).  `params` / `results` arrays
+ * declare the signature, must point to valid storage for `params_len` /
+ * `results_len` elements respectively, and must match the signature the
+ * module declares for that import.  A null `callback` causes instantiation
+ * to fail.
+ */
+typedef struct StatorWasmHostFunc {
+  /**
+   * Null-terminated UTF-8 import module name (e.g. `"env"`).
+   */
+  const char *module_name;
+  /**
+   * Null-terminated UTF-8 import field name (e.g. `"add"`).
+   */
+  const char *field_name;
+  /**
+   * Pointer to `params_len` parameter kinds, in order.  May be null when
+   * `params_len` is zero.
+   */
+  const StatorWasmValueKind *params;
+  /**
+   * Number of parameter kinds in `params`.
+   */
+  size_t params_len;
+  /**
+   * Pointer to `results_len` result kinds, in order.  May be null when
+   * `results_len` is zero.
+   */
+  const StatorWasmValueKind *results;
+  /**
+   * Number of result kinds in `results`.
+   */
+  size_t results_len;
+  /**
+   * Callback invoked on each Wasm-side call.  Required; null fails
+   * instantiation.
+   */
+  bool (*callback)(struct StatorContext *ctx,
+                   void *user_data,
+                   const struct StatorWasmValue *args,
+                   size_t args_len,
+                   struct StatorWasmValue *results,
+                   size_t results_len);
+  /**
+   * Opaque embedder data passed unchanged to `callback`.  Stator does not
+   * interpret this pointer.
+   */
+  void *user_data;
+} StatorWasmHostFunc;
+
+/**
+ * A collection of host-function imports passed to [`stator_wasm_instantiate`].
+ *
+ * A null pointer or a structure with `funcs_len == 0` declares "no imports".
+ */
+typedef struct StatorWasmImports {
+  /**
+   * Pointer to `funcs_len` [`StatorWasmHostFunc`] elements.  May be null
+   * when `funcs_len` is zero.
+   */
+  const struct StatorWasmHostFunc *funcs;
+  /**
+   * Number of elements in `funcs`.
+   */
+  size_t funcs_len;
+} StatorWasmImports;
+
+/**
  * C-callable named-property getter callback.
  *
  * Receives the property name, an embedder-data pointer, and an out-pointer
@@ -698,6 +842,30 @@ typedef struct StatorEmbedderCallbacks {
    */
   StatorMonotonicTimeFn monotonic_time;
 } StatorEmbedderCallbacks;
+
+/**
+ * Synchronous host-function callback used to fulfil a Wasm import.
+ *
+ * Invoked synchronously on the thread running the Wasm caller.  Returns
+ * `true` after writing exactly `results_len` typed results into `results`.
+ * Returning `false` traps the running Wasm call: the enclosing
+ * [`stator_wasm_instance_call`] then returns null.
+ *
+ * # Safety
+ * - `args` is a valid pointer for reads of `args_len` consecutive
+ *   [`StatorWasmValue`]s.
+ * - `results` is a valid pointer for writes of `results_len` consecutive
+ *   [`StatorWasmValue`]s.  Each slot must be initialised by the callback
+ *   with the kind declared in [`StatorWasmHostFunc::results`].
+ * - `ctx` and `user_data` are the values supplied at instantiate time and
+ *   must remain live for the duration of the call.
+ */
+typedef bool (*StatorWasmHostFuncCallback)(struct StatorContext *ctx,
+                                           void *user_data,
+                                           const struct StatorWasmValue *args,
+                                           size_t args_len,
+                                           struct StatorWasmValue *results,
+                                           size_t results_len);
 
 #ifdef __cplusplus
 extern "C" {
@@ -2831,12 +2999,15 @@ void stator_wasm_module_destroy(struct StatorWasmModule *module);
  * Instantiate a compiled [`StatorWasmModule`] into a live
  * [`StatorWasmInstance`].
  *
- * `ctx` is accepted for future use and may be null.  `imports` is reserved for
- * future use and **must** be null; passing a non-null value is currently
- * ignored.
+ * `ctx` is captured and forwarded to every host-import callback; it may be
+ * null when no callback needs an isolate context.  `imports` may be null (or
+ * a struct with `funcs_len == 0`) to instantiate with no host imports; in
+ * that case the module must declare no imports of its own or instantiation
+ * fails.
  *
- * Returns a null pointer if `module` is null or if instantiation fails (e.g.
- * the module requires imports that are not provided).
+ * Returns a null pointer if `module` is null, if any required import is
+ * missing or malformed (null callback, null name, invalid UTF-8, signature
+ * mismatch), or if instantiation fails.
  *
  * The returned pointer must eventually be passed to
  * [`stator_wasm_instance_destroy`].
@@ -2844,12 +3015,19 @@ void stator_wasm_module_destroy(struct StatorWasmModule *module);
  * # Safety
  * - `module` must be a non-null, valid pointer to a live
  *   [`StatorWasmModule`].
- * - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
- * - `imports` must be null.
+ * - `ctx` must be either null or a valid, live [`StatorContext`] pointer
+ *   that outlives every host callback invocation triggered through the
+ *   returned instance.
+ * - `imports`, when non-null, must point to a valid [`StatorWasmImports`]
+ *   whose inner arrays and strings remain valid for the duration of this
+ *   call.  The structures are only read during instantiation; afterwards
+ *   the embedder may reuse or free the storage.  However, every
+ *   `user_data` pointer and the `ctx` pointer captured here must remain
+ *   valid until [`stator_wasm_instance_destroy`] is called.
  */
 struct StatorWasmInstance *stator_wasm_instantiate(struct StatorWasmModule *module,
-                                                   struct StatorContext *_ctx,
-                                                   const void *_imports);
+                                                   struct StatorContext *ctx,
+                                                   const struct StatorWasmImports *imports);
 
 /**
  * Free a [`StatorWasmInstance`] previously returned by

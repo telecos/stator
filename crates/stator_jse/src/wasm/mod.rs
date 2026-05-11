@@ -45,9 +45,11 @@
 //! assert_eq!(result[0].unwrap_i32(), 3);
 //! ```
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use wasmtime::{Config, Engine, Instance, Linker, Module, Store, UpdateDeadline, Val};
+use wasmtime::{
+    Config, Engine, FuncType, Instance, Linker, Module, Store, UpdateDeadline, Val, ValType,
+};
 
 use crate::error::{StatorError, StatorResult};
 use crate::interpreter::{
@@ -216,6 +218,132 @@ impl WasmModule {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Host imports
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `WasmInstance::new_with_imports` lets embedders bind host functions into the
+// Wasm module's import namespace.  Each [`HostFunc`] declares a fully-qualified
+// import name (`module::name`), a signature (parameter + result kinds), and a
+// synchronous callback that runs on the thread executing the calling Wasm.
+//
+// Polling:
+//   * Before invoking the embedder callback the host shim observes the Stator
+//     interrupt flag and traps with [`SCRIPT_TERMINATED_MESSAGE`] if set.
+//   * After the embedder callback returns, the flag is observed again.  This
+//     covers the case where the embedder ran user-attributable work that
+//     responded to a termination request.
+//   * The callback returning `false` is reported as a Wasm trap to the running
+//     module; the outer [`WasmInstance::call`] surfaces this as a
+//     [`StatorError::WasmError`].
+
+/// The C-ABI–compatible value kind used by [`HostVal`] and [`HostFunc`].
+#[repr(u32)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HostValKind {
+    /// Wasm `i32`.
+    I32 = 0,
+    /// Wasm `i64`.
+    I64 = 1,
+    /// Wasm `f32`.
+    F32 = 2,
+    /// Wasm `f64`.
+    F64 = 3,
+}
+
+impl HostValKind {
+    fn to_wasmtime(self) -> ValType {
+        match self {
+            HostValKind::I32 => ValType::I32,
+            HostValKind::I64 => ValType::I64,
+            HostValKind::F32 => ValType::F32,
+            HostValKind::F64 => ValType::F64,
+        }
+    }
+}
+
+/// A typed Wasm value used at the host-import boundary.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum HostVal {
+    /// Wasm `i32`.
+    I32(i32),
+    /// Wasm `i64`.
+    I64(i64),
+    /// Wasm `f32`.
+    F32(f32),
+    /// Wasm `f64`.
+    F64(f64),
+}
+
+impl HostVal {
+    /// Return the [`HostValKind`] discriminant of this value.
+    pub fn kind(&self) -> HostValKind {
+        match self {
+            HostVal::I32(_) => HostValKind::I32,
+            HostVal::I64(_) => HostValKind::I64,
+            HostVal::F32(_) => HostValKind::F32,
+            HostVal::F64(_) => HostValKind::F64,
+        }
+    }
+
+    /// Return the zero value of the given kind.
+    pub fn zero_of(kind: HostValKind) -> HostVal {
+        match kind {
+            HostValKind::I32 => HostVal::I32(0),
+            HostValKind::I64 => HostVal::I64(0),
+            HostValKind::F32 => HostVal::F32(0.0),
+            HostValKind::F64 => HostVal::F64(0.0),
+        }
+    }
+
+    fn from_wasm(v: &Val) -> Option<HostVal> {
+        match v {
+            Val::I32(n) => Some(HostVal::I32(*n)),
+            Val::I64(n) => Some(HostVal::I64(*n)),
+            Val::F32(b) => Some(HostVal::F32(f32::from_bits(*b))),
+            Val::F64(b) => Some(HostVal::F64(f64::from_bits(*b))),
+            _ => None,
+        }
+    }
+
+    fn to_wasm(self) -> Val {
+        match self {
+            HostVal::I32(n) => Val::I32(n),
+            HostVal::I64(n) => Val::I64(n),
+            HostVal::F32(f) => Val::F32(f.to_bits()),
+            HostVal::F64(f) => Val::F64(f.to_bits()),
+        }
+    }
+}
+
+/// A synchronous host callback bound into a Wasm module's import namespace.
+///
+/// `args` carries the Wasm-side argument values in the order declared by
+/// [`HostFunc::params`].  The callback writes its results into `results` whose
+/// length and kinds match [`HostFunc::results`].  Returning `false` traps the
+/// caller; the outer Wasm call surfaces this as [`StatorError::WasmError`].
+pub type HostFuncCallback = Arc<dyn Fn(&[HostVal], &mut [HostVal]) -> bool + Send + Sync>;
+
+/// A single host function import.
+///
+/// `module` and `name` form the fully-qualified Wasm import name (e.g. `env`
+/// and `add`).  `params` and `results` declare the function's signature and
+/// are matched against the module's expected import signature at instantiate
+/// time: any mismatch fails instantiation.
+pub struct HostFunc {
+    /// Wasm import module name (e.g. `"env"`).
+    pub module: String,
+    /// Wasm import field name (e.g. `"add"`).
+    pub name: String,
+    /// Parameter kinds, in order.
+    pub params: Vec<HostValKind>,
+    /// Result kinds, in order.
+    pub results: Vec<HostValKind>,
+    /// Synchronous callback invoked when imported Wasm code calls this
+    /// function.  Runs on the thread executing the calling Wasm.
+    pub callback: HostFuncCallback,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // WasmInstance
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -238,6 +366,31 @@ impl WasmInstance {
     /// Returns [`StatorError::WasmError`] if instantiation fails (e.g. the
     /// module requires imports that are not provided).
     pub fn new(engine: &WasmEngine, module: &WasmModule) -> StatorResult<Self> {
+        Self::new_with_imports(engine, module, Vec::new())
+    }
+
+    /// Instantiate a [`WasmModule`] binding the given host-function imports.
+    ///
+    /// Each [`HostFunc`] is registered in the [`wasmtime::Linker`] under its
+    /// `(module, name)` pair using a [`FuncType`] derived from the declared
+    /// `params` / `results`.  Instantiation fails if the module expects an
+    /// import that is not provided, or if a provided import's declared
+    /// signature does not match the one the module expects (Wasmtime performs
+    /// the structural match).
+    ///
+    /// Host callbacks run synchronously on the thread that called
+    /// [`WasmInstance::call`]: see the "Host imports" section above for the
+    /// termination / polling contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StatorError::WasmError`] if linker registration fails (e.g.
+    /// duplicate import names) or if instantiation fails.
+    pub fn new_with_imports(
+        engine: &WasmEngine,
+        module: &WasmModule,
+        imports: Vec<HostFunc>,
+    ) -> StatorResult<Self> {
         let mut store: Store<()> = Store::new(engine.inner(), ());
         // Configure the store so that every epoch advance reaches a callback
         // which checks the current thread's Stator interrupt flag.  This lets
@@ -251,7 +404,60 @@ impl WasmInstance {
             Ok(UpdateDeadline::Continue(1))
         });
         store.set_epoch_deadline(1);
-        let linker: Linker<()> = Linker::new(engine.inner());
+
+        let mut linker: Linker<()> = Linker::new(engine.inner());
+        for imp in imports {
+            let HostFunc {
+                module: m_name,
+                name: f_name,
+                params,
+                results,
+                callback,
+            } = imp;
+            let ty = FuncType::new(
+                engine.inner(),
+                params.iter().map(|k| k.to_wasmtime()),
+                results.iter().map(|k| k.to_wasmtime()),
+            );
+            let results_kinds = results.clone();
+            linker
+                .func_new(&m_name, &f_name, ty, move |_caller, args, out| {
+                    // Pre-callback termination poll: short-circuit before
+                    // re-entering embedder code.
+                    if check_interrupt_flag() {
+                        return Err(wasmtime::Error::msg(SCRIPT_TERMINATED_MESSAGE));
+                    }
+                    let host_args: Vec<HostVal> =
+                        args.iter().filter_map(HostVal::from_wasm).collect();
+                    if host_args.len() != args.len() {
+                        return Err(wasmtime::Error::msg(
+                            "unsupported Wasm value type at host import boundary",
+                        ));
+                    }
+                    let mut host_results: Vec<HostVal> =
+                        results_kinds.iter().map(|k| HostVal::zero_of(*k)).collect();
+                    let ok = (callback)(&host_args, &mut host_results);
+                    if !ok {
+                        // Map a host-requested trap.  If the embedder triggered
+                        // it via the termination flag, surface the canonical
+                        // terminated message instead.
+                        if check_interrupt_flag() {
+                            return Err(wasmtime::Error::msg(SCRIPT_TERMINATED_MESSAGE));
+                        }
+                        return Err(wasmtime::Error::msg("host function trapped"));
+                    }
+                    // Post-callback termination poll.
+                    if check_interrupt_flag() {
+                        return Err(wasmtime::Error::msg(SCRIPT_TERMINATED_MESSAGE));
+                    }
+                    for (slot, hv) in out.iter_mut().zip(host_results.iter()) {
+                        *slot = hv.to_wasm();
+                    }
+                    Ok(())
+                })
+                .map_err(|e| StatorError::WasmError(e.to_string()))?;
+        }
+
         let instance = linker
             .instantiate(&mut store, module.inner())
             .map_err(|e| StatorError::WasmError(e.to_string()))?;
@@ -720,6 +926,220 @@ mod tests {
             }
             other => panic!("expected WasmError, got: {other:?}"),
         }
+    }
+
+    // ── Host imports ────────────────────────────────────────────────────────
+
+    /// Imported `env.add(i32, i32) -> i32` is bound and observable from a Wasm
+    /// export that simply forwards its arguments to the import.
+    #[test]
+    fn test_wasm_host_import_add_i32() {
+        let wat = r#"
+            (module
+                (import "env" "add" (func $add (param i32 i32) (result i32)))
+                (func (export "call_add") (param i32 i32) (result i32)
+                    local.get 0
+                    local.get 1
+                    call $add))
+        "#;
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, wat).unwrap();
+
+        let cb: HostFuncCallback = Arc::new(|args, results| {
+            let a = match args[0] {
+                HostVal::I32(n) => n,
+                _ => return false,
+            };
+            let b = match args[1] {
+                HostVal::I32(n) => n,
+                _ => return false,
+            };
+            results[0] = HostVal::I32(a.wrapping_add(b));
+            true
+        });
+        let imports = vec![HostFunc {
+            module: "env".to_string(),
+            name: "add".to_string(),
+            params: vec![HostValKind::I32, HostValKind::I32],
+            results: vec![HostValKind::I32],
+            callback: cb,
+        }];
+        let mut instance = WasmInstance::new_with_imports(&engine, &module, imports).unwrap();
+        let r = instance
+            .call("call_add", &[Val::I32(7), Val::I32(35)])
+            .unwrap();
+        assert_eq!(r[0].unwrap_i32(), 42);
+    }
+
+    /// A host callback returning `false` traps the running Wasm call and the
+    /// outer call surfaces a `WasmError`.
+    #[test]
+    fn test_wasm_host_import_callback_false_traps() {
+        let wat = r#"
+            (module
+                (import "env" "bad" (func $bad (result i32)))
+                (func (export "go") (result i32) (call $bad)))
+        "#;
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, wat).unwrap();
+        let cb: HostFuncCallback = Arc::new(|_args, _results| false);
+        let imports = vec![HostFunc {
+            module: "env".to_string(),
+            name: "bad".to_string(),
+            params: vec![],
+            results: vec![HostValKind::I32],
+            callback: cb,
+        }];
+        let mut instance = WasmInstance::new_with_imports(&engine, &module, imports).unwrap();
+        let err = instance.call("go", &[]).unwrap_err();
+        assert!(matches!(err, StatorError::WasmError(_)));
+    }
+
+    /// Instantiation fails if a required import is not supplied.
+    #[test]
+    fn test_wasm_host_import_missing_fails_instantiate() {
+        let wat = r#"
+            (module
+                (import "env" "missing" (func (result i32))))
+        "#;
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, wat).unwrap();
+        let result = WasmInstance::new_with_imports(&engine, &module, vec![]);
+        match result {
+            Ok(_) => panic!("instantiation should fail when imports are missing"),
+            Err(StatorError::WasmError(_)) => {}
+            Err(other) => panic!("expected WasmError, got: {other:?}"),
+        }
+    }
+
+    /// Instantiation fails if the supplied import is bound to the wrong module
+    /// or field name (the linker reports the missing required import).
+    #[test]
+    fn test_wasm_host_import_bad_name_fails_instantiate() {
+        let wat = r#"
+            (module
+                (import "env" "add" (func (param i32 i32) (result i32))))
+        "#;
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, wat).unwrap();
+        let cb: HostFuncCallback = Arc::new(|_args, _results| true);
+        let imports = vec![HostFunc {
+            module: "env".to_string(),
+            name: "other".to_string(),
+            params: vec![HostValKind::I32, HostValKind::I32],
+            results: vec![HostValKind::I32],
+            callback: cb,
+        }];
+        let result = WasmInstance::new_with_imports(&engine, &module, imports);
+        match result {
+            Ok(_) => panic!("instantiation should fail with mismatched import name"),
+            Err(StatorError::WasmError(_)) => {}
+            Err(other) => panic!("expected WasmError, got: {other:?}"),
+        }
+    }
+
+    /// Instantiation fails when the supplied host signature does not match the
+    /// module's import declaration.
+    #[test]
+    fn test_wasm_host_import_signature_mismatch_fails_instantiate() {
+        let wat = r#"
+            (module
+                (import "env" "f" (func (param i32 i32) (result i32))))
+        "#;
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, wat).unwrap();
+        let cb: HostFuncCallback = Arc::new(|_args, _results| true);
+        let imports = vec![HostFunc {
+            module: "env".to_string(),
+            name: "f".to_string(),
+            // Wrong: declared as f64/f64 -> f64.
+            params: vec![HostValKind::F64, HostValKind::F64],
+            results: vec![HostValKind::F64],
+            callback: cb,
+        }];
+        let result = WasmInstance::new_with_imports(&engine, &module, imports);
+        match result {
+            Ok(_) => panic!("instantiation should fail with mismatched signature"),
+            Err(StatorError::WasmError(_)) => {}
+            Err(other) => panic!("expected WasmError, got: {other:?}"),
+        }
+    }
+
+    /// A termination request issued before any Wasm runs must short-circuit
+    /// the next call with the canonical terminated message, even when the
+    /// module declares host imports.
+    #[test]
+    fn test_wasm_host_import_termination_before_call_returns_terminated() {
+        use crate::interpreter::{clear_interrupt_flag, set_interrupt_flag};
+        use std::sync::atomic::AtomicBool;
+
+        let wat = r#"
+            (module
+                (import "env" "add" (func $add (param i32 i32) (result i32)))
+                (func (export "go") (result i32)
+                    (call $add (i32.const 1) (i32.const 2))))
+        "#;
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, wat).unwrap();
+        let cb: HostFuncCallback = Arc::new(|args, results| {
+            if let (HostVal::I32(a), HostVal::I32(b)) = (args[0], args[1]) {
+                results[0] = HostVal::I32(a + b);
+                true
+            } else {
+                false
+            }
+        });
+        let imports = vec![HostFunc {
+            module: "env".to_string(),
+            name: "add".to_string(),
+            params: vec![HostValKind::I32, HostValKind::I32],
+            results: vec![HostValKind::I32],
+            callback: cb,
+        }];
+        let mut instance = WasmInstance::new_with_imports(&engine, &module, imports).unwrap();
+
+        let flag = AtomicBool::new(true);
+        // SAFETY: `flag` outlives the set/clear pair.
+        unsafe { set_interrupt_flag(&flag as *const _) };
+        let err = instance.call("go", &[]).unwrap_err();
+        clear_interrupt_flag();
+        match err {
+            StatorError::WasmError(msg) => assert_eq!(SCRIPT_TERMINATED_MESSAGE, msg),
+            other => panic!("expected WasmError, got: {other:?}"),
+        }
+    }
+
+    /// Host callbacks must run synchronously on the thread invoking the Wasm
+    /// call, not on any worker thread.
+    #[test]
+    fn test_wasm_host_import_runs_on_calling_thread() {
+        use std::sync::Mutex as StdMutex;
+        use std::thread::ThreadId;
+
+        let wat = r#"
+            (module
+                (import "env" "probe" (func $probe))
+                (func (export "go") (call $probe)))
+        "#;
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, wat).unwrap();
+        let observed: Arc<StdMutex<Option<ThreadId>>> = Arc::new(StdMutex::new(None));
+        let observed_cb = Arc::clone(&observed);
+        let cb: HostFuncCallback = Arc::new(move |_args, _results| {
+            *observed_cb.lock().unwrap() = Some(std::thread::current().id());
+            true
+        });
+        let imports = vec![HostFunc {
+            module: "env".to_string(),
+            name: "probe".to_string(),
+            params: vec![],
+            results: vec![],
+            callback: cb,
+        }];
+        let mut instance = WasmInstance::new_with_imports(&engine, &module, imports).unwrap();
+        instance.call("go", &[]).unwrap();
+        let seen = observed.lock().unwrap().expect("callback must have run");
+        assert_eq!(seen, std::thread::current().id());
     }
 
     // ── Value conversion ────────────────────────────────────────────────────

@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::io::Write as _;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use stator_jse::bytecode::bytecode_array::BytecodeArray;
@@ -33,7 +34,9 @@ use stator_jse::objects::js_object::JsObject;
 use stator_jse::objects::property_map::PropertyMap;
 use stator_jse::objects::value::{JsValue, NativeFn};
 use stator_jse::parser;
-use stator_jse::wasm::{WasmEngine, WasmInstance, WasmModule};
+use stator_jse::wasm::{
+    HostFunc, HostFuncCallback, HostVal, HostValKind, WasmEngine, WasmInstance, WasmModule,
+};
 
 /// An opaque isolate handle.
 ///
@@ -5726,15 +5729,141 @@ pub unsafe extern "C" fn stator_wasm_module_destroy(module: *mut StatorWasmModul
     }
 }
 
+/// C-ABI Wasm value kind used by host-import marshalling.
+///
+/// Discriminants are stable and embedders may rely on them.
+#[repr(u32)]
+#[derive(Copy, Clone, Debug)]
+pub enum StatorWasmValueKind {
+    /// 32-bit signed integer (`i32`).
+    StatorWasmValueKindI32 = 0,
+    /// 64-bit signed integer (`i64`).
+    StatorWasmValueKindI64 = 1,
+    /// 32-bit IEEE-754 float (`f32`).
+    StatorWasmValueKindF32 = 2,
+    /// 64-bit IEEE-754 float (`f64`).
+    StatorWasmValueKindF64 = 3,
+}
+
+/// C-ABI union payload of a [`StatorWasmValue`].
+///
+/// Only the variant indicated by the containing [`StatorWasmValue::kind`] is
+/// well-defined; reading any other variant is undefined behavior.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union StatorWasmValuePayload {
+    /// `i32` storage.
+    pub i32_: i32,
+    /// `i64` storage.
+    pub i64_: i64,
+    /// `f32` storage.
+    pub f32_: f32,
+    /// `f64` storage.
+    pub f64_: f64,
+}
+
+/// A typed Wasm value used at the host-import boundary.
+///
+/// `kind` discriminates the active union member.  Embedders must initialise
+/// the payload member matching `kind`; Stator only reads the active member.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct StatorWasmValue {
+    /// Discriminant for the active member of `value`.
+    pub kind: StatorWasmValueKind,
+    /// Typed payload.  The active member is selected by `kind`.
+    pub value: StatorWasmValuePayload,
+}
+
+/// Synchronous host-function callback used to fulfil a Wasm import.
+///
+/// Invoked synchronously on the thread running the Wasm caller.  Returns
+/// `true` after writing exactly `results_len` typed results into `results`.
+/// Returning `false` traps the running Wasm call: the enclosing
+/// [`stator_wasm_instance_call`] then returns null.
+///
+/// # Safety
+/// - `args` is a valid pointer for reads of `args_len` consecutive
+///   [`StatorWasmValue`]s.
+/// - `results` is a valid pointer for writes of `results_len` consecutive
+///   [`StatorWasmValue`]s.  Each slot must be initialised by the callback
+///   with the kind declared in [`StatorWasmHostFunc::results`].
+/// - `ctx` and `user_data` are the values supplied at instantiate time and
+///   must remain live for the duration of the call.
+pub type StatorWasmHostFuncCallback = unsafe extern "C" fn(
+    ctx: *mut StatorContext,
+    user_data: *mut c_void,
+    args: *const StatorWasmValue,
+    args_len: usize,
+    results: *mut StatorWasmValue,
+    results_len: usize,
+) -> bool;
+
+/// Declaration of a single Wasm host-function import.
+///
+/// `module_name` and `field_name` form the fully-qualified Wasm import name
+/// the module expects (e.g. `env` / `add`).  `params` / `results` arrays
+/// declare the signature, must point to valid storage for `params_len` /
+/// `results_len` elements respectively, and must match the signature the
+/// module declares for that import.  A null `callback` causes instantiation
+/// to fail.
+#[repr(C)]
+pub struct StatorWasmHostFunc {
+    /// Null-terminated UTF-8 import module name (e.g. `"env"`).
+    pub module_name: *const c_char,
+    /// Null-terminated UTF-8 import field name (e.g. `"add"`).
+    pub field_name: *const c_char,
+    /// Pointer to `params_len` parameter kinds, in order.  May be null when
+    /// `params_len` is zero.
+    pub params: *const StatorWasmValueKind,
+    /// Number of parameter kinds in `params`.
+    pub params_len: usize,
+    /// Pointer to `results_len` result kinds, in order.  May be null when
+    /// `results_len` is zero.
+    pub results: *const StatorWasmValueKind,
+    /// Number of result kinds in `results`.
+    pub results_len: usize,
+    /// Callback invoked on each Wasm-side call.  Required; null fails
+    /// instantiation.
+    pub callback: Option<
+        unsafe extern "C" fn(
+            ctx: *mut StatorContext,
+            user_data: *mut c_void,
+            args: *const StatorWasmValue,
+            args_len: usize,
+            results: *mut StatorWasmValue,
+            results_len: usize,
+        ) -> bool,
+    >,
+    /// Opaque embedder data passed unchanged to `callback`.  Stator does not
+    /// interpret this pointer.
+    pub user_data: *mut c_void,
+}
+
+/// A collection of host-function imports passed to [`stator_wasm_instantiate`].
+///
+/// A null pointer or a structure with `funcs_len == 0` declares "no imports".
+#[repr(C)]
+pub struct StatorWasmImports {
+    /// Pointer to `funcs_len` [`StatorWasmHostFunc`] elements.  May be null
+    /// when `funcs_len` is zero.
+    pub funcs: *const StatorWasmHostFunc,
+    /// Number of elements in `funcs`.
+    pub funcs_len: usize,
+}
+
 /// Instantiate a compiled [`StatorWasmModule`] into a live
 /// [`StatorWasmInstance`].
 ///
-/// `ctx` is accepted for future use and may be null.  `imports` is reserved for
-/// future use and **must** be null; passing a non-null value is currently
-/// ignored.
+/// `ctx` is captured and forwarded to every host-import callback; it may be
+/// null when no callback needs an isolate context.  `imports` may be null (or
+/// a struct with `funcs_len == 0`) to instantiate with no host imports; in
+/// that case the module must declare no imports of its own or instantiation
+/// fails.
 ///
-/// Returns a null pointer if `module` is null or if instantiation fails (e.g.
-/// the module requires imports that are not provided).
+/// Returns a null pointer if `module` is null, if any required import is
+/// missing or malformed (null callback, null name, invalid UTF-8, signature
+/// mismatch), or if instantiation fails.
 ///
 /// The returned pointer must eventually be passed to
 /// [`stator_wasm_instance_destroy`].
@@ -5742,22 +5871,214 @@ pub unsafe extern "C" fn stator_wasm_module_destroy(module: *mut StatorWasmModul
 /// # Safety
 /// - `module` must be a non-null, valid pointer to a live
 ///   [`StatorWasmModule`].
-/// - `ctx` must be either null or a valid, live [`StatorContext`] pointer.
-/// - `imports` must be null.
+/// - `ctx` must be either null or a valid, live [`StatorContext`] pointer
+///   that outlives every host callback invocation triggered through the
+///   returned instance.
+/// - `imports`, when non-null, must point to a valid [`StatorWasmImports`]
+///   whose inner arrays and strings remain valid for the duration of this
+///   call.  The structures are only read during instantiation; afterwards
+///   the embedder may reuse or free the storage.  However, every
+///   `user_data` pointer and the `ctx` pointer captured here must remain
+///   valid until [`stator_wasm_instance_destroy`] is called.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stator_wasm_instantiate(
     module: *mut StatorWasmModule,
-    _ctx: *mut StatorContext,
-    _imports: *const c_void,
+    ctx: *mut StatorContext,
+    imports: *const StatorWasmImports,
 ) -> *mut StatorWasmInstance {
     if module.is_null() {
         return std::ptr::null_mut();
     }
     // SAFETY: caller guarantees `module` is valid.
     let m = unsafe { &*module };
-    match WasmInstance::new(&m.engine, &m.module) {
+
+    let host_imports = if imports.is_null() {
+        Vec::new()
+    } else {
+        // SAFETY: caller guarantees `imports` is valid for one read.
+        match unsafe { build_host_imports(ctx, imports) } {
+            Some(v) => v,
+            None => return std::ptr::null_mut(),
+        }
+    };
+
+    match WasmInstance::new_with_imports(&m.engine, &m.module, host_imports) {
         Ok(instance) => Box::into_raw(Box::new(StatorWasmInstance { instance })),
         Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Marshal a C-ABI [`StatorWasmImports`] into a [`Vec<HostFunc>`] suitable for
+/// [`WasmInstance::new_with_imports`].
+///
+/// Returns `None` if any entry is malformed: null callback, null name, name
+/// not valid UTF-8, or kind arrays pointing nowhere with non-zero length.
+///
+/// # Safety
+/// `imports` must be a valid pointer to a [`StatorWasmImports`]; its inner
+/// arrays / strings must be valid for the duration of this call.
+unsafe fn build_host_imports(
+    ctx: *mut StatorContext,
+    imports: *const StatorWasmImports,
+) -> Option<Vec<HostFunc>> {
+    // SAFETY: caller guarantees `imports` is a valid pointer.
+    let imports = unsafe { &*imports };
+    if imports.funcs_len == 0 {
+        return Some(Vec::new());
+    }
+    if imports.funcs.is_null() {
+        return None;
+    }
+    // SAFETY: caller guarantees the slice is valid for `funcs_len` reads.
+    let funcs = unsafe { std::slice::from_raw_parts(imports.funcs, imports.funcs_len) };
+
+    let mut out: Vec<HostFunc> = Vec::with_capacity(funcs.len());
+    for f in funcs {
+        let cb_fn = match f.callback {
+            Some(cb) => cb,
+            None => return None,
+        };
+        if f.module_name.is_null() || f.field_name.is_null() {
+            return None;
+        }
+        if (f.params.is_null() && f.params_len != 0) || (f.results.is_null() && f.results_len != 0)
+        {
+            return None;
+        }
+        // SAFETY: caller guarantees the strings are valid null-terminated C
+        // strings for the duration of this call.
+        let module_name = match unsafe { CStr::from_ptr(f.module_name) }.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return None,
+        };
+        // SAFETY: as above.
+        let field_name = match unsafe { CStr::from_ptr(f.field_name) }.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return None,
+        };
+        let params: Vec<HostValKind> = if f.params_len == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: validated non-null above.
+            unsafe { std::slice::from_raw_parts(f.params, f.params_len) }
+                .iter()
+                .map(|k| stator_kind_to_host(*k))
+                .collect()
+        };
+        let results: Vec<HostValKind> = if f.results_len == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: validated non-null above.
+            unsafe { std::slice::from_raw_parts(f.results, f.results_len) }
+                .iter()
+                .map(|k| stator_kind_to_host(*k))
+                .collect()
+        };
+
+        // Wasmtime's `Linker::func_new` requires the closure to be
+        // `Send + Sync + 'static`.  Raw pointers are neither, even though
+        // Stator's Wasm runtime only invokes host callbacks synchronously on
+        // the calling thread.  Smuggle them through `usize` to satisfy the
+        // bound; the embedder is responsible for keeping `ctx` and
+        // `user_data` valid until the instance is destroyed.
+        let ctx_addr = ctx as usize;
+        let user_addr = f.user_data as usize;
+        let result_kinds = results.clone();
+        let callback: HostFuncCallback = Arc::new(move |args, out_results| {
+            let c_args: Vec<StatorWasmValue> = args.iter().map(host_val_to_stator).collect();
+            let mut c_results: Vec<StatorWasmValue> = result_kinds
+                .iter()
+                .map(|k| StatorWasmValue {
+                    kind: host_kind_to_stator(*k),
+                    value: StatorWasmValuePayload { i64_: 0 },
+                })
+                .collect();
+            // SAFETY: `cb_fn` is the embedder-provided extern "C" callback
+            // captured at instantiate time; `args` / `results` slices are
+            // valid for `len` reads/writes; `ctx` / `user_data` are the
+            // values supplied at instantiate time and the embedder is
+            // responsible for keeping them live until the instance is
+            // destroyed.
+            let ok = unsafe {
+                cb_fn(
+                    ctx_addr as *mut StatorContext,
+                    user_addr as *mut c_void,
+                    c_args.as_ptr(),
+                    c_args.len(),
+                    c_results.as_mut_ptr(),
+                    c_results.len(),
+                )
+            };
+            if !ok {
+                return false;
+            }
+            for (slot, c) in out_results.iter_mut().zip(c_results.iter()) {
+                *slot = stator_to_host_val(c);
+            }
+            true
+        });
+
+        out.push(HostFunc {
+            module: module_name,
+            name: field_name,
+            params,
+            results,
+            callback,
+        });
+    }
+    Some(out)
+}
+
+fn stator_kind_to_host(k: StatorWasmValueKind) -> HostValKind {
+    match k {
+        StatorWasmValueKind::StatorWasmValueKindI32 => HostValKind::I32,
+        StatorWasmValueKind::StatorWasmValueKindI64 => HostValKind::I64,
+        StatorWasmValueKind::StatorWasmValueKindF32 => HostValKind::F32,
+        StatorWasmValueKind::StatorWasmValueKindF64 => HostValKind::F64,
+    }
+}
+
+fn host_kind_to_stator(k: HostValKind) -> StatorWasmValueKind {
+    match k {
+        HostValKind::I32 => StatorWasmValueKind::StatorWasmValueKindI32,
+        HostValKind::I64 => StatorWasmValueKind::StatorWasmValueKindI64,
+        HostValKind::F32 => StatorWasmValueKind::StatorWasmValueKindF32,
+        HostValKind::F64 => StatorWasmValueKind::StatorWasmValueKindF64,
+    }
+}
+
+fn host_val_to_stator(v: &HostVal) -> StatorWasmValue {
+    match *v {
+        HostVal::I32(n) => StatorWasmValue {
+            kind: StatorWasmValueKind::StatorWasmValueKindI32,
+            value: StatorWasmValuePayload { i32_: n },
+        },
+        HostVal::I64(n) => StatorWasmValue {
+            kind: StatorWasmValueKind::StatorWasmValueKindI64,
+            value: StatorWasmValuePayload { i64_: n },
+        },
+        HostVal::F32(f) => StatorWasmValue {
+            kind: StatorWasmValueKind::StatorWasmValueKindF32,
+            value: StatorWasmValuePayload { f32_: f },
+        },
+        HostVal::F64(f) => StatorWasmValue {
+            kind: StatorWasmValueKind::StatorWasmValueKindF64,
+            value: StatorWasmValuePayload { f64_: f },
+        },
+    }
+}
+
+fn stator_to_host_val(v: &StatorWasmValue) -> HostVal {
+    // SAFETY: the embedder must initialise the union member that matches
+    // `kind`; reading any other member would be UB.  We document this
+    // contract on [`StatorWasmValue`].
+    unsafe {
+        match v.kind {
+            StatorWasmValueKind::StatorWasmValueKindI32 => HostVal::I32(v.value.i32_),
+            StatorWasmValueKind::StatorWasmValueKindI64 => HostVal::I64(v.value.i64_),
+            StatorWasmValueKind::StatorWasmValueKindF32 => HostVal::F32(v.value.f32_),
+            StatorWasmValueKind::StatorWasmValueKindF64 => HostVal::F64(v.value.f64_),
+        }
     }
 }
 
@@ -10424,6 +10745,277 @@ mod tests {
             stator_wasm_instance_destroy(inst);
             stator_wasm_module_destroy(m);
         }
+    }
+
+    // ── Wasm host imports (FFI) ───────────────────────────────────────────
+
+    /// FFI host-import callback: integer add through `env.add(i32,i32) -> i32`.
+    unsafe extern "C" fn ffi_add_cb(
+        _ctx: *mut StatorContext,
+        _user_data: *mut c_void,
+        args: *const StatorWasmValue,
+        args_len: usize,
+        results: *mut StatorWasmValue,
+        results_len: usize,
+    ) -> bool {
+        if args_len != 2 || results_len != 1 {
+            return false;
+        }
+        // SAFETY: caller passed args/results slices of the declared sizes.
+        let a = unsafe { (*args.add(0)).value.i32_ };
+        let b = unsafe { (*args.add(1)).value.i32_ };
+        unsafe {
+            (*results.add(0)).kind = StatorWasmValueKind::StatorWasmValueKindI32;
+            (*results.add(0)).value.i32_ = a.wrapping_add(b);
+        }
+        true
+    }
+
+    unsafe extern "C" fn ffi_trap_cb(
+        _ctx: *mut StatorContext,
+        _user_data: *mut c_void,
+        _args: *const StatorWasmValue,
+        _args_len: usize,
+        _results: *mut StatorWasmValue,
+        _results_len: usize,
+    ) -> bool {
+        false
+    }
+
+    /// FFI host import: compile, instantiate with `env.add`, call exported
+    /// `call_add(3, 4)` and observe `7`.
+    #[test]
+    fn test_ffi_wasm_host_import_add() {
+        let iso = IsolateGuard::new();
+        let wat: &[u8] = br#"
+            (module
+                (import "env" "add" (func $add (param i32 i32) (result i32)))
+                (func (export "call_add") (param i32 i32) (result i32)
+                    local.get 0
+                    local.get 1
+                    call $add))
+        "#;
+        // SAFETY: `iso` is valid; `wat` is valid WAT.
+        let m = unsafe { stator_wasm_compile(iso.as_ptr(), wat.as_ptr(), wat.len()) };
+        assert!(!m.is_null());
+
+        let params = [
+            StatorWasmValueKind::StatorWasmValueKindI32,
+            StatorWasmValueKind::StatorWasmValueKindI32,
+        ];
+        let results = [StatorWasmValueKind::StatorWasmValueKindI32];
+        let host = StatorWasmHostFunc {
+            module_name: c"env".as_ptr(),
+            field_name: c"add".as_ptr(),
+            params: params.as_ptr(),
+            params_len: params.len(),
+            results: results.as_ptr(),
+            results_len: results.len(),
+            callback: Some(ffi_add_cb),
+            user_data: std::ptr::null_mut(),
+        };
+        let imports = StatorWasmImports {
+            funcs: &host,
+            funcs_len: 1,
+        };
+        // SAFETY: pointers are valid.
+        let inst = unsafe { stator_wasm_instantiate(m, std::ptr::null_mut(), &imports) };
+        assert!(
+            !inst.is_null(),
+            "instantiate with valid imports must succeed"
+        );
+
+        let name = c"call_add";
+        // SAFETY: iso valid.
+        let a = unsafe { stator_value_new_number(iso.as_ptr(), 3.0) };
+        let b = unsafe { stator_value_new_number(iso.as_ptr(), 4.0) };
+        let argv: [*const StatorValue; 2] = [a, b];
+        // SAFETY: all pointers valid.
+        let res = unsafe {
+            stator_wasm_instance_call(inst, iso.as_ptr(), name.as_ptr(), argv.as_ptr(), argv.len())
+        };
+        assert!(!res.is_null());
+        // SAFETY: res valid.
+        let n = unsafe { stator_value_as_number(res) };
+        assert_eq!(n, 7.0);
+        // SAFETY: all pointers valid.
+        unsafe {
+            stator_value_destroy(res);
+            stator_value_destroy(a);
+            stator_value_destroy(b);
+            stator_wasm_instance_destroy(inst);
+            stator_wasm_module_destroy(m);
+        }
+    }
+
+    /// Host callback returning `false` traps the Wasm caller and the FFI call
+    /// returns null.
+    #[test]
+    fn test_ffi_wasm_host_import_trap_returns_null() {
+        let iso = IsolateGuard::new();
+        let wat: &[u8] = br#"
+            (module
+                (import "env" "bad" (func $bad (result i32)))
+                (func (export "go") (result i32) (call $bad)))
+        "#;
+        // SAFETY: valid input.
+        let m = unsafe { stator_wasm_compile(iso.as_ptr(), wat.as_ptr(), wat.len()) };
+        assert!(!m.is_null());
+        let results = [StatorWasmValueKind::StatorWasmValueKindI32];
+        let host = StatorWasmHostFunc {
+            module_name: c"env".as_ptr(),
+            field_name: c"bad".as_ptr(),
+            params: std::ptr::null(),
+            params_len: 0,
+            results: results.as_ptr(),
+            results_len: results.len(),
+            callback: Some(ffi_trap_cb),
+            user_data: std::ptr::null_mut(),
+        };
+        let imports = StatorWasmImports {
+            funcs: &host,
+            funcs_len: 1,
+        };
+        // SAFETY: valid.
+        let inst = unsafe { stator_wasm_instantiate(m, std::ptr::null_mut(), &imports) };
+        assert!(!inst.is_null());
+        let name = c"go";
+        // SAFETY: valid.
+        let res = unsafe {
+            stator_wasm_instance_call(inst, iso.as_ptr(), name.as_ptr(), std::ptr::null(), 0)
+        };
+        assert!(res.is_null(), "callback returning false must trap the call");
+        // SAFETY: valid pointers.
+        unsafe {
+            stator_wasm_instance_destroy(inst);
+            stator_wasm_module_destroy(m);
+        }
+    }
+
+    /// Instantiate fails when a required import is not supplied.
+    #[test]
+    fn test_ffi_wasm_host_import_missing_returns_null() {
+        let iso = IsolateGuard::new();
+        let wat: &[u8] = br#"
+            (module
+                (import "env" "missing" (func (result i32))))
+        "#;
+        // SAFETY: valid.
+        let m = unsafe { stator_wasm_compile(iso.as_ptr(), wat.as_ptr(), wat.len()) };
+        assert!(!m.is_null());
+        // No imports supplied — instantiate must fail.
+        // SAFETY: valid.
+        let inst = unsafe { stator_wasm_instantiate(m, std::ptr::null_mut(), std::ptr::null()) };
+        assert!(inst.is_null());
+        // SAFETY: valid.
+        unsafe { stator_wasm_module_destroy(m) };
+    }
+
+    /// Instantiate fails when the supplied import is bound under the wrong
+    /// field name.
+    #[test]
+    fn test_ffi_wasm_host_import_bad_name_returns_null() {
+        let iso = IsolateGuard::new();
+        let wat: &[u8] = br#"
+            (module
+                (import "env" "add" (func (param i32 i32) (result i32))))
+        "#;
+        // SAFETY: valid.
+        let m = unsafe { stator_wasm_compile(iso.as_ptr(), wat.as_ptr(), wat.len()) };
+        let params = [
+            StatorWasmValueKind::StatorWasmValueKindI32,
+            StatorWasmValueKind::StatorWasmValueKindI32,
+        ];
+        let results = [StatorWasmValueKind::StatorWasmValueKindI32];
+        let host = StatorWasmHostFunc {
+            module_name: c"env".as_ptr(),
+            field_name: c"other".as_ptr(),
+            params: params.as_ptr(),
+            params_len: params.len(),
+            results: results.as_ptr(),
+            results_len: results.len(),
+            callback: Some(ffi_add_cb),
+            user_data: std::ptr::null_mut(),
+        };
+        let imports = StatorWasmImports {
+            funcs: &host,
+            funcs_len: 1,
+        };
+        // SAFETY: valid.
+        let inst = unsafe { stator_wasm_instantiate(m, std::ptr::null_mut(), &imports) };
+        assert!(inst.is_null(), "bad field name must fail instantiate");
+        // SAFETY: valid.
+        unsafe { stator_wasm_module_destroy(m) };
+    }
+
+    /// Instantiate fails when the supplied import signature does not match
+    /// the module's declaration.
+    #[test]
+    fn test_ffi_wasm_host_import_bad_signature_returns_null() {
+        let iso = IsolateGuard::new();
+        let wat: &[u8] = br#"
+            (module
+                (import "env" "f" (func (param i32 i32) (result i32))))
+        "#;
+        // SAFETY: valid.
+        let m = unsafe { stator_wasm_compile(iso.as_ptr(), wat.as_ptr(), wat.len()) };
+        let params = [StatorWasmValueKind::StatorWasmValueKindF64];
+        let results = [StatorWasmValueKind::StatorWasmValueKindF64];
+        let host = StatorWasmHostFunc {
+            module_name: c"env".as_ptr(),
+            field_name: c"f".as_ptr(),
+            params: params.as_ptr(),
+            params_len: params.len(),
+            results: results.as_ptr(),
+            results_len: results.len(),
+            callback: Some(ffi_add_cb),
+            user_data: std::ptr::null_mut(),
+        };
+        let imports = StatorWasmImports {
+            funcs: &host,
+            funcs_len: 1,
+        };
+        // SAFETY: valid.
+        let inst = unsafe { stator_wasm_instantiate(m, std::ptr::null_mut(), &imports) };
+        assert!(inst.is_null(), "bad signature must fail instantiate");
+        // SAFETY: valid.
+        unsafe { stator_wasm_module_destroy(m) };
+    }
+
+    /// Null callback in a host import declaration is rejected.
+    #[test]
+    fn test_ffi_wasm_host_import_null_callback_returns_null() {
+        let iso = IsolateGuard::new();
+        let wat: &[u8] = br#"
+            (module
+                (import "env" "add" (func (param i32 i32) (result i32))))
+        "#;
+        // SAFETY: valid.
+        let m = unsafe { stator_wasm_compile(iso.as_ptr(), wat.as_ptr(), wat.len()) };
+        let params = [
+            StatorWasmValueKind::StatorWasmValueKindI32,
+            StatorWasmValueKind::StatorWasmValueKindI32,
+        ];
+        let results = [StatorWasmValueKind::StatorWasmValueKindI32];
+        let host = StatorWasmHostFunc {
+            module_name: c"env".as_ptr(),
+            field_name: c"add".as_ptr(),
+            params: params.as_ptr(),
+            params_len: params.len(),
+            results: results.as_ptr(),
+            results_len: results.len(),
+            callback: None,
+            user_data: std::ptr::null_mut(),
+        };
+        let imports = StatorWasmImports {
+            funcs: &host,
+            funcs_len: 1,
+        };
+        // SAFETY: valid.
+        let inst = unsafe { stator_wasm_instantiate(m, std::ptr::null_mut(), &imports) };
+        assert!(inst.is_null());
+        // SAFETY: valid.
+        unsafe { stator_wasm_module_destroy(m) };
     }
 
     // ── ObjectTemplate tests ─────────────────────────────────────────────
