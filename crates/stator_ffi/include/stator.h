@@ -674,7 +674,9 @@ typedef union StatorWasmValuePayload {
  * A typed Wasm value used at the host-import boundary.
  *
  * `kind` discriminates the active union member.  Embedders must initialise
- * the payload member matching `kind`; Stator only reads the active member.
+ * the payload member matching both `kind` and the result kind declared on the
+ * host import; Stator traps the Wasm call if a callback returns a mismatched
+ * result kind.
  */
 typedef struct StatorWasmValue {
   /**
@@ -848,7 +850,9 @@ typedef struct StatorEmbedderCallbacks {
  *
  * Invoked synchronously on the thread running the Wasm caller.  Returns
  * `true` after writing exactly `results_len` typed results into `results`.
- * Returning `false` traps the running Wasm call: the enclosing
+ * Result kinds must match the declaration in [`StatorWasmHostFunc::results`].
+ * Returning `false` or a mismatched result kind traps the running Wasm call:
+ * the enclosing
  * [`stator_wasm_instance_call`] then returns null.
  *
  * # Safety

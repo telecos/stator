@@ -5733,7 +5733,7 @@ pub unsafe extern "C" fn stator_wasm_module_destroy(module: *mut StatorWasmModul
 ///
 /// Discriminants are stable and embedders may rely on them.
 #[repr(u32)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum StatorWasmValueKind {
     /// 32-bit signed integer (`i32`).
     StatorWasmValueKindI32 = 0,
@@ -5765,7 +5765,9 @@ pub union StatorWasmValuePayload {
 /// A typed Wasm value used at the host-import boundary.
 ///
 /// `kind` discriminates the active union member.  Embedders must initialise
-/// the payload member matching `kind`; Stator only reads the active member.
+/// the payload member matching both `kind` and the result kind declared on the
+/// host import; Stator traps the Wasm call if a callback returns a mismatched
+/// result kind.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct StatorWasmValue {
@@ -5779,7 +5781,9 @@ pub struct StatorWasmValue {
 ///
 /// Invoked synchronously on the thread running the Wasm caller.  Returns
 /// `true` after writing exactly `results_len` typed results into `results`.
-/// Returning `false` traps the running Wasm call: the enclosing
+/// Result kinds must match the declaration in [`StatorWasmHostFunc::results`].
+/// Returning `false` or a mismatched result kind traps the running Wasm call:
+/// the enclosing
 /// [`stator_wasm_instance_call`] then returns null.
 ///
 /// # Safety
@@ -6011,6 +6015,14 @@ unsafe fn build_host_imports(
             };
             if !ok {
                 return false;
+            }
+            if out_results.len() != c_results.len() {
+                return false;
+            }
+            for (expected, c) in result_kinds.iter().zip(c_results.iter()) {
+                if c.kind != host_kind_to_stator(*expected) {
+                    return false;
+                }
             }
             for (slot, c) in out_results.iter_mut().zip(c_results.iter()) {
                 *slot = stator_to_host_val(c);
@@ -10782,6 +10794,24 @@ mod tests {
         false
     }
 
+    unsafe extern "C" fn ffi_wrong_result_kind_cb(
+        _ctx: *mut StatorContext,
+        _user_data: *mut c_void,
+        _args: *const StatorWasmValue,
+        _args_len: usize,
+        results: *mut StatorWasmValue,
+        results_len: usize,
+    ) -> bool {
+        if results_len != 1 {
+            return false;
+        }
+        unsafe {
+            (*results.add(0)).kind = StatorWasmValueKind::StatorWasmValueKindF64;
+            (*results.add(0)).value.f64_ = 42.0;
+        }
+        true
+    }
+
     /// FFI host import: compile, instantiate with `env.add`, call exported
     /// `call_add(3, 4)` and observe `7`.
     #[test]
@@ -10885,6 +10915,51 @@ mod tests {
             stator_wasm_instance_call(inst, iso.as_ptr(), name.as_ptr(), std::ptr::null(), 0)
         };
         assert!(res.is_null(), "callback returning false must trap the call");
+        // SAFETY: valid pointers.
+        unsafe {
+            stator_wasm_instance_destroy(inst);
+            stator_wasm_module_destroy(m);
+        }
+    }
+
+    /// A callback that writes a result kind different from the declared Wasm
+    /// import signature traps instead of letting Stator reinterpret the union
+    /// payload as the wrong type.
+    #[test]
+    fn test_ffi_wasm_host_import_wrong_result_kind_traps() {
+        let iso = IsolateGuard::new();
+        let wat: &[u8] = br#"
+            (module
+                (import "env" "bad" (func $bad (result i32)))
+                (func (export "go") (result i32) (call $bad)))
+        "#;
+        // SAFETY: valid input.
+        let m = unsafe { stator_wasm_compile(iso.as_ptr(), wat.as_ptr(), wat.len()) };
+        assert!(!m.is_null());
+        let results = [StatorWasmValueKind::StatorWasmValueKindI32];
+        let host = StatorWasmHostFunc {
+            module_name: c"env".as_ptr(),
+            field_name: c"bad".as_ptr(),
+            params: std::ptr::null(),
+            params_len: 0,
+            results: results.as_ptr(),
+            results_len: results.len(),
+            callback: Some(ffi_wrong_result_kind_cb),
+            user_data: std::ptr::null_mut(),
+        };
+        let imports = StatorWasmImports {
+            funcs: &host,
+            funcs_len: 1,
+        };
+        // SAFETY: valid.
+        let inst = unsafe { stator_wasm_instantiate(m, std::ptr::null_mut(), &imports) };
+        assert!(!inst.is_null());
+        let name = c"go";
+        // SAFETY: valid.
+        let res = unsafe {
+            stator_wasm_instance_call(inst, iso.as_ptr(), name.as_ptr(), std::ptr::null(), 0)
+        };
+        assert!(res.is_null(), "wrong result kind must trap the call");
         // SAFETY: valid pointers.
         unsafe {
             stator_wasm_instance_destroy(inst);
