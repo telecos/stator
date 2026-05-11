@@ -1170,6 +1170,36 @@ pub fn script_terminated_error() -> StatorError {
     StatorError::Internal(SCRIPT_TERMINATED_MESSAGE.to_string())
 }
 
+/// JIT-callable thunk that polls the embedder interrupt flag.
+///
+/// JIT-emitted code (currently Maglev loop headers) calls this `extern "C"`
+/// function once per polling site to detect host-requested termination
+/// without forcing every loop iteration to materialise a thread-local
+/// pointer through the platform TLS ABI.  The return value is `1` when the
+/// embedder has requested termination on this thread, `0` otherwise.
+///
+/// The function returns a `u32` so the System V / Win64 ABI clears the
+/// upper 32 bits of `RAX` on return; JIT-emitted callers can therefore
+/// test the whole `RAX` register (`test rax, rax`) without first
+/// zero-extending the result.
+///
+/// This is a tiny no-state wrapper around [`check_interrupt_flag`] and is
+/// safe to call from any thread that previously published its interrupt
+/// flag through [`set_interrupt_flag`].
+#[unsafe(no_mangle)]
+pub extern "C" fn stator_jit_poll_terminated() -> u32 {
+    if check_interrupt_flag() { 1 } else { 0 }
+}
+
+/// Address of the [`stator_jit_poll_terminated`] thunk as a raw integer,
+/// suitable for embedding into JIT-emitted `mov rN, imm64; call rN`
+/// sequences.  Centralising the cast keeps `unsafe` transmute-style
+/// reasoning out of the codegen modules.
+#[inline]
+pub fn stator_jit_poll_terminated_addr() -> usize {
+    stator_jit_poll_terminated as *const () as usize
+}
+
 /// Process-wide count of successful Maglev compilations.
 ///
 /// Uses atomics so the background compilation thread can update the counter
@@ -1946,7 +1976,18 @@ fn try_execute_maglev_raw(ba: &BytecodeArray, args: &[JsValue]) -> Option<i64> {
                 }
                 c.set(cats);
             });
-            ba.mark_jit_maglev_deopted();
+            // Embedder-requested termination is not a code-quality deopt
+            // and must not retire the JIT entry for this function: the
+            // termination flag is sticky only until the embedder clears
+            // it, and we want the function to remain tiered for any
+            // future runs.  The interpreter fallback path immediately
+            // observes the same flag at function entry and surfaces a
+            // `script execution terminated` error through the canonical
+            // unwind path.
+            use crate::compiler::baseline::compiler::JIT_DEOPT_TERMINATED;
+            if result != JIT_DEOPT_TERMINATED {
+                ba.mark_jit_maglev_deopted();
+            }
             None
         } else {
             MAGLEV_DIAG_EXECUTED.with(|c| c.set(c.get() + 1));

@@ -122,6 +122,11 @@ pub const JIT_DEOPT_OVERFLOW: i64 = i64::MIN + 1;
 pub const JIT_DEOPT_STUB: i64 = i64::MIN + 2;
 /// Deopt reason: promoted global load failed.
 pub const JIT_DEOPT_GLOBAL: i64 = i64::MIN + 3;
+/// Deopt reason: embedder requested termination via the published interrupt
+/// flag.  Emitted by JIT-side polling at loop headers; the interpreter's
+/// post-JIT fallback observes the same thread-local flag at function entry
+/// and surfaces a `script execution terminated` error.
+pub const JIT_DEOPT_TERMINATED: i64 = i64::MIN + 4;
 /// Deopt reason: integer division by zero.
 pub const JIT_DEOPT_DIVZERO: i64 = i64::MIN + 5;
 

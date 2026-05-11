@@ -10013,6 +10013,56 @@ mod tests {
         }
     }
 
+    /// A JIT-resident hot loop must observe termination via the Maglev
+    /// loop-header poll without first returning to the interpreter.
+    #[test]
+    fn test_isolate_terminate_aborts_maglev_jit_hot_loop() {
+        #[derive(Copy, Clone)]
+        struct IsoPtr(usize);
+        // SAFETY: only an atomic store is performed off-thread.
+        unsafe impl Send for IsoPtr {}
+
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        assert!(!ctx.is_null());
+
+        // JIT remains enabled (default).  The function is warmed up so
+        // Maglev compiles it, then the inner loop runs JIT-resident and
+        // must be terminated by the loop-header termination poll.
+        let src = b"function f(){var i=0;for(;;){i=i+1|0}} \
+                    for (var w=0; w<5000; w++){} \
+                    f();";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        assert!(!script.is_null());
+
+        let iso_ptr = IsoPtr(iso.as_ptr() as usize);
+        let killer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            unsafe {
+                stator_isolate_terminate_execution(iso_ptr.0 as *mut StatorIsolate);
+            }
+        });
+
+        let start = std::time::Instant::now();
+        let result = unsafe { stator_script_run(script, ctx) };
+        let elapsed = start.elapsed();
+        killer.join().unwrap();
+
+        assert!(result.is_null());
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "JIT hot loop did not terminate in time: {:?}",
+            elapsed
+        );
+
+        unsafe {
+            stator_isolate_cancel_terminate_execution(iso.as_ptr());
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
+    }
+
     /// A microtask flood must observe termination between tasks.  We drive
     /// the microtask queue directly to keep the test independent of the
     /// FFI surface for Promise microtask draining.

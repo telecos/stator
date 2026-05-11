@@ -659,6 +659,10 @@ struct MaglevCodegen<'a> {
     deopt_stub_label: Label,
     deopt_global_label: Label,
     deopt_divzero_label: Label,
+    /// Deopt entry point taken when an in-loop poll observes that the
+    /// embedder has requested termination.  Falls through to
+    /// `deopt_common_label` after setting `RAX = JIT_DEOPT_TERMINATED`.
+    deopt_terminated_label: Label,
     /// Common deopt exit (pops + ret, does NOT overwrite RAX).
     deopt_common_label: Label,
     safepoints: Vec<SafepointEntry>,
@@ -906,6 +910,7 @@ impl<'a> MaglevCodegen<'a> {
             deopt_stub_label: Label::new(),
             deopt_global_label: Label::new(),
             deopt_divzero_label: Label::new(),
+            deopt_terminated_label: Label::new(),
             deopt_common_label: Label::new(),
             safepoints: Vec::new(),
             deopt_entries: Vec::new(),
@@ -1214,6 +1219,7 @@ impl<'a> MaglevCodegen<'a> {
     fn emit_deopt_epilogue(&mut self) {
         use crate::compiler::baseline::compiler::{
             JIT_DEOPT_DIVZERO, JIT_DEOPT_GLOBAL, JIT_DEOPT_OVERFLOW, JIT_DEOPT_STUB,
+            JIT_DEOPT_TERMINATED,
         };
 
         // Category-specific entry points.
@@ -1231,6 +1237,14 @@ impl<'a> MaglevCodegen<'a> {
 
         self.masm.bind_label(&mut self.deopt_divzero_label);
         self.masm.mov_ri(Reg64::Rax, JIT_DEOPT_DIVZERO);
+        self.masm.jmp(&mut self.deopt_common_label);
+
+        // Embedder-requested termination: discovered by a loop-header
+        // poll.  The interrupt flag is still set when control reaches
+        // here, so the interpreter fallback will surface a
+        // `script execution terminated` error at function entry.
+        self.masm.bind_label(&mut self.deopt_terminated_label);
+        self.masm.mov_ri(Reg64::Rax, JIT_DEOPT_TERMINATED);
         self.masm.jmp(&mut self.deopt_common_label);
 
         // Uncategorised fallback (existing deopt paths that still use
@@ -1283,6 +1297,23 @@ impl<'a> MaglevCodegen<'a> {
         // Entering a new block invalidates register forwarding — control flow
         // from multiple predecessors may leave different values in RAX.
         self.clear_reg_forwarding();
+
+        // Loop-header termination poll.  Loops are the only construct that
+        // can keep JIT-compiled code running indefinitely without ever
+        // returning to the interpreter, so a single poll at each loop
+        // header is sufficient to guarantee bounded latency for embedder-
+        // requested termination (see
+        // `crate::interpreter::stator_jit_poll_terminated`).  The poll
+        // saves only the caller-saved registers that the function
+        // actually allocates and uses the host-ABI helper-call sequence,
+        // so it respects the Win64 shadow space.
+        #[cfg(any(
+            stator_maglev_jit_x86_64,
+            all(target_arch = "x86_64", any(unix, windows))
+        ))]
+        if block.is_loop_header {
+            self.emit_loop_header_termination_poll();
+        }
 
         // Record one safepoint per block (conservative GC point).
         self.safepoints.push(SafepointEntry {
@@ -4430,6 +4461,51 @@ impl<'a> MaglevCodegen<'a> {
     // **live across** the call (determined per-call-site by the register
     // allocator's liveness data), set up arguments using the host helper-call
     // ABI, call the extern "C" stub, check for JIT_DEOPT, and store the result.
+
+    /// Emit a termination-flag poll at a loop header.
+    ///
+    /// Calls the `extern "C"` thunk
+    /// [`crate::interpreter::stator_jit_poll_terminated`] which returns a
+    /// `u8` (`1` ⇒ embedder requested termination on this thread, `0`
+    /// otherwise).  On a non-zero return the generated code jumps to
+    /// `deopt_terminated_label`, which loads `JIT_DEOPT_TERMINATED` into
+    /// RAX and falls through the common deopt epilogue (callee-saved pop
+    /// + `ret`).  All caller-saved registers actually allocated by this
+    /// function are preserved across the call; the host ABI's shadow-
+    /// space requirement is honoured by
+    /// [`Self::emit_helper_call_pre_adjust`].
+    ///
+    /// The whole sequence on a "typical" loop with no caller-saved
+    /// allocations is roughly:
+    ///
+    /// ```text
+    ///   push r11                    ; align (saved-count = 0 → even)
+    ///   mov  r11, <addr_of_thunk>
+    ///   [sub rsp, 32]                ; Win64 shadow space only
+    ///   call r11
+    ///   [add rsp, 32]                ; Win64 shadow space only
+    ///   pop  r11                    ; un-align
+    ///   test al, al
+    ///   jne  deopt_terminated_label
+    /// ```
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
+    fn emit_loop_header_termination_poll(&mut self) {
+        let saved = self.emit_save_live_regs(NodeId(0));
+        let addr = crate::interpreter::stator_jit_poll_terminated_addr() as i64;
+        self.masm.mov_ri(Reg64::R11, addr);
+        let adj = self.emit_helper_call_pre_adjust();
+        self.masm.call_reg(Reg64::R11);
+        self.emit_helper_call_post_adjust(adj);
+        self.emit_restore_live_regs(saved);
+        // `test rax, rax` sets ZF=1 iff the thunk returned 0 (no
+        // termination).  Branch on NotZero (== "termination requested").
+        self.masm.test_rr(Reg64::Rax, Reg64::Rax);
+        self.masm
+            .jcc(CondCode::NotEqual, &mut self.deopt_terminated_label);
+    }
 
     /// Save only the caller-saved registers that are **live across**
     /// `at_node`.  Returns a bitmask of the saved register indices so that
@@ -11667,6 +11743,77 @@ mod tests {
     }
 
     // ── Execution tests (x86-64 / unix only) ─────────────────────────────────
+
+    /// Loop headers must embed a call to the [`stator_jit_poll_terminated`]
+    /// thunk so JIT-emitted code observes embedder-requested termination.
+    ///
+    /// We compile a single-block graph that we artificially mark as a loop
+    /// header (the codegen treats `is_loop_header` as a pure flag: alignment
+    /// padding + termination poll), then scan the produced code bytes for
+    /// the 8-byte little-endian address of the thunk that the helper-call
+    /// sequence loads into `R11` before the indirect `CALL`.
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
+    #[test]
+    fn loop_header_emits_termination_poll_call() {
+        let addr = crate::interpreter::stator_jit_poll_terminated_addr() as u64;
+        let addr_bytes = addr.to_le_bytes();
+
+        let mut graph = MaglevGraph::new(0);
+        let mut b0 = BasicBlock::new(0);
+        b0.is_loop_header = true;
+        let c = b0.push_value(ValueNode::SmiConstant { value: 0 });
+        b0.set_control(ControlNode::Return { value: c });
+        graph.add_block(b0);
+
+        let cc = do_compile(&graph, 0);
+        assert!(
+            cc.code.windows(8).any(|w| w == addr_bytes),
+            "loop-header termination poll did not embed thunk address {addr:#x} \
+             in the {} bytes of generated code",
+            cc.code.len()
+        );
+    }
+
+    /// A loop-header block that runs after the interrupt flag is already
+    /// set must short-circuit through the new deopt path and return the
+    /// [`JIT_DEOPT_TERMINATED`] sentinel.  Together with the per-function
+    /// poll at every iteration this guarantees that hot loops compiled by
+    /// Maglev are terminable on Windows and Unix x86-64.
+    #[cfg(any(
+        stator_maglev_jit_x86_64,
+        all(target_arch = "x86_64", any(unix, windows))
+    ))]
+    #[test]
+    fn loop_header_poll_returns_terminated_when_flag_set() {
+        use crate::compiler::baseline::compiler::JIT_DEOPT_TERMINATED;
+        use crate::interpreter::{clear_interrupt_flag, set_interrupt_flag};
+        use std::sync::atomic::AtomicBool;
+
+        let mut graph = MaglevGraph::new(0);
+        let mut b0 = BasicBlock::new(0);
+        b0.is_loop_header = true;
+        let c = b0.push_value(ValueNode::SmiConstant { value: 7 });
+        b0.set_control(ControlNode::Return { value: c });
+        graph.add_block(b0);
+
+        let cc = do_compile(&graph, 0);
+
+        let flag = AtomicBool::new(true);
+        // SAFETY: `flag` outlives the JIT call (and we clear before drop).
+        unsafe { set_interrupt_flag(&flag as *const _) };
+        // SAFETY: code was produced by MaglevCodegen from a well-formed graph.
+        let result = unsafe { cc.execute(&[]) }.expect("execute returned Err");
+        clear_interrupt_flag();
+
+        assert_eq!(
+            result, JIT_DEOPT_TERMINATED,
+            "loop-header poll must return JIT_DEOPT_TERMINATED when the \
+             interrupt flag is set; got {result:#x}"
+        );
+    }
 
     #[cfg(any(
         stator_maglev_jit_x86_64,
