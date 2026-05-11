@@ -640,15 +640,28 @@ void *stator_isolate_get_data(const struct StatorIsolate *isolate, uint32_t slot
 /**
  * Request that JavaScript execution on `isolate` be terminated.
  *
- * Mirrors `v8::Isolate::TerminateExecution`.  Sets a sticky flag on the
- * isolate; subsequent calls to [`stator_script_run`] will refuse to start a
- * new script while the flag is set, returning a null result and recording a
- * JavaScript-style termination exception via [`stator_isolate_throw_exception`]
- * where applicable.  The flag remains set until explicitly cleared via
+ * Mirrors `v8::Isolate::TerminateExecution`.  Sets a sticky atomic flag on
+ * the isolate; the interpreter polls this flag at backward branches,
+ * function-call boundaries, and between microtasks, and unwinds the running
+ * script with a script-execution-terminated error visible through the
+ * existing pending-exception / try-catch reporting paths.  Subsequent calls
+ * to [`stator_script_run`] will also refuse to start a new script while the
+ * flag is set.  The flag remains set until explicitly cleared via
  * [`stator_isolate_cancel_terminate_execution`].
  *
- * Note: This is currently plumbing only.  The interpreter does not yet poll
- * the flag mid-execution; integration will follow in a subsequent change.
+ * This function is safe to call from any thread; the underlying flag is
+ * atomic.  Concurrency on the rest of the isolate is still the embedder's
+ * responsibility.
+ *
+ * Limitations:
+ * * Baseline / Maglev / Turbofan JIT-emitted machine code does not poll
+ *   the flag in this slice.  Termination is observed at the next
+ *   interpreter boundary (JIT return / deopt / runtime stub).  Hostile
+ *   code that stays inside JIT code indefinitely is not terminable until
+ *   it re-enters the interpreter; embedders running untrusted code should
+ *   currently call [`stator_isolate_set_jit_disabled`].
+ * * Wasm execution does not poll the flag; termination is observed at the
+ *   next JS↔Wasm boundary.
  *
  * Does nothing when `isolate` is null.
  *
@@ -664,6 +677,8 @@ void stator_isolate_terminate_execution(struct StatorIsolate *isolate);
  * [`stator_isolate_is_execution_terminating`] returns `false` until a new
  * termination is requested.  Does nothing when `isolate` is null.
  *
+ * Safe to call from any thread.
+ *
  * # Safety
  * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
  */
@@ -673,7 +688,7 @@ void stator_isolate_cancel_terminate_execution(struct StatorIsolate *isolate);
  * Return `true` if a termination has been requested on `isolate` and not
  * yet cleared.
  *
- * Returns `false` when `isolate` is null.
+ * Returns `false` when `isolate` is null.  Safe to call from any thread.
  *
  * # Safety
  * `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.

@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::io::Write as _;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use stator_jse::bytecode::bytecode_array::BytecodeArray;
 use stator_jse::bytecode::bytecode_generator::BytecodeGenerator;
@@ -72,11 +73,16 @@ pub struct StatorIsolate {
     /// When true, the embedder has requested that JavaScript execution on
     /// this isolate be terminated.  Mirrors `v8::Isolate::TerminateExecution`.
     ///
-    /// Today this flag is plumbing only: it can be set, queried, and cleared
-    /// via the `stator_isolate_*_terminate_execution` family, but the
-    /// interpreter does not yet honour it mid-execution.  Embedders may use it
-    /// pre-execution to short-circuit `stator_script_run`.
-    terminating: bool,
+    /// Stored as an `AtomicBool` so that other threads can safely request
+    /// termination of a script running on the isolate's owning thread.
+    /// While a script is executing on the owning thread, the interpreter
+    /// polls this flag at backward branches, function-call boundaries, and
+    /// between microtasks via the thread-local pointer published by
+    /// [`stator_jse::interpreter::set_interrupt_flag`].
+    ///
+    /// Setting and observing the flag from any thread is well-defined; the
+    /// rest of `StatorIsolate` remains single-threaded.
+    terminating: AtomicBool,
 }
 
 // SAFETY: `StatorIsolate` contains raw pointer fields that are only ever
@@ -101,7 +107,7 @@ pub extern "C" fn stator_isolate_create() -> *mut StatorIsolate {
         pending_exception_owned: false,
         active_handle_scope: std::ptr::null_mut(),
         jit_disabled: false,
-        terminating: false,
+        terminating: AtomicBool::new(false),
     }))
 }
 
@@ -227,15 +233,28 @@ pub unsafe extern "C" fn stator_isolate_get_data(
 
 /// Request that JavaScript execution on `isolate` be terminated.
 ///
-/// Mirrors `v8::Isolate::TerminateExecution`.  Sets a sticky flag on the
-/// isolate; subsequent calls to [`stator_script_run`] will refuse to start a
-/// new script while the flag is set, returning a null result and recording a
-/// JavaScript-style termination exception via [`stator_isolate_throw_exception`]
-/// where applicable.  The flag remains set until explicitly cleared via
+/// Mirrors `v8::Isolate::TerminateExecution`.  Sets a sticky atomic flag on
+/// the isolate; the interpreter polls this flag at backward branches,
+/// function-call boundaries, and between microtasks, and unwinds the running
+/// script with a script-execution-terminated error visible through the
+/// existing pending-exception / try-catch reporting paths.  Subsequent calls
+/// to [`stator_script_run`] will also refuse to start a new script while the
+/// flag is set.  The flag remains set until explicitly cleared via
 /// [`stator_isolate_cancel_terminate_execution`].
 ///
-/// Note: This is currently plumbing only.  The interpreter does not yet poll
-/// the flag mid-execution; integration will follow in a subsequent change.
+/// This function is safe to call from any thread; the underlying flag is
+/// atomic.  Concurrency on the rest of the isolate is still the embedder's
+/// responsibility.
+///
+/// Limitations:
+/// * Baseline / Maglev / Turbofan JIT-emitted machine code does not poll
+///   the flag in this slice.  Termination is observed at the next
+///   interpreter boundary (JIT return / deopt / runtime stub).  Hostile
+///   code that stays inside JIT code indefinitely is not terminable until
+///   it re-enters the interpreter; embedders running untrusted code should
+///   currently call [`stator_isolate_set_jit_disabled`].
+/// * Wasm execution does not poll the flag; termination is observed at the
+///   next JS↔Wasm boundary.
 ///
 /// Does nothing when `isolate` is null.
 ///
@@ -246,8 +265,9 @@ pub unsafe extern "C" fn stator_isolate_terminate_execution(isolate: *mut Stator
     if isolate.is_null() {
         return;
     }
-    // SAFETY: caller guarantees `isolate` is valid.
-    unsafe { (*isolate).terminating = true };
+    // SAFETY: caller guarantees `isolate` is valid.  The atomic store is
+    // safe from any thread.
+    unsafe { (*isolate).terminating.store(true, Ordering::Relaxed) };
 }
 
 /// Clear a previously requested termination on `isolate`.
@@ -255,6 +275,8 @@ pub unsafe extern "C" fn stator_isolate_terminate_execution(isolate: *mut Stator
 /// Mirrors `v8::Isolate::CancelTerminateExecution`.  After this call,
 /// [`stator_isolate_is_execution_terminating`] returns `false` until a new
 /// termination is requested.  Does nothing when `isolate` is null.
+///
+/// Safe to call from any thread.
 ///
 /// # Safety
 /// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
@@ -264,13 +286,13 @@ pub unsafe extern "C" fn stator_isolate_cancel_terminate_execution(isolate: *mut
         return;
     }
     // SAFETY: caller guarantees `isolate` is valid.
-    unsafe { (*isolate).terminating = false };
+    unsafe { (*isolate).terminating.store(false, Ordering::Relaxed) };
 }
 
 /// Return `true` if a termination has been requested on `isolate` and not
 /// yet cleared.
 ///
-/// Returns `false` when `isolate` is null.
+/// Returns `false` when `isolate` is null.  Safe to call from any thread.
 ///
 /// # Safety
 /// `isolate` must be either null or a valid, live [`StatorIsolate`] pointer.
@@ -282,7 +304,7 @@ pub unsafe extern "C" fn stator_isolate_is_execution_terminating(
         return false;
     }
     // SAFETY: caller guarantees `isolate` is valid.
-    unsafe { (*isolate).terminating }
+    unsafe { (*isolate).terminating.load(Ordering::Relaxed) }
 }
 
 /// Record `exception` as the pending exception on `isolate`.
@@ -2607,7 +2629,40 @@ unsafe fn context_is_execution_terminating(ctx: *mut StatorContext) -> bool {
     }
     // SAFETY: caller guarantees `ctx` is valid.
     let isolate = unsafe { (*ctx)._isolate };
-    !isolate.is_null() && unsafe { (*isolate).terminating }
+    !isolate.is_null() && unsafe { (*isolate).terminating.load(Ordering::Relaxed) }
+}
+
+/// RAII guard: publish the isolate's termination flag to the interpreter's
+/// thread-local interrupt slot for the duration of a script run, and clear
+/// it on drop.  See `stator_jse::interpreter::set_interrupt_flag`.
+struct InterruptFlagScope {
+    prev: *const AtomicBool,
+}
+
+impl InterruptFlagScope {
+    fn new(ctx: *mut StatorContext) -> Self {
+        let prev = stator_jse::interpreter::interrupt_flag_ptr();
+        if !ctx.is_null() {
+            // SAFETY: caller of run_script_inner / run_script_no_result_inner
+            // guarantees `ctx` is valid.
+            let isolate = unsafe { (*ctx)._isolate };
+            if !isolate.is_null() {
+                // SAFETY: `isolate` outlives the script run; the atomic
+                // address is stable for the isolate's lifetime.
+                let flag_ptr: *const AtomicBool = unsafe { &(*isolate).terminating };
+                unsafe { stator_jse::interpreter::set_interrupt_flag(flag_ptr) };
+            }
+        }
+        Self { prev }
+    }
+}
+
+impl Drop for InterruptFlagScope {
+    fn drop(&mut self) {
+        // SAFETY: `prev` was the previously published pointer (possibly null);
+        // restoring it is always safe.
+        unsafe { stator_jse::interpreter::set_interrupt_flag(self.prev) };
+    }
 }
 
 unsafe fn run_script_inner(
@@ -2622,6 +2677,10 @@ unsafe fn run_script_inner(
             "script execution terminated".to_string(),
         )));
     }
+    // Publish the isolate's atomic termination flag to the interpreter's
+    // thread-local interrupt slot so backward branches, call boundaries, and
+    // microtask drains poll it.  Cleared on drop, even on panic.
+    let _interrupt_scope = InterruptFlagScope::new(ctx);
     // SAFETY: caller guarantees `script` is valid.
     let bytecodes = match unsafe { &(*script).bytecodes } {
         Some(b) => b,
@@ -2668,6 +2727,7 @@ unsafe fn run_script_no_result_inner(
             "script execution terminated".to_string(),
         )));
     }
+    let _interrupt_scope = InterruptFlagScope::new(ctx);
     // SAFETY: caller guarantees `script` is valid.
     let bytecodes = match unsafe { &(*script).bytecodes } {
         Some(b) => b,
@@ -9821,6 +9881,181 @@ mod tests {
             stator_isolate_cancel_terminate_execution(std::ptr::null_mut());
             assert!(!stator_isolate_is_execution_terminating(std::ptr::null()));
         }
+    }
+
+    /// A hostile `while (true) {}` script must be terminable from another
+    /// thread within a bounded time, and the isolate must be reusable
+    /// after the termination is cancelled.
+    #[test]
+    fn test_isolate_terminate_aborts_infinite_loop_cross_thread() {
+        // Sendable pointer wrapper: `*mut StatorIsolate` is not `Send` by
+        // default but the underlying flag is atomic and is safe to set from
+        // any thread.
+        #[derive(Copy, Clone)]
+        struct IsoPtr(usize);
+        // SAFETY: the only operations performed on the other thread are
+        // atomic stores to the isolate's termination flag, which are
+        // thread-safe by construction.
+        unsafe impl Send for IsoPtr {}
+
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        assert!(!ctx.is_null());
+
+        // Disable JIT so the test exercises the interpreter polling path
+        // deterministically; the JIT does not poll in this slice.
+        unsafe {
+            stator_isolate_set_jit_disabled(iso.as_ptr(), true);
+        }
+
+        let src = b"while (true) { }";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        assert!(!script.is_null());
+
+        let iso_ptr = IsoPtr(iso.as_ptr() as usize);
+        let killer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            // SAFETY: the main thread keeps the isolate alive until after
+            // join; the atomic store is thread-safe.
+            unsafe {
+                stator_isolate_terminate_execution(iso_ptr.0 as *mut StatorIsolate);
+            }
+        });
+
+        let start = std::time::Instant::now();
+        let result = unsafe { stator_script_run(script, ctx) };
+        let elapsed = start.elapsed();
+        killer.join().unwrap();
+
+        assert!(
+            result.is_null(),
+            "script_run should return null after termination"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "termination took too long: {elapsed:?}"
+        );
+        // The flag should still be set (it is sticky until cancelled).
+        unsafe {
+            assert!(stator_isolate_is_execution_terminating(iso.as_ptr()));
+        }
+
+        // Cancelling termination must restore the ability to run scripts.
+        unsafe {
+            stator_isolate_cancel_terminate_execution(iso.as_ptr());
+            assert!(!stator_isolate_is_execution_terminating(iso.as_ptr()));
+
+            let src2 = b"1 + 2";
+            let script2 = stator_script_compile(ctx, src2.as_ptr() as *const c_char, src2.len());
+            assert!(!script2.is_null());
+            let r = stator_script_run(script2, ctx);
+            assert!(!r.is_null(), "script must run after cancel");
+            assert_eq!(stator_value_as_number(r), 3.0);
+            stator_value_destroy(r);
+            stator_script_free(script2);
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    /// A function-call infinite recursion / loop is terminable via the
+    /// `run_inner` call-boundary poll.
+    #[test]
+    fn test_isolate_terminate_aborts_function_call_loop() {
+        #[derive(Copy, Clone)]
+        struct IsoPtr(usize);
+        // SAFETY: only an atomic store is performed off-thread.
+        unsafe impl Send for IsoPtr {}
+
+        let iso = IsolateGuard::new();
+        let ctx = unsafe { stator_context_new(iso.as_ptr()) };
+        assert!(!ctx.is_null());
+        unsafe {
+            stator_isolate_set_jit_disabled(iso.as_ptr(), true);
+        }
+
+        // Loop body contains a function call so the call-boundary poll is
+        // also exercised.
+        let src = b"function f(){return 1} while (true) { f(); }";
+        let script =
+            unsafe { stator_script_compile(ctx, src.as_ptr() as *const c_char, src.len()) };
+        assert!(!script.is_null());
+
+        let iso_ptr = IsoPtr(iso.as_ptr() as usize);
+        let killer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            unsafe {
+                stator_isolate_terminate_execution(iso_ptr.0 as *mut StatorIsolate);
+            }
+        });
+
+        let start = std::time::Instant::now();
+        let result = unsafe { stator_script_run(script, ctx) };
+        let elapsed = start.elapsed();
+        killer.join().unwrap();
+
+        assert!(result.is_null());
+        assert!(elapsed < std::time::Duration::from_secs(5));
+
+        unsafe {
+            stator_isolate_cancel_terminate_execution(iso.as_ptr());
+            stator_script_free(script);
+            stator_context_destroy(ctx);
+        }
+    }
+
+    /// A microtask flood must observe termination between tasks.  We drive
+    /// the microtask queue directly to keep the test independent of the
+    /// FFI surface for Promise microtask draining.
+    #[test]
+    fn test_microtask_drain_observes_interrupt_flag_between_tasks() {
+        use std::cell::Cell as StdCell;
+        use std::rc::Rc as StdRc;
+
+        let flag = AtomicBool::new(false);
+        // SAFETY: `flag` outlives the publish/clear pair below.
+        unsafe { stator_jse::interpreter::set_interrupt_flag(&flag as *const _) };
+
+        let queue = stator_jse::builtins::promise::MicrotaskQueue::new();
+        let ran = StdRc::new(StdCell::new(0u32));
+
+        // Enqueue 1000 tasks; the 5th one trips the termination flag.
+        // Tasks scheduled after termination must not run during this drain.
+        for i in 0..1000u32 {
+            let ran = StdRc::clone(&ran);
+            let flag_ptr: *const AtomicBool = &flag;
+            queue.enqueue(Box::new(move || {
+                ran.set(ran.get() + 1);
+                if i == 4 {
+                    // SAFETY: `flag` outlives the drain.
+                    unsafe { (*flag_ptr).store(true, Ordering::Relaxed) };
+                }
+            }));
+        }
+
+        queue.drain();
+
+        // Tasks 0..=4 should have run; tasks >= 5 should not have run during
+        // this drain (the between-task poll bails out).
+        assert!(
+            ran.get() <= 5,
+            "expected drain to bail after termination flag was set, ran {} tasks",
+            ran.get()
+        );
+        assert!(
+            ran.get() >= 5,
+            "expected at least 5 tasks (through the one that set the flag) to run"
+        );
+        // Remaining tasks are preserved; once we cancel, they would drain.
+        assert!(!queue.is_empty());
+
+        flag.store(false, Ordering::Relaxed);
+        queue.drain();
+        assert!(queue.is_empty());
+        assert_eq!(ran.get(), 1000);
+
+        stator_jse::interpreter::clear_interrupt_flag();
     }
 
     #[test]

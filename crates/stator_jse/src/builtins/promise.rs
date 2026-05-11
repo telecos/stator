@@ -244,9 +244,18 @@ impl MicrotaskQueue {
     /// Drain the queue: run all pending microtasks in FIFO order, including
     /// any that are enqueued by tasks that run during this drain.
     ///
-    /// Returns when the queue is empty.
+    /// Returns when the queue is empty, or earlier if the embedder has
+    /// requested termination via the interpreter interrupt flag (see
+    /// [`crate::interpreter::check_interrupt_flag`]). Pending tasks remaining
+    /// in the queue are preserved; a subsequent call to `drain` after
+    /// termination has been cancelled will resume processing them.
     pub fn drain(&self) {
         loop {
+            // Honour host-requested termination between microtasks so a flood
+            // of self-rescheduling microtasks cannot wedge the embedder.
+            if crate::interpreter::check_interrupt_flag() {
+                break;
+            }
             let task = self.0.borrow_mut().pop_front();
             match task {
                 Some(t) => t(),

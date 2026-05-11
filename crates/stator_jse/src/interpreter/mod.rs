@@ -1067,6 +1067,99 @@ pub fn get_execution_deadline() -> Option<Instant> {
     EXECUTION_DEADLINE.with(|d| d.get())
 }
 
+// ── Termination / interrupt polling ──────────────────────────────────────────
+//
+// The interpreter consults a thread-local raw pointer to an embedder-owned
+// [`AtomicBool`].  When the bool is set (typically by an embedder host on a
+// **different** thread via `stator_isolate_terminate_execution`) the interpreter
+// unwinds the running script with a `StatorError::Internal("script execution
+// terminated")`, which is observable via the same try-catch / pending-exception
+// reporting paths used for any other uncatchable script error.
+//
+// The pointer is published by [`set_interrupt_flag`] just before entering a
+// script and cleared by [`clear_interrupt_flag`] after the script returns.
+// While the pointer is null the polling sites are a single predicted-not-taken
+// load, so the hot path overhead is negligible.
+//
+// Polling sites in this slice:
+//   * Every interpreter backward branch (`JumpLoop` — both the regular and
+//     SMI fast-path dispatchers).  This is what makes an empty
+//     `while (true) {}` terminable.
+//   * The entry of [`Interpreter::run_inner`], i.e. every function call
+//     boundary observed by the interpreter.
+//   * Between microtasks in [`crate::builtins::promise::MicrotaskQueue::drain`].
+//
+// Scope and limitations:
+//   * Baseline / Maglev / Turbofan JIT-generated code does **not** poll the
+//     flag in this slice.  Termination still unwinds at the next interpreter
+//     boundary (e.g. when JIT code returns, deopts, or calls back into the
+//     interpreter for a slow runtime stub).  An infinite loop that lives
+//     entirely inside JIT-emitted machine code will not be terminated until
+//     it falls back to the interpreter.  Embedders that require synchronous
+//     mid-JIT termination should currently disable JIT
+//     (`stator_isolate_disable_jit`) on isolates that may run hostile code.
+//   * Wasm execution does not poll the flag in this slice; termination is
+//     observed at the next JS↔Wasm boundary.  See
+//     `crate::wasm` for the Wasm engine entry points.
+thread_local! {
+    /// Pointer to the embedder-owned [`AtomicBool`] consulted by the
+    /// interpreter to detect host-requested termination.  Null when no
+    /// embedder is driving execution on this thread.
+    static INTERRUPT_FLAG: Cell<*const std::sync::atomic::AtomicBool> =
+        const { Cell::new(std::ptr::null()) };
+}
+
+/// Publish an embedder-owned [`AtomicBool`] pointer that the interpreter on
+/// this thread will poll to detect host-requested termination.
+///
+/// Passing a null pointer clears the association.
+///
+/// # Safety
+/// `flag` must either be null or point to an `AtomicBool` that remains valid
+/// for the duration that any interpreter call on this thread might observe
+/// it (i.e. until `set_interrupt_flag(std::ptr::null())` is called or this
+/// thread exits).  Concurrent mutation from other threads via atomic stores
+/// is permitted and is the intended cross-thread termination path.
+pub unsafe fn set_interrupt_flag(flag: *const std::sync::atomic::AtomicBool) {
+    INTERRUPT_FLAG.with(|f| f.set(flag));
+}
+
+/// Clear the embedder interrupt-flag association for this thread.
+pub fn clear_interrupt_flag() {
+    INTERRUPT_FLAG.with(|f| f.set(std::ptr::null()));
+}
+
+/// Returns the currently published interrupt-flag pointer on this thread,
+/// or null when none is set.
+pub fn interrupt_flag_ptr() -> *const std::sync::atomic::AtomicBool {
+    INTERRUPT_FLAG.with(Cell::get)
+}
+
+/// Returns `true` if a host has requested termination of script execution
+/// on this thread.  Cheap (one Relaxed atomic load through a thread-local
+/// pointer); the no-embedder hot path is a single null-pointer test.
+#[inline(always)]
+pub fn check_interrupt_flag() -> bool {
+    let ptr = INTERRUPT_FLAG.with(Cell::get);
+    if ptr.is_null() {
+        return false;
+    }
+    // SAFETY: `set_interrupt_flag` requires callers to keep `*ptr` valid
+    // for as long as it is published; concurrent atomic stores are
+    // synchronised via the AtomicBool.
+    unsafe { (*ptr).load(std::sync::atomic::Ordering::Relaxed) }
+}
+
+/// The canonical error returned by interpreter polling sites when the
+/// embedder has requested termination.  The message is intentionally
+/// identical to the pre-execution short-circuit so embedders observe a
+/// single textual contract.
+#[cold]
+#[inline(never)]
+pub fn script_terminated_error() -> StatorError {
+    StatorError::Internal("script execution terminated".to_string())
+}
+
 /// Process-wide count of successful Maglev compilations.
 ///
 /// Uses atomics so the background compilation thread can update the counter
@@ -3717,6 +3810,12 @@ impl Interpreter {
     fn run_inner(frame: &mut InterpreterFrame, skip_globals: bool) -> StatorResult<JsValue> {
         DIAG_RUN_INNER_ENTERED.with(|c| c.set(c.get() + 1));
 
+        // Termination poll at every function-call boundary observed by the
+        // interpreter.  See module-level "Termination / interrupt polling".
+        if check_interrupt_flag() {
+            return Err(script_terminated_error());
+        }
+
         // Increment invocation count for tiering — ensures top-level code
         // (not just function calls) participates in JIT compilation decisions.
         let inv_count = frame.bytecode_array.increment_invocation_count();
@@ -4930,6 +5029,15 @@ impl Interpreter {
                             Opcode::JumpLoop => {
                                 let loop_end = pc;
                                 pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
+
+                                // Termination poll on every SMI-loop back-edge.
+                                if check_interrupt_flag() {
+                                    acc = materialize_acc!();
+                                    frame.pc = pc;
+                                    frame.accumulator = acc.cheap_clone();
+                                    return Err(script_terminated_error());
+                                }
+
                                 frame.osr_loop_count = frame.osr_loop_count.saturating_add(1);
 
                                 // JIT compilation + OSR execution inside the
@@ -9796,6 +9904,17 @@ impl Interpreter {
                         // instructions have pre-computed targets.
                         let loop_end = pc; // Position after this JumpLoop
                         pc = unsafe { resolve_jump_unchecked(pc, jump_targets) };
+
+                        // Termination poll on every backward branch — this is
+                        // what makes an empty `while (true) {}` terminable.
+                        // The check is a single Relaxed load through a
+                        // thread-local pointer that is typically null.
+                        if check_interrupt_flag() {
+                            frame.pc = pc;
+                            frame.accumulator = acc;
+                            return Err(script_terminated_error());
+                        }
+
                         frame.osr_loop_count = frame.osr_loop_count.saturating_add(1);
                         if frame.osr_loop_count == OSR_LOOP_THRESHOLD {
                             if frame.bytecode_array.try_get_jit_code().is_none()
