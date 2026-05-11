@@ -253,8 +253,10 @@ pub unsafe extern "C" fn stator_isolate_get_data(
 ///   code that stays inside JIT code indefinitely is not terminable until
 ///   it re-enters the interpreter; embedders running untrusted code should
 ///   currently call [`stator_isolate_set_jit_disabled`].
-/// * Wasm execution does not poll the flag; termination is observed at the
-///   next JS↔Wasm boundary.
+/// * Wasm execution polls the flag at JS↔Wasm entry and through Wasmtime epoch
+///   interruption while compiled Wasm is running.  The epoch broadcast is
+///   process-wide, but each store only traps when the thread running that store
+///   observes its own published Stator interrupt flag.
 ///
 /// Does nothing when `isolate` is null.
 ///
@@ -268,6 +270,12 @@ pub unsafe extern "C" fn stator_isolate_terminate_execution(isolate: *mut Stator
     // SAFETY: caller guarantees `isolate` is valid.  The atomic store is
     // safe from any thread.
     unsafe { (*isolate).terminating.store(true, Ordering::Relaxed) };
+    // Advance the epoch of every live Wasm engine in the process so any
+    // in-flight Wasm call reaches its per-store deadline callback at the next
+    // epoch check.  The callback checks the running thread's interrupt flag
+    // before trapping, so unrelated isolates ignore the broadcast: see
+    // `stator_jse::wasm::interrupt_all_wasm_engines`.
+    stator_jse::wasm::interrupt_all_wasm_engines();
 }
 
 /// Clear a previously requested termination on `isolate`.

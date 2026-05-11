@@ -1098,9 +1098,15 @@ pub fn get_execution_deadline() -> Option<Instant> {
 //     it falls back to the interpreter.  Embedders that require synchronous
 //     mid-JIT termination should currently disable JIT
 //     (`stator_isolate_disable_jit`) on isolates that may run hostile code.
-//   * Wasm execution does not poll the flag in this slice; termination is
-//     observed at the next JS↔Wasm boundary.  See
-//     `crate::wasm` for the Wasm engine entry points.
+//   * Wasm execution:
+//     - Every JS→Wasm boundary (`WasmInstance::call`) checks the interrupt
+//       flag at entry and short-circuits with a terminated error before
+//       entering Wasmtime.
+//     - Wasmtime is configured with epoch interruption.  The FFI termination
+//       entry point ([`stator_isolate_terminate_execution`]) bumps every
+//       live engine's epoch, and each store callback checks this thread's
+//       published Stator interrupt flag before deciding whether to trap.  See
+//       `crate::wasm` for the engine registry.
 thread_local! {
     /// Pointer to the embedder-owned [`AtomicBool`] consulted by the
     /// interpreter to detect host-requested termination.  Null when no
@@ -1150,6 +1156,10 @@ pub fn check_interrupt_flag() -> bool {
     unsafe { (*ptr).load(std::sync::atomic::Ordering::Relaxed) }
 }
 
+/// Canonical message returned by polling sites when the embedder has requested
+/// termination.
+pub const SCRIPT_TERMINATED_MESSAGE: &str = "script execution terminated";
+
 /// The canonical error returned by interpreter polling sites when the
 /// embedder has requested termination.  The message is intentionally
 /// identical to the pre-execution short-circuit so embedders observe a
@@ -1157,7 +1167,7 @@ pub fn check_interrupt_flag() -> bool {
 #[cold]
 #[inline(never)]
 pub fn script_terminated_error() -> StatorError {
-    StatorError::Internal("script execution terminated".to_string())
+    StatorError::Internal(SCRIPT_TERMINATED_MESSAGE.to_string())
 }
 
 /// Process-wide count of successful Maglev compilations.

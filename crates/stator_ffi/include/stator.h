@@ -660,8 +660,10 @@ void *stator_isolate_get_data(const struct StatorIsolate *isolate, uint32_t slot
  *   code that stays inside JIT code indefinitely is not terminable until
  *   it re-enters the interpreter; embedders running untrusted code should
  *   currently call [`stator_isolate_set_jit_disabled`].
- * * Wasm execution does not poll the flag; termination is observed at the
- *   next JS↔Wasm boundary.
+ * * Wasm execution polls the flag at JS↔Wasm entry and through Wasmtime epoch
+ *   interruption while compiled Wasm is running.  The epoch broadcast is
+ *   process-wide, but each store only traps when the thread running that store
+ *   observes its own published Stator interrupt flag.
  *
  * Does nothing when `isolate` is null.
  *

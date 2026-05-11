@@ -45,10 +45,83 @@
 //! assert_eq!(result[0].unwrap_i32(), 3);
 //! ```
 
-use wasmtime::{Engine, Instance, Linker, Module, Store, Val};
+use std::sync::Mutex;
+
+use wasmtime::{Config, Engine, Instance, Linker, Module, Store, UpdateDeadline, Val};
 
 use crate::error::{StatorError, StatorResult};
+use crate::interpreter::{
+    SCRIPT_TERMINATED_MESSAGE, check_interrupt_flag, script_terminated_error,
+};
 use crate::objects::value::JsValue;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Termination plumbing
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Wasmtime provides an "epoch interruption" mechanism: compiled Wasm code
+// periodically checks the engine's epoch counter against a per-store
+// deadline.  When the deadline is reached the configured callback decides
+// whether to trap the running call.  This is the only safe way to interrupt
+// a Wasm call from another thread without relying on signals or signals
+// emulation.  See:
+//   https://docs.wasmtime.dev/api/wasmtime/struct.Config.html#method.epoch_interruption
+//
+// Polling sites in this slice:
+//   * Every [`WasmInstance::call`] entry checks the Stator interrupt flag
+//     and short-circuits with [`script_terminated_error`] so a JS→Wasm
+//     boundary is always observable, even if Wasm compiled code never
+//     reaches an epoch check (e.g. very short call, no loops).
+//   * Every [`WasmEngine::new`] enables epoch interruption and every
+//     [`Store`] starts with `epoch_deadline = 1` and a callback that checks
+//     this thread's published Stator interrupt flag.
+//     [`interrupt_all_wasm_engines`] (called by the FFI termination
+//     entry point) advances every live engine's epoch so in-flight Wasm calls
+//     reach the callback at their next epoch check.
+//
+// Scope and limitations:
+//   * The engine registry is process-global.  Triggering termination on one
+//     isolate also bumps the epoch of Wasm engines belonging to other
+//     isolates that happen to be running on this process.  The other
+//     isolates will simply observe an extra (idempotent) epoch tick — they
+//     will not trap unless their own embedder is concurrently asking for
+//     termination — but the conservative behavior is to keep this in mind
+//     for future per-isolate scoping.
+
+/// Process-wide registry of live Wasm engines.  Used by
+/// [`interrupt_all_wasm_engines`] to advance every engine's epoch when the
+/// host requests termination.  Entries are added by [`WasmEngine::new`].
+///
+/// Engines are reference-counted internally by Wasmtime; storing a clone
+/// here keeps the underlying engine alive even if the embedder drops its
+/// last [`WasmEngine`].  For dogfood the number of engines is small and
+/// bounded by isolate count, so unbounded growth is not a concern in
+/// practice.
+static WASM_ENGINES: Mutex<Vec<Engine>> = Mutex::new(Vec::new());
+
+/// Advance the epoch of every registered Wasm [`Engine`] so any in-flight
+/// Wasm call observes its deadline at its next epoch check.
+///
+/// Safe to call from any thread; safe to call when no Wasm is in flight.
+/// Idempotent: calling twice in a row simply increments the epoch twice
+/// (the deadline is already past after the first call).  The per-store
+/// deadline callback decides whether the epoch tick represents this isolate's
+/// own termination request or an unrelated cross-isolate broadcast.
+pub fn interrupt_all_wasm_engines() {
+    let guard = WASM_ENGINES
+        .lock()
+        .expect("Stator Wasm engine registry mutex poisoned");
+    for engine in guard.iter() {
+        engine.increment_epoch();
+    }
+}
+
+fn register_engine(engine: &Engine) {
+    WASM_ENGINES
+        .lock()
+        .expect("Stator Wasm engine registry mutex poisoned")
+        .push(engine.clone());
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WasmEngine
@@ -64,11 +137,21 @@ pub struct WasmEngine {
 }
 
 impl WasmEngine {
-    /// Create a new [`WasmEngine`] with default compilation settings.
+    /// Create a new [`WasmEngine`] with default compilation settings and
+    /// epoch interruption enabled.
+    ///
+    /// Epoch interruption is the mechanism [`interrupt_all_wasm_engines`]
+    /// uses to terminate an in-flight Wasm call.  Enabling it on the engine
+    /// is a no-op unless a [`Store`] also configures a deadline; both are
+    /// set up here for every Stator-created Wasm execution.
     pub fn new() -> Self {
-        Self {
-            inner: Engine::default(),
-        }
+        let mut config = Config::new();
+        config.epoch_interruption(true);
+        // `Engine::new` only fails for invalid `Config`s; the defaults plus
+        // `epoch_interruption(true)` are always valid.
+        let inner = Engine::new(&config).expect("default wasmtime Config should be valid");
+        register_engine(&inner);
+        Self { inner }
     }
 
     /// Return a reference to the underlying [`wasmtime::Engine`].
@@ -156,6 +239,18 @@ impl WasmInstance {
     /// module requires imports that are not provided).
     pub fn new(engine: &WasmEngine, module: &WasmModule) -> StatorResult<Self> {
         let mut store: Store<()> = Store::new(engine.inner(), ());
+        // Configure the store so that every epoch advance reaches a callback
+        // which checks the current thread's Stator interrupt flag.  This lets
+        // a process-wide epoch broadcast terminate the isolate that owns the
+        // running script without trapping unrelated isolates that share the
+        // same process-global Wasm engine registry.
+        store.epoch_deadline_callback(|_| {
+            if check_interrupt_flag() {
+                return Ok(UpdateDeadline::Interrupt);
+            }
+            Ok(UpdateDeadline::Continue(1))
+        });
+        store.set_epoch_deadline(1);
         let linker: Linker<()> = Linker::new(engine.inner());
         let instance = linker
             .instantiate(&mut store, module.inner())
@@ -175,6 +270,17 @@ impl WasmInstance {
     ///   function.
     /// - The call traps or returns an error.
     pub fn call(&mut self, name: &str, args: &[Val]) -> StatorResult<Vec<Val>> {
+        // JS↔Wasm boundary termination poll.  If the embedder has requested
+        // termination on this thread we short-circuit before entering Wasm
+        // so the embedder observes the canonical "script execution
+        // terminated" error rather than whatever value a partial Wasm call
+        // might happen to return.
+        if check_interrupt_flag() {
+            return Err(StatorError::WasmError(
+                SCRIPT_TERMINATED_MESSAGE.to_string(),
+            ));
+        }
+
         let func = self
             .inner
             .get_func(&mut self.store, name)
@@ -185,7 +291,12 @@ impl WasmInstance {
         let mut results = vec![Val::I32(0); result_count];
 
         func.call(&mut self.store, args, &mut results)
-            .map_err(|e| StatorError::WasmError(e.to_string()))?;
+            .map_err(|e| {
+                if check_interrupt_flag() {
+                    return StatorError::WasmError(SCRIPT_TERMINATED_MESSAGE.to_string());
+                }
+                StatorError::WasmError(e.to_string())
+            })?;
 
         Ok(results)
     }
@@ -453,6 +564,162 @@ mod tests {
 
         let err = instance.call("nonexistent", &[]).unwrap_err();
         assert!(matches!(err, StatorError::WasmError(_)));
+    }
+
+    // ── Termination at JS↔Wasm boundary ─────────────────────────────────────
+
+    /// `WasmInstance::call` must observe the interpreter interrupt flag at
+    /// entry and short-circuit with a terminated `WasmError`, even when the
+    /// callee is a trivial constant function that would otherwise return
+    /// immediately.
+    #[test]
+    fn test_wasm_call_entry_observes_interrupt_flag() {
+        use crate::interpreter::{clear_interrupt_flag, set_interrupt_flag};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, ADD_WAT).unwrap();
+        let mut instance = WasmInstance::new(&engine, &module).unwrap();
+
+        // Sanity: with the flag clear, the call succeeds normally.
+        let ok = instance.call("add", &[Val::I32(1), Val::I32(2)]).unwrap();
+        assert_eq!(ok[0].unwrap_i32(), 3);
+
+        let flag = AtomicBool::new(true);
+        // SAFETY: `flag` lives for the duration of the `set`/`clear` pair.
+        unsafe { set_interrupt_flag(&flag as *const _) };
+
+        let err = instance
+            .call("add", &[Val::I32(1), Val::I32(2)])
+            .expect_err("call must observe the interrupt flag at entry");
+        match err {
+            StatorError::WasmError(msg) => {
+                assert_eq!(SCRIPT_TERMINATED_MESSAGE, msg);
+            }
+            other => panic!("expected WasmError, got: {other:?}"),
+        }
+
+        // After clearing, the call succeeds again so we know the boundary
+        // observation is gated on the flag and not a sticky state.
+        flag.store(false, Ordering::Relaxed);
+        clear_interrupt_flag();
+        let ok = instance.call("add", &[Val::I32(10), Val::I32(20)]).unwrap();
+        assert_eq!(ok[0].unwrap_i32(), 30);
+    }
+
+    /// [`interrupt_all_wasm_engines`] must run without panicking even when
+    /// no Wasm call is in flight (idempotency / safety contract).
+    #[test]
+    fn test_interrupt_all_wasm_engines_safe_when_idle() {
+        // Ensure at least one engine is registered.
+        let _engine = WasmEngine::new();
+        interrupt_all_wasm_engines();
+        interrupt_all_wasm_engines();
+    }
+
+    /// A process-global epoch tick must not trap an unrelated isolate.  The
+    /// callback should continue execution unless this thread's Stator interrupt
+    /// flag is set.
+    #[test]
+    fn test_wasm_epoch_bump_without_interrupt_flag_continues() {
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, ADD_WAT).unwrap();
+        let mut instance = WasmInstance::new(&engine, &module).unwrap();
+
+        engine.inner().increment_epoch();
+
+        let ok = instance.call("add", &[Val::I32(4), Val::I32(5)]).unwrap();
+        assert_eq!(ok[0].unwrap_i32(), 9);
+    }
+
+    /// After an epoch tick, a running Wasm call traps only when the Stator
+    /// interrupt flag published on the executing thread is set.  We call
+    /// Wasmtime directly here so this validates the epoch callback rather than
+    /// the public `WasmInstance::call` entry check.
+    #[test]
+    fn test_wasm_call_mid_execution_traps_when_interrupt_flag_set() {
+        use crate::interpreter::{clear_interrupt_flag, set_interrupt_flag};
+        use std::sync::atomic::AtomicBool;
+
+        // (module
+        //   (func (export "spin")
+        //     (loop $L (br $L))))
+        let spin_wat = r#"
+            (module
+                (func (export "spin")
+                    (loop $L (br $L))))
+        "#;
+
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, spin_wat).unwrap();
+        let mut instance = WasmInstance::new(&engine, &module).unwrap();
+
+        let func = instance
+            .inner
+            .get_func(&mut instance.store, "spin")
+            .expect("spin export should exist");
+        let mut results = Vec::new();
+        let flag = AtomicBool::new(true);
+
+        // Pre-advance the engine's epoch so the store's deadline callback runs
+        // at the first loop epoch check.  With the thread-local flag set, the
+        // callback interrupts instead of continuing.
+        engine.inner().increment_epoch();
+
+        // SAFETY: `flag` lives for the duration of the `set`/`clear` pair.
+        unsafe { set_interrupt_flag(&flag as *const _) };
+        let err = func
+            .call(&mut instance.store, &[], &mut results)
+            .expect_err("spin must trap when the interrupt flag is set");
+        clear_interrupt_flag();
+        // Wasmtime surfaces the trap as a generic error string.  We only
+        // require that the call errors out instead of hanging — the test
+        // would time out if epoch interruption was not wired up.
+        assert!(!err.to_string().is_empty());
+    }
+
+    /// Public Wasm calls that are interrupted after entry should map
+    /// Wasmtime's generic interrupt trap back to Stator's canonical
+    /// termination message.
+    #[test]
+    fn test_wasm_call_mid_execution_maps_interrupt_to_terminated_error() {
+        use crate::interpreter::{clear_interrupt_flag, set_interrupt_flag};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let spin_wat = r#"
+            (module
+                (func (export "spin")
+                    (loop $L (br $L))))
+        "#;
+
+        let engine = WasmEngine::new();
+        let module = WasmModule::from_wat(&engine, spin_wat).unwrap();
+        let mut instance = WasmInstance::new(&engine, &module).unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let trigger_flag = Arc::clone(&flag);
+        let trigger = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            trigger_flag.store(true, Ordering::Relaxed);
+            interrupt_all_wasm_engines();
+        });
+
+        // SAFETY: `flag` stays alive until after the call returns and the
+        // thread-local association is cleared.
+        unsafe { set_interrupt_flag(Arc::as_ptr(&flag)) };
+        let err = instance
+            .call("spin", &[])
+            .expect_err("spin must terminate after the async epoch bump");
+        clear_interrupt_flag();
+        trigger.join().unwrap();
+
+        match err {
+            StatorError::WasmError(msg) => {
+                assert_eq!(SCRIPT_TERMINATED_MESSAGE, msg);
+            }
+            other => panic!("expected WasmError, got: {other:?}"),
+        }
     }
 
     // ── Value conversion ────────────────────────────────────────────────────
